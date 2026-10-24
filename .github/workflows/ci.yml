@@ -1,0 +1,120 @@
+name: ci
+
+# One workflow, one matrix. Later work packages extend it by adding steps at the marked
+# extension points below (fixture builds, the cmltest harness, ...); they should not add
+# parallel workflow files.
+
+on:
+  push:
+    branches: [main, 'wp/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.os }} / ${{ matrix.compiler }} / ${{ matrix.config }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+        compiler: [msvc, clang-cl]
+        config: [Debug, RelWithDebInfo]
+    env:
+      BUILD_DIR: build
+      LOG_DIR: ci-logs
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Puts cl.exe, link.exe, the Windows SDK and the VS-bundled CMake/Ninja on PATH (x64).
+      - name: Set up MSVC developer environment (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Select compiler and print toolchain versions
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          if ('${{ matrix.compiler }}' -eq 'clang-cl') {
+            $llvm = 'C:\Program Files\LLVM\bin\clang-cl.exe'
+            if (Test-Path $llvm) { $cxx = $llvm } else { $cxx = (Get-Command clang-cl).Source }
+          } else {
+            $cxx = (Get-Command cl).Source
+          }
+          "CML_CXX=$cxx" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          Write-Host "Selected C++ compiler: $cxx"
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
+          $v = @()
+          $v += "== cmake ==";  $v += (cmake --version)
+          $v += "== ninja ==";  $v += (ninja --version)
+          $v += "== link ==";   $v += (Get-Command link).Source
+          $v += "== cl ==";     $v += (cl 2>&1 | Out-String)
+          if ('${{ matrix.compiler }}' -eq 'clang-cl') { $v += "== clang-cl =="; $v += (& $cxx --version) }
+          $v | Tee-Object -FilePath "$env:LOG_DIR/toolchain.txt"
+
+      - name: Configure
+        run: |
+          $cxxArg = "-DCMAKE_CXX_COMPILER=$env:CML_CXX"
+          cmake -S . -B $env:BUILD_DIR -G Ninja `
+            -DCMAKE_BUILD_TYPE=${{ matrix.config }} `
+            $cxxArg `
+            -DCML_BUILD_GUI=ON `
+            *>&1 | Tee-Object -FilePath "$env:LOG_DIR/configure.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build
+        run: |
+          cmake --build $env:BUILD_DIR --parallel -- -v *>&1 | Tee-Object -FilePath "$env:LOG_DIR/build.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test
+        run: |
+          ctest --test-dir $env:BUILD_DIR -C ${{ matrix.config }} --output-on-failure `
+            --output-junit "$PWD/$env:LOG_DIR/ctest-junit.xml" *>&1 | Tee-Object -FilePath "$env:LOG_DIR/ctest.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run cml_broker --version
+        run: |
+          & "$env:BUILD_DIR/bin/cml_broker.exe" --version *>&1 | Tee-Object -FilePath "$env:LOG_DIR/broker-version.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # ---- Extension point (later WPs): build tests/fixtures, run cmltest.exe, ... -----------
+      # Add steps here, between "Run cml_broker --version" and the artifact upload. Write any
+      # logs you want to keep into $env:LOG_DIR; the upload step below always runs.
+
+      - name: Upload logs and test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.os }}-${{ matrix.compiler }}-${{ matrix.config }}
+          path: |
+            ci-logs/
+            build/Testing/
+            build/CMakeFiles/CMakeConfigureLog.yaml
+            build/.ninja_log
+          if-no-files-found: warn
+
+  # Not part of the 8-cell matrix: proves the Visual Studio generator still configures and
+  # builds, which is what most developers use locally.
+  vs-generator:
+    name: windows-2022 / Visual Studio 17 2022 generator
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build-vs -G "Visual Studio 17 2022" -A x64 -DCML_BUILD_GUI=ON
+      - name: Build (Debug)
+        run: cmake --build build-vs --config Debug --parallel
+      - name: Test (Debug)
+        run: ctest --test-dir build-vs -C Debug --output-on-failure

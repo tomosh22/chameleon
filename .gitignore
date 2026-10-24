@@ -1,0 +1,31 @@
+# Build trees
+/build/
+/build-*/
+/out/
+/cmake-build-*/
+CMakeUserPresets.json
+compile_commands.json
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.vcxproj.user
+
+# Binaries and debug info
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exp
+*.dll
+*.exe
+*.lib
+*.a
+
+# Chameleon runtime artefacts
+*.cml-cache
+*.log
+ci-logs/

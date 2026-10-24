@@ -1,0 +1,8 @@
+add_subdirectory(cml_util)
+add_subdirectory(cml_coff)
+add_subdirectory(cml_pe)
+add_subdirectory(cml_pdb)
+add_subdirectory(cml_ipc)
+add_subdirectory(cml_proc)
+add_subdirectory(cml_toolchain)
+add_subdirectory(cml_watch)

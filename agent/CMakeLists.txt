@@ -1,0 +1,6 @@
+add_library(cml_agent SHARED src/agent.cpp)
+target_include_directories(cml_agent PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_compile_definitions(cml_agent PRIVATE CML_AGENT_BUILD)
+set_target_properties(cml_agent PROPERTIES FOLDER "agent")
+cml_apply_warnings(cml_agent)
+cml_target_agent_style(cml_agent)
