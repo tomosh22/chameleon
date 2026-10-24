@@ -61,3 +61,28 @@ Ids for the by-design limitations in plan §1/§4.2 are pre-allocated in
 `x0xx` is reserved for generic/plumbing errors, `x1xx` for by-design limitations, and `x2xx+`
 for everything else, allocated by the WP that introduces it (record new ids in the WP doc;
 the orchestrator folds limitation ids into `KNOWN_LIMITATIONS.md`).
+
+## ADR-0004 GUI technology for M3 (plan §13 Q4)
+
+**Date:** 2026-10-24 · **Status:** Accepted
+
+**Decision.** Ship the Dear ImGui + D3D11 front-end (WP-19) as planned; no interim Win32 tray UI.
+Until WP-19 lands, the headless CLI and control pipe (WP-12) are the only UI.
+
+**Reason.** The crash dialog (WP-20) and clickable compile output need a real UI; building a
+throwaway tray app first would cost a WP for no lasting value. ImGui is already vendored (WP-01).
+
+## ADR-0005 Default editor-open commands (plan §13 Q5)
+
+**Date:** 2026-10-24 · **Status:** Accepted
+
+Defaults used by WP-19 for "open file at line" (user-overridable, `{file}` `{line}` `{col}` placeholders):
+
+| Editor | Command |
+|---|---|
+| VS Code (default if `code` is on PATH) | `code -g "{file}:{line}:{col}"` |
+| Visual Studio | `devenv.exe /edit "{file}" /command "Edit.GoTo {line}"` |
+| Rider | `rider64.exe --line {line} "{file}"` |
+| Fallback | `ShellExecute` "open" on `{file}` |
+
+Detection order: user setting → VS Code on PATH → `devenv.exe` via vswhere → fallback.
