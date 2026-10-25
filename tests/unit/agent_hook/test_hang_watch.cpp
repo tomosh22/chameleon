@@ -117,8 +117,8 @@ TEST_CASE("the out-of-process hang watchdog reports every thread of a process wh
     GetExitCodeProcess(victim.process, &victim_exit);
 
     INFO("watcher output:\n" << output);
-    CHECK(watcher_exit == 3);
-    CHECK(victim_exit == 3);
+    CHECK(watcher_exit == 3u);
+    CHECK(victim_exit == 3u);
     CHECK(output.find("is still running after 2 s") != std::string::npos);
     // main thread + 3 sleepers (+ whatever the runtime adds): one line each
     CHECK(count_of(output, "HANGWATCH: thread ") >= 4);
@@ -157,7 +157,7 @@ TEST_CASE("the out-of-process hang watchdog leaves a process that ends in time a
     REQUIRE(WaitForSingleObject(watcher.process, 30000) == WAIT_OBJECT_0);  // it noticed
     DWORD watcher_exit = 99;
     GetExitCodeProcess(watcher.process, &watcher_exit);
-    CHECK(watcher_exit == 0);
+    CHECK(watcher_exit == 0u);
     const std::string output = read_available(watcher, false);
     CHECK(output.find("HANGWATCH") == std::string::npos);
     CloseHandle(victim.process);

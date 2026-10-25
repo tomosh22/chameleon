@@ -25,7 +25,6 @@
 #include <tlhelp32.h>
 
 #include <cstdlib>
-#include <cstring>
 #include <string>
 
 namespace {
@@ -251,7 +250,7 @@ void start_external_watch(unsigned long limit_s) {
     char directory[MAX_PATH] = ".";
     const DWORD d = GetEnvironmentVariableA("CML_TEST_DUMP_DIR", directory, MAX_PATH);
     if (d == 0 || d >= MAX_PATH) {
-        std::strcpy(directory, ".");
+        copy_text(directory, MAX_PATH, ".");
     }
     std::string command = "\"" + std::string(exe) + "\" " + std::to_string(GetCurrentProcessId()) + " " +
                           std::to_string(limit_s + 10) + " \"" + directory + "\"";
