@@ -1,0 +1,11 @@
+--- a/lambdas.cpp
++++ b/lambdas.cpp
+@@ -8,7 +8,7 @@
+ 
+ void lambdas_init(int base)
+ {
+-    g_fn = [base](int x) { return x + base; };
++    g_fn = [base](int x) { return x + base * 10; };
+ }
+ 
+ int lambdas_value(int n)

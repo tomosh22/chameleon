@@ -270,6 +270,37 @@ PDB fails with `ERROR_USER_MAPPED_FILE`. **WP-12 must release the module's index
 a copy-in-memory mode) before anything relinks that module**, e.g. before hot-restart rebuilds.
 Patch PDBs are separate files and are unaffected.
 
+## ADR-0018 Review convergence policy
+
+**Date:** 2026-10-25 · **Status:** Accepted
+
+WP-11 needed six review rounds. Each high-effort review of the previous round's delta found
+new edge cases, several of them introduced by the fixes themselves. Policy from now on:
+1. The first review covers the whole PR at the required effort. Every finding with a realistic
+   path gets fixed.
+2. Later reviews cover only the fix delta and report only high-severity bugs: crash, UAF,
+   deadlock, hang, lost requests, security.
+3. When the same area keeps producing findings, the orchestrator stops issuing open-ended fix
+   lists. It makes the design decision itself (exact rules, invariants), sends that as the spec,
+   and merges on green CI. Remaining minor findings become tracked follow-ups (`PROGRESS.md`).
+4. Prefer reverting a fix that caused regressions over patching it again.
+
+## ADR-0019 Agent API contract details settled in WP-11
+
+**Date:** 2026-10-25 · **Status:** Accepted
+
+- `cml_destroy_agent` / `cml::DestroyAgent` return `cml_status`. Destroy is refused, with
+  `CML_STATUS_INVALID_ARGUMENT`, when it is called from inside another agent call on the same
+  thread, e.g. from work run in `SyncPoint()`. The ABI version stays at 2: no external
+  consumer existed before this merge.
+- `DestroyAgent` must not race with other calls on the same agent, except threads already
+  blocked in `WaitForRequest`. Those are released with CML5215 and destroy waits for them to
+  leave.
+- Only an explicit, successful `DisableModule` removes a module from the agent's enabled set.
+  Refused internal re-enables are retried after the next accepted module list.
+- Auto-started broker launches back off 1 s → 60 s; refused module-list resends back off
+  1 s → 30 s. Both back-offs reset once a module list is accepted.
+
 ## ADR-0020 WP-03 spike findings
 
 **Date:** 2026-10-25 · **Status:** Accepted (evidence: CI run 40162572353 of branch `wp/03-e2e-spike`, details in `docs/wp/WP-03.md`)
@@ -349,37 +380,6 @@ needs the 20-byte symbol form, not implemented).
 Not exercised: the "RIP inside the window, retry" path of the hook (one thread, the first attempt
 always succeeded), bigobj, non-trivial externals, unload on failure.
 
-## ADR-0018 Review convergence policy
-
-**Date:** 2026-10-25 · **Status:** Accepted
-
-WP-11 needed six review rounds. Each high-effort review of the previous round's delta found
-new edge cases, several of them introduced by the fixes themselves. Policy from now on:
-1. The first review covers the whole PR at the required effort. Every finding with a realistic
-   path gets fixed.
-2. Later reviews cover only the fix delta and report only high-severity bugs: crash, UAF,
-   deadlock, hang, lost requests, security.
-3. When the same area keeps producing findings, the orchestrator stops issuing open-ended fix
-   lists. It makes the design decision itself (exact rules, invariants), sends that as the spec,
-   and merges on green CI. Remaining minor findings become tracked follow-ups (`PROGRESS.md`).
-4. Prefer reverting a fix that caused regressions over patching it again.
-
-## ADR-0019 Agent API contract details settled in WP-11
-
-**Date:** 2026-10-25 · **Status:** Accepted
-
-- `cml_destroy_agent` / `cml::DestroyAgent` return `cml_status`. Destroy is refused, with
-  `CML_STATUS_INVALID_ARGUMENT`, when it is called from inside another agent call on the same
-  thread, e.g. from work run in `SyncPoint()`. The ABI version stays at 2: no external
-  consumer existed before this merge.
-- `DestroyAgent` must not race with other calls on the same agent, except threads already
-  blocked in `WaitForRequest`. Those are released with CML5215 and destroy waits for them to
-  leave.
-- Only an explicit, successful `DisableModule` removes a module from the agent's enabled set.
-  Refused internal re-enables are retried after the next accepted module list.
-- Auto-started broker launches back off 1 s → 60 s; refused module-list resends back off
-  1 s → 30 s. Both back-offs reset once a module list is accepted.
-
 ## ADR-0021 Control-pipe protocol for tests and IDEs (WP-13 defines, WP-12 implements)
 
 **Date:** 2026-10-25 · **Status:** Accepted
@@ -414,3 +414,58 @@ Skipped steps never count as passes. WP-12's acceptance switches CI to
 WP-03 drives fixture `basic` from outside (`VirtualAllocEx`, remote `LoadLibraryW` thread,
 `WriteProcessMemory`, external `SuspendThread`) as its "stub agent". WP-11's agent is not
 involved. This isolates the gate from agent bugs. Patching from inside the agent is WP-08 and WP-10.
+
+## ADR-0024 Section locators replace "anchor every section" (corrects plan §4.6)
+
+**Date:** 2026-10-25 · **Status:** Accepted · **Source:** WP-03 and WP-06 CI evidence
+
+Plan §4.6 adds a static `__cml_anchor_<n>` to every section. The evidence contradicts that:
+- **Static anchors are invisible.** Neither linker writes them to the PDB (WP-03, WP-06).
+- **External anchors break in discarded COMDATs.** They work in single-object links, but
+  lld-link fails with "undefined symbol" when it discards a COMDAT as a duplicate of another
+  object's copy. link.exe tolerates it.
+
+**Decision.** Each section gets a *locator*:
+- **Non-COMDAT section:** an external anchor `__cml_anchor_<tag>_<n>`. The tag is unique per
+  object within one link: a content hash plus the compiland index.
+- **COMDAT section:** its leader symbol, which is external and appears in the patch PDB as
+  `S_PUB32`. RVA of the section = leader RVA − leader value. A discarded duplicate resolves to
+  the kept copy, which is the correct retarget base.
+- **Associative section** (`.pdata`/`.xdata`): no locator. These never need retargeting to old
+  data; their relocations target patch-local functions or binding thunks.
+
+The retargeter (WP-07/09/12) computes `site_va` from the locator. A relocation needing
+retargeting inside a section without a locator is a CML33xx diagnostic. Section contributions
+from the patch PDB are a cross-check: lld-link matches all sections, and link.exe all except
+`.pdata`.
+
+## ADR-0025 Fix-up formula reads the in-place addend (corrects plan §4.6)
+
+**Date:** 2026-10-25 · **Status:** Accepted · **Source:** WP-03
+
+The plan's REL32 formula omits the addend stored at the relocation site. cl emits `REL32_1`
+with an addend of 0, while clang-cl emits plain `REL32` with an in-place addend of −1 for the
+same access. The retargeter therefore computes `target = S + A` (A read from the original
+object's section bytes at the site) and writes `target − (site + 4 + N)`. ADDR64 likewise adds
+the in-place 64-bit addend.
+
+## ADR-0026 Toolchain facts from WP-05
+
+**Date:** 2026-10-25 · **Status:** Accepted
+
+- **clang-cl replay:** the recorded cc1 command is replayed as `<clang> -cc1 <rewritten args>`.
+  This is option (a). Translating cc1 back to driver flags was lossy, so it was rejected.
+  Symbol sets match the original in clang 17.0.6, 18.1.8, 19.1.7 and 20.1.8. **The minimum
+  supported clang-cl is 17** (plan §13 Q3). Older versions are untested.
+- **cl PCH + `/Zi`:** forcing `/Z7` fails with C2855 against a `/Zi` PCH. Default mode
+  `KeepZiPrivatePdb` keeps `/Zi /Yu /Fp` and points `/Fd` at a private copy of the recorded
+  compiler PDB. This amends plan §4.4's "replace `/Zi` with `/Z7`" for PCH users.
+- **`/Gy` detection (plan §13 Q1):** in priority order, an explicit command-line flag, then
+  functions in COMDAT sections in the recorded object, then implied by other flags
+  (`/ZI`, `/O1`, `/O2`), then absent.
+- **`/hotpatch`:** the `S_COMPILE3` hotpatch bit is set for every x64 object, and cl ignores
+  `/hotpatch` on x64 (D9002). The flag fact therefore means "x64 entry is patchable", not
+  "option passed".
+- **MSVC STL vs older clang:** STL 14.44+ rejects clang < 19 (STL1000) unless
+  `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` is defined. This affects users on clang 17/18 with
+  current MSVC.

@@ -1,0 +1,11 @@
+--- a/statics.cpp
++++ b/statics.cpp
+@@ -28,7 +28,7 @@
+     static Guarded g(make_base());            // function-local static with a thread-safe guard
+     ++s_calls;
+     Accum::total += k_weights[s_calls % 3];
+-    return g.base;
++    return g.base * 10;
+ }
+ 
+ int statics_calls()

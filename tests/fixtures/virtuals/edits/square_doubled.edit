@@ -1,0 +1,11 @@
+--- a/shapes.cpp
++++ b/shapes.cpp
+@@ -6,7 +6,7 @@
+ 
+ int Square::area() const
+ {
+-    return side * side;
++    return side * side * 2;
+ }
+ 
+ int Rect::area() const

@@ -21,3 +21,7 @@ if(CMAKE_C_COMPILER_LOADED)
     add_subdirectory(c_only)
 endif()
 add_subdirectory(bigobj)
+# M1 fixtures (plan section 10, WP-12 acceptance), orchestrator-owned like `basic`.
+foreach(_cml_m1 statics virtuals templates lambdas new_function new_global)
+    add_subdirectory(${_cml_m1})
+endforeach()
