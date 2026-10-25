@@ -29,6 +29,7 @@ ThreadSet::~ThreadSet() {
     // lesser evil compared with leaving threads stopped for ever.
     resume_all();
     delete[] entries_;
+    delete[] slots_;
 }
 
 bool ThreadSet::init(std::size_t capacity) {
@@ -39,8 +40,19 @@ bool ThreadSet::init(std::size_t capacity) {
         delete[] entries_;
         entries_ = new Entry[capacity];
         capacity_ = capacity;
+        delete[] slots_;
+        slot_count_ = 16;
+        while (slot_count_ < capacity * 2) {
+            slot_count_ *= 2;
+        }
+        slots_ = new DWORD[slot_count_]();
     }
     count_ = 0;
+    timed_out_ = false;
+    checks_ = 0;
+    for (std::size_t i = 0; i < slot_count_; ++i) {
+        slots_[i] = 0;
+    }
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (ntdll == nullptr) {
         return false;
@@ -50,13 +62,37 @@ bool ThreadSet::init(std::size_t capacity) {
     return get_next_thread_ != nullptr;
 }
 
+// The ids of the entries live in a pre-sized open-addressing table (load factor <= 1/2, linear
+// probing), so that a pass over N threads costs O(N), not O(N^2). Thread ids are never 0.
 bool ThreadSet::known(DWORD id) const noexcept {
-    for (std::size_t i = 0; i < count_; ++i) {
-        if (entries_[i].id == id) {
+    const std::size_t mask = slot_count_ - 1;
+    for (std::size_t i = (static_cast<std::size_t>(id) * 2654435761u) & mask; slots_[i] != 0; i = (i + 1) & mask) {
+        if (slots_[i] == id) {
             return true;
         }
     }
     return false;
+}
+
+void ThreadSet::remember(DWORD id) noexcept {
+    const std::size_t mask = slot_count_ - 1;
+    std::size_t i = (static_cast<std::size_t>(id) * 2654435761u) & mask;
+    while (slots_[i] != 0) {
+        i = (i + 1) & mask;
+    }
+    slots_[i] = id;
+}
+
+bool ThreadSet::expired() noexcept {
+    if (timed_out_) {
+        return true;
+    }
+    if (expire_after_checks_ != 0 && ++checks_ > expire_after_checks_) {
+        timed_out_ = true;
+    } else if (GetTickCount64() > deadline_) {
+        timed_out_ = true;
+    }
+    return timed_out_;
 }
 
 // True when the thread has finished or is being torn down: it will not run user code again, so its
@@ -79,7 +115,13 @@ bool ThreadSet::exited(HANDLE thread) const noexcept {
 bool ThreadSet::suspend_only(std::size_t index) noexcept {
     Entry& e = entries_[index];
     unsigned tries = 0;
-    while (SuspendThread(e.handle) == static_cast<DWORD>(-1)) {
+    for (;;) {
+        if (expired()) {
+            return false;
+        }
+        if (SuspendThread(e.handle) != static_cast<DWORD>(-1)) {
+            break;
+        }
         failed_error_ = GetLastError();
         if (exited(e.handle)) {
             return true;
@@ -101,7 +143,13 @@ bool ThreadSet::capture_context(std::size_t index) noexcept {
     // RIP read here is the one the thread will resume from.
     CONTEXT context;
     context.ContextFlags = CONTEXT_CONTROL;
-    for (unsigned tries = 0; GetThreadContext(e.handle, &context) == 0;) {
+    for (unsigned tries = 0;;) {
+        if (expired()) {
+            return false;
+        }
+        if (GetThreadContext(e.handle, &context) != 0) {
+            break;
+        }
         failed_error_ = GetLastError();
         if (exited(e.handle)) {
             e.rip = 0;
@@ -140,11 +188,17 @@ ThreadSet::Result ThreadSet::enumerate_pass(std::size_t* fresh) noexcept {
     // Two guards keep a kernel that behaves differently (an exited thread that is no longer listed)
     // from turning this into an endless loop: a step budget, and a check that the kernel did not
     // hand back the thread we came from. Either ends the pass with NotConverging.
-    const std::size_t step_limit = capacity_ * 2 + 256;
+    const std::size_t step_limit = step_limit_override_ != 0 ? step_limit_override_ : capacity_ * 2 + 256;
     HANDLE previous = nullptr;
     bool previous_is_temporary = false;
     DWORD previous_id = 0;
     for (std::size_t step = 0; step < step_limit; ++step) {
+        if (expired()) {
+            if (previous_is_temporary && previous != nullptr) {
+                CloseHandle(previous);
+            }
+            return Result::Timeout;
+        }
         HANDLE next = nullptr;
         const LONG status = get_next_thread_(process, previous, kThreadAccess, 0, 0, &next);
         if (previous_is_temporary && previous != nullptr) {
@@ -187,13 +241,20 @@ ThreadSet::Result ThreadSet::enumerate_pass(std::size_t* fresh) noexcept {
         entries_[index].rip = 0;
         entries_[index].suspended = false;
         entries_[index].rip_valid = false;
+        remember(id);
         ++*fresh;
         if (!suspend_only(index)) {
             failed_thread_id_ = id;
-            return Result::SuspendFailed;  // the handle stays in the set; resume_all() releases it
+            // The handle stays in the set; resume_all() releases it.
+            return timed_out_ ? Result::Timeout : Result::SuspendFailed;
         }
         previous = next;
         previous_id = id;
+    }
+    // Step budget used up. `previous` is the handle of the last thread visited; it is only owned
+    // here when it was a temporary one (a thread already in the set owns its own handle).
+    if (previous_is_temporary && previous != nullptr) {
+        CloseHandle(previous);
     }
     return Result::NotConverging;
 }
@@ -207,8 +268,9 @@ ThreadSet::Result ThreadSet::suspend_all(ULONGLONG deadline_tick, unsigned max_p
     failed_thread_id_ = 0;
     failed_error_ = 0;
     passes_ = 0;
+    deadline_ = deadline_tick;
     for (unsigned pass = 0; pass < max_passes; ++pass) {
-        if (GetTickCount64() > deadline_tick) {
+        if (expired()) {
             return Result::Timeout;
         }
         std::size_t fresh = 0;
@@ -218,7 +280,7 @@ ThreadSet::Result ThreadSet::suspend_all(ULONGLONG deadline_tick, unsigned max_p
             return r;
         }
         if (!capture_all()) {
-            return Result::SuspendFailed;
+            return timed_out_ ? Result::Timeout : Result::SuspendFailed;
         }
         if (pass < fake_new_passes) {
             ++fresh;
@@ -256,6 +318,11 @@ void ThreadSet::resume_all() noexcept {
         }
     }
     count_ = 0;
+    for (std::size_t i = 0; i < slot_count_; ++i) {
+        slots_[i] = 0;
+    }
+    timed_out_ = false;
+    checks_ = 0;
 }
 
 }  // namespace cml::agent::hook

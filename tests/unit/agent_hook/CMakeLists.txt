@@ -17,13 +17,18 @@ cml_add_unit_test(agent_hook
     LIBS cml_agent_core)
 
 if(WIN32)
-    target_sources(cml_test_agent_hook PRIVATE test_installer.cpp test_dispatch.cpp)
+    # agent/src/operator_new.cpp is what cml_agent.dll links: with it in the test executables every
+    # `new` goes through the agent's heap, so heap::set_alloc_forbidden() is really exercised (see
+    # alloc_guard.h).
+    set(CML_AGENT_OPERATOR_NEW "${PROJECT_SOURCE_DIR}/agent/src/operator_new.cpp")
+    target_sources(cml_test_agent_hook PRIVATE test_installer.cpp test_hardening.cpp test_dispatch.cpp
+                                               ${CML_AGENT_OPERATOR_NEW})
     target_include_directories(cml_test_agent_hook PRIVATE "${PROJECT_SOURCE_DIR}/agent/include")
     # Test functions are located by address: no incremental-link thunks, no identical-code folding.
     target_link_options(cml_test_agent_hook PRIVATE /INCREMENTAL:NO /OPT:NOICF)
     set_tests_properties(unit.agent_hook PROPERTIES TIMEOUT 300)
 
-    cml_add_unit_test(agent_hook_stress SOURCES test_stress.cpp LIBS cml_agent_core)
+    cml_add_unit_test(agent_hook_stress SOURCES test_stress.cpp ${CML_AGENT_OPERATOR_NEW} LIBS cml_agent_core)
     target_link_options(cml_test_agent_hook_stress PRIVATE /INCREMENTAL:NO /OPT:NOICF)
     file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/test_work/agent_hook")
     target_compile_definitions(cml_test_agent_hook_stress PRIVATE

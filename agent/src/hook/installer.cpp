@@ -227,6 +227,20 @@ bool bytes_equal(const std::uint8_t* address, const std::uint8_t* expected, std:
     return true;
 }
 
+// Lets the offender run for about `microseconds` (it is the only thread that does). Yields so that
+// it can be scheduled even on one processor; reads the performance counter, which is a plain
+// register / shared-page read.
+void let_run(unsigned microseconds) noexcept {
+    LARGE_INTEGER frequency, start, now;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&start);
+    const long long wanted = frequency.QuadPart * static_cast<long long>(microseconds) / 1000000;
+    do {
+        SwitchToThread();
+        QueryPerformanceCounter(&now);
+    } while (now.QuadPart - start.QuadPart < wanted);
+}
+
 std::uint32_t diag_for(ThreadSet::Result result) noexcept {
     switch (result) {
         case ThreadSet::Result::Ok: return 0;
@@ -389,6 +403,7 @@ void Installer::attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, 
     const ULONGLONG started = GetTickCount64();
     const ULONGLONG deadline = started + options_.window_budget_ms;
 
+    threads_.set_test_knobs(options_.test_expire_after_checks, options_.test_step_limit);
     ThreadSet::Result stopped = threads_.suspend_all(deadline, options_.max_passes, options_.test_fake_new_thread_passes);
     report->passes = std::max(report->passes, threads_.passes());
     unsigned steps = 0;
@@ -439,7 +454,12 @@ void Installer::attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, 
         report->job = static_cast<std::uint32_t>(job_index);
         report->thread_id = threads_.entry(thread_index).id;
         report->rip = threads_.entry(thread_index).rip;
-        if (steps >= options_.steps_per_attempt || GetTickCount64() > deadline) {
+        if (threads_.expired()) {
+            // The budget is spent: not "a thread would not leave" (CML4305) but "took too long" (CML4309).
+            stopped = ThreadSet::Result::Timeout;
+            break;
+        }
+        if (steps >= options_.steps_per_attempt) {
             report->retry = true;
             break;
         }
@@ -465,16 +485,20 @@ void Installer::attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, 
         for (std::size_t i = 0; i < offender_count; ++i) {
             threads_.resume_one(offenders[i]);
         }
-        SwitchToThread();
+        let_run(options_.offender_run_us);
         for (std::size_t i = 0; i < offender_count; ++i) {
             if (!threads_.suspend_one(offenders[i])) {
-                report->diag = ids::kSuspendFailed;
+                if (threads_.timed_out()) {
+                    stopped = ThreadSet::Result::Timeout;
+                } else {
+                    report->diag = ids::kSuspendFailed;
+                }
                 report->thread_id = threads_.entry(offenders[i]).id;
                 report->error = threads_.failed_error();
                 break;
             }
         }
-        if (report->diag != 0) {
+        if (report->diag != 0 || stopped != ThreadSet::Result::Ok) {
             break;
         }
         // The offenders may have started threads of their own.
@@ -662,7 +686,12 @@ BatchResult Installer::apply(bool reverting, const HookRequest* requests, std::s
         }
         std::size_t at_len = 0;
         read_code(request.target, at, kLookAhead, &at_len);  // a partial read still tells how much is readable
-        const HookPlan plan = plan_hook(before, before_len, at, at_len);
+        PlanEnvironment environment;
+        environment.entry_two_byte_aligned = (target & 1) == 0;
+        // Only worth a VirtualQuery when the bytes say the padding is there at all.
+        environment.padding_executable = before_len < kMinPadding || (is_code(reinterpret_cast<const void*>(target - kMinPadding)) &&
+                                                                      is_code(reinterpret_cast<const void*>(target - 1)));
+        const HookPlan plan = plan_hook(before, before_len, at, at_len, environment);
         if (plan.strategy == Strategy::None) {
             failure.code = plan.diag;
             failure.offset = plan.fail_offset;

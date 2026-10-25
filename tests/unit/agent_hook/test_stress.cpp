@@ -25,6 +25,7 @@
 #include <thread>
 #include <vector>
 
+#include "alloc_guard.h"
 #include "crash_report.h"
 #include "doctest.h"
 #include "hook/diag_ids.h"

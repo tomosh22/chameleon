@@ -30,6 +30,10 @@ diagnostic is planned, not live.
 
 - Functions currently executing on a thread's stack keep running old code until they return;
   the next call runs the new code.
+- Hook installation (WP-10) cannot see a thread whose real resume point is inside the bytes being
+  overwritten when its RIP is in ntdll's exception / APC / callback dispatcher at the moment it is
+  stopped (the interrupted RIP is in a context record on its stack, which is not examined). In
+  practice no compiler makes the first bytes of a function such a resume point.
 - x86 (32-bit), ARM64, Linux and macOS targets are out of scope for v1 (CML1106 for modules;
   CML1303 when the PE reader sees a PE32 image).
 - Modules loaded or unloaded by the host are noticed by the agent within about 500 ms

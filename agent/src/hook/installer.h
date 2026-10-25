@@ -86,6 +86,7 @@ struct BatchResult {
 struct InstallerOptions {
     unsigned max_attempts = 50;        // times the world may be stopped for one batch (plan: retry max 50)
     unsigned steps_per_attempt = 3;    // times per stop that only the offender runs before everything is resumed
+    unsigned offender_run_us = 1000;   // how long the offender runs alone in each such step
     unsigned window_budget_ms = 2000;  // longest the world may stay stopped in one attempt
     unsigned max_passes = 16;          // enumeration passes before "threads keep appearing"
     std::size_t max_threads = 4096;    // capacity of the pre-sized thread table
@@ -95,6 +96,10 @@ struct InstallerOptions {
     // report a new thread. `test_in_window`: called with the world stopped, immediately before the
     // bytes are written; it must not allocate or take locks.
     unsigned test_fake_new_thread_passes = 0;
+    // Tests only: the deadline is reported as passed at the n+1-th check inside the passes (0 = off);
+    // and the enumeration step budget (0 = default). See ThreadSet::set_test_knobs.
+    unsigned test_expire_after_checks = 0;
+    std::size_t test_step_limit = 0;
     void (*test_in_window)(void* context) = nullptr;
     void* test_context = nullptr;
 };

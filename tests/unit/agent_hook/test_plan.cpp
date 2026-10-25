@@ -258,6 +258,36 @@ TEST_CASE("encode_jmp_rel32 writes E9 and a little-endian displacement relative 
     CHECK_FALSE(encode_jmp_rel32(out, 0x140000000ull, 0x7FF600000000ull));
 }
 
+TEST_CASE("strategy 1 needs a 2-byte aligned entry and executable padding; otherwise strategy 2") {
+    const Bytes before = pad(8);
+    PlanEnvironment env;
+    SUBCASE("defaults (even entry, executable padding): strategy 1") {
+        CHECK(plan_hook(before.data(), before.size(), kClReleaseEntry.data(), kClReleaseEntry.size(), env).strategy ==
+              Strategy::PaddingTwoByte);
+    }
+    SUBCASE("an odd entry falls back to the 5-byte strategy") {
+        env.entry_two_byte_aligned = false;
+        const HookPlan p = plan_hook(before.data(), before.size(), kClReleaseEntry.data(), kClReleaseEntry.size(), env);
+        REQUIRE(p.strategy == Strategy::FiveByte);
+        CHECK(p.entry_write_len == 5);
+        CHECK(p.padding_write_len == 0);
+        CHECK(p.window_before == 0);
+    }
+    SUBCASE("padding that is not executable falls back to the 5-byte strategy") {
+        env.padding_executable = false;
+        const HookPlan p = plan_hook(before.data(), before.size(), kClReleaseEntry.data(), kClReleaseEntry.size(), env);
+        REQUIRE(p.strategy == Strategy::FiveByte);
+        CHECK(p.padding_write_len == 0);
+    }
+    SUBCASE("the fallback still refuses what strategy 2 refuses") {
+        env.entry_two_byte_aligned = false;
+        const Bytes call_first = {0xFF, 0xD0, 0x48, 0x83, 0xEC, 0x28, 0xC3};  // call rax ; sub rsp,28h ; ret
+        const HookPlan p = plan_hook(before.data(), before.size(), call_first.data(), call_first.size(), env);
+        CHECK(p.strategy == Strategy::None);
+        CHECK(p.diag == ids::kCallInWindow);
+    }
+}
+
 TEST_CASE("to_string names the strategies") {
     CHECK(std::string(to_string(Strategy::PaddingTwoByte)) == "padding+2-byte");
     CHECK(std::string(to_string(Strategy::FiveByte)) == "5-byte");

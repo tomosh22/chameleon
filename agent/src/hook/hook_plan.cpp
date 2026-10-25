@@ -49,8 +49,8 @@ std::uint32_t diag_for(DecodeStatus status) noexcept {
 
 }  // namespace
 
-HookPlan plan_hook(const std::uint8_t* before, std::size_t before_len, const std::uint8_t* at,
-                   std::size_t at_len) noexcept {
+HookPlan plan_hook(const std::uint8_t* before, std::size_t before_len, const std::uint8_t* at, std::size_t at_len,
+                   const PlanEnvironment& environment) noexcept {
     if (at == nullptr || at_len == 0) {
         return fail(ids::kCodeUnreadable, at, 0, 0);
     }
@@ -60,8 +60,10 @@ HookPlan plan_hook(const std::uint8_t* before, std::size_t before_len, const std
         return fail(diag_for(first.status), at, at_len, 0);
     }
 
-    // Strategy 1: padding in front, first instruction at least as long as the 2-byte jump.
-    bool padded = before != nullptr && before_len >= kMinPadding;
+    // Strategy 1: padding in front, first instruction at least as long as the 2-byte jump, an even
+    // entry and executable padding. Anything else falls back to strategy 2.
+    bool padded = environment.entry_two_byte_aligned && environment.padding_executable && before != nullptr &&
+                  before_len >= kMinPadding;
     for (std::size_t i = 0; padded && i < kMinPadding; ++i) {
         padded = is_padding_byte(before[before_len - 1 - i]);
     }

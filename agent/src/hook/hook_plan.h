@@ -3,8 +3,10 @@
 // Choosing how to hook a function (plan section 4.8, ADR-0020 items 4 and 5). Portable: it works on
 // copies of the bytes around the entry, so it is unit-tested on any host.
 //
-// Strategy 1, PaddingTwoByte. At least 6 bytes of 0xCC / 0x90 precede the entry and the first
-//   instruction is at least 2 bytes long. `jmp rel32` goes into the padding (the 5 bytes just
+// Strategy 1, PaddingTwoByte. At least 6 bytes of 0xCC / 0x90 precede the entry, the first
+//   instruction is at least 2 bytes long, the entry is 2-byte aligned (so that the 16-bit exchange
+//   never straddles a cache line) and the padding lies in executable memory (a jump written into a
+//   data page would land on bytes the CPU cannot run). `jmp rel32` goes into the padding (the 5 bytes just
 //   before the entry), then the 2 bytes at the entry become `EB F9` (`jmp -7`, which lands on the
 //   padding jump). The entry write is one aligned-or-not 16-bit interlocked exchange, so a thread
 //   that is not suspended sees the old or the new instruction, never half of one.
@@ -60,11 +62,18 @@ struct HookPlan {
     bool short_function = false;
 };
 
+// Facts about the addresses that the byte copies do not show. The defaults suit the unit tests of
+// the portable planner; the installer fills both in from the real address and VirtualQuery.
+struct PlanEnvironment {
+    bool entry_two_byte_aligned = true;  // the entry address is even
+    bool padding_executable = true;      // the 6 bytes before the entry are committed, executable memory
+};
+
 // `before` holds the `before_len` (<= kLookBehind) bytes immediately preceding the entry, so
 // before[before_len - 1] is the byte at entry - 1; `at` holds the `at_len` (<= kLookAhead, at least
 // the readable part) bytes from the entry on.
-HookPlan plan_hook(const std::uint8_t* before, std::size_t before_len, const std::uint8_t* at,
-                   std::size_t at_len) noexcept;
+HookPlan plan_hook(const std::uint8_t* before, std::size_t before_len, const std::uint8_t* at, std::size_t at_len,
+                   const PlanEnvironment& environment = {}) noexcept;
 
 // E9 rel32 placed at address `site` jumping to `target`. False when the displacement does not fit
 // in 32 bits (the target is more than 2 GB away).

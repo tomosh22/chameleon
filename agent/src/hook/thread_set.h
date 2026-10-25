@@ -25,6 +25,12 @@
 // contexts. A thread whose suspension is queued can still run until its context has been read, so
 // "no new thread" is only concluded from a pass that follows a completed context read.
 //
+// Budget: the deadline is checked inside the passes (before every enumeration step, before every
+// SuspendThread / GetThreadContext attempt and between their retries), not only between passes. On
+// expiry the call returns Timeout at once and the caller resumes everything. The one call that
+// cannot be bounded is GetThreadContext itself: it returns when the target has really stopped,
+// which the kernel does not let a caller abandon (docs/wp/WP-10.md, "The one unbounded call").
+//
 // Convergence: suspend_all() repeats the enumeration until a complete pass finds no thread it has
 // not already suspended. A thread that appears after the last pass can still start running; the
 // installer's write is built so that is survivable (see installer.h), and the bounded number of
@@ -78,12 +84,28 @@ public:
     const Entry& entry(std::size_t index) const noexcept { return entries_[index]; }
     unsigned passes() const noexcept { return passes_; }
 
-    // Lets one thread run (it stays in the set) / stops it again and refreshes its RIP.
+    // Lets one thread run (it stays in the set) / stops it again and refreshes its RIP. suspend_one
+    // returns false on failure; timed_out() tells a missed deadline from a real failure.
     void resume_one(std::size_t index) noexcept;
     bool suspend_one(std::size_t index) noexcept;
 
+    // True once the deadline given to suspend_all() has passed (checked inside every pass, per
+    // thread and per retry; see expired()). Cleared by resume_all().
+    bool timed_out() const noexcept { return timed_out_; }
+    // Checks the deadline now. Window-safe (reads the shared user data page).
+    bool expired() noexcept;
+
     // Resumes every suspended thread and releases all handles; the set is empty afterwards.
     void resume_all() noexcept;
+
+    // Tests only. `expire_after_checks`: the deadline is reported as passed at the n+1-th deadline
+    // check (0 = off), which makes "the budget ran out in the middle of a pass" deterministic.
+    // `step_limit`: replaces the per-pass step budget of the enumeration (0 = default), which
+    // makes the step-limit exit reachable. Both persist until set again.
+    void set_test_knobs(unsigned expire_after_checks, std::size_t step_limit) noexcept {
+        expire_after_checks_ = expire_after_checks;
+        step_limit_override_ = step_limit;
+    }
 
     // Details of the last failure, for the diagnostic.
     DWORD failed_thread_id() const noexcept { return failed_thread_id_; }
@@ -94,7 +116,8 @@ private:
                                            ULONG flags, PHANDLE new_thread);
 
     Result enumerate_pass(std::size_t* fresh) noexcept;
-    bool known(DWORD id) const noexcept;
+    bool known(DWORD id) const noexcept;       // open-addressing lookup, O(1)
+    void remember(DWORD id) noexcept;
     bool suspend_only(std::size_t index) noexcept;       // SuspendThread; the thread may still run a little
     bool capture_context(std::size_t index) noexcept;    // GetThreadContext: returns once it has really stopped
     bool suspend_entry(std::size_t index) noexcept;      // both, one thread
@@ -102,6 +125,8 @@ private:
     bool exited(HANDLE thread) const noexcept;
 
     Entry* entries_ = nullptr;
+    DWORD* slots_ = nullptr;  // open-addressing set of the ids in entries_ (0 = empty), a power of two long
+    std::size_t slot_count_ = 0;
     std::size_t capacity_ = 0;
     std::size_t count_ = 0;
     unsigned passes_ = 0;
@@ -109,6 +134,11 @@ private:
     DWORD failed_thread_id_ = 0;
     DWORD failed_error_ = 0;
     NtGetNextThreadFn get_next_thread_ = nullptr;
+    ULONGLONG deadline_ = 0;
+    bool timed_out_ = false;
+    unsigned expire_after_checks_ = 0;
+    unsigned checks_ = 0;
+    std::size_t step_limit_override_ = 0;
 };
 
 }  // namespace cml::agent::hook

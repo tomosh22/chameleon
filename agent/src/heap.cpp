@@ -16,6 +16,8 @@ namespace {
 // Constant-initialised, so safe to use from operator new before any dynamic initialisation ran.
 std::atomic<HANDLE> g_heap{nullptr};
 std::atomic<bool> g_forbidden{false};
+std::atomic<DWORD> g_forbidden_thread{0};
+std::atomic<ViolationHook> g_violation_hook{nullptr};
 std::atomic<std::size_t> g_live_blocks{0};
 
 constexpr std::size_t kNaturalAlignment = 16;  // what HeapAlloc guarantees on x64
@@ -40,6 +42,11 @@ HANDLE heap_handle() noexcept {
 
 void check_allowed() noexcept {
     if (g_forbidden.load(std::memory_order_relaxed)) {
+        const ViolationHook hook = g_violation_hook.load(std::memory_order_relaxed);
+        if (hook != nullptr) {
+            hook();
+            return;
+        }
         fail_fast("cml_agent: heap use while allocation is forbidden (host threads are suspended)");
     }
 }
@@ -110,7 +117,16 @@ void release_aligned(void* block, std::size_t alignment) noexcept {
 }
 
 void set_alloc_forbidden(bool forbidden) noexcept {
+    g_forbidden_thread.store(forbidden ? GetCurrentThreadId() : 0, std::memory_order_relaxed);
     g_forbidden.store(forbidden, std::memory_order_relaxed);
+}
+
+unsigned long alloc_forbidden_thread() noexcept {
+    return g_forbidden.load(std::memory_order_relaxed) ? g_forbidden_thread.load(std::memory_order_relaxed) : 0;
+}
+
+void set_violation_hook_for_test(ViolationHook hook) noexcept {
+    g_violation_hook.store(hook, std::memory_order_relaxed);
 }
 
 bool alloc_forbidden() noexcept {
