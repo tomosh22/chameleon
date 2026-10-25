@@ -127,6 +127,20 @@ jobs:
             Write-Host "no WP-06 evidence file (unit.coff_link did not run)"
           }
 
+      # WP-09: linker detection, the LINK lines of every fixture under both linkers, link times and the
+      # /IGNORE evidence (written by unit.link_patch). docs/wp/WP-09.md quotes these lines.
+      - name: WP-09 link evidence (linker driver)
+        if: always()
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          $e = "$env:BUILD_DIR/test_work/link_patch/evidence.txt"
+          if (Test-Path $e) {
+            Copy-Item $e "$env:LOG_DIR/wp09-evidence.txt"
+            Get-Content $e
+          } else {
+            Write-Host "no WP-09 evidence file (unit.link_patch did not run)"
+          }
+
       # WP-05: what the toolchain library makes of the fixtures built by this cell: recorded commands
       # (the real command lines the unit corpus is checked against), rewrites, build-flag facts, the
       # recompile check against the original objects, and every PCH strategy (/Zi + /Yu question).
@@ -267,6 +281,11 @@ jobs:
         run: |
           $e = "build-vs/test_work/coff_link/evidence.txt"
           if (Test-Path $e) { Get-Content $e } else { Write-Host "no WP-06 evidence file" }
+      - name: WP-09 link evidence (linker driver)
+        if: always()
+        run: |
+          $e = "build-vs/test_work/link_patch/evidence.txt"
+          if (Test-Path $e) { Get-Content $e } else { Write-Host "no WP-09 evidence file" }
       - name: Upload hang dumps
         if: failure()
         uses: actions/upload-artifact@v4

@@ -8,9 +8,10 @@ set(_cml_toolchain_sources
     src/tool_info.cpp
     src/build_flags.cpp
     src/symbol_set.cpp
-    src/invoke_common.cpp)
+    src/invoke_common.cpp
+    src/link_patch.cpp)
 if(WIN32)
-    list(APPEND _cml_toolchain_sources src/process_win.cpp src/compile_win.cpp)
+    list(APPEND _cml_toolchain_sources src/process_win.cpp src/compile_win.cpp src/link_win.cpp)
 endif()
 
 cml_add_core_library(cml_toolchain
