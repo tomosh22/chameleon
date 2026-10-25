@@ -1,6 +1,5 @@
 // CreateProcess with captured output, job-object cancellation, timeouts and @response files.
 #include <windows.h>
-#include <tlhelp32.h>
 
 #include <algorithm>
 #include <atomic>
@@ -8,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #include "cml/toolchain/command_line.h"
 #include "cml/toolchain/diag_ids.h"
@@ -92,48 +92,49 @@ std::wstring build_environment_block(const std::vector<std::pair<std::string, st
     return block;
 }
 
-// The tree below `root` (children, grandchildren, ...) from a Toolhelp snapshot, without the shared PDB server.
-std::vector<DWORD> descendants_of(DWORD root) {
-    std::vector<DWORD> found;
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) {
-        return found;
+// True for the shared PDB server (matched by image name, case-insensitive).
+bool is_pdb_server(HANDLE process) {
+    wchar_t buf[MAX_PATH * 2];
+    DWORD len = static_cast<DWORD>(sizeof(buf) / sizeof(buf[0]));
+    if (!QueryFullProcessImageNameW(process, 0, buf, &len)) {
+        return true;  // cannot tell what it is: do not kill it
     }
-    std::vector<std::pair<DWORD, DWORD>> all;  // pid, parent
-    std::vector<std::wstring> names;
-    PROCESSENTRY32W e{};
-    e.dwSize = sizeof(e);
-    for (BOOL ok = Process32FirstW(snap, &e); ok; ok = Process32NextW(snap, &e)) {
-        all.emplace_back(e.th32ProcessID, e.th32ParentProcessID);
-        names.emplace_back(e.szExeFile);
-    }
-    CloseHandle(snap);
-    std::vector<DWORD> frontier{root};
-    while (!frontier.empty()) {
-        const DWORD parent = frontier.back();
-        frontier.pop_back();
-        for (std::size_t i = 0; i < all.size(); ++i) {
-            if (all[i].second != parent || all[i].first == root) {
-                continue;
-            }
-            if (_wcsicmp(names[i].c_str(), L"mspdbsrv.exe") == 0) {
-                continue;  // shared by other compiles: never ours to kill, and nothing below it is ours either
-            }
-            found.push_back(all[i].first);
-            frontier.push_back(all[i].first);
+    const wchar_t* base = buf;
+    for (const wchar_t* c = buf; *c != L'\0'; ++c) {
+        if (*c == L'\\' || *c == L'/') {
+            base = c + 1;
         }
     }
-    return found;
+    return _wcsicmp(base, L"mspdbsrv.exe") == 0;
+}
+
+// Process ids currently inside `job` (empty when the query fails). `buffer` is allocated once by the caller.
+std::vector<DWORD> job_process_ids(HANDLE job, std::vector<char>& buffer) {
+    auto* list = reinterpret_cast<JOBOBJECT_BASIC_PROCESS_ID_LIST*>(buffer.data());
+    std::vector<DWORD> ids;
+    if (QueryInformationJobObject(job, JobObjectBasicProcessIdList, list, static_cast<DWORD>(buffer.size()), nullptr)) {
+        for (DWORD i = 0; i < list->NumberOfProcessIdsInList; ++i) {
+            ids.push_back(static_cast<DWORD>(list->ProcessIdList[i]));
+        }
+    }
+    return ids;
 }
 
 // State shared between the running process and the cancellation / timeout killers.
 //
-// Why the job object is created with JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK: cl /Zi starts mspdbsrv.exe, a PDB server
-// that other, concurrent compiles use. Processes created by a process in the job would otherwise join the job and
-// die with it on TerminateJobObject, taking the other compile's PDB server down (their /Zi compiles then fail). With
-// silent breakaway the compiler's children are outside the job. The price is that the job holds only the compiler
-// driver, so kill() also walks the process tree itself (Toolhelp snapshot taken BEFORE anything is terminated) and
-// terminates every descendant except mspdbsrv.exe.
+// Rule: cancellation kills ONLY processes that are inside OUR job object, and NEVER mspdbsrv.exe. The tree is never
+// found by walking parent process ids (mspdbsrv.exe is started by whichever cl /Zi needs it first, so its parent pid
+// is often a compiler that is being cancelled, and parent pids are also stale after pid reuse).
+//
+// The job has JOB_OBJECT_LIMIT_BREAKAWAY_OK (no silent breakaway, no KILL_ON_JOB_CLOSE), so the compiler's helper
+// processes (c1xx, link, ...) join the job. kill() first terminates the driver (so it cannot start a new stage while
+// helpers are being killed; helpers stay in the job after their parent dies), then makes up to 4 passes over the job
+// (JobObjectBasicProcessIdList): each listed process is opened, checked with IsProcessInJob (a pid that was reused by
+// an unrelated process is skipped), skipped when it is mspdbsrv.exe (image name), and terminated otherwise. Between
+// passes it waits up to 200 ms in total for the processes terminated in the previous pass, then queries again; it
+// stops when a pass terminates nothing. TerminateJobObject is never used: it would also kill the shared PDB server,
+// which other concurrent /Zi compiles use. Closing the job handle leaves mspdbsrv.exe running. Without a job
+// (assignment failed) only the driver is killed.
 struct Killable {
     std::mutex mutex;
     HANDLE job = nullptr;
@@ -152,18 +153,43 @@ struct Killable {
             return false;  // exited on its own just now: not a cancellation
         }
         killed = true;
-        const std::vector<DWORD> tree = descendants_of(pid);
-        for (const DWORD child : tree) {
-            if (HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, child)) {
-                TerminateProcess(h, 1);
-                CloseHandle(h);
-            }
+        if (process != nullptr) {
+            TerminateProcess(process, 1);  // the driver first: it must not spawn another stage
         }
         if (job != nullptr) {
-            TerminateJobObject(job, 1);
-        }
-        if (process != nullptr) {
-            TerminateProcess(process, 1);
+            constexpr DWORD kMaxIds = 4096;
+            std::vector<char> buffer(sizeof(JOBOBJECT_BASIC_PROCESS_ID_LIST) + kMaxIds * sizeof(ULONG_PTR));
+            const ULONGLONG deadline = GetTickCount64() + 200;  // shared wait budget for all passes
+            std::vector<HANDLE> terminated;
+            for (int pass = 0; pass < 4; ++pass) {
+                for (const DWORD id : job_process_ids(job, buffer)) {
+                    if (id == pid) {
+                        continue;
+                    }
+                    HANDLE h = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, id);
+                    if (h == nullptr) {
+                        continue;
+                    }
+                    BOOL in_job = FALSE;
+                    if (IsProcessInJob(h, job, &in_job) && in_job && !is_pdb_server(h) &&
+                        WaitForSingleObject(h, 0) != WAIT_OBJECT_0) {
+                        TerminateProcess(h, 1);
+                        terminated.push_back(h);  // closed below
+                    } else {
+                        CloseHandle(h);
+                    }
+                }
+                const bool any = !terminated.empty();
+                for (HANDLE h : terminated) {
+                    const ULONGLONG now = GetTickCount64();
+                    WaitForSingleObject(h, now < deadline ? static_cast<DWORD>(deadline - now) : 0);
+                    CloseHandle(h);
+                }
+                terminated.clear();
+                if (!any) {
+                    break;
+                }
+            }
         }
         return true;
     }
@@ -330,8 +356,8 @@ Result<ProcessResult> run_process(const ProcessSpec& spec, CancelToken* cancel) 
     job.h = CreateJobObjectW(nullptr, nullptr);
     if (job.h != nullptr) {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-        // See Killable: silent breakaway keeps the shared mspdbsrv.exe out of the job; no KILL_ON_JOB_CLOSE.
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
+        // See Killable: no silent breakaway, no KILL_ON_JOB_CLOSE; the job is only used to enumerate our processes.
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
         SetInformationJobObject(job.h, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
         if (!AssignProcessToJobObject(job.h, pi.hProcess)) {
             CML_LOG(Debug, "toolchain: AssignProcessToJobObject failed (%lu); cancelling will kill the main process only",
