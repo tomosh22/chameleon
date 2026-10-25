@@ -59,7 +59,11 @@ TEST_CASE("base_identifier and enclosing_function") {
     CHECK(base_identifier("?g@?1??statics_value@@YAHXZ@4UGuarded@@A") == "g");
     CHECK(base_identifier("??$offset@H@@YAHH@Z") == "offset");
     CHECK(base_identifier("?$TSS0@?1??statics_value@@YAHXZ@4HA") == "$TSS0");
-    CHECK(base_identifier("??0Square@@QEAA@H@Z").empty());
+    CHECK(base_identifier("??0Square@@QEAA@H@Z") == "Square");
+    CHECK(base_identifier("??1Square@@UEAA@XZ") == "~Square");
+    CHECK(base_identifier("??0?$Box@H@ns@@QEAA@XZ") == "Box");
+    CHECK(base_identifier("??R<lambda_0>@?0??lambdas_init@@YAXH@Z@QEBA?A?<auto>@@H@Z") == "operator()");
+    CHECK(base_identifier("??HFoo@@QEBAHH@Z") == "operator+");
     CHECK(base_identifier("??_7Square@@6B@").empty());
     CHECK(base_identifier("fixture_note").empty());
     CHECK(enclosing_function("?g@?1??statics_value@@YAHXZ@4UGuarded@@A") == "statics_value");

@@ -26,6 +26,10 @@
 #include "cml/pdb/index.h"
 #include "doctest.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 using namespace cml::core;
 using namespace cml::core::bind;
 
@@ -322,7 +326,76 @@ constexpr bool kIsCl = true;
 constexpr bool kIsCl = false;
 #endif
 
+// ---- other loaded modules (resolution step 5) ----------------------------------------------------
+
+// The exports of the system DLLs this very process has loaded (ntdll exports strlen, memcpy, ...): the
+// real data WP-12's ProcessModules will offer. The old module's own IAT is not needed by these fixtures.
+class SystemModules final : public ProcessModules {
+public:
+    std::optional<SymbolAddress> iat_slot(std::string_view, std::string_view) const override { return std::nullopt; }
+    std::optional<SymbolAddress> find_export(std::string_view name) const override {
+#ifdef _WIN32
+        if (name.empty() || name[0] == '?') {
+            return std::nullopt;
+        }
+        const std::string n(name);
+        for (const char* mod : {"ntdll.dll", "kernelbase.dll", "kernel32.dll", "ucrtbase.dll"}) {
+            HMODULE h = GetModuleHandleA(mod);
+            if (h == nullptr) {
+                continue;
+            }
+            if (FARPROC p = GetProcAddress(h, n.c_str())) {
+                SymbolAddress a;
+                a.va = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(p));
+                a.is_function = true;
+                a.origin = mod;
+                return a;
+            }
+        }
+#else
+        (void)name;
+#endif
+        return std::nullopt;
+    }
+};
+
 // ---- the test ---------------------------------------------------------------------------------
+
+void emit_decisions(const std::string& tag, const BindPlan& p, const cml::pdb::PdbIndex& pdb_index) {
+    for (const SymbolDecision& d : p.decisions) {
+        if (d.decision == DecisionKind::BindOldData) {
+            line("BIND-OLD-DATA " + tag + " " + d.display + (d.defined ? " (defined" : " (undefined") + (d.is_static ? ", static)" : ")") +
+                 " source=" + to_string(d.source) + (d.old_address.rva != kNoRva ? " rva=" + hex(d.old_address.rva) : " va=" + hex(d.old_address.va)));
+        }
+        // ADR-0010 evidence: how each STATIC of the new object was bridged to the PDB.
+        if (d.defined && d.is_static && d.decision != DecisionKind::PatchFresh) {
+            brief("STATIC " + tag + " obj=" + d.name + " display=" + d.display + " section=" + std::to_string(d.section) + " value=" + hex(d.value) +
+                 " -> " + to_string(d.decision) + " source=" + to_string(d.source) + (d.old_address.rva != kNoRva ? " rva=" + hex(d.old_address.rva) : ""));
+        }
+    }
+    {
+        // What the PDB records for the compiland (the other side of the bridge).
+        auto syms = pdb_index.compiland_symbols(p.compiland_index);
+        std::size_t shown = 0;
+        if (syms) {
+            for (const cml::pdb::SymbolView& v : *syms) {
+                if (v.kind == cml::pdb::SymbolKind::Udt || v.rva == cml::pdb::kNoRva) {
+                    continue;
+                }
+                if (v.kind == cml::pdb::SymbolKind::LocalData || v.kind == cml::pdb::SymbolKind::LocalProc ||
+                    v.kind == cml::pdb::SymbolKind::LocalThread || v.parent_proc != cml::pdb::kNoSymbol) {
+                    (tag == "statics" ? brief : line)("PDB-STATIC " + tag + " kind=" + cml::pdb::to_string(v.kind) + " name='" + std::string(v.name) + "' parent='" +
+                         std::string(v.parent_name) + "' rva=" + hex(v.rva));
+                    if (++shown >= 80) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+}
+
 
 void plan_fixture(const std::string& name) {
     const FixtureEntry* fx = nullptr;
@@ -349,17 +422,23 @@ void plan_fixture(const std::string& name) {
     in.module_base = 0x140000000ull;
     in.compiland = base_name(fx->obj);  // the compiler names the original object the same way
 
+    SystemModules system_modules;
+    in.modules = &system_modules;
+
     std::vector<cml::Diag> errors;
-    auto plan = plan_bind(in, &errors);
+    BindPlan partial;
+    auto plan = plan_bind(in, &errors, &partial);
     brief("== " + tag + " (" + fx->edit + " on " + fx->tu + ", " + std::string(kIsCl ? "cl" : "clang-cl") + ", " + paths().config + ") ==");
     if (!plan) {
         for (const cml::Diag& d : errors) {
             brief("PLAN-ERROR " + tag + " " + d.format());
         }
         brief("BINDPLAN " + tag + " FAILED errors=" + std::to_string(errors.size()));
+        emit_decisions(tag, partial, **pdb);
         FAIL("planning " << tag << " failed with " << errors.size() << " error(s); first: " << plan.error().format());
     }
     const BindPlan& p = *plan;
+    emit_decisions(tag, p, **pdb);
     const std::string summary = p.summary_line(tag);
     brief(summary);
     std::printf("%s\n", summary.c_str());
@@ -390,38 +469,6 @@ void plan_fixture(const std::string& name) {
     for (const ThunkEntry& t : p.thunks) {
         line("THUNK " + tag + " " + t.display + " source=" + to_string(t.source) + (t.target.rva != kNoRva ? " rva=" + hex(t.target.rva) : " va=" + hex(t.target.va)));
     }
-    for (const SymbolDecision& d : p.decisions) {
-        if (d.decision == DecisionKind::BindOldData) {
-            line("BIND-OLD-DATA " + tag + " " + d.display + (d.defined ? " (defined" : " (undefined") + (d.is_static ? ", static)" : ")") +
-                 " source=" + to_string(d.source) + (d.old_address.rva != kNoRva ? " rva=" + hex(d.old_address.rva) : " va=" + hex(d.old_address.va)));
-        }
-        // ADR-0010 evidence: how each STATIC of the new object was bridged to the PDB.
-        if (d.defined && d.is_static && d.decision != DecisionKind::PatchFresh) {
-            brief("STATIC " + tag + " obj=" + d.name + " display=" + d.display + " section=" + std::to_string(d.section) + " value=" + hex(d.value) +
-                 " -> " + to_string(d.decision) + " source=" + to_string(d.source) + (d.old_address.rva != kNoRva ? " rva=" + hex(d.old_address.rva) : ""));
-        }
-    }
-    {
-        // What the PDB records for the compiland (the other side of the bridge).
-        auto syms = (*pdb)->compiland_symbols(p.compiland_index);
-        std::size_t shown = 0;
-        if (syms) {
-            for (const cml::pdb::SymbolView& v : *syms) {
-                if (v.kind == cml::pdb::SymbolKind::Udt || v.rva == cml::pdb::kNoRva) {
-                    continue;
-                }
-                if (v.kind == cml::pdb::SymbolKind::LocalData || v.kind == cml::pdb::SymbolKind::LocalProc ||
-                    v.kind == cml::pdb::SymbolKind::LocalThread || v.parent_proc != cml::pdb::kNoSymbol) {
-                    (tag == "statics" ? brief : line)("PDB-STATIC " + tag + " kind=" + cml::pdb::to_string(v.kind) + " name='" + std::string(v.name) + "' parent='" +
-                         std::string(v.parent_name) + "' rva=" + hex(v.rva));
-                    if (++shown >= 80) {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
     // The complete plan, for the artifacts.
     {
         std::ofstream out(std::string(CML_BIND_WORK_DIR) + "/" + tag + ".plan.json", std::ios::binary | std::ios::trunc);

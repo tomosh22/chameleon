@@ -51,6 +51,13 @@ Result<std::vector<FixupTriple>> make_fixup_triples(const BindPlan& plan, const 
                                       "Reserve the patch within +-2 GiB of the module (the loader does this), or hot-restart.");
                 }
                 t.value = static_cast<std::uint32_t>(static_cast<std::int32_t>(disp));
+            } else if (f.kind == FixupKind::SecRel32) {
+                const std::int64_t v = static_cast<std::int64_t>(f.target_section_offset) + f.addend;
+                if (v < 0 || v > static_cast<std::int64_t>(UINT32_MAX)) {
+                    return Diag::make(diag::kRel32OutOfRange, "the SECREL32 value for '" + f.symbol + "' does not fit 32 bits",
+                                      "Hot-restart; this is not expected for a real module.");
+                }
+                t.value = static_cast<std::uint64_t>(v);
             } else {
                 t.value = target;
             }

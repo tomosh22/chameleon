@@ -27,5 +27,6 @@ inline constexpr std::uint32_t kCompilandAmbiguous = 3209; // several compilands
 inline constexpr std::uint32_t kSharedInitialiser = 3210;  // TU-wide initialiser may re-run initialisers of bound globals
 inline constexpr std::uint32_t kGuardUnmatched = 3211;     // function-local static guard not found in the old image
 inline constexpr std::uint32_t kSectionRelative = 3212;    // reference through a section symbol into bound data
+inline constexpr std::uint32_t kAmbiguousStaticFunction = 3213;  // static function matches several old records: not hooked
 
 }  // namespace cml::core::bind::diag

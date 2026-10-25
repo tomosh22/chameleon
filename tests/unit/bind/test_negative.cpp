@@ -4,6 +4,7 @@
 
 #include "cml/core/bind_diag_ids.h"
 #include "cml/core/bind_plan.h"
+#include "cml/core/symbol_registry.h"
 #include "doctest.h"
 #include "synth.h"
 #include "worlds.h"
@@ -112,19 +113,58 @@ TEST_CASE("the same relocation kinds against patch-local symbols are not our bus
     CHECK(r->fixups.empty());
 }
 
-TEST_CASE("section-relative (TLS) references to bound symbols and thread_local definitions are CML3102") {
+TEST_CASE("SECREL against module data is retargeted (the CRT's thread-safe-static epoch); other TLS cases are CML3102") {
     SynthWorld w = basic_world();
     {
         SynthObj o;
         auto f = o.function("?compute_value@@YAHXZ", true, 0x20);
         const std::uint32_t tick = o.undefined("?g_tick@@3HA", false);
-        o.reloc(f.section, 0, tick, coff::RelocType::SecRel);
+        o.reloc(f.section, 0, tick, coff::RelocType::SecRel, 4);
+        Built b = o.build();
+        auto r = plan_bind(w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        REQUIRE(r->fixups.size() == 1);
+        const Fixup& fx = r->fixups[0];
+        CHECK(fx.kind == FixupKind::SecRel32);
+        CHECK(fx.target_section_offset == 0x80);  // 0x3080 inside .data (rva 0x3000)
+        CHECK(fx.addend == 4);
+        PatchLayout l;
+        l.patch_base = 0x150000000ull;
+        l.section_rva[f.section] = 0x1000;
+        auto t = make_fixup_triples(*r, l);
+        REQUIRE_MESSAGE(t.has_value(), err(t));
+        REQUIRE(t->size() == 1);
+        CHECK((*t)[0].kind == FixupKind::SecRel32);
+        CHECK((*t)[0].rva == 0x1000);
+        CHECK((*t)[0].value == 0x84);
+    }
+    {
+        // SECREL against a symbol that is not in the patched module (registry): cannot be computed.
+        InMemorySymbolRegistry reg;
+        reg.add("?patch_tls@@3HA", {0x7FF000002000ull, false, "patch 1"});
+        w.registry = &reg;
+        SynthObj o;
+        auto f = o.function("?compute_value@@YAHXZ", true, 0x20);
+        const std::uint32_t t = o.undefined("?patch_tls@@3HA", false);
+        o.reloc(f.section, 0, t, coff::RelocType::SecRel);
+        Built b = o.build();
+        std::vector<cml::Diag> errors;
+        auto r = plan_bind(w.input(b), &errors);
+        REQUIRE(!r.has_value());
+        REQUIRE(errors.size() == 1);
+        CHECK(errors[0].code == diag::kThreadLocal);
+        w.registry = nullptr;
+    }
+    {
+        SynthObj o;
+        auto f = o.function("?compute_value@@YAHXZ", true, 0x20);
+        const std::uint32_t tick = o.undefined("?g_tick@@3HA", false);
         o.reloc(f.section, 8, tick, coff::RelocType::Section);
         Built b = o.build();
         std::vector<cml::Diag> errors;
         auto r = plan_bind(w.input(b), &errors);
         REQUIRE(!r.has_value());
-        REQUIRE(errors.size() == 2);
+        REQUIRE(errors.size() == 1);
         CHECK(errors[0].code == diag::kThreadLocal);
         CHECK(errors[0].id() == "CML3102");
         CHECK(contains(errors[0].message, "?g_tick@@3HA"));

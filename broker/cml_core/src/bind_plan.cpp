@@ -64,6 +64,7 @@ const char* to_string(FixupKind k) noexcept {
         case FixupKind::Rel32_4: return "REL32_4";
         case FixupKind::Rel32_5: return "REL32_5";
         case FixupKind::Addr64: return "ADDR64";
+        case FixupKind::SecRel32: return "SECREL32";
         case FixupKind::Slot: return "SLOT";
     }
     return "?";
@@ -169,7 +170,7 @@ struct OldRef {
 
 class Planner {
 public:
-    explicit Planner(const PlanInput& in) : in_(in), obj_(*in.object), pdb_(*in.module_pdb) {}
+    Planner(const PlanInput& in, BindPlan* partial) : in_(in), obj_(*in.object), pdb_(*in.module_pdb), partial_(partial) {}
 
     Result<BindPlan> run(std::vector<Diag>* all_errors);
 
@@ -178,6 +179,7 @@ private:
     const coff::Object& obj_;
     const pdb::PdbIndex& pdb_;
     BindPlan plan_;
+    BindPlan* partial_ = nullptr;
     std::vector<Diag> errors_;
     std::optional<Diag> fatal_;
     std::uint32_t ci_ = 0;
@@ -252,7 +254,8 @@ private:
     std::optional<OldRef> lookup_registry(const std::string& name, SymbolType want);
     std::optional<OldRef> lookup_public(const std::string& name, SymbolType want);
     bool ensure_compiland_symbols();
-    std::vector<const pdb::SymbolView*> static_candidates(const std::string& base, const std::string& encl, bool want_function);
+    std::vector<const pdb::SymbolView*> static_candidates(const std::string& base, const std::string& encl, bool want_function,
+                                                          const std::string& display = {});
     std::optional<OldRef> resolve_name(Sym& sy);  // the undefined-symbol chain
 
     void decide(Sym& sy, DecisionKind kind, BindSource source, SymbolType type, const TargetAddress& addr, std::string reason);
@@ -551,7 +554,8 @@ bool Planner::ensure_compiland_symbols() {
     return true;
 }
 
-std::vector<const pdb::SymbolView*> Planner::static_candidates(const std::string& base, const std::string& encl, bool want_function) {
+std::vector<const pdb::SymbolView*> Planner::static_candidates(const std::string& base, const std::string& encl, bool want_function,
+                                                                const std::string& display) {
     std::vector<const pdb::SymbolView*> out;
     if (base.empty() || !ensure_compiland_symbols()) {
         return out;
@@ -570,6 +574,25 @@ std::vector<const pdb::SymbolView*> Planner::static_candidates(const std::string
             continue;
         }
         all.push_back(&v);
+    }
+    // The qualified name, when both sides spell it the same, is a much stronger key than the last
+    // component: "lambdas_init::<lambda_0>::operator()" (clang) or "Ns::Cls::f".
+    if (!display.empty()) {
+        std::vector<const pdb::SymbolView*> exact;
+        for (const pdb::SymbolView* v : all) {
+            std::string n(v->name);
+            const std::string_view anon = "`anonymous namespace'";
+            for (std::size_t at = n.find(anon); at != std::string::npos; at = n.find(anon, at)) {
+                n.replace(at, anon.size(), "(anonymous namespace)");
+            }
+            if (n == display) {
+                exact.push_back(v);
+            }
+        }
+        if (!exact.empty()) {
+            std::sort(exact.begin(), exact.end(), [](const pdb::SymbolView* a, const pdb::SymbolView* b) { return a->rva < b->rva; });
+            return exact;
+        }
     }
     if (!encl.empty()) {
         for (const pdb::SymbolView* v : all) {
@@ -683,6 +706,7 @@ void Planner::bridge_statics() {
         bool is_func = false;
         std::string base;
         std::string encl;
+        std::string display;
         std::vector<std::uint32_t> members;  // positions in syms_
     };
     std::map<std::string, Group> groups;
@@ -695,6 +719,13 @@ void Planner::bridge_statics() {
         if (!is_func && is_guard_variable(sy.name)) {
             continue;  // pass C
         }
+        if (is_func && starts_with(sy.name, "??$")) {
+            // A static function template instantiation (typically over a local/lambda type): same base
+            // name as unrelated instantiations, and the PDB spells the arguments differently. Not bridged.
+            decide(sy, DecisionKind::PatchNewFunction, BindSource::None, sy.dec.type, {},
+                   "static function template instantiation: not matched to the old image, not hooked");
+            continue;
+        }
         const std::string base = base_identifier(sy.name);
         if (base.empty()) {
             // Nothing to match by: a static without a source-level name (compiler temporary).
@@ -703,11 +734,12 @@ void Planner::bridge_statics() {
             continue;
         }
         const std::string encl = enclosing_function(sy.name);
-        const std::string key = std::string(is_func ? "F|" : "D|") + base + "|" + encl;
+        const std::string key = std::string(is_func ? "F|" : "D|") + sy.dec.display + "|" + base + "|" + encl;
         Group& g = groups[key];
         g.is_func = is_func;
         g.base = base;
         g.encl = encl;
+        g.display = sy.dec.display == sy.name ? std::string() : sy.dec.display;
         g.members.push_back(static_cast<std::uint32_t>(pos));
     }
     for (auto& [key, g] : groups) {
@@ -730,7 +762,7 @@ void Planner::bridge_statics() {
 
     // Pass A: unambiguous name matches (also learns the section deltas).
     for (auto& [key, g] : groups) {
-        const std::vector<const pdb::SymbolView*> cands = static_candidates(g.base, g.encl, g.is_func);
+        const std::vector<const pdb::SymbolView*> cands = static_candidates(g.base, g.encl, g.is_func, g.display);
         if (cands.empty()) {
             for (const std::uint32_t pos : g.members) {
                 Sym& sy = syms_[pos];
@@ -762,7 +794,7 @@ void Planner::bridge_statics() {
     // Pass B: ambiguous groups, by RVA in the unchanged section layout, then by position.
     for (const std::string& key : deferred) {
         Group& g = groups[key];
-        const std::vector<const pdb::SymbolView*> cands = static_candidates(g.base, g.encl, g.is_func);
+        const std::vector<const pdb::SymbolView*> cands = static_candidates(g.base, g.encl, g.is_func, g.display);
         std::vector<std::uint32_t> unmatched = g.members;
         std::vector<const pdb::SymbolView*> free_cands = cands;
         if (!g.is_func) {
@@ -795,6 +827,14 @@ void Planner::bridge_statics() {
         }
         for (const std::uint32_t pos : unmatched) {
             Sym& sy = syms_[pos];
+            if (g.is_func) {
+                warn(diag::kAmbiguousStaticFunction,
+                     "static function '" + sy.dec.display + "' (" + sy.name + ") matches " + std::to_string(cands.size()) + " records named '" + g.base +
+                         "' in compiland " + std::to_string(ci_) + " but the patch object defines " + std::to_string(g.members.size()) + "; it is not hooked",
+                     "Rename the overloads or keep their number unchanged; callers outside the patch keep the old code of this function.");
+                decide(sy, DecisionKind::PatchNewFunction, BindSource::None, sy.dec.type, {}, "ambiguous static function (CML3213): not hooked");
+                continue;
+            }
             error(diag::kAmbiguousStatic,
                   "static " + std::string(g.is_func ? "function" : "data") + " '" + sy.dec.display + "' (" + sy.name + ") matches " + std::to_string(cands.size()) +
                       " records named '" + g.base + "' in compiland " + std::to_string(ci_) + " but the patch object defines " + std::to_string(g.members.size()) + " of them",
@@ -866,7 +906,7 @@ std::optional<OldRef> Planner::resolve_name(Sym& sy) {
         const std::string base = base_identifier(name);
         const std::string encl = enclosing_function(name);
         for (const bool want_function : {false, true}) {
-            const std::vector<const pdb::SymbolView*> cands = static_candidates(base, encl, want_function);
+            const std::vector<const pdb::SymbolView*> cands = static_candidates(base, encl, want_function, sy.dec.display == name ? std::string() : sy.dec.display);
             if (cands.size() == 1) {
                 OldRef r;
                 r.addr = module_address(cands.front()->rva);
@@ -1062,10 +1102,26 @@ void Planner::build_fixups() {
             if (type == coff::RelocType::Absolute) {
                 continue;
             }
-            if (type == coff::RelocType::Section || type == coff::RelocType::SecRel || type == coff::RelocType::SecRel7) {
-                error(diag::kThreadLocal, "thread-local or section-relative reference to " + describe(ts) + " from " + where() + " in " + in_.object_name,
+            if (type == coff::RelocType::Section || type == coff::RelocType::SecRel7) {
+                error(diag::kThreadLocal, "section-index reference (" + std::string(coff::reloc_type_name(type)) + ") to " + describe(ts) + " from " + where() + " in " + in_.object_name,
                       "Move the thread_local to an unchanged source file, or hot-restart.");
                 continue;
+            }
+            const bool secrel = type == coff::RelocType::SecRel;
+            std::uint32_t section_offset = 0;
+            if (secrel) {
+                // The offset of the target inside ITS section of the old image (what the linker would
+                // write): the CRT's _Init_thread_epoch is read like this by every thread-safe static.
+                const std::optional<pdb::SectionOffset> so =
+                    ts.dec.old_address.rva != kNoRva ? pdb_.section_offset_from_rva(ts.dec.old_address.rva) : std::nullopt;
+                if (dk != DecisionKind::BindOldData || !so) {
+                    error(diag::kThreadLocal,
+                          "thread-local reference to " + describe(ts) + " from " + where() + " in " + in_.object_name +
+                              ", which is not data of the patched module; it cannot be retargeted",
+                          "Move the thread_local to an unchanged source file, or hot-restart.");
+                    continue;
+                }
+                section_offset = so->offset;
             }
             if (type == coff::RelocType::Addr32Nb) {
                 if (dk == DecisionKind::BindOldData) {
@@ -1076,7 +1132,7 @@ void Planner::build_fixups() {
                 continue;  // to a thunk: legal, resolved by the linker
             }
             const bool rel = coff::is_rel32_family(type);
-            if (!rel && type != coff::RelocType::Addr64) {
+            if (!rel && !secrel && type != coff::RelocType::Addr64) {
                 error(diag::kUnsupportedReloc,
                       "unsupported relocation " + std::string(coff::reloc_type_name(type)) + " against " + describe(ts) + " from " + where() + " in " + in_.object_name,
                       "Compile with /MD-compatible 64-bit code models (no 32-bit absolute addresses), or hot-restart.");
@@ -1097,7 +1153,7 @@ void Planner::build_fixups() {
                 continue;
             }
             // In-place addend (ADR-0025).
-            const std::size_t width = rel ? 4u : 8u;
+            const std::size_t width = (rel || secrel) ? 4u : 8u;
             const coff::ByteSpan data = site.sec->data;
             if (static_cast<std::uint64_t>(off) + width > data.size()) {
                 error(diag::kBadRelocationSite,
@@ -1106,7 +1162,7 @@ void Planner::build_fixups() {
                 continue;
             }
             std::int64_t addend = 0;
-            if (rel) {
+            if (rel || secrel) {
                 std::int32_t a32 = 0;
                 std::memcpy(&a32, data.data() + off, 4);
                 addend = a32;
@@ -1118,7 +1174,8 @@ void Planner::build_fixups() {
             Fixup f;
             f.section_index = sec_index;
             f.offset = off;
-            f.kind = rel ? rel32_kind(type) : FixupKind::Addr64;
+            f.kind = rel ? rel32_kind(type) : (secrel ? FixupKind::SecRel32 : FixupKind::Addr64);
+            f.target_section_offset = section_offset;
             f.addend = addend;
             f.target_va = ts.dec.old_address.va;
             f.target_rva = ts.dec.old_address.rva;
@@ -1143,7 +1200,10 @@ void Planner::find_initialisers() {
         if (sy.defined && sy.decided && sy.dec.decision == DecisionKind::PatchNewData) {
             any_new_data = true;
         }
-        if (sy.defined && sy.decided && sy.dec.decision == DecisionKind::BindOldData) {
+        // Only writable data can hold state a re-run initialiser would clobber (inline constants in
+        // .rdata have no dynamic initialisation).
+        if (sy.defined && sy.decided && sy.dec.decision == DecisionKind::BindOldData && sy.dec.section != 0 &&
+            (secs_[sy.dec.section - 1].sec->characteristics & coff::scn::MemWrite) != 0) {
             any_bound_defined_data = true;
         }
     }
@@ -1338,6 +1398,10 @@ Result<BindPlan> Planner::run(std::vector<Diag>* all_errors) {
         if (all_errors != nullptr) {
             *all_errors = errors_;
         }
+        if (partial_ != nullptr) {
+            assemble();  // what was decided, for tools and evidence
+            *partial_ = std::move(plan_);
+        }
         return errors_.front();
     };
 
@@ -1386,14 +1450,14 @@ Result<BindPlan> Planner::run(std::vector<Diag>* all_errors) {
 
 }  // namespace
 
-Result<BindPlan> plan_bind(const PlanInput& input, std::vector<Diag>* all_errors) {
+Result<BindPlan> plan_bind(const PlanInput& input, std::vector<Diag>* all_errors, BindPlan* partial) {
     if (all_errors != nullptr) {
         all_errors->clear();
     }
     if (input.object == nullptr || input.module_pdb == nullptr) {
         return Diag::make(diag::kUnsupportedObject, "plan_bind called without an object or a module PDB", "This is a programming error in the caller.");
     }
-    Planner planner(input);
+    Planner planner(input, partial);
     return planner.run(all_errors);
 }
 

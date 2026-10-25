@@ -177,7 +177,10 @@ struct NewGlobal {
     std::vector<std::string> initialisers;  // InitialiserEntry::function values that run for it
 };
 
-enum class FixupKind : std::uint8_t { Rel32 = 0, Rel32_1, Rel32_2, Rel32_3, Rel32_4, Rel32_5, Addr64, Slot };
+// SecRel32: IMAGE_REL_AMD64_SECREL against a symbol of the old module (the CRT's thread-safe-static
+// epoch `_Init_thread_epoch` is read through it): the 32-bit offset of the target inside its image
+// section, plus the in-place addend. Valid for module targets only (the PDB knows the section).
+enum class FixupKind : std::uint8_t { Rel32 = 0, Rel32_1, Rel32_2, Rel32_3, Rel32_4, Rel32_5, Addr64, SecRel32, Slot };
 const char* to_string(FixupKind k) noexcept;
 inline constexpr bool is_rel32(FixupKind k) noexcept { return k <= FixupKind::Rel32_5; }
 // N of REL32_N (bytes that follow the 4-byte field inside the instruction).
@@ -190,6 +193,7 @@ struct Fixup {
     std::int64_t addend = 0;          // in-place addend of the OBJECT (ADR-0025)
     std::uint64_t target_va = 0;      // S: old address of the symbol
     std::uint32_t target_rva = kNoRva;
+    std::uint32_t target_section_offset = 0;  // SecRel32 only: offset of the target in its image section
     std::string symbol;               // the referenced object symbol; for Slot the patch symbol that receives the address
     std::string section_name;         // informational
 };
@@ -246,8 +250,10 @@ struct PlanInput {
 };
 
 // Builds the plan. On failure returns the first error; with `all_errors` every error is collected
-// (the usual case: several unresolved symbols). Warnings are in BindPlan::warnings.
-Result<BindPlan> plan_bind(const PlanInput& input, std::vector<Diag>* all_errors = nullptr);
+// (the usual case: several unresolved symbols). With `partial`, a failed planning (diagnostics, not an
+// unreadable PDB/object) still fills it with every decision made, for tools and evidence. Warnings are
+// in BindPlan::warnings.
+Result<BindPlan> plan_bind(const PlanInput& input, std::vector<Diag>* all_errors = nullptr, BindPlan* partial = nullptr);
 
 // ---------------------------------------------------------------------------------------------
 // From plan to (rva, kind, value)

@@ -371,6 +371,23 @@ std::string base_identifier(std::string_view d) {
     if (starts_with(body, "?$")) {  // function template: ??$name@args@@...
         body = body.substr(2);
     } else if (body[0] == '?') {    // ctor, dtor, operator, vftable ...
+        Reader r{d, 2, true};
+        const char c = r.get();
+        if (c == '0' || c == '1') {  // the PDB names them after the class: "Tracker", "~Tracker"
+            const Scope sc = parse_qualified(r);
+            if (!r.ok || sc.frags.empty()) {
+                return {};
+            }
+            std::string n = sc.frags.front();
+            const std::size_t lt = n.find('<');
+            if (lt != std::string::npos) {
+                n.resize(lt);
+            }
+            return c == '1' ? "~" + n : n;
+        }
+        if (const char* op = operator_name(c)) {
+            return op;
+        }
         return {};
     }
     const std::size_t e = body.find('@');
