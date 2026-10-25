@@ -102,6 +102,10 @@ struct ProcessResult {
     std::string response_file;            // set when an @file was used (deleted after the run)
 };
 
+// After the process exited, run_process waits at most this long for the remaining output; a grandchild that inherited
+// the pipe and keeps running cannot hold the call longer (the reader is stopped and the output so far is returned).
+inline constexpr unsigned long kProcessDrainGraceMs = 500;
+
 #if defined(_WIN32)
 // CML2202 when the process cannot be created, CML2206 when the response file cannot be written.
 // A process that ran and failed is NOT an error here (see exit_code).

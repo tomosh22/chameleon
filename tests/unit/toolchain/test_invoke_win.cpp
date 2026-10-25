@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -186,3 +187,72 @@ TEST_CASE("detect_tool finds the compiler this test was built with") {
     std::printf("TOOL %s family=%s version=%s source=%s\n", path.c_str(), to_string(info->family), info->version_text.c_str(),
                 info->from_version_resource ? "version-resource" : "banner");
 }
+
+TEST_CASE("run_process: a grandchild that holds the pipe cannot hang the call, and no timeout is reported after the exit") {
+    // `start /b ping` returns at once; ping inherits cmd's stdout (our pipe) and runs for 60 s.
+    ProcessSpec spec = cmd("start /b ping -n 60 127.0.0.1");
+    spec.timeout_ms = 400;  // after cmd's exit, before the end of the drain grace period
+    const auto start = std::chrono::steady_clock::now();
+    auto r = run_process(spec);
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    REQUIRE(r);
+    CHECK(secs < static_cast<double>(kProcessDrainGraceMs) / 1000.0 + 1.0);
+    CHECK(r->exit_code == 0);
+    CHECK_FALSE(r->timed_out);  // the process exited before the deadline: never a timeout
+    CHECK_FALSE(r->cancelled);
+    // Tidy up the 60 s ping.
+    ProcessSpec kill = cmd("taskkill /F /IM ping.exe >nul 2>&1");
+    (void)run_process(kill);
+}
+
+TEST_CASE("run_process: cancellation after the process exited is not a cancellation") {
+    CancelToken token;
+    auto r = run_process(cmd("echo done"), &token);
+    token.cancel();
+    REQUIRE(r);
+    CHECK_FALSE(r->cancelled);
+    CHECK(r->exit_code == 0);
+}
+
+#ifdef CML_TEST_COMPILER_IS_CL
+// The shared mspdbsrv.exe must survive a cancelled compile: a concurrent /Zi compile uses it.
+TEST_CASE("cancelling a /Zi compile does not break a concurrent /Zi compile (mspdbsrv is not killed)") {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::path(CML_TEST_WORK_DIR) / "toolchain" / "cancel_zi";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    {
+        std::ofstream src(dir / "slow.cpp");
+        src << "#include <map>\n#include <string>\n#include <vector>\n";
+        for (int i = 0; i < 1500; ++i) {
+            src << "int f" << i << "(int x) { std::map<int, std::string> m; m[x] = \"v" << i << "\"; std::vector<int> v(x, " << i
+                << "); return static_cast<int>(m.size() + v.size()); }\n";
+        }
+    }
+    const auto compile = [&](const char* tag) {
+        ProcessSpec spec;
+        spec.exe = CML_TEST_CXX_COMPILER;
+        spec.cwd = dir.string();
+        spec.args = {"/nologo", "/c", "/Zi", "/Od", "/EHsc", "/FS", std::string("/Fd") + (dir / (std::string(tag) + ".pdb")).string(),
+                     std::string("/Fo") + (dir / (std::string(tag) + ".obj")).string(), "slow.cpp"};
+        spec.timeout_ms = 240000;
+        return spec;
+    };
+    CancelToken token;
+    std::thread a([&] {
+        auto r = run_process(compile("a"), &token);
+        REQUIRE(r);
+    });
+    std::thread canceller([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(700));
+        token.cancel();
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    auto b = run_process(compile("b"));
+    a.join();
+    canceller.join();
+    REQUIRE(b);
+    CHECK_MESSAGE(b->exit_code == 0, b->output);
+    CHECK(std::filesystem::exists(dir / "b.obj"));
+}
+#endif

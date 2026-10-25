@@ -22,6 +22,8 @@ constexpr std::array kClRules = {
     Rule{MatchKind::Exact, "Zi", Action::Replace, "Z7", 0, Tag::DebugInfo, kNone, kNone, "/Zi -> /Z7: debug info inside the object"},
     Rule{MatchKind::Exact, "ZI", Action::Replace, "Z7", 0, Tag::EditAndContinue, kNone, kNone, "/ZI -> /Z7 (and /Gy is added: /ZI implied it)"},
     Rule{MatchKind::Exact, "Z7", Action::Keep, "", 0, Tag::DebugInfo, kNone, kNone, "already /Z7"},
+    // "/Fd:" <file> (colon form with the value in the next token) and "/Fd:<file>" / "/Fd<file>" (attached).
+    Rule{MatchKind::Exact, "Fd:", Action::Drop, "", 1, Tag::PdbFile, kNone, kNone, "/Fd: <file>: no compiler PDB with /Z7 (value remembered for PchDebugMode::KeepZiPrivatePdb)"},
     Rule{MatchKind::Prefix, "Fd", Action::Drop, "", 0, Tag::PdbFile, kNone, kNone, "/Fd: no compiler PDB with /Z7 (value remembered for PchDebugMode::KeepZiPrivatePdb)"},
     Rule{MatchKind::Exact, "FS", Action::Drop, "", 0, Tag::None, kNone, kNone, "/FS only matters with a shared compiler PDB"},
     Rule{MatchKind::Exact, "Gm", Action::Drop, "", 0, Tag::None, kNone, kNone, "/Gm (minimal rebuild) is deprecated and conflicts with /Z7"},
@@ -34,7 +36,9 @@ constexpr std::array kClRules = {
     Rule{MatchKind::Prefix, "sourceDependencies:", Action::Drop, "", 0, Tag::None, kNone, kNone, "/sourceDependencies:<form> writes into the build tree"},
     Rule{MatchKind::Exact, "experimental:log", Action::Drop, "", 1, Tag::None, kNone, kNone, "/experimental:log <file> writes a SARIF file into the build tree"},
     Rule{MatchKind::Prefix, "analyze", Action::Drop, "", 0, Tag::None, kNone, kNone, "/analyze is far too slow for a hot-reload compile"},
+    Rule{MatchKind::Exact, "Fo:", Action::Drop, "", 1, Tag::ObjectOutput, kNone, kNone, "/Fo: <file>: replaced by the patch object path"},
     Rule{MatchKind::Prefix, "Fo", Action::Drop, "", 0, Tag::ObjectOutput, kNone, kNone, "/Fo: replaced by the patch object path"},
+    Rule{MatchKind::Exact, "Fe:", Action::Drop, "", 1, Tag::None, kNone, kNone, "/Fe: <file>: no link step"},
     Rule{MatchKind::Prefix, "Fe", Action::Drop, "", 0, Tag::None, kNone, kNone, "/Fe: no link step"},
     Rule{MatchKind::Prefix, "Fa", Action::Drop, "", 0, Tag::None, kNone, kNone, "/Fa: no assembly listing into the build tree"},
     Rule{MatchKind::Prefix, "FA", Action::Drop, "", 0, Tag::None, kNone, kNone, "/FA: no assembly listing into the build tree"},

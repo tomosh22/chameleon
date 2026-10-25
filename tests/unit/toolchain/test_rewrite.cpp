@@ -1,4 +1,6 @@
 // Behaviour of the rewriter that the corpus does not show: options, results, rule tables, paths.
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -298,4 +300,201 @@ TEST_CASE("detect_dialect") {
     r.compiler = "cl";
     r.args = {"/c"};
     CHECK(detect_dialect(r) == Dialect::Cl);
+}
+
+namespace {
+std::size_t index_of(const std::vector<std::string>& v, const std::string& s) {
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        if (v[i] == s) return i;
+    }
+    return static_cast<std::size_t>(-1);
+}
+}  // namespace
+
+TEST_CASE("rewrite: appended options go before the end-of-options marker") {
+    const std::size_t none = static_cast<std::size_t>(-1);
+    SUBCASE("cl dialect") {
+        auto r = rewrite_for_patch(cl_record("/c /Zi /EHsc -- a.cpp"), options());
+        REQUIRE(r);
+        const std::size_t marker = index_of(r->args, "--");
+        REQUIRE(marker != none);
+        CHECK(index_of(r->args, "/Fo" + options().output_object) < marker);
+        CHECK(index_of(r->args, "/nologo") < marker);
+        CHECK(index_of(r->args, "/c") < marker);
+        CHECK(r->args[marker + 1] == "a.cpp");
+        CHECK(r->args.size() == marker + 2);
+    }
+    SUBCASE("clang-cl driver, /-- spelling, and the source added after the marker when missing") {
+        CompileRecord rec;
+        rec.compiler = R"(C:\LLVM\bin\clang-cl.exe)";
+        rec.cwd = R"(D:\p)";
+        rec.source = R"(D:\p\a.cpp)";
+        rec.args = split_command_line("/Zi -c /--");
+        auto r = rewrite_for_patch(rec, options());
+        REQUIRE(r);
+        const std::size_t marker = index_of(r->args, "/--");
+        REQUIRE(marker != none);
+        CHECK(index_of(r->args, "/clang:-gcodeview-command-line") < marker);
+        CHECK(index_of(r->args, "/Fo" + options().output_object) < marker);
+        CHECK(r->args.back() == R"(D:\p\a.cpp)");
+        CHECK(r->args.size() == marker + 2);
+    }
+    SUBCASE("tokens after the marker that look like options are inputs, not rules") {
+        auto r = rewrite_for_patch(cl_record("/c /Zi -- -Fofoo.obj a.cpp"), options());
+        REQUIRE(r);
+        CHECK(index_of(r->args, "-Fofoo.obj") != none);  // not dropped
+        CHECK(index_of(r->args, "-Fofoo.obj") > index_of(r->args, "--"));
+    }
+    SUBCASE("cc1") {
+        CompileRecord rec;
+        rec.compiler = R"(C:\LLVM\bin\clang.exe)";
+        rec.cwd = R"(D:\p)";
+        rec.source = R"(D:\p\a.cpp)";
+        rec.args = {"-cc1", "-emit-obj", "-gcodeview", "-x", "c++", "-o", "x.obj", "--", R"(D:\p\a.cpp)"};
+        auto r = rewrite_for_patch(rec, options());
+        REQUIRE(r);
+        const std::size_t marker = index_of(r->args, "--");
+        REQUIRE(marker != none);
+        CHECK(index_of(r->args, "-o") + 1 < marker);
+        CHECK(r->args[index_of(r->args, "-o") + 1] == options().output_object);
+        CHECK(index_of(r->args, "-gcodeview-command-line") < marker);
+        CHECK(r->args.size() == marker + 2);
+    }
+    SUBCASE("DropPch before the marker keeps the marker in front of the inputs") {
+        auto r = rewrite_for_patch(cl_record("/c /Zi /Yupch.h /Fppch.pch -- a.cpp"), options(PchDebugMode::DropPch));
+        REQUIRE(r);
+        const std::size_t marker = index_of(r->args, "--");
+        REQUIRE(marker != none);
+        CHECK(index_of(r->args, "/Fo" + options().output_object) < marker);
+        CHECK(r->args[marker + 1] == "a.cpp");
+    }
+}
+
+TEST_CASE("rewrite: /Fo: /Fd: /Fe: colon forms") {
+    auto sep = rewrite_for_patch(cl_record(R"(/c /Zi /Fo: out\a.obj /Fd: out\vc.pdb /Fe: out\a.exe /EHsc a.cpp)"), options());
+    REQUIRE(sep);
+    CHECK(index_of(sep->args, R"(out\a.obj)") == static_cast<std::size_t>(-1));
+    CHECK(index_of(sep->args, R"(out\vc.pdb)") == static_cast<std::size_t>(-1));
+    CHECK(index_of(sep->args, R"(out\a.exe)") == static_cast<std::size_t>(-1));
+    CHECK(index_of(sep->args, "/EHsc") != static_cast<std::size_t>(-1));
+    auto att = rewrite_for_patch(cl_record(R"(/c /Zi /Fo:out\a.obj /Fd:out\vc.pdb /Fe:out\a.exe /EHsc a.cpp)"), options());
+    REQUIRE(att);
+    CHECK(sep->command_line == att->command_line);
+    // The value of /Fd: (either spelling) is the PDB a /Yu translation unit copies.
+    auto pch = rewrite_for_patch(cl_record(R"(/c /Zi /Fd: D:\p\out\vc.pdb /Yupch.h a.cpp)"), options(PchDebugMode::KeepZiPrivatePdb));
+    REQUIRE(pch);
+    CHECK(pch->pdb_copy_from == R"(D:\p\out\vc.pdb)");
+    auto pch2 = rewrite_for_patch(cl_record(R"(/c /Zi /Fd:D:\p\out\vc.pdb /Yupch.h a.cpp)"), options(PchDebugMode::KeepZiPrivatePdb));
+    REQUIRE(pch2);
+    CHECK(pch2->pdb_copy_from == R"(D:\p\out\vc.pdb)");
+}
+
+TEST_CASE("rewrite: /Fd naming a directory resolves to vc<NNN>.pdb") {
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() / ("cml_fd_dir_" + std::to_string(reinterpret_cast<std::uintptr_t>(&root)));
+    fs::create_directories(root / "dir");
+    const auto touch = [&](const fs::path& p) { std::ofstream(p) << "x"; };
+    touch(root / "dir" / "vc140.pdb");
+    const std::string dir = (root / "dir").string();
+    const std::string S(1, static_cast<char>(fs::path::preferred_separator));
+    const std::string sepdir = dir + S;
+    const auto rec_with = [&](const std::string& fd, const std::string& recorded) {
+        CompileRecord rec = cl_record("/c /Zi /Fd" + fd + " /Yupch.h a.cpp");
+        rec.cwd = root.string();
+        rec.recorded_pdb = recorded;
+        return rec;
+    };
+    SUBCASE("trailing separator, no recorded PDB: the only vc*.pdb in the directory") {
+        auto r = rewrite_for_patch(rec_with(sepdir, ""), options(PchDebugMode::KeepZiPrivatePdb));
+        REQUIRE(r);
+        CHECK(r->pdb_copy_from == sepdir + "vc140.pdb");
+    }
+    SUBCASE("an existing directory without separator") {
+        auto r = rewrite_for_patch(rec_with(dir, ""), options(PchDebugMode::KeepZiPrivatePdb));
+        REQUIRE(r);
+        CHECK(r->pdb_copy_from == sepdir + "vc140.pdb");
+    }
+    SUBCASE("relative directory is relative to the recorded cwd") {
+        auto r = rewrite_for_patch(rec_with("dir" + S, ""), options(PchDebugMode::KeepZiPrivatePdb));
+        REQUIRE(r);
+        CHECK(r->pdb_copy_from == root.string() + S + "dir" + S + "vc140.pdb");
+    }
+    SUBCASE("several vc*.pdb: the one the recorded PDB names, else the highest number") {
+        touch(root / "dir" / "vc143.pdb");
+        touch(root / "dir" / "vc120.pdb");
+        touch(root / "dir" / "vcfoo.pdb");  // not vc<digits>.pdb
+        auto named = rewrite_for_patch(rec_with(sepdir, R"(D:\gone\vc120.pdb)"), options(PchDebugMode::KeepZiPrivatePdb));
+        REQUIRE(named);
+        CHECK(named->pdb_copy_from == sepdir + "vc120.pdb");
+        auto highest = rewrite_for_patch(rec_with(sepdir, ""), options(PchDebugMode::KeepZiPrivatePdb));
+        REQUIRE(highest);
+        CHECK(highest->pdb_copy_from == sepdir + "vc143.pdb");
+    }
+    SUBCASE("an existing recorded PDB wins over /Fd") {
+        touch(root / "recorded.pdb");
+        auto r = rewrite_for_patch(rec_with(sepdir, (root / "recorded.pdb").string()), options(PchDebugMode::KeepZiPrivatePdb));
+        REQUIRE(r);
+        CHECK(r->pdb_copy_from == (root / "recorded.pdb").string());
+    }
+    SUBCASE("an empty directory falls back to vc140.pdb; a file-like /Fd gets .pdb") {
+        fs::create_directories(root / "empty");
+        auto r = rewrite_for_patch(rec_with((root / "empty").string() + S, ""), options(PchDebugMode::KeepZiPrivatePdb));
+        REQUIRE(r);
+        CHECK(r->pdb_copy_from == (root / "empty").string() + S + "vc140.pdb");
+        auto f = rewrite_for_patch(rec_with("D:\\p\\mypdb", ""), options(PchDebugMode::KeepZiPrivatePdb));
+        REQUIRE(f);
+        CHECK(f->pdb_copy_from == "D:\\p\\mypdb.pdb");
+    }
+    std::error_code ec;
+    fs::remove_all(root, ec);
+}
+
+TEST_CASE("rewrite: -Xclang and /clang: options are judged by the cc1 rule table") {
+    CompileRecord rec;
+    rec.compiler = R"(C:\LLVM\bin\clang-cl.exe)";
+    rec.cwd = R"(D:\p)";
+    rec.source = R"(D:\p\a.cpp)";
+    SUBCASE("depfile and codeview switches dropped with their values, -include-pch kept and recorded") {
+        rec.args = split_command_line(
+            "/Zi -Xclang -dependency-file -Xclang dep.d -Xclang -gno-codeview-command-line -Xclang -include-pch -Xclang a.pch "
+            "/clang:-sys-header-deps /clang:-gno-codeview-command-line /clang:-MT /clang:o.obj a.cpp");
+        auto r = rewrite_for_patch(rec, options());
+        REQUIRE(r);
+        CHECK(r->uses_pch);
+        CHECK(index_of(r->args, "-dependency-file") == static_cast<std::size_t>(-1));
+        CHECK(index_of(r->args, "dep.d") == static_cast<std::size_t>(-1));
+        CHECK(index_of(r->args, "-gno-codeview-command-line") == static_cast<std::size_t>(-1));
+        CHECK(index_of(r->args, "/clang:-sys-header-deps") == static_cast<std::size_t>(-1));
+        CHECK(index_of(r->args, "/clang:-MT") == static_cast<std::size_t>(-1));
+        CHECK(index_of(r->args, "/clang:o.obj") == static_cast<std::size_t>(-1));
+        CHECK(index_of(r->args, "-include-pch") != static_cast<std::size_t>(-1));
+        CHECK(index_of(r->args, "a.pch") != static_cast<std::size_t>(-1));
+        // The codeview-command-line switch is gone, so the rewriter adds its own.
+        CHECK(index_of(r->args, "/clang:-gcodeview-command-line") != static_cast<std::size_t>(-1));
+    }
+    SUBCASE("-emit-pch is CML2102, in both spellings") {
+        rec.args = split_command_line("/Zi -Xclang -emit-pch a.cpp");
+        auto a = rewrite_for_patch(rec, options());
+        REQUIRE_FALSE(a);
+        CHECK(a.error().code == diag::kPchCreatingTu);
+        rec.args = split_command_line("/Zi /clang:-emit-pch a.cpp");
+        auto b = rewrite_for_patch(rec, options());
+        REQUIRE_FALSE(b);
+        CHECK(b.error().code == diag::kPchCreatingTu);
+    }
+    SUBCASE("-Xclang with an option the table does not know is passed through") {
+        rec.args = split_command_line("/Zi -Xclang -fsomething-odd a.cpp");
+        auto r = rewrite_for_patch(rec, options());
+        REQUIRE(r);
+        CHECK(index_of(r->args, "-Xclang") != static_cast<std::size_t>(-1));
+        CHECK(index_of(r->args, "-fsomething-odd") != static_cast<std::size_t>(-1));
+    }
+    SUBCASE("-Xclang -emit-llvm-bc is replaced and warns") {
+        rec.args = split_command_line("/Zi -Xclang -emit-llvm-bc a.cpp");
+        auto r = rewrite_for_patch(rec, options());
+        REQUIRE(r);
+        CHECK(index_of(r->args, "-emit-obj") != static_cast<std::size_t>(-1));
+        REQUIRE(r->warnings.size() == 1);
+        CHECK(r->warnings[0].code == diag::kWholeProgramDowngraded);
+    }
 }

@@ -1,6 +1,7 @@
 #include "cml/toolchain/rewrite.h"
 
 #include <cstdio>
+#include <filesystem>
 #include <memory>
 #include <regex>
 #include <vector>
@@ -124,6 +125,69 @@ struct Seen {
 
 }  // namespace
 
+// The compiler PDB a /Yu translation unit needs a private copy of. Order: the PDB recorded next to the command when it
+// exists; else /Fd: a file, or (value ends in a separator, or is an existing directory) vc<NNN>.pdb in that directory -
+// the one the recorded PDB names, else the only / highest-numbered vc*.pdb there, else vc140.pdb (every toolset since
+// VS2015 uses vc140.pdb); else whatever was recorded even if it is not there (the copy then fails with a warning).
+static std::string resolve_compiler_pdb(const std::string& fd_value, const std::string& recorded_pdb, const std::string& cwd) {
+    // Separator of the paths at hand: backslash, unless they are plain forward-slash paths (portable test hosts).
+    const auto separator_for = [](const std::string& p) { return p.find('\\') == std::string::npos && p.find('/') != std::string::npos ? '/' : '\\'; };
+    const auto absolute = [&](std::string p) {
+        if (!p.empty() && !detail::is_absolute(p) && !cwd.empty()) {
+            p = cwd + (path::is_separator(cwd.back()) ? std::string() : std::string(1, separator_for(cwd))) + p;
+        }
+        return p;
+    };
+    const std::string recorded = recorded_pdb.empty() ? std::string() : absolute(recorded_pdb);
+    if (!recorded.empty() && detail::file_exists(recorded)) {
+        return recorded;
+    }
+    if (fd_value.empty()) {
+        return recorded;
+    }
+    std::string fd = absolute(fd_value);
+    std::error_code ec;
+    const bool is_dir = path::is_separator(fd.back()) || std::filesystem::is_directory(detail::to_path(fd), ec);
+    if (!is_dir) {
+        if (path::base_name(std::string_view(fd)).find('.') == std::string_view::npos) {
+            fd += ".pdb";
+        }
+        return fd;
+    }
+    std::string dir = fd;
+    const char sep = separator_for(fd);
+    if (!path::is_separator(dir.back())) {
+        dir.push_back(sep);
+    }
+    const std::string recorded_name = detail::lower(path::base_name(std::string_view(recorded)));
+    std::string best;
+    unsigned best_number = 0;
+    for (std::filesystem::directory_iterator it(detail::to_path(dir), ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string name = detail::to_utf8(it->path().filename());
+        const std::string lname = detail::lower(name);
+        if (lname.size() < 7 || lname.compare(0, 2, "vc") != 0 || lname.compare(lname.size() - 4, 4, ".pdb") != 0) {
+            continue;
+        }
+        bool digits = lname.size() > 6;
+        unsigned number = 0;
+        for (std::size_t k = 2; k + 4 < lname.size(); ++k) {
+            digits = digits && lname[k] >= '0' && lname[k] <= '9';
+            number = number * 10 + static_cast<unsigned>(lname[k] - '0');
+        }
+        if (!digits) {
+            continue;
+        }
+        if (lname == recorded_name) {
+            return dir + name;
+        }
+        if (best.empty() || number > best_number) {
+            best = dir + name;
+            best_number = number;
+        }
+    }
+    return best.empty() ? dir + "vc140.pdb" : best;
+}
+
 std::string patch_object_path(std::string_view session_tmp, std::string_view module_name, std::uint64_t compiland_hash,
                               std::string_view source) {
     std::string module;
@@ -200,38 +264,133 @@ Result<RewriteResult> rewrite_for_patch(const CompileRecord& record, const Rewri
     Seen seen;
     std::vector<std::string> kept;
     const std::vector<std::string>& in = res.expanded_args;
-    for (std::size_t i = 0; i < in.size(); ++i) {
-        const std::string& tok = in[i];
-        if (!is_option(tok)) {
-            kept.push_back(tok);
-            trace("keep input " + tok);
-            continue;
-        }
-        const std::string_view text = std::string_view(tok).substr(1);
-        const Rule* rule = find_rule(tables, text);
-        if (rule == nullptr) {
-            kept.push_back(tok);
-            continue;
-        }
+    const bool driver = res.dialect == Dialect::ClangClDriver;
+    // Index in `kept` of the end-of-options marker ("--", clang-cl also "/--"); npos = none. Everything after it
+    // is an input, and every option the rewriter appends goes BEFORE it.
+    constexpr std::size_t kNoMarker = static_cast<std::size_t>(-1);
+    std::size_t marker = kNoMarker;
+
+    // Warning and tag bookkeeping shared by the plain path and the -Xclang / /clang: pass-through path.
+    const auto note_rule = [&](const Rule& rule, const std::string& spelled) {
         bool already_warned = false;
         for (const Diag& w : res.warnings) {
-            already_warned = already_warned || w.code == rule->warn_diag;
+            already_warned = already_warned || w.code == rule.warn_diag;
         }
-        if (rule->warn_diag != 0 && !already_warned) {
-            res.warnings.push_back(Diag::make(rule->warn_diag, replace_all(replace_all(rule->why, "{opt}", tok), "{file}", display_source),
-                                              rule->warn_diag == diag::kWholeProgramDowngraded
+        if (rule.warn_diag != 0 && !already_warned) {
+            res.warnings.push_back(Diag::make(rule.warn_diag, replace_all(replace_all(rule.why, "{opt}", spelled), "{file}", display_source),
+                                              rule.warn_diag == diag::kWholeProgramDowngraded
                                                   ? "Build with /GL- for hot-reload sessions to keep the patched code identical to the original."
                                                   : "See the log for details."));
         }
-        switch (rule->tag) {
+        switch (rule.tag) {
             case Tag::DebugInfo: seen.debug_info = true; break;
             case Tag::EditAndContinue: seen.debug_info = true; break;
             case Tag::PchUse: seen.pch_use = true; break;
             case Tag::ShowIncludes: seen.show_includes = true; break;
             case Tag::CodeViewCommandLine: seen.codeview_cmdline = true; break;
             case Tag::FunctionLinking: seen.function_linking = true; break;
-            case Tag::PdbFile: seen.fd_value = tok.substr(3); break;
             default: break;
+        }
+    };
+    const auto refuse = [&](const Rule& rule, const std::string& spelled) {
+        const std::string msg = replace_all(replace_all(rule.why, "{opt}", spelled), "{file}",
+                                            display_source.empty() ? std::string("<source>") : display_source);
+        return Diag::make(rule.diag, msg, what_to_do_for(rule.diag));
+    };
+
+    for (std::size_t i = 0; i < in.size(); ++i) {
+        const std::string& tok = in[i];
+        if (marker != kNoMarker) {
+            kept.push_back(tok);  // after "--" nothing is an option
+            continue;
+        }
+        if (tok == "--" || (driver && tok == "/--")) {
+            marker = kept.size();
+            kept.push_back(tok);
+            trace("end of options " + tok);
+            continue;
+        }
+        if (!is_option(tok)) {
+            kept.push_back(tok);
+            trace("keep input " + tok);
+            continue;
+        }
+        const std::string_view text = std::string_view(tok).substr(1);
+
+        // clang-cl driver: "-Xclang <cc1 option>" and "/clang:<option>" are judged by the cc1 rule table, so
+        // `-Xclang -dependency-file`, `-Xclang -emit-pch`, `/clang:-gno-codeview-command-line`, ... behave as on the cc1 path.
+        if (driver) {
+            std::string inner;
+            bool via_xclang = false;
+            bool via_clang = false;
+            if ((tok == "-Xclang" || tok == "/Xclang") && i + 1 < in.size()) {
+                inner = in[i + 1];
+                via_xclang = true;
+            } else if (tok.compare(0, 7, "/clang:") == 0 || tok.compare(0, 7, "-clang:") == 0) {
+                if (find_rule({TableRef{clang_cl_extra_rules(), &extra_regexes()}}, text) == nullptr) {
+                    inner = tok.substr(7);
+                    via_clang = true;
+                }
+            }
+            if ((via_xclang || via_clang) && inner.size() >= 2 && inner[0] == '-') {
+                const Rule* r = find_rule({TableRef{cc1_rules(), &cc1_regexes()}}, std::string_view(inner).substr(1));
+                if (r != nullptr) {
+                    note_rule(*r, tok);
+                    if (r->action == Action::Error) {
+                        return refuse(*r, inner);
+                    }
+                    const std::size_t head = via_xclang ? 1 : 0;  // tokens of this option beyond `tok`
+                    if (r->action == Action::Drop || r->action == Action::DropRest) {
+                        std::size_t j = i + head;  // last token of the option itself
+                        for (unsigned k = 0; k < r->consume_next && j + 1 < in.size(); ++k) {
+                            ++j;  // the value, preceded by "-Xclang" in that spelling
+                            if (via_xclang && (in[j] == "-Xclang" || in[j] == "/Xclang") && j + 1 < in.size()) {
+                                ++j;
+                            }
+                        }
+                        trace("drop " + tok + (via_xclang ? " " + inner : std::string()) + " (" + r->why + ")");
+                        i = j;
+                        continue;
+                    }
+                    if (r->action == Action::Replace) {
+                        const std::string repl = "-" + std::string(r->replacement);
+                        if (via_xclang) {
+                            kept.push_back(tok);
+                            kept.push_back(repl);
+                        } else {
+                            kept.push_back(tok.substr(0, 7) + repl);
+                        }
+                        trace("replace " + inner + " -> " + repl);
+                        i += head;
+                        continue;
+                    }
+                    // Keep: the option (and its separate values) pass through unchanged.
+                    kept.push_back(tok);
+                    if (via_xclang) {
+                        kept.push_back(in[i + 1]);
+                        ++i;
+                    }
+                    trace("keep " + tok + (via_xclang ? " " + inner : std::string()));
+                    continue;
+                }
+            }
+        }
+
+        const Rule* rule = find_rule(tables, text);
+        if (rule == nullptr) {
+            kept.push_back(tok);
+            continue;
+        }
+        note_rule(*rule, tok);
+        if (rule->tag == Tag::PdbFile) {
+            if (rule->consume_next > 0 && i + 1 < in.size()) {
+                seen.fd_value = in[i + 1];  // "/Fd:" <value>
+            } else {
+                seen.fd_value = tok.substr(3);
+                if (!seen.fd_value.empty() && seen.fd_value.front() == ':') {
+                    seen.fd_value.erase(0, 1);  // "/Fd:<value>"
+                }
+            }
         }
         if (rule->tag == Tag::PchUse || rule->tag == Tag::PchFile) {
             seen.pch_tokens.push_back(kept.size());
@@ -264,9 +423,8 @@ Result<RewriteResult> rewrite_for_patch(const CompileRecord& record, const Rewri
                 }
                 i += rule->consume_next;
                 if (rule->tag == Tag::EditAndContinue && !seen.function_linking) {
-                    // /ZI implied /Gy: keep function-level linking. A later explicit /Gy- is still
-                    // honoured because it is kept verbatim after this point... except that the
-                    // explicit option comes later in the list and wins in cl as well.
+                    // /ZI implied /Gy: keep function-level linking. A later explicit /Gy- is kept verbatim
+                    // after this point and wins, as it does in cl.
                     kept.push_back(std::string(1, tok[0]) + "Gy");
                     trace("add " + kept.back() + " (/ZI implied /Gy)");
                 }
@@ -278,9 +436,7 @@ Result<RewriteResult> rewrite_for_patch(const CompileRecord& record, const Rewri
                 break;
             }
             case Action::Error: {
-                const std::string msg = replace_all(replace_all(rule->why, "{opt}", tok), "{file}",
-                                                    display_source.empty() ? std::string("<source>") : display_source);
-                return Diag::make(rule->diag, msg, what_to_do_for(rule->diag));
+                return refuse(*rule, tok);
             }
         }
     }
@@ -329,6 +485,9 @@ Result<RewriteResult> rewrite_for_patch(const CompileRecord& record, const Rewri
                     if (seen.z7_index != static_cast<std::size_t>(-1) && idx < seen.z7_index) {
                         --seen.z7_index;
                     }
+                    if (marker != kNoMarker && idx < marker) {
+                        --marker;
+                    }
                 }
             }
         } else if (mode == PchDebugMode::KeepZiPrivatePdb && seen.zi_replaced && seen.z7_index < kept.size()) {
@@ -338,10 +497,7 @@ Result<RewriteResult> rewrite_for_patch(const CompileRecord& record, const Rewri
                 dir = std::string(path::parent_directory(std::string_view(options.output_object)));
             }
             private_pdb = dir + (dir.empty() || path::is_separator(dir.back()) ? "" : "\\") + path_stem(res.source) + ".compiler.pdb";
-            std::string from = seen.fd_value.empty() ? record.recorded_pdb : seen.fd_value;
-            if (!from.empty() && !detail::is_absolute(from) && !record.cwd.empty()) {
-                from = record.cwd + (path::is_separator(record.cwd.back()) ? "" : "\\") + from;
-            }
+            const std::string from = resolve_compiler_pdb(seen.fd_value, record.recorded_pdb, record.cwd);
             if (from.empty()) {
                 res.warnings.push_back(Diag::make(diag::kPdbCopyFailed,
                                                   "no compiler PDB is recorded for '" + res.source + "'; the PCH-using TU is compiled with a fresh /Zi PDB",
@@ -357,9 +513,12 @@ Result<RewriteResult> rewrite_for_patch(const CompileRecord& record, const Rewri
     }
 
     // ---- assemble ---------------------------------------------------------------------------
+    // Appended options go before the end-of-options marker; the marker and what follows it come last.
+    std::vector<std::string> head(kept.begin(), kept.begin() + static_cast<std::ptrdiff_t>(marker == kNoMarker ? kept.size() : marker));
+    std::vector<std::string> tail(kept.begin() + static_cast<std::ptrdiff_t>(marker == kNoMarker ? kept.size() : marker), kept.end());
     std::vector<std::string>& out = res.args;
     if (cc1) {
-        out.insert(out.end(), kept.begin(), kept.end());  // starts with -cc1 (that is how the dialect is detected)
+        out.insert(out.end(), head.begin(), head.end());  // starts with -cc1 (that is how the dialect is detected)
         for (const std::string& t : out) {
             if (t == "-emit-obj") {
                 seen.emit_obj = true;
@@ -383,13 +542,10 @@ Result<RewriteResult> rewrite_for_patch(const CompileRecord& record, const Rewri
         }
         out.push_back("-o");
         out.push_back(options.output_object);
-        if (!source_present) {
-            out.push_back(res.source);
-        }
     } else {
         out.push_back("/nologo");
         out.push_back("/c");
-        out.insert(out.end(), kept.begin(), kept.end());
+        out.insert(out.end(), head.begin(), head.end());
         if (options.capture_includes && !seen.show_includes) {
             out.push_back("/showIncludes");
         }
@@ -402,9 +558,10 @@ Result<RewriteResult> rewrite_for_patch(const CompileRecord& record, const Rewri
             trace("add /clang:-gcodeview-command-line");
         }
         out.push_back("/Fo" + options.output_object);
-        if (!source_present) {
-            out.push_back(res.source);
-        }
+    }
+    out.insert(out.end(), tail.begin(), tail.end());
+    if (!source_present) {
+        out.push_back(res.source);
     }
     res.command_line = join_command_line(out);
     CML_LOG(Debug, "toolchain: patch command for %s: %s %s", res.source.c_str(), res.compiler.c_str(), res.command_line.c_str());

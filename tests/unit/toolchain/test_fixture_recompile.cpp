@@ -396,3 +396,48 @@ TEST_CASE("fixture basic: recorded commands name a compiler that exists and a cw
         std::printf("TOOL %s family=%s version=%s\n", rec->compiler.c_str(), to_string(info->family), info->version_text.c_str());
     }
 }
+
+TEST_CASE("fixture pch: /Fd naming a directory (CMake's /Fd<dir>\\ form) resolves to the compiler PDB for a /Yu TU") {
+    if (!is_cl_cell()) {
+        return;  // clang-cl has no compiler PDB
+    }
+    const FixturePaths& paths = FixturePaths::get();
+    REQUIRE(paths.loaded());
+    auto idx = cml::pdb::PdbIndex::open_pdb(paths.value("pch_pdb"));
+    REQUIRE(idx);
+    int tested = 0;
+    for (const SourceCompiland& c : source_compilands(**idx)) {
+        if (c.stem != "logic") continue;
+        auto rec = record_from_build_env(c.env);
+        REQUIRE(rec);
+        const std::string recorded = rec->recorded_pdb;
+        const std::size_t slash = recorded.find_last_of("\\/");
+        REQUIRE(slash != std::string::npos);
+        std::string base = recorded.substr(slash + 1);
+        std::transform(base.begin(), base.end(), base.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        if (base.size() < 7 || base.compare(0, 2, "vc") != 0) {
+            std::printf("FD-DIR skipped: the compiler PDB of this generator is '%s', not vc<NNN>.pdb\n", base.c_str());
+            continue;
+        }
+        rec->recorded_pdb.clear();                                   // only /Fd tells where the PDB is
+        rec->args.push_back("-Fd" + recorded.substr(0, slash + 1));  // a directory, trailing backslash
+        CompileRequest req;
+        req.record = *rec;
+        req.output_object = patch_object_path(work_dir("fd_dir"), "fixture", 7, rec->source);
+        req.pch_debug = PchDebugMode::KeepZiPrivatePdb;
+        req.fallback_search_dirs = fallback_dirs();
+        CompileOutcome out;
+        auto r = compile_tu(req, out);
+        REQUIRE_MESSAGE(r, r.error().format() << "\ncommand: " << out.command_line << "\n" << out.output);
+        for (const cml::Diag& w : out.warnings) {
+            CHECK(w.code != diag::kPdbCopyFailed);
+        }
+        auto before = symbol_set_of_file(find_object("pch_objs", "logic"));
+        auto after = symbol_set_of_file(out.object_path);
+        REQUIRE(before);
+        REQUIRE(after);
+        CHECK(diff_symbol_sets(*before, *after).empty());
+        ++tested;
+    }
+    std::printf("FD-DIR tested=%d\n", tested);
+}

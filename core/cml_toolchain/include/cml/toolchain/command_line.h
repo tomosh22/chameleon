@@ -23,9 +23,17 @@
 
 namespace cml::toolchain {
 
+// What a doubled quote inside a quoted region means. The two Windows parsers differ:
+//   Crt        the C runtime's argv parser since VS2008 / the UCRT (parse_cmdline): `""` inside quotes is one literal
+//              `"` and the region stays quoted. cl.exe and clang(-cl) parse their command line this way, so it is the
+//              default and what every recorded command is split with.
+//   ShellArgv  shell32's CommandLineToArgvW: `""` inside quotes emits one `"` and ENDS the quoted region.
+// Everything else (whitespace, backslash runs before quotes) is identical in both.
+enum class QuoteMode { Crt, ShellArgv };
+
 // Splits `command_line` into arguments. There is no special first-argument rule: callers decide
 // whether the first token is a program name (see CompileRecord).
-std::vector<std::string> split_command_line(std::string_view command_line);
+std::vector<std::string> split_command_line(std::string_view command_line, QuoteMode mode = QuoteMode::Crt);
 
 // The quoting clang uses when it records its cc1 command line in CodeView (llvm::sys::printArg
 // with Quote=true): every argument in double quotes, and inside them a backslash escapes `"`, `\`,
@@ -46,6 +54,8 @@ FileReader default_file_reader();
 std::string decode_response_file_bytes(std::string_view bytes);
 
 inline constexpr int kMaxResponseFileDepth = 8;
+inline constexpr int kMaxResponseFiles = 256;               // files read by one expansion (a file included twice counts twice)
+inline constexpr std::size_t kMaxResponseTokens = 1000000;  // tokens produced by one expansion
 
 // Replaces every "@file" token by the tokens of that file (recursively). A token that is just "@"
 // stays. CML1500 for an unreadable file, CML1501 beyond kMaxResponseFileDepth (also catches cycles).

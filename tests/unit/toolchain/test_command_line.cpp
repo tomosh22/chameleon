@@ -122,3 +122,74 @@ TEST_CASE("default_file_reader reports an unreadable file as CML1500") {
     REQUIRE_FALSE(r);
     CHECK(r.error().code == diag::kResponseFileUnreadable);
 }
+
+TEST_CASE("quote modes: the CRT parser (cl) and CommandLineToArgvW differ on a doubled quote inside quotes") {
+    // CRT (default, what cl.exe and clang see): "" inside quotes is one literal quote, the region stays quoted.
+    CHECK(split_command_line(R"("a ""b"" c")") == Tokens{R"(a "b" c)"});
+    CHECK(split_command_line(R"("a ""b"" c")", QuoteMode::Crt) == Tokens{R"(a "b" c)"});
+    // CommandLineToArgvW: "" inside quotes emits one quote and ENDS the quoted region, so ` c` is split off.
+    CHECK(split_command_line(R"("a ""b"" c")", QuoteMode::ShellArgv) == Tokens{R"(a "b)", "c"});
+    CHECK(split_command_line(R"(x"y ""z)", QuoteMode::Crt) == Tokens{R"(xy "z)"});
+    CHECK(split_command_line(R"(x"y ""z w)", QuoteMode::ShellArgv) == Tokens{R"(xy "z)", "w"});
+    // Everything else is identical.
+    for (const char* text : {R"(a\\\"b c d)", R"("abc" d e)", R"(a\\\\"b c" d e)", "a b\tc", R"("" x)"}) {
+        CAPTURE(text);
+        CHECK(split_command_line(text, QuoteMode::Crt) == split_command_line(text, QuoteMode::ShellArgv));
+    }
+}
+
+TEST_CASE("response files: real cycles, limits") {
+    FakeFs fs;
+    SUBCASE("a cycle through two files is CML1501, a diamond (same file twice, not nested) is fine") {
+        fs.files[R"(D:\w\a.rsp)"] = "@b.rsp";
+        fs.files[R"(D:\w\b.rsp)"] = "@A.RSP";  // case-insensitive path, same file
+        auto cyc = expand_response_files({"@a.rsp"}, R"(D:\w)", fs.reader());
+        REQUIRE_FALSE(cyc);
+        CHECK(cyc.error().code == diag::kResponseFileTooDeep);
+        CHECK(cyc.error().message.find("cycle") != std::string::npos);
+
+        fs.files[R"(D:\w\c.rsp)"] = "@leaf.rsp @leaf.rsp /DX";
+        fs.files[R"(D:\w\leaf.rsp)"] = "/DLEAF";
+        auto diamond = expand_response_files({"@c.rsp", "@leaf.rsp"}, R"(D:\w)", fs.reader());
+        REQUIRE(diamond);
+        CHECK(*diamond == Tokens{"/DLEAF", "/DLEAF", "/DX", "/DLEAF"});
+    }
+    SUBCASE("a file that includes itself directly") {
+        fs.files[R"(D:\w\s.rsp)"] = "/DA @s.rsp";
+        auto r = expand_response_files({"@s.rsp"}, R"(D:\w)", fs.reader());
+        REQUIRE_FALSE(r);
+        CHECK(r.error().code == diag::kResponseFileTooDeep);
+    }
+    SUBCASE("more than 256 files read") {
+        fs.files[R"(D:\w\leaf.rsp)"] = "/DL";
+        Tokens args;
+        for (int i = 0; i < kMaxResponseFiles + 1; ++i) {
+            args.push_back("@leaf.rsp");
+        }
+        auto r = expand_response_files(args, R"(D:\w)", fs.reader());
+        REQUIRE_FALSE(r);
+        CHECK(r.error().code == diag::kResponseFileTooDeep);
+        args.pop_back();
+        auto ok = expand_response_files(args, R"(D:\w)", fs.reader());
+        REQUIRE(ok);
+        CHECK(ok->size() == static_cast<std::size_t>(kMaxResponseFiles));
+    }
+    SUBCASE("more than 1,000,000 tokens") {
+        std::string big;
+        big.reserve(2 * 600000);
+        for (int i = 0; i < 600000; ++i) {
+            big += "x ";
+        }
+        fs.files[R"(D:\w\big.rsp)"] = big;
+        auto one = expand_response_files({"@big.rsp"}, R"(D:\w)", fs.reader());
+        REQUIRE(one);
+        CHECK(one->size() == 600000);
+        auto two = expand_response_files({"@big.rsp", "@big.rsp"}, R"(D:\w)", fs.reader());
+        REQUIRE_FALSE(two);
+        CHECK(two.error().code == diag::kResponseFileTooDeep);
+        // Plain arguments count too.
+        Tokens many(kMaxResponseTokens + 1, "y");
+        auto plain = expand_response_files(many, R"(D:\w)", fs.reader());
+        REQUIRE_FALSE(plain);
+    }
+}

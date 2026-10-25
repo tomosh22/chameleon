@@ -1,5 +1,6 @@
 // CreateProcess with captured output, job-object cancellation, timeouts and @response files.
 #include <windows.h>
+#include <tlhelp32.h>
 
 #include <algorithm>
 #include <atomic>
@@ -91,23 +92,80 @@ std::wstring build_environment_block(const std::vector<std::pair<std::string, st
     return block;
 }
 
+// The tree below `root` (children, grandchildren, ...) from a Toolhelp snapshot, without the shared PDB server.
+std::vector<DWORD> descendants_of(DWORD root) {
+    std::vector<DWORD> found;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) {
+        return found;
+    }
+    std::vector<std::pair<DWORD, DWORD>> all;  // pid, parent
+    std::vector<std::wstring> names;
+    PROCESSENTRY32W e{};
+    e.dwSize = sizeof(e);
+    for (BOOL ok = Process32FirstW(snap, &e); ok; ok = Process32NextW(snap, &e)) {
+        all.emplace_back(e.th32ProcessID, e.th32ParentProcessID);
+        names.emplace_back(e.szExeFile);
+    }
+    CloseHandle(snap);
+    std::vector<DWORD> frontier{root};
+    while (!frontier.empty()) {
+        const DWORD parent = frontier.back();
+        frontier.pop_back();
+        for (std::size_t i = 0; i < all.size(); ++i) {
+            if (all[i].second != parent || all[i].first == root) {
+                continue;
+            }
+            if (_wcsicmp(names[i].c_str(), L"mspdbsrv.exe") == 0) {
+                continue;  // shared by other compiles: never ours to kill, and nothing below it is ours either
+            }
+            found.push_back(all[i].first);
+            frontier.push_back(all[i].first);
+        }
+    }
+    return found;
+}
+
 // State shared between the running process and the cancellation / timeout killers.
+//
+// Why the job object is created with JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK: cl /Zi starts mspdbsrv.exe, a PDB server
+// that other, concurrent compiles use. Processes created by a process in the job would otherwise join the job and
+// die with it on TerminateJobObject, taking the other compile's PDB server down (their /Zi compiles then fail). With
+// silent breakaway the compiler's children are outside the job. The price is that the job holds only the compiler
+// driver, so kill() also walks the process tree itself (Toolhelp snapshot taken BEFORE anything is terminated) and
+// terminates every descendant except mspdbsrv.exe.
 struct Killable {
     std::mutex mutex;
     HANDLE job = nullptr;
     HANDLE process = nullptr;
+    DWORD pid = 0;
     bool finished = false;
+    bool killed = false;
 
-    void kill() {
+    // True when this call killed the process tree; false when the process had already exited or finish() ran.
+    bool kill() {
         std::lock_guard<std::mutex> lock(mutex);
-        if (finished) {
-            return;
+        if (finished || killed) {
+            return false;
+        }
+        if (process != nullptr && WaitForSingleObject(process, 0) == WAIT_OBJECT_0) {
+            return false;  // exited on its own just now: not a cancellation
+        }
+        killed = true;
+        const std::vector<DWORD> tree = descendants_of(pid);
+        for (const DWORD child : tree) {
+            if (HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, child)) {
+                TerminateProcess(h, 1);
+                CloseHandle(h);
+            }
         }
         if (job != nullptr) {
             TerminateJobObject(job, 1);
-        } else if (process != nullptr) {
+        }
+        if (process != nullptr) {
             TerminateProcess(process, 1);
         }
+        return true;
     }
     void finish() {
         std::lock_guard<std::mutex> lock(mutex);
@@ -178,17 +236,34 @@ Result<ProcessResult> run_process(const ProcessSpec& spec, CancelToken* cancel) 
     res.command_line = command;
 
     // ---- pipe, NUL stdin ---------------------------------------------------------------------
+    // The read end is an overlapped named-pipe handle so the reader can always be stopped (a grandchild that inherited
+    // the write end would otherwise keep a blocking ReadFile alive for as long as it runs).
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
     HandleCloser read_end;
     HandleCloser write_end;
     HandleCloser nul;
-    if (!CreatePipe(&read_end.h, &write_end.h, &sa, 0)) {
+    {
+        static std::atomic<unsigned> pipe_counter{0};
+        wchar_t pipe_name[96];
+        swprintf(pipe_name, sizeof(pipe_name) / sizeof(pipe_name[0]), L"\\\\.\\pipe\\cml_toolchain_%lu_%u", GetCurrentProcessId(),
+                 pipe_counter.fetch_add(1));
+        read_end.h = CreateNamedPipeW(pipe_name, PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                                      PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 65536, 65536, 0, nullptr);
+        if (read_end.h == INVALID_HANDLE_VALUE) {
+            read_end.h = nullptr;
+        } else {
+            write_end.h = CreateFileW(pipe_name, GENERIC_WRITE, 0, &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (write_end.h == INVALID_HANDLE_VALUE) {
+                write_end.h = nullptr;
+            }
+        }
+    }
+    if (read_end.h == nullptr || write_end.h == nullptr) {
         return Diag::make(diag::kCannotStartCompiler, "cannot create a pipe for '" + spec.exe + "' (error " + std::to_string(GetLastError()) + ")",
                           "Close other programs or retry.");
     }
-    SetHandleInformation(read_end.h, HANDLE_FLAG_INHERIT, 0);
     nul.h = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (nul.h == INVALID_HANDLE_VALUE) {
         nul.h = nullptr;
@@ -255,9 +330,8 @@ Result<ProcessResult> run_process(const ProcessSpec& spec, CancelToken* cancel) 
     job.h = CreateJobObjectW(nullptr, nullptr);
     if (job.h != nullptr) {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-        // Not KILL_ON_JOB_CLOSE: cl /Zi may start mspdbsrv.exe, which other compiles share. The job
-        // exists to kill the whole tree on cancel / timeout (TerminateJobObject).
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+        // See Killable: silent breakaway keeps the shared mspdbsrv.exe out of the job; no KILL_ON_JOB_CLOSE.
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK;
         SetInformationJobObject(job.h, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
         if (!AssignProcessToJobObject(job.h, pi.hProcess)) {
             CML_LOG(Debug, "toolchain: AssignProcessToJobObject failed (%lu); cancelling will kill the main process only",
@@ -268,13 +342,14 @@ Result<ProcessResult> run_process(const ProcessSpec& spec, CancelToken* cancel) 
     }
     killable->job = job.h;
     killable->process = pi.hProcess;
+    killable->pid = pi.dwProcessId;
 
     CancelToken::Handle killer_handle = 0;
     if (cancel != nullptr) {
         killer_handle = cancel->add_killer([killable]() { killable->kill(); });
     }
 
-    // Timeout watchdog.
+    // Timeout watchdog: fires only while the process is still running (Killable::kill checks).
     std::atomic<bool> timed_out{false};
     HandleCloser done_event;
     std::thread watchdog;
@@ -283,39 +358,60 @@ Result<ProcessResult> run_process(const ProcessSpec& spec, CancelToken* cancel) 
         HANDLE ev = done_event.h;
         const unsigned ms = spec.timeout_ms;
         watchdog = std::thread([killable, ev, ms, &timed_out]() {
-            if (WaitForSingleObject(ev, ms) == WAIT_TIMEOUT) {
+            if (WaitForSingleObject(ev, ms) == WAIT_TIMEOUT && killable->kill()) {
                 timed_out.store(true);
-                killable->kill();
             }
         });
     }
 
     ResumeThread(pi.hThread);
 
-    // ---- output reader ---------------------------------------------------------------------------
-    std::atomic<bool> reader_done{false};
+    // ---- output reader (overlapped, stoppable) ------------------------------------------------------
+    HandleCloser stop_event;
+    stop_event.h = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HandleCloser reader_finished;
+    reader_finished.h = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     std::string captured;
     HANDLE read_handle = read_end.h;
-    std::thread reader([&captured, read_handle, &reader_done]() {
+    HANDLE stop_h = stop_event.h;
+    HANDLE finished_h = reader_finished.h;
+    std::thread reader([&captured, read_handle, stop_h, finished_h]() {
+        HandleCloser io_event;
+        io_event.h = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        const HANDLE waits[2] = {io_event.h, stop_h};
         char buf[8192];
-        DWORD n = 0;
-        while (ReadFile(read_handle, buf, sizeof(buf), &n, nullptr) && n > 0) {
+        for (;;) {
+            OVERLAPPED ov{};
+            ov.hEvent = io_event.h;
+            ResetEvent(io_event.h);
+            DWORD n = 0;
+            if (!ReadFile(read_handle, buf, sizeof(buf), &n, &ov)) {
+                if (GetLastError() != ERROR_IO_PENDING) {
+                    break;  // broken pipe: every writer is gone
+                }
+                if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
+                    CancelIoEx(read_handle, &ov);
+                    if (GetOverlappedResult(read_handle, &ov, &n, TRUE) && n > 0) {
+                        captured.append(buf, n);
+                    }
+                    break;
+                }
+                if (!GetOverlappedResult(read_handle, &ov, &n, FALSE)) {
+                    break;
+                }
+            }
+            if (n == 0) {
+                break;
+            }
             captured.append(buf, n);
         }
-        reader_done.store(true);
+        SetEvent(finished_h);
     });
 
     WaitForSingleObject(pi.hProcess, INFINITE);
-    // The pipe closes when every holder of the write end is gone. A grandchild (mspdbsrv) may keep
-    // it open: give the reader a moment, then cancel its blocking read.
-    for (int i = 0; i < 200 && !reader_done.load(); ++i) {
-        Sleep(5);
-    }
-    if (!reader_done.load()) {
-        CancelIoEx(read_handle, nullptr);
-    }
-    reader.join();
-
+    // The process is gone. Nothing may be reported as a timeout or cancellation from here on, so the killers are
+    // disarmed first; only then the output is drained.
+    killable->finish();
     if (watchdog.joinable()) {
         SetEvent(done_event.h);
         watchdog.join();
@@ -323,14 +419,18 @@ Result<ProcessResult> run_process(const ProcessSpec& spec, CancelToken* cancel) 
     if (cancel != nullptr) {
         cancel->remove_killer(killer_handle);
     }
-    killable->finish();
+    // A grandchild that inherited the pipe may keep it open: give the reader a bounded grace period, then stop it.
+    if (WaitForSingleObject(reader_finished.h, static_cast<DWORD>(kProcessDrainGraceMs)) != WAIT_OBJECT_0) {
+        SetEvent(stop_event.h);
+    }
+    reader.join();
 
     DWORD code = 1;
     GetExitCodeProcess(pi.hProcess, &code);
     res.exit_code = static_cast<int>(code);
     res.output = std::move(captured);
     res.timed_out = timed_out.load();
-    res.cancelled = cancel != nullptr && cancel->cancelled();
+    res.cancelled = killable->killed && !res.timed_out;
     return res;
 }
 

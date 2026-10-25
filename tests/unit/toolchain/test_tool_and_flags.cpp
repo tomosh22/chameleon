@@ -197,7 +197,10 @@ TEST_CASE("flags: /Gy from the command line, implied options and the object's CO
     CHECK(zi.function_level_linking.source == Evidence::CommandLineImplied);
     CHECK(facts_for("/c /O2 a.cpp", Dialect::Cl).function_level_linking.value == Tri::Yes);
     CHECK(facts_for("/c /O2 /Gy- a.cpp", Dialect::Cl).function_level_linking.value == Tri::No);
-    CHECK(facts_for("/c /O2 a.cpp", Dialect::ClangClDriver).function_level_linking.value == Tri::No);  // clang-cl: /O2 does not imply /Gy
+    CHECK(facts_for("/c /O2 a.cpp", Dialect::ClangClDriver).function_level_linking.value == Tri::Yes);  // clang-cl: /O1 and /O2 include /Gy
+    CHECK(facts_for("/c /O1 a.cpp", Dialect::ClangClDriver).function_level_linking.source == Evidence::CommandLineImplied);
+    CHECK(facts_for("/c /O2 /Gy- a.cpp", Dialect::ClangClDriver).function_level_linking.value == Tri::No);
+    CHECK(facts_for("/c /Od a.cpp", Dialect::ClangClDriver).function_level_linking.value == Tri::No);
     CHECK(facts_for("/c /Od a.cpp", Dialect::Cl).function_level_linking.source == Evidence::CommandLineAbsent);
     CHECK(facts_for("-cc1 -ffunction-sections", Dialect::ClangCc1).function_level_linking.value == Tri::Yes);
     CHECK(facts_for("-cc1 -ffunction-sections -fno-function-sections", Dialect::ClangCc1).function_level_linking.value == Tri::No);

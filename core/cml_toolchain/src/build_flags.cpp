@@ -99,7 +99,7 @@ CmdScan scan_command_line(std::span<const std::string> args, Dialect dialect) {
         else if (t == "Gy") set(scan.gy, Tri::Yes, false, tok);
         else if (t == "Gy-") set(scan.gy, Tri::No, false, tok);
         else if (cl && t == "ZI") set(scan.gy, Tri::Yes, true, tok);
-        else if (cl && (t == "O1" || t == "O2")) set(scan.gy, Tri::Yes, true, tok);
+        else if (t == "O1" || t == "O2") set(scan.gy, Tri::Yes, true, tok);  // cl and clang-cl: /O1 and /O2 include /Gy
         else if (t == "hotpatch") set(scan.hotpatch, Tri::Yes, false, tok);
         else if (t == "guard:cf" || t.substr(0, 9) == "guard:cf,") set(scan.guard_cf, Tri::Yes, false, tok);
         else if (t == "guard:cf-") set(scan.guard_cf, Tri::No, false, tok);

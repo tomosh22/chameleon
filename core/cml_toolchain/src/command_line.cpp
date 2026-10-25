@@ -6,6 +6,7 @@
 #include <iterator>
 #include <system_error>
 
+#include "cml/pdb/index.h"
 #include "cml/toolchain/diag_ids.h"
 #include "cml/util/log.h"
 #include "cml/util/path.h"
@@ -39,7 +40,7 @@ void append_utf8(std::string& out, std::uint32_t cp) {
 
 }  // namespace
 
-std::vector<std::string> split_command_line(std::string_view s) {
+std::vector<std::string> split_command_line(std::string_view s, QuoteMode mode) {
     std::vector<std::string> out;
     std::string cur;
     bool in_token = false;
@@ -72,8 +73,9 @@ std::vector<std::string> split_command_line(std::string_view s) {
         if (c == '"') {
             in_token = true;
             if (in_quotes && i + 1 < n && s[i + 1] == '"') {
-                cur.push_back('"');  // "" inside quotes: one literal quote, still quoted
+                cur.push_back('"');  // "" inside quotes: one literal quote ...
                 i += 2;
+                in_quotes = mode == QuoteMode::Crt;  // ... and the CRT stays quoted, CommandLineToArgvW does not
                 continue;
             }
             in_quotes = !in_quotes;
@@ -216,18 +218,33 @@ FileReader default_file_reader() {
 
 namespace {
 
-Result<void> expand_into(const std::vector<std::string>& in, std::string_view cwd, const FileReader& reader,
-                         int depth, std::vector<std::string>& out) {
+struct ExpandState {
+    int files = 0;
+    std::size_t tokens = 0;
+    std::vector<std::string> stack;  // normalised paths of the response files being expanded, outermost first
+};
+
+Result<void> expand_into(const std::vector<std::string>& in, std::string_view cwd, const FileReader& reader, ExpandState& st,
+                         std::vector<std::string>& out) {
     for (const std::string& arg : in) {
         if (arg.size() < 2 || arg[0] != '@') {
             out.push_back(arg);
+            if (++st.tokens > kMaxResponseTokens) {
+                return Diag::make(diag::kResponseFileTooDeep,
+                                  "the command line expands to more than " + std::to_string(kMaxResponseTokens) + " tokens",
+                                  "Remove the runaway @file reference from the recorded command line.");
+            }
             continue;
         }
-        if (depth >= kMaxResponseFileDepth) {
+        if (static_cast<int>(st.stack.size()) >= kMaxResponseFileDepth) {
             return Diag::make(diag::kResponseFileTooDeep,
-                              "response files nest deeper than " + std::to_string(kMaxResponseFileDepth) +
-                                  " levels at '" + arg + "'",
-                              "Remove the recursive @file reference from the recorded command line.");
+                              "response files nest deeper than " + std::to_string(kMaxResponseFileDepth) + " levels at '" + arg + "'",
+                              "Remove the deeply nested @file reference from the recorded command line.");
+        }
+        if (st.files >= kMaxResponseFiles) {
+            return Diag::make(diag::kResponseFileTooDeep,
+                              "more than " + std::to_string(kMaxResponseFiles) + " response files are read at '" + arg + "'",
+                              "Remove the runaway @file references from the recorded command line.");
         }
         std::string path = arg.substr(1);
         if (path.size() >= 2 && path.front() == '"' && path.back() == '"') {
@@ -240,12 +257,22 @@ Result<void> expand_into(const std::vector<std::string>& in, std::string_view cw
             }
             path = joined + path;
         }
+        const std::string canonical = pdb::normalize_path(path);
+        for (const std::string& open : st.stack) {
+            if (open == canonical) {
+                return Diag::make(diag::kResponseFileTooDeep, "response file '" + path + "' includes itself (cycle)",
+                                  "Remove the recursive @file reference from the recorded command line.");
+            }
+        }
+        ++st.files;
         Result<std::string> text = reader(path);
         if (!text) {
             return text.error();
         }
         CML_LOG(Trace, "toolchain: expanding response file %s", path.c_str());
-        Result<void> nested = expand_into(split_command_line(*text), cwd, reader, depth + 1, out);
+        st.stack.push_back(canonical);
+        Result<void> nested = expand_into(split_command_line(*text), cwd, reader, st, out);
+        st.stack.pop_back();
         if (!nested) {
             return nested;
         }
@@ -259,7 +286,8 @@ Result<std::vector<std::string>> expand_response_files(const std::vector<std::st
                                                        std::string_view cwd, const FileReader& reader) {
     std::vector<std::string> out;
     out.reserve(arguments.size());
-    Result<void> r = expand_into(arguments, cwd, reader ? reader : default_file_reader(), 0, out);
+    ExpandState st;
+    Result<void> r = expand_into(arguments, cwd, reader ? reader : default_file_reader(), st, out);
     if (!r) {
         return r.error();
     }
