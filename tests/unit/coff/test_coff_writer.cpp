@@ -853,6 +853,7 @@ TEST_CASE("coff anchors: on every fixture object, anchored objects keep the orig
     REQUIRE(p.loaded());
     std::size_t checked = 0;
     std::size_t tags = 0;
+    std::size_t with_anchors = 0;  // objects that needed at least one anchor: only they claim a tag
     for (const char* key : {"basic_objs", "cov_extras_objs", "bigobj_objs"}) {
         std::unordered_set<std::string> used_tags;  // the objects of one list are linked together: tags must be unique
         const std::string list = p.value(key);
@@ -882,20 +883,23 @@ TEST_CASE("coff anchors: on every fixture object, anchored objects keep the orig
             REQUIRE_MESSAGE(after.has_value(), path << ": " << after.error().format());
             check_anchored(owned->object, *after, *loc, tag, path);
             std::size_t with = 0;
+            bool any_anchor = false;
             for (const coff::SectionLocator& l : *loc) {
                 with += l.kind == coff::LocatorKind::None ? 0u : 1u;
+                any_anchor = any_anchor || l.kind == coff::LocatorKind::Anchor;
             }
             CHECK_MESSAGE(with > 0, path);
             // Anchored output is itself a fixed point of the writer.
             auto again = coff::rewrite(*after);
             REQUIRE(again.has_value());
             CHECK(to_u8(*again) == to_u8(*w));
+            with_anchors += any_anchor ? 1u : 0u;
             ++checked;
         }
         tags += used_tags.size();
     }
     CHECK(checked >= 6u);
-    CHECK(tags == checked);
+    CHECK(tags == with_anchors);
 }
 
 
