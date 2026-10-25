@@ -25,3 +25,9 @@ endif()
 if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/integration/CMakeLists.txt")
     add_subdirectory(integration)
 endif()
+
+# WP-04: cml_pdb_bench (load time / memory benchmark; the large-PDB run is the `pdb-benchmark` CI job).
+# Added after fixtures/ so that it can refer to the fixture targets.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench/CMakeLists.txt")
+    add_subdirectory(bench)
+endif()

@@ -86,6 +86,30 @@ jobs:
           & "$env:BUILD_DIR/bin/cml_broker.exe" --version *>&1 | Tee-Object -FilePath "$env:LOG_DIR/broker-version.txt"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # WP-04: what cml_pdb indexes for the fixture built by this cell's compiler. The log is the
+      # evidence docs/wp/WP-04.md quotes (S_ENVBLOCK vs S_BUILDINFO, names of statics/templates).
+      - name: cml_pdb_dump of fixture_basic (evidence)
+        run: |
+          $dump = "$env:BUILD_DIR/bin/cml_pdb_dump.exe"
+          $exe = "$env:BUILD_DIR/bin/fixture_basic.exe"
+          $out = "$env:LOG_DIR/pdb-dump.txt"
+          "== summary ==" | Tee-Object -FilePath $out
+          & $dump $exe --summary *>&1 | Tee-Object -FilePath $out -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "== compilands ==" | Tee-Object -FilePath $out -Append
+          & $dump $exe --compilands *>&1 | Tee-Object -FilePath $out -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($stem in 'main', 'logic', 'extras') {
+            "== compiland $stem ==" | Tee-Object -FilePath $out -Append
+            & $dump $exe --compiland $stem *>&1 | Tee-Object -FilePath $out -Append
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          foreach ($needle in 'add_one', 'extras', 'g_tick', 'compute_value', 'fixture_note') {
+            "== publics containing '$needle' ==" | Tee-Object -FilePath $out -Append
+            & $dump $exe --publics $needle *>&1 | Tee-Object -FilePath $out -Append
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
       # ---- Extension point (later WPs): build tests/fixtures, run cmltest.exe, ... -----------
       # Add steps here, between "Run cml_broker --version" and the artifact upload. Write any
       # logs you want to keep into $env:LOG_DIR; the upload step below always runs.
@@ -119,3 +143,84 @@ jobs:
         run: cmake --build build-vs --config Debug --parallel
       - name: Test (Debug)
         run: ctest --test-dir build-vs -C Debug --output-on-failure
+
+  # WP-04 (ADR-0009): load-time / memory benchmark of cml_pdb on a large synthetic PDB. Not part of
+  # the 8-cell matrix. The PDB is built once (python generator -> MSVC /Z7 + /DEBUG:FULL) and cached
+  # by actions/cache, keyed by the generator script's hash and BENCH_ID (the generator parameters);
+  # a cache hit skips the long build. Raise --tus / --funcs-per-tu (and BENCH_ID) for a 500 MB+ PDB.
+  pdb-benchmark:
+    name: pdb-benchmark (windows-2022 / msvc / RelWithDebInfo)
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      BENCH_ID: tus900-f1000-h24-s1-Z7
+      LOG_DIR: ci-logs
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore the cached benchmark PDB
+        id: pdbcache
+        uses: actions/cache/restore@v4
+        with:
+          path: bench-pdb/bench_project.pdb
+          key: pdb-bench-${{ env.BENCH_ID }}-${{ hashFiles('tests/bench/gen_pdb_project.py') }}
+
+      - name: Set up MSVC developer environment (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Generate and build the benchmark project (cache miss only)
+        if: steps.pdbcache.outputs.cache-hit != 'true'
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
+          python tests/bench/gen_pdb_project.py bench-src --tus 900 --funcs-per-tu 1000 --headers 24 --seed 1 --debug-format Z7 *>&1 | Tee-Object -FilePath "$env:LOG_DIR/bench-generate.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake -S bench-src -B bench-build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=cl *>&1 | Tee-Object -FilePath "$env:LOG_DIR/bench-configure.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          cmake --build bench-build --parallel *>&1 | Tee-Object -FilePath "$env:LOG_DIR/bench-build.log"
+          $rc = $LASTEXITCODE
+          "benchmark project build time: $([int]$sw.Elapsed.TotalSeconds) s" | Tee-Object -FilePath "$env:LOG_DIR/bench-build-time.txt"
+          if ($rc -ne 0) { exit $rc }
+          New-Item -ItemType Directory -Force -Path bench-pdb | Out-Null
+          Copy-Item bench-build/bench_project.pdb bench-pdb/bench_project.pdb
+          "benchmark PDB size: $((Get-Item bench-pdb/bench_project.pdb).Length) bytes" | Tee-Object -FilePath "$env:LOG_DIR/bench-pdb-size.txt"
+
+      - name: Cache the benchmark PDB
+        if: steps.pdbcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: bench-pdb/bench_project.pdb
+          key: pdb-bench-${{ env.BENCH_ID }}-${{ hashFiles('tests/bench/gen_pdb_project.py') }}
+
+      - name: Build cml_pdb_bench
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=cl *>&1 | Tee-Object -FilePath "$env:LOG_DIR/configure.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --target cml_pdb_bench *>&1 | Tee-Object -FilePath "$env:LOG_DIR/build.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run the benchmark (asserts the load-time and memory budgets)
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          build/bin/cml_pdb_bench.exe bench-pdb/bench_project.pdb --min-size-mb 500 *>&1 | Tee-Object -FilePath "$env:LOG_DIR/pdb-benchmark.txt"
+          $rc = $LASTEXITCODE
+          '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          Get-Content "$env:LOG_DIR/pdb-benchmark.txt" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          if ($rc -ne 0) { exit $rc }
+
+      - name: Upload benchmark logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-pdb-benchmark
+          path: ci-logs/
+          if-no-files-found: warn
