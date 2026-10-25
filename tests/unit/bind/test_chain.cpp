@@ -192,7 +192,7 @@ TEST_CASE("chain (5): exports of other loaded modules; an export the module does
     SynthWorld w = basic_world();
     InMemoryProcessModules mods;
     mods.add_export("kernel32.dll", "Beep", 0x7FFB00001000ull, true);
-    mods.add_export("some.dll", "exported_counter", 0x7FFB00002000ull, false);
+    mods.add_export("some.dll", "exported_counter", 0x150000000ull, false);  // within rel32 reach of the module
     w.modules = &mods;
     Caller c;
     c.use("Beep", true);
@@ -373,17 +373,13 @@ TEST_CASE("statics: static functions are matched to S_LPROC32 and hooked") {
     CHECK(find(*r, "?brand_new_static@@YAHXZ")->decision == DecisionKind::PatchNewFunction);
 }
 
-TEST_CASE("statics: same-named statics are told apart by position, and by RVA inside the unchanged layout") {
+TEST_CASE("statics: same-named statics are told apart by the RVA the unchanged layout predicts, never by position") {
     SynthWorld w = basic_world(false);
-    // Two overloaded static functions called pick, two block-scope statics called tmp in f.
-    w.proc(w.tu(), "pick", 0x60, 0x10, true);
-    w.proc(w.tu(), "pick", 0x70, 0x10, true);
+    // Two block-scope statics called tmp in f.
     w.data(w.tu(), "`anonymous namespace'::anchor", 0x10);
     w.proc_with_statics(w.tu(), "f", 0x80, {{"tmp", 0x34}, {"tmp", 0x30}});
     w.open();
     SynthObj o;
-    o.function("?pick@@YAHH@Z", false);
-    o.function("?pick@@YANN@Z", false);
     const std::uint32_t d = o.section(".data", kData, 0x40);
     const std::int32_t sec = static_cast<std::int32_t>(d);
     o.symbol("?anchor@?A0x1@@3HA", 0x10, sec, false, false);
@@ -392,10 +388,6 @@ TEST_CASE("statics: same-named statics are told apart by position, and by RVA in
     Built b = o.build();
     auto r = plan_bind(w.input(b));
     REQUIRE_MESSAGE(r.has_value(), err(r));
-    // Functions: by order of definition (COMDAT order = link order).
-    CHECK(find(*r, "?pick@@YAHH@Z")->source == BindSource::CompilandOrdinal);
-    CHECK(find(*r, "?pick@@YAHH@Z")->old_address.rva == 0x1060);
-    CHECK(find(*r, "?pick@@YANN@Z")->old_address.rva == 0x1070);
     // Data: the unchanged section layout (anchor 0x10 -> 0x3010) gives the exact RVAs, whatever the record order.
     const SymbolDecision* t1 = find(*r, "?tmp@?1??f@@YAXXZ@4HA");
     const SymbolDecision* t2 = find(*r, "?tmp@?2??f@@YAXXZ@4HA");
@@ -405,7 +397,7 @@ TEST_CASE("statics: same-named statics are told apart by position, and by RVA in
     CHECK(t2->old_address.rva == 0x3034);
 }
 
-TEST_CASE("statics: an ambiguous static DATA is CML3207, an ambiguous static function is not hooked (CML3213)") {
+TEST_CASE("statics: ambiguous static data is CML3207, ambiguous static overloads are CML3214") {
     SynthWorld w = basic_world(false);
     w.proc(w.tu(), "pick", 0x60, 0x10, true);
     w.proc(w.tu(), "pick", 0x70, 0x10, true);
@@ -415,13 +407,15 @@ TEST_CASE("statics: an ambiguous static DATA is CML3207, an ambiguous static fun
         SynthObj o;
         o.function("?pick@@YAHH@Z", false);  // the object keeps only one of the two overloads
         Built b = o.build();
-        auto r = plan_bind(w.input(b));
-        REQUIRE_MESSAGE(r.has_value(), err(r));
-        CHECK(find(*r, "?pick@@YAHH@Z")->decision == DecisionKind::PatchNewFunction);
-        CHECK(r->hooks.empty());
-        REQUIRE(r->warnings.size() == 1);
-        CHECK(r->warnings[0].code == diag::kAmbiguousStaticFunction);
-        CHECK(r->warnings[0].message.find("pick") != std::string::npos);
+        std::vector<cml::Diag> errors;
+        auto r = plan_bind(w.input(b), &errors);
+        REQUIRE(!r.has_value());
+        REQUIRE(errors.size() == 1);
+        CHECK(errors[0].code == diag::kAmbiguousOverloads);
+        CHECK(errors[0].id() == "CML3214");
+        CHECK(errors[0].message.find("ambiguous overloads of static") != std::string::npos);
+        CHECK(errors[0].message.find("pick") != std::string::npos);
+        CHECK(errors[0].message.find("logic.cpp.obj") != std::string::npos);
     }
     {
         SynthObj o;  // one tmp in the object, two in the old compiland, no unique static to fix the layout
@@ -439,30 +433,40 @@ TEST_CASE("statics: an ambiguous static DATA is CML3207, an ambiguous static fun
 }
 
 TEST_CASE("statics: static function templates are not matched by base name; operators and ctors match by qualified name") {
-    SynthWorld w = basic_world(false);
-    w.proc(w.tu(), "forward", 0x60, 0x10, true);  // some unrelated instantiation of forward<>
-    w.proc(w.tu(), "lambdas_init::<lambda_0>::operator()", 0x70, 0x10, true);
-    w.proc(w.tu(), "`anonymous namespace'::Tracker::Tracker", 0x80, 0x10, true);
-    w.proc(w.tu(), "`lambdas_init'::`2'::<lambda_9c7f3a1b2d4e5f60718293a4b5c6d7e8>::operator()", 0x90, 0x10, true);  // cl's spelling (CI evidence)
-    w.proc(w.tu(), "std::function<int __cdecl(int)>::operator()", 0xA0, 0x10, true);
-    w.open();
-    SynthObj o;
-    o.function("??$forward@AEBV<lambda_0>@?0??lambdas_init@@YAXH@Z@@std@@YAAEBV<lambda_0>@?0??lambdas_init@@YAXH@Z@AEBV1?0??2@YAXH@Z@@Z", false);
-    o.function("??R<lambda_0>@?0??lambdas_init@@YAXH@Z@QEBA?A?<auto>@@H@Z", false);
-    o.function("??0Tracker@?A0x1@@QEAA@PEBD@Z", false);
-    o.function("??R<lambda_1>@?1??lambdas_init@@YAXH@Z@QEBA@H@Z", false);  // cl numbering
-    Built b = o.build();
-    auto r = plan_bind(w.input(b));
-    REQUIRE_MESSAGE(r.has_value(), err(r));
-    CHECK(r->decisions[0].decision == DecisionKind::PatchNewFunction);  // the template: left alone
-    CHECK(r->decisions[1].decision == DecisionKind::PatchHooked);
-    CHECK(r->decisions[1].old_address.rva == 0x1070);
-    CHECK(r->decisions[2].decision == DecisionKind::PatchHooked);
-    CHECK(r->decisions[2].old_address.rva == 0x1080);
-    CHECK(r->decisions[3].decision == DecisionKind::PatchHooked);  // not confused with std::function::operator()
-    CHECK(r->decisions[3].old_address.rva == 0x1090);
-    CHECK(r->hooks.size() == 3);
-    CHECK(r->warnings.empty());
+    {
+        SynthWorld w = basic_world(false);
+        w.proc(w.tu(), "forward", 0x60, 0x10, true);  // some unrelated instantiation of forward<>
+        w.proc(w.tu(), "lambdas_init::<lambda_0>::operator()", 0x70, 0x10, true);  // clang's spelling
+        w.proc(w.tu(), "`anonymous namespace'::Tracker::Tracker", 0x80, 0x10, true);
+        w.open();
+        SynthObj o;
+        o.function("??$forward@AEBV<lambda_0>@?0??lambdas_init@@YAXH@Z@@std@@YAAEBV<lambda_0>@?0??lambdas_init@@YAXH@Z@AEBV1?0??2@YAXH@Z@@Z", false);
+        o.function("??R<lambda_0>@?0??lambdas_init@@YAXH@Z@QEBA?A?<auto>@@H@Z", false);
+        o.function("??0Tracker@?A0x1@@QEAA@PEBD@Z", false);
+        Built b = o.build();
+        auto r = plan_bind(w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        CHECK(r->decisions[0].decision == DecisionKind::PatchNewFunction);  // the template: left alone
+        CHECK(r->decisions[1].decision == DecisionKind::PatchHooked);
+        CHECK(r->decisions[1].old_address.rva == 0x1070);
+        CHECK(r->decisions[2].decision == DecisionKind::PatchHooked);
+        CHECK(r->decisions[2].old_address.rva == 0x1080);
+        CHECK(r->hooks.size() == 2);
+    }
+    {
+        SynthWorld w = basic_world(false);  // cl: hashed lambda, quoted scopes; std::function::operator() is another record
+        w.proc(w.tu(), "`lambdas_init'::`2'::<lambda_9c7f3a1b2d4e5f60718293a4b5c6d7e8>::operator()", 0x90, 0x10, true);
+        w.proc(w.tu(), "std::function<int __cdecl(int)>::operator()", 0xA0, 0x10, true);
+        w.open();
+        SynthObj o;
+        o.function("??R<lambda_1>@?1??lambdas_init@@YAXH@Z@QEBA@H@Z", false);
+        Built b = o.build();
+        auto r = plan_bind(w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        CHECK(r->decisions[0].decision == DecisionKind::PatchHooked);  // not confused with std::function::operator()
+        CHECK(r->decisions[0].old_address.rva == 0x1090);
+        CHECK(r->warnings.empty());
+    }
 }
 
 TEST_CASE("compiland lookup: by object name, by stem, by index; unknown and ambiguous TUs are diagnosed") {

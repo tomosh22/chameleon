@@ -13,6 +13,7 @@ cml_add_unit_test(bind
         test_negative.cpp
         test_triples.cpp
         test_golden.cpp
+        test_scope.cpp
     LIBS cml_core)
 target_compile_definitions(cml_test_bind PRIVATE "CML_BIND_GOLDEN_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/golden\"")
 if(NOT MSVC)

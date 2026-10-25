@@ -44,6 +44,10 @@ Result<std::vector<FixupTriple>> make_fixup_triples(const BindPlan& plan, const 
             const std::uint64_t target = f.target_va + static_cast<std::uint64_t>(f.addend);  // S + A (wraps like the machine)
             if (is_rel32(f.kind)) {
                 const std::int64_t disp = static_cast<std::int64_t>(target - (site + 4u + rel32_extra(f.kind)));
+                if ((disp < INT32_MIN || disp > INT32_MAX) && f.thunk_fallback) {
+                    CML_LOG(Trace, "bind: %s to '%s' out of rel32 reach: the thunk stays", to_string(f.kind), f.symbol.c_str());
+                    continue;
+                }
                 if (disp < INT32_MIN || disp > INT32_MAX) {
                     return Diag::make(diag::kRel32OutOfRange,
                                       "the " + std::string(to_string(f.kind)) + " displacement to '" + f.symbol + "' does not fit 32 bits: site " + hex(site) +

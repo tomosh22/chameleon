@@ -216,7 +216,7 @@ TEST_CASE("row 5: vtables, RTTI, string and FP constants, unwind data and funcle
     (void)f;
 }
 
-TEST_CASE("row 6: an undefined function becomes a thunk and a slot; calls need no fix-up, function pointers do") {
+TEST_CASE("row 6: an undefined function becomes a thunk and a slot; calls and pointers go to the old address, ADDR32NB keeps the thunk") {
     SynthWorld w = basic_world();
     SynthObj o;
     auto f = o.function("?compute_value@@YAHXZ");
@@ -243,8 +243,10 @@ TEST_CASE("row 6: an undefined function becomes a thunk and a slot; calls need n
     CHECK(r->thunks[0].slot == "__cml_slot_fixture_note");
     CHECK(r->thunks[0].target.va == SynthWorld::kBase + 0x1100);
     CHECK(r->placeholders.empty());
-    // One ADDR64 retarget plus three slot writes; no REL32 / ADDR32NB fix-up.
-    REQUIRE(r->fixups.size() == 4);
+    // Two REL32 and one ADDR64 retarget (direct to the old address) plus three slot writes; ADDR32NB has no fix-up.
+    REQUIRE(r->fixups.size() == 6);
+    CHECK(has_fixup(*r, FixupKind::Rel32, f.section, 1, "fixture_note"));
+    CHECK(has_fixup(*r, FixupKind::Rel32, f.section, 6, "__security_check_cookie"));
     CHECK(has_fixup(*r, FixupKind::Addr64, rdata, 0, "fixture_note"));
     CHECK(has_fixup(*r, FixupKind::Slot, 0, 0, "__cml_slot_fixture_note"));
     CHECK(has_fixup(*r, FixupKind::Slot, 0, 0, "__cml_slot___security_check_cookie"));

@@ -510,6 +510,25 @@ std::string initializer_target_prefix(std::string_view d) {
     return std::string(e == std::string_view::npos ? rest : rest.substr(0, e + 2));
 }
 
+bool initializer_matches_global(std::string_view initializer, std::string_view global) {
+    const std::string prefix = initializer_target_prefix(initializer);
+    if (prefix.empty() || global.size() < 2) {
+        return false;
+    }
+    if (prefix[0] != '?') {
+        return global.substr(1, prefix.size()) == prefix;
+    }
+    if (global == prefix) {
+        return true;
+    }
+    // Variable template: the initialiser embeds "?$v@H" (the template-id), the variable is "??$v@H@@3HA".
+    if (starts_with(prefix, "?$")) {
+        const std::string wanted = "?" + prefix + "@@";
+        return starts_with(global, wanted);
+    }
+    return false;
+}
+
 bool is_fresh_data_name(std::string_view d) {
     return starts_with(d, "$") || starts_with(d, "??_7") || starts_with(d, "??_R") || starts_with(d, "??_C@") ||
            starts_with(d, "??_S") || starts_with(d, "??_8") || starts_with(d, "__real@") ||

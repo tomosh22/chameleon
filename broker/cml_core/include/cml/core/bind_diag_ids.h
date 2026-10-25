@@ -22,11 +22,13 @@ inline constexpr std::uint32_t kLayoutIncomplete = 3206;   // patch layout lacks
 inline constexpr std::uint32_t kAmbiguousStatic = 3207;    // static matches several old symbols
 inline constexpr std::uint32_t kBadRelocationSite = 3208;  // relocation site outside its section
 inline constexpr std::uint32_t kCompilandAmbiguous = 3209; // several compilands match the TU name
+inline constexpr std::uint32_t kAmbiguousOverloads = 3214; // same-scope static overloads cannot be told apart
+inline constexpr std::uint32_t kUnmatchedInitialiser = 3215; // dynamic initialiser without a global of the TU
 
 // Warnings (the plan is still produced).
 inline constexpr std::uint32_t kSharedInitialiser = 3210;  // TU-wide initialiser may re-run initialisers of bound globals
 inline constexpr std::uint32_t kGuardUnmatched = 3211;     // function-local static guard not found in the old image
 inline constexpr std::uint32_t kSectionRelative = 3212;    // reference through a section symbol into bound data
-inline constexpr std::uint32_t kAmbiguousStaticFunction = 3213;  // static function matches several old records: not hooked
+// 3213 is retired (ambiguous static functions are the error 3214).
 
 }  // namespace cml::core::bind::diag

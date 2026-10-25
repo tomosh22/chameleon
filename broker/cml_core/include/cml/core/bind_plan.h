@@ -195,6 +195,10 @@ struct Fixup {
     std::uint64_t target_va = 0;      // S: old address of the symbol
     std::uint32_t target_rva = kNoRva;
     std::uint32_t target_section_offset = 0;  // SecRel32 only: offset of the target in its image section
+    // REL32 to a bound FUNCTION: the reference was linked to the binding object's thunk, so if the real
+    // address turns out to be out of rel32 reach of the patch, make_fixup_triples() leaves the thunk in
+    // place instead of failing.
+    bool thunk_fallback = false;
     std::string symbol;               // the referenced object symbol; for Slot the patch symbol that receives the address
     std::string section_name;         // informational
 };

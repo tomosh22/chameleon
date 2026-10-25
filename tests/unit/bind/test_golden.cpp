@@ -108,7 +108,8 @@ std::string statics_like() {
     const std::uint32_t calls = o.symbol("?s_calls@?A0x5a5a5a5a@@3HA", 0x10, sec, false, false);
     const std::uint32_t g = o.symbol("?g@?1??statics_value@@YAHXZ@4UGuarded@@A", 0x20, sec, false, false);
     const std::uint32_t guard = o.symbol("?$TSS0@?1??statics_value@@YAHXZ@4HA", 0x24, sec, false, false);
-    const std::uint32_t weights = o.symbol("?k_weights@@3QBHB", 0x40, sec, false, false);
+    const std::uint32_t ro = o.section(".rdata", kRdata, 0x10);  // const table: read-only data is fresh
+    const std::uint32_t weights = o.symbol("?k_weights@@3QBHB", 0, static_cast<std::int32_t>(ro), false, false);
     const std::uint32_t total = o.undefined("?total@Accum@@2HA", false);
     o.reloc(fv.section, 0x08, mb.symbol, kRel32);
     o.reloc(fv.section, 0x10, guard, kRel32);

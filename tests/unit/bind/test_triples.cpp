@@ -34,7 +34,7 @@ struct Scenario {
         o.reloc(f.section, 3, tick, kRel32_1, 0);     // cmp dword ptr [g_tick], imm8   (cl)
         o.reloc(f.section, 0x10, tick, kRel32, -1);   // the same access as clang emits it
         o.reloc(f.section, 0x20, tick, coff::RelocType::Rel32_4, 0);
-        o.reloc(f.section, 0x30, note, kRel32);       // a call: through the thunk, no fix-up
+        o.reloc(f.section, 0x30, note, kRel32);       // a call: direct to the old function, the thunk is the fallback
         o.reloc(data_section, 8, note, kAddr64, 0);
         o.reloc(data_section, 0, tick, kAddr64, 0x20);
         built = o.build();
@@ -68,7 +68,7 @@ TEST_CASE("fix-up triples: REL32 family, ADDR64 and slot writes follow target = 
     Scenario s;
     auto t = make_fixup_triples(s.plan, s.layout());
     REQUIRE_MESSAGE(t.has_value(), err(t));
-    REQUIRE(t->size() == 6);
+    REQUIRE(t->size() == 7);
     const std::uint64_t g_tick = SynthWorld::kBase + 0x3080;
     const std::uint64_t note = SynthWorld::kBase + 0x1100;
 

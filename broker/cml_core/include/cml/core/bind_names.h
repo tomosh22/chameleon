@@ -46,6 +46,12 @@ bool is_guard_variable(std::string_view decorated);       // ?$TSS<n>@..., ?$S<n
 // starts with ("g_tracker@?A0x1@@"). Empty when `decorated` is not a cl dynamic initialiser.
 std::string initializer_target_prefix(std::string_view decorated);
 
+// True when the cl dynamic initialiser `initializer` (??__E...) belongs to the global `global`:
+//   ??__Eg@?A0x1@@YAXXZ      <-> ?g@?A0x1@@3UT@@A     (ordinary globals)
+//   ??__E?x@Foo@@2HA@@YAXXZ  <-> ?x@Foo@@2HA          (static data members)
+//   ??__E?$v@H@@YAXXZ        <-> ??$v@H@@3HA          (variable templates)
+bool initializer_matches_global(std::string_view initializer, std::string_view global);
+
 // Names whose definitions are always patch-local fresh copies (plan 4.5): vtables, RTTI, string and
 // floating-point constants, cl's compiler-generated "$..." locals.
 bool is_fresh_data_name(std::string_view decorated);

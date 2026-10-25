@@ -11,7 +11,7 @@
     { "symbol": "make_base", "decision": "patch-hooked", "source": "compiland-static", "when": "cl" },
     { "symbol": "Accum::total", "decision": "bind-old-data", "source": "pdb-public" },
     { "symbol": "(anonymous namespace)::s_calls", "decision": "bind-old-data", "source": "compiland-static" },
-    { "symbol": "k_weights", "decision": "bind-old-data", "source": "compiland-static" },
+    { "symbol": "k_weights", "decision": "patch-fresh" },
     { "symbol": "statics_value::g", "decision": "bind-old-data", "source": "compiland-static" },
     { "symbol": "statics_value::$TSS0", "decision": "bind-old-data", "source": "compiland-static", "when": "cl" },
     { "symbol": "statics_value::$TSS0", "decision": "bind-old-data", "source": "compiland-layout", "when": "clang" }

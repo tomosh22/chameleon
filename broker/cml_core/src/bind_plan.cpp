@@ -183,6 +183,68 @@ std::string canonical_lambda_names(std::string n) {
     return n;
 }
 
+// The PDB's spelling of a qualified name, brought to the decorated name's ("display") spelling.
+std::string normalized_pdb_name(std::string_view name) {
+    std::string n(name);
+    const std::string_view anon = "`anonymous namespace'";
+    for (std::size_t at = n.find(anon); at != std::string::npos; at = n.find(anon, at)) {
+        n.replace(at, anon.size(), "(anonymous namespace)");
+    }
+    // cl spells the scope of a local entity with quotes and block numbers:
+    // BACKTICK f QUOTE :: BACKTICK 2 QUOTE :: <lambda_1>::operator()  (as the CI evidence shows).
+    for (std::size_t at = n.find('`'); at != std::string::npos; at = n.find('`', at)) {
+        const std::size_t close = n.find('\'', at + 1);
+        if (close == std::string::npos) {
+            break;
+        }
+        const std::string inner = n.substr(at + 1, close - at - 1);
+        const bool digits = !inner.empty() && inner.find_first_not_of("0123456789") == std::string::npos;
+        if (digits) {
+            std::size_t end = close + 1;
+            if (n.compare(end, 2, "::") == 0) {
+                end += 2;
+            }
+            n.erase(at, end - at);
+        } else {
+            n.replace(at, close + 1 - at, inner);
+        }
+    }
+    // Older spelling: "f::__l2::<lambda_1>::operator()".
+    for (std::size_t at = n.find("::__l"); at != std::string::npos; at = n.find("::__l", at)) {
+        std::size_t e = at + 5;
+        while (e < n.size() && n[e] >= '0' && n[e] <= '9') {
+            ++e;
+        }
+        if (e > at + 5 && n.compare(e, 2, "::") == 0) {
+            n.erase(at, e - at);
+        } else {
+            ++at;
+        }
+    }
+    return n;
+}
+
+// "a::b<c::d>::e" -> {"a", "b<c::d>", "e"}
+std::vector<std::string> scope_components(const std::string& n) {
+    std::vector<std::string> out;
+    int depth = 0;
+    std::size_t start = 0;
+    for (std::size_t k = 0; k < n.size(); ++k) {
+        const char c = n[k];
+        if (c == '<' || c == '(' || c == '`') {
+            ++depth;
+        } else if ((c == '>' || c == ')' || c == '\'') && depth > 0) {
+            --depth;
+        } else if (c == ':' && depth == 0 && k + 1 < n.size() && n[k + 1] == ':') {
+            out.push_back(n.substr(start, k - start));
+            start = k + 2;
+            ++k;
+        }
+    }
+    out.push_back(n.substr(start));
+    return out;
+}
+
 class Planner {
 public:
     Planner(const PlanInput& in, BindPlan* partial) : in_(in), obj_(*in.object), pdb_(*in.module_pdb), partial_(partial) {}
@@ -276,6 +338,9 @@ private:
     void decide(Sym& sy, DecisionKind kind, BindSource source, SymbolType type, const TargetAddress& addr, std::string reason);
     void trace(const Sym& sy) const;
     std::uint32_t old_size_for(const TargetAddress& a);
+    std::uint64_t module_size();
+    bool rel32_reachable(const SymbolDecision& d);
+    std::uint64_t module_size_ = 0;
 };
 
 // ---- naming of the referencing function --------------------------------------------------
@@ -574,6 +639,10 @@ bool Planner::ensure_compiland_symbols() {
 
 std::vector<const pdb::SymbolView*> Planner::static_candidates(const std::string& base, const std::string& encl, bool want_function,
                                                                 const std::string& display) {
+    // A static matches an old record ONLY when its scope matches exactly: the same enclosing function, or
+    // file scope. Records of other scopes are never candidates (a wrong match would bind live state or a
+    // hook to an unrelated entity): "f::counter" is not "g::counter", and a new file-scope "count" is
+    // not the old "f::count".
     std::vector<const pdb::SymbolView*> out;
     if (base.empty() || !ensure_compiland_symbols()) {
         return out;
@@ -593,86 +662,71 @@ std::vector<const pdb::SymbolView*> Planner::static_candidates(const std::string
         }
         all.push_back(&v);
     }
-    // The qualified name, when both sides spell it the same, is a much stronger key than the last
-    // component: "lambdas_init::<lambda_0>::operator()" (clang) or "Ns::Cls::f".
+    const auto by_rva = [](const pdb::SymbolView* a, const pdb::SymbolView* b) { return a->rva < b->rva; };
+    // The qualified name, when both sides spell it the same, is the strongest key: it contains the scope
+    // ("lambdas_init::<lambda_0>::operator()" on clang, "Ns::Cls::f").
     if (!display.empty()) {
         const std::string canonical_display = canonical_lambda_names(display);
-        std::vector<const pdb::SymbolView*> exact;
         for (const pdb::SymbolView* v : all) {
-            std::string n(v->name);
-            const std::string_view anon = "`anonymous namespace'";
-            for (std::size_t at = n.find(anon); at != std::string::npos; at = n.find(anon, at)) {
-                n.replace(at, anon.size(), "(anonymous namespace)");
-            }
-            // cl spells the scope of a local entity with quotes and block numbers:
-            // BACKTICK f QUOTE :: BACKTICK 2 QUOTE :: <lambda_1>::operator()  (as the CI evidence shows).
-            for (std::size_t at = n.find('`'); at != std::string::npos; at = n.find('`', at)) {
-                const std::size_t close = n.find('\'', at + 1);
-                if (close == std::string::npos) {
-                    break;
-                }
-                const std::string inner = n.substr(at + 1, close - at - 1);
-                const bool digits = !inner.empty() && inner.find_first_not_of("0123456789") == std::string::npos;
-                if (digits) {
-                    std::size_t end = close + 1;
-                    if (n.compare(end, 2, "::") == 0) {
-                        end += 2;
-                    }
-                    n.erase(at, end - at);
-                } else {
-                    n.replace(at, close + 1 - at, inner);
-                }
-            }
-            // Older spelling: "f::__l2::<lambda_1>::operator()".
-            for (std::size_t at = n.find("::__l"); at != std::string::npos; at = n.find("::__l", at)) {
-                std::size_t e = at + 5;
-                while (e < n.size() && n[e] >= '0' && n[e] <= '9') {
-                    ++e;
-                }
-                if (e > at + 5 && n.compare(e, 2, "::") == 0) {
-                    n.erase(at, e - at);
-                } else {
-                    ++at;
-                }
-            }
-            if (canonical_lambda_names(n) == canonical_display) {
-                exact.push_back(v);
-            }
-        }
-        if (!exact.empty()) {
-            std::sort(exact.begin(), exact.end(), [](const pdb::SymbolView* a, const pdb::SymbolView* b) { return a->rva < b->rva; });
-            return exact;
-        }
-    }
-    if (want_function) {
-        // Member functions of local classes (lambdas) are top-level procs in the PDB; the function scope
-        // in the decorated name only matters for data.
-        out = all;
-    } else if (!encl.empty()) {
-        for (const pdb::SymbolView* v : all) {
-            if (v->parent_proc != pdb::kNoSymbol && last_component(v->parent_name) == encl) {
+            if (canonical_lambda_names(normalized_pdb_name(v->name)) == canonical_display) {
                 out.push_back(v);
             }
         }
-        if (out.empty()) {
-            for (const pdb::SymbolView* v : all) {
-                if (v->parent_proc != pdb::kNoSymbol) {
-                    out.push_back(v);
-                }
+        if (!out.empty()) {
+            std::sort(out.begin(), out.end(), by_rva);
+            return out;
+        }
+    }
+    if (want_function) {
+        // Functions are top-level procs in the PDB; a local scope (lambda, local class) lives in the
+        // qualified name: it must contain the enclosing function, and a file-scope function must not be
+        // inside a lambda.
+        for (const pdb::SymbolView* v : all) {
+            const std::vector<std::string> comps = scope_components(normalized_pdb_name(v->name));
+            bool has_encl = false;
+            bool in_lambda = false;
+            for (std::size_t k = 0; k + 1 < comps.size(); ++k) {
+                has_encl = has_encl || comps[k] == encl;
+                in_lambda = in_lambda || starts_with(comps[k], "<lambda");
+            }
+            if (encl.empty() ? !in_lambda : has_encl) {
+                out.push_back(v);
             }
         }
     } else {
         for (const pdb::SymbolView* v : all) {
-            if (v->parent_proc == pdb::kNoSymbol) {
+            const bool local = v->parent_proc != pdb::kNoSymbol;
+            if (encl.empty() ? !local : (local && last_component(v->parent_name) == encl)) {
                 out.push_back(v);
             }
         }
-        if (out.empty()) {
-            out = all;
+    }
+    std::sort(out.begin(), out.end(), by_rva);
+    return out;
+}
+
+std::uint64_t Planner::module_size() {
+    if (module_size_ == 0) {
+        for (const pdb::SectionHeader& h : pdb_.sections()) {
+            module_size_ = std::max<std::uint64_t>(module_size_, static_cast<std::uint64_t>(h.rva) + std::max(h.virtual_size, h.raw_size));
         }
     }
-    std::sort(out.begin(), out.end(), [](const pdb::SymbolView* a, const pdb::SymbolView* b) { return a->rva < b->rva; });
-    return out;
+    return module_size_;
+}
+
+// Can a REL32 from EVERY place the patch may be loaded reach the target? The patch is reserved within
+// +-1.5 GiB of the module (ADR-0020 #8, plan 4.7); rel32 reaches +-2 GiB. Targets of earlier patches
+// (registry) are checked when the patch base is known (make_fixup_triples).
+bool Planner::rel32_reachable(const SymbolDecision& d) {
+    if (d.old_address.rva == kNoRva && d.source != BindSource::ExportOtherModule) {
+        return true;
+    }
+    constexpr std::int64_t kWindow = 0x60000000;
+    constexpr std::int64_t kLimit = 0x7FFFFFF0;
+    const std::int64_t base = static_cast<std::int64_t>(in_.module_base);
+    const std::int64_t end = base + static_cast<std::int64_t>(module_size());
+    const std::int64_t t = static_cast<std::int64_t>(d.old_address.va);
+    return t - (base - kWindow) <= kLimit && (end + kWindow) - t <= kLimit;
 }
 
 std::uint32_t Planner::old_size_for(const TargetAddress& a) {
@@ -726,6 +780,14 @@ void Planner::decide_defined() {
         }
         if (type == SymbolType::Data && si != nullptr && si->crt_init) {
             decide(sy, DecisionKind::PatchFresh, BindSource::None, type, {}, "initialiser table");
+            continue;
+        }
+
+        // Read-only data (.rdata tables, constants) carries no state, and binding it to the old copy would
+        // silently ignore the user's edit of it: a fresh copy is correct. (The address of const data
+        // therefore changes across a patch; KNOWN_LIMITATIONS.)
+        if (type == SymbolType::Data && si != nullptr && !si->code && (si->sec->characteristics & coff::scn::MemWrite) == 0) {
+            decide(sy, DecisionKind::PatchFresh, BindSource::None, type, {}, "read-only data: a fresh copy is correct, the edit takes effect (the address of const data changes)");
             continue;
         }
 
@@ -846,12 +908,38 @@ void Planner::bridge_statics() {
         delta_.erase(sec);
     }
 
-    // Pass B: ambiguous groups, by RVA in the unchanged section layout, then by position.
+    // Pass B: groups with several members and/or several candidates in the same scope. Never paired
+    // by position alone: only by (1) the member's exact qualified name (clang spells lambdas with the same
+    // counter as the decorated name), (2) the RVA in the unchanged section layout (data). Whatever is left
+    // is ambiguous: CML3214 for functions (overloads), CML3207 for data. (The signature would tell
+    // overloads apart, but cml_pdb offers no type access yet.)
     for (const std::string& key : deferred) {
         Group& g = groups[key];
         const std::vector<const pdb::SymbolView*> cands = static_candidates(g.base, g.encl, g.is_func, g.display);
         std::vector<std::uint32_t> unmatched = g.members;
         std::vector<const pdb::SymbolView*> free_cands = cands;
+        // (1) exact qualified names, one-to-one
+        for (auto it = unmatched.begin(); it != unmatched.end();) {
+            const Sym& sy = syms_[*it];
+            std::vector<std::size_t> hits;
+            for (std::size_t c = 0; c < free_cands.size(); ++c) {
+                if (normalized_pdb_name(free_cands[c]->name) == sy.dec.display) {
+                    hits.push_back(c);
+                }
+            }
+            std::size_t same_display = 0;
+            for (const std::uint32_t other : unmatched) {
+                same_display += syms_[other].dec.display == sy.dec.display ? 1u : 0u;
+            }
+            if (hits.size() == 1 && same_display == 1) {
+                matched[*it] = {free_cands[hits[0]], BindSource::CompilandStatic};
+                free_cands.erase(free_cands.begin() + static_cast<std::ptrdiff_t>(hits[0]));
+                it = unmatched.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        // (2) data: the RVA the unchanged layout predicts
         if (!g.is_func) {
             for (auto it = unmatched.begin(); it != unmatched.end();) {
                 const Sym& sy = syms_[*it];
@@ -871,30 +959,22 @@ void Planner::bridge_statics() {
                 it = taken ? unmatched.erase(it) : it + 1;
             }
         }
-        if (unmatched.empty()) {
-            continue;
-        }
-        if (unmatched.size() == free_cands.size()) {
-            for (std::size_t k = 0; k < unmatched.size(); ++k) {
-                matched[unmatched[k]] = {free_cands[k], BindSource::CompilandOrdinal};
-            }
-            continue;
-        }
         for (const std::uint32_t pos : unmatched) {
             Sym& sy = syms_[pos];
             if (g.is_func) {
-                warn(diag::kAmbiguousStaticFunction,
-                     "static function '" + sy.dec.display + "' (" + sy.name + ") matches " + std::to_string(cands.size()) + " records named '" + g.base +
-                         "' in compiland " + std::to_string(ci_) + " but the patch object defines " + std::to_string(g.members.size()) + "; it is not hooked",
-                     "Rename the overloads or keep their number unchanged; callers outside the patch keep the old code of this function.");
-                decide(sy, DecisionKind::PatchNewFunction, BindSource::None, sy.dec.type, {}, "ambiguous static function (CML3213): not hooked");
+                error(diag::kAmbiguousOverloads,
+                      "ambiguous overloads of static '" + sy.dec.display + "' (" + sy.name + ") in " + in_.object_name +
+                          "; cannot tell which old function each new one replaces (" + std::to_string(g.members.size()) + " in the patch, " +
+                          std::to_string(cands.size()) + " records named '" + g.base + "' in compiland " + std::to_string(ci_) + ")",
+                      "Rename one overload, or hot-restart.");
+                decide(sy, DecisionKind::PatchNewFunction, BindSource::None, sy.dec.type, {}, "ambiguous static overloads (CML3214)");
                 continue;
             }
             error(diag::kAmbiguousStatic,
-                  "static " + std::string(g.is_func ? "function" : "data") + " '" + sy.dec.display + "' (" + sy.name + ") matches " + std::to_string(cands.size()) +
+                  "static data '" + sy.dec.display + "' (" + sy.name + ") matches " + std::to_string(cands.size()) +
                       " records named '" + g.base + "' in compiland " + std::to_string(ci_) + " but the patch object defines " + std::to_string(g.members.size()) + " of them",
                   "Rename one of the statics, keep their number unchanged, or hot-restart.");
-            decide(sy, g.is_func ? DecisionKind::PatchNewFunction : DecisionKind::PatchNewData, BindSource::None, sy.dec.type, {}, "ambiguous static (CML3207)");
+            decide(sy, DecisionKind::PatchNewData, BindSource::None, sy.dec.type, {}, "ambiguous static (CML3207)");
         }
     }
 
@@ -1195,8 +1275,21 @@ void Planner::build_fixups() {
                       "Compile with /MD-compatible 64-bit code models (no 32-bit absolute addresses), or hot-restart.");
                 continue;
             }
+            bool thunk_fallback = false;
             if (dk == DecisionKind::BindOldFunction && rel) {
-                continue;  // call/jump through the binding object's thunk
+                // Retarget directly (call or lea alike) so that pointer identity matches the old code;
+                // the thunk stays for ADDR32NB and for targets that no patch base can reach.
+                if (!rel32_reachable(ts.dec)) {
+                    CML_LOG(Trace, "bind: %s -> %s out of rel32 reach of any patch base: through the thunk", ts.name.c_str(), hex(ts.dec.old_address.va).c_str());
+                    continue;
+                }
+                thunk_fallback = true;
+            } else if (dk == DecisionKind::BindOldData && rel && !rel32_reachable(ts.dec)) {
+                error(diag::kRel32OutOfRange,
+                      "REL32 reference to " + describe(ts) + " (" + hex(ts.dec.old_address.va) + ", " + ts.dec.old_address.module + ") from " + where() + " in " + in_.object_name +
+                          " cannot reach it: it is more than 2 GiB away from every place the patch can be loaded",
+                      "Access the data through a function or pointer in the module, or hot-restart.");
+                continue;
             }
             if (ts.dec.source == BindSource::SynthesizedImportSlot) {
                 continue;  // the placeholder itself holds the address
@@ -1239,6 +1332,7 @@ void Planner::build_fixups() {
             f.offset = off;
             f.kind = rel ? rel32_kind(type) : (secrel ? FixupKind::SecRel32 : FixupKind::Addr64);
             f.target_section_offset = section_offset;
+            f.thunk_fallback = thunk_fallback;
             f.addend = addend;
             f.target_va = ts.dec.old_address.va;
             f.target_rva = ts.dec.old_address.rva;
@@ -1318,8 +1412,7 @@ void Planner::find_initialisers() {
                     if (!g.defined || !g.decided) {
                         continue;
                     }
-                    const bool match = !prefix.empty() && (prefix[0] == '?' ? g.name == prefix
-                                                                           : (g.name.size() > 1 && std::string_view(g.name).substr(1).substr(0, prefix.size()) == prefix));
+                    const bool match = !prefix.empty() && initializer_matches_global(fn.name, g.name);
                     if (!match) {
                         continue;
                     }
@@ -1330,10 +1423,14 @@ void Planner::find_initialisers() {
                         CML_LOG(Trace, "bind: initialiser %s skipped: global %s is bound to the old image", fn.name.c_str(), g.name.c_str());
                     }
                 }
+                if (!found) {
+                    error(diag::kUnmatchedInitialiser,
+                          "dynamic initialiser '" + fn.name + "' (" + fn.dec.display + ") in " + in_.object_name + " could not be matched to a new global",
+                          "Report the symbol names; as a workaround move the global with dynamic initialisation to an unchanged source file, or hot-restart.");
+                    continue;
+                }
                 if (e.globals.empty()) {
-                    if (!found) {
-                        CML_LOG(Trace, "bind: initialiser %s skipped: no global of the TU matches it", fn.name.c_str());
-                    }
+                    CML_LOG(Trace, "bind: initialiser %s skipped: its global is bound to the old image", fn.name.c_str());
                     continue;
                 }
             } else {
@@ -1454,20 +1551,18 @@ Result<BindPlan> Planner::run(std::vector<Diag>* all_errors) {
     plan_.module_base = in_.module_base;
 
     const auto finish_errors = [&]() -> Result<BindPlan> {
-        if (fatal_) {
-            if (all_errors != nullptr) {
-                all_errors->push_back(*fatal_);
-            }
-            return *fatal_;
-        }
+        // Everything collected so far, the fatal error (an unreadable PDB or object) last.
         if (all_errors != nullptr) {
             *all_errors = errors_;
+            if (fatal_) {
+                all_errors->push_back(*fatal_);
+            }
         }
         if (partial_ != nullptr) {
             assemble();  // what was decided, for tools and evidence
             *partial_ = std::move(plan_);
         }
-        return errors_.front();
+        return fatal_ ? *fatal_ : errors_.front();
     };
 
     if (obj_.machine() != coff::Machine::Amd64) {

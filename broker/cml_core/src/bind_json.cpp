@@ -302,6 +302,9 @@ std::string to_json(const BindPlan& plan, const JsonOptions& o) {
             if (f.target_rva != kNoRva) {
                 j.field_u("target_rva", f.target_rva);
             }
+            if (f.thunk_fallback) {
+                j.field_b("thunk_fallback", true);
+            }
             if (f.kind == FixupKind::SecRel32) {
                 j.field_u("target_section_offset", f.target_section_offset);
             }

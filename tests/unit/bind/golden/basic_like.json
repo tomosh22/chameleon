@@ -9,7 +9,7 @@
     "bind_old_data": 2,
     "thunks": 3,
     "new": 0,
-    "fixups": 5
+    "fixups": 7
   },
   "decisions": [
     {
@@ -196,6 +196,28 @@
       "symbol": "?g_tick@@3HA",
       "target_rva": 12416,
       "target_va": 5368721536
+    },
+    {
+      "kind": "REL32",
+      "section": 1,
+      "section_name": ".text$mn",
+      "offset": 18,
+      "addend": 0,
+      "symbol": "fixture_note",
+      "target_rva": 4352,
+      "thunk_fallback": true,
+      "target_va": 5368713472
+    },
+    {
+      "kind": "REL32",
+      "section": 1,
+      "section_name": ".text$mn",
+      "offset": 28,
+      "addend": 0,
+      "symbol": "__security_check_cookie",
+      "target_rva": 4608,
+      "thunk_fallback": true,
+      "target_va": 5368713728
     },
     {
       "kind": "SLOT",

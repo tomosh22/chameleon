@@ -6,10 +6,10 @@
   "module_base": 5368709120,
   "summary": {
     "hooks": 2,
-    "bind_old_data": 5,
+    "bind_old_data": 4,
     "thunks": 0,
     "new": 0,
-    "fixups": 5
+    "fixups": 4
   },
   "decisions": [
     {
@@ -88,13 +88,10 @@
       "type": "data",
       "defined": true,
       "static": true,
-      "section": ".data",
-      "decision": "bind-old-data",
-      "source": "compiland-static",
-      "module": "old.exe",
-      "rva": 12352,
-      "va": 5368721472,
-      "reason": "static data present in the old compiland: matched record 'k_weights' at rva 0x3040 in compiland 0 (compiland-static)"
+      "section": ".rdata",
+      "decision": "patch-fresh",
+      "source": "none",
+      "reason": "read-only data: a fresh copy is correct, the edit takes effect (the address of const data changes)"
     },
     {
       "symbol": "?total@Accum@@2HA",
@@ -173,16 +170,6 @@
       "symbol": "?s_calls@?A0x5a5a5a5a@@3HA",
       "target_rva": 12304,
       "target_va": 5368721424
-    },
-    {
-      "kind": "REL32",
-      "section": 1,
-      "section_name": ".text$mn",
-      "offset": 40,
-      "addend": 0,
-      "symbol": "?k_weights@@3QBHB",
-      "target_rva": 12352,
-      "target_va": 5368721472
     },
     {
       "kind": "REL32_1",
