@@ -10,10 +10,10 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-04 | cml_pdb index | 1 | done | wp/04-pdb-index | #5 | — |
 | WP-11 | Agent skeleton, public header and IPC | 1 | done | wp/11-agent-ipc | #6 | — |
 | WP-03 | End-to-end spike (M1 gate) | 2 | done — **gate passed** (verified by orchestrator from CI logs, all 8 cells) | wp/03-e2e-spike | #10 | — |
-| WP-05 | Toolchain command parsing and rewriting | 2 | done | wp/05-toolchain | #13 | — |
+| WP-05 | Toolchain command parsing and rewriting | 2 | done (post-merge fix #15: never kill mspdbsrv on cancel) | wp/05-toolchain | #13, #15 | — |
 | WP-06 | cml_coff writer: anchors and binding object | 2 | done | wp/06-coff-writer | #11 | — |
 | WP-13 | Test harness cmltest | 2 | done (partial scenario per ADR-0022 until WP-12) | wp/13-cmltest | #12 | — |
-| WP-07..WP-10 | Wave 3 | 3 | todo | — | — | main red: WP-05 cancel-/Zi test (0xC0000142), fix in progress |
+| WP-07..WP-10 | Wave 3 | 3 | todo | — | — | WP-11 fix: intermittent `unit.agent` hang (ctest timeout) being root-caused on `wp/11-fix-agent-test-hang` |
 | WP-12 | Broker core (orchestrator integration) | 4 | todo | — | — | wave 3 |
 
 ## Orchestrator integration work
