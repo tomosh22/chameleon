@@ -43,6 +43,8 @@ TEST_CASE("display_name: special members and generated symbols") {
     CHECK(display_name("??__Fg_tracker@?A0x1@@YAXXZ") == "`dynamic atexit destructor for '(anonymous namespace)::g_tracker''");
     CHECK(display_name("??RFoo@@QEBAHXZ") == "Foo::operator()");
     CHECK(display_name("??HFoo@@QEBAHH@Z") == "Foo::operator+");
+    CHECK(display_name("??2@YAPEAX_K@Z") == "operator new");
+    CHECK(display_name("??3@YAXPEAX_K@Z") == "operator delete");
     CHECK(display_name("??R<lambda_1>@?0??lambdas_init@@YAXH@Z@QEBA?A?<auto>@@H@Z") == "lambdas_init::<lambda_1>::operator()");
 }
 

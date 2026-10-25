@@ -63,7 +63,9 @@ std::string join_scope(const Scope& sc, const char* last_override = nullptr) {
         out += sc.frags[k - 1];
     }
     if (last_override != nullptr) {
-        out += "::";
+        if (!out.empty()) {
+            out += "::";
+        }
         out += last_override;
     }
     return out;
