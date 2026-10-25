@@ -4,6 +4,8 @@
 
 #include <windows.h>
 
+#include <share.h>
+
 #include <cstdio>
 #include <deque>
 #include <mutex>
@@ -99,10 +101,8 @@ void install_logging() {
     installed = true;
     if (const std::optional<std::string> path = proc::get_env("CML_AGENT_LOG"); path && !path->empty()) {
         const std::wstring wide = proc::wide_from_utf8(*path);
-        std::FILE* file = nullptr;
-        if (_wfopen_s(&file, wide.c_str(), L"ab") == 0) {
-            s.file = file;
-        }
+        // Shareable for reading (_wfopen_s would open it exclusively).
+        s.file = _wfsopen(wide.c_str(), L"ab", _SH_DENYWR);
     }
     LogLevel level = LogLevel::Info;
     if (const std::optional<std::string> text = proc::get_env("CML_LOG_LEVEL"); text) {

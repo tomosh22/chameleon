@@ -18,6 +18,8 @@
 #if defined(_WIN32)
 #include <windows.h>
 
+#include <share.h>
+
 #include <chrono>
 
 #include "cml/core/connection_server.h"
@@ -162,8 +164,10 @@ int run_headless(const Options& options) {
     g_log_output.file = stdout;
     if (!options.log_file.empty()) {
         const std::wstring wide = cml::proc::wide_from_utf8(options.log_file);
-        std::FILE* file = nullptr;
-        if (_wfopen_s(&file, wide.c_str(), L"ab") != 0 || file == nullptr) {
+        // _wfsopen, not _wfopen_s: the latter opens the file exclusively, and tests (and users) read
+        // the log while the broker is still running.
+        std::FILE* file = _wfsopen(wide.c_str(), L"ab", _SH_DENYWR);
+        if (file == nullptr) {
             std::fprintf(stderr, "cml_broker: cannot open log file '%s'\n", options.log_file.c_str());
             return 1;
         }

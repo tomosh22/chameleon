@@ -23,7 +23,7 @@ function(cml_add_header_check name source standard)
     if(standard STREQUAL "c99")
         if(CMAKE_C_COMPILER_ID STREQUAL "Clang")
             target_compile_options(${name} PRIVATE
-                /W4 /WX /clang:-std=c99 -Wall -Wextra -Werror -Wno-unused-command-line-argument)
+                /W4 /WX /clang:-std=c99 /clang:-Wall /clang:-Wextra /clang:-Werror -Wno-unused-command-line-argument)
         else()
             target_compile_options(${name} PRIVATE /W4 /WX /std:c11)
         endif()
@@ -34,7 +34,8 @@ function(cml_add_header_check name source standard)
         cml_apply_warnings(${name})
         cml_target_core_style(${name})
         if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-            target_compile_options(${name} PRIVATE -Wall -Wextra -Werror)
+            # Not plain -Wall: clang-cl maps that to -Weverything. /clang: hands the flag to clang itself.
+            target_compile_options(${name} PRIVATE /clang:-Wall /clang:-Wextra /clang:-Werror)
         endif()
     endif()
 
