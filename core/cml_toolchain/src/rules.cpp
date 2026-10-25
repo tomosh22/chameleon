@@ -88,6 +88,8 @@ constexpr std::array kCc1Rules = {
     Rule{MatchKind::Exact, "dependency-filter", Action::Drop, "", 1, Tag::None, kNone, kNone, "depfile content"},
     Rule{MatchKind::Exact, "module-dependency-dir", Action::Drop, "", 1, Tag::None, kNone, kNone, "depfile content"},
     Rule{MatchKind::Exact, "show-includes", Action::Drop, "", 0, Tag::ShowIncludes, kNone, kNone, "re-added only when RewriteOptions::capture_includes is set"},
+    // clang-cl 20 records the option as --show-includes (CI evidence).
+    Rule{MatchKind::Exact, "-show-includes", Action::Drop, "", 0, Tag::ShowIncludes, kNone, kNone, "re-added only when RewriteOptions::capture_includes is set"},
     Rule{MatchKind::Exact, "header-include-file", Action::Drop, "", 1, Tag::None, kNone, kNone, "include-tree output"},
     Rule{MatchKind::Exact, "header-include-format", Action::Drop, "", 1, Tag::None, kNone, kNone, "include-tree output"},
     Rule{MatchKind::Exact, "header-include-filtering", Action::Drop, "", 1, Tag::None, kNone, kNone, "include-tree output"},

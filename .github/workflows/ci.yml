@@ -143,7 +143,14 @@ jobs:
           }
           Section 'recheck basic --translate-cc1 (option (b) prototype, evidence)'
           & $probe recheck "$env:BUILD_DIR/bin/fixture_basic.exe" --obj-dir "$env:BUILD_DIR/tests/fixtures/basic/CMakeFiles/fixture_basic_objs.dir" --translate-cc1 --keep "$env:BUILD_DIR/test_work/probe-basic-translate" *>&1 | Tee-Object -FilePath $out -Append
+          # The compiler PDB / IPI structure of the recorded command strings (long cl commands are split).
+          $pdbutil = 'C:\Program Files\LLVM\bin\llvm-pdbutil.exe'
+          if (Test-Path $pdbutil) {
+            Section 'llvm-pdbutil IPI records of fixture_basic (LF_BUILDINFO / LF_STRING_ID / LF_SUBSTR_LIST)'
+            & $pdbutil dump --ids "$env:BUILD_DIR/bin/fixture_basic.pdb" 2>&1 | Select-String -Pattern 'LF_(BUILDINFO|SUBSTR_LIST|STRING_ID)' | Select-Object -First 60 | ForEach-Object { $l = $_.Line; if ($l.Length -gt 260) { $l = $l.Substring(0, 260) }; $l } | Tee-Object -FilePath $out -Append
+          }
           if ($failed) { exit 1 }
+          exit 0
 
       - name: WP-05 unit.toolchain verbose output (strategy and flag evidence lines)
         if: always()

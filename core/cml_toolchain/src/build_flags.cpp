@@ -87,7 +87,7 @@ CmdScan scan_command_line(std::span<const std::string> args, Dialect dialect) {
         if (cc1) {
             if (t == "ffunction-sections") set(scan.gy, Tri::Yes, false, tok);
             else if (t == "fno-function-sections") set(scan.gy, Tri::No, false, tok);
-            else if (t.substr(0, 4) == "flto" && t != "fno-lto") set(scan.gl, Tri::Yes, false, tok);
+            else if (t == "flto" || t.substr(0, 5) == "flto=" || t == "flto-unit") set(scan.gl, Tri::Yes, false, tok);  // not -flto-visibility-public-std
             else if (t == "cfguard" || t == "cfguard-no-checks") set(scan.guard_cf, Tri::Yes, false, tok);
             else if (t == "fms-hotpatch") set(scan.hotpatch, Tri::Yes, false, tok);
             continue;
