@@ -96,7 +96,8 @@ constexpr std::array kCc1Rules = {
     Rule{MatchKind::Exact, "fcolor-diagnostics", Action::Drop, "", 0, Tag::None, kNone, kNone, "plain text diagnostics"},
     Rule{MatchKind::Exact, "fansi-escape-codes", Action::Drop, "", 0, Tag::None, kNone, kNone, "plain text diagnostics"},
     // LTO objects are bitcode, not COFF
-    Rule{MatchKind::Prefix, "flto", Action::Drop, "", 0, Tag::None, kNone, diag::kWholeProgramDowngraded, "bitcode objects cannot be patched; compiled without LTO"},
+    // Careful: -flto-visibility-public-std is an unrelated cc1 option that every clang-cl compile records.
+    Rule{MatchKind::Regex, "flto(=.*)?|flto-unit|flto-jobs=.*|fwhole-program-vtables", Action::Drop, "", 0, Tag::None, kNone, diag::kWholeProgramDowngraded, "bitcode objects cannot be patched; compiled without LTO"},
     Rule{MatchKind::Exact, "emit-llvm-bc", Action::Replace, "emit-obj", 0, Tag::None, kNone, diag::kWholeProgramDowngraded, "bitcode objects cannot be patched; -emit-obj instead"},
     // PCH
     Rule{MatchKind::Exact, "emit-pch", Action::Error, "", 0, Tag::PchCreate, diag::kPchCreatingTu, kNone, "{file} creates the precompiled header (/Yc); changes to it cannot be hot-reloaded."},

@@ -19,6 +19,11 @@ if(WIN32)
 endif()
 
 cml_add_unit_test(toolchain SOURCES ${_cml_toolchain_tests} LIBS cml_toolchain)
+if(MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    # cl's traditional preprocessor mangles raw string literals (backslashes, quotes) when doctest
+    # stringizes a CHECK() expression; the conforming preprocessor does it right.
+    target_compile_options(cml_test_toolchain PRIVATE /Zc:preprocessor)
+endif()
 target_include_directories(cml_test_toolchain PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../support")
 
 if(WIN32)

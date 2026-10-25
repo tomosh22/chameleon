@@ -114,6 +114,7 @@ jobs:
       # (the real command lines the unit corpus is checked against), rewrites, build-flag facts, the
       # recompile check against the original objects, and every PCH strategy (/Zi + /Yu question).
       - name: WP-05 toolchain evidence (cml_tc_probe)
+        if: always()
         run: |
           $probe = "$env:BUILD_DIR/bin/cml_tc_probe.exe"
           $out = "$env:LOG_DIR/toolchain-evidence.txt"

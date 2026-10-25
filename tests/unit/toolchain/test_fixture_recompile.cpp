@@ -136,6 +136,10 @@ void check_recompile(const Fixture& fx, PchDebugMode mode, bool expect_all_ok, s
         if (original.empty()) {
             continue;  // objects that are not fixture sources (none expected)
         }
+        std::printf("RECORDED fixture=%s stem=%s origin=%s\n  cwd=%s\n  cl=%s\n  src=%s\n  pdb=%s\n  cmd=%s\n", fx.name, c.stem.c_str(),
+                    cml::pdb::to_string(c.env.source), std::string(c.env.cwd().value_or("")).c_str(),
+                    std::string(c.env.compiler().value_or("")).c_str(), std::string(c.env.source_file().value_or("")).c_str(),
+                    std::string(c.env.pdb().value_or("")).c_str(), std::string(c.env.command().value_or("")).c_str());
         auto rec = record_from_build_env(c.env);
         REQUIRE_MESSAGE(rec, rec.error().format());
         CompileRequest req;
@@ -205,8 +209,13 @@ TEST_CASE("fixture pch: evidence for every PCH strategy (only the default one is
         const std::size_t before = evidence.size();
         check_recompile(kFixtures[1], mode, false, &evidence);
         const std::string section = evidence.substr(before);
-        // A strategy works when no line of it reports an error id.
-        if (section.find("result=CML") == std::string::npos) {
+        // A strategy works when no line of it reports an error id other than the expected CML2102
+        // rejection of the /Yc translation unit.
+        std::string without_expected = section;
+        for (std::size_t pos; (pos = without_expected.find("result=CML2102")) != std::string::npos;) {
+            without_expected.erase(pos, 14);
+        }
+        if (without_expected.find("result=CML") == std::string::npos) {
             ++working;
         }
     }

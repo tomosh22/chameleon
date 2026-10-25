@@ -33,6 +33,7 @@ struct Case {
     const char* source;
     const char* command;
     int pch_mode;  // 0 = Auto (the library default), 1 = ForceZ7, 2 = KeepZiPrivatePdb, 3 = DropPch
+    int from_pdb;  // 1 = the string is an S_BUILDINFO command (tokenised with the unquoted-path repair)
     const char* expected_tokens;
     const char* expected_command;
     const char* expected_warnings;  // comma separated ids, "" = none

@@ -183,13 +183,15 @@ TEST_CASE("rewrite: clang cc1 replay") {
     rec.cwd = R"(D:\p)";
     rec.source = R"(D:\p\a.cpp)";
     rec.args = {"-cc1", "-triple", "x86_64-pc-windows-msvc19.44.0", "-gcodeview", "-debug-info-kind=constructor", "-dependency-file", "a.d",
-                "-MT", "a.obj", "-sys-header-deps", "-o", "old.obj", "-x", "c++", R"(D:\p\a.cpp)"};
+                "-MT", "a.obj", "-sys-header-deps", "-flto-visibility-public-std", "-o", "old.obj", "-x", "c++", R"(D:\p\a.cpp)"};
     auto r = rewrite_for_patch(rec, options());
     REQUIRE(r);
     CHECK(r->dialect == Dialect::ClangCc1);
     CHECK(r->args.front() == "-cc1");
     CHECK(contains(r->args, "-gcodeview-command-line"));
     CHECK(contains(r->args, "-gcodeview"));
+    CHECK(contains(r->args, "-flto-visibility-public-std"));  // not an LTO switch
+    CHECK(r->warnings.empty());
     CHECK(contains(r->args, "-debug-info-kind=constructor"));
     CHECK(contains(r->args, "-emit-obj"));
     for (const char* dropped : {"-dependency-file", "a.d", "-MT", "a.obj", "-sys-header-deps", "old.obj"}) {

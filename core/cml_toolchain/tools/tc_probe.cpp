@@ -105,13 +105,14 @@ std::shared_ptr<const PdbIndex> open_index(const std::string& input) {
 
 #if defined(_WIN32)
 int cmd_driver_compile(int argc, char** argv) {
-    std::string compiler, source, out, include;
+    std::string compiler, source, out, include, define;
     for (int i = 2; i < argc; ++i) {
         const std::string t = argv[i];
         if (t == "--compiler" && i + 1 < argc) compiler = argv[++i];
         else if (t == "--source" && i + 1 < argc) source = argv[++i];
         else if (t == "--out" && i + 1 < argc) out = argv[++i];
         else if (t == "--include" && i + 1 < argc) include = argv[++i];
+        else if (t == "--define" && i + 1 < argc) define = argv[++i];
     }
     if (compiler.empty() || source.empty() || out.empty()) {
         std::fprintf(stderr, "driver-compile needs --compiler, --source and --out\n");
@@ -123,6 +124,7 @@ int cmd_driver_compile(int argc, char** argv) {
     req.record.cwd = out;
     req.record.args = {"/nologo", "/TP", "/Zi", "/Od", "/EHsc", "/c", "/FoOLD.obj", "/FdOLD.pdb"};
     if (!include.empty()) req.record.args.push_back("/I" + include);
+    if (!define.empty()) req.record.args.push_back("/D" + define);
     req.output_object = tc::patch_object_path(out, "driver", 1, source);
     tc::CompileOutcome o;
     cml::Result<void> r = tc::compile_tu(req, o);
@@ -182,7 +184,7 @@ struct Translation {
     std::vector<std::string> unmapped;
 };
 
-Translation translate_cc1_to_driver(const std::vector<std::string>& cc1) {
+Translation translate_cc1_to_driver(const std::vector<std::string>& cc1, const std::string& source) {
     Translation t;
     for (std::size_t i = 0; i < cc1.size(); ++i) {
         const std::string& a = cc1[i];
@@ -229,7 +231,8 @@ Translation translate_cc1_to_driver(const std::vector<std::string>& cc1) {
         } else if (a == "-w" || a.rfind("-W", 0) == 0) {
             t.args.push_back("/clang:" + a);
         } else if (a.empty() || a[0] != '-') {
-            t.args.push_back(a);  // the source
+            // Values of options the translator does not know ("-mrelocation-model pic"); only the source is kept.
+            if (lower(a) == lower(source)) t.args.push_back(a);
         } else {
             t.unmapped.push_back(a);
         }
@@ -272,7 +275,7 @@ int cmd_recheck(const Args& a) {
                 std::printf("RESULT %s SKIP --translate-cc1 needs a clang cc1 record\n", stem.c_str());
                 continue;
             }
-            Translation t = translate_cc1_to_driver(req.record.args);
+            Translation t = translate_cc1_to_driver(req.record.args, req.record.source);
             std::printf("TRANSLATE %s: %zu driver args, %zu cc1 options with no mapping:", stem.c_str(), t.args.size(), t.unmapped.size());
             for (const std::string& u : t.unmapped) std::printf(" %s", u.c_str());
             std::printf("\n");

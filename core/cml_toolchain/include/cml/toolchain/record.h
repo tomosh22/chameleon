@@ -54,7 +54,15 @@ Result<CompileRecord> record_from_build_env(const pdb::BuildEnv& env);
 
 // Tokenises a recorded command: Windows rules, except that a command starting with -cc1 (clang's
 // CodeView record) uses clang's own quoting (split_command_line_posix).
-std::vector<std::string> tokenize_recorded_command(std::string_view command);
+//
+// `pdb_record` = the command comes from S_BUILDINFO / S_ENVBLOCK. cl writes the include directories
+// it takes from %INCLUDE% into that string as `-I<path>` WITHOUT quotes, so a directory with spaces
+// ("C:\Program Files (x86)\Windows Kits\...") falls apart into several tokens (CI evidence, see
+// docs/wp/WP-05.md). For such records every token that is not an option is glued back onto the
+// previous token with a space, except a token that names `source` (cl records the source separately,
+// but a record that does contain it keeps it).
+std::vector<std::string> tokenize_recorded_command(std::string_view command, bool pdb_record = false,
+                                                   std::string_view source = {});
 
 // Detects the dialect from the compiler name and the first argument. Unknown for anything that is
 // neither cl, clang-cl nor a cc1 command.

@@ -34,7 +34,8 @@ foreach ($v in $variants) {
     $dir = Join-Path $Work $v.name
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     Write-Host "::group::clang-cl $ver variant $($v.name)"
-    $compileArgs = @('/nologo', '/Zi', '/Od', '/EHsc', '/Gy', '/hotpatch', '/c', "/Fo$dir\", "/I$Repo\agent\include") + $v.flags + $sources
+    # _ALLOW_COMPILER_AND_STL_VERSION_MISMATCH: the MSVC STL of the runner (14.44+) refuses clang older than 19 (STL1000).
+    $compileArgs = @('/nologo', '/Zi', '/Od', '/EHsc', '/Gy', '/hotpatch', '/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH', '/c', "/Fo$dir\", "/I$Repo\agent\include") + $v.flags + $sources
     & $Clang @compileArgs 2>&1 | Out-Host
     if ($LASTEXITCODE -ne 0) { Write-Host "TABLE llvm=$ver variant=$($v.name) compile=FAILED"; $failed = $true; Write-Host '::endgroup::'; continue }
     $exe = Join-Path $dir 'basic.exe'
@@ -58,7 +59,7 @@ foreach ($v in $variants) {
         if ($source -eq 'BuildInfo' -and $rc -ne 0) { $failed = $true }
         & $probe recheck $exe --obj-dir $dir --translate-cc1 --keep (Join-Path $dir 'translate') 2>&1 | Out-Host
         Write-Host "TABLE llvm=$ver variant=default translate_cc1_recheck_exit=$LASTEXITCODE"
-        & $probe driver-compile --compiler $Clang --source (Join-Path $Repo 'tests/fixtures/basic/logic.cpp') --out (Join-Path $dir 'driver') --include (Join-Path $Repo 'agent/include') 2>&1 | Out-Host
+        & $probe driver-compile --compiler $Clang --source (Join-Path $Repo 'tests/fixtures/basic/logic.cpp') --define _ALLOW_COMPILER_AND_STL_VERSION_MISMATCH --out (Join-Path $dir 'driver') --include (Join-Path $Repo 'agent/include') 2>&1 | Out-Host
         Write-Host "TABLE llvm=$ver variant=default driver_form_compile_exit=$LASTEXITCODE"
     }
     Write-Host '::endgroup::'

@@ -1,6 +1,7 @@
 // Tokenisation, quoting and response files (WP-05).
 #include "cml/toolchain/command_line.h"
 #include "cml/toolchain/diag_ids.h"
+#include "cml/toolchain/record.h"
 
 #include <map>
 #include <string>
@@ -55,6 +56,19 @@ TEST_CASE("split_command_line_posix: clang's CodeView quoting") {
     // A backslash before any other character stays.
     CHECK(split_command_line_posix(R"("a\b")") == Tokens{R"(a\b)"});
     CHECK(split_command_line_posix(R"("")") == Tokens{""});
+}
+
+TEST_CASE("tokenize_recorded_command: S_BUILDINFO commands with unquoted directories that contain spaces") {
+    const std::string cmd = R"(-IC:\Program Files (x86)\Windows Kits\10\include\um -X -nologo -DA=1 -c -ID:\x\inc -IC:\Program Files\VS\include)";
+    CHECK(tokenize_recorded_command(cmd, true, R"(D:\p\a.cpp)") ==
+          Tokens{R"(-IC:\Program Files (x86)\Windows Kits\10\include\um)", "-X", "-nologo", "-DA=1", "-c", R"(-ID:\x\inc)", R"(-IC:\Program Files\VS\include)"});
+    // Without the flag (compile_commands.json, MSBuild) nothing is glued.
+    CHECK(tokenize_recorded_command("/c a.cpp /Zi", false, "a.cpp") == Tokens{"/c", "a.cpp", "/Zi"});
+    // The source is not glued onto a path, whatever its spelling.
+    CHECK(tokenize_recorded_command(R"(-IC:\Program Files\x -c D:\p\a.cpp)", true, R"(d:\p\A.cpp)") ==
+          Tokens{R"(-IC:\Program Files\x)", "-c", R"(D:\p\a.cpp)"});
+    // cc1 commands use clang's quoting and are never repaired.
+    CHECK(tokenize_recorded_command(R"("-cc1" "-I" "C:\\Program Files\\x")", true) == Tokens{"-cc1", "-I", R"(C:\Program Files\x)"});
 }
 
 TEST_CASE("decode_response_file_bytes") {
