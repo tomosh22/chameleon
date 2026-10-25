@@ -4,14 +4,22 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <new>
 
 namespace cml {
 
 namespace {
 
 std::atomic<int> g_level{static_cast<int>(LogLevel::Info)};
-std::atomic<LogSink> g_sink{nullptr};
-std::atomic<void*> g_user{nullptr};
+// The sink and its user pointer are published together as one immutable record, so a reader can
+// never pair an old sink with a new user pointer. Records are intentionally never freed: a
+// concurrent log_write may still be reading the previous one, and set_log_sink is a rare,
+// configuration-time call (a few bytes per call).
+struct SinkRecord {
+    LogSink sink;
+    void* user;
+};
+std::atomic<const SinkRecord*> g_record{nullptr};  // nullptr = default stderr sink
 
 const char* base_name(const char* path) noexcept {
     if (path == nullptr) {
@@ -37,12 +45,23 @@ LogLevel log_level() noexcept {
 }
 
 bool log_enabled(LogLevel level) noexcept {
+    // Off is a threshold ("emit nothing"), never a level a message can be logged at.
+    if (level == LogLevel::Off) {
+        return false;
+    }
     return static_cast<int>(level) >= g_level.load(std::memory_order_relaxed);
 }
 
 void set_log_sink(LogSink sink, void* user) noexcept {
-    g_user.store(user, std::memory_order_release);
-    g_sink.store(sink, std::memory_order_release);
+    if (sink == nullptr) {
+        g_record.store(nullptr, std::memory_order_release);
+        return;
+    }
+    const SinkRecord* record = new (std::nothrow) SinkRecord{sink, user};
+    if (record == nullptr) {
+        return;  // out of memory: keep the previous sink rather than pair sink and user wrongly
+    }
+    g_record.store(record, std::memory_order_release);
 }
 
 const char* to_string(LogLevel level) noexcept {
@@ -74,9 +93,9 @@ void log_write(LogLevel level, const char* file, int line, const char* fmt, ...)
         std::memcpy(buffer, kFailed, sizeof(kFailed));
     }
 
-    const LogSink sink = g_sink.load(std::memory_order_acquire);
-    if (sink != nullptr) {
-        sink(g_user.load(std::memory_order_acquire), level, file, line, buffer);
+    const SinkRecord* record = g_record.load(std::memory_order_acquire);
+    if (record != nullptr) {
+        record->sink(record->user, level, file, line, buffer);
         return;
     }
     std::fprintf(stderr, "[%s] %s:%d: %s\n", to_string(level), base_name(file), line, buffer);

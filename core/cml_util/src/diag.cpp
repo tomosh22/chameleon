@@ -25,8 +25,12 @@ DiagCategory Diag::category() const noexcept {
 }
 
 std::string Diag::id() const {
+    if (!valid()) {
+        // Never print a truncated or zero code that could be mistaken for a real id.
+        return "CML????";
+    }
     char buf[16];
-    std::snprintf(buf, sizeof(buf), "CML%04u", static_cast<unsigned>(code % 10000u));
+    std::snprintf(buf, sizeof(buf), "CML%04u", static_cast<unsigned>(code));
     return std::string(buf);
 }
 

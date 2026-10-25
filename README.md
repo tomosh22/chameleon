@@ -8,7 +8,7 @@ its version. See `docs/IMPLEMENTATION_PLAN.md` for the plan and `docs/PROGRESS.m
 
 ## Build (Windows x64)
 
-Requirements are listed in `docs/BUILD_REQUIREMENTS.md`: CMake 3.21+, Visual Studio 2022 (MSVC
+Requirements are listed in `docs/BUILD_REQUIREMENTS.md`: CMake 3.24+, Visual Studio 2022 (MSVC
 v143) and optionally LLVM clang-cl. Use an x64 developer prompt for the Ninja generator.
 
 ```bat

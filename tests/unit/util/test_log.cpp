@@ -1,6 +1,8 @@
 #include "cml/util/log.h"
 
+#include <atomic>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "doctest.h"
@@ -83,4 +85,75 @@ TEST_CASE("Long messages are truncated, not overrun") {
 TEST_CASE("Level names") {
     CHECK(std::string(cml::to_string(cml::LogLevel::Trace)) == "trace");
     CHECK(std::string(cml::to_string(cml::LogLevel::Error)) == "error");
+}
+
+TEST_CASE("CML_LOG(Off, ...) never emits, whatever the threshold") {
+    std::vector<Captured> got;
+    SinkGuard guard(&got);
+    cml::set_log_level(cml::LogLevel::Trace);
+    CML_LOG(Off, "must not appear");
+    CHECK(got.empty());
+    CHECK_FALSE(cml::log_enabled(cml::LogLevel::Off));
+    cml::set_log_level(cml::LogLevel::Off);
+    CML_LOG(Off, "must not appear either");
+    CHECK(got.empty());
+}
+
+namespace {
+
+struct SinkContext {
+    std::atomic<int> calls{0};
+};
+SinkContext g_ctx_a;
+SinkContext g_ctx_b;
+std::atomic<int> g_mismatches{0};
+
+// Each sink only ever expects its own context. Pairing sink A with context B counts a mismatch.
+void sink_a(void* user, cml::LogLevel, const char*, int, const char*) {
+    if (user != &g_ctx_a) {
+        g_mismatches.fetch_add(1);
+    }
+    g_ctx_a.calls.fetch_add(1);
+}
+void sink_b(void* user, cml::LogLevel, const char*, int, const char*) {
+    if (user != &g_ctx_b) {
+        g_mismatches.fetch_add(1);
+    }
+    g_ctx_b.calls.fetch_add(1);
+}
+
+}  // namespace
+
+TEST_CASE("set_log_sink publishes sink and user together while other threads log") {
+    const cml::LogLevel saved = cml::log_level();
+    cml::set_log_level(cml::LogLevel::Trace);
+    cml::set_log_sink(&sink_a, &g_ctx_a);
+    g_mismatches = 0;
+
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> loggers;
+    for (int t = 0; t < 4; ++t) {
+        loggers.emplace_back([&stop] {
+            while (!stop.load()) {
+                CML_LOG(Info, "tick");
+            }
+        });
+    }
+    for (int i = 0; i < 20000; ++i) {
+        if ((i & 1) == 0) {
+            cml::set_log_sink(&sink_b, &g_ctx_b);
+        } else {
+            cml::set_log_sink(&sink_a, &g_ctx_a);
+        }
+    }
+    stop = true;
+    for (auto& th : loggers) {
+        th.join();
+    }
+
+    CHECK(g_mismatches.load() == 0);
+    CHECK(g_ctx_a.calls.load() + g_ctx_b.calls.load() > 0);
+
+    cml::set_log_sink(nullptr, nullptr);
+    cml::set_log_level(saved);
 }

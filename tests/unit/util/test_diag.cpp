@@ -20,10 +20,19 @@ TEST_CASE("Diag categories follow the thousands digit") {
 TEST_CASE("Diag with out-of-range code is invalid") {
     const cml::Diag none;
     CHECK_FALSE(none.valid());
-    CHECK(none.id() == "CML0000");
+    CHECK(none.id() == "CML????");
     CHECK(none.category() == cml::DiagCategory::Unknown);
     CHECK_FALSE(cml::Diag::make(999, "m", "w").valid());
     CHECK_FALSE(cml::Diag::make(6000, "m", "w").valid());
+}
+
+TEST_CASE("Diag::id never aliases an out-of-range code onto a valid-looking id") {
+    CHECK(cml::Diag::make(11101, "m", "w").id() == "CML????");
+    CHECK(cml::Diag::make(6101, "m", "w").id() == "CML????");
+    CHECK(cml::Diag::make(101, "m", "w").id() == "CML????");
+    CHECK(cml::Diag::make(1000, "m", "w").id() == "CML1000");
+    CHECK(cml::Diag::make(5999, "m", "w").id() == "CML5999");
+    CHECK(cml::Diag::make(11101, "m", "w").format().rfind("CML????:", 0) == 0);
 }
 
 TEST_CASE("Diag without a hint omits the what-to-do clause") {

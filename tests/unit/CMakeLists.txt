@@ -16,6 +16,10 @@ endfunction()
 cml_add_unit_test(util
     SOURCES util/test_diag.cpp util/test_result.cpp util/test_log.cpp util/test_hash.cpp
     LIBS cml_util)
+if(NOT MSVC)
+    find_package(Threads REQUIRED)
+    target_link_libraries(cml_test_util PRIVATE Threads::Threads)
+endif()
 cml_add_unit_test(coff SOURCES lib/test_coff.cpp LIBS cml_coff)
 cml_add_unit_test(pe SOURCES lib/test_pe.cpp LIBS cml_pe)
 cml_add_unit_test(pdb SOURCES lib/test_pdb.cpp LIBS cml_pdb)

@@ -15,12 +15,16 @@ enum class LogLevel : int { Trace = 0, Debug, Info, Warn, Error, Off };
 // A sink receives fully formatted messages. `user` is the pointer given to set_log_sink.
 using LogSink = void (*)(void* user, LogLevel level, const char* file, int line, const char* message);
 
-// Configure before starting threads that log; the level is atomic but sink + user are set as a pair.
+// Thread-safe. The level is atomic; sink and user pointer are published together as one unit.
 void set_log_level(LogLevel level) noexcept;
 LogLevel log_level() noexcept;
 bool log_enabled(LogLevel level) noexcept;
 
-// nullptr restores the default sink (one line to stderr).
+// nullptr restores the default sink (one line to stderr). Safe to call while other threads log.
+// Lifetime rule: after set_log_sink returns, a log call that began earlier may still invoke the
+// previous sink with the previous `user` pointer, so keep the old `user` object (and sink code)
+// alive until no thread can still be inside a log call, e.g. until process exit or a point where
+// logging threads are quiescent. LogLevel::Off is a threshold only; CML_LOG(Off, ...) never emits.
 void set_log_sink(LogSink sink, void* user) noexcept;
 
 const char* to_string(LogLevel level) noexcept;

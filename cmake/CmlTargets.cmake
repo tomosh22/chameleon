@@ -1,6 +1,6 @@
 # Target "styles" used across the repository.
 #
-#   cml_target_exceptions_allowed(<t>)  C++ exceptions + RTTI on (tests, GUI, third-party)
+#   cml_target_exceptions_allowed(<t>)  C++ exceptions + RTTI enabled as language features (tests, GUI, third-party)
 #   cml_target_core_style(<t>)          core/ and broker/ non-GUI: no exceptions, no RTTI
 #   cml_target_agent_style(<t>)         agent/: static CRT, no exceptions, no RTTI
 #   cml_target_fixture_style(<t>)       test fixtures: RelWithDebInfo uses /Ob0 (no inlining)
@@ -10,15 +10,15 @@
 
 function(cml_target_exceptions_allowed target)
     if(MSVC)
-        target_compile_options(${target} PRIVATE /EHsc)
+        target_compile_options(${target} PRIVATE /EHsc /GR)
     endif()
 endfunction()
 
 function(cml_target_core_style target)
     if(MSVC)
-        # _HAS_EXCEPTIONS=0 keeps the MSVC STL from warning (C4577) about noexcept without /EH.
+        # _HAS_EXCEPTIONS=0 (set project-wide in CmlToolchain.cmake) keeps the MSVC STL from
+        # warning (C4577) about noexcept without /EH.
         target_compile_options(${target} PRIVATE /EHs-c- /GR-)
-        target_compile_definitions(${target} PRIVATE _HAS_EXCEPTIONS=0)
     else()
         target_compile_options(${target} PRIVATE -fno-exceptions -fno-rtti)
     endif()

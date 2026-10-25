@@ -34,7 +34,7 @@ struct Diag {
     bool valid() const noexcept;
     DiagCategory category() const noexcept;
 
-    // "CML1101"; "CML0000" when the code is 0.
+    // "CML1101"; "CML????" when the code is outside CML1xxx..CML5xxx (including 0).
     std::string id() const;
     // "CML1101: <message> What to do: <what_to_do>"
     std::string format() const;
