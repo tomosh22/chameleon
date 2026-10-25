@@ -25,3 +25,13 @@ to the fixture directory).
 | `basic` | present | `logic.cpp` is the patch target (two externals: `g_tick`, `fixture_note`); `extras.cpp` covers COFF features for reader tests; edit `value_2.edit` changes the printed value 1 → 2 |
 | `c_only` | present (WP-11) | one C99 TU using the C API of `Chameleon_API.h`; `main.c` prints `TICK n=<k> value=7`; `--agent` creates the agent, enables its own module, calls the sync point every iteration |
 | `pch` | present (WP-05) | `target_precompile_headers(pch.h)`: a generated `/Yc` TU (`cmake_pch.cxx`) and two `/Yu` TUs (`main.cpp`, `logic.cpp`); `TICK n=<k> value=<v> base=100`; edits `value_2.edit` (TU change) and `pch_header.edit` (PCH header change, must be rejected). Used for the `/Zi` + `/Yu` recompile investigation in `docs/wp/WP-05.md` |
+| `statics` | present | file-static, function-local static with guard, static member, `.rdata` const; edit `value_30` (value 3 → 30, `calls=` must keep counting) |
+| `virtuals` | present | objects created at startup; edit `square_doubled` (value 19 → 28 via virtual calls on old objects) |
+| `templates` | present | header template COMDAT in two TUs + TU-local template; edit `offset_100` (value 13 → 211) |
+| `lambdas` | present | capturing lambda stored in `std::function` at startup; edit `lambda_times_10` (value (n%3)+5 → (n%3)+50) |
+| `new_function` | present | edit `add_helper` adds a new external function called by `compute_value` (value 1 → 42) |
+| `new_global` | present | edit `add_tracker` adds a global with dynamic initialiser and destructor (value 1 → 7) |
+
+Fixtures after `basic` share `common/fixture_runtime.h` (TICK loop, `--ticks`, `--agent`,
+`--agent-wait`), which only `main.cpp` includes; scenarios never patch `main.cpp`.
+

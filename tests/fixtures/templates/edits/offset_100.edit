@@ -1,0 +1,11 @@
+--- a/a.cpp
++++ b/a.cpp
+@@ -3,7 +3,7 @@
+ // TU-local template with int and double instantiations.
+ template <typename T> __declspec(noinline) T offset(T v)
+ {
+-    return v + 1;
++    return v + 100;
+ }
+ 
+ int templates_a()

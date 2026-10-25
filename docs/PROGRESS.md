@@ -22,4 +22,5 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 |---|---|---|
 | Housekeeping docs (DECISIONS, KNOWN_LIMITATIONS, PROGRESS) | done | #1 |
 | Shared fixture `basic` + `cml_add_fixture`; flaky log test fix | done | #3 |
+| M1 fixtures statics/virtuals/templates/lambdas/new_function/new_global | in review | #14 |
 | Make `extras.cpp` opaque so constructs survive clang-cl /O2 (WP-02 note) | in review | #8 |
