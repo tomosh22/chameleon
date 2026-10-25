@@ -10,6 +10,8 @@
 #include <vector>
 
 #include "cml/pdb/pdb.h"
+#include <ostream>  // doctest streams string_view operands; MSVC needs the full definition
+
 #include "doctest.h"
 
 #if defined(CML_FIXTURE_BASIC_PDB) && defined(CML_FIXTURE_BASIC_EXE) && defined(CML_FIXTURE_BASIC_SRC)

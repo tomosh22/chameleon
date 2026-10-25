@@ -1,6 +1,8 @@
 #include <string>
 
 #include "cml/pdb/pdb.h"
+#include <ostream>  // doctest streams string_view operands; MSVC needs the full definition
+
 #include "doctest.h"
 
 using cml::pdb::is_absolute_path;
