@@ -165,3 +165,14 @@ Plan §4.5 keys statics by (mangled name, object file). Module symbol records (`
 plus an RVA→public map for externals. The bind planner must bridge decorated obj names to PDB
 records. Candidate methods: undecorate the obj name and compare with the display name scoped by
 compiland; or match by section contribution plus offset order. The spike records what works.
+
+## ADR-0011 WP-03 debugger acceptance via cdb.exe in CI
+
+**Date:** 2026-10-25 · **Status:** Accepted (approved by the project owner)
+
+The plan's WP-03 acceptance item "debugger (VS) shows the patched function with symbols" is
+satisfied by a scripted `cdb.exe` session in CI. The session attaches to the running fixture
+after the patch is applied, lists the patch module, resolves the patched function to the
+patch DLL with its source file and line from the patch PDB, and prints the result. The
+orchestrator reads that output from the CI log. No manual Visual Studio check is required for
+the gate.
