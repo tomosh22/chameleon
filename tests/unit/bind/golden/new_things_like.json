@@ -18,6 +18,7 @@
       "type": "function",
       "defined": true,
       "static": false,
+      "section": ".text$mn",
       "decision": "patch-hooked",
       "source": "pdb-public",
       "module": "old.exe",
@@ -31,6 +32,7 @@
       "type": "function",
       "defined": true,
       "static": false,
+      "section": ".text$mn",
       "decision": "patch-new-function",
       "source": "none",
       "reason": "defined function not in the old image: new canonical symbol, no hook"
@@ -41,6 +43,7 @@
       "type": "data",
       "defined": true,
       "static": true,
+      "section": ".data",
       "decision": "patch-new-data",
       "source": "none",
       "reason": "static data 'g_tracker' has no record in compiland 0: new"
@@ -51,6 +54,7 @@
       "type": "function",
       "defined": true,
       "static": true,
+      "section": ".text$mn",
       "decision": "patch-fresh",
       "source": "none",
       "reason": "dynamic initialiser or atexit stub: run through the initialiser list, never hooked"
@@ -61,6 +65,7 @@
       "type": "function",
       "defined": true,
       "static": true,
+      "section": ".text$mn",
       "decision": "patch-fresh",
       "source": "none",
       "reason": "dynamic initialiser or atexit stub: run through the initialiser list, never hooked"
@@ -135,5 +140,7 @@
       "target_va": 140716281958400
     }
   ],
+  "locator_sections": [],
+  "associative_locator_sections": [],
   "warnings": []
 }

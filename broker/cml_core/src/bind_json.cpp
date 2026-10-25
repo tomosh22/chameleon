@@ -182,6 +182,9 @@ std::string to_json(const BindPlan& plan, const JsonOptions& o) {
         j.field("type", to_string(d.type));
         j.field_b("defined", d.defined);
         j.field_b("static", d.is_static);
+        if (d.defined) {
+            j.field("section", d.section_name);
+        }
         j.field("decision", to_string(d.decision));
         j.field("source", to_string(d.source));
         target_fields(j, d.old_address, o);
@@ -305,6 +308,19 @@ std::string to_json(const BindPlan& plan, const JsonOptions& o) {
             j.field_u("target_va", f.target_va);
         }
         j.end_object();
+    }
+    j.end_array();
+
+    j.key("locator_sections");
+    j.begin_array();
+    for (const std::uint32_t sec : plan.locator_sections) {
+        j.u64(sec);
+    }
+    j.end_array();
+    j.key("associative_locator_sections");
+    j.begin_array();
+    for (const std::uint32_t sec : plan.associative_locator_sections) {
+        j.u64(sec);
     }
     j.end_array();
 

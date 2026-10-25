@@ -18,6 +18,7 @@
       "type": "function",
       "defined": true,
       "static": false,
+      "section": ".text$mn",
       "decision": "patch-hooked",
       "source": "pdb-public",
       "module": "old.exe",
@@ -31,6 +32,7 @@
       "type": "function",
       "defined": true,
       "static": true,
+      "section": ".text$mn",
       "decision": "patch-hooked",
       "source": "compiland-static",
       "module": "old.exe",
@@ -44,6 +46,7 @@
       "type": "data",
       "defined": true,
       "static": true,
+      "section": ".data",
       "decision": "bind-old-data",
       "source": "compiland-static",
       "module": "old.exe",
@@ -57,6 +60,7 @@
       "type": "data",
       "defined": true,
       "static": true,
+      "section": ".data",
       "decision": "bind-old-data",
       "source": "compiland-static",
       "module": "old.exe",
@@ -70,6 +74,7 @@
       "type": "data",
       "defined": true,
       "static": true,
+      "section": ".data",
       "decision": "bind-old-data",
       "source": "compiland-layout",
       "module": "old.exe",
@@ -83,6 +88,7 @@
       "type": "data",
       "defined": true,
       "static": true,
+      "section": ".data",
       "decision": "bind-old-data",
       "source": "compiland-static",
       "module": "old.exe",
@@ -189,5 +195,9 @@
       "target_va": 5368721552
     }
   ],
+  "locator_sections": [
+    1
+  ],
+  "associative_locator_sections": [],
   "warnings": []
 }

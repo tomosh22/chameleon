@@ -18,6 +18,7 @@
       "type": "function",
       "defined": true,
       "static": false,
+      "section": ".text$mn",
       "decision": "patch-hooked",
       "source": "pdb-public",
       "module": "old.exe",
@@ -96,6 +97,7 @@
       "type": "data",
       "defined": true,
       "static": true,
+      "section": ".rdata",
       "decision": "patch-fresh",
       "source": "none",
       "reason": "vtable, RTTI, constant or runtime table: a fresh copy is correct"
@@ -106,6 +108,7 @@
       "type": "data",
       "defined": true,
       "static": true,
+      "section": ".xdata",
       "decision": "patch-fresh",
       "source": "none",
       "reason": "vtable, RTTI, constant or runtime table: a fresh copy is correct"
@@ -213,5 +216,9 @@
       "target_va": 5368713744
     }
   ],
+  "locator_sections": [
+    1
+  ],
+  "associative_locator_sections": [],
   "warnings": []
 }

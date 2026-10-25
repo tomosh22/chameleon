@@ -1,5 +1,6 @@
 #include "cml/coff/anchors.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <utility>
 
@@ -138,7 +139,9 @@ Result<std::vector<SectionLocator>> add_anchors(ObjectModel& m, const AnchorOpti
         const std::uint32_t def = tracker.definition(i + 1);
         if (def != SectionSymbolTracker::kNone) {
             const ModelSymbol& d = m.symbols[def];
-            if (d.aux.size() > 14 && std::to_integer<std::uint8_t>(d.aux[14]) == kSelectionAssociative) {
+            if (d.aux.size() > 14 && std::to_integer<std::uint8_t>(d.aux[14]) == kSelectionAssociative &&
+                std::find(options.anchor_associative.begin(), options.anchor_associative.end(), loc.section_index) ==
+                    options.anchor_associative.end()) {
                 loc.reason = NoLocatorReason::Associative;
                 continue;
             }

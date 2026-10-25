@@ -2,6 +2,8 @@
 // referencing function, never a silently wrong plan.
 #include <string>
 
+#include "cml/coff/anchors.h"
+#include "cml/coff/writer.h"
 #include "cml/core/bind_diag_ids.h"
 #include "cml/core/bind_plan.h"
 #include "cml/core/symbol_registry.h"
@@ -184,22 +186,49 @@ TEST_CASE("SECREL against module data is retargeted (the CRT's thread-safe-stati
     }
 }
 
-TEST_CASE("a fix-up needed inside a section without locator (associative / not linked) is CML3204") {
+TEST_CASE("a fix-up inside an associative COMDAT (cl's .text$x funclets) asks for a locator instead of failing") {
     SynthWorld w = basic_world();
     SynthObj o;
     auto f = o.function("?compute_value@@YAHXZ");
     const std::uint32_t tick = o.undefined("?g_tick@@3HA", false);
-    const std::uint32_t xdata = o.section(".xdata", kRdata | coff::scn::LnkComdat, 0x10, coff::ComdatSelection::Associative, f.section);
-    o.reloc(xdata, 8, tick, kAddr64);  // an absolute pointer to old data inside unwind data
+    const std::uint32_t funclet = o.section(".text$x", kTextComdat, 0x20, coff::ComdatSelection::Associative, f.section);
+    o.symbol("?dtor$0@?0??compute_value@@YAHXZ@4HA", 0, static_cast<std::int32_t>(funclet), true, false);
+    o.reloc(funclet, 8, tick, kRel32);
+    o.reloc(f.section, 3, tick, kRel32);
     Built b = o.build();
-    std::vector<cml::Diag> errors;
-    auto r = plan_bind(w.input(b), &errors);
-    REQUIRE(!r.has_value());
-    REQUIRE(errors.size() == 1);
-    CHECK(errors[0].code == diag::kNoLocator);
-    CHECK(contains(errors[0].message, "?g_tick@@3HA"));
-    CHECK(contains(errors[0].message, "compute_value"));
-    CHECK(contains(errors[0].message, "associative"));
+    auto r = plan_bind(w.input(b));
+    REQUIRE_MESSAGE(r.has_value(), err(r));
+    CHECK(find(*r, "?dtor$0@?0??compute_value@@YAHXZ@4HA")->decision == DecisionKind::PatchFresh);
+    REQUIRE(r->fixups.size() == 2);
+    CHECK(r->locator_sections == std::vector<std::uint32_t>({f.section, funclet}));
+    CHECK(r->associative_locator_sections == std::vector<std::uint32_t>({funclet}));
+
+    // Without the request the section has no locator (ADR-0024) ...
+    auto model = coff::ObjectModel::from_object(b.obj());
+    REQUIRE_MESSAGE(model.has_value(), err(model));
+    coff::AnchorOptions plain;
+    plain.tag = "t1";
+    auto none = coff::add_anchors(*model, plain);
+    REQUIRE_MESSAGE(none.has_value(), err(none));
+    CHECK((*none)[funclet - 1].kind == coff::LocatorKind::None);
+    // ... with it, the funclet is located like any COMDAT (its leader is static: an anchor).
+    auto model2 = coff::ObjectModel::from_object(b.obj());
+    REQUIRE_MESSAGE(model2.has_value(), err(model2));
+    coff::AnchorOptions asked;
+    asked.tag = "t2";
+    asked.anchor_associative = r->associative_locator_sections;
+    auto located = coff::add_anchors(*model2, asked);
+    REQUIRE_MESSAGE(located.has_value(), err(located));
+    CHECK((*located)[funclet - 1].kind == coff::LocatorKind::Anchor);
+    CHECK((*located)[funclet - 1].symbol_name == "__cml_anchor_t2_" + std::to_string(funclet));
+
+    // A layout without that section fails loudly in make_fixup_triples.
+    PatchLayout l;
+    l.patch_base = 0x150000000ull;
+    l.section_rva[f.section] = 0x1000;
+    auto t = make_fixup_triples(*r, l);
+    REQUIRE(!t.has_value());
+    CHECK(t.error().code == diag::kNoLocator);
 }
 
 TEST_CASE("relocations in debug sections are never retargeted and never diagnosed") {

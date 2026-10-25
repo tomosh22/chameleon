@@ -460,6 +460,9 @@ void Planner::collect_symbols() {
         sy.dec.defined = sy.defined;
         sy.dec.is_static = sy.is_static;
         sy.dec.section = sn > 0 ? static_cast<std::uint32_t>(sn) : 0;
+        if (sn > 0) {
+            sy.dec.section_name = secs_[static_cast<std::size_t>(sn) - 1].name;
+        }
         sy.dec.value = s.value;
         if (s.index < pos_of_raw_.size()) {
             pos_of_raw_[s.index] = static_cast<std::uint32_t>(syms_.size());
@@ -585,6 +588,18 @@ std::vector<const pdb::SymbolView*> Planner::static_candidates(const std::string
             for (std::size_t at = n.find(anon); at != std::string::npos; at = n.find(anon, at)) {
                 n.replace(at, anon.size(), "(anonymous namespace)");
             }
+            // cl numbers the local scopes of lambdas in function bodies: "f::__l2::<lambda_1>::operator()".
+            for (std::size_t at = n.find("::__l"); at != std::string::npos; at = n.find("::__l", at)) {
+                std::size_t e = at + 5;
+                while (e < n.size() && n[e] >= '0' && n[e] <= '9') {
+                    ++e;
+                }
+                if (e > at + 5 && n.compare(e, 2, "::") == 0) {
+                    n.erase(at, e - at);
+                } else {
+                    ++at;
+                }
+            }
             if (n == display) {
                 exact.push_back(v);
             }
@@ -655,7 +670,8 @@ void Planner::decide_defined() {
             continue;
         }
         // Fresh copies (plan 4.5): vtables, RTTI, constants, unwind tables, initialiser stubs, funclets.
-        if (type == SymbolType::Data && (is_fresh_data_name(sy.name) || (si != nullptr && si->runtime_table))) {
+        if (type == SymbolType::Data && (is_fresh_data_name(sy.name) || sy.name.find("$rtc") != std::string::npos ||
+                                         (si != nullptr && si->runtime_table))) {
             decide(sy, DecisionKind::PatchFresh, BindSource::None, type, {}, "vtable, RTTI, constant or runtime table: a fresh copy is correct");
             continue;
         }
@@ -1069,6 +1085,8 @@ FixupKind rel32_kind(coff::RelocType t) {
 void Planner::build_fixups() {
     std::set<std::uint32_t> warned_sections;
     std::set<std::uint32_t> bound_sections;
+    std::set<std::uint32_t> locator_set;
+    std::set<std::uint32_t> associative_set;
     for (const Sym& sy : syms_) {
         if (sy.defined && sy.decided && sy.dec.decision == DecisionKind::BindOldData && sy.dec.section != 0) {
             bound_sections.insert(sy.dec.section);
@@ -1149,12 +1167,18 @@ void Planner::build_fixups() {
                 continue;  // the placeholder itself holds the address
             }
             const SecInfo& site = si;
-            if (!site.has_locator) {
+            if (!site.linked) {
                 error(diag::kNoLocator,
                       "reference to " + describe(ts) + " from " + where() + " in " + in_.object_name + " sits in section '" + site.name +
-                          "' which has no locator (" + (site.associative ? "associative COMDAT" : "not linked") + "); it cannot be retargeted",
-                      "Move the reference out of unwind or debug data, or hot-restart.");
+                          "' which is not linked into the image; it cannot be retargeted",
+                      "Hot-restart; this is not expected for a compiler-generated object.");
                 continue;
+            }
+            // Sections with fix-ups need a locator; associative ones only get one on request (ADR-0024
+            // amended: cl's `.text$x` funclets reference bound statics).
+            locator_set.insert(sec_index);
+            if (site.associative) {
+                associative_set.insert(sec_index);
             }
             // In-place addend (ADR-0025).
             const std::size_t width = (rel || secrel) ? 4u : 8u;
@@ -1193,6 +1217,8 @@ void Planner::build_fixups() {
     std::stable_sort(plan_.fixups.begin(), plan_.fixups.end(), [](const Fixup& a, const Fixup& b) {
         return a.section_index != b.section_index ? a.section_index < b.section_index : a.offset < b.offset;
     });
+    plan_.locator_sections.assign(locator_set.begin(), locator_set.end());
+    plan_.associative_locator_sections.assign(associative_set.begin(), associative_set.end());
 }
 
 // ---- initialisers -----------------------------------------------------------------------------
@@ -1207,7 +1233,7 @@ void Planner::find_initialisers() {
         // Only writable data can hold state a re-run initialiser would clobber (inline constants in
         // .rdata have no dynamic initialisation).
         if (sy.defined && sy.decided && sy.dec.decision == DecisionKind::BindOldData && sy.dec.section != 0 &&
-            (secs_[sy.dec.section - 1].sec->characteristics & coff::scn::MemWrite) != 0) {
+            (secs_[sy.dec.section - 1].sec->characteristics & coff::scn::MemWrite) != 0 && !secs_[sy.dec.section - 1].sec->is_comdat()) {
             any_bound_defined_data = true;
         }
     }

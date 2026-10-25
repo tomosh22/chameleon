@@ -101,6 +101,7 @@ struct SymbolDecision {
     bool defined = false;
     bool is_static = false;
     std::uint32_t section = 0;       // defining section (defined symbols), 1-based
+    std::string section_name;        // its name (".text$mn", ".bss", ...)
     std::uint32_t value = 0;         // offset in that section
     DecisionKind decision = DecisionKind::PatchFresh;
     BindSource source = BindSource::None;
@@ -221,6 +222,12 @@ struct BindPlan {
     std::vector<NewGlobal> new_globals;
     std::vector<InitialiserEntry> initialisers;  // in run order
     std::vector<Fixup> fixups;                   // by section, offset
+    // Sections of the object that hold a (non-slot) fix-up and therefore need a locator (ADR-0024).
+    // The associative ones among them (cl's `.text$x` EH funclets that touch a bound static, e.g. the
+    // guard `$TSS0`) must be passed to coff::AnchorOptions::anchor_associative, otherwise they have
+    // none and make_fixup_triples() fails with CML3204.
+    std::vector<std::uint32_t> locator_sections;
+    std::vector<std::uint32_t> associative_locator_sections;
     std::vector<Diag> warnings;
 
     PlanSummary summary() const;

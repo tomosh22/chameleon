@@ -460,7 +460,8 @@ void plan_fixture(const std::string& name) {
         for (const std::string& i : n.initialisers) {
             inits += " init=" + i;
         }
-        brief("NEW-GLOBAL " + tag + " " + n.display + (n.is_static ? " static" : "") + inits);
+        const SymbolDecision* nd = p.find_decision(n.name);
+        brief("NEW-GLOBAL " + tag + " " + n.display + (n.is_static ? " static" : "") + (nd != nullptr ? " section=" + nd->section_name : std::string()) + inits);
     }
     for (const InitialiserEntry& e : p.initialisers) {
         brief("INITIALISER " + tag + " " + e.function + " table=" + e.table_section_name + "+" + std::to_string(e.table_offset) +
