@@ -43,8 +43,17 @@ std::string read_all(const std::string& path, bool* ok) {
 
 void check_golden(const std::string& name, const std::string& actual) {
     const std::string path = golden_path(name);
+#ifdef _WIN32
+    char* update_buf = nullptr;
+    std::size_t update_len = 0;
+    _dupenv_s(&update_buf, &update_len, "CML_UPDATE_GOLDEN");
+    const bool update_requested = update_buf != nullptr && update_buf[0] == '1';
+    std::free(update_buf);
+#else
     const char* update = std::getenv("CML_UPDATE_GOLDEN");
-    if (update != nullptr && update[0] == '1') {
+    const bool update_requested = update != nullptr && update[0] == '1';
+#endif
+    if (update_requested) {
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
         out << actual;
         return;
