@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 namespace hooktest {
 
@@ -27,6 +28,34 @@ inline void crash_line(const char* format, ...) {
         DWORD written = 0;
         WriteFile(GetStdHandle(STD_ERROR_HANDLE), buffer, static_cast<DWORD>(n), &written, nullptr);
     }
+}
+
+// "function + offset" (or "module + offset") for an address, via dbghelp loaded at run time.
+inline std::string symbolize(std::uintptr_t address) {
+    using SymInitializeFn = BOOL(WINAPI*)(HANDLE, PCSTR, BOOL);
+    using SymFromAddrFn = BOOL(WINAPI*)(HANDLE, DWORD64, PDWORD64, PSYMBOL_INFO);
+    static HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
+    static auto sym_initialize =
+        dbghelp ? reinterpret_cast<SymInitializeFn>(reinterpret_cast<void (*)()>(GetProcAddress(dbghelp, "SymInitialize"))) : nullptr;
+    static auto sym_from_addr =
+        dbghelp ? reinterpret_cast<SymFromAddrFn>(reinterpret_cast<void (*)()>(GetProcAddress(dbghelp, "SymFromAddr"))) : nullptr;
+    static const bool initialised = sym_initialize != nullptr && sym_initialize(GetCurrentProcess(), nullptr, TRUE) != 0;
+    char buffer[64];
+    std::snprintf(buffer, sizeof(buffer), "0x%llx", static_cast<unsigned long long>(address));
+    std::string text = buffer;
+    if (initialised && sym_from_addr != nullptr) {
+        alignas(SYMBOL_INFO) char storage[sizeof(SYMBOL_INFO) + 256] = {};
+        auto* symbol = reinterpret_cast<PSYMBOL_INFO>(storage);
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = 255;
+        DWORD64 displacement = 0;
+        if (sym_from_addr(GetCurrentProcess(), address, &displacement, symbol)) {
+            text += std::string(" ") + symbol->Name + "+0x";
+            std::snprintf(buffer, sizeof(buffer), "%llx", static_cast<unsigned long long>(displacement));
+            text += buffer;
+        }
+    }
+    return text;
 }
 
 inline LONG WINAPI report_unhandled_exception(PEXCEPTION_POINTERS info) {

@@ -908,23 +908,28 @@ TEST_CASE("threads created continuously while hooks are installed and reverted")
 
     std::atomic<bool> stop{false};
     std::atomic<long long> created{0};
+    std::atomic<int> alive{0};  // children that have not finished: none may outlive this test
     // Creates short-lived threads as fast as it can. It is itself stopped by the installer, perhaps
     // inside CreateThread while holding the loader lock or the heap lock: the installer must not
     // need either.
     std::thread creator([&] {
         while (!stop.load()) {
+            ++alive;
             HANDLE h = CreateThread(
                 nullptr, 0,
-                [](LPVOID) -> DWORD {
+                [](LPVOID counter) -> DWORD {
                     for (int i = 0; i < 2000; ++i) {
                         YieldProcessor();
                     }
+                    static_cast<std::atomic<int>*>(counter)->fetch_sub(1);
                     return 0;
                 },
-                nullptr, 0, nullptr);
+                &alive, 0, nullptr);
             if (h != nullptr) {
                 CloseHandle(h);
                 ++created;
+            } else {
+                --alive;
             }
         }
     });
@@ -968,6 +973,13 @@ TEST_CASE("threads created continuously while hooks are installed and reverted")
     }
     stop = true;
     creator.join();
+    // Let every child finish (a thread still starting up when the process exits has crashed the
+    // Debug runtime's checks in the past), then give the last ones time to leave the kernel.
+    for (int waited = 0; alive.load() > 0 && waited < 1000; ++waited) {
+        Sleep(10);
+    }
+    Sleep(100);
+    CHECK(alive.load() == 0);
     if (installer.hook_count() > 0) {
         REQUIRE(revert_one(installer, old_fn.entry, "fn", nullptr).ok());  // nothing creates threads any more
     }
@@ -981,25 +993,35 @@ TEST_CASE("threads created continuously while hooks are installed and reverted")
     CHECK(old_fn.as_int()(1) == 1);
 }
 
-TEST_CASE("no test thread is left behind by the tests above") {
-    // Threads that outlive their test could be running (or crashing) while the process exits. Only
-    // the main thread, the hang watchdog of doctest_main.cpp and (briefly) exiting threads may exist.
+TEST_CASE("which threads exist after the tests above (information for the exit crash hunt)") {
+    // Not an assertion on the exact number: Windows may keep thread-pool threads. The start address of
+    // every thread other than this one is printed so that a thread of ours that was left behind shows up.
     Sleep(200);
+    using QueryFn = LONG(NTAPI*)(HANDLE, int, PVOID, ULONG, PULONG);
+    const auto query = reinterpret_cast<QueryFn>(
+        reinterpret_cast<void (*)()>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread")));
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     REQUIRE(snapshot != INVALID_HANDLE_VALUE);
     THREADENTRY32 entry;
     entry.dwSize = sizeof(entry);
     int threads = 0;
-    std::string ids;
     for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
-        if (entry.th32OwnerProcessID == GetCurrentProcessId()) {
-            ++threads;
-            ids += " " + std::to_string(entry.th32ThreadID);
+        if (entry.th32OwnerProcessID != GetCurrentProcessId()) {
+            continue;
         }
+        ++threads;
+        std::uintptr_t start = 0;
+        if (HANDLE h = OpenThread(THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID)) {
+            if (query != nullptr) {
+                query(h, 9 /* ThreadQuerySetWin32StartAddress */, &start, sizeof(start), nullptr);
+            }
+            CloseHandle(h);
+        }
+        MESSAGE("thread " << entry.th32ThreadID << (entry.th32ThreadID == GetCurrentThreadId() ? " (this one)" : "")
+                          << " starts at " << hooktest::symbolize(start));
     }
     CloseHandle(snapshot);
-    MESSAGE("threads in the process:" << ids);
-    CHECK(threads <= 3);
+    CHECK(threads < 16);
 }
 
 #endif  // _WIN32
