@@ -414,3 +414,37 @@ Skipped steps never count as passes. WP-12's acceptance switches CI to
 WP-03 drives fixture `basic` from outside (`VirtualAllocEx`, remote `LoadLibraryW` thread,
 `WriteProcessMemory`, external `SuspendThread`) as its "stub agent". WP-11's agent is not
 involved. This isolates the gate from agent bugs. Patching from inside the agent is WP-08 and WP-10.
+
+## ADR-0024 Section locators replace "anchor every section" (corrects plan §4.6)
+
+**Date:** 2026-10-25 · **Status:** Accepted · **Source:** WP-03 and WP-06 CI evidence
+
+Plan §4.6 adds a static `__cml_anchor_<n>` to every section. The evidence contradicts that:
+- **Static anchors are invisible.** Neither linker writes them to the PDB (WP-03, WP-06).
+- **External anchors break in discarded COMDATs.** They work in single-object links, but
+  lld-link fails with "undefined symbol" when it discards a COMDAT as a duplicate of another
+  object's copy. link.exe tolerates it.
+
+**Decision.** Each section gets a *locator*:
+- **Non-COMDAT section:** an external anchor `__cml_anchor_<tag>_<n>`. The tag is unique per
+  object within one link: a content hash plus the compiland index.
+- **COMDAT section:** its leader symbol, which is external and appears in the patch PDB as
+  `S_PUB32`. RVA of the section = leader RVA − leader value. A discarded duplicate resolves to
+  the kept copy, which is the correct retarget base.
+- **Associative section** (`.pdata`/`.xdata`): no locator. These never need retargeting to old
+  data; their relocations target patch-local functions or binding thunks.
+
+The retargeter (WP-07/09/12) computes `site_va` from the locator. A relocation needing
+retargeting inside a section without a locator is a CML33xx diagnostic. Section contributions
+from the patch PDB are a cross-check: lld-link matches all sections, and link.exe all except
+`.pdata`.
+
+## ADR-0025 Fix-up formula reads the in-place addend (corrects plan §4.6)
+
+**Date:** 2026-10-25 · **Status:** Accepted · **Source:** WP-03
+
+The plan's REL32 formula omits the addend stored at the relocation site. cl emits `REL32_1`
+with an addend of 0, while clang-cl emits plain `REL32` with an in-place addend of −1 for the
+same access. The retargeter therefore computes `target = S + A` (A read from the original
+object's section bytes at the site) and writes `target − (site + 4 + N)`. ADDR64 likewise adds
+the in-place 64-bit addend.
