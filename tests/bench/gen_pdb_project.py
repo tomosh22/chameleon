@@ -13,7 +13,7 @@ duplicated in every module that uses them). That gives the PDB what real project
 many compilands, large module symbol streams, many publics and a big file -> compilands map.
 
 Usage:
-    gen_pdb_project.py OUT_DIR [--tus 600] [--funcs-per-tu 1000] [--headers 24] [--seed 1]
+    gen_pdb_project.py OUT_DIR [--tus 900] [--funcs-per-tu 1000] [--headers 24] [--seed 1]
                                [--debug-format Z7|Zi]
 
 A 500 MB+ PDB is one flag away: raise --tus / --funcs-per-tu (PDB size grows linearly with both).
@@ -184,7 +184,7 @@ target_link_options(bench_project PRIVATE /DEBUG:FULL /INCREMENTAL:NO /OPT:NOREF
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("out_dir")
-    ap.add_argument("--tus", type=int, default=600, help="translation units (compilands)")
+    ap.add_argument("--tus", type=int, default=900, help="translation units (compilands)")
     ap.add_argument("--funcs-per-tu", type=int, default=1000, help="distinct functions per translation unit")
     ap.add_argument("--headers", type=int, default=24, help="shared headers")
     ap.add_argument("--seed", type=int, default=1)

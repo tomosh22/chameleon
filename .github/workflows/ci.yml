@@ -152,7 +152,7 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 90
     env:
-      BENCH_ID: tus600-f1000-h24-s1-Z7
+      BENCH_ID: tus900-f1000-h24-s1-Z7
       LOG_DIR: ci-logs
     defaults:
       run:
@@ -177,7 +177,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
           if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
-          python tests/bench/gen_pdb_project.py bench-src --tus 600 --funcs-per-tu 1000 --headers 24 --seed 1 --debug-format Z7 *>&1 | Tee-Object -FilePath "$env:LOG_DIR/bench-generate.log"
+          python tests/bench/gen_pdb_project.py bench-src --tus 900 --funcs-per-tu 1000 --headers 24 --seed 1 --debug-format Z7 *>&1 | Tee-Object -FilePath "$env:LOG_DIR/bench-generate.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake -S bench-src -B bench-build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=cl *>&1 | Tee-Object -FilePath "$env:LOG_DIR/bench-configure.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -209,7 +209,7 @@ jobs:
       - name: Run the benchmark (asserts the load-time and memory budgets)
         run: |
           New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
-          build/bin/cml_pdb_bench.exe bench-pdb/bench_project.pdb --min-size-mb 250 *>&1 | Tee-Object -FilePath "$env:LOG_DIR/pdb-benchmark.txt"
+          build/bin/cml_pdb_bench.exe bench-pdb/bench_project.pdb --min-size-mb 500 *>&1 | Tee-Object -FilePath "$env:LOG_DIR/pdb-benchmark.txt"
           $rc = $LASTEXITCODE
           '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
           Get-Content "$env:LOG_DIR/pdb-benchmark.txt" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
