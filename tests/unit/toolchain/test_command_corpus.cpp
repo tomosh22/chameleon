@@ -97,7 +97,7 @@ TEST_CASE("corpus: tokenisation, rewritten command and diagnostics of every case
         rec.compiler = c.compiler;
         rec.cwd = c.cwd;
         rec.source = c.source;
-        rec.args = tokenize_recorded_command(c.command, c.from_pdb != 0, c.source);
+        rec.args = tokenize_recorded_command(c.command);
 
         // 1. tokenisation
         CHECK(join(rec.args, '|') == std::string(c.expected_tokens));
@@ -142,7 +142,7 @@ TEST_CASE("corpus: the rewritten command line tokenises back to the rewritten ar
         rec.compiler = c.compiler;
         rec.cwd = c.cwd;
         rec.source = c.source;
-        rec.args = tokenize_recorded_command(c.command, c.from_pdb != 0, c.source);
+        rec.args = tokenize_recorded_command(c.command);
         RewriteOptions options;
         options.output_object = kOut;
         options.pch_debug = mode_of(c.pch_mode);

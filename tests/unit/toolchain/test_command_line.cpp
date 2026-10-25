@@ -58,17 +58,10 @@ TEST_CASE("split_command_line_posix: clang's CodeView quoting") {
     CHECK(split_command_line_posix(R"("")") == Tokens{""});
 }
 
-TEST_CASE("tokenize_recorded_command: S_BUILDINFO commands with unquoted directories that contain spaces") {
-    const std::string cmd = R"(-IC:\Program Files (x86)\Windows Kits\10\include\um -X -nologo -DA=1 -c -ID:\x\inc -IC:\Program Files\VS\include)";
-    CHECK(tokenize_recorded_command(cmd, true, R"(D:\p\a.cpp)") ==
-          Tokens{R"(-IC:\Program Files (x86)\Windows Kits\10\include\um)", "-X", "-nologo", "-DA=1", "-c", R"(-ID:\x\inc)", R"(-IC:\Program Files\VS\include)"});
-    // Without the flag (compile_commands.json, MSBuild) nothing is glued.
-    CHECK(tokenize_recorded_command("/c a.cpp /Zi", false, "a.cpp") == Tokens{"/c", "a.cpp", "/Zi"});
-    // The source is not glued onto a path, whatever its spelling.
-    CHECK(tokenize_recorded_command(R"(-IC:\Program Files\x -c D:\p\a.cpp)", true, R"(d:\p\A.cpp)") ==
-          Tokens{R"(-IC:\Program Files\x)", "-c", R"(D:\p\a.cpp)"});
-    // cc1 commands use clang's quoting and are never repaired.
-    CHECK(tokenize_recorded_command(R"("-cc1" "-I" "C:\\Program Files\\x")", true) == Tokens{"-cc1", "-I", R"(C:\Program Files\x)"});
+TEST_CASE("tokenize_recorded_command: Windows rules for cl, clang quoting for cc1") {
+    CHECK(tokenize_recorded_command(R"(-c -I"C:\Program Files\VS\include" -X)") == Tokens{"-c", R"(-IC:\Program Files\VS\include)", "-X"});
+    CHECK(tokenize_recorded_command(R"("-cc1" "-I" "C:\\Program Files\\x")") == Tokens{"-cc1", "-I", R"(C:\Program Files\x)"});
+    CHECK(tokenize_recorded_command(R"(-cc1 "-I" "a")") == Tokens{"-cc1", "-I", "a"});
 }
 
 TEST_CASE("decode_response_file_bytes") {

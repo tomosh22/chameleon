@@ -263,7 +263,9 @@ CompilandFlagFacts detect_compiland_flags(const CompilandFlagInputs& in) {
     {
         FlagFact& f = facts.hotpatch;
         if (in.compile3 != nullptr && in.compile3->hotpatch) {
-            f = {Tri::Yes, Evidence::Compile3, "S_COMPILE3 hotpatch flag is set"};
+            f = {Tri::Yes, Evidence::Compile3,
+                 "S_COMPILE3 hotpatch flag is set (x64 cl ignores /hotpatch with D9002, ADR-0020, and CI shows the bit set for cl and clang-cl objects "
+                 "whether or not the option was given: it records that x64 functions are patchable, not what was on the command line)"};
         } else if (in.have_command_line && cmd.hotpatch.value == Tri::Yes) {
             f = {Tri::Yes, Evidence::CommandLine, with_token("command line has", cmd.hotpatch)};
         } else if (in.compile3 != nullptr && !clang) {
