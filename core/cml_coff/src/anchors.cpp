@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <utility>
 
+#include "cml/util/hash.h"
 #include "cml/util/log.h"
 
 namespace cml::coff {
@@ -25,6 +26,32 @@ bool is_anchorable(const ModelSection& s) noexcept {
     return true;
 }
 
+std::string content_tag(const ObjectModel& m) {
+    // Chain hash64 over the pieces; order and sizes are part of the input.
+    std::uint64_t h = 0x9E3779B97F4A7C15ull;
+    const auto mix = [&h](const void* p, std::size_t n) {
+        std::string buf(reinterpret_cast<const char*>(&h), sizeof(h));
+        buf.append(reinterpret_cast<const char*>(p), n);
+        h = hash64(buf.data(), buf.size());
+    };
+    for (const ModelSection& s : m.sections) {
+        mix(s.raw_name.data(), s.raw_name.size());
+        mix(&s.characteristics, sizeof(s.characteristics));
+        const std::uint64_t n = s.data.size();
+        mix(&n, sizeof(n));
+        mix(s.data.data(), s.data.size());
+        const std::uint64_t r = s.relocations.size();
+        mix(&r, sizeof(r));
+    }
+    for (const ModelSymbol& s : m.symbols) {
+        mix(s.name.data(), s.name.size());
+        mix(&s.value, sizeof(s.value));
+    }
+    char out[17];
+    std::snprintf(out, sizeof(out), "%016llx", static_cast<unsigned long long>(h));
+    return std::string(out);
+}
+
 std::string anchor_name(std::uint32_t section_index, std::string_view tag) {
     std::string name(kAnchorPrefix);
     if (!tag.empty()) {
@@ -34,10 +61,6 @@ std::string anchor_name(std::uint32_t section_index, std::string_view tag) {
 }
 
 Result<std::vector<Anchor>> add_anchors(ObjectModel& m, const AnchorOptions& options) {
-    if (options.external && options.tag.empty()) {
-        return Diag::make(diag::kBadAnchorOptions, "external anchors need a tag (two objects of one link would define the same name)",
-                          "Set AnchorOptions::tag to a string that is unique per object.");
-    }
     for (char c : options.tag) {
         const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
         if (!ok) {
@@ -45,6 +68,7 @@ Result<std::vector<Anchor>> add_anchors(ObjectModel& m, const AnchorOptions& opt
                               "Use only letters, digits and '_' in the tag.");
         }
     }
+    const std::string tag = options.tag.empty() && options.external ? content_tag(m) : options.tag;
     for (const ModelSymbol& s : m.symbols) {
         if (starts_with(s.name, kAnchorPrefix)) {
             return Diag::make(diag::kAnchorNameClash,
@@ -69,7 +93,7 @@ Result<std::vector<Anchor>> add_anchors(ObjectModel& m, const AnchorOptions& opt
             continue;
         }
         const std::uint32_t section_index = static_cast<std::uint32_t>(i + 1);
-        std::string name = anchor_name(section_index, options.tag);
+        std::string name = anchor_name(section_index, tag);
         auto raw = m.encode_symbol_name(name);
         if (!raw) {
             return raw.error();

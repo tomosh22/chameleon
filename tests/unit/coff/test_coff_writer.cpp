@@ -630,12 +630,16 @@ TEST_CASE("coff anchors: errors") {
     auto m = coff::ObjectModel::from_object(*before);
     REQUIRE(m.has_value());
 
-    SUBCASE("external anchors need a tag") {
-        coff::AnchorOptions o;
-        o.external = true;
-        auto r = coff::add_anchors(*m, o);
-        REQUIRE_FALSE(r.has_value());
-        CHECK(r.error().code == coff::diag::kBadAnchorOptions);
+    SUBCASE("external anchors without a tag get a content-derived 16-digit tag, unique per object") {
+        const std::string tag = coff::content_tag(*m);  // before the anchors are added
+        auto r = coff::add_anchors(*m);
+        REQUIRE(r.has_value());
+        CHECK(tag.size() == 16);
+        CHECK((*r)[0].symbol_name == "__cml_anchor_" + tag + "_1");
+        auto other = coff::ObjectModel::from_object(*before);
+        REQUIRE(other.has_value());
+        other->sections[0].data[0] = std::byte{0x42};
+        CHECK(coff::content_tag(*other) != tag);
     }
     SUBCASE("tags use [A-Za-z0-9_] only") {
         coff::AnchorOptions o;

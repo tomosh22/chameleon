@@ -668,7 +668,7 @@ void run_set(const SetSpec& spec) {
             coff::AnchorOptions opt;
             opt.external = external;
             if (external) {
-                opt.tag = "o" + std::to_string(i);
+                // tag left empty: the content-derived default is used
                 // lld-link rejects external anchors inside COMDATs that are discarded as duplicates.
                 opt.comdat_static = objects.size() > 1;
             }

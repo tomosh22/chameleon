@@ -37,17 +37,18 @@ namespace cml::coff {
 inline constexpr std::string_view kAnchorPrefix = "__cml_anchor_";
 
 struct AnchorOptions {
-    // IMAGE_SYM_CLASS_STATIC (default, the plan's form) or IMAGE_SYM_CLASS_EXTERNAL. PDB publics
-    // (S_PUB32) are the linker's external symbols: an external anchor is a public with its RVA, a
-    // static one is not published as a public (docs/wp/WP-06.md has the per-linker evidence).
-    bool external = false;
-    // With `external`: keep the anchors of COMDAT sections STATIC. An external symbol that lives in a
-    // COMDAT section the linker discards as a duplicate of another object's makes lld-link report
-    // "undefined symbol" (link.exe tolerates it), so use this whenever several objects are linked
-    // together. A COMDAT function already has its leader symbol as a public.
+    // EXTERNAL anchors (default). Neither link.exe nor lld-link writes STATIC symbols to the PDB
+    // (publics or module symbols: 0 found, docs/wp/WP-06.md and ADR-0020), while an external anchor
+    // is an S_PUB32 public with its RVA. false gives the plan's original static form (never visible).
+    bool external = true;
+    // With `external`: keep the anchors of COMDAT sections STATIC. Needed when several objects are
+    // linked together: an external symbol inside a COMDAT that the linker drops as a duplicate of
+    // another object's makes lld-link report "undefined symbol" (WP-06 CI evidence; link.exe
+    // tolerates it). Single-object links need not set it. A COMDAT function's leader is a public anyway.
     bool comdat_static = false;
-    // Inserted into the name: "__cml_anchor_<tag>_<n>". Mandatory for external anchors (two objects
-    // of one link must not define the same external name); letters, digits and '_' only.
+    // Inserted into the name: "__cml_anchor_<tag>_<n>" so that two objects of one link never define
+    // the same external name. Letters, digits and '_' only. Empty with `external`: derived from a
+    // 64-bit hash of the object's content (see content_tag()), 16 hex digits.
     std::string tag;
 };
 
@@ -60,13 +61,15 @@ struct Anchor {
 // True when the section is linked into the image (see the rules above).
 bool is_anchorable(const ModelSection& section) noexcept;
 
+// 16 hex digits of a 64-bit hash over the model's section names, headers, data and symbol names.
+std::string content_tag(const ObjectModel& model);
+
 // The anchor symbol name of a section: "__cml_anchor_<section_index>", or with a tag
 // "__cml_anchor_<tag>_<section_index>".
 std::string anchor_name(std::uint32_t section_index, std::string_view tag = {});
 
 // Appends the anchors; returns them in section order. CML3306 when the object already holds a
-// symbol named __cml_anchor_*; CML3307 for invalid options (external without a tag, bad tag
-// characters); CML3300 when the symbol or string table would overflow.
+// symbol named __cml_anchor_*; CML3307 for invalid tag characters; CML3300 when the symbol or string table would overflow.
 Result<std::vector<Anchor>> add_anchors(ObjectModel& model, const AnchorOptions& options = {});
 
 }  // namespace cml::coff
