@@ -129,11 +129,16 @@ void reap_finished(std::vector<std::unique_ptr<Connection>>& connections) {
 }  // namespace
 
 ConnectionServer::ConnectionServer(ServerOptions options) : options_(std::move(options)) {
-    stop_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (options_.stop_event != nullptr) {
+        stop_event_ = options_.stop_event;
+    } else {
+        stop_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        owns_stop_event_ = stop_event_ != nullptr;
+    }
 }
 
 ConnectionServer::~ConnectionServer() {
-    if (stop_event_ != nullptr) {
+    if (owns_stop_event_) {
         CloseHandle(stop_event_);
     }
 }
@@ -166,7 +171,11 @@ Result<ServerExit> ConnectionServer::run() {
     ServerExit exit_reason = ServerExit::Stopped;
     std::optional<Diag> failure;
 
-    while (!stop_requested_.load(std::memory_order_acquire)) {
+    const auto stop_signalled = [this] {
+        return stop_requested_.load(std::memory_order_acquire) ||
+               WaitForSingleObject(stop_event_, 0) == WAIT_OBJECT_0;
+    };
+    while (!stop_signalled()) {
         // stop() signals stop_event_, which also ends a wait for a client at once.
         Result<ipc::PipeServer::Accepted> accepted = server.accept(kAcceptPollMs, stop_event_);
         if (!accepted) {
@@ -214,6 +223,7 @@ Result<ServerExit> ConnectionServer::run() {
         }
     }
 
+    stop_requested_.store(true, std::memory_order_release);  // the connection threads look at this too
     server.cancel();
     for (auto& connection : connections) {
         connection->pipe.cancel();

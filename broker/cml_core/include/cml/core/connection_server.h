@@ -19,6 +19,10 @@ struct ServerOptions {
     std::string pipe_name;                    // full \\.\pipe\ name
     std::uint32_t exit_when_idle_ms = 0;      // 0 = never; else exit this long after the last agent left
     std::uint32_t startup_timeout_ms = 0;     // 0 = never; else exit if no agent ever connected in time
+    // Optional manual-reset event handle owned by the caller (never closed by the server). Setting
+    // it stops the server, exactly like stop(); meant for signal handlers (Ctrl+C), which must not
+    // touch a server object that may be torn down at the same time.
+    void* stop_event = nullptr;
 };
 
 enum class ServerExit {
@@ -44,7 +48,8 @@ public:
 private:
     ServerOptions options_;
     std::atomic<bool> stop_requested_{false};
-    void* stop_event_ = nullptr;  // manual-reset event, set by stop()
+    void* stop_event_ = nullptr;  // manual-reset event, set by stop() (options_.stop_event or our own)
+    bool owns_stop_event_ = false;
 };
 
 }  // namespace cml::core

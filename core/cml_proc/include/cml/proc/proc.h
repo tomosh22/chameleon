@@ -47,11 +47,13 @@ std::uint32_t current_process_id() noexcept;
 
 // Reads a Win32 path-like string through `fetch(wchar_t* buffer, DWORD capacity) -> DWORD`
 // (GetModuleFileNameW and friends): starts small, and while the call reports truncation (returns
-// `capacity`) quadruples the buffer up to 32768 characters. Returns an empty string when the call
+// `capacity`) quadruples the buffer up to 32769 characters (the longest Windows path is 32767). Returns an empty string when the call
 // fails (returns 0) or the string does not fit even then.
 template <class Fetch>
 std::wstring read_growing_string(Fetch fetch, std::size_t initial_capacity = 260) {
-    constexpr std::size_t kLimit = 32768;
+    // 32767 characters is the longest path Windows has; with the terminator and the "capacity - 1
+    // may mean truncated" rule that needs a buffer of 32769.
+    constexpr std::size_t kLimit = 32769;
     std::wstring buffer(initial_capacity, L'\0');
     for (;;) {
         const std::size_t n = fetch(buffer.data(), static_cast<unsigned long>(buffer.size()));

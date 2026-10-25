@@ -216,4 +216,17 @@ TEST_CASE("read_growing_string also grows when truncation is reported as capacit
     CHECK(proc::read_growing_string(fetch_exact) == exact);
 }
 
+TEST_CASE("the longest possible path (32767 characters) is returned") {
+    // Mimics GetModuleFileNameW: the length when the string fits, else the capacity.
+    const auto fetcher_for = [](std::size_t length) {
+        return [length](wchar_t* buffer, unsigned long capacity) -> std::size_t {
+            const std::size_t n = std::min<std::size_t>(length, capacity);
+            std::fill(buffer, buffer + n, L'm');
+            return length < capacity ? length : capacity;
+        };
+    };
+    CHECK(proc::read_growing_string(fetcher_for(32767)).size() == 32767);
+    CHECK(proc::read_growing_string(fetcher_for(32768)).empty());  // longer than any Windows path
+}
+
 #endif  // _WIN32

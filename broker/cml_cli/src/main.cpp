@@ -154,11 +154,13 @@ void write_log_line(void* user, cml::LogLevel level, const char* file, int line,
     std::fflush(out->file);
 }
 
-cml::core::ConnectionServer* g_server = nullptr;
+// Ctrl+C / console close: the handler runs on its own thread, possibly while the server is being
+// torn down, so it touches nothing but an event that lives as long as the process (never closed).
+HANDLE g_stop_event = nullptr;
 
 BOOL WINAPI on_console_event(DWORD) {
-    if (g_server != nullptr) {
-        g_server->stop();
+    if (g_stop_event != nullptr) {
+        SetEvent(g_stop_event);
     }
     return TRUE;
 }
@@ -193,13 +195,12 @@ int run_headless(const Options& options) {
     server_options.pipe_name = *pipe_name;
     server_options.exit_when_idle_ms = options.exit_when_idle_ms;
     server_options.startup_timeout_ms = options.startup_timeout_ms;
+    g_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    server_options.stop_event = g_stop_event;
     cml::core::ConnectionServer server(server_options);
-    g_server = &server;
     SetConsoleCtrlHandler(on_console_event, TRUE);
 
     const cml::Result<cml::core::ServerExit> result = server.run();
-    SetConsoleCtrlHandler(on_console_event, FALSE);
-    g_server = nullptr;
     int exit_code = 0;
     if (!result) {
         CML_LOG(Error, "%s", result.error().format().c_str());

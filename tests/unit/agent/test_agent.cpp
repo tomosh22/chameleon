@@ -594,7 +594,7 @@ namespace {
 // (per connection) and can be told to misbehave: answer with a corrupt frame, or hang up.
 class ScriptedBroker {
 public:
-    enum class Action { Answer, CorruptAnswer, Hangup };
+    enum class Action { Answer, CorruptAnswer, Reject, Hangup };
     using Hook = std::function<Action(const cml::ipc::Message&)>;
 
     ScriptedBroker(std::string pipe, Hook hook = nullptr) : pipe_(std::move(pipe)), hook_(std::move(hook)) {
@@ -759,7 +759,12 @@ private:
         }
         ipc::Reply reply;
         reply.request_id = id;
-        reply.message = "scripted ok";
+        if (action == Action::Reject) {
+            reply.status = 5201;
+            reply.message = "scripted rejection";
+        } else {
+            reply.message = "scripted ok";
+        }
         return send(pipe, reply);
     }
 
@@ -938,8 +943,7 @@ TEST_CASE("a module loaded just before an EnableModule is known to the broker, e
     cml::DestroyAgent(agent);
 }
 
-TEST_CASE("the broker's working directory and relative --log paths") {
-    using cml::agent::absolutize_log_argument;
+TEST_CASE("the broker's working directory") {
     using cml::agent::broker_working_directory;
     CHECK(broker_working_directory(L"C:\\tools\\cml_broker.exe") == L"C:\\tools");
     CHECK(broker_working_directory(L"C:\\cml_broker.exe") == L"C:\\");  // a drive root keeps its backslash
@@ -947,15 +951,102 @@ TEST_CASE("the broker's working directory and relative --log paths") {
     CHECK(broker_working_directory(L"cml_broker.exe").empty());           // no directory: inherit
     const std::wstring too_long = L"C:\\" + std::wstring(300, L'd') + L"\\cml_broker.exe";
     CHECK(broker_working_directory(too_long).empty());                    // CreateProcess could not take it
+}
 
-    const std::wstring cwd = L"C:\\work";
-    CHECK(absolutize_log_argument("--log run.log", cwd) == "--log \"C:\\work\\run.log\"");
-    CHECK(absolutize_log_argument("--exit-when-idle 5 --log \"sub dir\\x.log\" --verbose", L"C:\\work\\") ==
+TEST_CASE("CML_BROKER_ARGS is split with the CommandLineToArgvW rules") {
+    using cml::agent::split_command_line;
+    using Args = std::vector<std::wstring>;
+    CHECK(split_command_line(L"") == Args{});
+    CHECK(split_command_line(L"   \t ") == Args{});
+    CHECK(split_command_line(L"--log run.log") == Args{L"--log", L"run.log"});
+    CHECK(split_command_line(L"a \"b c\"   d") == Args{L"a", L"b c", L"d"});
+    CHECK(split_command_line(L"\"C:\\x y\\\\\" z") == Args{L"C:\\x y\\", L"z"});  // 2 backslashes + quote
+    CHECK(split_command_line(L"x\\\"y") == Args{L"x\"y"});                        // backslash-quote is a quote
+    CHECK(split_command_line(L"\\\\srv\\share\\f") == Args{L"\\\\srv\\share\\f"});  // not before a quote: literal
+    CHECK(split_command_line(L"\"a\"\"b\"") == Args{L"a\"b"});                     // "" inside quotes
+    CHECK(split_command_line(L"\"unterminated tail") == Args{L"unterminated tail"});
+}
+
+TEST_CASE("every --log value is resolved against the host directory") {
+    using cml::agent::absolutize_log_arguments;
+    const auto fake = [](const std::wstring& path) {
+        return path.size() >= 2 && path[1] == L':' ? path : L"C:\\work\\" + path;
+    };
+    CHECK(absolutize_log_arguments("--log run.log", fake) == "--log C:\\work\\run.log");
+    CHECK(absolutize_log_arguments("--exit-when-idle 5 --log \"sub dir\\x.log\" --verbose", fake) ==
           "--exit-when-idle 5 --log \"C:\\work\\sub dir\\x.log\" --verbose");
-    CHECK(absolutize_log_argument("--log C:\\abs.log", cwd) == "--log C:\\abs.log");
-    CHECK(absolutize_log_argument("--log \\\\srv\\s\\x.log", cwd) == "--log \\\\srv\\s\\x.log");
-    CHECK(absolutize_log_argument("--verbose", cwd) == "--verbose");
-    CHECK(absolutize_log_argument("--logfile x.log", cwd) == "--logfile x.log");  // a different option
-    CHECK(absolutize_log_argument("--log", cwd) == "--log");
-    CHECK(absolutize_log_argument("--log run.log", L"") == "--log run.log");       // no host directory known
+    CHECK(absolutize_log_arguments("--log a.log --log b.log", fake) == "--log C:\\work\\a.log --log C:\\work\\b.log");
+    // Nothing to change: returned exactly as given.
+    CHECK(absolutize_log_arguments("--log C:\\abs.log", fake) == "--log C:\\abs.log");
+    CHECK(absolutize_log_arguments("--verbose", fake) == "--verbose");
+    CHECK(absolutize_log_arguments("--logfile x.log", fake) == "--logfile x.log");  // a different option
+    CHECK(absolutize_log_arguments("--log", fake) == "--log");
+    CHECK(absolutize_log_arguments("--log run.log", [](const std::wstring&) { return std::wstring(); }) == "--log run.log");
+}
+
+TEST_CASE("the real resolver uses the host directory and understands drive-relative paths") {
+    using cml::agent::resolve_against_host_directory;
+    wchar_t cwd[MAX_PATH];
+    REQUIRE(GetCurrentDirectoryW(MAX_PATH, cwd) > 0);
+    std::wstring expected = cwd;
+    if (expected.back() != L'\\') {
+        expected.push_back(L'\\');
+    }
+    CHECK(resolve_against_host_directory(L"rel.log") == expected + L"rel.log");
+    CHECK(resolve_against_host_directory(L"C:\\a\\..\\b.log") == L"C:\\b.log");
+    const std::wstring drive_relative = resolve_against_host_directory(L"Q:rel.log");
+    CHECK(drive_relative.rfind(L"Q:\\", 0) == 0);  // resolved on drive Q, not glued to the cwd
+    CHECK(drive_relative.find(expected) == std::wstring::npos);
+}
+
+TEST_CASE("a refused module list fails the session and the agent starts over") {
+    const std::string pipe = unique_pipe_name("badlist");
+    ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));
+    ScopedEnv broker_env(L"CML_BROKER_PATH", exe_directory() + L"\\no_such_broker.exe");
+    std::atomic<int> lists{0};
+    ScriptedBroker broker(pipe, [&](const cml::ipc::Message& m) {
+        return std::holds_alternative<cml::ipc::ModuleList>(m) && lists.fetch_add(1) == 0
+                   ? ScriptedBroker::Action::Reject
+                   : ScriptedBroker::Action::Answer;
+    });
+    REQUIRE(broker.ready());
+    cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str());
+    REQUIRE(agent.IsValid());
+    REQUIRE(wait_until([&] { return broker.connections() >= 2; }, 20000));  // the first session was given up
+    REQUIRE(wait_until([&] { return agent.IsConnected(); }, 20000));
+    cml::Reply reply;
+    const cml::Request r = agent.EnableModule(L"after_refusal.dll");
+    REQUIRE(agent.WaitForRequest(r, 15000, &reply) == CML_STATUS_OK);
+    CHECK(reply.status == 0);
+    CHECK(broker.count(0, is_enable) == 0);  // nothing ran on the half-initialised session
+    cml::DestroyAgent(agent);
+}
+
+TEST_CASE("300 enabled modules are all re-enabled after a reconnect") {
+    const std::string pipe = unique_pipe_name("many300");
+    ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));
+    ScopedEnv broker_env(L"CML_BROKER_PATH", exe_directory() + L"\\no_such_broker.exe");
+    ScriptedBroker broker(pipe);
+    REQUIRE(broker.ready());
+    cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str());
+    REQUIRE(agent.IsValid());
+    REQUIRE(wait_until([&] { return agent.IsConnected(); }, 20000));
+    constexpr int kModules = 300;
+    cml::Reply reply;
+    for (int i = 0; i < kModules; ++i) {
+        const cml::Request r = agent.EnableModule(L"bulk_" + std::to_wstring(i) + L".dll");
+        REQUIRE(agent.WaitForRequest(r, 15000, &reply) == CML_STATUS_OK);
+        REQUIRE(reply.status == 0);
+    }
+    broker.hang_up();
+    REQUIRE(wait_until([&] { return broker.connections() >= 2; }, 20000));
+    REQUIRE(wait_until([&] { return broker.count(1, is_enable) >= static_cast<std::size_t>(kModules); }, 60000));
+    std::map<std::string, int> seen;
+    for (const cml::ipc::Message& m : broker.messages(1)) {
+        if (const auto* enable = std::get_if<cml::ipc::EnableModule>(&m)) {
+            ++seen[enable->path];
+        }
+    }
+    CHECK(seen.size() == static_cast<std::size_t>(kModules));
+    cml::DestroyAgent(agent);
 }

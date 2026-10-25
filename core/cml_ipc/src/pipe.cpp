@@ -574,6 +574,16 @@ Result<PipeServer> PipeServer::create(const std::string& pipe_name) {
     return PipeServer(std::move(impl));
 }
 
+namespace {
+void replace_listening_instance(PipeServer::Impl& s);
+}  // namespace
+
+void PipeServer::refresh_instance() {
+    if (impl_) {
+        replace_listening_instance(*impl_);
+    }
+}
+
 void PipeServer::cancel() noexcept {
     if (impl_ && impl_->cancel_event != nullptr) {
         SetEvent(impl_->cancel_event);
@@ -582,13 +592,20 @@ void PipeServer::cancel() noexcept {
 
 namespace {
 
-// After an unexpected error the instance may be in an unusable state: close it, so that the next
-// accept() creates a fresh one instead of failing again on the same handle.
-void drop_listening_instance(PipeServer::Impl& s) {
+// After an unexpected error the listening instance may be unusable. Replace it, but create the new
+// one BEFORE closing the old: the pipe name must never be left without an instance, or another
+// process could take it over. If no replacement can be made the old instance stays (the next
+// accept() reports the problem again), so the server keeps owning the name.
+void replace_listening_instance(PipeServer::Impl& s) {
+    Result<HANDLE> fresh = s.create_instance();
+    if (!fresh) {
+        CML_LOG(Warn, "%s", fresh.error().format().c_str());
+        return;
+    }
     if (s.listening != INVALID_HANDLE_VALUE) {
         CloseHandle(s.listening);
-        s.listening = INVALID_HANDLE_VALUE;
     }
+    s.listening = *fresh;
 }
 
 }  // namespace
@@ -639,7 +656,7 @@ Result<PipeServer::Accepted> PipeServer::accept(std::uint32_t timeout_ms, void* 
             continue;
         }
         if (error != ERROR_IO_PENDING) {
-            drop_listening_instance(s);  // do not keep retrying on a handle that is broken
+            replace_listening_instance(s);  // do not keep retrying on a handle that is broken
             return io_diag("waiting for a client", error);
         }
 
@@ -654,7 +671,7 @@ Result<PipeServer::Accepted> PipeServer::accept(std::uint32_t timeout_ms, void* 
                 DisconnectNamedPipe(s.listening);
             } else {
                 const DWORD accept_error = GetLastError();
-                drop_listening_instance(s);
+                replace_listening_instance(s);
                 return io_diag("accepting a client", accept_error);
             }
         } else {
@@ -674,7 +691,7 @@ Result<PipeServer::Accepted> PipeServer::accept(std::uint32_t timeout_ms, void* 
                 out.status = IoStatus::Woken;
                 return out;
             } else {
-                drop_listening_instance(s);
+                replace_listening_instance(s);
                 return io_diag("waiting for a client", wait_error);
             }
         }

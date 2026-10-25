@@ -93,61 +93,93 @@ std::wstring broker_working_directory(const std::wstring& broker_path) {
     return directory;
 }
 
-std::string absolutize_log_argument(const std::string& args, const std::wstring& host_directory) {
-    const auto blank = [](char c) { return c == ' ' || c == '\t'; };
-    for (std::size_t at = args.find("--log"); at != std::string::npos; at = args.find("--log", at + 1)) {
-        const bool starts_token = at == 0 || blank(args[at - 1]);
-        const std::size_t after = at + 5;
-        if (!starts_token || after >= args.size() || !blank(args[after])) {
-            continue;
+std::vector<std::wstring> split_command_line(const std::wstring& line) {
+    std::vector<std::wstring> args;
+    const std::size_t n = line.size();
+    std::size_t i = 0;
+    for (;;) {
+        while (i < n && (line[i] == L' ' || line[i] == L'\t')) {
+            ++i;
         }
-        std::size_t begin = after;
-        while (begin < args.size() && blank(args[begin])) {
-            ++begin;
+        if (i >= n) {
+            break;
         }
-        if (begin >= args.size()) {
-            return args;
-        }
-        std::size_t end = 0;
-        std::string value;
-        std::size_t resume = 0;
-        if (args[begin] == '"') {
-            end = args.find('"', begin + 1);
-            if (end == std::string::npos) {
-                return args;  // unbalanced quote: leave it for the broker to complain about
+        std::wstring arg;
+        bool in_quotes = false;
+        while (i < n) {
+            std::size_t backslashes = 0;
+            while (i < n && line[i] == L'\\') {
+                ++backslashes;
+                ++i;
             }
-            value = args.substr(begin + 1, end - begin - 1);
-            resume = end + 1;
-        } else {
-            end = begin;
-            while (end < args.size() && !blank(args[end])) {
-                ++end;
+            if (i < n && line[i] == L'"') {
+                arg.append(backslashes / 2, L'\\');
+                if (backslashes % 2 == 1) {
+                    arg.push_back(L'"');  // an escaped quote
+                    ++i;
+                } else if (in_quotes && i + 1 < n && line[i + 1] == L'"') {
+                    arg.push_back(L'"');  // "" inside quotes is a literal quote
+                    i += 2;
+                } else {
+                    in_quotes = !in_quotes;
+                    ++i;
+                }
+                continue;
             }
-            value = args.substr(begin, end - begin);
-            resume = end;
+            arg.append(backslashes, L'\\');
+            if (i >= n || (!in_quotes && (line[i] == L' ' || line[i] == L'\t'))) {
+                break;
+            }
+            arg.push_back(line[i]);
+            ++i;
         }
-        const bool rooted = !value.empty() && (value[0] == '\\' || value[0] == '/' ||
-                                              (value.size() >= 2 && value[1] == ':'));
-        if (value.empty() || rooted || host_directory.empty()) {
-            return args;
-        }
-        std::string absolute = proc::utf8_from_wide(host_directory);
-        if (!absolute.empty() && absolute.back() != '\\' && absolute.back() != '/') {
-            absolute.push_back('\\');
-        }
-        absolute += value;
-        return args.substr(0, begin) + "\"" + absolute + "\"" + args.substr(resume);
+        args.push_back(std::move(arg));
     }
     return args;
 }
 
+std::wstring resolve_against_host_directory(const std::wstring& path) {
+    return proc::read_growing_string(
+        [&path](wchar_t* buffer, unsigned long capacity) -> std::size_t {
+            // Returns the length without the terminator, or the needed size when it does not fit
+            // (> capacity), which read_growing_string treats as "truncated".
+            const DWORD n = GetFullPathNameW(path.c_str(), capacity, buffer, nullptr);
+            return n >= capacity ? static_cast<std::size_t>(capacity) : static_cast<std::size_t>(n);
+        });
+}
+
+std::string absolutize_log_arguments(const std::string& args,
+                                     const std::function<std::wstring(const std::wstring&)>& resolve) {
+    std::vector<std::wstring> tokens = split_command_line(proc::wide_from_utf8(args));
+    bool changed = false;
+    for (std::size_t k = 0; k + 1 < tokens.size(); ++k) {
+        if (tokens[k] != L"--log") {
+            continue;
+        }
+        const std::wstring resolved = resolve(tokens[k + 1]);
+        if (!resolved.empty() && resolved != tokens[k + 1]) {
+            tokens[k + 1] = resolved;
+            changed = true;
+        }
+        ++k;  // the value is not an option
+    }
+    if (!changed) {
+        return args;
+    }
+    std::wstring line;
+    for (const std::wstring& token : tokens) {
+        if (!line.empty()) {
+            line.push_back(L' ');
+        }
+        const bool plain = !token.empty() && token.find_first_of(L" \t\"") == std::wstring::npos;
+        line += plain ? token : quote_argument(token);
+    }
+    return proc::utf8_from_wide(line);
+}
+
 Result<void> launch_broker(const std::wstring& broker_path, const std::string& pipe_name,
                            const std::string& extra_args_in) {
-    wchar_t host_directory[MAX_PATH];
-    const DWORD host_length = GetCurrentDirectoryW(MAX_PATH, host_directory);
-    const std::string extra_args = absolutize_log_argument(
-        extra_args_in, host_length > 0 && host_length < MAX_PATH ? std::wstring(host_directory, host_length)
-                                                                  : std::wstring());
+    const std::string extra_args = absolutize_log_arguments(extra_args_in, resolve_against_host_directory);
     const DWORD attributes = GetFileAttributesW(broker_path.c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
         return start_failed(broker_path, "the file does not exist");

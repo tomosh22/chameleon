@@ -27,13 +27,13 @@ constexpr DWORD kSendTimeoutMs = 5000;
 constexpr DWORD kHandshakeTimeoutMs = 5000;
 constexpr ULONGLONG kModulePollMs = 500;
 constexpr DWORD kReceiveSliceMs = 250;       // longest the agent thread sleeps without re-checking
-// The request table. Answers nobody has collected are kept only up to kMaxUnconsumedAnswers (the
-// oldest are dropped first) and are evicted when the table is full, so they can never keep new
-// requests out; kReenableReserve is extra room for the internal re-enables after a reconnect.
+// The request table (see the invariants in agent.h):
+//  * at most kMaxOutstanding application requests are open (not yet answered) at a time;
+//  * answers nobody has collected yet are kept, oldest evicted first, only up to
+//    kMaxUnconsumedAnswers and never while a thread is waiting for them;
+//  * the internal re-enables after a reconnect are outside both limits (one per enabled module).
 constexpr std::size_t kMaxOutstanding = 1024;
 constexpr std::size_t kMaxUnconsumedAnswers = 512;
-constexpr std::size_t kMaxTrackedModules = 256;
-constexpr std::size_t kReenableReserve = kMaxTrackedModules;
 constexpr std::size_t kMaxLogsPerPass = 16;
 // Requests sent but not yet answered. Bounded so that the agent keeps reading replies while it
 // writes: with an unbounded burst both pipe buffers could fill up and stall both ends.
@@ -157,7 +157,10 @@ void Agent::stop() {
         }
         for (const std::uint64_t id : open) {
             const auto it = entries_.find(id);
-            finish_locked(it, ids::kRequestCancelled, "the agent was destroyed before the broker answered", false);
+            // Everything open becomes "cancelled" and stays collectable: no eviction here, so every
+            // waiter, and every later wait_request, sees kRequestCancelled.
+            finish_locked(it, ids::kRequestCancelled, "the agent was destroyed before the broker answered",
+                          /*answered_by_broker=*/false, /*evict=*/false);
         }
         outgoing_.clear();
     }
@@ -178,13 +181,9 @@ cml_status Agent::enqueue(std::uint64_t id, ipc::Message message, bool wanted) {
         if (stopping_.load(std::memory_order_acquire)) {
             return static_cast<cml_status>(ids::kRequestCancelled);
         }
-        // Answers nobody collected must never lock new requests out: make room by evicting the
-        // oldest of them. Only genuinely open requests can fill the table.
-        while (entries_.size() >= kMaxOutstanding + kReenableReserve && !done_order_.empty()) {
-            entries_.erase(done_order_.front());
-            done_order_.pop_front();
-        }
-        if (entries_.size() >= kMaxOutstanding + kReenableReserve) {
+        // The limit counts open application requests only. Answers waiting to be collected and the
+        // internal re-enables never use it up.
+        if (open_app_ >= kMaxOutstanding) {
             return static_cast<cml_status>(ids::kRequestQueueFull);
         }
         Entry entry;
@@ -192,6 +191,7 @@ cml_status Agent::enqueue(std::uint64_t id, ipc::Message message, bool wanted) {
         entry.wanted = wanted;
         entry.seq = queue_seq_.fetch_add(1, std::memory_order_acq_rel) + 1;
         entries_.emplace(id, std::move(entry));
+        ++open_app_;
         outgoing_.push_back(id);
     }
     SetEvent(wake_event_);
@@ -253,6 +253,19 @@ cml_status Agent::wait_request(std::uint64_t request_id, std::uint32_t timeout_m
     if (lookup() == entries_.end()) {
         return CML_STATUS_UNKNOWN_REQUEST;
     }
+    // While this thread is inside wait_request the entry has a waiter and is never evicted, even
+    // after it has been answered and before this thread has picked the answer up.
+    ++lookup()->second.waiters;
+    struct WaiterGuard {
+        Agent& agent;
+        std::uint64_t id;
+        ~WaiterGuard() {  // runs with the lock still held (declared after it)
+            const auto it = agent.entries_.find(id);
+            if (it != agent.entries_.end() && it->second.waiters > 0) {
+                --it->second.waiters;
+            }
+        }
+    } guard{*this, request_id};
     if (!is_done()) {
         if (timeout_ms == 0) {
             return CML_STATUS_TIMEOUT;
@@ -265,11 +278,29 @@ cml_status Agent::wait_request(std::uint64_t request_id, std::uint32_t timeout_m
     }
     const auto it = lookup();
     if (it == entries_.end()) {
-        return CML_STATUS_UNKNOWN_REQUEST;  // consumed by another waiter or evicted meanwhile
+        return CML_STATUS_UNKNOWN_REQUEST;  // consumed by another waiter meanwhile
     }
     fill_reply(reply, it->second.status, it->second.text);
     erase_done_locked(request_id);
     return CML_STATUS_OK;
+}
+
+void Agent::complete_for_testing(std::uint64_t request_id, std::uint32_t status, const std::string& text) {
+    complete(request_id, status, text);
+}
+
+std::size_t Agent::waiters_for_testing() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::size_t total = 0;
+    for (const auto& [id, entry] : entries_) {
+        total += static_cast<std::size_t>(entry.waiters);
+    }
+    return total;
+}
+
+std::size_t Agent::tracked_modules_for_testing() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return enabled_.size();
 }
 
 void Agent::sync_point() {
@@ -362,6 +393,8 @@ bool Agent::run_session(ipc::PipeConnection& connection) {
     }
     known_modules_.clear();
     last_module_poll_ = GetTickCount64();
+    session_failed_ = false;
+    module_list_request_ = 0;
     const bool established = handshake(connection) && send_module_list(connection);
     if (established) {
         queue_reenables();
@@ -375,7 +408,7 @@ bool Agent::run_session(ipc::PipeConnection& connection) {
         CML_LOG(Info, "disconnected from the broker; will reconnect");
     }
     fail_in_flight(ids::kConnectionLost, "the connection to the broker was lost before it answered");
-    return established;
+    return established && !session_failed_;
 }
 
 bool Agent::send_message(ipc::PipeConnection& connection, const ipc::Message& message) {
@@ -476,10 +509,12 @@ bool Agent::send_module_list(ipc::PipeConnection& connection) {
     const std::uint64_t seq_mark = queue_seq_.load(std::memory_order_acquire);
     Result<std::vector<proc::ModuleInfo>> modules = proc::enumerate_modules(0);
     if (!modules) {
-        CML_LOG(Warn, "%s", modules.error().format().c_str());
-    } else {
-        list.modules = to_entries(*modules);
+        // An empty list would make the broker refuse every EnableModule for modules it never
+        // heard of. Better to fail the session and start over (with back-off).
+        CML_LOG(Warn, "cannot send the module list: %s", modules.error().format().c_str());
+        return false;
     }
+    list.modules = to_entries(*modules);
     {
         // Register before sending so the Reply cannot race the registration.
         Entry entry;
@@ -487,6 +522,7 @@ bool Agent::send_module_list(ipc::PipeConnection& connection) {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto inserted = entries_.emplace(list.request_id, std::move(entry));
         note_sent_locked(inserted.first->second);
+        module_list_request_ = list.request_id;
     }
     if (!send_message(connection, list)) {
         return false;
@@ -600,7 +636,9 @@ void Agent::track_enabled_locked(const Entry& entry, std::uint32_t status) {
             const auto existing = std::find_if(enabled_.begin(), enabled_.end(), same);
             if (existing != enabled_.end()) {
                 existing->options = enable->options;  // a later enable may change the options
-            } else if (enabled_.size() < kMaxTrackedModules) {
+            } else {
+                // No cap: the set is bounded by the modules the broker accepted, i.e. by the
+                // modules that are loaded in this process.
                 enabled_.push_back(EnabledModule{enable->path, enable->options});
             }
         } else if (entry.internal) {
@@ -616,14 +654,18 @@ void Agent::track_enabled_locked(const Entry& entry, std::uint32_t status) {
     }
 }
 
-// Ends an open request. A request whose answer is wanted becomes Done and waits to be collected
-// (bounded; the oldest uncollected answers are dropped); internal ones and ones created without a
-// request id are simply forgotten.
+// Ends an open request. A request whose answer is wanted becomes Done and waits to be collected;
+// internal ones and ones created without a request id are simply forgotten. `evict` lets the
+// oldest uncollected answers (Done, nobody waiting) go when more than kMaxUnconsumedAnswers pile
+// up; stop() passes false so that cancellation never loses an answer.
 void Agent::finish_locked(std::map<std::uint64_t, Entry>::iterator it, std::uint32_t status, const char* text,
-                          bool answered_by_broker) {
+                          bool answered_by_broker, bool evict) {
     Entry& entry = it->second;
     if (entry.state == State::Sent) {
         --sent_count_;
+    }
+    if (!entry.internal) {
+        --open_app_;
     }
     if (answered_by_broker) {
         track_enabled_locked(entry, status);  // a lost connection says nothing about the module
@@ -636,9 +678,20 @@ void Agent::finish_locked(std::map<std::uint64_t, Entry>::iterator it, std::uint
     entry.status = status;
     entry.text = text;
     done_order_.push_back(it->first);
-    while (done_order_.size() > kMaxUnconsumedAnswers) {
-        entries_.erase(done_order_.front());
-        done_order_.pop_front();
+    if (evict) {
+        evict_oldest_answers_locked();
+    }
+}
+
+void Agent::evict_oldest_answers_locked() {
+    for (auto candidate = done_order_.begin(); done_order_.size() > kMaxUnconsumedAnswers && candidate != done_order_.end();) {
+        const auto entry = entries_.find(*candidate);
+        if (entry != entries_.end() && entry->second.waiters > 0) {
+            ++candidate;  // someone is about to collect it: never evict
+            continue;
+        }
+        entries_.erase(*candidate);
+        candidate = done_order_.erase(candidate);
     }
 }
 
@@ -685,7 +738,7 @@ void Agent::complete(std::uint64_t request_id, std::uint32_t status, std::string
         if (it != entries_.end() && it->second.state != State::Done) {
             known = true;
             wake = !it->second.internal && it->second.wanted;
-            finish_locked(it, status, text.c_str(), true);
+            finish_locked(it, status, text.c_str(), true, true);
         }
     }
     if (!known) {
@@ -713,7 +766,7 @@ void Agent::fail_in_flight(std::uint32_t status, const char* text) {
             }
         }
         for (const std::uint64_t id : sent) {
-            finish_locked(entries_.find(id), status, text, false);
+            finish_locked(entries_.find(id), status, text, false, true);
         }
     }
     done_.notify_all();
@@ -722,6 +775,13 @@ void Agent::fail_in_flight(std::uint32_t status, const char* text) {
 void Agent::handle_message(const ipc::Message& message) {
     CML_LOG(Debug, "<- %s", ipc::describe(message).c_str());
     if (const auto* reply = std::get_if<ipc::Reply>(&message)) {
+        if (reply->request_id == module_list_request_ && reply->status != 0) {
+            // Without the module list the broker cannot place any later request: the session is
+            // half-initialised, so give it up and start over.
+            CML_LOG(Warn, "the broker refused the module list: CML%u %s; reconnecting", reply->status,
+                    reply->message.c_str());
+            session_failed_ = true;
+        }
         complete(reply->request_id, reply->status, reply->message);
         return;
     }
@@ -744,6 +804,9 @@ void Agent::serve(ipc::PipeConnection& connection) {
         switch (received->status) {
             case ipc::IoStatus::Ok:
                 handle_message(received->message);
+                if (session_failed_) {
+                    return;
+                }
                 break;
             case ipc::IoStatus::Rejected:
                 // An answer we cannot decode would leave its request waiting for ever (and hold an

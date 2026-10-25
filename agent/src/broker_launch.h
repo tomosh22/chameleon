@@ -4,7 +4,9 @@
 
 #if defined(_WIN32)
 
+#include <functional>
 #include <string>
+#include <vector>
 
 #include "cml/util/result.h"
 
@@ -32,11 +34,22 @@ std::wstring broker_command_line(const std::wstring& broker_path, const std::str
 // of drive C").
 std::wstring broker_working_directory(const std::wstring& broker_path);
 
+// Splits a command-line tail into arguments with the rules of CommandLineToArgvW (quotes,
+// backslashes before quotes, "" inside quotes). The agent cannot use that function itself: it lives
+// in shell32.dll, which the agent must not import.
+std::vector<std::wstring> split_command_line(const std::wstring& line);
+
 // The broker runs in its own directory, so a relative path in CML_BROKER_ARGS would be resolved
-// against that directory, not against the host's. For `--log` (the one option that takes a path)
-// the agent therefore makes a relative path absolute against `host_directory` first. Other options
-// are passed through untouched.
-std::string absolutize_log_argument(const std::string& args, const std::wstring& host_directory);
+// against that directory, not against the host's. For every `--log <path>` pair the agent therefore
+// resolves <path> through `resolve` (production: resolve_against_host_directory) before launch; an
+// empty result leaves the value alone. Arguments without `--log` are returned untouched; otherwise
+// the tail is re-quoted from the parsed tokens. Other options are never rewritten.
+std::string absolutize_log_arguments(const std::string& args,
+                                     const std::function<std::wstring(const std::wstring&)>& resolve);
+
+// GetFullPathNameW against the host's current directory; handles drive-relative forms ("C:log")
+// and ".." too. Empty on failure.
+std::wstring resolve_against_host_directory(const std::wstring& path);
 
 Result<void> launch_broker(const std::wstring& broker_path, const std::string& pipe_name,
                            const std::string& extra_args);

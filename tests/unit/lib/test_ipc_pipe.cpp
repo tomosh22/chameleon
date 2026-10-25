@@ -435,4 +435,22 @@ TEST_CASE("resolve_pipe_name precedence: explicit, environment, session default"
     SetEnvironmentVariableW(L"CML_PIPE_NAME", nullptr);
 }
 
+TEST_CASE("refreshing the listening instance never frees the pipe name") {
+    const std::string name = unique_pipe_name("refresh");
+    Result<PipeServer> server = PipeServer::create(name);
+    REQUIRE(server.has_value());
+    for (int i = 0; i < 20; ++i) {
+        server->refresh_instance();  // the replacement exists before the old instance is closed
+        CHECK(ipc::pipe_exists(name));
+    }
+    // Still the owner: nobody else can create the pipe, and clients are still served.
+    Result<PipeServer> usurper = PipeServer::create(name);
+    CHECK_FALSE(usurper.has_value());
+    Result<PipeConnection> client = ipc::connect_pipe(name, kWaitMs);
+    REQUIRE(client.has_value());
+    Result<PipeServer::Accepted> accepted = server->accept(kWaitMs);
+    REQUIRE(accepted.has_value());
+    CHECK(accepted->status == IoStatus::Ok);
+}
+
 #endif  // _WIN32

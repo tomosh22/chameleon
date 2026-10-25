@@ -431,4 +431,24 @@ TEST_CASE("a request whose id cannot even be read closes the connection") {
     CloseHandle(raw);
 }
 
+TEST_CASE("a caller-owned stop event stops the server and is left open") {
+    QuietLogs quiet;
+    HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    REQUIRE(event != nullptr);
+    {
+        ServerOptions options;
+        options.pipe_name = unique_pipe_name("extstop");
+        options.stop_event = event;
+        RunningServer server(options);
+        REQUIRE(ipc::pipe_exists(options.pipe_name));
+        PipeConnection agent = connect(options.pipe_name);
+        exchange(agent, hello(1));
+        SetEvent(event);  // what a Ctrl+C handler does: no server object involved
+        REQUIRE(server.join());
+        CHECK(server.reason() == ServerExit::Stopped);
+    }  // the server object is gone here
+    CHECK(WaitForSingleObject(event, 0) == WAIT_OBJECT_0);  // the event is still ours and still valid
+    CloseHandle(event);
+}
+
 #endif  // _WIN32

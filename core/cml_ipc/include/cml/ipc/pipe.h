@@ -120,6 +120,11 @@ public:
     // Waits for the next client. Any number of connections may be open at once.
     Result<Accepted> accept(std::uint32_t timeout_ms, void* wake_event = nullptr);
 
+    // Replaces the instance that waits for the next client with a fresh one (accept() does this by
+    // itself after an unexpected error). The new instance is created before the old one is closed,
+    // so the pipe name is never without an instance and cannot be taken by another process.
+    void refresh_instance();
+
     // Any thread; sticky. Makes accept() return Cancelled.
     void cancel() noexcept;
 

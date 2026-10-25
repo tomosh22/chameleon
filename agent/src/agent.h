@@ -67,7 +67,24 @@ public:
     bool is_connected() const noexcept { return connected_.load(std::memory_order_acquire); }
     bool synchronized() const noexcept { return mode_ == CML_MODE_SYNCHRONIZED; }
 
+    // Test hooks: inject an answer as if the broker had sent it, and count the threads currently
+    // inside wait_request.
+    void complete_for_testing(std::uint64_t request_id, std::uint32_t status, const std::string& text);
+    std::size_t waiters_for_testing();
+    std::size_t tracked_modules_for_testing();
+
 private:
+    // Request table invariants (all under mutex_):
+    //  I1. entries_ holds every open request (Queued or Sent), every answered request whose answer
+    //      has not been collected (Done), and the internal ones (ModuleList, re-enables).
+    //  I2. open_app_ == number of non-Done application entries; enqueue() refuses (CML5217) at
+    //      kMaxOutstanding. Done and internal entries do not count.
+    //  I3. sent_count_ == number of entries in State::Sent; the flush window is kMaxInFlight.
+    //  I4. done_order_ lists exactly the Done entries, oldest first. Only a Done entry with
+    //      waiters == 0 may be evicted (oldest first, beyond kMaxUnconsumedAnswers); an entry with a
+    //      thread inside wait_request is never evicted, nor is anything while stop() cancels.
+    //  I5. Internal entries and entries created without a request id are erased when they finish.
+    //  I6. A lost connection fails Sent entries but never changes the enabled-module set.
     enum class State { Queued, Sent, Done };
 
     struct Entry {
@@ -75,6 +92,7 @@ private:
         bool internal = false;  // Hello / ModuleList / re-enables: answered on the agent thread, never waited on
         bool wanted = true;     // the caller asked for the answer (passed a request id)
         std::uint64_t seq = 0;  // queue order; compared with the last module poll
+        int waiters = 0;        // threads currently inside wait_request for this entry
         ipc::Message message;
         std::uint32_t status = 0;  // valid when Done
         std::string text;          // valid when Done
@@ -114,7 +132,8 @@ private:
     void track_enabled_locked(const Entry& entry, std::uint32_t status);
     void note_sent_locked(Entry& entry);
     void finish_locked(std::map<std::uint64_t, Entry>::iterator it, std::uint32_t status, const char* text,
-                       bool answered_by_broker);
+                       bool answered_by_broker, bool evict);
+    void evict_oldest_answers_locked();
     void queue_reenables();
     void erase_done_locked(std::uint64_t id);
 
@@ -144,6 +163,7 @@ private:
     std::deque<std::uint64_t> outgoing_;    // ids in State::Queued, in send order
     std::deque<std::uint64_t> done_order_;  // ids in State::Done, oldest first (bounded)
     std::size_t sent_count_ = 0;            // entries in State::Sent (the in-flight window)
+    std::size_t open_app_ = 0;              // application entries not yet Done (the 1024 limit)
     std::vector<EnabledModule> enabled_;    // modules the broker accepted and that were not disabled
 
     std::mutex connection_mutex_;  // guards active_connection_
@@ -153,6 +173,8 @@ private:
     std::vector<ipc::ModuleEntry> known_modules_;
     ULONGLONG last_module_poll_ = 0;
     std::uint64_t polled_seq_ = 0;  // queue_seq_ as of the last module poll
+    std::uint64_t module_list_request_ = 0;  // id of this session's ModuleList request
+    bool session_failed_ = false;            // the broker refused the module list
 };
 
 }  // namespace cml::agent
