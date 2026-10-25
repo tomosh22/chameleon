@@ -64,6 +64,26 @@ public:
     // it runs right now on the calling thread. Returns false when `work` is null.
     bool post_main_thread_work(SyncQueue::WorkFn work, void* context);
 
+    // Public-call guard. Every exported function that touches the Agent holds one for its whole
+    // duration; destroy() waits until none is left, so the object is never freed under a thread
+    // that is still inside it (e.g. a waiter being woken by stop()).
+    class CallGuard {
+    public:
+        explicit CallGuard(Agent& agent) noexcept : agent_(agent) {
+            agent_.active_calls_.fetch_add(1, std::memory_order_acq_rel);
+        }
+        ~CallGuard() { agent_.active_calls_.fetch_sub(1, std::memory_order_acq_rel); }
+        CallGuard(const CallGuard&) = delete;
+        CallGuard& operator=(const CallGuard&) = delete;
+
+    private:
+        Agent& agent_;
+    };
+
+    // stop(), then wait until every thread has left every public call. Call this (not just the
+    // destructor) before freeing an Agent that other threads may still be using.
+    void stop_and_wait_for_calls();
+
     bool is_connected() const noexcept { return connected_.load(std::memory_order_acquire); }
     bool synchronized() const noexcept { return mode_ == CML_MODE_SYNCHRONIZED; }
 
@@ -72,6 +92,7 @@ public:
     void complete_for_testing(std::uint64_t request_id, std::uint32_t status, const std::string& text);
     std::size_t waiters_for_testing();
     std::size_t tracked_modules_for_testing();
+    std::size_t active_calls_for_testing() const noexcept { return static_cast<std::size_t>(active_calls_.load()); }
 
 private:
     // Request table invariants (all under mutex_):
@@ -90,6 +111,7 @@ private:
     struct Entry {
         State state = State::Queued;
         bool internal = false;  // Hello / ModuleList / re-enables: answered on the agent thread, never waited on
+        bool module_list = false;  // the internal ModuleList request (its refusal is handled, see handle_message)
         bool wanted = true;     // the caller asked for the answer (passed a request id)
         std::uint64_t seq = 0;  // queue order; compared with the last module poll
         int waiters = 0;        // threads currently inside wait_request for this entry
@@ -152,6 +174,7 @@ private:
     HANDLE wake_event_ = nullptr;  // auto-reset: new work for the agent thread
     std::mutex stop_mutex_;        // serialises stop()
     std::atomic<bool> stopping_{false};
+    std::atomic<int> active_calls_{0};  // threads inside a public call (see CallGuard)
     std::atomic<bool> connected_{false};
     bool logs_forwarded_ = false;
 
@@ -173,8 +196,7 @@ private:
     std::vector<ipc::ModuleEntry> known_modules_;
     ULONGLONG last_module_poll_ = 0;
     std::uint64_t polled_seq_ = 0;  // queue_seq_ as of the last module poll
-    std::uint64_t module_list_request_ = 0;  // id of this session's ModuleList request
-    bool session_failed_ = false;            // the broker refused the module list
+    bool full_list_pending_ = false;         // the broker refused a ModuleList: send a full one on the next poll
 };
 
 }  // namespace cml::agent

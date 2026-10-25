@@ -999,7 +999,7 @@ TEST_CASE("the real resolver uses the host directory and understands drive-relat
     CHECK(drive_relative.find(expected) == std::wstring::npos);
 }
 
-TEST_CASE("a refused module list fails the session and the agent starts over") {
+TEST_CASE("a refused module list keeps the session and the next poll sends the full list again") {
     const std::string pipe = unique_pipe_name("badlist");
     ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));
     ScopedEnv broker_env(L"CML_BROKER_PATH", exe_directory() + L"\\no_such_broker.exe");
@@ -1012,15 +1012,97 @@ TEST_CASE("a refused module list fails the session and the agent starts over") {
     REQUIRE(broker.ready());
     cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str());
     REQUIRE(agent.IsValid());
-    REQUIRE(wait_until([&] { return broker.connections() >= 2; }, 20000));  // the first session was given up
     REQUIRE(wait_until([&] { return agent.IsConnected(); }, 20000));
+    constexpr auto is_list = [](const cml::ipc::Message& m) { return std::holds_alternative<cml::ipc::ModuleList>(m); };
+    // The agent sends the whole list again on its own, on the same connection.
+    REQUIRE(wait_until([&] { return broker.count(0, is_list) >= 2; }, 20000));
+    CHECK(broker.connections() == 1);
+    CHECK(agent.IsConnected());
     cml::Reply reply;
     const cml::Request r = agent.EnableModule(L"after_refusal.dll");
     REQUIRE(agent.WaitForRequest(r, 15000, &reply) == CML_STATUS_OK);
     CHECK(reply.status == 0);
-    CHECK(broker.count(0, is_enable) == 0);  // nothing ran on the half-initialised session
+    CHECK(broker.connections() == 1);
     cml::DestroyAgent(agent);
 }
+
+TEST_CASE("destroying the agent while threads wait on it neither crashes nor leaves a waiter behind") {
+    using WaitFn = cml_status (*)(void*, std::uint64_t, std::uint32_t, cml_reply*);
+    using EnableFn = cml_status (*)(void*, const wchar_t*, std::uint32_t, std::uint64_t*);
+    using WaitersFn = std::uint64_t (*)(void*);
+    constexpr int kThreads = 8;
+    for (int round = 0; round < 50; ++round) {
+        NoBrokerEnv env("destroy_race");
+        cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str());
+        REQUIRE(agent.IsValid());
+        const WaitFn wait = agent_export<WaitFn>("cml_agent_wait_request");
+        const EnableFn enable = agent_export<EnableFn>("cml_agent_enable_module");
+        const WaitersFn waiters = agent_export<WaitersFn>("cml_agent_testing_waiters");
+        void* const impl = agent.NativeHandle()->impl;
+
+        std::atomic<int> returned{0};
+        std::atomic<int> cancelled{0};
+        std::vector<std::thread> threads;
+        for (int i = 0; i < kThreads; ++i) {
+            threads.emplace_back([&, i] {
+                std::uint64_t id = 0;
+                const std::wstring path = L"destroy_race_" + std::to_wstring(i) + L".dll";
+                if (enable(impl, path.c_str(), 0, &id) == CML_STATUS_OK) {
+                    cml_reply reply{};
+                    if (wait(impl, id, 0xFFFFFFFFu, &reply) == CML_STATUS_OK && reply.status == 5215) {
+                        ++cancelled;
+                    }
+                }
+                ++returned;
+            });
+        }
+        REQUIRE(wait_until([&] { return waiters(impl) == static_cast<std::uint64_t>(kThreads); }, 20000));
+        std::thread destroyer([&] { agent.NativeHandle()->destroy(impl); });
+        destroyer.join();
+        for (std::thread& t : threads) {
+            t.join();
+        }
+        CHECK(returned.load() == kThreads);
+        CHECK(cancelled.load() == kThreads);
+        HeapFree(GetProcessHeap(), 0, agent.NativeHandle());  // the wrapper; the agent object is gone
+    }
+}
+
+#ifdef CML_TEST_BROKER_EXE
+TEST_CASE("when the auto-started broker exits the agent starts a new one") {
+    const std::string pipe = unique_pipe_name("relaunch");
+    ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));
+    std::wstring broker_exe = L"" CML_TEST_BROKER_EXE;
+    std::replace(broker_exe.begin(), broker_exe.end(), L'/', L'\\');
+    ScopedEnv broker_env(L"CML_BROKER_PATH", broker_exe);
+    ScopedEnv args_env(L"CML_BROKER_ARGS", L"--exit-when-idle 20000");
+    const auto broker_pid = [&]() -> DWORD {
+        cml::Result<cml::ipc::PipeConnection> probe = cml::ipc::connect_pipe(pipe, 2000);
+        return probe ? probe->peer_process_id() : 0;
+    };
+    const auto kill = [](DWORD pid) {
+        HANDLE process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+        REQUIRE(process != nullptr);
+        TerminateProcess(process, 1);
+        WaitForSingleObject(process, 10000);
+        CloseHandle(process);
+    };
+
+    cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str());
+    REQUIRE(agent.IsValid());
+    REQUIRE_MESSAGE(wait_until([&] { return agent.IsConnected(); }, 60000), "the agent did not start a broker");
+    const DWORD first = broker_pid();
+    REQUIRE(first != 0);
+    kill(first);
+    REQUIRE(wait_until([&] { return !agent.IsConnected(); }, 20000));
+    REQUIRE_MESSAGE(wait_until([&] { return agent.IsConnected(); }, 60000), "the agent did not start a second broker");
+    const DWORD second = broker_pid();
+    REQUIRE(second != 0);
+    CHECK(second != first);
+    cml::DestroyAgent(agent);
+    kill(second);
+}
+#endif
 
 TEST_CASE("300 enabled modules are all re-enabled after a reconnect") {
     const std::string pipe = unique_pipe_name("many300");

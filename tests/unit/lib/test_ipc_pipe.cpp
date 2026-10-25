@@ -453,4 +453,39 @@ TEST_CASE("refreshing the listening instance never frees the pipe name") {
     CHECK(accepted->status == IoStatus::Ok);
 }
 
+TEST_CASE("a failure to create the next instance never frees the pipe name") {
+    const std::string name = unique_pipe_name("lapse");
+    Result<PipeServer> server = PipeServer::create(name);
+    REQUIRE(server.has_value());
+
+    // A client connects while creating the replacement instance keeps failing.
+    ipc::set_instance_create_failures_for_testing(1000000);
+    Result<PipeConnection> client = ipc::connect_pipe(name, kWaitMs);
+    REQUIRE(client.has_value());
+    Result<PipeServer::Accepted> first = server->accept(300);
+    REQUIRE(first.has_value());
+    CHECK(first->status == IoStatus::Timeout);  // not handed over: there is no replacement yet
+    // Even if the client leaves, the server still owns the connected instance: the name is held.
+    client->close();
+    CHECK(ipc::pipe_exists(name));
+    {
+        Result<PipeServer> usurper = PipeServer::create(name);
+        CHECK_FALSE(usurper.has_value());  // not on wine: it does not enforce the first-instance flag
+    }
+
+    // Creation works again: the next call completes the hand-over of the pending connection.
+    ipc::set_instance_create_failures_for_testing(0);
+    Result<PipeServer::Accepted> second = server->accept(kWaitMs);
+    REQUIRE(second.has_value());
+    CHECK(second->status == IoStatus::Ok);
+    CHECK(ipc::pipe_exists(name));
+
+    // And a fresh client is served normally afterwards.
+    Result<PipeConnection> again = ipc::connect_pipe(name, kWaitMs);
+    REQUIRE(again.has_value());
+    Result<PipeServer::Accepted> third = server->accept(kWaitMs);
+    REQUIRE(third.has_value());
+    CHECK(third->status == IoStatus::Ok);
+}
+
 #endif  // _WIN32

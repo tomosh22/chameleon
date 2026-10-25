@@ -7,6 +7,7 @@
 #include <sddl.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -75,6 +76,8 @@ Diag bad_name_diag(const std::string& name) {
 }
 
 // Deadline arithmetic on GetTickCount64 so that waits are bounded across loop iterations.
+constexpr DWORD kReplaceRetryMs = 50;  // pause between attempts to create the next listening instance
+
 ULONGLONG deadline_after(std::uint32_t timeout_ms) {
     return timeout_ms == kInfiniteTimeout ? 0 : GetTickCount64() + timeout_ms;
 }
@@ -466,12 +469,23 @@ Result<PipeConnection> connect_pipe(const std::string& pipe_name, std::uint32_t 
 
 // --- server -------------------------------------------------------------------------------------
 
+std::atomic<int> g_injected_create_failures{0};
+
+void set_instance_create_failures_for_testing(int count) {
+    g_injected_create_failures.store(count);
+}
+
 struct PipeServer::Impl {
     std::string name;
     std::wstring wide_name;
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     SECURITY_ATTRIBUTES attributes;
     HANDLE listening = INVALID_HANDLE_VALUE;  // an instance waiting for the next client
+    // A connected instance that accept() has not handed to the caller yet because the replacement
+    // listening instance could not be created. accept() creates the replacement BEFORE handing the
+    // connected instance over; while that keeps failing it keeps retrying and keeps owning this
+    // handle, so the pipe name is never without an instance and cannot be taken by another process.
+    HANDLE pending = INVALID_HANDLE_VALUE;
     HANDLE connect_event = nullptr;
     HANDLE cancel_event = nullptr;
     OVERLAPPED ov;
@@ -487,6 +501,9 @@ struct PipeServer::Impl {
         if (listening != INVALID_HANDLE_VALUE) {
             CloseHandle(listening);
         }
+        if (pending != INVALID_HANDLE_VALUE) {
+            CloseHandle(pending);
+        }
         if (connect_event != nullptr) {
             CloseHandle(connect_event);
         }
@@ -501,6 +518,11 @@ struct PipeServer::Impl {
     // Creates one pipe instance. The very first one carries FILE_FLAG_FIRST_PIPE_INSTANCE so that
     // creation fails if any other process already serves this name (no squatting, no two brokers).
     Result<HANDLE> create_instance() {
+        if (g_injected_create_failures.load() > 0 && first_instance_created &&
+            g_injected_create_failures.fetch_sub(1) > 0) {
+            return Diag::make(ids::kPipeCreateFailed, "cannot create pipe '" + name + "' (injected failure)",
+                              "Test hook: set_instance_create_failures_for_testing.");
+        }
         DWORD open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
         if (!first_instance_created) {
             open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
@@ -625,7 +647,7 @@ Result<PipeServer::Accepted> PipeServer::accept(std::uint32_t timeout_ms, void* 
     // ours: drop that instance's state and listen again. One bad client must never stop the
     // broker, so only a run of such events (a pathological flood) gives up for this call.
     constexpr int kMaxDroppedClients = 64;
-    bool connected = false;
+    bool connected = s.pending != INVALID_HANDLE_VALUE;  // a connection from an earlier call, see Impl::pending
     for (int dropped = 0; !connected; ++dropped) {
         if (dropped >= kMaxDroppedClients) {
             out.status = IoStatus::Timeout;  // the caller's loop calls accept() again
@@ -697,18 +719,49 @@ Result<PipeServer::Accepted> PipeServer::accept(std::uint32_t timeout_ms, void* 
         }
     }
 
-    // Hand the connected instance over and immediately provide a fresh one for the next client.
-    HANDLE connected_pipe = s.listening;
-    s.listening = INVALID_HANDLE_VALUE;
+    // The next listening instance must exist before the connected one leaves our hands: until then
+    // the connected instance (owned by s.pending) is what keeps the name alive. If the replacement
+    // cannot be created, keep trying until it works, the wait is cancelled, woken or out of time;
+    // the connection stays pending and is handed over by a later accept() call.
+    if (s.pending == INVALID_HANDLE_VALUE) {
+        s.pending = s.listening;
+        s.listening = INVALID_HANDLE_VALUE;
+    }
+    const ULONGLONG replace_deadline = deadline_after(timeout_ms);
+    bool warned = false;
+    while (s.listening == INVALID_HANDLE_VALUE) {
+        Result<HANDLE> next = s.create_instance();
+        if (next) {
+            s.listening = *next;
+            break;
+        }
+        if (!warned) {
+            CML_LOG(Warn, "%s; retrying", next.error().format().c_str());
+            warned = true;
+        }
+        const DWORD left = remaining_ms(timeout_ms, replace_deadline);
+        if (left == 0) {
+            out.status = IoStatus::Timeout;
+            return out;
+        }
+        HANDLE waits[2] = {s.cancel_event, static_cast<HANDLE>(wake_event)};
+        const DWORD count = wake_event != nullptr ? 2 : 1;
+        const DWORD w = WaitForMultipleObjects(count, waits, FALSE, std::min<DWORD>(left, kReplaceRetryMs));
+        if (w == WAIT_OBJECT_0) {
+            out.status = IoStatus::Cancelled;
+            return out;
+        }
+        if (w == WAIT_OBJECT_0 + 1) {
+            out.status = IoStatus::Woken;
+            return out;
+        }
+    }
+
+    HANDLE connected_pipe = s.pending;
+    s.pending = INVALID_HANDLE_VALUE;
     ULONG client_pid = 0;
     GetNamedPipeClientProcessId(connected_pipe, &client_pid);
     std::unique_ptr<PipeConnection::Impl> impl = make_impl(connected_pipe, client_pid);
-    Result<HANDLE> next = s.create_instance();
-    if (next) {
-        s.listening = *next;
-    } else {
-        CML_LOG(Warn, "%s", next.error().format().c_str());  // accept() retries creating it
-    }
     if (!impl) {
         return Diag::make(ids::kPipeIoFailed, "cannot create synchronisation events for the pipe",
                           "Close other programs to free system resources and retry.");

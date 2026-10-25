@@ -99,6 +99,10 @@ Result<PipeConnection> connect_pipe(const std::string& pipe_name, std::uint32_t 
 // True if a pipe with this name exists (without connecting to it).
 bool pipe_exists(const std::string& pipe_name);
 
+// Test hook: the next `count` attempts to create a further pipe instance (after the server exists)
+// fail, as if the system were out of resources.
+void set_instance_create_failures_for_testing(int count);
+
 class PipeServer {
 public:
     PipeServer() noexcept;
@@ -117,7 +121,11 @@ public:
         PipeConnection connection;           // valid only when status == Ok
     };
 
-    // Waits for the next client. Any number of connections may be open at once.
+    // Waits for the next client. Any number of connections may be open at once. The pipe name is
+    // never left without an instance: when a client has connected, the replacement listening
+    // instance is created before the connection is returned. If that creation fails, accept()
+    // keeps retrying (and keeps owning the connected instance) until it works or the wait times
+    // out / is cancelled / is woken; the connection is then returned by a later call.
     Result<Accepted> accept(std::uint32_t timeout_ms, void* wake_event = nullptr);
 
     // Replaces the instance that waits for the next client with a fresh one (accept() does this by

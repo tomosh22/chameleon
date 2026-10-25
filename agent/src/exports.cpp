@@ -55,7 +55,12 @@ CML_AGENT_EXPORT cml_status cml_agent_create(const cml_agent_create_params* para
 }
 
 CML_AGENT_EXPORT void cml_agent_destroy(void* agent) {
-    delete as_agent(agent);  // ~Agent stops the thread; deleting nullptr is fine
+    if (agent == nullptr) {
+        return;
+    }
+    // Wakes every waiter and waits until all of them have left the agent before freeing it.
+    as_agent(agent)->stop_and_wait_for_calls();
+    delete as_agent(agent);
 }
 
 CML_AGENT_EXPORT cml_status cml_agent_enable_module(void* agent, const wchar_t* path, uint32_t options,
@@ -63,6 +68,7 @@ CML_AGENT_EXPORT cml_status cml_agent_enable_module(void* agent, const wchar_t* 
     if (agent == nullptr || path == nullptr) {
         return CML_STATUS_INVALID_ARGUMENT;
     }
+    Agent::CallGuard guard(*as_agent(agent));
     return as_agent(agent)->enable_module(path, options, request_id);
 }
 
@@ -71,6 +77,7 @@ CML_AGENT_EXPORT cml_status cml_agent_disable_module(void* agent, const wchar_t*
     if (agent == nullptr || path == nullptr) {
         return CML_STATUS_INVALID_ARGUMENT;
     }
+    Agent::CallGuard guard(*as_agent(agent));
     return as_agent(agent)->disable_module(path, request_id);
 }
 
@@ -79,11 +86,13 @@ CML_AGENT_EXPORT cml_status cml_agent_wait_request(void* agent, uint64_t request
     if (agent == nullptr || out_reply == nullptr) {
         return CML_STATUS_INVALID_ARGUMENT;
     }
+    Agent::CallGuard guard(*as_agent(agent));
     return as_agent(agent)->wait_request(request_id, timeout_ms, out_reply);
 }
 
 CML_AGENT_EXPORT void cml_agent_sync_point(void* agent) {
     if (agent != nullptr) {
+        Agent::CallGuard guard(*as_agent(agent));
         as_agent(agent)->sync_point();
     }
 }
@@ -109,7 +118,11 @@ CML_AGENT_EXPORT cml_status cml_agent_set_global_hotkeys(void* agent, const cml_
 }
 
 CML_AGENT_EXPORT int cml_agent_is_connected(void* agent) {
-    return agent != nullptr && as_agent(agent)->is_connected() ? 1 : 0;
+    if (agent == nullptr) {
+        return 0;
+    }
+    Agent::CallGuard guard(*as_agent(agent));
+    return as_agent(agent)->is_connected() ? 1 : 0;
 }
 
 // --- test-only exports (not part of Chameleon_API.h; the unit tests resolve them by name) -------
@@ -120,7 +133,17 @@ CML_AGENT_EXPORT cml_status cml_agent_testing_post_work(void* agent, void (*work
     if (agent == nullptr || work == nullptr) {
         return CML_STATUS_INVALID_ARGUMENT;
     }
+    Agent::CallGuard guard(*as_agent(agent));
     return as_agent(agent)->post_main_thread_work(work, context) ? CML_STATUS_OK : CML_STATUS_INVALID_ARGUMENT;
+}
+
+// Threads currently blocked in wait_request (lets a test know the waiters are really waiting).
+CML_AGENT_EXPORT uint64_t cml_agent_testing_waiters(void* agent) {
+    if (agent == nullptr) {
+        return 0;
+    }
+    Agent::CallGuard guard(*as_agent(agent));
+    return as_agent(agent)->waiters_for_testing();
 }
 
 // Blocks currently allocated from the agent's private heap.
