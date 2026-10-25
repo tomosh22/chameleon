@@ -64,6 +64,10 @@ if(WIN32)
     set_target_properties(cml_test_fake_agent_abi PROPERTIES
         OUTPUT_NAME cml_agent
         RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:cml_test_agent>/fake_agent_abi"
+        # Same output name as the real agent: keep its import library and PDB out of the way.
+        ARCHIVE_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:cml_test_agent>/fake_agent_abi"
+        PDB_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:cml_test_agent>/fake_agent_abi"
+        COMPILE_PDB_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:cml_test_agent>/fake_agent_abi"
         FOLDER "tests")
 endif()
 if(WIN32)
