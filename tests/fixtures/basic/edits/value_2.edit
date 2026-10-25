@@ -1,0 +1,9 @@
+--- a/logic.cpp
++++ b/logic.cpp
+@@ -9,5 +9,5 @@
+     if (g_tick == 0) {
+         fixture_note("logic-start");
+     }
+-    return 1;
++    return 2;
+ }

@@ -139,7 +139,9 @@ TEST_CASE("set_log_sink publishes sink and user together while other threads log
             }
         });
     }
-    for (int i = 0; i < 20000; ++i) {
+    // Keep swapping until the loggers have demonstrably run concurrently with the swaps; on a
+    // loaded runner the threads may not be scheduled before a fixed number of swaps completes.
+    for (int i = 0; i < 20000 || g_ctx_a.calls.load() + g_ctx_b.calls.load() < 1000; ++i) {
         if ((i & 1) == 0) {
             cml::set_log_sink(&sink_b, &g_ctx_b);
         } else {

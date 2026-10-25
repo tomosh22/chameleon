@@ -5,7 +5,7 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 
 | WP | Title | Wave | Status | Branch | PR | Blockers |
 |---|---|---|---|---|---|---|
-| WP-01 | Repository skeleton and CI | 0 | todo | wp/01-skeleton-ci | — | — |
+| WP-01 | Repository skeleton and CI | 0 | done | wp/01-skeleton-ci | #2 | — |
 | WP-02 | cml_coff and cml_pe readers | 1 | todo | — | — | WP-01 |
 | WP-04 | cml_pdb index | 1 | todo | — | — | WP-01 |
 | WP-11 | Agent skeleton, public header and IPC | 1 | todo | — | — | WP-01 |
