@@ -25,6 +25,7 @@
 #include <tlhelp32.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <string>
 
 namespace {
@@ -235,6 +236,44 @@ void prepare_dump_paths() {
     }
 }
 
+// The in-process watchdog is one of the threads the hook installer stops, so for the executables that
+// stop the world (unit.agent_hook, unit.agent_hook_stress) the ctest registration also sets
+// CML_TEST_HANG_WATCH_EXE: a helper process (tests/unit/hang_watch) that waits for this process, and
+// when it is still running 10 s after the in-process budget it prints every thread's suspend count
+// and RIP, writes a minidump and terminates this process (exit code 3). The helper inherits this
+// process's standard handles, so its lines reach ctest's output. It exits by itself when this process does.
+void start_external_watch(unsigned long limit_s) {
+    char exe[MAX_PATH] = {};
+    const DWORD n = GetEnvironmentVariableA("CML_TEST_HANG_WATCH_EXE", exe, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) {
+        return;
+    }
+    char directory[MAX_PATH] = ".";
+    const DWORD d = GetEnvironmentVariableA("CML_TEST_DUMP_DIR", directory, MAX_PATH);
+    if (d == 0 || d >= MAX_PATH) {
+        std::strcpy(directory, ".");
+    }
+    std::string command = "\"" + std::string(exe) + "\" " + std::to_string(GetCurrentProcessId()) + " " +
+                          std::to_string(limit_s + 10) + " \"" + directory + "\"";
+    STARTUPINFOA startup = {};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = INVALID_HANDLE_VALUE;
+    startup.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    for (HANDLE h : {startup.hStdOutput, startup.hStdError}) {
+        if (h != nullptr && h != INVALID_HANDLE_VALUE) {
+            SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        }
+    }
+    PROCESS_INFORMATION info = {};
+    if (CreateProcessA(nullptr, command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &startup,
+                       &info)) {
+        CloseHandle(info.hThread);
+        CloseHandle(info.hProcess);
+    }
+}
+
 class Watchdog : public doctest::IReporter {
 public:
     explicit Watchdog(const doctest::ContextOptions&) {}
@@ -245,6 +284,7 @@ public:
             return;
         }
         prepare_dump_paths();
+        start_external_watch(g_limit_s);
         g_run_started_ms = GetTickCount64();
         g_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (g_stop_event != nullptr) {

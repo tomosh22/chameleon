@@ -85,7 +85,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # WP-10, TEMPORARY (remove once the exit-crash question is answered): runs unit.agent_hook and
-      # unit.agent_hook_stress 10 times each in every cell. A failing run prints ctest's output, which
+      # unit.agent_hook_stress 20 times each in every cell. A failing run prints ctest's output, which
       # includes crash_report.h's WP10-CRASH lines (exception code, faulting address, thread start
       # address and module, stack). The totals are the WP10-REPEAT lines.
       - name: WP-10 repeat run of unit.agent_hook and unit.agent_hook_stress (temporary)
@@ -95,7 +95,7 @@ jobs:
           foreach ($t in @('unit.agent_hook', 'unit.agent_hook_stress')) {
             $pass = 0
             $fail = 0
-            for ($i = 1; $i -le 10; $i++) {
+            for ($i = 1; $i -le 20; $i++) {
               $out = ctest --test-dir $env:BUILD_DIR -C ${{ matrix.config }} -R "^$([regex]::Escape($t))$" --output-on-failure 2>&1 | Out-String
               if ($LASTEXITCODE -eq 0) {
                 $pass++
@@ -107,7 +107,7 @@ jobs:
                 Add-Content -Path "$env:LOG_DIR/wp10-repeat-failures.txt" -Value "==== $t run $i`n$out"
               }
             }
-            $line = "WP10-REPEAT ${{ matrix.os }} ${{ matrix.compiler }} ${{ matrix.config }} $t runs=10 passed=$pass failed=$fail"
+            $line = "WP10-REPEAT ${{ matrix.os }} ${{ matrix.compiler }} ${{ matrix.config }} $t runs=20 passed=$pass failed=$fail"
             Write-Host $line
             Add-Content -Path "$env:LOG_DIR/wp10-repeat.txt" -Value $line
             $failed += $fail

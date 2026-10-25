@@ -21,12 +21,17 @@ if(WIN32)
     # `new` goes through the agent's heap, so heap::set_alloc_forbidden() is really exercised (see
     # alloc_guard.h).
     set(CML_AGENT_OPERATOR_NEW "${PROJECT_SOURCE_DIR}/agent/src/operator_new.cpp")
-    target_sources(cml_test_agent_hook PRIVATE test_installer.cpp test_hardening.cpp test_dispatch.cpp
+    target_sources(cml_test_agent_hook PRIVATE test_installer.cpp test_hardening.cpp test_hang_watch.cpp test_dispatch.cpp
                                                ${CML_AGENT_OPERATOR_NEW})
     target_include_directories(cml_test_agent_hook PRIVATE "${PROJECT_SOURCE_DIR}/agent/include")
     # Test functions are located by address: no incremental-link thunks, no identical-code folding.
     target_link_options(cml_test_agent_hook PRIVATE /INCREMENTAL:NO /OPT:NOICF)
     set_tests_properties(unit.agent_hook PROPERTIES TIMEOUT 300)
+    # The out-of-process hang watchdog (test_hang_watch.cpp tests it; doctest_main.cpp starts it for the
+    # executables that stop the world, because the in-process watchdog is stopped with everything else).
+    add_dependencies(cml_test_agent_hook cml_test_hang_watch)
+    target_compile_definitions(cml_test_agent_hook PRIVATE "CML_HANG_WATCH_PATH=\"$<TARGET_FILE:cml_test_hang_watch>\"")
+    set_property(TEST unit.agent_hook APPEND PROPERTY ENVIRONMENT "CML_TEST_HANG_WATCH_EXE=$<TARGET_FILE:cml_test_hang_watch>")
 
     cml_add_unit_test(agent_hook_stress SOURCES test_stress.cpp ${CML_AGENT_OPERATOR_NEW} LIBS cml_agent_core)
     target_link_options(cml_test_agent_hook_stress PRIVATE /INCREMENTAL:NO /OPT:NOICF)
@@ -34,6 +39,8 @@ if(WIN32)
     target_compile_definitions(cml_test_agent_hook_stress PRIVATE
         "CML_TEST_WORK_DIR=\"${CMAKE_BINARY_DIR}/test_work/agent_hook\"")
     set_tests_properties(unit.agent_hook_stress PROPERTIES TIMEOUT 400)
+    add_dependencies(cml_test_agent_hook_stress cml_test_hang_watch)
+    set_property(TEST unit.agent_hook_stress APPEND PROPERTY ENVIRONMENT "CML_TEST_HANG_WATCH_EXE=$<TARGET_FILE:cml_test_hang_watch>")
 endif()
 
 # The decoder against every function of a real module (CI evidence; see docs/wp/WP-10.md). The ctest
