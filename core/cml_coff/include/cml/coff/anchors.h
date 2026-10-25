@@ -7,22 +7,24 @@
 // and lld-link, in publics and in module symbols). add_anchors() therefore gives every section a
 // "locator", a symbol whose RVA in the patch PDB is known:
 //
-//   Anchor        non-COMDAT section: a new EXTERNAL symbol `__cml_anchor_<tag>_<n>` (n = 1-based
-//                 section index) at offset 0, value 0, appended to the symbol table.
+//   Anchor        a new EXTERNAL symbol `__cml_anchor_<tag>_<n>` (n = 1-based section index) at
+//                 offset 0, appended to the symbol table. Used for every linked section that is not
+//                 located by a COMDAT leader: non-COMDAT sections, and COMDAT sections whose leader
+//                 is static (`reason` StaticLeader) or missing (`reason` NoLeader). Such COMDATs are
+//                 never folded against another object's copy (the linkers fold by the EXTERNAL leader
+//                 name; the only other discard path is /OPT:REF, and patches link with /OPT:NOREF),
+//                 so the anchor cannot be left undefined by a discarded section.
 //   ComdatLeader  COMDAT section with an external leader (the first symbol after the section
 //                 definition): NO new symbol. The leader is already a public; the section starts at
 //                 `leader RVA - SectionLocator::offset` (offset = the leader's value, usually 0). When
 //                 the linker discards the COMDAT as a duplicate, every copy resolves to the kept
-//                 section, which is what retargeting that section's relocations needs. (External
-//                 anchors inside such COMDATs would make lld-link fail with "undefined symbol".)
+//                 section, which is what retargeting that section's relocations needs. (An external
+//                 anchor inside such a COMDAT would make lld-link fail with "undefined symbol".)
 //   None          no locator, with a reason:
 //                   NotLinked    sections that never reach the image (see is_anchorable)
 //                   Associative  .pdata/.xdata/.debug$S children of a COMDAT: they never need to be
 //                                retargeted to old data; their relocations target the patch's own
 //                                functions or binding thunks
-//                   NoLeader     COMDAT section without any symbol after its definition
-//                   StaticLeader COMDAT whose leader is a static symbol (e.g. a static inline
-//                                function): static symbols are not in the PDB
 //                 A caller that needs a locator for such a section gets a diagnostic from
 //                 require_locator() (CML3309), never a silent gap.
 //
@@ -56,12 +58,13 @@ namespace cml::coff {
 inline constexpr std::string_view kAnchorPrefix = "__cml_anchor_";
 
 enum class LocatorKind : std::uint8_t { Anchor, ComdatLeader, None };
+// For kind == Anchor the reason is HasLocator, StaticLeader or NoLeader (why a COMDAT is anchored).
 enum class NoLocatorReason : std::uint8_t { HasLocator, NotLinked, Associative, NoLeader, StaticLeader };
 
 struct SectionLocator {
     std::uint32_t section_index = 0;  // 1-based
     LocatorKind kind = LocatorKind::None;
-    NoLocatorReason reason = NoLocatorReason::NotLinked;  // HasLocator unless kind == None
+    NoLocatorReason reason = NoLocatorReason::NotLinked;  // see above
     std::string symbol_name;          // the anchor or the COMDAT leader; empty for None
     std::uint32_t symbol_index = 0;   // raw symbol-table index of that symbol in the written object
     std::uint32_t offset = 0;         // the locator symbol's offset in its section: section start = RVA - offset

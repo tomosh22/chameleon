@@ -21,8 +21,8 @@ const char* reason_text(NoLocatorReason r) noexcept {
         case NoLocatorReason::HasLocator: return "has a locator";
         case NoLocatorReason::NotLinked: return "the section is not linked into the image";
         case NoLocatorReason::Associative: return "associative COMDAT sections have no locator (they never need retargeting to old data)";
-        case NoLocatorReason::NoLeader: return "the COMDAT section has no symbol after its definition";
-        case NoLocatorReason::StaticLeader: return "the COMDAT leader is a static symbol, which is not in the PDB";
+        case NoLocatorReason::NoLeader: return "the COMDAT section has no symbol after its definition (located by an anchor)";
+        case NoLocatorReason::StaticLeader: return "the COMDAT leader is a static symbol (located by an anchor)";
     }
     return "unknown";
 }
@@ -157,12 +157,19 @@ Result<std::vector<SectionLocator>> add_anchors(ObjectModel& m, const AnchorOpti
         }
         const std::int64_t lp = leader_pos[i + 1];
         if (lp == kNone) {
+            // No external symbol to find it by: an external anchor. Safe even in a COMDAT: the linkers
+            // fold COMDATs across objects by the external leader name, so a leaderless COMDAT is never
+            // discarded as a duplicate (and patches link with /OPT:NOREF).
+            loc.kind = LocatorKind::Anchor;
             loc.reason = NoLocatorReason::NoLeader;
+            ++wanted;
             continue;
         }
         const ModelSymbol& leader = m.symbols[static_cast<std::size_t>(lp)];
         if (leader.storage_class != static_cast<std::uint8_t>(StorageClass::External) || leader.name.empty()) {
+            loc.kind = LocatorKind::Anchor;  // static leader: same reasoning as above
             loc.reason = NoLocatorReason::StaticLeader;
+            ++wanted;
             continue;
         }
         loc.kind = LocatorKind::ComdatLeader;

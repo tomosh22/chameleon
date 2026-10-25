@@ -645,7 +645,7 @@ coff::ByteVector make_shared_comdat_object(const std::string& which) {
     add(".rdata", 0, 4, 0, C::Static, def(8, 0, 0, 2));
     add("shared_const", 0, 4, 0, C::External);
     add(".text$mn", 0, 5, 0, C::Static, def(16, 0, 0, 2));
-    add("static_fn_" + which, 0, 5, 0x20, C::Static);
+    add("static_fn", 0, 5, 0x20, C::Static);  // same static name in both objects
     add(".data", 0, 6, 0, C::Static, def(8, 1, 0, 0));
     add(".bss", 0, 7, 0, C::Static, def(16, 0, 0, 0));
     add("ext_f", 0, 0, 0x20, C::External);
@@ -872,17 +872,40 @@ void run_files(const std::string& name, const std::vector<std::string>& original
                 }
             }
         }
+        // Every linked, non-associative section has a locator ("eligible" is derived from the object
+        // itself, not from the locators).
+        std::size_t eligible = 0, located = 0, anchored_comdat = 0;
+        for (std::size_t i = 0; i < objects.size(); ++i) {
+            for (const coff::Section& sec : objects[i].object.sections()) {
+                coff::ModelSection ms;
+                ms.name = std::string(sec.name);
+                ms.characteristics = sec.characteristics;
+                const auto comdat = objects[i].object.comdat(sec);
+                const bool associative = comdat && comdat->selection == coff::ComdatSelection::Associative;
+                if (!coff::is_anchorable(ms) || associative) {
+                    continue;
+                }
+                ++eligible;
+                const coff::SectionLocator& l = locators[i][sec.index - 1];
+                located += l.kind != coff::LocatorKind::None ? 1 : 0;
+                anchored_comdat += (l.kind == coff::LocatorKind::Anchor && sec.is_comdat()) ? 1 : 0;
+            }
+        }
+        CHECK(eligible == located);
+        if (static_probe) {
+            CHECK_MESSAGE(anchored_comdat >= 2, tag << ": the static-leader COMDAT of each object should have been anchored");
+        }
         std::string reasons;
         for (const auto& [r, n] : no_loc_reasons) {
             reasons += " " + r + "=" + std::to_string(n);
         }
         evidence("set=%s linker=%s | link ok, bound=%zu (%zu functions) | image identical outside timestamp/checksum/debug directory: %s "
                  "(layout %s, code %s, %zu bytes differ) | locators: %zu anchors + %zu comdat leaders resolved %zu/%zu in PDB publics, "
-                 "%zu without locator (reasons:%s) | section contributions with same start %zu, same size %zu, same compiland %zu of %zu checked | "
+                 "%zu without locator (reasons:%s); sections with a locator %zu/%zu (%zu of them COMDATs located by anchor: static or missing leader) | section contributions with same start %zu, same size %zu, same compiland %zu of %zu checked | "
                  "shared COMDAT leaders in this link: %zu (locators of them resolved: %zu)",
                  name.c_str(), lk.label.c_str(), bind.size(), bind_functions, diff.bytes_differing_outside_debug_info == 0 ? "YES" : "NO",
                  diff.layout_equal ? "identical" : "DIFFERENT", diff.code_equal ? "identical" : "DIFFERENT",
-                 diff.bytes_differing_outside_debug_info, anchors, leaders, resolved, anchors + leaders, no_loc, reasons.c_str(), start_ok,
+                 diff.bytes_differing_outside_debug_info, anchors, leaders, resolved, anchors + leaders, no_loc, reasons.c_str(), located, eligible, anchored_comdat, start_ok,
                  size_ok, compiland_ok, exact_checked, shared_leaders, shared_resolved);
 
         // 3. the static probe: STATIC anchors are invisible in the PDB.

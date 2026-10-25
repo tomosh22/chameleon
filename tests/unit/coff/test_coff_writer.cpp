@@ -537,7 +537,9 @@ void check_anchored(const coff::Object& before, const coff::Object& after, const
         switch (l.kind) {
             case coff::LocatorKind::Anchor: {
                 CHECK(coff::is_anchorable(ms));
-                CHECK_FALSE(sec->is_comdat());
+                if (sec->is_comdat()) {
+                    CHECK((l.reason == coff::NoLocatorReason::StaticLeader || l.reason == coff::NoLocatorReason::NoLeader));
+                }
                 CHECK(l.symbol_name == coff::anchor_name(l.section_index, tag));
                 CHECK(l.symbol_index == next);
                 const coff::Symbol* s = after.symbol_at(l.symbol_index);
@@ -667,7 +669,7 @@ TEST_CASE("coff anchors: locator rules on a synthetic COMDAT object (regular and
     }
 }
 
-TEST_CASE("coff anchors: static leader, missing leader and leader offset") {
+TEST_CASE("coff anchors: static leader and missing leader get anchors, external leader with offset is the locator") {
     for (bool big : {false, true}) {
         const Built b = build_object(leader_cases_spec(big));
         auto before = coff::Object::parse(span_of(b.bytes));
@@ -677,20 +679,22 @@ TEST_CASE("coff anchors: static leader, missing leader and leader offset") {
         auto loc = coff::add_anchors(*m);
         REQUIRE(loc.has_value());
         REQUIRE(loc->size() == 3);
-        CHECK((*loc)[0].kind == coff::LocatorKind::None);
+        CHECK((*loc)[0].kind == coff::LocatorKind::Anchor);
         CHECK((*loc)[0].reason == coff::NoLocatorReason::StaticLeader);
-        CHECK((*loc)[1].kind == coff::LocatorKind::None);
+        CHECK((*loc)[1].kind == coff::LocatorKind::Anchor);
         CHECK((*loc)[1].reason == coff::NoLocatorReason::NoLeader);
+        CHECK((*loc)[0].symbol_name.rfind("__cml_anchor_", 0) == 0);
         CHECK((*loc)[2].kind == coff::LocatorKind::ComdatLeader);
         CHECK((*loc)[2].symbol_name == "leader_at_8");
         CHECK((*loc)[2].offset == 8);
-        CHECK(coff::require_locator((*loc)[0]).error().code == coff::diag::kNoLocator);
-        // No symbol was added.
+        CHECK(coff::require_locator((*loc)[0]).has_value());
+        CHECK(coff::require_locator((*loc)[1]).has_value());
+        // Two anchors were added, none for the leader-located section.
         auto w = coff::write(*m);
         REQUIRE(w.has_value());
         auto after = coff::Object::parse(coff::ByteSpan(w->data(), w->size()));
         REQUIRE(after.has_value());
-        CHECK(after->header().symbol_count == before->header().symbol_count);
+        CHECK(after->header().symbol_count == before->header().symbol_count + 2);
     }
 }
 
