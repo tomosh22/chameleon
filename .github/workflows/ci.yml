@@ -173,6 +173,46 @@ jobs:
       # Add steps here, between "Run cml_broker --version" and the artifact upload. Write any
       # logs you want to keep into $env:LOG_DIR; the upload step below always runs.
 
+      # WP-13: the scenario harness. cmltest builds fixture `basic` from a scratch copy (Ninja),
+      # starts a headless broker with a control pipe and the fixture with the agent, and checks
+      # stdout and `status`. Until WP-12 provides the reload pipeline the `reload` step and the
+      # steps after it are SKIPPED (reported as such, never as passes) and the run is PARTIAL;
+      # WP-12 adds --require-all-capabilities here.
+      - name: cmltest basic scenario (Ninja)
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          & "$env:BUILD_DIR/bin/cmltest.exe" --scenario tests/harness/scenarios/basic.toml `
+            --build-dir $env:BUILD_DIR --generator ninja --config ${{ matrix.config }} --cxx $env:CML_CXX `
+            --artifacts "$PWD/$env:LOG_DIR/cmltest-ninja" --junit "$PWD/$env:LOG_DIR/cmltest-ninja-junit.xml" `
+            *>&1 | Tee-Object -FilePath "$env:LOG_DIR/cmltest-ninja.log"
+          $rc = $LASTEXITCODE
+          Get-Content "$env:LOG_DIR/cmltest-ninja.log" | Where-Object { $_ -match '^(CMLTEST_RESULT|PARTIAL|FAILED)' } |
+            Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          if ($rc -ne 0) { exit $rc }
+
+      # Once per OS, with MSVC in Debug: the same scenario with the fixture built by the Visual
+      # Studio generator (MSBuild), proving that path of the fixture builder.
+      - name: cmltest basic scenario (MSBuild generator)
+        if: matrix.compiler == 'msvc' && matrix.config == 'Debug'
+        run: |
+          & "$env:BUILD_DIR/bin/cmltest.exe" --scenario tests/harness/scenarios/basic.toml `
+            --build-dir $env:BUILD_DIR --generator msbuild --config ${{ matrix.config }} --cxx $env:CML_CXX `
+            --artifacts "$PWD/$env:LOG_DIR/cmltest-msbuild" --junit "$PWD/$env:LOG_DIR/cmltest-msbuild-junit.xml" `
+            *>&1 | Tee-Object -FilePath "$env:LOG_DIR/cmltest-msbuild.log"
+          $rc = $LASTEXITCODE
+          Get-Content "$env:LOG_DIR/cmltest-msbuild.log" | Where-Object { $_ -match '^(CMLTEST_RESULT|PARTIAL|FAILED)' } |
+            Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          if ($rc -ne 0) { exit $rc }
+
+      - name: Upload cmltest results (JUnit, logs, dumps)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmltest-${{ matrix.os }}-${{ matrix.compiler }}-${{ matrix.config }}
+          path: |
+            ci-logs/cmltest-*
+          if-no-files-found: warn
+
       - name: Upload logs and test results
         if: always()
         uses: actions/upload-artifact@v4

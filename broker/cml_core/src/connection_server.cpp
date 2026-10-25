@@ -10,6 +10,8 @@
 #include <thread>
 #include <vector>
 
+#include "cml/core/control_server.h"
+#include "cml/core/process_registry.h"
 #include "cml/core/session.h"
 #include "cml/core/version.h"
 #include "cml/proc/diag_ids.h"
@@ -33,6 +35,7 @@ struct Connection {
 
 // State shared between run() and the connection threads.
 struct Shared {
+    ProcessRegistry registry;  // what the control pipe's `status` reports
     std::atomic<int> active{0};
     std::atomic<unsigned long long> last_idle_tick{0};  // GetTickCount64 when active last hit 0
 };
@@ -51,6 +54,7 @@ void serve_connection(Connection& connection, std::uint64_t agent_id, Shared& sh
         switch (received->status) {
             case ipc::IoStatus::Ok: {
                 SessionOutcome outcome = session.on_message(received->message);
+                shared.registry.update_if_changed(session);  // rebuilds only when modules / enabled set changed
                 for (const ipc::Message& reply : outcome.replies) {
                     CML_LOG(Debug, "agent#%llu -> %s", static_cast<unsigned long long>(agent_id),
                             ipc::describe(reply).c_str());
@@ -103,6 +107,7 @@ void serve_connection(Connection& connection, std::uint64_t agent_id, Shared& sh
                 break;
         }
     }
+    shared.registry.remove(agent_id);
     CML_LOG(Info, "agent#%llu disconnected (pid %u, %llu modules enabled)",
             static_cast<unsigned long long>(agent_id), session.pid(),
             static_cast<unsigned long long>(session.enabled_modules().size()));
@@ -163,6 +168,17 @@ Result<ServerExit> ConnectionServer::run() {
     CML_LOG(Info, "listening on %s", options_.pipe_name.c_str());
 
     Shared shared;
+    std::unique_ptr<ControlServer> control;
+    if (!options_.control_pipe_name.empty()) {
+        ControlContext context;
+        context.version = version_string();
+        context.registry = &shared.registry;
+        control = std::make_unique<ControlServer>(options_.control_pipe_name, std::move(context));
+        Result<void> started = control->start();
+        if (!started) {
+            return started.error();
+        }
+    }
     std::vector<std::unique_ptr<Connection>> connections;
     std::uint64_t next_agent_id = 1;
     bool ever_connected = false;
@@ -230,6 +246,9 @@ Result<ServerExit> ConnectionServer::run() {
     }
     for (auto& connection : connections) {
         connection->thread.join();
+    }
+    if (control) {
+        control->stop();
     }
     if (failure) {
         return *failure;

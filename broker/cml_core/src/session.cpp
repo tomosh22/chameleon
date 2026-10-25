@@ -72,6 +72,7 @@ SessionOutcome Session::handle_hello(const ipc::Hello& hello) {
         return outcome;
     }
     handshaken_ = true;
+    ++revision_;
     pid_ = hello.pid;
     agent_path_ = hello.agent_path;
     command_line_ = hello.command_line;
@@ -103,6 +104,7 @@ ipc::Reply Session::handle_enable(const ipc::EnableModule& request) {
         message = "module already enabled: " + module->path;
     } else {
         enabled_.push_back(module->path);
+        ++revision_;
         message = "module enabled: " + module->path;
     }
     CML_LOG(Info, "agent#%llu EnableModule request=%llu -> OK path=\"%s\"",
@@ -129,6 +131,7 @@ ipc::Reply Session::handle_disable(const ipc::DisableModule& request) {
     }
     const std::string removed = *it;
     enabled_.erase(it);
+    ++revision_;
     CML_LOG(Info, "agent#%llu DisableModule request=%llu -> OK path=\"%s\"",
             static_cast<unsigned long long>(agent_id_),
             static_cast<unsigned long long>(request.request_id), removed.c_str());
@@ -150,6 +153,7 @@ SessionOutcome Session::on_message(const ipc::Message& message) {
     SessionOutcome outcome;
     if (const auto* list = std::get_if<ipc::ModuleList>(&message)) {
         modules_ = list->modules;
+        ++revision_;
         CML_LOG(Info, "agent#%llu ModuleList request=%llu recorded %llu modules",
                 static_cast<unsigned long long>(agent_id_),
                 static_cast<unsigned long long>(list->request_id),
@@ -165,10 +169,12 @@ SessionOutcome Session::on_message(const ipc::Message& message) {
                                       [loaded](const ipc::ModuleEntry& e) { return e.base == loaded->module.base; }),
                        modules_.end());
         modules_.push_back(loaded->module);
+        ++revision_;
     } else if (const auto* unloaded = std::get_if<ipc::ModuleUnloaded>(&message)) {
         modules_.erase(std::remove_if(modules_.begin(), modules_.end(),
                                       [unloaded](const ipc::ModuleEntry& e) { return e.base == unloaded->module.base; }),
                        modules_.end());
+        ++revision_;
     } else if (const auto* log = std::get_if<ipc::Log>(&message)) {
         CML_LOG(Info, "agent#%llu log[%u]: %s", static_cast<unsigned long long>(agent_id_),
                 log->level, log->text.c_str());
