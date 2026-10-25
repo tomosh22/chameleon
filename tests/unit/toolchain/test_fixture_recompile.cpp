@@ -182,7 +182,17 @@ void check_recompile(const Fixture& fx, PchDebugMode mode, bool expect_all_ok, s
         REQUIRE_MESSAGE(before, before.error().format());
         REQUIRE_MESSAGE(after, after.error().format());
         const SymbolSetDiff d = diff_symbol_sets(*before, *after);
-        CHECK_MESSAGE(d.empty(), "symbol sets differ:\n" << d.to_string() << "command: " << out.command_line);
+        if (expect_all_ok) {
+            CHECK_MESSAGE(d.empty(), "symbol sets differ:\n" << d.to_string() << "command: " << out.command_line);
+        } else if (!d.empty()) {
+            // Strategy evidence: a strategy that compiles but changes the symbol set is not equivalent.
+            const std::string diff_line = std::string("PCH-STRATEGY-SYMDIFF fixture=") + fx.name + " mode=" + std::to_string(static_cast<int>(mode)) +
+                                          " stem=" + c.stem + "\n" + d.to_string();
+            std::printf("%s", diff_line.c_str());
+            if (evidence) {
+                *evidence += diff_line;
+            }
+        }
         CHECK(before->size() > 0);
 
         // The new object still carries CodeView.
@@ -215,7 +225,7 @@ TEST_CASE("fixture pch: evidence for every PCH strategy (only the default one is
         for (std::size_t pos; (pos = without_expected.find("result=CML2102")) != std::string::npos;) {
             without_expected.erase(pos, 14);
         }
-        if (without_expected.find("result=CML") == std::string::npos) {
+        if (without_expected.find("result=CML") == std::string::npos && without_expected.find("SYMDIFF") == std::string::npos) {
             ++working;
         }
     }
