@@ -1,6 +1,7 @@
 // Independent re-parse of every object the tests know about, plus the byte-identity round-trip
 // hook for the WP-06 writer (see coff_independent.h).
 #include <cstdint>
+#include <ostream>
 #include <string>
 #include <vector>
 

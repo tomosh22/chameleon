@@ -3,6 +3,7 @@
 #include "cml/coff/coff.h"
 
 #include <cstdint>
+#include <ostream>
 #include <string>
 #include <vector>
 
