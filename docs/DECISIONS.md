@@ -176,3 +176,83 @@ after the patch is applied, lists the patch module, resolves the patched functio
 patch DLL with its source file and line from the patch PDB, and prints the result. The
 orchestrator reads that output from the CI log. No manual Visual Studio check is required for
 the gate.
+
+## ADR-0012 Compile commands come from `S_BUILDINFO`, not `S_ENVBLOCK` (corrects plan §4.3)
+
+**Date:** 2026-10-25 · **Status:** Accepted · **Source:** WP-04 CI evidence
+
+Neither cl 19.51 (`/Zi`) nor clang-cl 20.1.8 emitted `S_ENVBLOCK` for the fixture's
+compilands. Both emit `S_BUILDINFO`, which refers to an `LF_BUILDINFO` record in the IPI
+stream; only CRT assembly objects carried `S_ENVBLOCK`. `cml_pdb::PdbIndex::build_env()`
+returns `S_ENVBLOCK` when present, else `S_BUILDINFO`, under the same keys (`cwd`, `cl`, `src`,
+`pdb`, `cmd`).
+
+Consequences:
+- **cl** records the real cl command line plus `pdb` (the compiler PDB, e.g. `vc140.pdb`).
+- **clang-cl** records the **cc1** command line (`"-cc1" "-triple" ...`, `"-D" "X"` pairs,
+  `-internal-isystem`) and an empty `pdb`. WP-05 must either translate cc1 back into a
+  clang-cl invocation or replay it as `clang-cl -cc1 ...` (to be decided by spike in WP-05),
+  with `compile_commands.json` as the fallback.
+- Diagnostic CML1102 ("no recorded command line") triggers when neither record exists.
+
+## ADR-0013 The PDB file list is not an include graph for clang-cl (affects WP-15)
+
+**Date:** 2026-10-25 · **Status:** Accepted · **Source:** WP-04 CI evidence
+
+cl's DBI file list contains every header it opened. clang-cl lists only files that
+contributed line information: `logic.h` (declarations only) is absent from `logic.obj`. Header →
+compiland mapping for clang-cl compilands therefore needs another source. WP-15 will use the
+first available of: `/showIncludes` (or `-MD` depfile) captured on first recompile and cached
+per compiland, `compile_commands.json` plus a dependency scan, or the PDB list (cl only).
+Until then, header changes on clang-cl builds may miss compilands whose headers contain no
+code.
+
+## ADR-0014 `cml_pdb` parses MSF/DBI/CodeView itself; raw_pdb is a validation gate
+
+**Date:** 2026-10-25 · **Status:** Accepted
+
+Plan §3/§6 describe `cml_pdb` as a wrapper over raw_pdb. WP-04 found that raw_pdb's stream
+classes trust file offsets and assert on bad input, which is incompatible with
+"diagnose, never crash" and WP-28 fuzzing. `cml_pdb` therefore uses raw_pdb's `ValidateFile`
+only as a gate and does all parsing with its own bounds-checked readers. The benchmark meets the
+budgets with this design: a 544 MiB PDB loads in 0.37 s. raw_pdb stays vendored and unmodified.
+This is an implementation choice within the DECIDED architecture, not a change to it.
+
+## ADR-0015 Object-format differences between cl and clang-cl (from WP-02)
+
+**Date:** 2026-10-25 · **Status:** Accepted (reference for WP-06/07/09)
+
+| Aspect | cl | clang-cl |
+|---|---|---|
+| Section names | `.text$mn`, `.text$di`, `.xdata$x`, `.rdata$r` | plain `.text`, `.xdata`, `.rdata` |
+| Function COMDAT selection | non-inline `NoDuplicates`; inline/templates `Any` | `Any` |
+| `.pdata`/`.xdata` | associative COMDATs, including leaf functions | associative COMDATs |
+| EH personality | `__CxxFrameHandler4` | `__CxxFrameHandler3` |
+| `.CRT$XCU` target | `??__E...` directly | `_GLOBAL__sub_I_<file>` wrapper (inlined when optimised) |
+| Weak externals | none (`/alternatename` is only a `.drectve` entry) | true `WEAK_EXTERNAL` for `__attribute__((weak))` |
+| String literals | Debug: static `$SG<n>` in `.rdata`; with `/GF`: `??_C@` COMDAT | `??_C@` COMDAT |
+| REL32 variants | `REL32`, `REL32_1..4` | `REL32` only |
+| `/bigobj` | always bigobj | ignored; bigobj only above 65279 sections; regular objects use unsigned 16-bit section numbers up to 65279 |
+
+Linked images (both toolchains) have no `IMAGE_DLLCHARACTERISTICS_GUARD_CF`, but the load
+config has `GuardFlags = CF_INSTRUMENTED` (from the `/guard:cf` CRT libraries). WP-18 must
+detect `/guard:cf` from the DllCharacteristics bit plus a function table, not from GuardFlags
+alone.
+
+## ADR-0016 Agent runtime choices (from WP-11)
+
+**Date:** 2026-10-25 · **Status:** Accepted
+
+- **Pipe security.** The broker pipe has a protected DACL with a single ACE for the current
+  user, rejects remote clients, and uses `FILE_FLAG_FIRST_PIPE_INSTANCE`. The agent connects at
+  `SECURITY_IDENTIFICATION` and verifies the server process runs as the same user (CML5209).
+- **Module notifications** use polling: a toolhelp diff every 500 ms and before each
+  enable/disable. `LdrRegisterDllNotification` was rejected because its callback runs under the
+  loader lock, which conflicts with WP-10's suspension rules.
+- **Agent heap.** `operator new/delete` inside the agent route to a private `HeapCreate`
+  heap. `heap::set_alloc_forbidden(true)` aborts on any allocation, and WP-10 sets it while
+  host threads are suspended. CRT `malloc` and Win32-internal allocations are not covered;
+  WP-10 must avoid those APIs in the suspension window.
+- **The agent DLL is never unloaded** once started, because hooks will point into it.
+- **Message ids** for every §4.13 family are fixed now (Hello=0x0001 … Restart=0x0061;
+  table in `docs/wp/WP-11.md`).
