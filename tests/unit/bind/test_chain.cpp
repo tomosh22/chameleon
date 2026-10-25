@@ -443,7 +443,7 @@ TEST_CASE("statics: static function templates are not matched by base name; oper
     w.proc(w.tu(), "forward", 0x60, 0x10, true);  // some unrelated instantiation of forward<>
     w.proc(w.tu(), "lambdas_init::<lambda_0>::operator()", 0x70, 0x10, true);
     w.proc(w.tu(), "`anonymous namespace'::Tracker::Tracker", 0x80, 0x10, true);
-    w.proc(w.tu(), "lambdas_init::__l2::<lambda_9c7f3a1b2d4e5f60718293a4b5c6d7e8>::operator()", 0x90, 0x10, true);  // cl's spelling
+    w.proc(w.tu(), "`lambdas_init'::`2'::<lambda_9c7f3a1b2d4e5f60718293a4b5c6d7e8>::operator()", 0x90, 0x10, true);  // cl's spelling (CI evidence)
     w.proc(w.tu(), "std::function<int __cdecl(int)>::operator()", 0xA0, 0x10, true);
     w.open();
     SynthObj o;

@@ -604,7 +604,26 @@ std::vector<const pdb::SymbolView*> Planner::static_candidates(const std::string
             for (std::size_t at = n.find(anon); at != std::string::npos; at = n.find(anon, at)) {
                 n.replace(at, anon.size(), "(anonymous namespace)");
             }
-            // cl numbers the local scopes of lambdas in function bodies: "f::__l2::<lambda_1>::operator()".
+            // cl spells the scope of a local entity with quotes and block numbers:
+            // BACKTICK f QUOTE :: BACKTICK 2 QUOTE :: <lambda_1>::operator()  (as the CI evidence shows).
+            for (std::size_t at = n.find('`'); at != std::string::npos; at = n.find('`', at)) {
+                const std::size_t close = n.find('\'', at + 1);
+                if (close == std::string::npos) {
+                    break;
+                }
+                const std::string inner = n.substr(at + 1, close - at - 1);
+                const bool digits = !inner.empty() && inner.find_first_not_of("0123456789") == std::string::npos;
+                if (digits) {
+                    std::size_t end = close + 1;
+                    if (n.compare(end, 2, "::") == 0) {
+                        end += 2;
+                    }
+                    n.erase(at, end - at);
+                } else {
+                    n.replace(at, close + 1 - at, inner);
+                }
+            }
+            // Older spelling: "f::__l2::<lambda_1>::operator()".
             for (std::size_t at = n.find("::__l"); at != std::string::npos; at = n.find("::__l", at)) {
                 std::size_t e = at + 5;
                 while (e < n.size() && n[e] >= '0' && n[e] <= '9') {
