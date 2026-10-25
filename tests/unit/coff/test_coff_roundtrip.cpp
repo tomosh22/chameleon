@@ -139,7 +139,7 @@ TEST_CASE("coff round trip: writer hook (byte identity)") {
 
     const FixturePaths& p = FixturePaths::get();
     REQUIRE(p.loaded());
-    for (const char* key : {"basic_objs", "cov_extras_objs"}) {
+    for (const char* key : {"basic_objs", "cov_extras_objs", "bigobj_objs"}) {
         const std::string list = p.value(key);
         std::size_t start = 0;
         while (start < list.size()) {

@@ -48,5 +48,30 @@ cml_add_unit_test(coff
         test_coff_synthetic.cpp
         test_coff_fixture.cpp
         test_coff_roundtrip.cpp
+        test_coff_writer.cpp
     LIBS cml_coff)
 cml_define_fixture_paths(cml_test_coff)
+
+# WP-06 acceptance: anchors and binding.obj through the real linkers (link.exe and lld-link).
+# Needs both linkers (CI cells provide them); CML_TEST_LINKERS=lld-link restricts local runs. Writes
+# <build>/test_work/coff_link/evidence.txt, which CI prints.
+cml_add_unit_test(coff_link
+    SOURCES test_coff_link.cpp
+    LIBS cml_coff cml_pe cml_pdb)
+cml_define_fixture_paths(cml_test_coff_link)
+target_compile_definitions(cml_test_coff_link PRIVATE "CML_TEST_WORK_DIR=\"${CMAKE_BINARY_DIR}/test_work/coff_link\"")
+set_tests_properties(unit.coff_link PROPERTIES TIMEOUT 1800)
+# Where link.exe is, independent of PATH (the Visual Studio generator job has no developer
+# environment): CMAKE_LINKER when it is link.exe, else the directory of cl.exe.
+set(_cml_msvc_link "")
+if(CMAKE_LINKER MATCHES "[/\\\\]link\\.exe$")
+    set(_cml_msvc_link "${CMAKE_LINKER}")
+else()
+    get_filename_component(_cml_cxx_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    if(EXISTS "${_cml_cxx_dir}/link.exe")
+        set(_cml_msvc_link "${_cml_cxx_dir}/link.exe")
+    endif()
+endif()
+if(_cml_msvc_link)
+    target_compile_definitions(cml_test_coff_link PRIVATE "CML_TEST_MSVC_LINK=\"${_cml_msvc_link}\"")
+endif()

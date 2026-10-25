@@ -110,6 +110,20 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
+      # WP-06: what the anchored-vs-unanchored link comparisons and the PDB lookups found (written by
+      # unit.coff_link). docs/wp/WP-06.md quotes these lines.
+      - name: WP-06 link evidence (anchors, binding object)
+        if: always()
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          $e = "$env:BUILD_DIR/test_work/coff_link/evidence.txt"
+          if (Test-Path $e) {
+            Copy-Item $e "$env:LOG_DIR/wp06-evidence.txt"
+            Get-Content $e
+          } else {
+            Write-Host "no WP-06 evidence file (unit.coff_link did not run)"
+          }
+
       # ---- Extension point (later WPs): build tests/fixtures, run cmltest.exe, ... -----------
       # Add steps here, between "Run cml_broker --version" and the artifact upload. Write any
       # logs you want to keep into $env:LOG_DIR; the upload step below always runs.
@@ -143,6 +157,11 @@ jobs:
         run: cmake --build build-vs --config Debug --parallel
       - name: Test (Debug)
         run: ctest --test-dir build-vs -C Debug --output-on-failure
+      - name: WP-06 link evidence (anchors, binding object)
+        if: always()
+        run: |
+          $e = "build-vs/test_work/coff_link/evidence.txt"
+          if (Test-Path $e) { Get-Content $e } else { Write-Host "no WP-06 evidence file" }
 
   # WP-04 (ADR-0009): load-time / memory benchmark of cml_pdb on a large synthetic PDB. Not part of
   # the 8-cell matrix. The PDB is built once (python generator -> MSVC /Z7 + /DEBUG:FULL) and cached
