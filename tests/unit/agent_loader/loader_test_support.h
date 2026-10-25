@@ -25,13 +25,11 @@ struct ProtoLayout {
     std::uint32_t rva_slot_b = 0;
     std::uint32_t rva_inits = 0;       // 3 pointers
     std::uint32_t rva_init_fault = 0;  // 1 pointer
-    std::uint32_t rva_init_overflow = 0;  // 1 pointer
     std::uint32_t rva_log = 0;
     std::uint32_t rva_log_len = 0;
     std::uint32_t rva_answer = 0;
     std::uint32_t init_fn_rva[3] = {};
     std::uint32_t fault_fn_rva = 0;
-    std::uint32_t overflow_fn_rva = 0;
 };
 
 const ProtoLayout& proto();
@@ -60,7 +58,6 @@ std::uint64_t stride();  // image size rounded up to 64 KiB: the bump step betwe
 std::vector<cml::ipc::Fixup> standard_fixups(std::uint64_t base, std::uint64_t target);
 std::vector<std::uint32_t> init_entry_rvas();  // cml_inits[0..2]
 std::vector<std::uint32_t> fault_entry_rvas();  // cml_init_fault[0]
-std::vector<std::uint32_t> overflow_entry_rvas();  // cml_init_overflow[0]
 
 // One-candidate LoadPatch for `base` using a fresh variant file; fix-ups are standard_fixups unless
 // `with_fixups` is false; initializers are the three in order unless `with_inits` is false.

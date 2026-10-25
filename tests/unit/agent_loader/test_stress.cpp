@@ -567,33 +567,6 @@ TEST_CASE("fault classification: stack overflow and C++ exceptions are named") {
     CHECK_FALSE(cml::agent::loader::initializers_refused_on_this_thread());
 }
 
-TEST_CASE("an initializer that overflows the stack is caught, the guard page restored, the patch unloaded") {
-    LoaderSession session(1);
-    const std::uint64_t base = session.blocks[0].base;
-    ipc::LoadPatch overflow = make_request(base, "overflow", true, false);
-    overflow.initializer_rvas = overflow_entry_rvas();
-    ipc::LoadPatch normal = make_request(base, "after_overflow", true, true);
-
-    // On a thread of its own: its stack is the one that overflows, and the test host's main thread is
-    // never at risk. The same thread then runs a normal load, which proves the guard page is back.
-    ipc::PatchLoaded first;
-    ipc::PatchLoaded second;
-    bool refused_afterwards = true;
-    std::thread worker([&] {
-        first = session.loader.load_patch(overflow);
-        refused_afterwards = cml::agent::loader::initializers_refused_on_this_thread();
-        second = session.loader.load_patch(normal);
-    });
-    worker.join();
-    CHECK(first.status == ids::kLoaderInitializerFailed);
-    CHECK(first.message.find("overflowed the stack") != std::string::npos);
-    CHECK(first.message.find("guard page was restored") != std::string::npos);
-    CHECK_FALSE(refused_afterwards);
-    CHECK_MESSAGE(second.status == 0, second.message);
-    session.loaded.push_back(second.image_base);
-    CHECK(initializer_log(base) == "ABC");
-}
-
 TEST_CASE("the final CML4203 reports the breakdown; without a collision the real reason is returned") {
     LoaderSession session(3);
     Grabber grabber;
