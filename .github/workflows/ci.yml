@@ -110,6 +110,17 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
+      # WP-03 (M1 gate): end-to-end spike. Starts fixture_basic, replaces compute_value() by a
+      # recompiled version loaded from a /FIXED patch DLL, asserts value=1 -> value=2, then
+      # checks the patched function with a non-invasive cdb.exe session. Fails the job on any
+      # assertion. Working directory (obj, dll, pdb, logs, cdb output) is uploaded below.
+      - name: WP-03 spike (replace compute_value in the running fixture)
+        run: |
+          python spike/run_spike.py --build-dir $env:BUILD_DIR --config ${{ matrix.config }} `
+            --compiler ${{ matrix.compiler }} --cxx "$env:CML_CXX" --work-dir spike-work `
+            *>&1 | Tee-Object -FilePath "$env:LOG_DIR/spike-run.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       # ---- Extension point (later WPs): build tests/fixtures, run cmltest.exe, ... -----------
       # Add steps here, between "Run cml_broker --version" and the artifact upload. Write any
       # logs you want to keep into $env:LOG_DIR; the upload step below always runs.
@@ -121,6 +132,7 @@ jobs:
           name: logs-${{ matrix.os }}-${{ matrix.compiler }}-${{ matrix.config }}
           path: |
             ci-logs/
+            spike-work/
             build/Testing/
             build/test_work/
             build/CMakeFiles/CMakeConfigureLog.yaml
