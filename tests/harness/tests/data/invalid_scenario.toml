@@ -1,0 +1,8 @@
+# Used by the ctest harness.cmltest_bad_scenario_fails: cmltest must reject this file (unknown key,
+# misspelt step kind) with exit code 1 and a CML5411 diagnostic, never run anything.
+name = "invalid"
+fixture = "basic"
+timout_s = 120
+
+[[step]]
+kind = "lunch"
