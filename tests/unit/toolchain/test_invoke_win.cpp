@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <tlhelp32.h>
 #include <fstream>
 #include <string>
 #include <thread>
@@ -238,21 +239,57 @@ TEST_CASE("cancelling a /Zi compile does not break a concurrent /Zi compile (msp
         spec.timeout_ms = 240000;
         return spec;
     };
-    CancelToken token;
-    std::thread a([&] {
-        auto r = run_process(compile("a"), &token);
-        REQUIRE(r);
-    });
-    std::thread canceller([&] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    // Running mspdbsrv.exe processes (Toolhelp snapshot, image name).
+    const auto pdb_servers = [] {
+        std::vector<DWORD> pids;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap == INVALID_HANDLE_VALUE) return pids;
+        PROCESSENTRY32W e{};
+        e.dwSize = sizeof(e);
+        for (BOOL ok = Process32FirstW(snap, &e); ok; ok = Process32NextW(snap, &e)) {
+            if (_wcsicmp(e.szExeFile, L"mspdbsrv.exe") == 0) pids.push_back(e.th32ProcessID);
+        }
+        CloseHandle(snap);
+        return pids;
+    };
+    const auto alive = [](DWORD pid) {
+        HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, pid);
+        if (h == nullptr) return false;
+        const bool running = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+        CloseHandle(h);
+        return running;
+    };
+    int rounds_with_server = 0;
+    for (int round = 0; round < 5; ++round) {
+        INFO("round " << round);
+        std::filesystem::remove(dir / "b.obj", ec);
+        CancelToken token;
+        std::thread a([&] {
+            auto r = run_process(compile("a"), &token);
+            REQUIRE(r);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        // B starts while A runs; both use the shared PDB server.
+        bool b_ok = false;
+        ProcessResult b;
+        std::thread b_thread([&] {
+            auto r = run_process(compile("b"));
+            b_ok = static_cast<bool>(r);
+            if (r) b = *r;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(450));
+        const std::vector<DWORD> before = pdb_servers();  // sampled just before the cancel
         token.cancel();
-    });
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
-    auto b = run_process(compile("b"));
-    a.join();
-    canceller.join();
-    REQUIRE(b);
-    CHECK_MESSAGE(b->exit_code == 0, b->output);
-    CHECK(std::filesystem::exists(dir / "b.obj"));
+        a.join();  // A's tree is dead now
+        for (const DWORD pid : before) {
+            CHECK_MESSAGE(alive(pid), "mspdbsrv.exe pid " << pid << " was running before the cancel and is gone after it");
+        }
+        if (!before.empty()) ++rounds_with_server;
+        b_thread.join();
+        REQUIRE(b_ok);
+        CHECK_MESSAGE(b.exit_code == 0, "compile B failed with exit code " << b.exit_code << "\n" << b.output);
+        CHECK(std::filesystem::exists(dir / "b.obj"));
+    }
+    std::printf("CANCEL-ZI rounds_with_running_mspdbsrv=%d of 5\n", rounds_with_server);
 }
 #endif
