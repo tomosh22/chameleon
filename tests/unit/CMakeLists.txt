@@ -56,7 +56,7 @@ if(WIN32)
     target_sources(cml_test_ipc PRIVATE lib/test_ipc_pipe.cpp)
     set_tests_properties(unit.ipc unit.proc PROPERTIES TIMEOUT 120)
 endif()
-cml_add_unit_test(toolchain SOURCES lib/test_toolchain.cpp LIBS cml_toolchain)
+add_subdirectory(toolchain)  # WP-05: unit.toolchain
 cml_add_unit_test(watch SOURCES lib/test_watch.cpp LIBS cml_watch)
 # WP-11: agent pieces (SyncPoint queue, module diff, heap) link the agent core library directly; the
 # end-to-end tests load cml_agent.dll through Chameleon_API.h like an application would and talk to

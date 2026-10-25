@@ -15,6 +15,7 @@ list(REMOVE_ITEM _cml_fixture_defs _HAS_EXCEPTIONS=0)
 set_directory_properties(PROPERTIES COMPILE_DEFINITIONS "${_cml_fixture_defs}")
 
 add_subdirectory(basic)
+add_subdirectory(pch)  # WP-05: precompiled header (/Yc + /Yu) fixture
 # c_only is C: needs the C language (enabled on Windows by tests/CMakeLists.txt).
 if(CMAKE_C_COMPILER_LOADED)
     add_subdirectory(c_only)

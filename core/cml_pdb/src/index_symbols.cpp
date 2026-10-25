@@ -518,9 +518,13 @@ constexpr int kMaxStringDepth = 4;
 
 enum class StrResult { Ok, Missing, Abuse };
 
-// LF_STRING_ID, followed by the strings of its LF_SUBSTR_LIST when it has one. Missing: a record is
-// absent or has the wrong kind (tolerated, the value is left empty). Abuse: the budget, the nesting
-// depth or the size cap was exceeded (a cycle or a fan-out bomb): reported as CML1419.
+// LF_STRING_ID with its LF_SUBSTR_LIST. A long string (cl splits its command line at ~250 bytes) is
+// stored as pieces: the pieces named by the substring list come FIRST, in list order, and the record's
+// own text is the LAST piece (llvm-pdbutil dump of a cl 19.51 PDB: 0x1021, 0x1022, 0x1023 plain
+// LF_STRING_IDs, 0x1024 LF_SUBSTR_LIST [0x1021 0x1022 0x1023], 0x1025 LF_STRING_ID {id 0x1024, " Kits\\...
+// -X"}). Missing: a record is absent or has the wrong kind (tolerated, the value is left empty).
+// Abuse: the budget, the nesting depth or the size cap was exceeded (a cycle or a fan-out bomb):
+// reported as CML1419.
 StrResult ipi_string(const IpiTable& t, std::uint32_t id, std::string& out, int depth, std::uint32_t& budget) {
     if (budget == 0 || depth > kMaxStringDepth) {
         return StrResult::Abuse;
@@ -531,10 +535,6 @@ StrResult ipi_string(const IpiTable& t, std::uint32_t id, std::string& out, int 
         return StrResult::Missing;
     }
     const std::uint32_t substr = rd32(r.body);
-    out.append(reinterpret_cast<const char*>(r.body + 4), cv::cstr_len(r.body + 4, r.body_len - 4));
-    if (out.size() > kMaxBuildString) {
-        return StrResult::Abuse;
-    }
     if (substr != 0) {
         if (budget == 0) {
             return StrResult::Abuse;
@@ -554,6 +554,10 @@ StrResult ipi_string(const IpiTable& t, std::uint32_t id, std::string& out, int 
                 return child;
             }
         }
+    }
+    out.append(reinterpret_cast<const char*>(r.body + 4), cv::cstr_len(r.body + 4, r.body_len - 4));
+    if (out.size() > kMaxBuildString) {
+        return StrResult::Abuse;
     }
     return StrResult::Ok;
 }
