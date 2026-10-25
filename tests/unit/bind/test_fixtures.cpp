@@ -384,7 +384,7 @@ void emit_decisions(const std::string& tag, const BindPlan& p, const cml::pdb::P
                 }
                 if (v.kind == cml::pdb::SymbolKind::LocalData || v.kind == cml::pdb::SymbolKind::LocalProc ||
                     v.kind == cml::pdb::SymbolKind::LocalThread || v.parent_proc != cml::pdb::kNoSymbol) {
-                    (tag == "statics" ? brief : line)("PDB-STATIC " + tag + " kind=" + cml::pdb::to_string(v.kind) + " name='" + std::string(v.name) + "' parent='" +
+                    (tag == "statics" || (tag == "lambdas" && std::string(v.name).find("operator()") != std::string::npos) ? brief : line)("PDB-STATIC " + tag + " kind=" + cml::pdb::to_string(v.kind) + " name='" + std::string(v.name) + "' parent='" +
                          std::string(v.parent_name) + "' rva=" + hex(v.rva));
                     if (++shown >= 80) {
                         break;

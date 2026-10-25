@@ -168,6 +168,21 @@ struct OldRef {
     std::string note;
 };
 
+// The PDB spells a lambda "<lambda_9c7f...>" (a content hash), the decorated name "<lambda_1>" (a counter):
+// compare them as "<lambda>".
+std::string canonical_lambda_names(std::string n) {
+    for (std::size_t at = n.find("<lambda_"); at != std::string::npos; at = n.find("<lambda_", at + 1)) {
+        std::size_t e = at + 8;
+        while (e < n.size() && ((n[e] >= '0' && n[e] <= '9') || (n[e] >= 'a' && n[e] <= 'z') || (n[e] >= 'A' && n[e] <= 'Z'))) {
+            ++e;
+        }
+        if (e < n.size() && n[e] == '>') {
+            n.replace(at, e + 1 - at, "<lambda>");
+        }
+    }
+    return n;
+}
+
 class Planner {
 public:
     Planner(const PlanInput& in, BindPlan* partial) : in_(in), obj_(*in.object), pdb_(*in.module_pdb), partial_(partial) {}
@@ -581,6 +596,7 @@ std::vector<const pdb::SymbolView*> Planner::static_candidates(const std::string
     // The qualified name, when both sides spell it the same, is a much stronger key than the last
     // component: "lambdas_init::<lambda_0>::operator()" (clang) or "Ns::Cls::f".
     if (!display.empty()) {
+        const std::string canonical_display = canonical_lambda_names(display);
         std::vector<const pdb::SymbolView*> exact;
         for (const pdb::SymbolView* v : all) {
             std::string n(v->name);
@@ -600,7 +616,7 @@ std::vector<const pdb::SymbolView*> Planner::static_candidates(const std::string
                     ++at;
                 }
             }
-            if (n == display) {
+            if (canonical_lambda_names(n) == canonical_display) {
                 exact.push_back(v);
             }
         }
@@ -751,7 +767,7 @@ void Planner::bridge_statics() {
             continue;
         }
         const std::string encl = enclosing_function(sy.name);
-        const std::string key = std::string(is_func ? "F|" : "D|") + sy.dec.display + "|" + base + "|" + encl;
+        const std::string key = std::string(is_func ? "F|" : "D|") + canonical_lambda_names(sy.dec.display) + "|" + base + "|" + encl;
         Group& g = groups[key];
         g.is_func = is_func;
         g.base = base;

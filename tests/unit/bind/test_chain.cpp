@@ -443,11 +443,14 @@ TEST_CASE("statics: static function templates are not matched by base name; oper
     w.proc(w.tu(), "forward", 0x60, 0x10, true);  // some unrelated instantiation of forward<>
     w.proc(w.tu(), "lambdas_init::<lambda_0>::operator()", 0x70, 0x10, true);
     w.proc(w.tu(), "`anonymous namespace'::Tracker::Tracker", 0x80, 0x10, true);
+    w.proc(w.tu(), "lambdas_init::__l2::<lambda_9c7f3a1b2d4e5f60718293a4b5c6d7e8>::operator()", 0x90, 0x10, true);  // cl's spelling
+    w.proc(w.tu(), "std::function<int __cdecl(int)>::operator()", 0xA0, 0x10, true);
     w.open();
     SynthObj o;
     o.function("??$forward@AEBV<lambda_0>@?0??lambdas_init@@YAXH@Z@@std@@YAAEBV<lambda_0>@?0??lambdas_init@@YAXH@Z@AEBV1?0??2@YAXH@Z@@Z", false);
     o.function("??R<lambda_0>@?0??lambdas_init@@YAXH@Z@QEBA?A?<auto>@@H@Z", false);
     o.function("??0Tracker@?A0x1@@QEAA@PEBD@Z", false);
+    o.function("??R<lambda_1>@?1??lambdas_init@@YAXH@Z@QEBA@H@Z", false);  // cl numbering
     Built b = o.build();
     auto r = plan_bind(w.input(b));
     REQUIRE_MESSAGE(r.has_value(), err(r));
@@ -456,7 +459,10 @@ TEST_CASE("statics: static function templates are not matched by base name; oper
     CHECK(r->decisions[1].old_address.rva == 0x1070);
     CHECK(r->decisions[2].decision == DecisionKind::PatchHooked);
     CHECK(r->decisions[2].old_address.rva == 0x1080);
-    CHECK(r->hooks.size() == 2);
+    CHECK(r->decisions[3].decision == DecisionKind::PatchHooked);  // not confused with std::function::operator()
+    CHECK(r->decisions[3].old_address.rva == 0x1090);
+    CHECK(r->hooks.size() == 3);
+    CHECK(r->warnings.empty());
 }
 
 TEST_CASE("compiland lookup: by object name, by stem, by index; unknown and ambiguous TUs are diagnosed") {
