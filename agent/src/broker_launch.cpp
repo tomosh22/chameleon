@@ -8,6 +8,7 @@
 
 #include "cml/proc/diag_ids.h"
 #include "cml/proc/proc.h"
+#include "cml/util/path.h"
 
 namespace cml::agent {
 
@@ -58,6 +59,26 @@ std::wstring broker_path_for(const std::wstring& override_path, const std::wstri
     return path;
 }
 
+std::wstring broker_command_line(const std::wstring& broker_path, const std::string& pipe_name,
+                                 const std::string& extra_args) {
+    std::wstring command = quote_argument(broker_path) + L" --headless --pipe " +
+                           quote_argument(proc::wide_from_utf8(pipe_name));
+    if (!extra_args.empty()) {
+        command += L" " + proc::wide_from_utf8(extra_args);
+    }
+    // An auto-started broker belongs to the user's session, not to the application that happened to
+    // start it, but it must not run forever either: unless the caller chose an idle timeout it
+    // exits when no agent has been connected for a while.
+    if (extra_args.find("--exit-when-idle") == std::string::npos) {
+        command += L" --exit-when-idle " + std::to_wstring(kDefaultIdleExitMs);
+    }
+    // ... and one that nobody connects to (e.g. the agent gave up) does not linger either.
+    if (extra_args.find("--startup-timeout") == std::string::npos) {
+        command += L" --startup-timeout " + std::to_wstring(kDefaultStartupTimeoutMs);
+    }
+    return command;
+}
+
 Result<void> launch_broker(const std::wstring& broker_path, const std::string& pipe_name,
                            const std::string& extra_args) {
     const DWORD attributes = GetFileAttributesW(broker_path.c_str());
@@ -65,11 +86,9 @@ Result<void> launch_broker(const std::wstring& broker_path, const std::string& p
         return start_failed(broker_path, "the file does not exist");
     }
 
-    std::wstring command = quote_argument(broker_path) + L" --headless --pipe " +
-                           quote_argument(proc::wide_from_utf8(pipe_name));
-    if (!extra_args.empty()) {
-        command += L" " + proc::wide_from_utf8(extra_args);
-    }
+    const std::wstring command = broker_command_line(broker_path, pipe_name, extra_args);
+    // Run it from its own directory, not from whatever the host's working directory is.
+    const std::wstring directory(path::parent_directory(std::wstring_view(broker_path)));
     std::vector<wchar_t> mutable_command(command.begin(), command.end());
     mutable_command.push_back(L'\0');  // CreateProcessW may modify the buffer
 
@@ -80,8 +99,8 @@ Result<void> launch_broker(const std::wstring& broker_path, const std::string& p
     ZeroMemory(&info, sizeof(info));
     // bInheritHandles = FALSE: the broker must not keep the application's pipes or files open.
     const BOOL ok = CreateProcessW(broker_path.c_str(), mutable_command.data(), nullptr, nullptr, FALSE,
-                                   DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, nullptr, nullptr,
-                                   &startup, &info);
+                                   DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, nullptr,
+                                   directory.empty() ? nullptr : directory.c_str(), &startup, &info);
     if (!ok) {
         return start_failed(broker_path, "CreateProcess failed with Win32 error " +
                                              std::to_string(GetLastError()));

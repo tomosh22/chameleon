@@ -359,7 +359,9 @@ Result<PipeConnection::Received> PipeConnection::receive(std::uint32_t timeout_m
                 decode_message(header.type, header.version, s.payload.data(), s.payload.size());
             s.reset_receive_state();
             if (!message) {
-                return message.error();
+                out.status = IoStatus::Rejected;  // the stream is still frame-aligned
+                out.error = message.error();
+                return out;
             }
             out.status = IoStatus::Ok;
             out.message = std::move(*message);
@@ -581,39 +583,56 @@ Result<PipeServer::Accepted> PipeServer::accept(std::uint32_t timeout_ms, void* 
         out.status = IoStatus::Cancelled;
         return out;
     }
-    if (s.listening == INVALID_HANDLE_VALUE) {
-        Result<HANDLE> instance = s.create_instance();
-        if (!instance) {
-            return instance.error();
-        }
-        s.listening = *instance;
-    }
-
-    ResetEvent(s.connect_event);
-    std::memset(&s.ov, 0, sizeof(s.ov));
-    s.ov.hEvent = s.connect_event;
+    // A client that connects and vanishes before we get to it (ERROR_NO_DATA) is not an error of
+    // ours: drop that instance's state and listen again. One bad client must never stop the
+    // broker, so only a run of such events (a pathological flood) gives up for this call.
+    constexpr int kMaxDroppedClients = 64;
     bool connected = false;
-    if (ConnectNamedPipe(s.listening, &s.ov)) {
-        connected = true;
-    } else {
+    for (int dropped = 0; !connected; ++dropped) {
+        if (dropped >= kMaxDroppedClients) {
+            out.status = IoStatus::Timeout;  // the caller's loop calls accept() again
+            return out;
+        }
+        if (s.listening == INVALID_HANDLE_VALUE) {
+            Result<HANDLE> instance = s.create_instance();
+            if (!instance) {
+                return instance.error();
+            }
+            s.listening = *instance;
+        }
+
+        ResetEvent(s.connect_event);
+        std::memset(&s.ov, 0, sizeof(s.ov));
+        s.ov.hEvent = s.connect_event;
+        if (ConnectNamedPipe(s.listening, &s.ov)) {
+            connected = true;
+            break;
+        }
         const DWORD error = GetLastError();
         if (error == ERROR_PIPE_CONNECTED) {
             connected = true;  // the client connected before we started waiting
-        } else if (error != ERROR_IO_PENDING) {
+            break;
+        }
+        if (error == ERROR_NO_DATA) {
+            DisconnectNamedPipe(s.listening);  // the client already left; reuse the instance
+            continue;
+        }
+        if (error != ERROR_IO_PENDING) {
             return io_diag("waiting for a client", error);
         }
-    }
 
-    if (!connected) {
         HANDLE waits[3] = {s.connect_event, s.cancel_event, static_cast<HANDLE>(wake_event)};
         const DWORD count = wake_event != nullptr ? 3 : 2;
         const DWORD w = WaitForMultipleObjects(count, waits, FALSE, timeout_ms == kInfiniteTimeout ? INFINITE : timeout_ms);
         DWORD transferred = 0;
         if (w == WAIT_OBJECT_0) {
-            if (!GetOverlappedResult(s.listening, &s.ov, &transferred, FALSE)) {
+            if (GetOverlappedResult(s.listening, &s.ov, &transferred, FALSE)) {
+                connected = true;
+            } else if (GetLastError() == ERROR_NO_DATA) {
+                DisconnectNamedPipe(s.listening);
+            } else {
                 return io_diag("accepting a client", GetLastError());
             }
-            connected = true;
         } else {
             // Stop waiting. A client may connect in the instant before the cancel takes effect;
             // then the connection is real and must not be dropped.

@@ -16,6 +16,7 @@
 #include "cml/proc/diag_ids.h"
 #include "cml/proc/proc.h"
 #include "cml/util/log.h"
+#include "cml/util/path.h"
 #include "module_diff.h"
 
 namespace cml::agent {
@@ -26,9 +27,12 @@ constexpr DWORD kSendTimeoutMs = 5000;
 constexpr DWORD kHandshakeTimeoutMs = 5000;
 constexpr ULONGLONG kModulePollMs = 500;
 constexpr DWORD kReceiveSliceMs = 250;       // longest the agent thread sleeps without re-checking
-constexpr std::size_t kMaxOutstanding = 512;  // queued + sent requests plus unconsumed answers
-constexpr std::size_t kMaxUnconsumedAnswers = 128;
+constexpr std::size_t kMaxOutstanding = 1024;  // queued + sent requests plus unconsumed answers
+constexpr std::size_t kMaxUnconsumedAnswers = 1024;
 constexpr std::size_t kMaxLogsPerPass = 16;
+// Requests sent but not yet answered. Bounded so that the agent keeps reading replies while it
+// writes: with an unbounded burst both pipe buffers could fill up and stall both ends.
+constexpr std::size_t kMaxInFlight = 16;
 constexpr std::uint32_t kMaxBackoffMs = 1000;
 constexpr DWORD kReconnectPauseMs = 200;   // pause after a session that was up, before reconnecting
 
@@ -36,34 +40,27 @@ constexpr DWORD kReconnectPauseMs = 200;   // pause after a session that was up,
 int g_module_anchor = 0;
 
 std::wstring module_file_name(HMODULE module) {
-    std::wstring path(512, L'\0');
-    for (;;) {
-        const DWORD n = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
-        if (n == 0) {
-            return {};
-        }
-        if (n < path.size()) {
-            path.resize(n);
-            return path;
-        }
-        if (path.size() >= 32768) {
-            return {};
-        }
-        path.assign(path.size() * 4, L'\0');
-    }
+    return proc::read_growing_string([module](wchar_t* buffer, DWORD capacity) {
+        return GetModuleFileNameW(module, buffer, capacity);
+    });
 }
 
 std::wstring directory_of(const std::wstring& path) {
-    const std::size_t pos = path.find_last_of(L"\\/");
-    return pos == std::wstring::npos ? std::wstring() : path.substr(0, pos);
+    return std::wstring(path::parent_directory(std::wstring_view(path)));
+}
+
+std::vector<ipc::ModuleEntry> to_entries(const std::vector<proc::ModuleInfo>& modules) {
+    std::vector<ipc::ModuleEntry> entries;
+    entries.reserve(modules.size());
+    for (const proc::ModuleInfo& module : modules) {
+        entries.push_back(ipc::ModuleEntry{module.base, module.size, module.path});
+    }
+    return entries;
 }
 
 // Copies `text` into the fixed reply buffer, cutting at a UTF-8 boundary if it has to truncate.
 void fill_reply(cml_reply* reply, std::uint32_t status, const std::string& text) {
-    std::size_t n = std::min<std::size_t>(text.size(), CML_REPLY_MESSAGE_CAPACITY - 1);
-    while (n > 0 && n < text.size() && (static_cast<unsigned char>(text[n]) & 0xC0u) == 0x80u) {
-        --n;  // the cut would fall inside a multi-byte sequence
-    }
+    const std::size_t n = ipc::utf8_cut_point(text, CML_REPLY_MESSAGE_CAPACITY - 1);
     std::memcpy(reply->message, text.data(), n);
     reply->message[n] = '\0';
     reply->message_length = static_cast<std::uint32_t>(n);
@@ -186,35 +183,37 @@ cml_status Agent::enqueue(std::uint64_t id, ipc::Message message) {
     return CML_STATUS_OK;
 }
 
-cml_status Agent::enable_module(const wchar_t* path, std::uint32_t options, std::uint64_t* request_id) {
-    ipc::EnableModule request;
-    request.path = proc::utf8_from_wide(path, std::wcslen(path));
-    request.options = options;
-    if (request.path.empty() || request.path.size() > ipc::kMaxStringBytes) {
+template <class Build>
+cml_status Agent::submit_path_request(const wchar_t* path, std::uint64_t* request_id, Build build) {
+    std::string utf8 = proc::utf8_from_wide(path, std::wcslen(path));
+    if (utf8.empty() || utf8.size() > ipc::kMaxStringBytes) {
         return CML_STATUS_INVALID_ARGUMENT;
     }
-    request.request_id = next_id_.fetch_add(1, std::memory_order_relaxed);
-    const std::uint64_t id = request.request_id;
-    const cml_status status = enqueue(id, std::move(request));
+    const std::uint64_t id = next_id_.fetch_add(1, std::memory_order_relaxed);
+    const cml_status status = enqueue(id, build(id, std::move(utf8)));
     if (status == CML_STATUS_OK && request_id != nullptr) {
         *request_id = id;
     }
     return status;
 }
 
+cml_status Agent::enable_module(const wchar_t* path, std::uint32_t options, std::uint64_t* request_id) {
+    return submit_path_request(path, request_id, [options](std::uint64_t id, std::string utf8) {
+        ipc::EnableModule request;
+        request.request_id = id;
+        request.options = options;
+        request.path = std::move(utf8);
+        return ipc::Message(std::move(request));
+    });
+}
+
 cml_status Agent::disable_module(const wchar_t* path, std::uint64_t* request_id) {
-    ipc::DisableModule request;
-    request.path = proc::utf8_from_wide(path, std::wcslen(path));
-    if (request.path.empty() || request.path.size() > ipc::kMaxStringBytes) {
-        return CML_STATUS_INVALID_ARGUMENT;
-    }
-    request.request_id = next_id_.fetch_add(1, std::memory_order_relaxed);
-    const std::uint64_t id = request.request_id;
-    const cml_status status = enqueue(id, std::move(request));
-    if (status == CML_STATUS_OK && request_id != nullptr) {
-        *request_id = id;
-    }
-    return status;
+    return submit_path_request(path, request_id, [](std::uint64_t id, std::string utf8) {
+        ipc::DisableModule request;
+        request.request_id = id;
+        request.path = std::move(utf8);
+        return ipc::Message(std::move(request));
+    });
 }
 
 void Agent::erase_done_locked(std::uint64_t id) {
@@ -349,6 +348,7 @@ bool Agent::run_session(ipc::PipeConnection& connection) {
     last_module_poll_ = GetTickCount64();
     const bool established = handshake(connection) && send_module_list(connection);
     if (established) {
+        queue_reenables();
         connected_.store(true, std::memory_order_release);
         serve(connection);
     }
@@ -382,6 +382,7 @@ bool Agent::send_message(ipc::PipeConnection& connection, const ipc::Message& me
             return false;
         case ipc::IoStatus::Cancelled:
         case ipc::IoStatus::Woken:
+        case ipc::IoStatus::Rejected:
             return false;
     }
     return false;
@@ -423,6 +424,10 @@ bool Agent::handshake(ipc::PipeConnection& connection) {
                 CML_LOG(Warn, "CML%u: the broker closed the connection during the handshake",
                         ids::kHandshakeFailed);
                 return false;
+            case ipc::IoStatus::Rejected:
+                CML_LOG(Warn, "CML%u: unusable answer to Hello: %s", ids::kHandshakeFailed,
+                        received->error.format().c_str());
+                return false;
             case ipc::IoStatus::Cancelled:
                 return false;
         }
@@ -456,9 +461,7 @@ bool Agent::send_module_list(ipc::PipeConnection& connection) {
     if (!modules) {
         CML_LOG(Warn, "%s", modules.error().format().c_str());
     } else {
-        for (const proc::ModuleInfo& module : *modules) {
-            list.modules.push_back(ipc::ModuleEntry{module.base, module.size, module.path});
-        }
+        list.modules = to_entries(*modules);
     }
     {
         // Register before sending so the Reply cannot race the registration.
@@ -477,12 +480,22 @@ bool Agent::send_module_list(ipc::PipeConnection& connection) {
 }
 
 bool Agent::flush_outgoing(ipc::PipeConnection& connection) {
+    bool polled = false;
     for (;;) {
         std::uint64_t id = 0;
         ipc::Message message;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (outgoing_.empty()) {
+                return true;
+            }
+            // Leave the rest queued while a full window of requests awaits answers; serve() reads
+            // replies and calls us again.
+            std::size_t in_flight = 0;
+            for (const auto& [entry_id, entry] : entries_) {
+                in_flight += entry.state == State::Sent ? 1 : 0;
+            }
+            if (in_flight >= kMaxInFlight) {
                 return true;
             }
             id = outgoing_.front();
@@ -493,9 +506,14 @@ bool Agent::flush_outgoing(ipc::PipeConnection& connection) {
             }
             message = it->second.message;
         }
-        // The broker checks EnableModule against the module list it has, so make sure it is
-        // current before the request goes out.
-        bool ok = poll_modules(connection) && send_message(connection, message);
+        // The broker checks EnableModule against the module list it has, so bring it up to date
+        // once per pass, before the first request of the pass goes out.
+        bool ok = true;
+        if (!polled) {
+            polled = true;
+            ok = poll_modules(connection);
+        }
+        ok = ok && send_message(connection, message);
         std::lock_guard<std::mutex> lock(mutex_);
         const auto it = entries_.find(id);
         if (!ok) {
@@ -531,11 +549,7 @@ bool Agent::poll_modules(ipc::PipeConnection& connection) {
         CML_LOG(Debug, "%s", modules.error().format().c_str());
         return true;  // a failed snapshot is not a connection problem; try again next time
     }
-    std::vector<ipc::ModuleEntry> current;
-    current.reserve(modules->size());
-    for (const proc::ModuleInfo& module : *modules) {
-        current.push_back(ipc::ModuleEntry{module.base, module.size, module.path});
-    }
+    std::vector<ipc::ModuleEntry> current = to_entries(*modules);
     const ModuleDelta delta = diff_modules(known_modules_, current);
     for (const ipc::ModuleEntry& module : delta.unloaded) {
         if (!send_message(connection, ipc::ModuleUnloaded{module})) {
@@ -551,6 +565,51 @@ bool Agent::poll_modules(ipc::PipeConnection& connection) {
     return true;
 }
 
+bool Agent::same_module(const std::string& a, const std::string& b) {
+    return path::matches_module(a, b) || path::matches_module(b, a);
+}
+
+void Agent::track_enabled_locked(const Entry& entry, std::uint32_t status) {
+    if (const auto* enable = std::get_if<ipc::EnableModule>(&entry.message)) {
+        const auto same = [enable](const EnabledModule& m) { return same_module(m.path, enable->path); };
+        if (status == 0) {
+            if (std::none_of(enabled_.begin(), enabled_.end(), same)) {
+                enabled_.push_back(EnabledModule{enable->path, enable->options});
+            }
+        } else if (entry.internal) {
+            // Re-enabling after a reconnect failed (the module is gone): stop tracking it.
+            enabled_.erase(std::remove_if(enabled_.begin(), enabled_.end(), same), enabled_.end());
+        }
+    } else if (const auto* disable = std::get_if<ipc::DisableModule>(&entry.message)) {
+        if (status == 0) {
+            enabled_.erase(std::remove_if(enabled_.begin(), enabled_.end(),
+                                          [disable](const EnabledModule& m) { return same_module(m.path, disable->path); }),
+                           enabled_.end());
+        }
+    }
+}
+
+// After a reconnect the new broker session knows nothing of what the application enabled. Queue
+// an EnableModule for each tracked module ahead of everything else that is waiting.
+void Agent::queue_reenables() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = enabled_.rbegin(); it != enabled_.rend(); ++it) {
+        ipc::EnableModule request;
+        request.request_id = next_id_.fetch_add(1, std::memory_order_relaxed);
+        request.options = it->options;
+        request.path = it->path;
+        Entry entry;
+        entry.internal = true;
+        entry.message = request;
+        entries_.emplace(request.request_id, std::move(entry));
+        outgoing_.push_front(request.request_id);
+    }
+    if (!enabled_.empty()) {
+        CML_LOG(Info, "re-enabling %llu module(s) in the new broker session",
+                static_cast<unsigned long long>(enabled_.size()));
+    }
+}
+
 void Agent::complete(std::uint64_t request_id, std::uint32_t status, std::string text) {
     bool known = false;
     bool internal = false;
@@ -560,6 +619,7 @@ void Agent::complete(std::uint64_t request_id, std::uint32_t status, std::string
         if (it != entries_.end() && it->second.state != State::Done) {
             known = true;
             internal = it->second.internal;
+            track_enabled_locked(it->second, status);
             if (internal) {
                 entries_.erase(it);
             } else {
@@ -635,6 +695,9 @@ void Agent::serve(ipc::PipeConnection& connection) {
         switch (received->status) {
             case ipc::IoStatus::Ok:
                 handle_message(received->message);
+                break;
+            case ipc::IoStatus::Rejected:
+                CML_LOG(Warn, "dropped one message from the broker: %s", received->error.format().c_str());
                 break;
             case ipc::IoStatus::Timeout:
             case ipc::IoStatus::Woken:

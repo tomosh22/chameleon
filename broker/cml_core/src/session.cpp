@@ -5,37 +5,12 @@
 
 #include "cml/proc/diag_ids.h"
 #include "cml/util/log.h"
+#include "cml/util/path.h"
 
 namespace cml::core {
 
 namespace {
 
-char fold(char c) noexcept {
-    if (c == '/') {
-        return '\\';
-    }
-    if (c >= 'A' && c <= 'Z') {
-        return static_cast<char>(c - 'A' + 'a');
-    }
-    return c;
-}
-
-std::string_view strip_extended_prefix(std::string_view path) {
-    constexpr std::string_view kPrefix = "\\\\?\\";
-    if (path.size() > kPrefix.size() && path.substr(0, kPrefix.size()) == kPrefix) {
-        return path.substr(kPrefix.size());
-    }
-    return path;
-}
-
-bool has_separator(std::string_view path) {
-    return path.find_first_of("\\/") != std::string_view::npos;
-}
-
-std::string_view base_name(std::string_view path) {
-    const std::size_t pos = path.find_last_of("\\/");
-    return pos == std::string_view::npos ? path : path.substr(pos + 1);
-}
 
 ipc::Reply make_reply(std::uint64_t request_id, std::uint32_t status, std::string message) {
     ipc::Reply reply;
@@ -51,18 +26,14 @@ Session::Session(std::uint64_t agent_id, std::string broker_version)
     : agent_id_(agent_id), broker_version_(std::move(broker_version)) {}
 
 bool Session::same_path(std::string_view a, std::string_view b) {
-    a = strip_extended_prefix(a);
-    b = strip_extended_prefix(b);
-    return a.size() == b.size() &&
-           std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) { return fold(x) == fold(y); });
+    return path::same_path(a, b);
 }
 
 const ipc::ModuleEntry* Session::find_module(std::string_view path) const {
     // A bare file name ("Game.dll") matches a module by name; anything with a directory must be
     // the same full path.
-    const bool by_name = !has_separator(path);
     for (const ipc::ModuleEntry& module : modules_) {
-        if (by_name ? same_path(base_name(module.path), path) : same_path(module.path, path)) {
+        if (path::matches_module(path, module.path)) {
             return &module;
         }
     }

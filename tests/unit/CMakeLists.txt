@@ -14,7 +14,7 @@ function(cml_add_unit_test name)
 endfunction()
 
 cml_add_unit_test(util
-    SOURCES util/test_diag.cpp util/test_result.cpp util/test_log.cpp util/test_hash.cpp
+    SOURCES util/test_diag.cpp util/test_result.cpp util/test_log.cpp util/test_hash.cpp util/test_path.cpp
     LIBS cml_util)
 if(NOT MSVC)
     find_package(Threads REQUIRED)
@@ -45,7 +45,7 @@ if(NOT MSVC)
     target_link_libraries(cml_test_broker_core PRIVATE Threads::Threads)
 endif()
 if(WIN32)
-    target_sources(cml_test_agent PRIVATE agent/test_heap.cpp agent/test_agent.cpp)
+    target_sources(cml_test_agent PRIVATE agent/test_heap.cpp agent/test_agent_log.cpp agent/test_agent.cpp)
     target_link_libraries(cml_test_agent PRIVATE cml_core)
     target_include_directories(cml_test_agent PRIVATE "${PROJECT_SOURCE_DIR}/agent/include")
     add_dependencies(cml_test_agent cml_agent cml_test_dummy_module cml_test_fake_agent_abi)

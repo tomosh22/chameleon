@@ -244,9 +244,36 @@ TEST_CASE("malformed input on the wire is diagnosed") {
         REQUIRE(accepted->status == IoStatus::Ok);
         const unsigned char header[8] = {0x00, 0x00, 0x00, 0x00, 0x7E, 0x7E, 0x01, 0x00};
         write_raw(raw, header, sizeof(header));
+        // The frame is whole, only its type is unknown: it is rejected, not fatal ...
         Result<PipeConnection::Received> received = accepted->connection.receive(kWaitMs);
-        REQUIRE_FALSE(received.has_value());
-        CHECK(received.error().code == ids::kMessageTypeUnsupported);
+        REQUIRE(received.has_value());
+        CHECK(received->status == IoStatus::Rejected);
+        CHECK(received->error.code == ids::kMessageTypeUnsupported);
+        // ... and the stream is still in sync: the next, valid frame is read normally.
+        ipc::Reply reply;
+        reply.request_id = 42;
+        Result<std::vector<std::uint8_t>> frame = ipc::encode_frame(reply);
+        REQUIRE(frame.has_value());
+        write_raw(raw, frame->data(), static_cast<DWORD>(frame->size()));
+        const ipc::Message next = receive_ok(accepted->connection);
+        REQUIRE(std::holds_alternative<ipc::Reply>(next));
+        CHECK(std::get<ipc::Reply>(next).request_id == 42);
+        CloseHandle(raw);
+    }
+    SUBCASE("a Log with invalid UTF-8 is rejected without breaking the stream") {
+        HANDLE raw = open_raw(name);
+        REQUIRE(raw != INVALID_HANDLE_VALUE);
+        Result<PipeServer::Accepted> accepted = server->accept(kWaitMs);
+        REQUIRE(accepted.has_value());
+        REQUIRE(accepted->status == IoStatus::Ok);
+        // level 3, text length 2, bytes FF FE (not UTF-8)
+        const unsigned char bad_log[] = {0x0A, 0x00, 0x00, 0x00, 0x60, 0x00, 0x01, 0x00,
+                                         0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0xFF, 0xFE};
+        write_raw(raw, bad_log, sizeof(bad_log));
+        Result<PipeConnection::Received> received = accepted->connection.receive(kWaitMs);
+        REQUIRE(received.has_value());
+        CHECK(received->status == IoStatus::Rejected);
+        CHECK(received->error.code == ids::kPayloadMalformed);
         CloseHandle(raw);
     }
     SUBCASE("a frame cut off by a disconnect is Closed, not a crash") {

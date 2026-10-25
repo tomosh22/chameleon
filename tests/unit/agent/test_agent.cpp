@@ -5,13 +5,18 @@
 // for a fixed time to "let things happen".
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <memory>
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
+
+#include "broker_launch.h"
 
 #include "Chameleon_API.h"
 #include "cml/core/connection_server.h"
@@ -284,6 +289,10 @@ TEST_CASE("a restarted broker is found again") {
         TestBroker first(pipe);
         REQUIRE_MESSAGE(first.ready(), first.error());
         REQUIRE_MESSAGE(wait_until([&] { return agent.IsConnected(); }, 20000), "no connection to the first broker");
+        const cml::Request first_enable = agent.EnableModule(cml::GetCurrentModulePath());
+        REQUIRE(first_enable.status == CML_STATUS_OK);
+        REQUIRE(agent.WaitForRequest(first_enable, 15000, &reply) == CML_STATUS_OK);
+        REQUIRE(reply.status == 0);
     }
     // The first broker is gone; the agent notices and fails nothing it did not send.
     REQUIRE(wait_until([&] { return !agent.IsConnected(); }, 20000));
@@ -294,7 +303,158 @@ TEST_CASE("a restarted broker is found again") {
     REQUIRE(enable.status == CML_STATUS_OK);
     REQUIRE(agent.WaitForRequest(enable, 15000, &reply) == CML_STATUS_OK);
     CHECK(reply.status == 0);
+    CHECK(reply.message.find("already enabled") != std::string::npos);  // re-enabled on reconnect
+    // The module the application had enabled is enabled in the new session too, so disabling it
+    // works (it would be CML5213 if the agent had forgotten it).
+    const cml::Request disable = agent.DisableModule(cml::GetCurrentModulePath());
+    REQUIRE(disable.status == CML_STATUS_OK);
+    REQUIRE(agent.WaitForRequest(disable, 15000, &reply) == CML_STATUS_OK);
+    CHECK(reply.status == 0);
     cml::DestroyAgent(agent);
+}
+
+TEST_CASE("hundreds of requests queued before the connection are all answered") {
+    const std::string pipe = unique_pipe_name("flood");
+    ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));
+    ScopedEnv broker_env(L"CML_BROKER_PATH", exe_directory() + L"\\no_such_broker.exe");
+    cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str());
+    REQUIRE(agent.IsValid());
+
+    constexpr int kRequests = 400;  // far more than the pipe buffers could hold of replies unread
+    const std::wstring self = cml::GetCurrentModulePath();
+    std::vector<cml::Request> requests;
+    for (int i = 0; i < kRequests; ++i) {
+        requests.push_back(i % 2 == 0 ? agent.EnableModule(self) : agent.DisableModule(self));
+        REQUIRE(requests.back().status == CML_STATUS_OK);
+    }
+    TestBroker broker(pipe);
+    REQUIRE_MESSAGE(broker.ready(), broker.error());
+    REQUIRE_MESSAGE(wait_until([&] { return agent.IsConnected(); }, 20000), "the agent never connected");
+    int failed = 0;
+    for (const cml::Request& request : requests) {
+        cml::Reply reply;
+        REQUIRE(agent.WaitForRequest(request, 30000, &reply) == CML_STATUS_OK);
+        failed += reply.status == 0 ? 0 : 1;
+    }
+    CHECK(failed == 0);  // enable, disable, enable, ...: every one is valid in sequence
+    cml::DestroyAgent(agent);
+}
+
+TEST_CASE("a failing create can be retried any number of times without growth") {
+    // CML5208: the pipe name is not in the pipe namespace, so the agent cannot even start.
+    ScopedEnv pipe_env(L"CML_PIPE_NAME", L"not_a_pipe_name");
+    using LiveBlocksFn = uint64_t (*)(void);
+    DWORD handles_after_first = 0;
+    uint64_t blocks_after_first = 0;
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        cml_status status = CML_STATUS_OK;
+        cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str(), &status);
+        CHECK_FALSE(agent.IsValid());
+        CHECK(status == 5208);
+        // The DLL is deliberately still loaded after a failed create (see cml_create_agent()).
+        const LiveBlocksFn live = agent_export<LiveBlocksFn>("cml_agent_testing_live_heap_blocks");
+        DWORD handles = 0;
+        REQUIRE(GetProcessHandleCount(GetCurrentProcess(), &handles));
+        if (attempt == 0) {
+            handles_after_first = handles;
+            blocks_after_first = live();
+        } else {
+            CHECK(handles <= handles_after_first);
+            CHECK(live() == blocks_after_first);
+        }
+    }
+}
+
+TEST_CASE("an auto-started broker runs from its own directory and does not live forever") {
+    const std::wstring broker = L"C:\\tools\\chameleon\\cml_broker.exe";
+    const std::wstring plain = cml::agent::broker_command_line(broker, "\\\\.\\pipe\\x", "");
+    CHECK(plain.find(L"\"C:\\tools\\chameleon\\cml_broker.exe\" --headless --pipe") == 0);
+    CHECK(plain.find(L"--exit-when-idle 300000") != std::wstring::npos);
+    CHECK(plain.find(L"--startup-timeout 60000") != std::wstring::npos);
+
+    // A caller's own limits win; nothing is added twice.
+    const std::wstring custom = cml::agent::broker_command_line(
+        broker, "\\\\.\\pipe\\x", "--exit-when-idle 2000 --startup-timeout 9000 --log \"a b.log\"");
+    CHECK(custom.find(L"--exit-when-idle 2000") != std::wstring::npos);
+    CHECK(custom.find(L"--exit-when-idle", custom.find(L"--exit-when-idle") + 1) == std::wstring::npos);
+    CHECK(custom.find(L"300000") == std::wstring::npos);
+    CHECK(custom.find(L"--startup-timeout", custom.find(L"--startup-timeout") + 1) == std::wstring::npos);
+}
+
+namespace {
+
+// Names of the DLLs a PE file imports (normal and delay-load), lower-cased.
+std::vector<std::string> imported_dlls(const std::wstring& path) {
+    std::vector<std::string> names;
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    REQUIRE(file != INVALID_HANDLE_VALUE);
+    std::vector<unsigned char> image(GetFileSize(file, nullptr));
+    DWORD read = 0;
+    REQUIRE(ReadFile(file, image.data(), static_cast<DWORD>(image.size()), &read, nullptr));
+    CloseHandle(file);
+
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image.data());
+    REQUIRE(dos->e_magic == IMAGE_DOS_SIGNATURE);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(image.data() + dos->e_lfanew);
+    REQUIRE(nt->Signature == IMAGE_NT_SIGNATURE);
+    REQUIRE(nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC);
+    const IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(nt);
+    const auto to_offset = [&](DWORD rva) -> std::size_t {
+        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+            const IMAGE_SECTION_HEADER& s = sections[i];
+            if (rva >= s.VirtualAddress && rva < s.VirtualAddress + std::max(s.Misc.VirtualSize, s.SizeOfRawData)) {
+                return s.PointerToRawData + (rva - s.VirtualAddress);
+            }
+        }
+        return 0;
+    };
+    const auto add_name = [&](DWORD name_rva) {
+        const std::size_t offset = to_offset(name_rva);
+        if (offset == 0) {
+            return;
+        }
+        std::string name(reinterpret_cast<const char*>(image.data() + offset));
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        names.push_back(name);
+    };
+
+    const IMAGE_DATA_DIRECTORY imports = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (imports.VirtualAddress != 0) {
+        const auto* descriptor = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(image.data() + to_offset(imports.VirtualAddress));
+        for (; descriptor->Name != 0; ++descriptor) {
+            add_name(descriptor->Name);
+        }
+    }
+    const IMAGE_DATA_DIRECTORY delayed = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+    if (delayed.VirtualAddress != 0) {
+        const auto* descriptor = reinterpret_cast<const IMAGE_DELAYLOAD_DESCRIPTOR*>(image.data() + to_offset(delayed.VirtualAddress));
+        for (; descriptor->DllNameRVA != 0; ++descriptor) {
+            add_name(descriptor->DllNameRVA);
+        }
+    }
+    return names;
+}
+
+}  // namespace
+
+TEST_CASE("cml_agent.dll imports only the system DLLs it strictly needs") {
+    // The agent is injected into arbitrary hosts: every extra import is a dependency of the host.
+    // Allowed: kernel32 (everything), advapi32 (tokens, SIDs, security descriptors), ntdll, and the
+    // api-ms-win-core-* API-set forwarders of kernel32 that the static runtime may use.
+    const std::vector<std::string> imports = imported_dlls(exe_directory() + L"\\cml_agent.dll");
+    std::string listing;
+    for (const std::string& name : imports) {
+        listing += name + " ";
+    }
+    INFO("cml_agent.dll imports: " << listing);
+    CHECK_FALSE(imports.empty());
+    for (const std::string& name : imports) {
+        const bool allowed = name == "kernel32.dll" || name == "advapi32.dll" || name == "ntdll.dll" ||
+                             name.rfind("api-ms-win-core-", 0) == 0;
+        CHECK_MESSAGE(allowed, "unexpected import: " << name);
+    }
+    CHECK(std::find(imports.begin(), imports.end(), "shell32.dll") == imports.end());
+    CHECK(std::find(imports.begin(), imports.end(), "user32.dll") == imports.end());
 }
 
 namespace {

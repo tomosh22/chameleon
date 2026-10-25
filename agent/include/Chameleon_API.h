@@ -242,8 +242,12 @@ CML_INLINE wchar_t* cml_join_agent_path(const wchar_t* dir, size_t dir_length) {
  * CML_STATUS_ABI_MISMATCH, CML_STATUS_AGENT_LOAD_FAILED or an agent diagnostic. Does not block on
  * the broker.
  *
- * The agent DLL stays loaded for the life of the process once it has been started successfully:
- * later versions install hooks that point into it, so it must never be unloaded. */
+ * Once the DLL's create function has been called the DLL is never unloaded again, whether or not
+ * creation succeeded: it has by then set up process-lifetime state (its private heap, its log
+ * sink and log file) that cannot be torn down safely, and later versions install hooks that
+ * point into it. A failed creation therefore leaves the DLL loaded; retrying reuses it and
+ * initialises nothing twice, so repeated failing calls do not grow memory or handles. A DLL
+ * that fails the ABI check never ran any of that and is unloaded again. */
 CML_INLINE cml_agent cml_create_agent(const wchar_t* agent_dir, uint32_t mode,
                                       cml_status* status_out) {
     cml_status status = CML_STATUS_OK;
@@ -254,6 +258,7 @@ CML_INLINE cml_agent cml_create_agent(const wchar_t* agent_dir, uint32_t mode,
     cml_agent_create_params params;
     cml_pfn_create create;
     void* impl = NULL;
+    int create_called = 0;
     int missing;
 
     if (mode != CML_MODE_IMMEDIATE && mode != CML_MODE_SYNCHRONIZED) {
@@ -335,6 +340,7 @@ CML_INLINE cml_agent cml_create_agent(const wchar_t* agent_dir, uint32_t mode,
     params.mode = mode;
     params.host_abi_version = CML_AGENT_ABI_VERSION;
     params.reserved = 0;
+    create_called = 1;
     status = create(&params, &impl);
     if (status != CML_STATUS_OK) {
         goto done;
@@ -350,8 +356,9 @@ done:
             HeapFree(GetProcessHeap(), 0, agent);
             agent = NULL;
         }
-        if (module != NULL) {
-            /* Nothing of the agent is running (create failed or was never called). */
+        if (module != NULL && !create_called) {
+            /* The agent code never ran (wrong ABI, missing export): safe to unload. After a
+             * create attempt the DLL stays loaded, see cml_create_agent(). */
             FreeLibrary(module);
         }
     }

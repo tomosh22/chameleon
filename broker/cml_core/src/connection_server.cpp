@@ -21,6 +21,8 @@ namespace {
 
 constexpr std::uint32_t kAcceptPollMs = 100;  // how often run() re-checks stop and idle timers
 constexpr std::uint32_t kSendTimeoutMs = 5000;
+constexpr int kMaxConsecutiveAcceptFailures = 50;
+constexpr DWORD kAcceptRetryPauseMs = 100;
 
 struct Connection {
     ipc::PipeConnection pipe;
@@ -66,6 +68,12 @@ void serve_connection(Connection& connection, std::uint64_t agent_id, Shared& sh
                 }
                 break;
             }
+            case ipc::IoStatus::Rejected:
+                // One bad message (invalid UTF-8, unsupported version or type) is logged and
+                // skipped; framing is intact, so the connection and the session carry on.
+                CML_LOG(Warn, "agent#%llu: dropped one message: %s", static_cast<unsigned long long>(agent_id),
+                        received->error.format().c_str());
+                break;
             case ipc::IoStatus::Timeout:
             case ipc::IoStatus::Woken:
                 break;
@@ -114,6 +122,7 @@ Result<ServerExit> ConnectionServer::run() {
     std::vector<std::unique_ptr<Connection>> connections;
     std::uint64_t next_agent_id = 1;
     bool ever_connected = false;
+    int consecutive_accept_failures = 0;
     const ULONGLONG started = GetTickCount64();
     ServerExit exit_reason = ServerExit::Stopped;
     std::optional<Diag> failure;
@@ -121,10 +130,17 @@ Result<ServerExit> ConnectionServer::run() {
     while (!stop_requested_.load(std::memory_order_acquire)) {
         Result<ipc::PipeServer::Accepted> accepted = server.accept(kAcceptPollMs);
         if (!accepted) {
+            // One failed accept (resource shortage, a client that misbehaved) must not take the
+            // broker down; only a long unbroken run of failures means the pipe is really broken.
             CML_LOG(Error, "%s", accepted.error().format().c_str());
-            failure = accepted.error();
-            break;
+            if (++consecutive_accept_failures >= kMaxConsecutiveAcceptFailures) {
+                failure = accepted.error();
+                break;
+            }
+            Sleep(kAcceptRetryPauseMs);
+            continue;
         }
+        consecutive_accept_failures = 0;
         if (accepted->status == ipc::IoStatus::Ok) {
             const std::uint64_t agent_id = next_agent_id++;
             ever_connected = true;

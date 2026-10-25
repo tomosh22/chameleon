@@ -9,7 +9,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <string>
+#include <vector>
 
 #include "cml/proc/diag_ids.h"
 
@@ -121,9 +123,77 @@ TEST_CASE("get_env distinguishes unset, empty and long values") {
 TEST_CASE("command line access") {
     const std::string line = proc::current_command_line();
     CHECK(lower(line).find("cml_test_proc") != std::string::npos);
-    const std::vector<std::string> args = proc::command_line_arguments();
-    REQUIRE_FALSE(args.empty());
-    CHECK(lower(args[0]).find("cml_test_proc") != std::string::npos);
+}
+
+TEST_CASE("read_growing_string grows the buffer until the string fits") {
+    const std::wstring wanted(1000, L'p');
+    std::vector<unsigned long> capacities;
+    // Mimics GetModuleFileNameW: copies what fits and returns the capacity when it had to cut.
+    const auto fetch = [&](wchar_t* buffer, unsigned long capacity) -> std::size_t {
+        capacities.push_back(capacity);
+        const std::size_t n = std::min<std::size_t>(wanted.size(), capacity);
+        std::copy(wanted.begin(), wanted.begin() + static_cast<std::ptrdiff_t>(n), buffer);
+        return n == wanted.size() && n < capacity ? n : capacity;
+    };
+    CHECK(proc::read_growing_string(fetch) == wanted);
+    REQUIRE(capacities.size() >= 2);
+    CHECK(capacities.front() == 260);
+    CHECK(capacities.back() > 1000);
+
+    // Exactly capacity-1 characters fit; exactly `capacity` is reported as truncated.
+    const std::wstring edge(259, L'e');
+    const auto fetch_edge = [&](wchar_t* buffer, unsigned long capacity) -> std::size_t {
+        if (capacity > edge.size()) {
+            std::copy(edge.begin(), edge.end(), buffer);
+            return edge.size();
+        }
+        return capacity;
+    };
+    CHECK(proc::read_growing_string(fetch_edge) == edge);
+}
+
+TEST_CASE("read_growing_string gives up on failure and on absurd lengths") {
+    CHECK(proc::read_growing_string([](wchar_t*, unsigned long) -> std::size_t { return 0; }).empty());
+    CHECK(proc::read_growing_string([](wchar_t*, unsigned long capacity) -> std::size_t { return capacity; }).empty());
+}
+
+TEST_CASE("module paths longer than MAX_PATH are not truncated") {
+    // Copy a DLL to a deeply nested directory (> 260 characters in total) and load it.
+    wchar_t temp[MAX_PATH];
+    REQUIRE(GetTempPathW(MAX_PATH, temp) > 0);
+    std::wstring dir = L"\\\\?\\" + std::wstring(temp) + L"cml_ut_long_" + std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    std::vector<std::wstring> created = {dir};
+    for (int i = 0; i < 6; ++i) {
+        dir += L"\\" + std::wstring(45, static_cast<wchar_t>(L'a' + i));
+        CreateDirectoryW(dir.c_str(), nullptr);
+        created.push_back(dir);
+    }
+    wchar_t exe[MAX_PATH];
+    REQUIRE(GetModuleFileNameW(nullptr, exe, MAX_PATH) > 0);
+    const std::wstring exe_dir = std::wstring(exe).substr(0, std::wstring(exe).find_last_of(L'\\'));
+    const std::wstring source = exe_dir + L"\\cml_test_dummy_module.dll";
+    const std::wstring target = dir + L"\\cml_test_dummy_module.dll";
+    if (GetFileAttributesW(source.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        for (auto it = created.rbegin(); it != created.rend(); ++it) RemoveDirectoryW(it->c_str());
+        return;  // the dummy DLL is only built with the agent tests (unit.proc can run without it)
+    }
+    REQUIRE(CopyFileW(source.c_str(), target.c_str(), FALSE));
+    HMODULE module = LoadLibraryW(target.c_str());
+    if (module != nullptr) {
+        Result<std::vector<proc::ModuleInfo>> modules = proc::enumerate_modules();
+        REQUIRE(modules.has_value());
+        std::size_t longest = 0;
+        for (const proc::ModuleInfo& m : *modules) {
+            longest = std::max(longest, m.path.size());
+        }
+        CHECK(longest > 260);
+        FreeLibrary(module);
+    } else {
+        INFO("the long path could not be loaded on this system; skipping the check");
+    }
+    DeleteFileW(target.c_str());
+    for (auto it = created.rbegin(); it != created.rend(); ++it) RemoveDirectoryW(it->c_str());
 }
 
 #endif  // _WIN32

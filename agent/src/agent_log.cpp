@@ -15,12 +15,14 @@
 
 #include "cml/proc/proc.h"
 #include "cml/util/log.h"
+#include "cml/util/path.h"
 
 namespace cml::agent {
 
 namespace {
 
 constexpr std::size_t kMaxForwarded = 128;
+constexpr std::size_t kMaxForwardedTextBytes = 2000;
 
 struct State {
     std::mutex mutex;
@@ -33,16 +35,6 @@ struct State {
 State& state() {
     static State* const instance = new State();
     return *instance;
-}
-
-const char* base_name(const char* path) {
-    const char* base = path;
-    for (const char* p = path; *p != '\0'; ++p) {
-        if (*p == '/' || *p == '\\') {
-            base = p + 1;
-        }
-    }
-    return base;
 }
 
 std::optional<LogLevel> parse_level(const std::string& text) {
@@ -59,7 +51,7 @@ void sink(void*, LogLevel level, const char* file, int line, const char* message
     const int n = std::snprintf(buffer, sizeof(buffer), "[cml_agent pid=%lu tid=%lu] [%s] %s:%d: %s\n",
                                 static_cast<unsigned long>(GetCurrentProcessId()),
                                 static_cast<unsigned long>(GetCurrentThreadId()), to_string(level),
-                                base_name(file), line, message);
+                                std::string(path::base_name(std::string_view(file))).c_str(), line, message);
     if (n < 0) {
         return;
     }
@@ -75,13 +67,11 @@ void sink(void*, LogLevel level, const char* file, int line, const char* message
     if (level >= LogLevel::Warn && s.forwarders > 0) {
         ipc::Log entry;
         entry.level = static_cast<std::uint32_t>(level);
-        entry.text = std::string(base_name(file)) + ":" + std::to_string(line) + ": " + message;
-        if (entry.text.size() > 2000) {
-            entry.text.resize(2000);
-            while (!entry.text.empty() && !ipc::is_valid_utf8(entry.text)) {
-                entry.text.pop_back();  // do not leave half a UTF-8 sequence behind
-            }
-        }
+        // The C runtime cuts log lines at a fixed byte count, possibly inside a multi-byte
+        // character, and callers may log arbitrary bytes: always repair before it goes on the wire.
+        entry.text = ipc::sanitize_utf8(std::string(path::base_name(std::string_view(file))) + ":" +
+                                            std::to_string(line) + ": " + message,
+                                        kMaxForwardedTextBytes);
         if (s.queue.size() >= kMaxForwarded) {
             s.queue.pop_front();
         }

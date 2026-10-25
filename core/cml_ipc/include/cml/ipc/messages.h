@@ -183,4 +183,14 @@ std::string describe(const Message& message);
 // True when `text` is well-formed UTF-8 (no overlong forms, no surrogates, nothing above U+10FFFF).
 bool is_valid_utf8(std::string_view text) noexcept;
 
+// Largest n <= max_bytes such that cutting `text` after n bytes does not split a UTF-8 sequence
+// (assuming `text` is valid UTF-8 up to that point). Use it wherever a string is shortened.
+std::size_t utf8_cut_point(std::string_view text, std::size_t max_bytes) noexcept;
+
+// Returns a well-formed UTF-8 copy of `text` no longer than `max_bytes`: invalid bytes become
+// U+FFFD and the cut falls on a character boundary. Strings that go on the wire (Log text, ...)
+// pass through this when their origin is not known to be clean (e.g. a log line the C runtime cut
+// at a fixed byte count).
+std::string sanitize_utf8(std::string_view text, std::size_t max_bytes);
+
 }  // namespace cml::ipc

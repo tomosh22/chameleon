@@ -1,5 +1,6 @@
 #include "cml/ipc/messages.h"
 
+#include <algorithm>
 #include <cstring>
 #include <type_traits>
 
@@ -44,6 +45,11 @@ public:
             u32(0);
             return;
         }
+        if (!is_valid_utf8(s)) {
+            invalid_utf8_ = true;  // never put a frame on the wire that the peer would reject
+            u32(0);
+            return;
+        }
         u32(static_cast<std::uint32_t>(s.size()));
         out_.insert(out_.end(), s.begin(), s.end());
     }
@@ -53,10 +59,12 @@ public:
         str(e.path);
     }
     bool too_large() const noexcept { return too_large_; }
+    bool invalid_utf8() const noexcept { return invalid_utf8_; }
 
 private:
     std::vector<std::uint8_t>& out_;
     bool too_large_ = false;
+    bool invalid_utf8_ = false;
 };
 
 // --- bounds-checked little-endian reader --------------------------------------------------------
@@ -284,7 +292,7 @@ std::string clip(const std::string& s, std::size_t limit = 260) {
     if (s.size() <= limit) {
         return s;
     }
-    return s.substr(0, limit) + "...";
+    return s.substr(0, utf8_cut_point(s, limit)) + "...";
 }
 
 std::string quoted(const std::string& s) {
@@ -398,6 +406,46 @@ bool is_valid_utf8(std::string_view text) noexcept {
     return true;
 }
 
+std::size_t utf8_cut_point(std::string_view text, std::size_t max_bytes) noexcept {
+    if (max_bytes >= text.size()) {
+        return text.size();
+    }
+    std::size_t n = max_bytes;
+    // Back up over continuation bytes, then over the lead byte they belong to.
+    while (n > 0 && (static_cast<unsigned char>(text[n]) & 0xC0u) == 0x80u) {
+        --n;
+    }
+    return n;
+}
+
+std::string sanitize_utf8(std::string_view text, std::size_t max_bytes) {
+    std::string out;
+    out.reserve(std::min(text.size(), max_bytes));
+    const auto* p = reinterpret_cast<const unsigned char*>(text.data());
+    const std::size_t n = text.size();
+    std::size_t i = 0;
+    while (i < n) {
+        // Length of the well-formed sequence at i, or 0.
+        std::size_t len = 1;
+        if (p[i] >= 0x80) {
+            len = 0;
+            for (std::size_t candidate = 2; candidate <= 4 && i + candidate <= n; ++candidate) {
+                if (is_valid_utf8(text.substr(i, candidate))) {
+                    len = candidate;
+                    break;
+                }
+            }
+        }
+        const std::string_view piece = len == 0 ? std::string_view("\xEF\xBF\xBD") : text.substr(i, len);
+        if (out.size() + piece.size() > max_bytes) {
+            break;
+        }
+        out.append(piece);
+        i += len == 0 ? 1 : len;
+    }
+    return out;
+}
+
 Result<FrameHeader> parse_frame_header(const std::uint8_t* bytes, std::size_t size) {
     if (bytes == nullptr || size < kFrameHeaderSize) {
         return Diag::make(ids::kFrameHeaderInvalid,
@@ -426,6 +474,9 @@ Result<std::vector<std::uint8_t>> encode_frame(const Message& message) {
     std::visit([&writer](const auto& m) { encode(writer, m); }, message);
     const MessageType type = type_of(message);
     const std::size_t payload_size = frame.size() - kFrameHeaderSize;
+    if (writer.invalid_utf8()) {
+        return malformed(to_string(type), "a string field is not valid UTF-8 (refusing to send it)");
+    }
     if (writer.too_large() || payload_size > kMaxPayloadSize) {
         return Diag::make(ids::kMessageTooLarge,
                           std::string("cannot send ") + to_string(type) +

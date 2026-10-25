@@ -5,7 +5,7 @@
 #include <windows.h>
 
 #include <sddl.h>
-#include <shellapi.h>
+#include <psapi.h>
 #include <tlhelp32.h>
 
 #include <cstring>
@@ -55,6 +55,21 @@ std::string sid_to_string(PSID sid) {
     return utf8_from_wide(text, std::wcslen(text));
 }
 
+// Full path of a module, without the MAX_PATH limit of the toolhelp snapshot. Empty on failure.
+std::wstring full_module_path(HANDLE process, bool self, HMODULE module) {
+    if (self) {
+        return read_growing_string([module](wchar_t* buffer, unsigned long capacity) {
+            return static_cast<std::size_t>(GetModuleFileNameW(module, buffer, capacity));
+        });
+    }
+    if (process == nullptr) {
+        return {};
+    }
+    return read_growing_string([process, module](wchar_t* buffer, unsigned long capacity) {
+        return static_cast<std::size_t>(K32GetModuleFileNameExW(process, module, buffer, capacity));
+    });
+}
+
 Diag sid_diag(const char* what, DWORD error) {
     return Diag::make(ids::kSidQueryFailed,
                       std::string("cannot query ") + what + " (" + win_error_text(error) + ")",
@@ -87,6 +102,10 @@ Result<std::vector<ModuleInfo>> enumerate_modules(std::uint32_t pid) {
                           "Check that the process still exists and that you may inspect it.");
     }
 
+    const bool self = target == GetCurrentProcessId();
+    // Another process's module names need a process handle; if it cannot be had we keep the
+    // (possibly truncated) toolhelp name.
+    UniqueHandle process(self ? nullptr : OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, target));
     std::vector<ModuleInfo> modules;
     MODULEENTRY32W entry;
     std::memset(&entry, 0, sizeof(entry));
@@ -96,7 +115,10 @@ Result<std::vector<ModuleInfo>> enumerate_modules(std::uint32_t pid) {
         ModuleInfo info;
         info.base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(entry.modBaseAddr));
         info.size = entry.modBaseSize;
-        info.path = utf8_from_wide(entry.szExePath, std::wcslen(entry.szExePath));
+        // szExePath is cut at MAX_PATH; ask the OS for the full name of the module instead.
+        std::wstring full = full_module_path(process.get(), self, entry.hModule);
+        info.path = full.empty() ? utf8_from_wide(entry.szExePath, std::wcslen(entry.szExePath))
+                                 : utf8_from_wide(full);
         modules.push_back(std::move(info));
     }
     return modules;
@@ -239,20 +261,6 @@ std::wstring wide_from_utf8(std::string_view text) {
     std::wstring out(static_cast<std::size_t>(n), L'\0');
     MultiByteToWideChar(CP_UTF8, 0, text.data(), in_len, out.data(), n);
     return out;
-}
-
-std::vector<std::string> command_line_arguments() {
-    std::vector<std::string> args;
-    int argc = 0;
-    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    if (argv == nullptr) {
-        return args;
-    }
-    std::unique_ptr<void, LocalFreeDeleter> guard(argv);
-    for (int i = 0; i < argc; ++i) {
-        args.push_back(utf8_from_wide(argv[i], std::wcslen(argv[i])));
-    }
-    return args;
 }
 
 }  // namespace cml::proc

@@ -11,6 +11,7 @@
 #include <string>
 #include <thread>
 #include <variant>
+#include <vector>
 
 #include "cml/ipc/pipe.h"
 #include "cml/proc/diag_ids.h"
@@ -283,6 +284,96 @@ TEST_CASE("a pipe that is already served makes run() fail with CML5207") {
     REQUIRE(second.join());
     CHECK_FALSE(second.ok());
     CHECK(second.error().find("CML5207") != std::string::npos);
+}
+
+namespace {
+
+HANDLE open_raw_client(const std::string& name) {
+    const std::wstring wide(name.begin(), name.end());
+    return CreateFileW(wide.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+}
+
+void raw_write(HANDLE handle, const std::vector<std::uint8_t>& bytes) {
+    DWORD written = 0;
+    REQUIRE(WriteFile(handle, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr));
+    REQUIRE(written == bytes.size());
+}
+
+void raw_send(HANDLE handle, const ipc::Message& message) {
+    Result<std::vector<std::uint8_t>> frame = ipc::encode_frame(message);
+    REQUIRE(frame.has_value());
+    raw_write(handle, *frame);
+}
+
+ipc::Message raw_receive(HANDLE handle) {
+    std::vector<std::uint8_t> header(ipc::kFrameHeaderSize);
+    DWORD read = 0;
+    REQUIRE(ReadFile(handle, header.data(), static_cast<DWORD>(header.size()), &read, nullptr));
+    REQUIRE(read == header.size());
+    Result<ipc::FrameHeader> parsed = ipc::parse_frame_header(header.data(), header.size());
+    REQUIRE(parsed.has_value());
+    std::vector<std::uint8_t> payload(parsed->payload_size);
+    DWORD got = 0;
+    while (got < payload.size()) {
+        DWORD n = 0;
+        REQUIRE(ReadFile(handle, payload.data() + got, static_cast<DWORD>(payload.size() - got), &n, nullptr));
+        got += n;
+    }
+    Result<ipc::Message> message = ipc::decode_message(parsed->type, parsed->version, payload.data(), payload.size());
+    REQUIRE(message.has_value());
+    return *message;
+}
+
+}  // namespace
+
+TEST_CASE("one malformed Log does not cost the agent its connection") {
+    QuietLogs quiet;
+    ServerOptions options;
+    options.pipe_name = unique_pipe_name("badlog");
+    RunningServer server(options);
+    REQUIRE(ipc::pipe_exists(options.pipe_name));
+
+    HANDLE raw = open_raw_client(options.pipe_name);
+    REQUIRE(raw != INVALID_HANDLE_VALUE);
+    raw_send(raw, hello(1));
+    REQUIRE(std::holds_alternative<ipc::Welcome>(raw_receive(raw)));
+
+    // A Log whose text is not UTF-8 (level 3, two bytes FF FE), framed correctly.
+    const std::vector<std::uint8_t> bad_log = {0x0A, 0x00, 0x00, 0x00, 0x60, 0x00, 0x01, 0x00,
+                                               0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0xFF, 0xFE};
+    raw_write(raw, bad_log);
+
+    // The session is still alive and still has its state.
+    ipc::ModuleList list;
+    list.request_id = 2;
+    list.modules.push_back({0x1000, 0x1000, "C:\\app\\demo.exe"});
+    raw_send(raw, list);
+    const ipc::Message answer = raw_receive(raw);
+    REQUIRE(std::holds_alternative<ipc::Reply>(answer));
+    CHECK(std::get<ipc::Reply>(answer).request_id == 2);
+    CHECK(std::get<ipc::Reply>(answer).status == 0);
+    CloseHandle(raw);
+}
+
+TEST_CASE("a client that connects and immediately leaves does not stop the broker") {
+    QuietLogs quiet;
+    ServerOptions options;
+    options.pipe_name = unique_pipe_name("ghost");
+    RunningServer server(options);
+    REQUIRE(ipc::pipe_exists(options.pipe_name));
+
+    for (int i = 0; i < 5; ++i) {
+        HANDLE ghost = open_raw_client(options.pipe_name);
+        if (ghost != INVALID_HANDLE_VALUE) {
+            CloseHandle(ghost);  // gone before (or just after) the broker accepted it
+        }
+    }
+    CHECK_FALSE(server.finished());
+
+    PipeConnection agent = connect(options.pipe_name);
+    const ipc::Message welcome = exchange(agent, hello(1));
+    CHECK(std::holds_alternative<ipc::Welcome>(welcome));
+    CHECK_FALSE(server.finished());
 }
 
 #endif  // _WIN32

@@ -374,3 +374,49 @@ TEST_CASE("UTF-8 validation") {
     CHECK_FALSE(is_valid_utf8("\x80"));              // lone continuation
     CHECK_FALSE(is_valid_utf8("\xFF"));
 }
+
+TEST_CASE("utf8_cut_point never splits a multi-byte character") {
+    const std::string text = "ab\xE2\x82\xAC" "cd";  // a, b, euro sign (3 bytes), c, d
+    CHECK(ipc::utf8_cut_point(text, 100) == text.size());
+    CHECK(ipc::utf8_cut_point(text, 2) == 2);
+    CHECK(ipc::utf8_cut_point(text, 3) == 2);  // would cut after the first byte of the euro sign
+    CHECK(ipc::utf8_cut_point(text, 4) == 2);
+    CHECK(ipc::utf8_cut_point(text, 5) == 5);
+    CHECK(ipc::utf8_cut_point("", 0) == 0);
+}
+
+TEST_CASE("sanitize_utf8 repairs invalid input and cuts on a boundary") {
+    CHECK(ipc::sanitize_utf8("plain", 100) == "plain");
+    CHECK(ipc::sanitize_utf8("caf\xC3\xA9", 100) == "caf\xC3\xA9");
+    // A lone lead byte and a stray byte become U+FFFD.
+    const std::string repaired = ipc::sanitize_utf8("a\xE2z\xFFz", 100);
+    CHECK(repaired == "a\xEF\xBF\xBD" "z\xEF\xBF\xBD" "z");
+    CHECK(ipc::is_valid_utf8(repaired));
+    // Cutting never leaves half a character, and the result always fits.
+    const std::string euros = "\xE2\x82\xAC\xE2\x82\xAC\xE2\x82\xAC";
+    for (std::size_t limit = 0; limit <= 10; ++limit) {
+        const std::string cut = ipc::sanitize_utf8(euros, limit);
+        CHECK(cut.size() <= limit);
+        CHECK(ipc::is_valid_utf8(cut));
+    }
+    CHECK(ipc::sanitize_utf8(euros, 7).size() == 6);
+}
+
+TEST_CASE("a log line cut at 1023 bytes inside a multi-byte character becomes a valid Log") {
+    // What cml::log_write produces for a long message: 1022 ASCII bytes then the first byte of a
+    // 3-byte character (the C runtime cuts by bytes).
+    std::string cut(1022, 'x');
+    cut += '\xE2';
+    REQUIRE_FALSE(ipc::is_valid_utf8(cut));
+    ipc::Log log;
+    log.level = 3;
+    log.text = cut;
+    // The encoder refuses to put invalid text on the wire...
+    Result<std::vector<std::uint8_t>> refused = encode_frame(log);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().code == ids::kPayloadMalformed);
+    // ... and the sanitised text goes through.
+    log.text = ipc::sanitize_utf8(cut, 2000);
+    CHECK(encode_frame(log).has_value());
+    CHECK(log.text.size() == 1022 + 3);  // the dangling lead byte became U+FFFD
+}

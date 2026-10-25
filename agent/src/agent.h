@@ -102,6 +102,15 @@ private:
 
     // Any thread ------------------------------------------------------------------------------
     cml_status enqueue(std::uint64_t id, ipc::Message message);
+    template <class Build>
+    cml_status submit_path_request(const wchar_t* path, std::uint64_t* request_id, Build build);
+    struct EnabledModule {
+        std::string path;  // as the application spelled it
+        std::uint32_t options;
+    };
+    static bool same_module(const std::string& a, const std::string& b);
+    void track_enabled_locked(const Entry& entry, std::uint32_t status);
+    void queue_reenables();
     void erase_done_locked(std::uint64_t id);
 
     const std::uint32_t mode_;
@@ -128,6 +137,7 @@ private:
     std::map<std::uint64_t, Entry> entries_;
     std::deque<std::uint64_t> outgoing_;    // ids in State::Queued, in send order
     std::deque<std::uint64_t> done_order_;  // ids in State::Done, oldest first (bounded)
+    std::vector<EnabledModule> enabled_;    // modules the broker accepted and that were not disabled
 
     std::mutex connection_mutex_;  // guards active_connection_
     ipc::PipeConnection* active_connection_ = nullptr;

@@ -7,6 +7,7 @@
 
 #if defined(_WIN32)
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -44,6 +45,30 @@ Result<bool> process_runs_as_current_user(std::uint32_t pid);
 
 std::uint32_t current_process_id() noexcept;
 
+// Reads a Win32 path-like string through `fetch(wchar_t* buffer, DWORD capacity) -> DWORD`
+// (GetModuleFileNameW and friends): starts small, and while the call reports truncation (returns
+// `capacity`) quadruples the buffer up to 32768 characters. Returns an empty string when the call
+// fails (returns 0) or the string does not fit even then.
+template <class Fetch>
+std::wstring read_growing_string(Fetch fetch, std::size_t initial_capacity = 260) {
+    constexpr std::size_t kLimit = 32768;
+    std::wstring buffer(initial_capacity, L'\0');
+    for (;;) {
+        const std::size_t n = fetch(buffer.data(), static_cast<unsigned long>(buffer.size()));
+        if (n == 0) {
+            return {};
+        }
+        if (n < buffer.size()) {
+            buffer.resize(n);
+            return buffer;
+        }
+        if (buffer.size() >= kLimit) {
+            return {};
+        }
+        buffer.assign(std::min(buffer.size() * 4, kLimit), L'\0');
+    }
+}
+
 // Full command line of the calling process, UTF-8.
 std::string current_command_line();
 
@@ -55,9 +80,6 @@ std::optional<std::string> get_env(std::string_view name);
 std::string utf8_from_wide(const wchar_t* text, std::size_t length);
 std::string utf8_from_wide(std::wstring_view text);
 std::wstring wide_from_utf8(std::string_view text);
-
-// Command-line arguments of the calling process as UTF-8 (argv[0] included).
-std::vector<std::string> command_line_arguments();
 
 }  // namespace cml::proc
 

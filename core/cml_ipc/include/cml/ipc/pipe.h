@@ -36,6 +36,8 @@ enum class IoStatus {
     Woken,      // receive(): the caller's wake event was signalled
     Closed,     // the peer closed the pipe (or the connection was closed locally)
     Cancelled,  // cancel() was called
+    Rejected,   // receive(): a whole frame arrived but its payload was invalid or unsupported
+                // (CML5201..5203); framing is intact, so the connection stays usable
 };
 
 inline constexpr std::uint32_t kInfiniteTimeout = 0xFFFFFFFFu;
@@ -59,11 +61,14 @@ public:
     struct Received {
         IoStatus status = IoStatus::Closed;
         Message message;  // valid only when status == Ok
+        Diag error;       // valid only when status == Rejected
     };
 
     // Waits for one complete frame. `wake_event` (a Win32 event HANDLE, may be null) makes the call
     // return Woken as soon as it is signalled, so one thread can wait for both pipe traffic and
-    // its own work queue. A malformed frame returns a Diag and the connection should be closed.
+    // its own work queue. A frame whose header is broken (bad length) returns a Diag and the
+    // connection must be closed; a frame with a well-formed header but an invalid payload is
+    // consumed and reported as IoStatus::Rejected so the caller can log it and carry on.
     Result<Received> receive(std::uint32_t timeout_ms, void* wake_event = nullptr);
 
     void cancel() noexcept;

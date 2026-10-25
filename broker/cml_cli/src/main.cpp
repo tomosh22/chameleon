@@ -14,10 +14,12 @@
 
 #include "cml/core/version.h"
 #include "cml/util/log.h"
+#include "cml/util/path.h"
 
 #if defined(_WIN32)
 #include <windows.h>
 
+#include <shellapi.h>
 #include <share.h>
 
 #include <chrono>
@@ -118,7 +120,16 @@ std::vector<std::string> collect_args(int argc, char** argv) {
     // The narrow argv uses the ANSI code page; paths in --log must survive, so use UTF-16.
     (void)argc;
     (void)argv;
-    return cml::proc::command_line_arguments();
+    std::vector<std::string> args;
+    int wide_argc = 0;
+    LPWSTR* wide_argv = CommandLineToArgvW(GetCommandLineW(), &wide_argc);
+    if (wide_argv != nullptr) {
+        for (int i = 0; i < wide_argc; ++i) {
+            args.push_back(cml::proc::utf8_from_wide(wide_argv[i], std::wcslen(wide_argv[i])));
+        }
+        LocalFree(wide_argv);
+    }
+    return args;
 #else
     return std::vector<std::string>(argv, argv + argc);
 #endif
@@ -133,20 +144,12 @@ struct LogOutput {
 };
 LogOutput g_log_output;
 
-const char* base_name(const char* path) {
-    const char* base = path;
-    for (const char* p = path; *p != '\0'; ++p) {
-        if (*p == '/' || *p == '\\') base = p + 1;
-    }
-    return base;
-}
-
 void write_log_line(void* user, cml::LogLevel level, const char* file, int line, const char* message) {
     auto* out = static_cast<LogOutput*>(user);
     const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                              std::chrono::steady_clock::now() - out->start)
                              .count();
-    std::fprintf(out->file, "[%7lld ms] [%s] %s:%d: %s\n", ms, cml::to_string(level), base_name(file),
+    std::fprintf(out->file, "[%7lld ms] [%s] %s:%d: %s\n", ms, cml::to_string(level), std::string(cml::path::base_name(std::string_view(file))).c_str(),
                  line, message);
     std::fflush(out->file);
 }
