@@ -7,6 +7,7 @@
 #include <fstream>
 #include <utility>
 
+#include "cml/coff/section_symbols.h"
 #include "cml/util/log.h"
 
 namespace cml::coff {
@@ -521,22 +522,10 @@ Result<Object> Object::parse(ByteSpan b) {
     }
 
     // ---- derived indices ----
-    o.section_def_pos_.assign(static_cast<std::size_t>(h.section_count) + 1, kNoPos);
-    o.leader_pos_.assign(static_cast<std::size_t>(h.section_count) + 1, kNoPos);
+    SectionSymbolTracker tracker(h.section_count);
     for (std::uint32_t pos = 0; pos < o.symbols_.size(); ++pos) {
         const Symbol& s = o.symbols_[pos];
-        if (s.section_number > 0) {
-            const std::size_t sec = static_cast<std::size_t>(s.section_number);
-            const bool is_def = o.section_definition(s).has_value();
-            if (o.section_def_pos_[sec] == kNoPos) {
-                if (is_def) {
-                    o.section_def_pos_[sec] = pos;
-                }
-                // A symbol of this section that precedes its section-definition symbol is not the leader.
-            } else if (o.leader_pos_[sec] == kNoPos && !is_def) {
-                o.leader_pos_[sec] = pos;
-            }
-        }
+        tracker.add(pos, s.section_number, o.section_definition(s).has_value());
         auto it = o.by_name_.find(s.name);
         if (it == o.by_name_.end()) {
             o.by_name_.emplace(s.name, pos);
@@ -545,6 +534,8 @@ Result<Object> Object::parse(ByteSpan b) {
             it->second = pos;
         }
     }
+    o.section_def_pos_ = tracker.definitions();
+    o.leader_pos_ = tracker.leaders();
 
     CML_LOG(Trace, "coff: parsed %s object, machine 0x%04x, %u sections, %u symbol records",
             h.is_bigobj ? "bigobj" : "regular", static_cast<unsigned>(h.machine), static_cast<unsigned>(h.section_count),
@@ -592,8 +583,7 @@ const Symbol* Object::find_symbol(std::string_view name) const noexcept {
 }
 
 std::optional<SectionDefinitionAux> Object::section_definition(const Symbol& s) const noexcept {
-    if (s.storage_class != StorageClass::Static || s.section_number <= 0 || s.aux_count < 1 || s.value != 0 ||
-        s.is_function()) {
+    if (!is_section_definition_symbol(static_cast<std::uint8_t>(s.storage_class), s.section_number, s.aux_count, s.value, s.type)) {
         return std::nullopt;
     }
     const ByteSpan a = s.aux.subspan(0, header_.symbol_record_size);
