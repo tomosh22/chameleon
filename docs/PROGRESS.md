@@ -13,10 +13,10 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-05 | Toolchain command parsing and rewriting | 2 | done (post-merge fix #15: never kill mspdbsrv on cancel) | wp/05-toolchain | #13, #15 | — |
 | WP-06 | cml_coff writer: anchors and binding object | 2 | done | wp/06-coff-writer | #11 | — |
 | WP-13 | Test harness cmltest | 2 | done (partial scenario per ADR-0022 until WP-12) | wp/13-cmltest | #12 | — |
-| WP-07 | Bind planner | 3 | in progress | wp/07-bind-planner | — | — |
+| WP-07 | Bind planner | 3 | in review (high effort: 7 findings, silent mis-binding) | wp/07-bind-planner | #19 | — |
 | WP-08 | Address-space reservation and patch loading (agent) | 3 | done | wp/08-agent-loading | #18 | — |
 | WP-09 | Linker driver (Q2 settled: ADR-0027) | 3 | done | wp/09-linker-driver | #17 | — |
-| WP-10 | Hook installer (agent) | 3 | in review (high effort: 8 findings) | wp/10-hook-installer | #20 | — |
+| WP-10 | Hook installer (agent) | 3 | done | wp/10-hook-installer | #20 | — |
 | WP-12 | Broker core (orchestrator integration) | 4 | todo | — | — | wave 3 |
 
 ## Orchestrator integration work
@@ -43,3 +43,4 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | FU-09 | WP-11 fix (#16) | Test watchdog only fires inside a test case; hangs in static destructors or doctest teardown stay silent until ctest TIMEOUT | WP-13 owner / orchestrator |
 | FU-10 | WP-08 (#18) | Dedup `hex()` (3 copies) into cml_util; `restore_reservation` should reuse `proc::query_free_regions`; single rollback helper in `try_load_candidate` | WP-12 |
 | FU-11 | WP-09 (#17) | Linker output parsing: match only real linker diagnostics (not any ": warning: " line); dedup trim/upper/read_u32 with invoke_common and cml_pe | WP-18 |
+| FU-12 | WP-07 (#19) | Bind planner normalises compiland names repeatedly (O(G*N)); cache normalised names once per compiland | WP-12 |
