@@ -469,3 +469,24 @@ the in-place 64-bit addend.
 - **MSVC STL vs older clang:** STL 14.44+ rejects clang < 19 (STL1000) unless
   `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` is defined. This affects users on clang 17/18 with
   current MSVC.
+
+## ADR-0027 Patch linker mirrors the module's linker; lld-link is not the default (plan §13 Q2)
+
+**Date:** 2026-10-25 · **Status:** Accepted · **Source:** WP-09 CI measurements (PR #17)
+
+WP-09 timed the `basic` patch link with both linkers on the same objects in all 8 matrix cells (median of 5 links after a warm-up; full table in `docs/wp/WP-09.md`). link.exe was faster in every cell, by 4–16 ms. Every median was 26–46 ms, far inside the 300 ms budget.
+
+**Decision.** The patch is linked with the family that linked the module. The family is detected from the module PDB's `* Linker *` compiland, cross-checked with the PE. A user override exists. lld-link has no speed advantage that would justify the cost of mixing toolchains.
+
+**Related facts:**
+- `/IGNORE:4001,4254,4281` is not passed by default. Neither linker printed anything without it. It remains available.
+- link.exe warns LNK4210 (".CRT section exists") for patches with dynamic initialisers. The warning is surfaced as CML3357; the initialisers are run by the agent (WP-08, plan §4.10).
+- **lld-link 20.1.8 crash.** lld-link 20.1.8 crashes (0xC0000005) linking a single anchored clang-cl object with `/DEBUG:FULL /NODEFAULTLIB` and nothing else. This happens when nothing is bound, e.g. the `new_function` fixture.
+  - Workaround: the driver always links a binding object. If it has no content, it is a pad object holding `__cml_binding_pad`.
+  - Re-check when the minimum LLVM moves.
+- **Correction to WP-04's notes.** link.exe also writes an `S_ENVBLOCK` into the `* Linker *` compiland, so an env block alone identifies no linker family.
+- **Optimisation flags the driver refuses (CML3360).** These would break section locators (ADR-0024) or the `/FIXED` base:
+  - `/OPT:REF`, `/OPT:ICF[=n]`, `/OPT:SAFEICF`;
+  - `/PROFILE`, `/INCREMENTAL`, `/DYNAMICBASE`, `/FIXED:NO`, `/FORCE*`.
+
+  The driver also refuses `/DEBUG:NONE` and `/DEBUG:FASTLINK`, because the patch PDB must be full.
