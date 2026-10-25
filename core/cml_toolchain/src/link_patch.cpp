@@ -171,10 +171,8 @@ Result<LinkerDetection> decide_linker_family(const PeLinkerFacts& pe, const PdbL
         } else if (contains_ci(pdb->compile_version, "microsoft") || contains_ci(pdb->compile_version, "link")) {
             d.from_pdb = ToolFamily::Link;
             d.evidence.push_back("PDB: S_COMPILE3 version string names Microsoft/LINK -> link");
-        } else if (pdb->has_env_block) {
-            d.from_pdb = ToolFamily::LldLink;
-            d.evidence.push_back("PDB: S_ENVBLOCK in the linker module (only lld-link writes one, WP-04 evidence) -> lld-link");
         } else {
+            // Not a clue: both linkers write an S_ENVBLOCK into `* Linker *` (CI evidence, docs/wp/WP-09.md).
             d.evidence.push_back("PDB: the linker module does not identify the linker");
         }
         if (!d.version[0] && pdb->has_compile3) {

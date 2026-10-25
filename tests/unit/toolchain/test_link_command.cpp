@@ -416,13 +416,19 @@ TEST_CASE("linker family: PDB facts, in order of strength") {
     auto d = decide_linker_family(none, &llvm);
     REQUIRE(d);
     CHECK(d->family == ToolFamily::LldLink);
-    // 3. only an environment block (lld-link writes one, link.exe does not)
+    // 3. only an environment block says nothing: both linkers write one (CI evidence)
     PdbLinkerFacts env;
     env.linker_module_found = true;
     env.has_env_block = true;
     auto e = decide_linker_family(none, &env);
-    REQUIRE(e);
-    CHECK(e->family == ToolFamily::LldLink);
+    REQUIRE_FALSE(e);
+    CHECK(e.error().code == diag::kLinkerFamilyUnknown);
+    // ... but the environment block's exe key does: link.exe's is a short (8.3) path
+    PdbLinkerFacts short_path = env;
+    short_path.exe_path = "C:\\PROGRA~1\\MICROS~2\\2022\\ENTERP~1\\VC\\Tools\\MSVC\\1444~1.352\\bin\\Hostx64\\x64\\link.exe";
+    auto sp = decide_linker_family(none, &short_path);
+    REQUIRE(sp);
+    CHECK(sp->family == ToolFamily::Link);
     // a linker module that says nothing
     PdbLinkerFacts silent;
     silent.linker_module_found = true;

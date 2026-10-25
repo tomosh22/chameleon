@@ -56,7 +56,7 @@ struct PdbLinkerFacts {
     bool has_compile3 = false;
     std::string compile_version;                 // S_COMPILE3 version string
     std::array<unsigned, 4> backend_version{};   // S_COMPILE3 backend version
-    bool has_env_block = false;                  // S_ENVBLOCK in the linker module (lld-link writes one, link.exe does not)
+    bool has_env_block = false;                  // S_ENVBLOCK in the linker module (both linkers write one: not a clue by itself)
     std::string exe_path;                        // the "exe" key of that block, if any
     std::string command;                         // the "cmd" key, if any
 };
