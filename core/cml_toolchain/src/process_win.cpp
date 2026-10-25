@@ -108,10 +108,8 @@ bool is_pdb_server(HANDLE process) {
     return _wcsicmp(base, L"mspdbsrv.exe") == 0;
 }
 
-// Process ids currently inside `job` (empty when the query fails).
-std::vector<DWORD> job_process_ids(HANDLE job) {
-    constexpr DWORD kMax = 4096;
-    std::vector<char> buffer(sizeof(JOBOBJECT_BASIC_PROCESS_ID_LIST) + kMax * sizeof(ULONG_PTR));
+// Process ids currently inside `job` (empty when the query fails). `buffer` is allocated once by the caller.
+std::vector<DWORD> job_process_ids(HANDLE job, std::vector<char>& buffer) {
     auto* list = reinterpret_cast<JOBOBJECT_BASIC_PROCESS_ID_LIST*>(buffer.data());
     std::vector<DWORD> ids;
     if (QueryInformationJobObject(job, JobObjectBasicProcessIdList, list, static_cast<DWORD>(buffer.size()), nullptr)) {
@@ -129,9 +127,14 @@ std::vector<DWORD> job_process_ids(HANDLE job) {
 // is often a compiler that is being cancelled, and parent pids are also stale after pid reuse).
 //
 // The job has JOB_OBJECT_LIMIT_BREAKAWAY_OK (no silent breakaway, no KILL_ON_JOB_CLOSE), so the compiler's helper
-// processes (c1xx, link, ...) join the job. kill() enumerates the job (JobObjectBasicProcessIdList), skips mspdbsrv.exe
-// by image name, and terminates each of the others individually. TerminateJobObject is never used: it would also kill
-// the shared PDB server, which other concurrent /Zi compiles use. Closing the job handle leaves mspdbsrv.exe running.
+// processes (c1xx, link, ...) join the job. kill() first terminates the driver (so it cannot start a new stage while
+// helpers are being killed; helpers stay in the job after their parent dies), then makes up to 4 passes over the job
+// (JobObjectBasicProcessIdList): each listed process is opened, checked with IsProcessInJob (a pid that was reused by
+// an unrelated process is skipped), skipped when it is mspdbsrv.exe (image name), and terminated otherwise. Between
+// passes it waits up to 200 ms in total for the processes terminated in the previous pass, then queries again; it
+// stops when a pass terminates nothing. TerminateJobObject is never used: it would also kill the shared PDB server,
+// which other concurrent /Zi compiles use. Closing the job handle leaves mspdbsrv.exe running. Without a job
+// (assignment failed) only the driver is killed.
 struct Killable {
     std::mutex mutex;
     HANDLE job = nullptr;
@@ -150,31 +153,43 @@ struct Killable {
             return false;  // exited on its own just now: not a cancellation
         }
         killed = true;
+        if (process != nullptr) {
+            TerminateProcess(process, 1);  // the driver first: it must not spawn another stage
+        }
         if (job != nullptr) {
-            // A few passes: a dying helper may still have spawned a child between the query and the terminate.
+            constexpr DWORD kMaxIds = 4096;
+            std::vector<char> buffer(sizeof(JOBOBJECT_BASIC_PROCESS_ID_LIST) + kMaxIds * sizeof(ULONG_PTR));
+            const ULONGLONG deadline = GetTickCount64() + 200;  // shared wait budget for all passes
+            std::vector<HANDLE> terminated;
             for (int pass = 0; pass < 4; ++pass) {
-                bool any = false;
-                for (const DWORD id : job_process_ids(job)) {
+                for (const DWORD id : job_process_ids(job, buffer)) {
                     if (id == pid) {
-                        continue;  // the driver goes last
+                        continue;
                     }
                     HANDLE h = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, id);
                     if (h == nullptr) {
                         continue;
                     }
-                    if (!is_pdb_server(h) && WaitForSingleObject(h, 0) != WAIT_OBJECT_0) {
+                    BOOL in_job = FALSE;
+                    if (IsProcessInJob(h, job, &in_job) && in_job && !is_pdb_server(h) &&
+                        WaitForSingleObject(h, 0) != WAIT_OBJECT_0) {
                         TerminateProcess(h, 1);
-                        any = true;
+                        terminated.push_back(h);  // closed below
+                    } else {
+                        CloseHandle(h);
                     }
+                }
+                const bool any = !terminated.empty();
+                for (HANDLE h : terminated) {
+                    const ULONGLONG now = GetTickCount64();
+                    WaitForSingleObject(h, now < deadline ? static_cast<DWORD>(deadline - now) : 0);
                     CloseHandle(h);
                 }
+                terminated.clear();
                 if (!any) {
                     break;
                 }
             }
-        }
-        if (process != nullptr) {
-            TerminateProcess(process, 1);
         }
         return true;
     }

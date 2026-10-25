@@ -247,14 +247,19 @@ TEST_CASE("cancelling a /Zi compile does not break a concurrent /Zi compile (msp
         PROCESSENTRY32W e{};
         e.dwSize = sizeof(e);
         for (BOOL ok = Process32FirstW(snap, &e); ok; ok = Process32NextW(snap, &e)) {
-            if (_wcsicmp(e.szExeFile, L"mspdbsrv.exe") == 0) pids.push_back(e.th32ProcessID);
+            if (_wcsicmp(e.szExeFile, L"mspdbsrv.exe") != 0) continue;
+            // Only servers we can open with SYNCHRONIZE now: those are the ones whose liveness we can judge later.
+            if (HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, e.th32ProcessID)) {
+                CloseHandle(h);
+                pids.push_back(e.th32ProcessID);
+            }
         }
         CloseHandle(snap);
         return pids;
     };
     const auto alive = [](DWORD pid) {
         HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, pid);
-        if (h == nullptr) return false;
+        if (h == nullptr) return GetLastError() == ERROR_ACCESS_DENIED;  // exists but not ours to open: alive
         const bool running = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
         CloseHandle(h);
         return running;
@@ -267,6 +272,7 @@ TEST_CASE("cancelling a /Zi compile does not break a concurrent /Zi compile (msp
         std::thread a([&] {
             auto r = run_process(compile("a"), &token);
             REQUIRE(r);
+            CHECK(r->cancelled);
         });
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
         // B starts while A runs; both use the shared PDB server.
@@ -291,5 +297,6 @@ TEST_CASE("cancelling a /Zi compile does not break a concurrent /Zi compile (msp
         CHECK(std::filesystem::exists(dir / "b.obj"));
     }
     std::printf("CANCEL-ZI rounds_with_running_mspdbsrv=%d of 5\n", rounds_with_server);
+    REQUIRE_MESSAGE(rounds_with_server > 0, "no round saw a running mspdbsrv.exe: the test did not exercise the shared PDB server");
 }
 #endif
