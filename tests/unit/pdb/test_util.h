@@ -66,10 +66,12 @@ inline Spec standard_spec() {
     const std::uint32_t tool = s.ipi.string_id("C:\\llvm\\clang-cl.exe");
     const std::uint32_t src = s.ipi.string_id("main.cpp");
     const std::uint32_t pdb = s.ipi.string_id("");
-    const std::uint32_t part3 = s.ipi.string_id(" -O2");
+    // Long strings are stored as pieces: the substring list holds the leading pieces, the record's own
+    // text is the last one (verified against a cl 19.51 PDB with llvm-pdbutil; WP-05).
+    const std::uint32_t part1 = s.ipi.string_id("\"-cc1\"");
     const std::uint32_t part2 = s.ipi.string_id(" -c");
-    const std::uint32_t list = s.ipi.substr_list({part2, part3});
-    const std::uint32_t cmd = s.ipi.string_id("\"-cc1\"", list);
+    const std::uint32_t list = s.ipi.substr_list({part1, part2});
+    const std::uint32_t cmd = s.ipi.string_id(" -O2", list);
     const std::uint32_t build_info = s.ipi.buildinfo({cwd, tool, src, pdb, cmd});
 
     {
