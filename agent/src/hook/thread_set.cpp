@@ -76,7 +76,7 @@ bool ThreadSet::exited(HANDLE thread) const noexcept {
     return false;
 }
 
-bool ThreadSet::suspend_entry(std::size_t index) noexcept {
+bool ThreadSet::suspend_only(std::size_t index) noexcept {
     Entry& e = entries_[index];
     unsigned tries = 0;
     while (SuspendThread(e.handle) == static_cast<DWORD>(-1)) {
@@ -91,15 +91,21 @@ bool ThreadSet::suspend_entry(std::size_t index) noexcept {
         SwitchToThread();
     }
     e.suspended = true;
+    e.rip_valid = false;
+    return true;
+}
 
+bool ThreadSet::capture_context(std::size_t index) noexcept {
+    Entry& e = entries_[index];
     // GetThreadContext on a thread whose suspension is still in flight waits for it to stop, so the
     // RIP read here is the one the thread will resume from.
     CONTEXT context;
     context.ContextFlags = CONTEXT_CONTROL;
-    for (tries = 0; GetThreadContext(e.handle, &context) == 0;) {
+    for (unsigned tries = 0; GetThreadContext(e.handle, &context) == 0;) {
         failed_error_ = GetLastError();
         if (exited(e.handle)) {
             e.rip = 0;
+            e.rip_valid = true;
             return true;
         }
         if (++tries >= kSuspendRetries) {
@@ -108,6 +114,21 @@ bool ThreadSet::suspend_entry(std::size_t index) noexcept {
         SwitchToThread();
     }
     e.rip = context.Rip;
+    e.rip_valid = true;
+    return true;
+}
+
+bool ThreadSet::suspend_entry(std::size_t index) noexcept {
+    return suspend_only(index) && (!entries_[index].suspended || capture_context(index));
+}
+
+bool ThreadSet::capture_all() noexcept {
+    for (std::size_t i = 0; i < count_; ++i) {
+        if (entries_[i].suspended && !entries_[i].rip_valid && !capture_context(i)) {
+            failed_thread_id_ = entries_[i].id;
+            return false;
+        }
+    }
     return true;
 }
 
@@ -165,8 +186,9 @@ ThreadSet::Result ThreadSet::enumerate_pass(std::size_t* fresh) noexcept {
         entries_[index].id = id;
         entries_[index].rip = 0;
         entries_[index].suspended = false;
+        entries_[index].rip_valid = false;
         ++*fresh;
-        if (!suspend_entry(index)) {
+        if (!suspend_only(index)) {
             failed_thread_id_ = id;
             return Result::SuspendFailed;  // the handle stays in the set; resume_all() releases it
         }
@@ -194,6 +216,9 @@ ThreadSet::Result ThreadSet::suspend_all(ULONGLONG deadline_tick, unsigned max_p
         ++passes_;
         if (r != Result::Ok) {
             return r;
+        }
+        if (!capture_all()) {
+            return Result::SuspendFailed;
         }
         if (pass < fake_new_passes) {
             ++fresh;

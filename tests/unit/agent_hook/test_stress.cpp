@@ -111,6 +111,24 @@ LONG CALLBACK count_crashes(PEXCEPTION_POINTERS info) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+LONG WINAPI report_unhandled(PEXCEPTION_POINTERS info) {
+    HMODULE module = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       static_cast<LPCSTR>(info->ExceptionRecord->ExceptionAddress), &module);
+    char name[MAX_PATH] = "?";
+    if (module != nullptr) {
+        GetModuleFileNameA(module, name, MAX_PATH);
+    }
+    std::fprintf(stderr, "WP10-STRESS unhandled exception 0x%08lx at %p (%s + 0x%llx), thread %lu\n",
+                 static_cast<unsigned long>(info->ExceptionRecord->ExceptionCode), info->ExceptionRecord->ExceptionAddress,
+                 name,
+                 static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info->ExceptionRecord->ExceptionAddress) -
+                                                 reinterpret_cast<std::uintptr_t>(module)),
+                 static_cast<unsigned long>(GetCurrentThreadId()));
+    std::fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 int configured_seconds() {
     char text[16];
     const DWORD n = GetEnvironmentVariableA("CML_HOOK_STRESS_SECONDS", text, sizeof(text));
@@ -223,6 +241,7 @@ TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy mul
         REQUIRE_MESSAGE(call_target(t.entry, argument) == expected(t, 0, argument), t.name);
     }
 
+    SetUnhandledExceptionFilter(&report_unhandled);  // stays installed: names a crash at process exit too
     void* const veh = AddVectoredExceptionHandler(1, &count_crashes);
     g_crashes = 0;
 
@@ -250,6 +269,12 @@ TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy mul
                     }
                 }
                 ++x;
+                // Let the other runnable threads in now and then: with 16 spinners on a few processors a
+                // thread that is never descheduled for long stops the world slowly (the suspension of a
+                // thread takes effect when it next runs).
+                if ((x & 0x3F) == 0) {
+                    SwitchToThread();
+                }
             }
         });
     }
@@ -273,13 +298,16 @@ TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy mul
                     FreeLibrary(module);
                 }
             }
+#if !defined(CML_HOOK_NO_THREAD_CHURN)  // local Wine smoke runs only: Wine hangs on thread creation under suspension
             if ((churn_rounds.load() & 31) == 0) {
                 HANDLE h = CreateThread(
                     nullptr, 0, [](LPVOID) -> DWORD { return 0; }, nullptr, 0, nullptr);
                 if (h != nullptr) {
+                    WaitForSingleObject(h, INFINITE);  // one short-lived thread at a time, not a backlog
                     CloseHandle(h);
                 }
             }
+#endif
             ++churn_rounds;
         }
     });

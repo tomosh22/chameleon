@@ -18,6 +18,13 @@
 //     user-mode lock or allocates; this is established by how the Windows system DLLs implement them
 //     (they forward to the kernel), not by a test, and docs/wp/WP-10.md says so.
 //
+// Latency: SuspendThread only queues the suspension; the target stops when it next runs, and
+// GetThreadContext is what waits for that. With more runnable threads than processors, waiting for
+// each thread right after suspending it costs a scheduling delay per thread, one after the other.
+// So a pass first suspends every thread it finds (their delays overlap) and only then reads the
+// contexts. A thread whose suspension is queued can still run until its context has been read, so
+// "no new thread" is only concluded from a pass that follows a completed context read.
+//
 // Convergence: suspend_all() repeats the enumeration until a complete pass finds no thread it has
 // not already suspended. A thread that appears after the last pass can still start running; the
 // installer's write is built so that is survivable (see installer.h), and the bounded number of
@@ -46,8 +53,9 @@ public:
     struct Entry {
         HANDLE handle = nullptr;
         DWORD id = 0;
-        std::uint64_t rip = 0;  // valid when suspended
+        std::uint64_t rip = 0;  // valid when suspended and rip_valid
         bool suspended = false;
+        bool rip_valid = false;
     };
 
     ThreadSet() = default;
@@ -87,7 +95,10 @@ private:
 
     Result enumerate_pass(std::size_t* fresh) noexcept;
     bool known(DWORD id) const noexcept;
-    bool suspend_entry(std::size_t index) noexcept;
+    bool suspend_only(std::size_t index) noexcept;       // SuspendThread; the thread may still run a little
+    bool capture_context(std::size_t index) noexcept;    // GetThreadContext: returns once it has really stopped
+    bool suspend_entry(std::size_t index) noexcept;      // both, one thread
+    bool capture_all() noexcept;                         // contexts of every suspended thread that has none yet
     bool exited(HANDLE thread) const noexcept;
 
     Entry* entries_ = nullptr;
