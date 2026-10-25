@@ -4,6 +4,10 @@
 // the RIP-in-window retry path, thread convergence and the stopped-world discipline.
 #if defined(_WIN32)
 
+#include <windows.h>
+
+#include <tlhelp32.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -975,6 +979,27 @@ TEST_CASE("threads created continuously while hooks are installed and reverted")
     CHECK(slowest_ms < 10000);
     CHECK(installer.hook_count() == 0);
     CHECK(old_fn.as_int()(1) == 1);
+}
+
+TEST_CASE("no test thread is left behind by the tests above") {
+    // Threads that outlive their test could be running (or crashing) while the process exits. Only
+    // the main thread, the hang watchdog of doctest_main.cpp and (briefly) exiting threads may exist.
+    Sleep(200);
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    REQUIRE(snapshot != INVALID_HANDLE_VALUE);
+    THREADENTRY32 entry;
+    entry.dwSize = sizeof(entry);
+    int threads = 0;
+    std::string ids;
+    for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
+        if (entry.th32OwnerProcessID == GetCurrentProcessId()) {
+            ++threads;
+            ids += " " + std::to_string(entry.th32ThreadID);
+        }
+    }
+    CloseHandle(snapshot);
+    MESSAGE("threads in the process:" << ids);
+    CHECK(threads <= 3);
 }
 
 #endif  // _WIN32

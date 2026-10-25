@@ -9,11 +9,25 @@
 
 #include <dbghelp.h>
 
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 
 namespace hooktest {
+
+// Writes to the process's stderr handle directly (no C runtime stream).
+inline void crash_line(const char* format, ...) {
+    char buffer[512];
+    va_list args;
+    va_start(args, format);
+    const int n = std::vsnprintf(buffer, sizeof(buffer) - 1, format, args);
+    va_end(args);
+    if (n > 0) {
+        DWORD written = 0;
+        WriteFile(GetStdHandle(STD_ERROR_HANDLE), buffer, static_cast<DWORD>(n), &written, nullptr);
+    }
+}
 
 inline LONG WINAPI report_unhandled_exception(PEXCEPTION_POINTERS info) {
     using SymInitializeFn = BOOL(WINAPI*)(HANDLE, PCSTR, BOOL);
@@ -22,11 +36,11 @@ inline LONG WINAPI report_unhandled_exception(PEXCEPTION_POINTERS info) {
     using StackWalk64Fn = BOOL(WINAPI*)(DWORD, HANDLE, HANDLE, LPSTACKFRAME64, PVOID, PREAD_PROCESS_MEMORY_ROUTINE64,
                                         PFUNCTION_TABLE_ACCESS_ROUTINE64, PGET_MODULE_BASE_ROUTINE64,
                                         PTRANSLATE_ADDRESS_ROUTINE64);
-    std::fprintf(stderr, "WP10-CRASH exception 0x%08lx at %p, thread %lu\n",
+    crash_line("WP10-CRASH exception 0x%08lx at %p, thread %lu\n",
                  static_cast<unsigned long>(info->ExceptionRecord->ExceptionCode), info->ExceptionRecord->ExceptionAddress,
                  static_cast<unsigned long>(GetCurrentThreadId()));
     if (info->ExceptionRecord->NumberParameters >= 2 && info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
-        std::fprintf(stderr, "WP10-CRASH access violation: %s address %p\n",
+        crash_line("WP10-CRASH access violation: %s address %p\n",
                      info->ExceptionRecord->ExceptionInformation[0] == 0   ? "read of"
                      : info->ExceptionRecord->ExceptionInformation[0] == 1 ? "write to"
                                                                           : "execute of",
@@ -65,26 +79,22 @@ inline LONG WINAPI report_unhandled_exception(PEXCEPTION_POINTERS info) {
                 symbol->MaxNameLen = 255;
                 DWORD64 displacement = 0;
                 if (sym_from_addr(process, frame.AddrPC.Offset, &displacement, symbol)) {
-                    std::fprintf(stderr, "WP10-CRASH   #%d %s + 0x%llx\n", depth, symbol->Name,
+                    crash_line("WP10-CRASH   #%d %s + 0x%llx\n", depth, symbol->Name,
                                  static_cast<unsigned long long>(displacement));
                 } else {
-                    std::fprintf(stderr, "WP10-CRASH   #%d 0x%llx\n", depth,
+                    crash_line("WP10-CRASH   #%d 0x%llx\n", depth,
                                  static_cast<unsigned long long>(frame.AddrPC.Offset));
                 }
             }
         }
     }
-    std::fflush(stderr);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
 struct CrashReporterInstaller {
     CrashReporterInstaller() {
         SetUnhandledExceptionFilter(&report_unhandled_exception);
-        std::atexit([] {
-            std::fprintf(stderr, "WP10 process exit begins\n");
-            std::fflush(stderr);
-        });
+        std::atexit([] { crash_line("WP10 process exit begins\n"); });
     }
 };
 inline const CrashReporterInstaller g_crash_reporter_installer;
