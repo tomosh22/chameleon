@@ -1,0 +1,23 @@
+{
+  "fixture": "virtuals",
+  "edit": "square_doubled.edit (shapes.cpp)",
+  "min_hooks": 5,
+  "min_thunks": 1,
+  "expect": [
+    { "symbol": "Square::area", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol": "Rect::area", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol": "shapes_create", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol": "shapes_count", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol": "shape_at", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol": "Square::Square", "decision": "patch-hooked" },
+    { "symbol": "Rect::Rect", "decision": "patch-hooked" },
+    { "symbol": "(anonymous namespace)::g_shapes", "decision": "bind-old-data", "source": "compiland-static" },
+    { "symbol": "Square::`vftable'", "decision": "patch-fresh" },
+    { "symbol": "Rect::`vftable'", "decision": "patch-fresh" },
+    { "symbol": "operator new", "decision": "bind-old-function" }
+  ],
+  "absent": [
+    { "symbol": "Square::`vftable'", "decision": "bind-old-data" },
+    { "symbol": "(anonymous namespace)::g_shapes", "decision": "patch-new-data" }
+  ]
+}

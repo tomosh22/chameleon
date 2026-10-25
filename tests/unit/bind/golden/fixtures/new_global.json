@@ -1,0 +1,17 @@
+{
+  "fixture": "new_global",
+  "edit": "add_tracker.edit (logic.cpp)",
+  "min_hooks": 1,
+  "min_new_globals": 1,
+  "min_initialisers": 1,
+  "expect": [
+    { "symbol": "compute_value", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol": "(anonymous namespace)::g_tracker", "decision": "patch-new-data" },
+    { "symbol_contains": "dynamic initializer for '(anonymous namespace)::g_tracker'", "decision": "patch-fresh", "when": "cl" },
+    { "symbol_contains": "Tracker::Tracker", "decision": "patch-new-function" }
+  ],
+  "absent": [
+    { "symbol": "(anonymous namespace)::g_tracker", "decision": "bind-old-data" },
+    { "symbol_contains": "dynamic initializer for", "decision": "patch-hooked" }
+  ]
+}

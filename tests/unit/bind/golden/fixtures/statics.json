@@ -1,0 +1,25 @@
+{
+  "fixture": "statics",
+  "edit": "value_30.edit (statics.cpp)",
+  "min_hooks": 4,
+  "min_bind_old_data": 4,
+  "min_fixups": 4,
+  "expect": [
+    { "symbol": "statics_value", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol": "statics_calls", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol": "statics_total", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol": "make_base", "decision": "patch-hooked", "source": "compiland-static", "when": "cl" },
+    { "symbol": "Accum::total", "decision": "bind-old-data", "source": "pdb-public" },
+    { "symbol": "(anonymous namespace)::s_calls", "decision": "bind-old-data", "source": "compiland-static" },
+    { "symbol": "k_weights", "decision": "patch-fresh" },
+    { "symbol": "statics_value::g", "decision": "bind-old-data", "source": "compiland-static" },
+    { "symbol": "statics_value::$TSS0", "decision": "bind-old-data", "source": "compiland-static", "when": "cl" },
+    { "symbol": "statics_value::$TSS0", "decision": "bind-old-data", "source": "compiland-layout", "when": "clang" }
+  ],
+  "absent": [
+    { "symbol": "Accum::total", "decision": "patch-new-data" },
+    { "symbol": "(anonymous namespace)::s_calls", "decision": "patch-new-data" },
+    { "symbol": "statics_value::g", "decision": "patch-new-data" },
+    { "symbol": "statics_value::$TSS0", "decision": "patch-new-data" }
+  ]
+}

@@ -89,6 +89,7 @@ if(WIN32)
 endif()
 add_subdirectory(agent_hook)  # WP-10: unit.agent_hook, unit.agent_hook_stress
 cml_add_unit_test(broker_core SOURCES broker/test_core.cpp broker/test_session.cpp LIBS cml_core)
+add_subdirectory(bind)  # WP-07: unit.bind
 if(NOT MSVC)
     # Portable pieces are tested on non-Windows hosts too (CML_ALLOW_NON_WINDOWS).
     target_link_libraries(cml_test_agent PRIVATE Threads::Threads)

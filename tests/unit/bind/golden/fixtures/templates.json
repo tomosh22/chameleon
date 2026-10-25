@@ -1,0 +1,15 @@
+{
+  "fixture": "templates",
+  "edit": "offset_100.edit (a.cpp)",
+  "min_hooks": 4,
+  "expect": [
+    { "symbol": "templates_a", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol": "offset<int>", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol": "offset<double>", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol": "twice<int>", "decision": "patch-hooked", "source": "pdb-public" }
+  ],
+  "absent": [
+    { "symbol": "offset<int>", "decision": "patch-new-function" },
+    { "symbol": "twice<int>", "decision": "patch-new-function" }
+  ]
+}

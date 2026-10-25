@@ -253,6 +253,23 @@ jobs:
             Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
           if ($rc -ne 0) { exit $rc }
 
+      # WP-07: the bind planner on every M1 fixture (written by unit.bind_fixtures): one
+      # `BINDPLAN <fixture> hooks=N bind_old_data=N thunks=N new=N fixups=N` line per fixture, plus how each
+      # static of the edited TU was bridged to the old PDB (ADR-0010 evidence). The complete plans are
+      # build/test_work/bindplan/*.plan.json (uploaded with the logs). docs/wp/WP-07.md quotes these lines.
+      - name: WP-07 bind plan evidence (BINDPLAN per fixture)
+        if: always()
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          $d = "$env:BUILD_DIR/test_work/bindplan"
+          if (Test-Path "$d/summary.txt") {
+            Copy-Item "$d/summary.txt" "$env:LOG_DIR/wp07-summary.txt"
+            if (Test-Path "$d/evidence.txt") { Copy-Item "$d/evidence.txt" "$env:LOG_DIR/wp07-evidence.txt" }
+            Get-Content "$d/summary.txt"
+          } else {
+            Write-Host "no WP-07 evidence file (unit.bind_fixtures did not run)"
+          }
+
       - name: Upload cmltest results (JUnit, logs, dumps)
         if: always()
         uses: actions/upload-artifact@v4
@@ -313,6 +330,11 @@ jobs:
         run: |
           $e = "build-vs/test_work/coff_link/evidence.txt"
           if (Test-Path $e) { Get-Content $e } else { Write-Host "no WP-06 evidence file" }
+      - name: WP-07 bind plan evidence (BINDPLAN per fixture)
+        if: always()
+        run: |
+          $s = "build-vs/test_work/bindplan/summary.txt"
+          if (Test-Path $s) { Get-Content $s } else { Write-Host "no WP-07 evidence file" }
       - name: WP-09 link evidence (linker driver)
         if: always()
         run: |
