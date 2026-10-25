@@ -22,7 +22,33 @@ if(NOT MSVC)
 endif()
 cml_add_unit_test(coff SOURCES lib/test_coff.cpp LIBS cml_coff)
 cml_add_unit_test(pe SOURCES lib/test_pe.cpp LIBS cml_pe)
-cml_add_unit_test(pdb SOURCES lib/test_pdb.cpp LIBS cml_pdb)
+cml_add_unit_test(pdb
+    SOURCES
+        lib/test_pdb.cpp
+        pdb/test_path.cpp
+        pdb/test_synthetic.cpp
+        pdb/test_robust.cpp
+        pdb/test_pe_lookup.cpp
+        pdb/test_fixture.cpp
+    LIBS cml_pdb)
+# WP-04: pdb/test_fixture.cpp reads the PDB of fixture `basic` (built by this CI cell's compiler).
+# Local overrides (portable syntax-check builds have no fixture binaries): CML_TEST_FIXTURE_BASIC_PDB,
+# CML_TEST_FIXTURE_BASIC_EXE, CML_TEST_FIXTURE_BASIC_SRC.
+if(CML_TEST_FIXTURE_BASIC_PDB AND CML_TEST_FIXTURE_BASIC_EXE AND CML_TEST_FIXTURE_BASIC_SRC)
+    target_compile_definitions(cml_test_pdb PRIVATE
+        "CML_FIXTURE_BASIC_PDB=\"${CML_TEST_FIXTURE_BASIC_PDB}\""
+        "CML_FIXTURE_BASIC_EXE=\"${CML_TEST_FIXTURE_BASIC_EXE}\""
+        "CML_FIXTURE_BASIC_SRC=\"${CML_TEST_FIXTURE_BASIC_SRC}\"")
+elseif(MSVC AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../fixtures/basic/CMakeLists.txt")
+    target_compile_definitions(cml_test_pdb PRIVATE
+        "CML_FIXTURE_BASIC_PDB=\"$<TARGET_PDB_FILE:fixture_basic>\""
+        "CML_FIXTURE_BASIC_EXE=\"$<TARGET_FILE:fixture_basic>\""
+        "CML_FIXTURE_BASIC_SRC=\"${CMAKE_CURRENT_SOURCE_DIR}/../fixtures/basic\"")
+    add_dependencies(cml_test_pdb fixture_basic)
+endif()
+if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    target_compile_definitions(cml_test_pdb PRIVATE CML_TEST_COMPILER_IS_CL=1)  # cl.exe, not clang-cl
+endif()
 cml_add_unit_test(ipc SOURCES lib/test_ipc.cpp LIBS cml_ipc)
 cml_add_unit_test(proc SOURCES lib/test_proc.cpp LIBS cml_proc)
 cml_add_unit_test(toolchain SOURCES lib/test_toolchain.cpp LIBS cml_toolchain)
