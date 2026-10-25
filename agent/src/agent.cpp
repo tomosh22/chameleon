@@ -18,6 +18,7 @@
 #include "cml/proc/proc.h"
 #include "cml/util/log.h"
 #include "cml/util/path.h"
+#include "hook/installer.h"
 #include "loader/patch_loader.h"
 #include "module_diff.h"
 
@@ -892,12 +893,16 @@ void Agent::handle_message(const ipc::Message& message) {
         }
         return;
     }
+    if (const auto* install = std::get_if<ipc::InstallHooks>(&message)) {
+        handle_install_hooks(*install);
+        return;
+    }
     CML_LOG(Warn, "ignoring unexpected %s from the broker", ipc::to_string(ipc::type_of(message)));
 }
 
 void Agent::serve(ipc::PipeConnection& connection) {
     while (!stopping_.load(std::memory_order_acquire)) {
-        if (!flush_outgoing(connection) || !flush_logs(connection)) {
+        if (!flush_outgoing(connection) || !flush_replies(connection) || !flush_logs(connection)) {
             return;
         }
         if (GetTickCount64() - last_module_poll_ >= kModulePollMs && !poll_modules(connection)) {
@@ -938,6 +943,16 @@ void Agent::serve(ipc::PipeConnection& connection) {
                 // An answer we cannot decode would leave its request waiting for ever (and hold an
                 // in-flight slot): drop the connection, which fails everything in flight and
                 // reconnects. Anything else (a stray event) can be skipped.
+                if (received->raw_type == static_cast<std::uint16_t>(ipc::MessageType::InstallHooks) &&
+                    received->request_id.has_value()) {
+                    // The broker waits for an answer: tell it the request was unusable.
+                    ipc::HooksInstalled refusal;
+                    refusal.request_id = *received->request_id;
+                    refusal.status = received->error.code;
+                    refusal.message = ipc::sanitize_utf8(received->error.format(), 1000);
+                    queue_reply(std::move(refusal));
+                    break;
+                }
                 if (received->raw_type == static_cast<std::uint16_t>(ipc::MessageType::Reply) ||
                     received->raw_type == static_cast<std::uint16_t>(ipc::MessageType::Welcome)) {
                     CML_LOG(Warn, "an undecodable answer from the broker (%s); dropping the connection",

@@ -20,12 +20,20 @@ diagnostic is planned, not live.
 | CML1504 | C++/CLI (`/clr`) or C++/CX (`/ZW`) compilands | Compiland `<obj>` is built with /clr or /ZW; managed and WinRT code cannot be hot-reloaded. | Hot-reload only native compilands. | WP-05 | **live** |
 | CML2210 | `/GL` or LTO removed for the patch compile (warning) | `<obj>` was built with /GL (or -flto); the patch is compiled without it. | Disable /GL for iterated modules to avoid behaviour differences. | WP-05 | **live** |
 | CML3104 | Stale inlined copies (warning) | `<function>` changed but compiland `<obj>` is optimised; inlined copies elsewhere keep the old code. | Build iterated modules with /Ob0 or /Od. | WP-18 | planned |
-| CML4101 | Function too short to hook (<5 bytes, no padding) | `<function>` is shorter than 5 bytes and has no hot-patch padding; it cannot be hooked. | Build with /hotpatch and link with /FUNCTIONPADMIN. | WP-10 | planned |
+| CML4101 | Function too short to hook (<5 bytes, no padding) | `<function>` is shorter than 5 bytes and has no hot-patch padding; it cannot be hooked. | Build with /hotpatch and link with /FUNCTIONPADMIN. | WP-10 | superseded by CML4301 (live, see docs/wp/WP-10.md) |
+| CML4300 | Unknown instruction in the bytes a hook overwrites (VEX/EVEX prologue, ...) | The instruction at `<function>+N` (bytes ..) is not understood; the hook installer fails safe. | Report the bytes, or exclude the function. | WP-10 | **live** |
+| CML4301 | Function shorter than 5 bytes with no padding before or after | `<function>` is too short for the 5-byte jump and no `CC`/`90` padding can be used. | Link with /FUNCTIONPADMIN or give the function a longer body. | WP-10 | **live** |
+| CML4304 | A call ends inside the overwritten bytes | A call at `<function>+N` ends inside the hook's overwritten range. | Exclude the function or add padding before it. | WP-10 | **live** |
+| CML4305 | Thread stayed inside the function's first bytes for 50 stops | Thread N kept executing inside the first bytes of `<function>`. | Wait for the application to leave the function and reload again. | WP-10 | **live** |
 
 ## Documented behaviour (no diagnostic)
 
 - Functions currently executing on a thread's stack keep running old code until they return;
   the next call runs the new code.
+- Hook installation (WP-10) cannot see a thread whose real resume point is inside the bytes being
+  overwritten when its RIP is in ntdll's exception / APC / callback dispatcher at the moment it is
+  stopped (the interrupted RIP is in a context record on its stack, which is not examined). In
+  practice no compiler makes the first bytes of a function such a resume point.
 - x86 (32-bit), ARM64, Linux and macOS targets are out of scope for v1 (CML1106 for modules;
   CML1303 when the PE reader sees a PE32 image).
 - Modules loaded or unloaded by the host are noticed by the agent within about 500 ms
