@@ -592,7 +592,7 @@ TEST_CASE("creating and destroying agents leaves the private heap balanced") {
 
 namespace {
 
-// A broker that speaks the protocol by hand over a blocking pipe, records everything it receives
+// A broker that speaks the protocol by hand over an overlapped pipe, records everything it receives
 // (per connection) and can be told to misbehave: answer with a corrupt frame, or hang up.
 class ScriptedBroker {
 public:
@@ -603,31 +603,22 @@ public:
     // next pipe instance, i.e. in the gap where no instance of the pipe exists.
     ScriptedBroker(std::string pipe, Hook hook = nullptr, std::function<void()> before_listen = nullptr)
         : pipe_(std::move(pipe)), hook_(std::move(hook)), before_listen_(std::move(before_listen)) {
-        thread_ = std::thread([this] {
-            run();
-            exited_.store(true);
-        });
+        thread_ = std::thread([this] { run(); });
         ready_ = wait_until([this] { return cml::ipc::pipe_exists(pipe_); }, 10000);
     }
     ~ScriptedBroker() {
+        // Every wait of the listener thread (for a client, for data, for a write) includes
+        // stop_event_, so this ends it wherever it is, also in the gap between two pipe instances:
+        // the event stays set, and the thread sees it at its next wait or at the top of its loop.
         stopping_.store(true);
-        // The listener blocks in ConnectNamedPipe, which only a client can end. A throw-away client
-        // helps only if an instance exists at that moment: between two sessions the listener may
-        // not have created the next one yet (it may even have passed its stopping_ check already),
-        // and then a single poke finds nothing and the join below would wait for ever. So keep
-        // poking until the thread has really exited.
-        const ULONGLONG deadline = GetTickCount64() + 30000;
-        while (!exited_.load() && GetTickCount64() < deadline) {
-            poke();
-            SetEvent(hangup_event_);
-            Sleep(1);
-        }
+        SetEvent(stop_event_);
+        SetEvent(hangup_event_);
         thread_.join();
         CloseHandle(hangup_event_);
+        CloseHandle(stop_event_);
+        CloseHandle(io_event_);
     }
     bool ready() const { return ready_; }
-    // Throw-away client connections made by the destructor so far (tests only).
-    int pokes() const { return pokes_.load(); }
 
     // Closes the current connection (the agent will reconnect).
     void hang_up() { SetEvent(hangup_event_); }
@@ -650,64 +641,99 @@ public:
     }
 
 private:
-    // Reads exactly `size` bytes by polling (PeekNamedPipe), so the wait can be abandoned when the
-    // test hangs up or stops the broker. False on end of stream, error or abandonment.
+    bool stop_requested() const { return stopping_.load() || WaitForSingleObject(stop_event_, 0) == WAIT_OBJECT_0; }
+
+    // Waits for the overlapped operation `ov` (on io_event_) on `pipe`. True with the byte count when
+    // it completed successfully. Otherwise (error, end of stream, stop, and for reads also a hang-up
+    // request) the operation is cancelled and waited for, because the kernel owns `ov` and the buffer
+    // until then, and false is returned.
+    bool finish_io(HANDLE pipe, OVERLAPPED& ov, bool started, bool abandon_on_hangup, DWORD* transferred) {
+        if (!started && GetLastError() != ERROR_IO_PENDING) {
+            return false;  // the client closed its end, or another error
+        }
+        const HANDLE waits[3] = {io_event_, stop_event_, hangup_event_};
+        const DWORD w = WaitForMultipleObjects(abandon_on_hangup ? 3 : 2, waits, FALSE, INFINITE);
+        if (w == WAIT_OBJECT_0) {
+            return GetOverlappedResult(pipe, &ov, transferred, FALSE) != FALSE;
+        }
+        CancelIoEx(pipe, &ov);
+        DWORD ignored = 0;
+        GetOverlappedResult(pipe, &ov, &ignored, TRUE);
+        return false;
+    }
+    // Reads exactly `size` bytes. False on end of stream, error or abandonment (stop or hang-up).
     bool read_exactly(HANDLE pipe, void* buffer, DWORD size) {
         auto* bytes = static_cast<unsigned char*>(buffer);
         DWORD done = 0;
         while (done < size) {
-            DWORD available = 0;
-            if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) {
-                return false;  // the client closed its end
-            }
-            if (available == 0) {
-                if (stopping_.load() || WaitForSingleObject(hangup_event_, 0) == WAIT_OBJECT_0) {
-                    return false;
-                }
-                Sleep(1);
-                continue;
-            }
+            OVERLAPPED ov = {};
+            ov.hEvent = io_event_;
+            ResetEvent(io_event_);
             DWORD n = 0;
-            if (!ReadFile(pipe, bytes + done, std::min<DWORD>(available, size - done), &n, nullptr) || n == 0) {
+            const BOOL started = ReadFile(pipe, bytes + done, size - done, nullptr, &ov);
+            if (!finish_io(pipe, ov, started != FALSE, /*abandon_on_hangup=*/true, &n) || n == 0) {
                 return false;
             }
             done += n;
         }
         return true;
     }
-    static bool write_all(HANDLE pipe, const std::vector<std::uint8_t>& bytes) {
-        DWORD written = 0;
-        return WriteFile(pipe, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) && written == bytes.size();
+    bool write_all(HANDLE pipe, const std::vector<std::uint8_t>& bytes) {
+        DWORD done = 0;
+        const DWORD size = static_cast<DWORD>(bytes.size());
+        while (done < size) {
+            OVERLAPPED ov = {};
+            ov.hEvent = io_event_;
+            ResetEvent(io_event_);
+            DWORD n = 0;
+            const BOOL started = WriteFile(pipe, bytes.data() + done, size - done, nullptr, &ov);
+            if (!finish_io(pipe, ov, started != FALSE, /*abandon_on_hangup=*/false, &n) || n == 0) {
+                return false;
+            }
+            done += n;
+        }
+        return true;
     }
-    static bool send(HANDLE pipe, const cml::ipc::Message& message) {
+    bool send(HANDLE pipe, const cml::ipc::Message& message) {
         cml::Result<std::vector<std::uint8_t>> frame = cml::ipc::encode_frame(message);
         return frame.has_value() && write_all(pipe, *frame);
     }
 
-    void poke() {
-        const std::wstring wide = widen(pipe_);
-        HANDLE client = CreateFileW(wide.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-        if (client != INVALID_HANDLE_VALUE) {
-            CloseHandle(client);
-        }
-        pokes_.fetch_add(1);
-    }
-
+    // One pipe instance at a time, with an overlapped ConnectNamedPipe that a stop ends at once
+    // (the same pattern as PipeServer::accept in core/cml_ipc/src/pipe.cpp).
     void run() {
         const std::wstring wide = widen(pipe_);
-        while (!stopping_.load()) {
+        while (!stop_requested()) {
             if (before_listen_) {
                 before_listen_();
             }
-            HANDLE pipe = CreateNamedPipeW(wide.c_str(), PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                                           PIPE_UNLIMITED_INSTANCES, 65536, 65536, 0, nullptr);
+            HANDLE pipe = CreateNamedPipeW(wide.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                                           PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, PIPE_UNLIMITED_INSTANCES,
+                                           65536, 65536, 0, nullptr);
             if (pipe == INVALID_HANDLE_VALUE) {
                 return;
             }
-            if (ConnectNamedPipe(pipe, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED) {
-                if (!stopping_.load()) {
-                    serve(pipe);
+            OVERLAPPED ov = {};
+            ov.hEvent = io_event_;
+            ResetEvent(io_event_);
+            bool connected = ConnectNamedPipe(pipe, &ov) != FALSE;
+            if (!connected) {
+                const DWORD error = GetLastError();
+                if (error == ERROR_PIPE_CONNECTED) {
+                    connected = true;  // the client was faster than this call
+                } else if (error == ERROR_IO_PENDING) {
+                    const HANDLE waits[2] = {io_event_, stop_event_};
+                    DWORD transferred = 0;
+                    if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0) {
+                        connected = GetOverlappedResult(pipe, &ov, &transferred, FALSE) != FALSE;
+                    } else {
+                        CancelIoEx(pipe, &ov);  // stop requested; the kernel owns `ov` until this returns
+                        connected = GetOverlappedResult(pipe, &ov, &transferred, TRUE) != FALSE;
+                    }
                 }
+            }
+            if (connected && !stop_requested()) {
+                serve(pipe);
             }
             CloseHandle(pipe);
         }
@@ -799,9 +825,9 @@ private:
     std::thread thread_;
     std::function<void()> before_listen_;
     std::atomic<bool> stopping_{false};
-    std::atomic<bool> exited_{false};
-    std::atomic<int> pokes_{0};
     bool ready_ = false;
+    HANDLE stop_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);    // manual-reset: set by the destructor
+    HANDLE io_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);      // completion of the listener's current I/O
     HANDLE hangup_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);  // manual-reset: reset per session
     mutable std::mutex mutex_;
     std::vector<std::vector<cml::ipc::Message>> sessions_;
@@ -1296,43 +1322,71 @@ TEST_CASE("a module list the broker keeps refusing is resent with a growing paus
     cml::DestroyAgent(agent);
 }
 
+namespace {
+
+class UniqueEvent {
+public:
+    UniqueEvent() : handle_(CreateEventW(nullptr, TRUE, FALSE, nullptr)) {}
+    ~UniqueEvent() { CloseHandle(handle_); }
+    UniqueEvent(const UniqueEvent&) = delete;
+    UniqueEvent& operator=(const UniqueEvent&) = delete;
+    HANDLE get() const { return handle_; }
+
+private:
+    HANDLE handle_;
+};
+
+}  // namespace
+
 TEST_CASE("a scripted broker destroyed between two sessions still stops") {
     // The listener thread of ScriptedBroker has a gap, after a session ended and before the next
-    // pipe instance exists, in which a destructor that pokes once finds no instance to connect to.
-    // The listener then creates one, blocks in ConnectNamedPipe and the join never returns. Park
-    // the listener in that gap, start the destructor, let it poke into the void, then release.
+    // pipe instance exists. A shutdown request that arrives in it must not be lost (the old
+    // destructor poked once with a throw-away client, found no instance, and then joined a thread
+    // that went on to block in ConnectNamedPipe for ever). Park the listener in the gap, start the
+    // destructor, give it time to do its part, then let the listener go on.
     const std::string pipe = unique_pipe_name("brokerstop");
-    HANDLE in_gap = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    HANDLE release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    REQUIRE(in_gap != nullptr);
-    REQUIRE(release != nullptr);
+    UniqueEvent in_gap;
+    UniqueEvent release;
+    REQUIRE(in_gap.get() != nullptr);
+    REQUIRE(release.get() != nullptr);
     std::atomic<int> passes{0};
     auto broker = std::make_unique<ScriptedBroker>(pipe, nullptr, [&] {
         if (passes.fetch_add(1) == 1) {  // the second pass: the first session is over
-            SetEvent(in_gap);
-            WaitForSingleObject(release, 20000);
+            SetEvent(in_gap.get());
+            WaitForSingleObject(release.get(), 20000);
         }
     });
-    ScriptedBroker* const raw = broker.get();
-    REQUIRE(raw->ready());
+    std::atomic<bool> destroyed{false};
+    std::thread destroyer;
+    // Declared after `broker` and `destroyer`, so it runs first on every exit path, a failed REQUIRE
+    // included: the listener is never left parked, and the destroyer thread is always joined.
+    struct Cleanup {
+        HANDLE release;
+        std::thread& destroyer;
+        ~Cleanup() {
+            SetEvent(release);
+            if (destroyer.joinable()) {
+                destroyer.join();
+            }
+        }
+    } cleanup{release.get(), destroyer};
+    REQUIRE(broker->ready());
 
     const std::wstring wide = widen(pipe);
     HANDLE client = CreateFileW(wide.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
     REQUIRE(client != INVALID_HANDLE_VALUE);
     CloseHandle(client);  // a session that ends at once
-    REQUIRE(WaitForSingleObject(in_gap, 10000) == WAIT_OBJECT_0);
+    REQUIRE(WaitForSingleObject(in_gap.get(), 10000) == WAIT_OBJECT_0);
 
-    std::atomic<bool> destroyed{false};
-    std::thread destroyer([&] {
+    destroyer = std::thread([&] {
         broker.reset();
         destroyed.store(true);
     });
-    // The destructor has poked once and found no pipe: the interleaving is in place.
-    const bool poked = wait_until([&] { return raw->pokes() >= 1; }, 10000);
-    SetEvent(release);
+    Sleep(200);  // the destructor has asked the listener to stop; it is parked and cannot hear it yet
+    SetEvent(release.get());
     const bool stopped = wait_until([&] { return destroyed.load(); }, 10000);
     if (!stopped) {
-        // A broker that cannot stop: free it by hand so that the failure is reported, not a hang.
+        // A broker that cannot stop on its own: free it by hand so that the failure is reported, not a hang.
         wait_until(
             [&] {
                 HANDLE rescue = CreateFileW(wide.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -1343,9 +1397,5 @@ TEST_CASE("a scripted broker destroyed between two sessions still stops") {
             },
             10000);
     }
-    destroyer.join();
-    CloseHandle(in_gap);
-    CloseHandle(release);
-    CHECK(poked);
     CHECK_MESSAGE(stopped, "the scripted broker's destructor did not finish on its own");
 }

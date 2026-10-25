@@ -3,6 +3,19 @@
 
 set(CML_UNIT_MAIN "${CMAKE_CURRENT_SOURCE_DIR}/doctest_main.cpp")
 
+# The hang watchdog of doctest_main.cpp is off unless CML_TEST_CASE_TIMEOUT_S is set. Every unit
+# test gets it set to its ctest TIMEOUT minus 30 s (ctest's default timeout is 1500 s), so that the
+# watchdog speaks, with a minidump, before ctest kills the process silently. TIMEOUT is usually set
+# after cml_add_unit_test() returns, so this runs at the end of the calling directory.
+function(_cml_unit_test_watchdog test)
+    get_test_property(${test} TIMEOUT _timeout)
+    if(NOT _timeout OR _timeout STREQUAL "NOTFOUND")
+        set(_timeout 1500)
+    endif()
+    math(EXPR _budget "${_timeout} - 30")
+    set_property(TEST ${test} APPEND PROPERTY ENVIRONMENT "CML_TEST_CASE_TIMEOUT_S=${_budget}")
+endfunction()
+
 function(cml_add_unit_test name)
     cmake_parse_arguments(T "" "" "SOURCES;LIBS" ${ARGN})
     add_executable(cml_test_${name} ${CML_UNIT_MAIN} ${T_SOURCES})
@@ -11,6 +24,8 @@ function(cml_add_unit_test name)
     cml_target_exceptions_allowed(cml_test_${name})
     set_target_properties(cml_test_${name} PROPERTIES FOLDER "tests")
     add_test(NAME unit.${name} COMMAND cml_test_${name})
+    # (EVAL: the arguments of a deferred call are otherwise evaluated when it runs, not now.)
+    cmake_language(EVAL CODE "cmake_language(DEFER DIRECTORY [[${CMAKE_CURRENT_SOURCE_DIR}]] CALL _cml_unit_test_watchdog [[unit.${name}]])")
 endfunction()
 
 cml_add_unit_test(util
