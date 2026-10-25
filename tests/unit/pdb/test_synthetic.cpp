@@ -812,6 +812,47 @@ TEST_CASE("cache and lazy loading are thread-safe") {
     }
 }
 
+TEST_CASE("cache: concurrent opens of one PDB always share a single index") {
+    // Regression: sweep() could erase a slot another thread had been handed but not yet locked,
+    // so a third thread built a second index for the same key. Repeat to widen the window.
+    TempDir dir;
+    const std::string path = dir.file("c.pdb");
+    write_file(path, build(standard_spec()));
+    constexpr int kThreads = 8;
+    int mismatched_rounds = 0;
+    for (int round = 0; round < 200; ++round) {
+        PdbIndex::cache_clear();
+        std::vector<std::shared_ptr<const PdbIndex>> got(kThreads);
+        std::atomic<bool> go{false};
+        std::vector<std::thread> threads;
+        for (int t = 0; t < kThreads; ++t) {
+            threads.emplace_back([&, t]() {
+                while (!go.load()) {
+                    std::this_thread::yield();
+                }
+                auto r = PdbIndex::open_pdb(path);
+                if (r) {
+                    got[static_cast<std::size_t>(t)] = *r;
+                }
+            });
+        }
+        go = true;
+        for (auto& th : threads) {
+            th.join();
+        }
+        for (int t = 0; t < kThreads; ++t) {
+            REQUIRE(got[static_cast<std::size_t>(t)] != nullptr);
+        }
+        for (int t = 1; t < kThreads; ++t) {
+            if (got[static_cast<std::size_t>(t)].get() != got[0].get()) {
+                ++mismatched_rounds;
+                break;
+            }
+        }
+    }
+    CHECK(mismatched_rounds == 0);
+}
+
 TEST_CASE("memory accounting: tracked and mapped bytes return to the baseline") {
     TempDir dir;
     const std::string path = dir.file("m.pdb");
