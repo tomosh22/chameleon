@@ -175,6 +175,16 @@ jobs:
           ctest --test-dir $env:BUILD_DIR -C ${{ matrix.config }} -R '^unit\.toolchain$' -V *>&1 | Tee-Object -FilePath "$env:LOG_DIR/unit-toolchain-verbose.txt"
           exit 0
 
+      # WP-08: the stress line (WP08-STRESS), the concurrent-thief line (WP08-RACE) and the failure
+      # injection results of unit.agent_loader; docs/wp/WP-08.md quotes these lines. The test already
+      # ran in the Test step above; this reruns it verbosely to keep its output.
+      - name: WP-08 unit.agent_loader verbose output (stress and race evidence)
+        if: always()
+        run: |
+          ctest --test-dir $env:BUILD_DIR -C ${{ matrix.config }} -R '^unit\.agent_loader$' -V *>&1 | Tee-Object -FilePath "$env:LOG_DIR/unit-agent-loader-verbose.txt"
+          Select-String -Path "$env:LOG_DIR/unit-agent-loader-verbose.txt" -Pattern 'WP08-' | ForEach-Object { $_.Line }
+          exit 0
+
       # WP-03 (M1 gate): end-to-end spike. Starts fixture_basic, replaces compute_value() by a
       # recompiled version loaded from a /FIXED patch DLL, asserts value=1 -> value=2, then
       # checks the patched function with a non-invasive cdb.exe session. Fails the job on any
