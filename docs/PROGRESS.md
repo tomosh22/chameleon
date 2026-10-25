@@ -24,3 +24,16 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | Shared fixture `basic` + `cml_add_fixture`; flaky log test fix | done | #3 |
 | M1 fixtures statics/virtuals/templates/lambdas/new_function/new_global | done | #14 |
 | Make `extras.cpp` opaque so constructs survive clang-cl /O2 (WP-02 note) | done | #8 |
+
+## Tracked follow-ups (minor review items deferred per ADR-0018)
+
+| Id | Origin | Item | Owner |
+|---|---|---|---|
+| FU-01 | WP-11 | `stop()` status codes: distinguish "not running" from "timed out" | WP-12 |
+| FU-02 | WP-11 | Idle trimming of completed (`Done`) answers in the agent's answer table | WP-12 |
+| FU-03 | WP-11 | Console `CTRL_CLOSE_EVENT` handler in the broker | WP-12 |
+| FU-04 | WP-05 | `""` quoting parity with the MSVC argv rules in the response-file writer | WP-18 |
+| FU-05 | WP-04 | Replace the private RSDS reader in `core/cml_pdb/src/detail/pe_codeview.cpp` with cml_pe | WP-12 |
+| FU-06 | WP-11 | `DestroyAgent` waits with `Sleep(1)`; use an event | WP-12 |
+| FU-07 | WP-05 fix (#15) | No-job fallback (AssignProcessToJobObject failed) kills only the driver on cancel/timeout | WP-18 |
+| FU-08 | WP-05 fix (#15) | `is_pdb_server` treats an image-name query failure (e.g. >520-char path) as mspdbsrv; use a growing buffer | WP-18 |
