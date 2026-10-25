@@ -14,7 +14,7 @@ function(cml_add_unit_test name)
 endfunction()
 
 cml_add_unit_test(util
-    SOURCES util/test_diag.cpp util/test_result.cpp util/test_log.cpp util/test_hash.cpp
+    SOURCES util/test_diag.cpp util/test_result.cpp util/test_log.cpp util/test_hash.cpp util/test_path.cpp
     LIBS cml_util)
 if(NOT MSVC)
     find_package(Threads REQUIRED)
@@ -51,10 +51,63 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
 endif()
 cml_add_unit_test(ipc SOURCES lib/test_ipc.cpp LIBS cml_ipc)
 cml_add_unit_test(proc SOURCES lib/test_proc.cpp LIBS cml_proc)
+if(WIN32)
+    # WP-11: named-pipe transport tests (real pipes, in-process client and server threads).
+    target_sources(cml_test_ipc PRIVATE lib/test_ipc_pipe.cpp)
+    set_tests_properties(unit.ipc unit.proc PROPERTIES TIMEOUT 120)
+endif()
 cml_add_unit_test(toolchain SOURCES lib/test_toolchain.cpp LIBS cml_toolchain)
 cml_add_unit_test(watch SOURCES lib/test_watch.cpp LIBS cml_watch)
-cml_add_unit_test(agent SOURCES agent/test_agent.cpp LIBS cml_agent)
-cml_add_unit_test(broker_core SOURCES broker/test_core.cpp LIBS cml_core)
+# WP-11: agent pieces (SyncPoint queue, module diff, heap) link the agent core library directly; the
+# end-to-end tests load cml_agent.dll through Chameleon_API.h like an application would and talk to
+# an in-process broker (cml_core's ConnectionServer).
+cml_add_unit_test(agent
+    SOURCES agent/test_sync_queue.cpp agent/test_module_diff.cpp
+    LIBS cml_agent_core)
+cml_add_unit_test(broker_core SOURCES broker/test_core.cpp broker/test_session.cpp LIBS cml_core)
+if(NOT MSVC)
+    # Portable pieces are tested on non-Windows hosts too (CML_ALLOW_NON_WINDOWS).
+    target_link_libraries(cml_test_agent PRIVATE Threads::Threads)
+    target_link_libraries(cml_test_broker_core PRIVATE Threads::Threads)
+endif()
+if(WIN32)
+    target_sources(cml_test_agent PRIVATE agent/test_heap.cpp agent/test_agent_log.cpp agent/test_agent_table.cpp agent/test_agent.cpp)
+    target_link_libraries(cml_test_agent PRIVATE cml_core)
+    target_include_directories(cml_test_agent PRIVATE "${PROJECT_SOURCE_DIR}/agent/include")
+    add_dependencies(cml_test_agent cml_agent cml_broker cml_test_dummy_module cml_test_fake_agent_abi cml_test_fake_broker)
+    target_compile_definitions(cml_test_agent PRIVATE "CML_TEST_FAKE_BROKER_EXE=\"$<TARGET_FILE:cml_test_fake_broker>\"")
+    # The real broker, for the test that lets the agent auto-start one (and kills it).
+    target_compile_definitions(cml_test_agent PRIVATE "CML_TEST_BROKER_EXE=\"$<TARGET_FILE:cml_broker>\"")
+    target_sources(cml_test_broker_core PRIVATE broker/test_connection_server.cpp)
+    set_tests_properties(unit.agent unit.broker_core PROPERTIES TIMEOUT 300)
+
+    # A broker that accepts one connection and exits at once (relaunch back-off test).
+    add_executable(cml_test_fake_broker agent/fake_broker.cpp)
+    target_link_libraries(cml_test_fake_broker PRIVATE cml_ipc)
+    cml_apply_warnings(cml_test_fake_broker)
+    set_target_properties(cml_test_fake_broker PROPERTIES FOLDER "tests")
+
+    # A harmless DLL the end-to-end test loads and unloads to exercise ModuleLoaded/Unloaded.
+    add_library(cml_test_dummy_module SHARED agent/dummy_module.cpp)
+    cml_apply_warnings(cml_test_dummy_module)
+    set_target_properties(cml_test_dummy_module PROPERTIES FOLDER "tests")
+
+    # A fake cml_agent.dll with the wrong ABI version, in its own directory next to the test
+    # exe, for the "ABI mismatch fails gracefully" test.
+    add_library(cml_test_fake_agent_abi SHARED agent/fake_agent_abi.cpp)
+    cml_apply_warnings(cml_test_fake_agent_abi)
+    set_target_properties(cml_test_fake_agent_abi PROPERTIES
+        OUTPUT_NAME cml_agent
+        RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:cml_test_agent>/fake_agent_abi"
+        # Same output name as the real agent: keep its import library and PDB out of the way.
+        ARCHIVE_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:cml_test_agent>/fake_agent_abi"
+        PDB_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:cml_test_agent>/fake_agent_abi"
+        COMPILE_PDB_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:cml_test_agent>/fake_agent_abi"
+        FOLDER "tests")
+endif()
+if(WIN32)
+    add_subdirectory(header)
+endif()
 
 # cml_broker --version: exit code 0 and exact output.
 string(CONCAT _cml_expected_version "cml_broker ${PROJECT_VERSION}")

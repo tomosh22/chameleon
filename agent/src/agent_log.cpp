@@ -1,0 +1,130 @@
+#include "agent_log.h"
+
+#if defined(_WIN32)
+
+#include <windows.h>
+
+#include <share.h>
+
+#include <cstdio>
+#include <deque>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <utility>
+
+#include "cml/proc/proc.h"
+#include "cml/util/log.h"
+#include "cml/util/path.h"
+
+namespace cml::agent {
+
+namespace {
+
+constexpr std::size_t kMaxForwarded = 128;
+constexpr std::size_t kMaxForwardedTextBytes = 2000;
+
+struct State {
+    std::mutex mutex;
+    std::FILE* file = nullptr;
+    int forwarders = 0;
+    std::deque<ipc::Log> queue;
+};
+
+// Intentionally leaked: logging can happen during process teardown, after static destructors.
+State& state() {
+    static State* const instance = new State();
+    return *instance;
+}
+
+std::optional<LogLevel> parse_level(const std::string& text) {
+    if (text == "trace") return LogLevel::Trace;
+    if (text == "debug") return LogLevel::Debug;
+    if (text == "info") return LogLevel::Info;
+    if (text == "warn") return LogLevel::Warn;
+    if (text == "error") return LogLevel::Error;
+    return std::nullopt;
+}
+
+void sink(void*, LogLevel level, const char* file, int line, const char* message) {
+    char buffer[1280];
+    const int n = std::snprintf(buffer, sizeof(buffer), "[cml_agent pid=%lu tid=%lu] [%s] %s:%d: %s\n",
+                                static_cast<unsigned long>(GetCurrentProcessId()),
+                                static_cast<unsigned long>(GetCurrentThreadId()), to_string(level),
+                                std::string(path::base_name(std::string_view(file))).c_str(), line, message);
+    if (n < 0) {
+        return;
+    }
+    if (IsDebuggerPresent()) {
+        OutputDebugStringA(buffer);
+    }
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (s.file != nullptr) {
+        std::fputs(buffer, s.file);
+        std::fflush(s.file);
+    }
+    if (level >= LogLevel::Warn && s.forwarders > 0) {
+        ipc::Log entry;
+        entry.level = static_cast<std::uint32_t>(level);
+        // The C runtime cuts log lines at a fixed byte count, possibly inside a multi-byte
+        // character, and callers may log arbitrary bytes: always repair before it goes on the wire.
+        entry.text = ipc::sanitize_utf8(std::string(path::base_name(std::string_view(file))) + ":" +
+                                            std::to_string(line) + ": " + message,
+                                        kMaxForwardedTextBytes);
+        if (s.queue.size() >= kMaxForwarded) {
+            s.queue.pop_front();
+        }
+        s.queue.push_back(std::move(entry));
+    }
+}
+
+}  // namespace
+
+void install_logging() {
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    static bool installed = false;
+    if (installed) {
+        return;
+    }
+    installed = true;
+    if (const std::optional<std::string> path = proc::get_env("CML_AGENT_LOG"); path && !path->empty()) {
+        const std::wstring wide = proc::wide_from_utf8(*path);
+        // Shareable for reading (_wfopen_s would open it exclusively).
+        s.file = _wfsopen(wide.c_str(), L"ab", _SH_DENYWR);
+    }
+    LogLevel level = LogLevel::Info;
+    if (const std::optional<std::string> text = proc::get_env("CML_LOG_LEVEL"); text) {
+        if (const std::optional<LogLevel> parsed = parse_level(*text)) {
+            level = *parsed;
+        }
+    }
+    set_log_level(level);
+    set_log_sink(&sink, nullptr);
+}
+
+void set_log_forwarding(bool enabled) {
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    s.forwarders += enabled ? 1 : -1;
+    if (s.forwarders <= 0) {
+        s.forwarders = 0;
+        std::deque<ipc::Log>().swap(s.queue);  // drop the storage too, not just the entries
+    }
+}
+
+std::vector<ipc::Log> take_forwarded_logs(std::size_t max) {
+    std::vector<ipc::Log> out;
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    while (!s.queue.empty() && out.size() < max) {
+        out.push_back(std::move(s.queue.front()));
+        s.queue.pop_front();
+    }
+    return out;
+}
+
+}  // namespace cml::agent
+
+#endif  // _WIN32

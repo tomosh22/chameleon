@@ -1,5 +1,8 @@
 add_executable(cml_broker src/main.cpp)
 target_link_libraries(cml_broker PRIVATE cml_core cml_util)
+if(WIN32)
+    target_link_libraries(cml_broker PRIVATE shell32)  # CommandLineToArgvW
+endif()
 cml_apply_warnings(cml_broker)
 cml_target_core_style(cml_broker)
 set_target_properties(cml_broker PROPERTIES FOLDER "broker")
