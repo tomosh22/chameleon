@@ -7,7 +7,7 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 |---|---|---|---|---|---|---|
 | WP-01 | Repository skeleton and CI | 0 | done | wp/01-skeleton-ci | #2 | — |
 | WP-02 | cml_coff and cml_pe readers | 1 | in review (fixing 9 review findings) | wp/02-coff-pe-readers | #4 | — |
-| WP-04 | cml_pdb index | 1 | in review (fixing 10 review findings) | wp/04-pdb-index | #5 | — |
+| WP-04 | cml_pdb index | 1 | done | wp/04-pdb-index | #5 | — |
 | WP-11 | Agent skeleton, public header and IPC | 1 | in review (fixing 10 high-effort review findings) | wp/11-agent-ipc | #6 | — |
 | WP-03 | End-to-end spike (M1 gate) | 2 | todo | — | — | WP-02 |
 | WP-05 | Toolchain command parsing and rewriting | 2 | todo | — | — | WP-04; no merge before WP-03 |

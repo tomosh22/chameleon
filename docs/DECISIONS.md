@@ -256,3 +256,16 @@ alone.
 - **The agent DLL is never unloaded** once started, because hooks will point into it.
 - **Message ids** for every §4.13 family are fixed now (Hello=0x0001 … Restart=0x0061;
   table in `docs/wp/WP-11.md`).
+
+## ADR-0017 WP-04 benchmark result and PDB file locking
+
+**Date:** 2026-10-25 · **Status:** Accepted
+
+Final benchmark numbers: a 544 MiB synthetic PDB (1131 compilands, 908k publics, 2.06M
+contributions) loads in 238 ms, against a budget of 2 s per 500 MB. Real memory, measured as
+private-bytes growth plus the mapped file, is 1.40× the PDB size, against a budget of 1.5×.
+
+`cml_pdb` keeps the PDB memory-mapped for the index lifetime. A linker that rewrites a mapped
+PDB fails with `ERROR_USER_MAPPED_FILE`. **WP-12 must release the module's index (or switch it to
+a copy-in-memory mode) before anything relinks that module**, e.g. before hot-restart rebuilds.
+Patch PDBs are separate files and are unaffected.
