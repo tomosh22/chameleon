@@ -51,7 +51,9 @@ CI runs this step in all 8 matrix cells; it uploads `spike-work/` as part of the
 9. Runs `cdb -pv -p <pid>` (non-invasive) and asserts: `patch_1` has PDB symbols,
    `patch_1!compute_value` resolves to the hook target, `logic.cpp @ <line>` is shown, and the
    old entry is a `jmp` into the patch. The raw cdb output is printed to the log.
-10. Kills the fixture.
+10. Resets `g_tick` to 0 in the target so the patched function takes its `g_tick == 0` branch, and asserts
+    that `NOTE logic-start` is printed by the old `fixture_note()` (reached through thunk and slot).
+11. Kills the fixture.
 
 Any failed assertion makes the script exit non-zero.
 

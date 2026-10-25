@@ -370,6 +370,26 @@ def run_pipeline(args, repo, build, work, logs, obj_dir, patch_dir, spike, fixtu
     after = read_ticks(fixture_out)
     if after[-1][0] <= n_before or after[-1][1] != 2:
         fail("the fixture stopped printing value=2 after the cdb session")
+    # ---- 11. exercise the thunk + slot + retargeted data reference at run time -------------------
+    say("STEP 11: reset g_tick to 0 so the patched function reads the old g_tick and calls the old fixture_note()")
+    with open(fixture_out, "rb") as f:
+        size_before = len(f.read())
+    run([spike, "exercise", str(pid), fixture], os.path.join(logs, "exercise.txt"))
+
+    def note_seen():
+        with open(fixture_out, "rb") as f:
+            return b"NOTE logic-start" in f.read()[size_before:]
+
+    if not wait_for(note_seen, 5):
+        fail("no `NOTE logic-start` line after resetting g_tick: the thunk/slot/data retarget path did not work")
+    time.sleep(0.5)
+    if proc.poll() is not None:
+        fail("the fixture died after fixture_note() was called through the thunk")
+    tail = read_ticks(fixture_out)
+    if tail[-1][1] != 2:
+        fail("the fixture does not print value=2 after the exercise")
+    say("SPIKE-THUNK `NOTE logic-start` printed by the OLD fixture_note() called from the patch via thunk and slot; "
+        f"fixture alive, last TICK {tail[-1]}")
     say(f"SPIKE-PASS value 1 -> 2, hook {old_entry:#x} -> {new_entry:#x}, patch at {patch_base:#x}, "
         f"cdb symbols + source + jmp verified, fixture alive (last {after[-1]})")
 

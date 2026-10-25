@@ -555,6 +555,32 @@ int cmd_hook(const Args& a)
     return 0;
 }
 
+// Resets the fixture's g_tick to 0 so that the patched compute_value() takes its
+// `g_tick == 0` branch: it must read the OLD module's g_tick (retargeted REL32) and call the old
+// fixture_note() through the thunk and slot, which prints "NOTE logic-start".
+int cmd_exercise(const Args& a)
+{
+    if (a.pos.size() != 2) {
+        die("usage: exercise <pid> <module.exe>");
+    }
+    const auto pid = static_cast<std::uint32_t>(parse_u64(a.pos[0]));
+    const RemoteModule mod = require_module(pid, basename_of(a.pos[1]));
+    auto pdb = open_pdb_for(a.pos[1]);
+    auto pub = pdb->find_public("?g_tick@@3HA");
+    if (!pub || pub->empty()) {
+        die("?g_tick@@3HA is not a public of the module");
+    }
+    const std::uint64_t va = mod.base + pub->front().rva;
+    HANDLE h = open_target(pid);
+    const std::vector<std::uint8_t> before = read_remote(h, va, 4);
+    const std::int32_t zero = 0;
+    write_remote(h, va, &zero, sizeof zero);
+    log("EXERCISE g_tick at %s: before=[%s], set to 0 so the patched code calls fixture_note() through its thunk",
+        hex64(va).c_str(), hex_bytes(before.data(), 4).c_str());
+    CloseHandle(h);
+    return 0;
+}
+
 #endif  // _WIN32
 
 }  // namespace
@@ -585,6 +611,9 @@ int main(int argc, char** argv)
     }
     if (cmd == "hook") {
         return cmd_hook(a);
+    }
+    if (cmd == "exercise") {
+        return cmd_exercise(a);
     }
 #endif
     die("unknown or unsupported command '%s'", cmd.c_str());
