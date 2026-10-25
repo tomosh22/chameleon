@@ -415,6 +415,15 @@ Result<std::vector<std::string>> build_link_command(const LinkCommandSpec& spec)
     return args;
 }
 
+Result<std::vector<std::byte>> make_padding_binding_object() {
+    const coff::BindSymbol pad{std::string(kBindingPadSymbol), coff::BindKind::Data};
+    Result<coff::ByteVector> bytes = coff::make_binding_object(std::span<const coff::BindSymbol>(&pad, 1));
+    if (!bytes) {
+        return bytes.error();
+    }
+    return std::vector<std::byte>(bytes->begin(), bytes->end());
+}
+
 bool needs_response_file(std::string_view program, std::span<const std::string> args, std::size_t limit) {
     const std::string line = quote_argument(program) + " " + join_command_line(args);
     return line.size() > limit;

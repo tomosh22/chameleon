@@ -122,6 +122,22 @@ Result<LinkedPatch> link_patch(const LinkPatchRequest& request, LinkTrace* trace
     }
     if (!request.binding_object.empty()) {
         spec.objects.push_back(request.binding_object);
+    } else {
+        // Nothing to bind: link a padding binding object anyway (see make_padding_binding_object()).
+        Result<std::vector<std::byte>> pad = make_padding_binding_object();
+        if (!pad) {
+            return pad.error();
+        }
+        const fs::path pad_path = dir / (request.name + ".pad.obj");
+        std::ofstream pf(pad_path, std::ios::binary | std::ios::trunc);
+        pf.write(reinterpret_cast<const char*>(pad->data()), static_cast<std::streamsize>(pad->size()));
+        pf.close();
+        if (!pf) {
+            return Diag::make(diag::kCannotPrepareLink, "cannot write the padding binding object '" + detail::to_utf8(pad_path) + "'",
+                              "Check that the session temp directory is writable and not full.");
+        }
+        tr.padding_binding_object = detail::to_utf8(pad_path);
+        spec.objects.push_back(tr.padding_binding_object);
     }
     spec.out_dll = out_dll;
     spec.out_pdb = out_pdb;

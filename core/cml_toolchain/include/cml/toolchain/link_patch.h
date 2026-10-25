@@ -127,6 +127,13 @@ bool needs_response_file(std::string_view program, std::span<const std::string> 
 // read for non-ASCII paths), one quoted argument per line.
 std::vector<std::byte> render_response_file(std::span<const std::string> args);
 
+// A patch that binds nothing still needs a binding object: lld-link 20.1.8 crashes (access violation, WP-09 CI evidence)
+// when it links one anchored clang-cl object with /DEBUG:FULL /NODEFAULTLIB and no second object, and does not when a
+// binding object with a data placeholder is added. This is that object: a binding object with the single data placeholder
+// `__cml_binding_pad`. link_patch() adds it by itself when LinkPatchRequest::binding_object is empty.
+inline constexpr std::string_view kBindingPadSymbol = "__cml_binding_pad";
+Result<std::vector<std::byte>> make_padding_binding_object();
+
 // What the linker printed.
 struct LinkOutputSummary {
     std::vector<std::string> errors;             // one per error line (LNKnnnn, lld-link: error:)
@@ -184,6 +191,7 @@ struct LinkTrace {
     std::vector<std::string> args;               // the arguments (without the program), as built
     std::string command_line;                    // what was passed to CreateProcess
     std::string response_file;                   // kept next to the output when one was used
+    std::string padding_binding_object;          // set when link_patch() added the padding binding object itself
     std::string output;                          // linker stdout + stderr
     int exit_code = -1;
     double link_ms = 0.0;
@@ -207,7 +215,7 @@ Result<LinkedPatch> read_linked_patch(const ReadPatchRequest& request);
 struct LinkPatchRequest {
     ToolInfo linker;                             // from resolve_linker(), or filled by hand (family + path + version_text)
     std::vector<PatchObjectInput> objects;       // anchored objects; link order
-    std::string binding_object;                  // path of binding.obj ("" = none)
+    std::string binding_object;                  // path of binding.obj; "" = nothing to bind, a padding object is linked
     std::vector<coff::BindSymbol> bindings;      // the symbols binding.obj was made from
     std::vector<std::string> new_functions;
     std::string out_dir;                         // created when missing

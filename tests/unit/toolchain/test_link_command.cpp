@@ -515,3 +515,13 @@ TEST_CASE("linked patch: find_section looks up by (object, section)") {
     CHECK(p.find_section(3, 1) == nullptr);
     CHECK(p.find_section(0, 1) != nullptr);
 }
+
+TEST_CASE("linked patch: the padding binding object is a valid x64 object with the pad placeholder") {
+    auto bytes = make_padding_binding_object();
+    REQUIRE_MESSAGE(bytes, bytes.error().format());
+    REQUIRE(bytes->size() > 20);
+    CHECK(std::to_integer<unsigned>((*bytes)[0]) == 0x64);  // IMAGE_FILE_MACHINE_AMD64 little endian
+    CHECK(std::to_integer<unsigned>((*bytes)[1]) == 0x86);
+    const std::string text(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+    CHECK(text.find(std::string(kBindingPadSymbol)) != std::string::npos);
+}

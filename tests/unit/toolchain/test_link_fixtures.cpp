@@ -544,10 +544,11 @@ void run_fixture(const std::string& fixture) {
             const std::size_t slots = lp->slot_rvas.size() + lp->data_rvas.size();
             evidence("LINK %s linker=%s ok locators=%zu/%zu slots=%zu/%zu ms=%.0f", fixture.c_str(), to_string(lp->linker_family),
                      lp->sections.size(), p.locator_count, slots, p.binds.size(), lp->link_ms);
-            evidence("LINK-DETAIL %s linker=%s%s version=%s thunks_verified=%zu new_functions=%zu image_size=%u base=0x%llx pdb_read_ms=%.1f warnings=%zu exit=%d",
+            evidence("LINK-DETAIL %s linker=%s%s version=%s thunks_verified=%zu new_functions=%zu image_size=%u base=0x%llx pdb_read_ms=%.1f warnings=%zu exit=%d padding_binding=%s",
                      fixture.c_str(), to_string(lp->linker_family), run.tool == &mirrored ? " (mirrored)" : " (other)",
                      lp->linker_version.c_str(), v.thunks, lp->function_rvas.size(), lp->image_size,
-                     static_cast<unsigned long long>(lp->base), lp->pdb_read_ms, lp->warnings.size(), trace.exit_code);
+                     static_cast<unsigned long long>(lp->base), lp->pdb_read_ms, lp->warnings.size(), trace.exit_code,
+                     trace.padding_binding_object.empty() ? "no" : "yes");
             for (const cml::Diag& w : lp->warnings) {
                 evidence("LINK-WARNING %s linker=%s %s", fixture.c_str(), to_string(lp->linker_family), w.message.c_str());
             }
