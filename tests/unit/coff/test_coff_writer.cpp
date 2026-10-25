@@ -599,6 +599,30 @@ TEST_CASE("coff anchors: rules on a synthetic COMDAT object (regular and bigobj)
     }
 }
 
+TEST_CASE("coff anchors: comdat_static keeps COMDAT anchors static in external mode") {
+    const Built b = build_object(comdat_spec(false));
+    auto before = coff::Object::parse(span_of(b.bytes));
+    REQUIRE(before.has_value());
+    auto m = coff::ObjectModel::from_object(*before);
+    REQUIRE(m.has_value());
+    coff::AnchorOptions opt;
+    opt.external = true;
+    opt.comdat_static = true;
+    opt.tag = "cs";
+    auto anchors = coff::add_anchors(*m, opt);
+    REQUIRE(anchors.has_value());
+    auto w = coff::write(*m);
+    REQUIRE(w.has_value());
+    auto after = coff::Object::parse(coff::ByteSpan(w->data(), w->size()));
+    REQUIRE(after.has_value());
+    for (const coff::Anchor& a : *anchors) {
+        const coff::Symbol* s = after->symbol_at(a.symbol_index);
+        REQUIRE(s != nullptr);
+        const bool comdat = before->section(a.section_index)->is_comdat();
+        CHECK(s->storage_class == (comdat ? coff::StorageClass::Static : coff::StorageClass::External));
+    }
+}
+
 TEST_CASE("coff anchors: errors") {
     const Built b = build_object(comdat_spec(false));
     auto before = coff::Object::parse(span_of(b.bytes));

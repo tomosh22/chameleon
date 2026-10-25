@@ -669,6 +669,8 @@ void run_set(const SetSpec& spec) {
             opt.external = external;
             if (external) {
                 opt.tag = "o" + std::to_string(i);
+                // lld-link rejects external anchors inside COMDATs that are discarded as duplicates.
+                opt.comdat_static = objects.size() > 1;
             }
             auto anchors = coff::add_anchors(*m, opt);
             REQUIRE_MESSAGE(anchors.has_value(), anchors.error().format());
@@ -725,11 +727,12 @@ void run_set(const SetSpec& spec) {
             std::size_t comdat_missing = 0;
             std::size_t plain_missing = 0;
             std::unordered_map<std::uint64_t, std::uint32_t> contribs;  // (compiland << 32 | rva) -> size
+            std::vector<cml::pdb::SectionContribution> sorted_contribs;
+            std::size_t unmatched_shown = 0;
             if (external) {
-                const std::size_t n = pdb.index->contribution_count();
-                contribs.reserve(n);
-                for (std::size_t i = 0; i < n; ++i) {
-                    const cml::pdb::SectionContribution c = pdb.index->contribution(i);
+                sorted_contribs = pdb.index->contributions();  // sorted by rva
+                contribs.reserve(sorted_contribs.size());
+                for (const cml::pdb::SectionContribution& c : sorted_contribs) {
                     contribs.emplace((static_cast<std::uint64_t>(c.compiland) << 32) | c.rva, c.size);
                 }
             }
@@ -761,6 +764,21 @@ void run_set(const SetSpec& spec) {
                         const auto c = contribs.find((static_cast<std::uint64_t>(compilands.front()) << 32) | it->second);
                         if (c != contribs.end() && c->second == sec->size_of_raw_data) {
                             ++contrib_match;
+                        } else if (unmatched_shown < 6) {
+                            ++unmatched_shown;
+                            // What the PDB has around that address, to see why the contribution does not match.
+                            std::string near_text = "no contribution covers the rva";
+                            auto up = std::upper_bound(sorted_contribs.begin(), sorted_contribs.end(), it->second,
+                                                       [](std::uint32_t rva, const cml::pdb::SectionContribution& x) { return rva < x.rva; });
+                            if (up != sorted_contribs.begin()) {
+                                const cml::pdb::SectionContribution& x = *(up - 1);
+                                near_text = "contribution rva=" + std::to_string(x.rva) + " size=" + std::to_string(x.size) +
+                                            " compiland=" + std::to_string(x.compiland);
+                            }
+                            evidence("UNMATCHED set=%s linker=%s section=%u '%s' comdat=%d raw_size=%u anchor_rva=%u expected_compiland=%u | %s",
+                                     spec.name.c_str(), lk.label.c_str(), static_cast<unsigned>(a.section_index),
+                                     std::string(sec->name).c_str(), sec->is_comdat() ? 1 : 0, static_cast<unsigned>(sec->size_of_raw_data),
+                                     static_cast<unsigned>(it->second), static_cast<unsigned>(compilands.front()), near_text.c_str());
                         }
                     }
                 }

@@ -41,6 +41,11 @@ struct AnchorOptions {
     // (S_PUB32) are the linker's external symbols: an external anchor is a public with its RVA, a
     // static one is not published as a public (docs/wp/WP-06.md has the per-linker evidence).
     bool external = false;
+    // With `external`: keep the anchors of COMDAT sections STATIC. An external symbol that lives in a
+    // COMDAT section the linker discards as a duplicate of another object's makes lld-link report
+    // "undefined symbol" (link.exe tolerates it), so use this whenever several objects are linked
+    // together. A COMDAT function already has its leader symbol as a public.
+    bool comdat_static = false;
     // Inserted into the name: "__cml_anchor_<tag>_<n>". Mandatory for external anchors (two objects
     // of one link must not define the same external name); letters, digits and '_' only.
     std::string tag;

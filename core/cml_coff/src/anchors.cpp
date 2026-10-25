@@ -80,7 +80,8 @@ Result<std::vector<Anchor>> add_anchors(ObjectModel& m, const AnchorOptions& opt
         sym.value = 0;
         sym.section_number = static_cast<std::int32_t>(section_index);
         sym.type = 0;
-        sym.storage_class = static_cast<std::uint8_t>(options.external ? StorageClass::External : StorageClass::Static);
+        const bool external = options.external && !(options.comdat_static && m.sections[i].is_comdat());
+        sym.storage_class = static_cast<std::uint8_t>(external ? StorageClass::External : StorageClass::Static);
         m.symbols.push_back(std::move(sym));
         anchors.push_back({section_index, static_cast<std::uint32_t>(next_index), std::move(name)});
         ++next_index;
