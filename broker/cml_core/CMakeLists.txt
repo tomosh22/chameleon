@@ -4,10 +4,13 @@ configure_file(
     @ONLY)
 
 # session.cpp is portable (unit-testable without pipes); connection_server.cpp is Windows-only.
+# WP-13: process_registry.cpp and the handler half of control_server.cpp are portable too.
 add_library(cml_core STATIC
     src/version.cpp
     src/session.cpp
-    src/connection_server.cpp)
+    src/connection_server.cpp
+    src/process_registry.cpp
+    src/control_server.cpp)
 target_include_directories(cml_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_BINARY_DIR}/generated")

@@ -1,11 +1,12 @@
 // cml_broker: command-line entry point of the Chameleon broker.
 //
 //   cml_broker --version | --help
-//   cml_broker --headless [--pipe NAME] [--exit-when-idle MS] [--startup-timeout MS]
+//   cml_broker --headless [--pipe NAME] [--control-pipe NAME] [--exit-when-idle MS] [--startup-timeout MS]
 //                         [--log FILE] [--verbose]
 //
 // WP-11 provides only the minimal headless broker (agents register, module lists are recorded,
-// EnableModule is answered); the real broker, control pipe and GUI arrive with WP-12/WP-13.
+// EnableModule is answered). WP-13 adds the control pipe (`status` only); the real broker
+// (reload pipeline, the other control commands) and the GUI arrive with WP-12.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -25,6 +26,9 @@
 #include <chrono>
 
 #include "cml/core/connection_server.h"
+#include <optional>
+
+#include "cml/ipc/control.h"
 #include "cml/ipc/pipe.h"
 #include "cml/proc/proc.h"
 #endif
@@ -34,12 +38,17 @@ namespace {
 void print_usage(std::FILE* out) {
     std::fputs(
         "usage: cml_broker --version | --help\n"
-        "       cml_broker --headless [--pipe NAME] [--exit-when-idle MS] [--startup-timeout MS]\n"
+        "       cml_broker --headless [--pipe NAME] [--control-pipe NAME] [--exit-when-idle MS]\n"
+        "                             [--startup-timeout MS]\n"
         "                             [--log FILE] [--verbose]\n"
         "\n"
         "  --headless            run without a GUI and serve agents on the broker pipe\n"
         "  --pipe NAME           full pipe name (default: CML_PIPE_NAME, else\n"
         "                        \\\\.\\pipe\\cml_broker_<logon session SID>)\n"
+        "  --control-pipe NAME   also serve the control protocol (docs/wp/WP-13.md) on this full pipe\n"
+        "                        name; CML_CONTROL_PIPE does the same. Without either, no control pipe\n"
+        "                        is served (the default name is\n"
+        "                        \\\\.\\pipe\\cml_control_<logon session SID>)\n"
         "  --exit-when-idle MS   exit MS milliseconds after the last agent disconnected\n"
         "  --startup-timeout MS  exit if no agent has connected after MS milliseconds\n"
         "  --log FILE            append the log to FILE instead of writing it to stdout\n"
@@ -53,6 +62,7 @@ struct Options {
     bool headless = false;
     bool verbose = false;
     std::string pipe;
+    std::string control_pipe;
     std::string log_file;
     std::uint32_t exit_when_idle_ms = 0;
     std::uint32_t startup_timeout_ms = 0;
@@ -93,6 +103,8 @@ bool parse_args(const std::vector<std::string>& args, Options* options) {
             options->verbose = true;
         } else if (arg == "--pipe") {
             if (!value_of("--pipe", &options->pipe)) return false;
+        } else if (arg == "--control-pipe") {
+            if (!value_of("--control-pipe", &options->control_pipe)) return false;
         } else if (arg == "--log") {
             if (!value_of("--log", &options->log_file)) return false;
         } else if (arg == "--exit-when-idle") {
@@ -193,6 +205,18 @@ int run_headless(const Options& options) {
 
     cml::core::ServerOptions server_options;
     server_options.pipe_name = *pipe_name;
+    // The control pipe is opt-in for now (--control-pipe or CML_CONTROL_PIPE): several headless
+    // brokers run side by side in tests, and a shared default name would make them collide.
+    const std::optional<std::string> control_from_env = cml::proc::get_env("CML_CONTROL_PIPE");
+    if (!options.control_pipe.empty() || (control_from_env && !control_from_env->empty())) {
+        cml::Result<std::string> control_name = cml::ipc::resolve_control_pipe_name(options.control_pipe);
+        if (!control_name) {
+            CML_LOG(Error, "%s", control_name.error().format().c_str());
+            return 1;
+        }
+        server_options.control_pipe_name = *control_name;
+        CML_LOG(Info, "control pipe=%s", control_name->c_str());
+    }
     server_options.exit_when_idle_ms = options.exit_when_idle_ms;
     server_options.startup_timeout_ms = options.startup_timeout_ms;
     g_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
