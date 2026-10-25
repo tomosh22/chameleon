@@ -53,8 +53,9 @@ enum class MessageType : std::uint16_t {
     ModuleUnloaded = 0x0014,  // implemented  agent -> broker (event)
 
     // Address space (WP-08).
-    ReserveRange = 0x0020,  // implemented  broker -> agent (request); the agent answers with ReserveRange (answer form)
+    ReserveRange = 0x0020,  // implemented  broker -> agent (request, answered by ReserveRangeResult)
     ReleaseRange = 0x0021,  // implemented  broker -> agent (request, answered by Reply)
+    ReserveRangeResult = 0x0022,  // implemented  agent -> broker (answer to ReserveRange; appended, ids above are unchanged)
 
     // Patch pipeline (WP-08).
     LoadPatch = 0x0030,         // implemented  broker -> agent (request, answered by PatchLoaded)
@@ -150,7 +151,7 @@ struct Reply {
 // --- address space and patch loading (WP-08) ---------------------------------------------------
 //
 // All of these are broker -> agent requests; ids are chosen by the broker. The agent answers
-// LoadPatch with PatchLoaded and ReserveRange with a ReserveRange in its answer form (both carry
+// LoadPatch with PatchLoaded and ReserveRange with ReserveRangeResult (both carry
 // status 0 or a CML42xx id, so a refusal still says why); everything else is answered with Reply.
 // A request whose payload cannot be decoded is answered with Reply (CML5201..5203).
 
@@ -227,19 +228,22 @@ struct AddressBlock {
     std::uint64_t size = 0;
 };
 
-// Request form: reserve up to `block_count` blocks of `block_size` bytes inside the window around
+// Reserve up to `block_count` blocks of `block_size` bytes inside the window around
 // [module_base, module_base + module_size) that keeps every REL32 between module and block in
-// range (and within `reach` of the module). Answer form: the blocks actually reserved.
+// range (and within `reach` of the module).
 struct ReserveRange {
     std::uint64_t request_id = 0;
-    bool answer = false;
-    // request
     std::uint64_t module_base = 0;
     std::uint64_t module_size = 0;
     std::uint64_t block_size = 64ull << 20;
     std::uint64_t reach = 1536ull << 20;
     std::uint32_t block_count = 4;
-    // answer
+};
+
+// The answer to ReserveRange: status 0 or a CML42xx id, and the blocks actually reserved (fewer
+// than asked is still status 0; none is CML4201).
+struct ReserveRangeResult {
+    std::uint64_t request_id = 0;
     std::uint32_t status = 0;
     std::string message;
     std::vector<AddressBlock> blocks;
@@ -259,7 +263,7 @@ struct ReleaseRange {
 
 using Message = std::variant<Hello, Welcome, ModuleList, EnableModule, DisableModule, ModuleLoaded,
                              ModuleUnloaded, Log, Reply, ReserveRange, ReleaseRange, LoadPatch,
-                             PatchLoaded, ApplyFixups, RunInitializers>;
+                             PatchLoaded, ApplyFixups, RunInitializers, ReserveRangeResult>;
 
 MessageType type_of(const Message& message) noexcept;
 

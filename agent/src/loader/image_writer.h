@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <span>
+#include <string>
 
 #include "cml/ipc/messages.h"
 #include "cml/util/result.h"
@@ -31,6 +32,16 @@ struct ImageRef {
     std::uint64_t base = 0;
     std::uint32_t size = 0;
 };
+
+// How an exception inside an initializer is treated. Stack overflow and C++ exceptions are named
+// because they need different handling and different words in the diagnostic.
+enum class FaultKind { StackOverflow, CppException, Other };
+FaultKind classify_fault(std::uint32_t exception_code) noexcept;
+// One-line description for the CML4209 message. `stack_restored` only matters for StackOverflow.
+std::string describe_fault(std::uint32_t exception_code, bool stack_restored);
+// True after a stack overflow on this thread whose guard page could not be restored: this thread
+// refuses to run initializers (CML4209) because the next overflow would kill the process.
+bool initializers_refused_on_this_thread() noexcept;
 
 // Applies the fix-ups in two passes: first every Rel32 and Addr64, then every SlotWrite (plan
 // order: fix-ups, then slots). Returns the number of fix-ups written. CML4207 (REL32 out of range),

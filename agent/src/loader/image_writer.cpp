@@ -5,6 +5,8 @@
 #include <windows.h>
 
 #include <cstring>
+#include <malloc.h>
+
 #include <string>
 #include <vector>
 
@@ -239,6 +241,11 @@ Result<std::uint32_t> write_pass(const ImageRef& image, std::span<const ipc::Fix
     return written;
 }
 
+constexpr DWORD kStackOverflowCode = 0xC00000FD;  // EXCEPTION_STACK_OVERFLOW
+constexpr DWORD kCppExceptionCode = 0xE06D7363;   // MSVC-compatible C++ throw
+
+thread_local bool t_stack_unrecoverable = false;
+
 #if defined(_MSC_VER) || defined(__clang__)
 // Runs one initializer; returns 0, or the SEH exception code if it faulted. Separate function: a
 // function with __try may not hold objects that need unwinding.
@@ -254,6 +261,35 @@ DWORD call_guarded(void (*function)()) {
 #endif
 
 }  // namespace
+
+FaultKind classify_fault(std::uint32_t exception_code) noexcept {
+    if (exception_code == kStackOverflowCode) {
+        return FaultKind::StackOverflow;
+    }
+    if (exception_code == kCppExceptionCode) {
+        return FaultKind::CppException;
+    }
+    return FaultKind::Other;
+}
+
+std::string describe_fault(std::uint32_t exception_code, bool stack_restored) {
+    switch (classify_fault(exception_code)) {
+        case FaultKind::StackOverflow:
+            return std::string("overflowed the stack (exception ") + hex(exception_code) + "); " +
+                   (stack_restored ? "the stack guard page was restored"
+                                   : "the stack could not be restored, so this thread refuses to run further initializers");
+        case FaultKind::CppException:
+            return "threw a C++ exception (code " + hex(exception_code) +
+                   "); it was caught so that the host keeps running, but the global was not constructed";
+        case FaultKind::Other:
+            break;
+    }
+    return "raised exception " + hex(exception_code);
+}
+
+bool initializers_refused_on_this_thread() noexcept {
+    return t_stack_unrecoverable;
+}
 
 Result<std::uint32_t> apply_fixups(const ImageRef& image, std::span<const ipc::Fixup> fixups) {
     if (image.base == 0 || image.size == 0) {
@@ -290,6 +326,11 @@ Result<std::uint32_t> apply_fixups(const ImageRef& image, std::span<const ipc::F
 Result<std::uint32_t> run_initializers(const ImageRef& image, std::span<const std::uint32_t> rvas) {
     if (rvas.empty()) {
         return std::uint32_t{0};
+    }
+    if (t_stack_unrecoverable) {
+        return invalid(ids::kLoaderInitializerFailed,
+                       "an earlier initializer overflowed the stack of this thread and the stack could not be restored; "
+                       "initializers are refused on this thread");
     }
     if (image.base == 0 || image.size == 0) {
         return invalid(ids::kLoaderInitializerFailed, "initializers were requested for an empty image");
@@ -335,11 +376,20 @@ Result<std::uint32_t> run_initializers(const ImageRef& image, std::span<const st
         const DWORD fault = 0;
 #endif
         if (fault != 0) {
+            bool restored = true;
+            if (classify_fault(fault) == FaultKind::StackOverflow) {
+                // The guard page was consumed by the overflow; without this the next one is fatal.
+                restored = _resetstkoflw() != 0;
+                if (!restored) {
+                    t_stack_unrecoverable = true;
+                }
+            }
             return Diag::make(ids::kLoaderInitializerFailed,
-                              "initializer " + std::to_string(i) + " (table entry at RVA " + hex(rvas[i]) +
-                                  ") raised exception 0x" + hex(fault).substr(2) + " after " + std::to_string(ran) +
+                              "initializer " + std::to_string(i) + " (table entry at RVA " + hex(rvas[i]) + ") " +
+                                  describe_fault(fault, restored) + " after " + std::to_string(ran) +
                                   " initializer(s) had run",
-                              "Fix the crash in the new global's constructor; the patch is unloaded and the old code keeps running.");
+                              "Fix the crash in the new global's constructor; a patch whose load failed is unloaded and the "
+                              "old code keeps running, a live patch stays loaded.");
         }
         ++ran;
     }

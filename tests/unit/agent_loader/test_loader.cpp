@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -23,6 +24,7 @@ using namespace loadertest;
 using cml::agent::loader::ImageRef;
 using cml::agent::loader::PatchLoader;
 using cml::agent::loader::ReserveParams;
+using cml::agent::loader::TestHooks;
 namespace ipc = cml::ipc;
 namespace ids = cml::ids;
 namespace proc = cml::proc;
@@ -42,6 +44,12 @@ bool owned_covers(const PatchLoader& loader, std::uint64_t base, std::uint64_t s
         }
     }
     return false;
+}
+
+std::string hex_text(std::uint64_t value) {
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "0x%llx", static_cast<unsigned long long>(value));
+    return buffer;
 }
 
 std::uint64_t read64(std::uint64_t address) {
@@ -382,7 +390,7 @@ TEST_CASE("every failure unloads the DLL and returns the block to the reserved s
         CHECK(owned_covers(session.loader, base, session.blocks[0].size));
     };
 
-    SUBCASE("a DLL that is not linked at the requested base (an ordinary ASLR DLL)") {
+    SUBCASE("a DLL that is not linked at the announced base (an ordinary ASLR DLL) is refused before anything is released") {
         ipc::LoadPatch request;
         request.request_id = 1;
         ipc::PatchCandidate candidate;
@@ -391,15 +399,43 @@ TEST_CASE("every failure unloads the DLL and returns the block to the reserved s
         candidate.image_size = 0x4000;
         request.candidates.push_back(candidate);
         const ipc::PatchLoaded answer = session.loader.load_patch(request);
-        expect_clean(answer, ids::kLoaderBaseMismatch);
-        CHECK(answer.message.find("instead of") != std::string::npos);
+        expect_clean(answer, ids::kLoaderImageMismatch);
+        CHECK(answer.attempts == 0);
+        CHECK(answer.message.find("ImageBase") != std::string::npos);
         std::wstring wide(candidate.path.begin(), candidate.path.end());
-        CHECK(GetModuleHandleW(wide.c_str()) == nullptr);  // it was unloaded again
+        CHECK(GetModuleHandleW(wide.c_str()) == nullptr);  // never loaded
     }
-    SUBCASE("the announced SizeOfImage is wrong") {
-        ipc::LoadPatch request = make_request(base, "wrong_size", false, false);
-        request.candidates[0].image_size = proto().image_size + 0x1000;
-        expect_clean(session.loader.load_patch(request), ids::kLoaderImageMismatch);
+    SUBCASE("the announced SizeOfImage is wrong: CML4206 from the file header, nothing released, no retry") {
+        struct Count {
+            int releases = 0;
+            static void hook(void* context, std::uint64_t, std::uint64_t, std::uint32_t) {
+                ++static_cast<Count*>(context)->releases;
+            }
+        } count;
+        TestHooks hooks;
+        hooks.after_release = &Count::hook;
+        hooks.context = &count;
+        session.loader.set_test_hooks(hooks);
+        for (const std::int64_t delta : {-0x1000ll, +0x1000ll, +0x10000ll}) {
+            ipc::LoadPatch request = make_request(base, "wrong_size" + std::to_string(delta), false, false);
+            request.candidates[0].image_size = static_cast<std::uint32_t>(proto().image_size + delta);
+            const ipc::PatchLoaded answer = session.loader.load_patch(request);
+            expect_clean(answer, ids::kLoaderImageMismatch);
+            CHECK(answer.attempts == 0);
+            CHECK(answer.message.find(hex_text(proto().image_size)) != std::string::npos);  // what the file says
+            CHECK(answer.message.find(hex_text(request.candidates[0].image_size)) != std::string::npos);  // what was announced
+        }
+        CHECK(count.releases == 0);
+        // With several candidates a bad one stops the request: a wrong announcement is not retried.
+        ipc::LoadPatch two = make_request(base, "wrong_two_a", false, false);
+        ipc::LoadPatch second = make_request(base + stride(), "wrong_two_b", false, false);
+        second.candidates[0].image_size += 0x1000;
+        two.candidates.push_back(second.candidates[0]);
+        CHECK(session.loader.load_patch(two).status == ids::kLoaderImageMismatch);
+        CHECK(count.releases == 0);
+        session.loader.set_test_hooks(TestHooks{});
+        // The correct size loads.
+        CHECK(session.load(make_request(base, "right_size", false, false)).status == 0);
     }
     SUBCASE("the file does not exist") {
         ipc::LoadPatch request = make_request(base, "gone", false, false);
@@ -488,9 +524,8 @@ TEST_CASE("the broker-facing dispatcher answers every request type") {
     reserve.block_count = 2;
     CHECK(PatchLoader::is_loader_request(reserve));
     ipc::Message answer = loader.handle_request(reserve);
-    REQUIRE(std::holds_alternative<ipc::ReserveRange>(answer));
-    const auto reserved = std::get<ipc::ReserveRange>(answer);
-    CHECK(reserved.answer);
+    REQUIRE(std::holds_alternative<ipc::ReserveRangeResult>(answer));
+    const auto reserved = std::get<ipc::ReserveRangeResult>(answer);
     CHECK(reserved.request_id == 1);
     REQUIRE_MESSAGE(reserved.status == 0, reserved.message);
     REQUIRE(reserved.blocks.size() == 2);
@@ -555,12 +590,12 @@ TEST_CASE("the broker-facing dispatcher answers every request type") {
     CHECK_FALSE(is_module_loaded_at(base));
     CHECK(query(base).State == MEM_RESERVE);
 
-    // Bad ReserveRange parameters are answered in the ReserveRange form.
+    // Bad ReserveRange parameters are answered with a ReserveRangeResult carrying the status.
     reserve.module_size = 0;
     answer = loader.handle_request(reserve);
-    REQUIRE(std::holds_alternative<ipc::ReserveRange>(answer));
-    CHECK(std::get<ipc::ReserveRange>(answer).status == ids::kLoaderInvalidRequest);
-    CHECK(std::get<ipc::ReserveRange>(answer).blocks.empty());
+    REQUIRE(std::holds_alternative<ipc::ReserveRangeResult>(answer));
+    CHECK(std::get<ipc::ReserveRangeResult>(answer).status == ids::kLoaderInvalidRequest);
+    CHECK(std::get<ipc::ReserveRangeResult>(answer).blocks.empty());
 
     // Anything else is refused with CML5203.
     answer = loader.handle_request(ipc::Hello{});

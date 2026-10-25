@@ -3,6 +3,8 @@
 #if defined(_WIN32)
 
 #include <algorithm>
+#include <atomic>
+#include <cstring>
 #include <limits>
 #include <utility>
 
@@ -91,6 +93,50 @@ bool image_header_ok(std::uint64_t base, std::uint32_t expected_size, std::strin
     }
     return true;
 }
+
+struct PeFileInfo {
+    std::uint64_t image_base = 0;
+    std::uint32_t size_of_image = 0;
+};
+
+// Reads ImageBase and SizeOfImage from the first 4 KiB of the file (CreateFile + ReadFile; nothing is
+// mapped or loaded). CML4204 when the file cannot be read or is not an x64 PE image.
+Result<PeFileInfo> read_pe_file_info(const std::wstring& wide_path, const std::string& path) {
+    HANDLE file = CreateFileW(wide_path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return make(ids::kLoaderLoadFailed, "cannot open " + path + " (OS error " + std::to_string(GetLastError()) + ")",
+                    "Check that the patch DLL exists and can be read.");
+    }
+    unsigned char buffer[4096];
+    DWORD got = 0;
+    const BOOL read_ok = ReadFile(file, buffer, sizeof(buffer), &got, nullptr);
+    const DWORD read_error = GetLastError();
+    CloseHandle(file);
+    if (!read_ok) {
+        return make(ids::kLoaderLoadFailed, "cannot read " + path + " (OS error " + std::to_string(read_error) + ")",
+                    "Check that the patch DLL exists and can be read.");
+    }
+    IMAGE_DOS_HEADER dos;
+    IMAGE_NT_HEADERS64 nt;
+    if (got < sizeof(dos)) {
+        return make(ids::kLoaderLoadFailed, path + " is not a PE image (too short)", "Pass the linked patch DLL.");
+    }
+    std::memcpy(&dos, buffer, sizeof(dos));
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0 ||
+        static_cast<std::uint64_t>(dos.e_lfanew) + sizeof(nt) > got) {
+        return make(ids::kLoaderLoadFailed, path + " is not a PE image (no usable DOS/NT header in the first 4 KiB)",
+                    "Pass the linked patch DLL.");
+    }
+    std::memcpy(&nt, buffer + dos.e_lfanew, sizeof(nt));
+    if (nt.Signature != IMAGE_NT_SIGNATURE || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+        nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) {
+        return make(ids::kLoaderLoadFailed, path + " is not an x64 PE32+ image", "Patches are x64 DLLs.");
+    }
+    return PeFileInfo{nt.OptionalHeader.ImageBase, nt.OptionalHeader.SizeOfImage};
+}
+
+std::atomic<PatchLoader*> g_shared{nullptr};
 
 }  // namespace
 
@@ -283,8 +329,41 @@ PatchLoader::~PatchLoader() {
 }
 
 PatchLoader& PatchLoader::shared() {
-    static PatchLoader* const instance = new PatchLoader();
-    return *instance;
+    PatchLoader* existing = g_shared.load(std::memory_order_acquire);
+    if (existing != nullptr) {
+        return *existing;
+    }
+    auto* created = new PatchLoader();
+    PatchLoader* expected = nullptr;
+    if (!g_shared.compare_exchange_strong(expected, created, std::memory_order_acq_rel)) {
+        delete created;  // another thread won; ours owns nothing yet
+        return *expected;
+    }
+    return *created;
+}
+
+PatchLoader* PatchLoader::shared_if_created() noexcept {
+    return g_shared.load(std::memory_order_acquire);
+}
+
+bool PatchLoader::is_patch_image(std::uint64_t base) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return std::any_of(patches_.begin(), patches_.end(), [&](const Patch& p) { return p.range.base == base; });
+}
+
+Result<std::vector<proc::ModuleInfo>> PatchLoader::enumerate_modules_without_patches() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Result<std::vector<proc::ModuleInfo>> modules = proc::enumerate_modules(0);
+    if (modules) {
+        auto& list = *modules;
+        list.erase(std::remove_if(list.begin(), list.end(),
+                                  [&](const proc::ModuleInfo& m) {
+                                      return std::any_of(patches_.begin(), patches_.end(),
+                                                         [&](const Patch& p) { return p.range.base == m.base; });
+                                  }),
+                   list.end());
+    }
+    return modules;
 }
 
 void PatchLoader::set_test_hooks(const TestHooks& hooks) {
@@ -497,17 +576,30 @@ PatchLoader::Patch* PatchLoader::find_patch(std::uint64_t image_base) {
 
 // Unloads patches_[index] and returns its range to the reserved state. Requires mutex_.
 Result<void> PatchLoader::unload_locked(std::size_t index) {
-    const Patch patch = patches_[index];
-    if (!FreeLibrary(patch.module)) {
-        const DWORD error = GetLastError();
+    const AddressRange range = patches_[index].range;
+    if (!patches_[index].released) {
+        if (!FreeLibrary(patches_[index].module)) {
+            const DWORD error = GetLastError();
+            patches_[index].busy = false;
+            return make(ids::kLoaderUnloadFailed,
+                        "FreeLibrary of the patch at " + hex(range.base) + " failed (OS error " + std::to_string(error) + ")",
+                        "The patch stays mapped and its address range is lost; report this with the agent log.");
+        }
+        patches_[index].released = true;  // our reference is gone, whatever happens next
+    }
+    // FreeLibrary only drops a reference. The image must really be gone before the range is reserved again.
+    HMODULE still_mapped = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(range.base), &still_mapped)) {
         patches_[index].busy = false;
         return make(ids::kLoaderUnloadFailed,
-                    "FreeLibrary of the patch at " + hex(patch.range.base) + " failed (OS error " + std::to_string(error) + ")",
-                    "The patch stays mapped and its address range is lost; report this with the agent log.");
+                    "patch image still referenced elsewhere; not unloaded (the image at " + hex(range.base) +
+                        " is still mapped after FreeLibrary)",
+                    "Something else loaded the same DLL; once it frees its reference, unload the patch again.");
     }
     patches_.erase(patches_.begin() + static_cast<std::ptrdiff_t>(index));
-    restore_reservation(patch.range);
-    CML_LOG(Debug, "unloaded patch at 0x%llx", ull(patch.range.base));
+    restore_reservation(range);
+    CML_LOG(Debug, "unloaded patch at 0x%llx", ull(range.base));
     return {};
 }
 
@@ -535,15 +627,22 @@ Result<void> PatchLoader::lock_patch(std::uint64_t image_base, std::uint64_t* im
         return make(ids::kLoaderPatchBusy, "the patch at " + hex(image_base) + " is being used by another request",
                     "Wait for the previous request on this patch to be answered.");
     }
+    if (!patch->live) {
+        return make(ids::kLoaderUnknownPatch, "the patch at " + hex(image_base) + " is not live (its load failed or it is being unloaded)",
+                    "Send LoadPatch again; ApplyFixups and RunInitializers address a patch by its load base.");
+    }
     patch->busy = true;
     *image_size_out = patch->image_size;
     return {};
 }
 
-void PatchLoader::unlock_patch(std::uint64_t image_base) {
+void PatchLoader::unlock_patch(std::uint64_t image_base, bool make_live) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (Patch* patch = find_patch(image_base)) {
         patch->busy = false;
+        if (make_live) {
+            patch->live = true;
+        }
     }
 }
 
@@ -577,11 +676,25 @@ ipc::PatchLoaded PatchLoader::load_patch(const ipc::LoadPatch& request) {
             return fail(make(ids::kLoaderInvalidRequest, "candidate path is not convertible: " + c.path,
                              "Use an absolute path."));
         }
+        // Before anything is released: the file must be the image the request describes. A wrong
+        // announcement is a broker bug, deterministic, so it is not retried with other candidates.
+        Result<PeFileInfo> info = read_pe_file_info(wide_paths.back(), c.path);
+        if (!info) {
+            return fail(info.error());
+        }
+        if (info->image_base != c.image_base || info->size_of_image != c.image_size) {
+            return fail(make(ids::kLoaderImageMismatch,
+                             c.path + " has ImageBase " + hex(info->image_base) + " and SizeOfImage " +
+                                 hex(info->size_of_image) + " but the request announced base " + hex(c.image_base) +
+                                 " and size " + hex(c.image_size),
+                             "Send the /BASE and the SizeOfImage of the DLL that was actually linked."));
+        }
     }
 
     // Steps 1-3 for each candidate in turn, until one is placed.
     std::uint32_t attempts = 0;
     std::uint32_t collisions = 0;
+    std::uint32_t not_reserved = 0;
     void (*busy_hook)(void*, std::uint64_t) = nullptr;
     void* busy_context = nullptr;
     std::size_t placed = request.candidates.size();
@@ -609,19 +722,27 @@ ipc::PatchLoaded PatchLoader::load_patch(const ipc::LoadPatch& request) {
         CML_LOG(Debug, "%s", last.format().c_str());
         if (last.code == ids::kLoaderRangeTaken) {
             ++collisions;
-        } else if (last.code != ids::kLoaderRangeNotReserved) {
+        } else if (last.code == ids::kLoaderRangeNotReserved) {
+            ++not_reserved;
+        } else {
             fatal = true;
             break;
         }
     }
     if (placed == request.candidates.size()) {
-        if (!fatal && collisions > 0) {
+        const std::string breakdown = std::to_string(collisions) + " collided (range taken by another allocation), " +
+                                      std::to_string(not_reserved) + " not reserved, " + std::to_string(fatal ? 1 : 0) + " other";
+        if (fatal) {
+            if (attempts > 1) {
+                last.message += " (after " + std::to_string(attempts) + " attempts: " + breakdown + ")";
+            }
+        } else if (collisions > 0) {
             last = make(ids::kLoaderRangeTaken,
-                        "the address range of every one of " + std::to_string(attempts) +
-                            " load attempt(s) was taken by another allocation before LoadLibrary could map the patch (last: " +
-                            last.message + ")",
+                        "no candidate could be loaded in " + std::to_string(attempts) + " attempt(s): " + breakdown +
+                            "; last: " + last.message,
                         "Retry the reload; if it keeps failing something in the process allocates aggressively near the module.");
         }
+        // else: no attempt collided, `last` is the last non-collision diagnostic (CML4205) and is returned as is
         answer.attempts = attempts;
         return fail(last);
     }
@@ -645,7 +766,7 @@ ipc::PatchLoaded PatchLoader::load_patch(const ipc::LoadPatch& request) {
         unload_after_failure(chosen.image_base);
         return fail(ran.error());
     }
-    unlock_patch(chosen.image_base);
+    unlock_patch(chosen.image_base, /*make_live=*/true);
 
     answer.status = 0;
     answer.image_base = chosen.image_base;
@@ -665,11 +786,7 @@ Result<std::uint32_t> PatchLoader::apply_fixups(std::uint64_t image_base, std::s
         return locked.error();
     }
     Result<std::uint32_t> applied = loader::apply_fixups({image_base, static_cast<std::uint32_t>(size)}, fixups);
-    if (!applied) {
-        unload_after_failure(image_base);
-        return applied;
-    }
-    unlock_patch(image_base);
+    unlock_patch(image_base);  // a live patch stays loaded whatever the outcome (see the header)
     return applied;
 }
 
@@ -680,11 +797,7 @@ Result<std::uint32_t> PatchLoader::run_initializers(std::uint64_t image_base, st
         return locked.error();
     }
     Result<std::uint32_t> ran = loader::run_initializers({image_base, static_cast<std::uint32_t>(size)}, rvas);
-    if (!ran) {
-        unload_after_failure(image_base);
-        return ran;
-    }
-    unlock_patch(image_base);
+    unlock_patch(image_base);  // a live patch stays loaded whatever the outcome (see the header)
     return ran;
 }
 
@@ -708,10 +821,7 @@ Result<void> PatchLoader::unload_patch(std::uint64_t image_base) {
 // ---------------------------------------------------------------------------------------------
 
 bool PatchLoader::is_loader_request(const ipc::Message& message) noexcept {
-    if (const auto* reserve = std::get_if<ipc::ReserveRange>(&message)) {
-        return !reserve->answer;
-    }
-    return std::holds_alternative<ipc::ReleaseRange>(message) || std::holds_alternative<ipc::LoadPatch>(message) ||
+    return std::holds_alternative<ipc::ReserveRange>(message) || std::holds_alternative<ipc::ReleaseRange>(message) || std::holds_alternative<ipc::LoadPatch>(message) ||
            std::holds_alternative<ipc::ApplyFixups>(message) || std::holds_alternative<ipc::RunInitializers>(message);
 }
 
@@ -728,16 +838,15 @@ ipc::Message PatchLoader::handle_request(const ipc::Message& request) {
         return r;
     };
 
-    if (const auto* reserve = std::get_if<ipc::ReserveRange>(&request); reserve != nullptr && !reserve->answer) {
+    if (const auto* reserve = std::get_if<ipc::ReserveRange>(&request)) {
         ReserveParams params;
         params.module_base = reserve->module_base;
         params.module_size = reserve->module_size;
         params.block_size = reserve->block_size;
         params.reach = reserve->reach;
         params.block_count = reserve->block_count;
-        ipc::ReserveRange answer;
+        ipc::ReserveRangeResult answer;
         answer.request_id = reserve->request_id;
-        answer.answer = true;
         Result<std::vector<AddressRange>> blocks = reserve_ranges(params);
         if (!blocks) {
             answer.status = blocks.error().code;

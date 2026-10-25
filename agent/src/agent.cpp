@@ -52,6 +52,11 @@ Result<std::vector<proc::ModuleInfo>> enumerate_loaded_modules() {
         return Diag::make(ids::kModuleEnumFailed, "module enumeration failed (injected failure)",
                           "Test hook: set_enumeration_failures_for_testing.");
     }
+    // Patch DLLs loaded by the WP-08 loader are not application modules: never report them. The
+    // snapshot is taken under the loader's lock so it cannot race a patch load or unload.
+    if (loader::PatchLoader* patch_loader = loader::PatchLoader::shared_if_created()) {
+        return patch_loader->enumerate_modules_without_patches();
+    }
     return proc::enumerate_modules(0);
 }
 

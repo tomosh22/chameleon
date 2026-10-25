@@ -272,21 +272,20 @@ void encode(Writer& w, const Reply& m) {
 // --- WP-08 encoders (append-only block) ---
 void encode(Writer& w, const ReserveRange& m) {
     w.u64(m.request_id);
-    w.u32(m.answer ? 1 : 0);
-    if (!m.answer) {
-        w.u64(m.module_base);
-        w.u64(m.module_size);
-        w.u64(m.block_size);
-        w.u64(m.reach);
-        w.u32(m.block_count);
-    } else {
-        w.u32(m.status);
-        w.str(m.message);
-        w.u32(static_cast<std::uint32_t>(m.blocks.size()));
-        for (const AddressBlock& b : m.blocks) {
-            w.u64(b.base);
-            w.u64(b.size);
-        }
+    w.u64(m.module_base);
+    w.u64(m.module_size);
+    w.u64(m.block_size);
+    w.u64(m.reach);
+    w.u32(m.block_count);
+}
+void encode(Writer& w, const ReserveRangeResult& m) {
+    w.u64(m.request_id);
+    w.u32(m.status);
+    w.str(m.message);
+    w.u32(static_cast<std::uint32_t>(m.blocks.size()));
+    for (const AddressBlock& b : m.blocks) {
+        w.u64(b.base);
+        w.u64(b.size);
     }
 }
 void encode(Writer& w, const ReleaseRange& m) {
@@ -432,35 +431,29 @@ Message decode_reply(Reader& r) {
 Message decode_reserve_range(Reader& r) {
     ReserveRange m;
     m.request_id = r.u64();
-    const std::uint32_t answer = r.u32();
-    if (r.ok() && answer > 1) {
-        r.fail("ReserveRange form must be 0 (request) or 1 (answer)");
+    m.module_base = r.u64();
+    m.module_size = r.u64();
+    m.block_size = r.u64();
+    m.reach = r.u64();
+    m.block_count = r.u32();
+    if (r.ok() && m.block_count > kMaxReservedBlocks) {
+        r.fail("block count above the limit of 64");
     }
-    m.answer = answer == 1;
-    if (!r.ok()) {
-        return m;
-    }
-    if (!m.answer) {
-        m.module_base = r.u64();
-        m.module_size = r.u64();
-        m.block_size = r.u64();
-        m.reach = r.u64();
-        m.block_count = r.u32();
-        if (r.ok() && m.block_count > kMaxReservedBlocks) {
-            r.fail("block count above the limit of 64");
-        }
-    } else {
-        m.status = r.u32();
-        m.message = r.str();
-        const std::uint32_t n = r.count(kMaxReservedBlocks, 16, "block count above the limit of 64");
-        if (r.ok()) {
-            m.blocks.reserve(n);
-            for (std::uint32_t i = 0; i < n && r.ok(); ++i) {
-                AddressBlock b;
-                b.base = r.u64();
-                b.size = r.u64();
-                m.blocks.push_back(b);
-            }
+    return m;
+}
+Message decode_reserve_result(Reader& r) {
+    ReserveRangeResult m;
+    m.request_id = r.u64();
+    m.status = r.u32();
+    m.message = r.str();
+    const std::uint32_t n = r.count(kMaxReservedBlocks, 16, "block count above the limit of 64");
+    if (r.ok()) {
+        m.blocks.reserve(n);
+        for (std::uint32_t i = 0; i < n && r.ok(); ++i) {
+            AddressBlock b;
+            b.base = r.u64();
+            b.size = r.u64();
+            m.blocks.push_back(b);
         }
     }
     return m;
@@ -570,6 +563,7 @@ const char* to_string(MessageType type) noexcept {
         case MessageType::ModuleLoaded: return "ModuleLoaded";
         case MessageType::ModuleUnloaded: return "ModuleUnloaded";
         case MessageType::ReserveRange: return "ReserveRange";
+        case MessageType::ReserveRangeResult: return "ReserveRangeResult";
         case MessageType::ReleaseRange: return "ReleaseRange";
         case MessageType::LoadPatch: return "LoadPatch";
         case MessageType::PatchLoaded: return "PatchLoaded";
@@ -598,6 +592,7 @@ bool is_implemented(MessageType type) noexcept {
         case MessageType::ModuleUnloaded:
         case MessageType::Log:
         case MessageType::ReserveRange:
+        case MessageType::ReserveRangeResult:
         case MessageType::ReleaseRange:
         case MessageType::LoadPatch:
         case MessageType::PatchLoaded:
@@ -621,6 +616,7 @@ MessageType type_of(const Message& message) noexcept {
         MessageType operator()(const Log&) const noexcept { return MessageType::Log; }
         MessageType operator()(const Reply&) const noexcept { return MessageType::Reply; }
         MessageType operator()(const ReserveRange&) const noexcept { return MessageType::ReserveRange; }
+        MessageType operator()(const ReserveRangeResult&) const noexcept { return MessageType::ReserveRangeResult; }
         MessageType operator()(const ReleaseRange&) const noexcept { return MessageType::ReleaseRange; }
         MessageType operator()(const LoadPatch&) const noexcept { return MessageType::LoadPatch; }
         MessageType operator()(const PatchLoaded&) const noexcept { return MessageType::PatchLoaded; }
@@ -797,6 +793,7 @@ Result<Message> decode_message(std::uint16_t type, std::uint16_t version, const 
         case MessageType::ModuleUnloaded: message = decode_unloaded(reader); break;
         case MessageType::Log: message = decode_log(reader); break;
         case MessageType::ReserveRange: message = decode_reserve_range(reader); break;
+        case MessageType::ReserveRangeResult: message = decode_reserve_result(reader); break;
         case MessageType::ReleaseRange: message = decode_release_range(reader); break;
         case MessageType::LoadPatch: message = decode_load_patch(reader); break;
         case MessageType::PatchLoaded: message = decode_patch_loaded(reader); break;
@@ -856,6 +853,7 @@ std::optional<std::uint64_t> peek_request_id(std::uint16_t type, const std::uint
         case MessageType::EnableModule:
         case MessageType::DisableModule:
         case MessageType::ReserveRange:
+        case MessageType::ReserveRangeResult:
         case MessageType::ReleaseRange:
         case MessageType::LoadPatch:
         case MessageType::PatchLoaded:
@@ -915,12 +913,12 @@ std::string describe(const Message& message) {
             return "Reply request=" + std::to_string(m.request_id) +
                    " status=" + std::to_string(m.status) + " message=" + quoted(m.message);
         }
+        std::string operator()(const ReserveRangeResult& m) const {
+            return "ReserveRangeResult request=" + std::to_string(m.request_id) +
+                   " status=" + std::to_string(m.status) + " blocks=" + std::to_string(m.blocks.size()) +
+                   " message=" + quoted(m.message);
+        }
         std::string operator()(const ReserveRange& m) const {
-            if (m.answer) {
-                return "ReserveRange(answer) request=" + std::to_string(m.request_id) +
-                       " status=" + std::to_string(m.status) + " blocks=" + std::to_string(m.blocks.size()) +
-                       " message=" + quoted(m.message);
-            }
             return "ReserveRange request=" + std::to_string(m.request_id) + " module=0x" + hex(m.module_base) +
                    "+0x" + hex(m.module_size) + " block_size=0x" + hex(m.block_size) +
                    " count=" + std::to_string(m.block_count) + " reach=0x" + hex(m.reach);

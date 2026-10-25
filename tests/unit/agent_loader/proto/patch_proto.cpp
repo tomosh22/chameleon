@@ -16,6 +16,7 @@
 //   cml_slot_a/_b     two 8-byte thunk slots
 //   cml_inits         three initializer pointers (table in a read-only section)
 //   cml_init_fault    one initializer pointer whose function faults
+//   cml_init_overflow one initializer pointer whose function recurses until the stack overflows
 //   cml_log/_len      what the initializers wrote
 //   cml_patch_answer  a plain function returning 42
 
@@ -59,8 +60,24 @@ void init_fault() {
     *reinterpret_cast<volatile int*>(0) = 1;  // access violation, caught by the agent
 }
 
+// Never set: the volatile read keeps the compiler from proving that the recursion is unconditional.
+volatile int g_recursion_stop = 0;
+
+void overflow_step(int depth) {
+    volatile char pad[2000];  // below the 4 KiB probe size: no __chkstk (there is no CRT)
+    pad[0] = static_cast<char>(depth);
+    if (g_recursion_stop == 0) {
+        overflow_step(depth + 1);
+    }
+    pad[1] = pad[0];
+}
+void init_overflow() {
+    overflow_step(0);
+}
+
 }  // namespace
 
 #pragma section(".cmlinit", read)
 extern "C" __declspec(allocate(".cmlinit")) __declspec(dllexport) void (*const cml_inits[3])() = {init_a, init_b, init_c};
 extern "C" __declspec(allocate(".cmlinit")) __declspec(dllexport) void (*const cml_init_fault[1])() = {init_fault};
+extern "C" __declspec(allocate(".cmlinit")) __declspec(dllexport) void (*const cml_init_overflow[1])() = {init_overflow};

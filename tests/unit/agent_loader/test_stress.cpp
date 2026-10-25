@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
@@ -13,7 +14,9 @@
 #include "cml/proc/address_space.h"
 #include "cml/proc/loader_diag_ids.h"
 #include "doctest.h"
+#include "cml/proc/proc.h"
 #include "heap.h"
+#include "module_diff.h"
 #include "loader/image_writer.h"
 #include "loader/patch_loader.h"
 #include "loader_test_support.h"
@@ -203,7 +206,8 @@ TEST_CASE("failure injection: the range is grabbed after release; retry with the
         CHECK(answer.status == ids::kLoaderRangeTaken);
         CHECK(answer.attempts == 5);
         CHECK(answer.image_base == 0);
-        CHECK(answer.message.find("5 load attempt") != std::string::npos);
+        CHECK(answer.message.find("5 collided") != std::string::npos);
+        CHECK(answer.message.find("0 not reserved") != std::string::npos);
         CHECK(answer.message.find("What to do") != std::string::npos);
         CHECK(grabber.grabbed.size() == 5);
         CHECK(grabber.attempts_seen == std::vector<std::uint32_t>{1, 2, 3, 4, 5});
@@ -383,22 +387,248 @@ TEST_CASE("operations on a patch that is being loaded are refused with CML4212")
     CHECK(session.loader.run_initializers(base, std::vector<std::uint32_t>{}).has_value());
 }
 
-TEST_CASE("staged requests for unknown or failed patches") {
+TEST_CASE("staged requests for unknown patches; a failing staged request never unloads a live patch") {
     LoaderSession session(1);
     const std::uint64_t base = session.blocks[0].base;
-    REQUIRE(session.load(make_request(base, "staged", true, false)).status == 0);
+    REQUIRE(session.load(make_request(base, "staged", true, true)).status == 0);  // live from here on
     // Unknown base.
     CHECK(session.loader.run_initializers(base + 0x1000000, std::vector<std::uint32_t>{}).error().code ==
           ids::kLoaderUnknownPatch);
     CHECK(session.loader.unload_patch(base + 0x1000000).error().code == ids::kLoaderUnknownPatch);
-    // After a failed staged call the patch is gone (unloaded), so a second call sees it unknown.
+
+    // Everything the patch contains right now.
+    const ProtoLayout& l = proto();
+    const auto snapshot = [&] {
+        std::vector<unsigned char> bytes(l.image_size - l.rva_rodata);
+        std::memcpy(bytes.data(), reinterpret_cast<const void*>(base + l.rva_rodata), bytes.size());
+        return bytes;
+    };
+    const std::vector<unsigned char> before = snapshot();
+    const std::string log_before = initializer_log(base);
+
+    // A bad initializer RVA.
     std::vector<std::uint32_t> bad = {proto().image_size + 8};
     const cml::Result<std::uint32_t> failed = session.loader.run_initializers(base, bad);
     REQUIRE_FALSE(failed.has_value());
     CHECK(failed.error().code == ids::kLoaderInitializerFailed);
+    // A REL32 that cannot reach, after a good entry in the same list.
+    ipc::Fixup good;
+    good.rva = l.rva_data + 64;
+    good.kind = ipc::FixupKind::Addr64;
+    good.value = 0x0102030405060708ull;
+    ipc::Fixup distant;
+    distant.rva = l.rva_data + 8;
+    distant.kind = ipc::FixupKind::Rel32;
+    distant.value = base + (5ull << 30);
+    const cml::Result<std::uint32_t> unreachable =
+        session.loader.apply_fixups(base, std::vector<ipc::Fixup>{good, distant});
+    REQUIRE_FALSE(unreachable.has_value());
+    CHECK(unreachable.error().code == ids::kLoaderRel32OutOfRange);
+    // A site outside the image.
+    ipc::Fixup outside = good;
+    outside.rva = l.image_size + 0x2000;
+    CHECK(session.loader.apply_fixups(base, std::vector<ipc::Fixup>{outside}).error().code == ids::kLoaderFixupInvalid);
+    // The same refusals through the broker-facing dispatcher.
+    ipc::ApplyFixups message;
+    message.request_id = 3;
+    message.image_base = base;
+    message.fixups = {good, distant};
+    const ipc::Message answer = session.loader.handle_request(message);
+    REQUIRE(std::holds_alternative<ipc::Reply>(answer));
+    CHECK(std::get<ipc::Reply>(answer).status == ids::kLoaderRel32OutOfRange);
+    // A faulting initializer in a staged request is reported, the patch stays.
+    const cml::Result<std::uint32_t> faulted = session.loader.run_initializers(base, fault_entry_rvas());
+    REQUIRE_FALSE(faulted.has_value());
+    CHECK(faulted.error().code == ids::kLoaderInitializerFailed);
+
+    // Loaded, callable and unchanged.
+    CHECK(session.loader.is_loaded(base));
+    CHECK(is_module_loaded_at(base));
+    CHECK(session.loader.patch_count() == 1);
+    CHECK(reinterpret_cast<int (*)()>(base + l.rva_answer)() == 42);
+    CHECK(initializer_log(base) == log_before);
+    CHECK(snapshot() == before);
+    const std::string problems = verify_standard(base, host_target_address());
+    CHECK_MESSAGE(problems.empty(), problems);
+    // Still addressable afterwards, and only an explicit unload removes it.
+    CHECK(session.loader.apply_fixups(base, std::vector<ipc::Fixup>{good}).has_value());
+    ipc::ReleaseRange release;
+    release.request_id = 4;
+    release.base = base;
+    release.mode = ipc::ReleaseMode::UnloadPatch;
+    const ipc::Message unloaded = session.loader.handle_request(release);
+    CHECK(std::get<ipc::Reply>(unloaded).status == 0);
     CHECK_FALSE(session.loader.is_loaded(base));
-    CHECK(session.loader.run_initializers(base, std::vector<std::uint32_t>{}).error().code == ids::kLoaderUnknownPatch);
     CHECK(query(base).State == MEM_RESERVE);
+}
+
+TEST_CASE("unload verifies that the image is really gone") {
+    LoaderSession session(1);
+    const std::uint64_t base = session.blocks[0].base;
+    const ipc::LoadPatch request = make_request(base, "refcount", false, false);
+    REQUIRE(session.load(request).status == 0);
+    const std::wstring wide(request.candidates[0].path.begin(), request.candidates[0].path.end());
+    HMODULE extra = LoadLibraryW(wide.c_str());  // a second reference, held by "someone else"
+    REQUIRE(reinterpret_cast<std::uint64_t>(extra) == base);
+
+    const cml::Result<void> refused = session.loader.unload_patch(base);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().code == ids::kLoaderUnloadFailed);
+    CHECK(refused.error().message.find("still referenced elsewhere") != std::string::npos);
+    CHECK(session.loader.is_loaded(base));       // the record is kept
+    CHECK(is_module_loaded_at(base));            // and so is the image
+    CHECK_FALSE(owned_covers(session.loader, base, 1));  // the range is not given back as reserved
+    CHECK(query(base).State == MEM_COMMIT);
+
+    // The other reference goes away: the retry completes the unload without another FreeLibrary.
+    REQUIRE(FreeLibrary(extra));
+    const cml::Result<void> done = session.loader.unload_patch(base);
+    REQUIRE_MESSAGE(done.has_value(), (done.has_value() ? "" : done.error().format()));
+    CHECK_FALSE(session.loader.is_loaded(base));
+    CHECK(query(base).State == MEM_RESERVE);
+    CHECK(owned_covers(session.loader, base, stride()));
+}
+
+TEST_CASE("module snapshots leave patch images out, so no ModuleLoaded/ModuleUnloaded is ever sent for them") {
+    LoaderSession session(1);
+    const std::uint64_t base = session.blocks[0].base;
+    const auto entries = [](const std::vector<proc::ModuleInfo>& modules) {
+        std::vector<ipc::ModuleEntry> list;
+        for (const proc::ModuleInfo& m : modules) {
+            list.push_back({m.base, m.size, m.path});
+        }
+        return list;
+    };
+    const auto contains = [](const std::vector<proc::ModuleInfo>& modules, std::uint64_t module_base) {
+        for (const proc::ModuleInfo& m : modules) {
+            if (m.base == module_base) {
+                return true;
+            }
+        }
+        return false;
+    };
+    // The agent's poll compares consecutive snapshots with diff_modules.
+    const auto filtered_before = session.loader.enumerate_modules_without_patches();
+    const auto raw_before = proc::enumerate_modules(0);
+    REQUIRE(filtered_before.has_value());
+    REQUIRE(raw_before.has_value());
+
+    REQUIRE(session.load(make_request(base, "poll", true, true)).status == 0);
+    CHECK(session.loader.is_patch_image(base));
+    CHECK_FALSE(session.loader.is_patch_image(base + 0x10000));
+
+    const auto filtered_after = session.loader.enumerate_modules_without_patches();
+    const auto raw_after = proc::enumerate_modules(0);
+    REQUIRE(filtered_after.has_value());
+    REQUIRE(raw_after.has_value());
+    CHECK(contains(*raw_after, base));  // control: the toolhelp snapshot does see the patch
+    CHECK_FALSE(contains(*filtered_after, base));
+    const cml::agent::ModuleDelta without = cml::agent::diff_modules(entries(*filtered_before), entries(*filtered_after));
+    const cml::agent::ModuleDelta with = cml::agent::diff_modules(entries(*raw_before), entries(*raw_after));
+    const auto mentions = [&](const std::vector<ipc::ModuleEntry>& list) {
+        for (const ipc::ModuleEntry& m : list) {
+            if (m.base == base) {
+                return true;
+            }
+        }
+        return false;
+    };
+    CHECK_FALSE(mentions(without.loaded));
+    CHECK_FALSE(mentions(without.unloaded));
+    CHECK(mentions(with.loaded));  // what the agent would have reported without the filter
+
+    // Unloading is silent too.
+    REQUIRE(session.loader.unload_patch(base).has_value());
+    const auto filtered_gone = session.loader.enumerate_modules_without_patches();
+    REQUIRE(filtered_gone.has_value());
+    const cml::agent::ModuleDelta gone = cml::agent::diff_modules(entries(*filtered_after), entries(*filtered_gone));
+    CHECK_FALSE(mentions(gone.loaded));
+    CHECK_FALSE(mentions(gone.unloaded));
+    // Other modules are untouched by the filter.
+    CHECK(contains(*filtered_gone, host_base()));
+}
+
+TEST_CASE("fault classification: stack overflow and C++ exceptions are named") {
+    using cml::agent::loader::classify_fault;
+    using cml::agent::loader::describe_fault;
+    using cml::agent::loader::FaultKind;
+    CHECK(classify_fault(0xC00000FD) == FaultKind::StackOverflow);
+    CHECK(classify_fault(0xE06D7363) == FaultKind::CppException);
+    CHECK(classify_fault(0xC0000005) == FaultKind::Other);
+    CHECK(classify_fault(0x80000003) == FaultKind::Other);
+    CHECK(describe_fault(0xC00000FD, true).find("overflowed the stack") != std::string::npos);
+    CHECK(describe_fault(0xC00000FD, true).find("restored") != std::string::npos);
+    CHECK(describe_fault(0xC00000FD, true).find("could not be restored") == std::string::npos);
+    CHECK(describe_fault(0xC00000FD, false).find("could not be restored") != std::string::npos);
+    CHECK(describe_fault(0xC00000FD, false).find("refuses") != std::string::npos);
+    CHECK(describe_fault(0xE06D7363, true).find("C++ exception") != std::string::npos);
+    CHECK(describe_fault(0xE06D7363, true).find("0xe06d7363") != std::string::npos);
+    CHECK(describe_fault(0xC0000005, true).find("raised exception 0xc0000005") != std::string::npos);
+    CHECK_FALSE(cml::agent::loader::initializers_refused_on_this_thread());
+}
+
+TEST_CASE("an initializer that overflows the stack is caught, the guard page restored, the patch unloaded") {
+    LoaderSession session(1);
+    const std::uint64_t base = session.blocks[0].base;
+    ipc::LoadPatch overflow = make_request(base, "overflow", true, false);
+    overflow.initializer_rvas = overflow_entry_rvas();
+    ipc::LoadPatch normal = make_request(base, "after_overflow", true, true);
+
+    // On a thread of its own: its stack is the one that overflows, and the test host's main thread is
+    // never at risk. The same thread then runs a normal load, which proves the guard page is back.
+    ipc::PatchLoaded first;
+    ipc::PatchLoaded second;
+    bool refused_afterwards = true;
+    std::thread worker([&] {
+        first = session.loader.load_patch(overflow);
+        refused_afterwards = cml::agent::loader::initializers_refused_on_this_thread();
+        second = session.loader.load_patch(normal);
+    });
+    worker.join();
+    CHECK(first.status == ids::kLoaderInitializerFailed);
+    CHECK(first.message.find("overflowed the stack") != std::string::npos);
+    CHECK(first.message.find("guard page was restored") != std::string::npos);
+    CHECK_FALSE(refused_afterwards);
+    CHECK_MESSAGE(second.status == 0, second.message);
+    session.loaded.push_back(second.image_base);
+    CHECK(initializer_log(base) == "ABC");
+}
+
+TEST_CASE("the final CML4203 reports the breakdown; without a collision the real reason is returned") {
+    LoaderSession session(3);
+    Grabber grabber;
+    grabber.install(session.loader);
+
+    SUBCASE("a collision and a skipped candidate") {
+        grabber.grab_through_attempt = 1;
+        ipc::LoadPatch request = candidates_in_blocks(session, 1, "bd_a");
+        request.candidates.push_back(request.candidates[0]);  // same range: lost to the thief, then not reserved
+        const ipc::PatchLoaded answer = session.load(request);
+        CHECK(answer.status == ids::kLoaderRangeTaken);
+        CHECK(answer.attempts == 2);
+        CHECK(answer.message.find("1 collided") != std::string::npos);
+        CHECK(answer.message.find("1 not reserved") != std::string::npos);
+        CHECK(answer.message.find("0 other") != std::string::npos);
+    }
+    SUBCASE("no attempt collided: the last non-collision diagnostic, not CML4203") {
+        grabber.grab_through_attempt = 0;
+        ipc::LoadPatch request = make_request(0x5500000000ull, "bd_b0", false, false);
+        const ipc::LoadPatch other = make_request(0x5600000000ull, "bd_b1", false, false);
+        request.candidates.push_back(other.candidates[0]);
+        const ipc::PatchLoaded answer = session.load(request);
+        CHECK(answer.status == ids::kLoaderRangeNotReserved);
+        CHECK(answer.attempts == 2);
+        CHECK(answer.message.find("0x5600000000") != std::string::npos);  // the last candidate's reason
+        CHECK(grabber.attempts_seen.empty());
+    }
+    SUBCASE("a failure after a candidate was placed keeps its own code") {
+        grabber.grab_through_attempt = 1;
+        ipc::LoadPatch request = candidates_in_blocks(session, 2, "bd_c");
+        request.candidates[1].fixups[0].rva = proto().image_size + 8;  // fails after its load
+        const ipc::PatchLoaded answer = session.load(request);
+        CHECK(answer.status == ids::kLoaderFixupInvalid);
+    }
+    session.loader.set_test_hooks(TestHooks{});
 }
 
 namespace {

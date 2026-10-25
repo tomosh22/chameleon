@@ -51,6 +51,7 @@ ProtoLayout build_layout() {
     l.rva_slot_b = export_rva(*exports, "cml_slot_b");
     l.rva_inits = export_rva(*exports, "cml_inits");
     l.rva_init_fault = export_rva(*exports, "cml_init_fault");
+    l.rva_init_overflow = export_rva(*exports, "cml_init_overflow");
     l.rva_log = export_rva(*exports, "cml_log");
     l.rva_log_len = export_rva(*exports, "cml_log_len");
     l.rva_answer = export_rva(*exports, "cml_patch_answer");
@@ -68,6 +69,7 @@ ProtoLayout build_layout() {
         l.init_fn_rva[i] = read_pointer(l.rva_inits + 8 * i);
     }
     l.fault_fn_rva = read_pointer(l.rva_init_fault);
+    l.overflow_fn_rva = read_pointer(l.rva_init_overflow);
     return l;
 }
 
@@ -184,6 +186,7 @@ std::vector<cml::ipc::Fixup> standard_fixups(std::uint64_t base, std::uint64_t t
         list.push_back(fixup(l.rva_inits + 8 * i, FixupKind::Addr64, 0, base + l.init_fn_rva[i]));
     }
     list.push_back(fixup(l.rva_init_fault, FixupKind::Addr64, 0, base + l.fault_fn_rva));
+    list.push_back(fixup(l.rva_init_overflow, FixupKind::Addr64, 0, base + l.overflow_fn_rva));
     list.push_back(fixup(l.rva_slot_a, FixupKind::SlotWrite, 0, target));
     list.push_back(fixup(l.rva_slot_b, FixupKind::SlotWrite, 0, target + 0x10));
     return list;
@@ -196,6 +199,10 @@ std::vector<std::uint32_t> init_entry_rvas() {
 
 std::vector<std::uint32_t> fault_entry_rvas() {
     return {proto().rva_init_fault};
+}
+
+std::vector<std::uint32_t> overflow_entry_rvas() {
+    return {proto().rva_init_overflow};
 }
 
 cml::ipc::LoadPatch make_request(std::uint64_t base, const std::string& tag, bool with_fixups, bool with_inits) {

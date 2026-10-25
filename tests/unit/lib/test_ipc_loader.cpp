@@ -80,23 +80,21 @@ TEST_CASE("WP-08 messages round-trip") {
         in.block_count = 7;
         const auto out = std::get<ReserveRange>(round_trip(in));
         CHECK(out.request_id == 5);
-        CHECK_FALSE(out.answer);
         CHECK(out.module_base == in.module_base);
         CHECK(out.module_size == in.module_size);
         CHECK(out.block_size == in.block_size);
         CHECK(out.reach == in.reach);
         CHECK(out.block_count == 7);
     }
-    SUBCASE("ReserveRange answer") {
-        ReserveRange in;
+    SUBCASE("ReserveRangeResult") {
+        ReserveRangeResult in;
         in.request_id = 5;
-        in.answer = true;
         in.status = 4201;
         in.message = "only one block";
         in.blocks.push_back({0x7FF5'FC00'0000ull, 4ull << 20});
         in.blocks.push_back({0x7FF5'F800'0000ull, 4ull << 20});
-        const auto out = std::get<ReserveRange>(round_trip(in));
-        CHECK(out.answer);
+        const auto out = std::get<ReserveRangeResult>(round_trip(in));
+        CHECK(out.request_id == 5);
         CHECK(out.status == 4201);
         CHECK(out.message == "only one block");
         REQUIRE(out.blocks.size() == 2);
@@ -260,15 +258,29 @@ TEST_CASE("WP-08 malformed payloads are diagnosed") {
         frame[fixup_at + 7] = 1;  // reserved
         CHECK(error_code(decode_frame(frame.data(), frame.size())) == ids::kPayloadMalformed);
     }
-    SUBCASE("ReserveRange: bad form, too many blocks") {
-        ReserveRange m;
-        std::vector<std::uint8_t> frame = frame_bytes(m);
-        frame[kFrameHeaderSize + 8] = 2;
-        CHECK(error_code(decode_frame(frame.data(), frame.size())) == ids::kPayloadMalformed);
+    SUBCASE("ReserveRange: too many blocks; ReserveRangeResult: lying block count") {
         ReserveRange many;
         many.block_count = 65;
-        frame = frame_bytes(many);
+        std::vector<std::uint8_t> frame = frame_bytes(many);
         CHECK(error_code(decode_frame(frame.data(), frame.size())) == ids::kPayloadMalformed);
+        ReserveRangeResult result;
+        frame = frame_bytes(result);
+        // id (8) + status (4) + empty message (4) = 16; the block count follows.
+        frame[kFrameHeaderSize + 16] = 3;  // three blocks claimed, none present
+        CHECK(error_code(decode_frame(frame.data(), frame.size())) == ids::kPayloadMalformed);
+        frame[kFrameHeaderSize + 16] = 65;
+        CHECK(error_code(decode_frame(frame.data(), frame.size())) == ids::kPayloadMalformed);
+    }
+    SUBCASE("every truncation of a ReserveRangeResult is rejected") {
+        ReserveRangeResult result;
+        result.message = "x";
+        result.blocks.push_back({1, 2});
+        const std::vector<std::uint8_t> frame = frame_bytes(result);
+        for (std::size_t cut = 0; cut < frame.size() - kFrameHeaderSize; ++cut) {
+            CHECK_FALSE(decode_message(static_cast<std::uint16_t>(MessageType::ReserveRangeResult), kMessageVersion,
+                                       frame.data() + kFrameHeaderSize, cut)
+                            .has_value());
+        }
     }
     SUBCASE("ReleaseRange: unknown mode") {
         ReleaseRange m;
@@ -299,7 +311,11 @@ TEST_CASE("WP-08 request classification and request-id peeking") {
         CHECK(is_implemented(t));
     }
     CHECK_FALSE(is_request_type(static_cast<std::uint16_t>(MessageType::PatchLoaded)));
+    CHECK_FALSE(is_request_type(static_cast<std::uint16_t>(MessageType::ReserveRangeResult)));
     CHECK(is_implemented(MessageType::PatchLoaded));
+    CHECK(is_implemented(MessageType::ReserveRangeResult));
+    CHECK(static_cast<int>(MessageType::ReserveRangeResult) == 0x0022);
+    CHECK(std::string(to_string(MessageType::ReserveRangeResult)) == "ReserveRangeResult");
     const std::vector<std::uint8_t> frame = frame_bytes(sample_load_patch());
     const auto id = peek_request_id(static_cast<std::uint16_t>(MessageType::LoadPatch),
                                     frame.data() + kFrameHeaderSize, frame.size() - kFrameHeaderSize);
@@ -314,9 +330,9 @@ TEST_CASE("WP-08 describe names the key fields") {
     CHECK(text.find("LoadPatch") != std::string::npos);
     CHECK(text.find("candidates=3") != std::string::npos);
     CHECK(text.find("initializers=3") != std::string::npos);
-    ReserveRange answer;
-    answer.answer = true;
-    CHECK(describe(answer).find("ReserveRange(answer)") != std::string::npos);
+    ReserveRangeResult answer;
+    CHECK(describe(answer).find("ReserveRangeResult") != std::string::npos);
+    CHECK(describe(ReserveRange{}).find("ReserveRange request=") != std::string::npos);
 }
 
 TEST_CASE("WP-08 the per-message fix-up limit is enforced by the decoder") {
@@ -334,4 +350,14 @@ TEST_CASE("WP-08 the per-message fix-up limit is enforced by the decoder") {
     } else {
         CHECK(too_many.error().code == ids::kMessageTooLarge);
     }
+}
+
+TEST_CASE("WP-08 ReserveRangeResult carries its request id first, like the other answers") {
+    ReserveRangeResult result;
+    result.request_id = 0x1122334455667788ull;
+    const std::vector<std::uint8_t> frame = frame_bytes(result);
+    const auto id = peek_request_id(static_cast<std::uint16_t>(MessageType::ReserveRangeResult),
+                                    frame.data() + kFrameHeaderSize, frame.size() - kFrameHeaderSize);
+    REQUIRE(id.has_value());
+    CHECK(*id == 0x1122334455667788ull);
 }
