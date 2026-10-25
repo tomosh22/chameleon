@@ -230,7 +230,7 @@ TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy mul
 
     std::atomic<bool> stop{false};
     std::atomic<int> running{0};
-    std::vector<WorkerStats> stats(kWorkerThreads);
+    std::vector<WorkerStats> stats(kWorkerThreads + 1);  // the last one belongs to the pinned thread
     std::vector<std::thread> workers;
     for (int w = 0; w < kWorkerThreads; ++w) {
         workers.emplace_back([&, w] {
@@ -261,6 +261,32 @@ TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy mul
             }
         });
     }
+
+    // The pinned thread. It calls the slow function with an argument that keeps it inside the first bytes of
+    // the function (a dec/jnz loop of about a millisecond) while the function is not hooked, with a 1 ms gap between calls. An install that follows a revert therefore finds this thread inside
+    // a window in a good share of the cycles, so the RIP-in-window path is exercised in every cycle, whatever the other 16
+    // threads (which only pass through the slow function for ~150 iterations between other calls) happen to
+    // be doing on this machine.
+    std::atomic<long long> pinned_calls{0};
+    workers.emplace_back([&] {
+        WorkerStats& mine = stats[kWorkerThreads];
+        const Target& t = targets.back();
+        ++running;
+        while (!stop.load(std::memory_order_relaxed)) {
+            const int result = call_target(t.entry, 3000000);
+            const int which = classify(t, 3000000, result);
+            if (which < 0) {
+                ++mine.bad;
+                mine.last_bad_target = static_cast<int>(targets.size()) - 1;
+                mine.last_bad_result = result;
+            } else {
+                ++mine.calls[which];
+            }
+            ++pinned_calls;
+            Sleep(1);  // a gap outside the function, so that the installer can win: a function that is never
+                       // left is a legitimate CML4305, and the stress run must still make progress
+        }
+    });
 
     // Heap, loader lock and thread creation churn: threads that get stopped holding those locks.
     std::atomic<long long> churn_rounds{0};
@@ -296,6 +322,9 @@ TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy mul
     });
 
     while (running.load() < kWorkerThreads) {
+        std::this_thread::yield();
+    }
+    while (pinned_calls.load() < 20) {
         std::this_thread::yield();
     }
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);

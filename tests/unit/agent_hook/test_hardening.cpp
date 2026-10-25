@@ -202,14 +202,18 @@ TEST_CASE("ThreadSet: the deadline is checked inside the pass, everything can be
     for (unsigned n : {1u, 2u, 3u, 4u, 5u, 7u, 9u, 12u, 16u, 24u, 40u}) {
         INFO("expire after " << n << " checks");
         set.set_test_knobs(n, 0);
+        // Nothing between suspend_all and resume_all may allocate or take a lock: the threads that are
+        // stopped could be holding the heap or CRT lock. Results are copied to locals first, and
+        // checked after the world runs again.
         const ThreadSet::Result r = set.suspend_all(GetTickCount64() + 60000, 16);
+        const bool timed_out_while_stopped = set.timed_out();
+        set.resume_all();
         if (r == ThreadSet::Result::Timeout) {
-            CHECK(set.timed_out());
+            CHECK(timed_out_while_stopped);
         } else {
             CHECK(r == ThreadSet::Result::Ok);  // the budget was larger than the work
-            CHECK_FALSE(set.timed_out());
+            CHECK_FALSE(timed_out_while_stopped);
         }
-        set.resume_all();
         CHECK_FALSE(set.timed_out());
         CHECK(set.size() == 0);
         CHECK(workers.running_again());
@@ -383,22 +387,28 @@ TEST_CASE("ThreadSet handles several hundred threads in one stop (set lookup is 
 
     ThreadSet set;
     REQUIRE(set.init(4096));
+    // Everything that is needed while the world is stopped is allocated before it stops.
+    std::vector<DWORD> ids(4096, 0);
     const auto start = std::chrono::steady_clock::now();
     const ThreadSet::Result r = set.suspend_all(GetTickCount64() + 60000, 16);
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
-    REQUIRE(r == ThreadSet::Result::Ok);
-    MESSAGE("suspend_all of " << set.size() << " threads took " << elapsed.count() << " ms in " << set.passes()
-                              << " pass(es)");
-    CHECK(set.size() >= static_cast<std::size_t>(kThreads));
-    std::vector<DWORD> ids;
-    for (std::size_t i = 0; i < set.size(); ++i) {
-        ids.push_back(set.entry(i).id);
-        CHECK(set.entry(i).suspended);
-        CHECK(set.entry(i).rip_valid);
+    const std::size_t stopped = set.size() <= ids.size() ? set.size() : ids.size();
+    const unsigned passes = set.passes();
+    std::size_t not_suspended = 0, no_rip = 0;
+    for (std::size_t i = 0; i < stopped; ++i) {
+        ids[i] = set.entry(i).id;
+        not_suspended += set.entry(i).suspended ? 0 : 1;
+        no_rip += set.entry(i).rip_valid ? 0 : 1;
     }
-    std::sort(ids.begin(), ids.end());
-    CHECK(std::adjacent_find(ids.begin(), ids.end()) == ids.end());  // each thread once
     set.resume_all();
+    REQUIRE(r == ThreadSet::Result::Ok);
+    MESSAGE("suspend_all of " << stopped << " threads took " << elapsed.count() << " ms in " << passes << " pass(es)");
+    CHECK(stopped >= static_cast<std::size_t>(kThreads));
+    CHECK(not_suspended == 0);
+    CHECK(no_rip == 0);
+    std::sort(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(stopped));
+    CHECK(std::adjacent_find(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(stopped)) ==
+          ids.begin() + static_cast<std::ptrdiff_t>(stopped));  // each thread once
     CHECK(elapsed < std::chrono::seconds(30));
 
     release = true;
@@ -421,11 +431,13 @@ TEST_CASE("the step-limit exit of the enumeration closes its temporary handle") 
         // Everything is known after the first call, so the second call's first step visits a thread
         // that is already in the set (or this one) and holds a temporary handle when the step budget
         // of 1 is used up.
-        REQUIRE(set.suspend_all(GetTickCount64() + 60000, 16) == ThreadSet::Result::Ok);
+        const ThreadSet::Result first = set.suspend_all(GetTickCount64() + 60000, 16);
         set.set_test_knobs(0, 1);
-        CHECK(set.suspend_all(GetTickCount64() + 60000, 16) == ThreadSet::Result::NotConverging);
+        const ThreadSet::Result second = set.suspend_all(GetTickCount64() + 60000, 16);
         set.set_test_knobs(0, 0);
-        set.resume_all();
+        set.resume_all();  // checks only after the world runs again (see the sweep test)
+        REQUIRE(first == ThreadSet::Result::Ok);
+        CHECK(second == ThreadSet::Result::NotConverging);
     }
     DWORD handles_after = 0;
     REQUIRE(GetProcessHandleCount(GetCurrentProcess(), &handles_after));
