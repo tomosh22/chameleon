@@ -58,6 +58,15 @@ public:
         u64(e.size);
         str(e.path);
     }
+    void u8(std::uint8_t v) { out_.push_back(v); }
+    void fixup(const Fixup& f) {
+        u32(f.rva);
+        u8(static_cast<std::uint8_t>(f.kind));
+        u8(f.n);
+        u8(0);
+        u8(0);
+        u64(f.value);
+    }
     bool too_large() const noexcept { return too_large_; }
     bool invalid_utf8() const noexcept { return invalid_utf8_; }
 
@@ -115,6 +124,77 @@ public:
         if (error_ == nullptr) {
             error_ = what;
         }
+    }
+
+    std::uint8_t u8() { return static_cast<std::uint8_t>(take(1)); }
+
+    // A count that is backed by payload: `count * min_bytes` must fit in what is left, so a lying
+    // count cannot force a large allocation. Returns 0 (and fails) otherwise.
+    std::uint32_t count(std::uint32_t limit, std::size_t min_bytes, const char* what) {
+        const std::uint32_t n = u32();
+        if (!ok()) {
+            return 0;
+        }
+        if (n > limit) {
+            fail(what);
+            return 0;
+        }
+        if (static_cast<std::uint64_t>(n) * min_bytes > remaining()) {
+            fail("a count is larger than the payload can hold");
+            return 0;
+        }
+        return n;
+    }
+
+    Fixup fixup() {
+        Fixup f;
+        f.rva = u32();
+        const std::uint8_t kind = u8();
+        f.n = u8();
+        const std::uint8_t reserved_lo = u8();
+        const std::uint8_t reserved_hi = u8();
+        f.value = u64();
+        if (!ok()) {
+            return f;
+        }
+        if (kind < static_cast<std::uint8_t>(FixupKind::Rel32) ||
+            kind > static_cast<std::uint8_t>(FixupKind::SlotWrite)) {
+            fail("unknown fix-up kind");
+            return f;
+        }
+        if (reserved_lo != 0 || reserved_hi != 0) {
+            fail("reserved fix-up bytes are not zero");
+            return f;
+        }
+        const bool n_ok = kind == static_cast<std::uint8_t>(FixupKind::Rel32) ? f.n <= 5 : f.n == 0;
+        if (!n_ok) {
+            fail("fix-up n must be 0..5 for Rel32 and 0 for other kinds");
+            return f;
+        }
+        f.kind = static_cast<FixupKind>(kind);
+        return f;
+    }
+    std::vector<Fixup> fixups() {
+        std::vector<Fixup> list;
+        const std::uint32_t n = count(kMaxFixupsPerMessage, kFixupWireBytes, "too many fix-ups in one message");
+        if (ok()) {
+            list.reserve(n);
+            for (std::uint32_t i = 0; i < n && ok(); ++i) {
+                list.push_back(fixup());
+            }
+        }
+        return list;
+    }
+    std::vector<std::uint32_t> rvas() {
+        std::vector<std::uint32_t> list;
+        const std::uint32_t n = count(kMaxInitializersPerMessage, 4, "too many initializers in one message");
+        if (ok()) {
+            list.reserve(n);
+            for (std::uint32_t i = 0; i < n && ok(); ++i) {
+                list.push_back(u32());
+            }
+        }
+        return list;
     }
 
 private:
@@ -187,6 +267,79 @@ void encode(Writer& w, const Reply& m) {
     w.u64(m.request_id);
     w.u32(m.status);
     w.str(m.message);
+}
+
+// --- WP-08 encoders (append-only block) ---
+void encode(Writer& w, const ReserveRange& m) {
+    w.u64(m.request_id);
+    w.u64(m.module_base);
+    w.u64(m.module_size);
+    w.u64(m.block_size);
+    w.u64(m.reach);
+    w.u32(m.block_count);
+}
+void encode(Writer& w, const ReserveRangeResult& m) {
+    w.u64(m.request_id);
+    w.u32(m.status);
+    w.str(m.message);
+    w.u32(static_cast<std::uint32_t>(m.blocks.size()));
+    for (const AddressBlock& b : m.blocks) {
+        w.u64(b.base);
+        w.u64(b.size);
+    }
+}
+void encode(Writer& w, const ReleaseRange& m) {
+    w.u64(m.request_id);
+    w.u64(m.base);
+    w.u64(m.size);
+    w.u32(static_cast<std::uint32_t>(m.mode));
+}
+void encode_fixups(Writer& w, const std::vector<Fixup>& list) {
+    w.u32(static_cast<std::uint32_t>(list.size()));
+    for (const Fixup& f : list) {
+        w.fixup(f);
+    }
+}
+void encode(Writer& w, const LoadPatch& m) {
+    w.u64(m.request_id);
+    w.u64(m.patch_id);
+    w.u32(m.flags);
+    w.u32(static_cast<std::uint32_t>(m.candidates.size()));
+    for (const PatchCandidate& c : m.candidates) {
+        w.str(c.path);
+        w.u64(c.image_base);
+        w.u32(c.image_size);
+        encode_fixups(w, c.fixups);
+    }
+    w.u32(static_cast<std::uint32_t>(m.initializer_rvas.size()));
+    for (const std::uint32_t rva : m.initializer_rvas) {
+        w.u32(rva);
+    }
+}
+void encode(Writer& w, const PatchLoaded& m) {
+    w.u64(m.request_id);
+    w.u64(m.patch_id);
+    w.u32(m.status);
+    w.str(m.message);
+    w.u64(m.image_base);
+    w.u32(m.image_size);
+    w.u32(m.candidate_index);
+    w.u32(m.attempts);
+    w.u32(m.fixups_applied);
+    w.u32(m.initializers_run);
+}
+void encode(Writer& w, const ApplyFixups& m) {
+    w.u64(m.request_id);
+    w.u64(m.image_base);
+    encode_fixups(w, m.fixups);
+}
+void encode(Writer& w, const RunInitializers& m) {
+    w.u64(m.request_id);
+    w.u64(m.image_base);
+    w.u32(static_cast<std::uint32_t>(m.rvas.size()));
+    for (const std::uint32_t rva : m.rvas) {
+        w.u32(rva);
+    }
 }
 
 // --- per-message decoders -----------------------------------------------------------------------
@@ -274,6 +427,104 @@ Message decode_reply(Reader& r) {
     return m;
 }
 
+// --- WP-08 decoders (append-only block) ---
+Message decode_reserve_range(Reader& r) {
+    ReserveRange m;
+    m.request_id = r.u64();
+    m.module_base = r.u64();
+    m.module_size = r.u64();
+    m.block_size = r.u64();
+    m.reach = r.u64();
+    m.block_count = r.u32();
+    if (r.ok() && m.block_count > kMaxReservedBlocks) {
+        r.fail("block count above the limit of 64");
+    }
+    return m;
+}
+Message decode_reserve_result(Reader& r) {
+    ReserveRangeResult m;
+    m.request_id = r.u64();
+    m.status = r.u32();
+    m.message = r.str();
+    const std::uint32_t n = r.count(kMaxReservedBlocks, 16, "block count above the limit of 64");
+    if (r.ok()) {
+        m.blocks.reserve(n);
+        for (std::uint32_t i = 0; i < n && r.ok(); ++i) {
+            AddressBlock b;
+            b.base = r.u64();
+            b.size = r.u64();
+            m.blocks.push_back(b);
+        }
+    }
+    return m;
+}
+Message decode_release_range(Reader& r) {
+    ReleaseRange m;
+    m.request_id = r.u64();
+    m.base = r.u64();
+    m.size = r.u64();
+    const std::uint32_t mode = r.u32();
+    if (r.ok() && mode > static_cast<std::uint32_t>(ReleaseMode::UnloadPatch)) {
+        r.fail("unknown release mode");
+    }
+    m.mode = static_cast<ReleaseMode>(mode);
+    return m;
+}
+Message decode_load_patch(Reader& r) {
+    LoadPatch m;
+    m.request_id = r.u64();
+    m.patch_id = r.u64();
+    m.flags = r.u32();
+    if (r.ok() && m.flags != 0) {
+        r.fail("LoadPatch flags are reserved and must be 0");
+    }
+    // A candidate is at least: empty path (4) + base (8) + size (4) + fix-up count (4).
+    const std::uint32_t n = r.count(kMaxLoadCandidates, 20, "more than 5 load candidates");
+    if (r.ok() && n == 0) {
+        r.fail("LoadPatch needs at least one candidate");
+    }
+    for (std::uint32_t i = 0; i < n && r.ok(); ++i) {
+        PatchCandidate c;
+        c.path = r.str();
+        c.image_base = r.u64();
+        c.image_size = r.u32();
+        c.fixups = r.fixups();
+        m.candidates.push_back(std::move(c));
+    }
+    if (r.ok()) {
+        m.initializer_rvas = r.rvas();
+    }
+    return m;
+}
+Message decode_patch_loaded(Reader& r) {
+    PatchLoaded m;
+    m.request_id = r.u64();
+    m.patch_id = r.u64();
+    m.status = r.u32();
+    m.message = r.str();
+    m.image_base = r.u64();
+    m.image_size = r.u32();
+    m.candidate_index = r.u32();
+    m.attempts = r.u32();
+    m.fixups_applied = r.u32();
+    m.initializers_run = r.u32();
+    return m;
+}
+Message decode_apply_fixups(Reader& r) {
+    ApplyFixups m;
+    m.request_id = r.u64();
+    m.image_base = r.u64();
+    m.fixups = r.fixups();
+    return m;
+}
+Message decode_run_initializers(Reader& r) {
+    RunInitializers m;
+    m.request_id = r.u64();
+    m.image_base = r.u64();
+    m.rvas = r.rvas();
+    return m;
+}
+
 // Lower-case hex of `value`, zero-padded to at least `min_digits` digits.
 std::string hex(std::uint64_t value, std::size_t min_digits = 1) {
     static const char kHex[] = "0123456789abcdef";
@@ -312,6 +563,7 @@ const char* to_string(MessageType type) noexcept {
         case MessageType::ModuleLoaded: return "ModuleLoaded";
         case MessageType::ModuleUnloaded: return "ModuleUnloaded";
         case MessageType::ReserveRange: return "ReserveRange";
+        case MessageType::ReserveRangeResult: return "ReserveRangeResult";
         case MessageType::ReleaseRange: return "ReleaseRange";
         case MessageType::LoadPatch: return "LoadPatch";
         case MessageType::PatchLoaded: return "PatchLoaded";
@@ -339,6 +591,13 @@ bool is_implemented(MessageType type) noexcept {
         case MessageType::ModuleLoaded:
         case MessageType::ModuleUnloaded:
         case MessageType::Log:
+        case MessageType::ReserveRange:
+        case MessageType::ReserveRangeResult:
+        case MessageType::ReleaseRange:
+        case MessageType::LoadPatch:
+        case MessageType::PatchLoaded:
+        case MessageType::ApplyFixups:
+        case MessageType::RunInitializers:
             return true;
         default:
             return false;
@@ -356,6 +615,13 @@ MessageType type_of(const Message& message) noexcept {
         MessageType operator()(const ModuleUnloaded&) const noexcept { return MessageType::ModuleUnloaded; }
         MessageType operator()(const Log&) const noexcept { return MessageType::Log; }
         MessageType operator()(const Reply&) const noexcept { return MessageType::Reply; }
+        MessageType operator()(const ReserveRange&) const noexcept { return MessageType::ReserveRange; }
+        MessageType operator()(const ReserveRangeResult&) const noexcept { return MessageType::ReserveRangeResult; }
+        MessageType operator()(const ReleaseRange&) const noexcept { return MessageType::ReleaseRange; }
+        MessageType operator()(const LoadPatch&) const noexcept { return MessageType::LoadPatch; }
+        MessageType operator()(const PatchLoaded&) const noexcept { return MessageType::PatchLoaded; }
+        MessageType operator()(const ApplyFixups&) const noexcept { return MessageType::ApplyFixups; }
+        MessageType operator()(const RunInitializers&) const noexcept { return MessageType::RunInitializers; }
     };
     return std::visit(Visitor{}, message);
 }
@@ -526,6 +792,13 @@ Result<Message> decode_message(std::uint16_t type, std::uint16_t version, const 
         case MessageType::ModuleLoaded: message = decode_loaded(reader); break;
         case MessageType::ModuleUnloaded: message = decode_unloaded(reader); break;
         case MessageType::Log: message = decode_log(reader); break;
+        case MessageType::ReserveRange: message = decode_reserve_range(reader); break;
+        case MessageType::ReserveRangeResult: message = decode_reserve_result(reader); break;
+        case MessageType::ReleaseRange: message = decode_release_range(reader); break;
+        case MessageType::LoadPatch: message = decode_load_patch(reader); break;
+        case MessageType::PatchLoaded: message = decode_patch_loaded(reader); break;
+        case MessageType::ApplyFixups: message = decode_apply_fixups(reader); break;
+        case MessageType::RunInitializers: message = decode_run_initializers(reader); break;
         default: break;  // unreachable: is_implemented() was checked above
     }
     if (!reader.ok()) {
@@ -559,6 +832,11 @@ bool is_request_type(std::uint16_t type) noexcept {
         case MessageType::ModuleList:
         case MessageType::EnableModule:
         case MessageType::DisableModule:
+        case MessageType::ReserveRange:
+        case MessageType::ReleaseRange:
+        case MessageType::LoadPatch:
+        case MessageType::ApplyFixups:
+        case MessageType::RunInitializers:
             return true;
         default:
             return false;
@@ -574,6 +852,13 @@ std::optional<std::uint64_t> peek_request_id(std::uint16_t type, const std::uint
         case MessageType::ModuleList:
         case MessageType::EnableModule:
         case MessageType::DisableModule:
+        case MessageType::ReserveRange:
+        case MessageType::ReserveRangeResult:
+        case MessageType::ReleaseRange:
+        case MessageType::LoadPatch:
+        case MessageType::PatchLoaded:
+        case MessageType::ApplyFixups:
+        case MessageType::RunInitializers:
             break;
         default:
             return std::nullopt;
@@ -627,6 +912,46 @@ std::string describe(const Message& message) {
         std::string operator()(const Reply& m) const {
             return "Reply request=" + std::to_string(m.request_id) +
                    " status=" + std::to_string(m.status) + " message=" + quoted(m.message);
+        }
+        std::string operator()(const ReserveRangeResult& m) const {
+            return "ReserveRangeResult request=" + std::to_string(m.request_id) +
+                   " status=" + std::to_string(m.status) + " blocks=" + std::to_string(m.blocks.size()) +
+                   " message=" + quoted(m.message);
+        }
+        std::string operator()(const ReserveRange& m) const {
+            return "ReserveRange request=" + std::to_string(m.request_id) + " module=0x" + hex(m.module_base) +
+                   "+0x" + hex(m.module_size) + " block_size=0x" + hex(m.block_size) +
+                   " count=" + std::to_string(m.block_count) + " reach=0x" + hex(m.reach);
+        }
+        std::string operator()(const ReleaseRange& m) const {
+            return "ReleaseRange request=" + std::to_string(m.request_id) + " base=0x" + hex(m.base) +
+                   " size=0x" + hex(m.size) + (m.mode == ReleaseMode::Free ? " mode=free" : " mode=unload-patch");
+        }
+        std::string operator()(const LoadPatch& m) const {
+            std::string s = "LoadPatch request=" + std::to_string(m.request_id) +
+                            " patch=" + std::to_string(m.patch_id) +
+                            " candidates=" + std::to_string(m.candidates.size()) +
+                            " initializers=" + std::to_string(m.initializer_rvas.size());
+            if (!m.candidates.empty()) {
+                const PatchCandidate& c = m.candidates.front();
+                s += " first={base=0x" + hex(c.image_base) + " size=0x" + hex(c.image_size) +
+                     " fixups=" + std::to_string(c.fixups.size()) + " path=" + quoted(c.path) + "}";
+            }
+            return s;
+        }
+        std::string operator()(const PatchLoaded& m) const {
+            return "PatchLoaded request=" + std::to_string(m.request_id) + " patch=" + std::to_string(m.patch_id) +
+                   " status=" + std::to_string(m.status) + " base=0x" + hex(m.image_base) +
+                   " candidate=" + std::to_string(m.candidate_index) + " attempts=" + std::to_string(m.attempts) +
+                   " message=" + quoted(m.message);
+        }
+        std::string operator()(const ApplyFixups& m) const {
+            return "ApplyFixups request=" + std::to_string(m.request_id) + " base=0x" + hex(m.image_base) +
+                   " fixups=" + std::to_string(m.fixups.size());
+        }
+        std::string operator()(const RunInitializers& m) const {
+            return "RunInitializers request=" + std::to_string(m.request_id) + " base=0x" + hex(m.image_base) +
+                   " initializers=" + std::to_string(m.rvas.size());
         }
     };
     return std::visit(Visitor{}, message);

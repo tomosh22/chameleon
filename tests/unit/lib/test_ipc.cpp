@@ -273,7 +273,7 @@ TEST_CASE("malformed payloads are diagnosed, never read out of range") {
         frame[4] = 0xEE;
         frame[5] = 0x7E;
         CHECK(error_code(decode_frame(frame.data(), frame.size())) == ids::kMessageTypeUnsupported);
-        frame[4] = static_cast<std::uint8_t>(MessageType::LoadPatch);
+        frame[4] = static_cast<std::uint8_t>(MessageType::Restart);
         frame[5] = 0;
         CHECK(error_code(decode_frame(frame.data(), frame.size())) == ids::kMessageTypeUnsupported);
     }

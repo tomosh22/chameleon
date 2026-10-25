@@ -27,6 +27,9 @@ jobs:
     env:
       BUILD_DIR: build
       LOG_DIR: ci-logs
+      # Where the unit-test hang watchdog (tests/unit/doctest_main.cpp) writes its minidump;
+      # ci-logs/ is uploaded below.
+      CML_TEST_DUMP_DIR: ${{ github.workspace }}/ci-logs
     defaults:
       run:
         shell: pwsh
@@ -172,6 +175,16 @@ jobs:
           ctest --test-dir $env:BUILD_DIR -C ${{ matrix.config }} -R '^unit\.toolchain$' -V *>&1 | Tee-Object -FilePath "$env:LOG_DIR/unit-toolchain-verbose.txt"
           exit 0
 
+      # WP-08: the stress line (WP08-STRESS), the concurrent-thief line (WP08-RACE) and the failure
+      # injection results of unit.agent_loader; docs/wp/WP-08.md quotes these lines. The test already
+      # ran in the Test step above; this reruns it verbosely to keep its output.
+      - name: WP-08 unit.agent_loader verbose output (stress and race evidence)
+        if: always()
+        run: |
+          ctest --test-dir $env:BUILD_DIR -C ${{ matrix.config }} -R '^unit\.agent_loader$' -V *>&1 | Tee-Object -FilePath "$env:LOG_DIR/unit-agent-loader-verbose.txt"
+          Select-String -Path "$env:LOG_DIR/unit-agent-loader-verbose.txt" -Pattern 'WP08-' | ForEach-Object { $_.Line }
+          exit 0
+
       # WP-03 (M1 gate): end-to-end spike. Starts fixture_basic, replaces compute_value() by a
       # recompiled version loaded from a /FIXED patch DLL, asserts value=1 -> value=2, then
       # checks the patched function with a non-invasive cdb.exe session. Fails the job on any
@@ -241,11 +254,27 @@ jobs:
             build/.ninja_log
           if-no-files-found: warn
 
+      # WP-09: linker detection, the LINK lines of every fixture under both linkers, link times and the /IGNORE
+      # evidence (written by unit.link_patch). The last step of the job so the lines are easy to read from the log
+      # tail; docs/wp/WP-09.md quotes them. The complete file is in the logs artifact (ci-logs/wp09-evidence.txt).
+      - name: WP-09 link evidence (linker driver)
+        if: always()
+        run: |
+          $e = "$env:BUILD_DIR/test_work/link_patch/evidence.txt"
+          if (Test-Path $e) {
+            Copy-Item $e "$env:LOG_DIR/wp09-evidence.txt"
+            Get-Content $e | Where-Object { $_ -match '^(LINK |LINK-TIME|LINK-NOIGNORE|LINK-IGNORE|LINK-RSP|LINK-SKIP|LINK-WARNING|LLD-PROBE|NEGATIVE|LINKER-DETECT fixture=basic|PREPARED fixture=(basic|new_function))' } | Select-Object -Unique
+          } else {
+            Write-Host "no WP-09 evidence file (unit.link_patch did not run)"
+          }
+
   # Not part of the 8-cell matrix: proves the Visual Studio generator still configures and
   # builds, which is what most developers use locally.
   vs-generator:
     name: windows-2022 / Visual Studio 17 2022 generator
     runs-on: windows-2022
+    env:
+      CML_TEST_DUMP_DIR: ${{ github.workspace }}/ci-logs
     defaults:
       run:
         shell: pwsh
@@ -262,6 +291,18 @@ jobs:
         run: |
           $e = "build-vs/test_work/coff_link/evidence.txt"
           if (Test-Path $e) { Get-Content $e } else { Write-Host "no WP-06 evidence file" }
+      - name: WP-09 link evidence (linker driver)
+        if: always()
+        run: |
+          $e = "build-vs/test_work/link_patch/evidence.txt"
+          if (Test-Path $e) { Get-Content $e } else { Write-Host "no WP-09 evidence file" }
+      - name: Upload hang dumps
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hang-dumps-vs-generator
+          path: ci-logs/*.dmp
+          if-no-files-found: ignore
 
   # WP-04 (ADR-0009): load-time / memory benchmark of cml_pdb on a large synthetic PDB. Not part of
   # the 8-cell matrix. The PDB is built once (python generator -> MSVC /Z7 + /DEBUG:FULL) and cached
