@@ -124,6 +124,54 @@ jobs:
             Write-Host "no WP-06 evidence file (unit.coff_link did not run)"
           }
 
+      # WP-05: what the toolchain library makes of the fixtures built by this cell: recorded commands
+      # (the real command lines the unit corpus is checked against), rewrites, build-flag facts, the
+      # recompile check against the original objects, and every PCH strategy (/Zi + /Yu question).
+      - name: WP-05 toolchain evidence (cml_tc_probe)
+        if: always()
+        run: |
+          $probe = "$env:BUILD_DIR/bin/cml_tc_probe.exe"
+          $out = "$env:LOG_DIR/toolchain-evidence.txt"
+          function Section($t) { "== $t ==" | Tee-Object -FilePath $out -Append }
+          Section 'detect'
+          & $probe detect *>&1 | Tee-Object -FilePath $out -Append
+          foreach ($fx in 'basic', 'pch') {
+            $objdir = "$env:BUILD_DIR/tests/fixtures/$fx/CMakeFiles/fixture_${fx}_objs.dir"
+            $exe = "$env:BUILD_DIR/bin/fixture_$fx.exe"
+            Section "commands $fx"
+            & $probe commands $exe --obj-dir $objdir *>&1 | Tee-Object -FilePath $out -Append
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Section "module flags $fx"
+            & $probe flags $exe *>&1 | Tee-Object -FilePath $out -Append
+          }
+          $failed = $false
+          foreach ($run in @(@('basic', 'auto'), @('pch', 'auto'))) {
+            Section "recheck $($run[0]) --pch-mode $($run[1])"
+            & $probe recheck "$env:BUILD_DIR/bin/fixture_$($run[0]).exe" --obj-dir "$env:BUILD_DIR/tests/fixtures/$($run[0])/CMakeFiles/fixture_$($run[0])_objs.dir" --pch-mode $run[1] --keep "$env:BUILD_DIR/test_work/probe-$($run[0])-$($run[1])" *>&1 | Tee-Object -FilePath $out -Append
+            if ($LASTEXITCODE -ne 0) { $failed = $true }
+          }
+          foreach ($mode in 'z7', 'keepzi', 'nopch') {
+            Section "recheck pch --pch-mode $mode (evidence, may fail)"
+            & $probe recheck "$env:BUILD_DIR/bin/fixture_pch.exe" --obj-dir "$env:BUILD_DIR/tests/fixtures/pch/CMakeFiles/fixture_pch_objs.dir" --pch-mode $mode --keep "$env:BUILD_DIR/test_work/probe-pch-$mode" *>&1 | Tee-Object -FilePath $out -Append
+            "PCH-MODE $mode exit=$LASTEXITCODE" | Tee-Object -FilePath $out -Append
+          }
+          Section 'recheck basic --translate-cc1 (option (b) prototype, evidence)'
+          & $probe recheck "$env:BUILD_DIR/bin/fixture_basic.exe" --obj-dir "$env:BUILD_DIR/tests/fixtures/basic/CMakeFiles/fixture_basic_objs.dir" --translate-cc1 --keep "$env:BUILD_DIR/test_work/probe-basic-translate" *>&1 | Tee-Object -FilePath $out -Append
+          # The compiler PDB / IPI structure of the recorded command strings (long cl commands are split).
+          $pdbutil = 'C:\Program Files\LLVM\bin\llvm-pdbutil.exe'
+          if (Test-Path $pdbutil) {
+            Section 'llvm-pdbutil IPI records of fixture_basic (LF_BUILDINFO / LF_STRING_ID / LF_SUBSTR_LIST)'
+            & $pdbutil dump --ids "$env:BUILD_DIR/bin/fixture_basic.pdb" 2>&1 | Select-String -Pattern 'LF_(BUILDINFO|SUBSTR_LIST|STRING_ID)' | Select-Object -First 60 | ForEach-Object { $l = $_.Line; if ($l.Length -gt 260) { $l = $l.Substring(0, 260) }; $l } | Tee-Object -FilePath $out -Append
+          }
+          if ($failed) { exit 1 }
+          exit 0
+
+      - name: WP-05 unit.toolchain verbose output (strategy and flag evidence lines)
+        if: always()
+        run: |
+          ctest --test-dir $env:BUILD_DIR -C ${{ matrix.config }} -R '^unit\.toolchain$' -V *>&1 | Tee-Object -FilePath "$env:LOG_DIR/unit-toolchain-verbose.txt"
+          exit 0
+
       # WP-03 (M1 gate): end-to-end spike. Starts fixture_basic, replaces compute_value() by a
       # recompiled version loaded from a /FIXED patch DLL, asserts value=1 -> value=2, then
       # checks the patched function with a non-invasive cdb.exe session. Fails the job on any
@@ -293,5 +341,74 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: logs-pdb-benchmark
+          path: ci-logs/
+          if-no-files-found: warn
+
+  # WP-05: which clang-cl versions record S_BUILDINFO with the cc1 command line (ADR-0012), and does
+  # replaying that command as `clang -cc1 ...` work with each? One cell per LLVM release (17..20),
+  # installed from the official installer into its own directory (side by side, no choco).
+  # Result lines start with TABLE; docs/wp/WP-05.md quotes them.
+  clang-versions:
+    name: clang-cl ${{ matrix.llvm }} (windows-2022)
+    runs-on: windows-2022
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        llvm: ['17.0.6', '18.1.8', '19.1.7', '20.1.8']
+    env:
+      LOG_DIR: ci-logs
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC developer environment (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install LLVM ${{ matrix.llvm }} into C:\llvm\${{ matrix.llvm }}
+        run: |
+          $v = '${{ matrix.llvm }}'
+          $dir = "C:\llvm\$v"
+          $installer = Join-Path $env:RUNNER_TEMP "LLVM-$v-win64.exe"
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$v/LLVM-$v-win64.exe"
+          foreach ($i in 1..4) {
+            try { Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing; break }
+            catch { Write-Host "download attempt $i failed: $_"; Start-Sleep -Seconds ([math]::Pow(2, $i)) }
+          }
+          if (-not (Test-Path $installer)) { throw "could not download $url" }
+          Start-Process -FilePath $installer -ArgumentList '/S', "/D=$dir" -Wait
+          if (-not (Test-Path "$dir\bin\clang-cl.exe")) {
+            Write-Host 'silent install did not produce clang-cl.exe; extracting the installer with 7z'
+            & 7z x $installer "-o$dir" -y | Out-Null
+          }
+          if (-not (Test-Path "$dir\bin\clang-cl.exe")) { throw "no clang-cl.exe in $dir" }
+          & "$dir\bin\clang-cl.exe" --version
+
+      - name: Build cml_pdb_dump and cml_tc_probe (MSVC)
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=cl -DCML_BUILD_TESTS=OFF
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --target cml_pdb_dump cml_tc_probe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Probe clang-cl ${{ matrix.llvm }}
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          ./tests/ci/clang_version_probe.ps1 -Clang "C:\llvm\${{ matrix.llvm }}\bin\clang-cl.exe" -BinDir "$PWD/build/bin" -Repo "$PWD" -Work "$PWD/clang-probe" *>&1 | Tee-Object -FilePath "$env:LOG_DIR/clang-${{ matrix.llvm }}.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "::group::TABLE lines"
+          Select-String -Path "$env:LOG_DIR/clang-${{ matrix.llvm }}.txt" -Pattern '^TABLE ' | ForEach-Object { $_.Line }
+          "::endgroup::"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-clang-${{ matrix.llvm }}
           path: ci-logs/
           if-no-files-found: warn

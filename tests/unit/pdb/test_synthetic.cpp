@@ -708,10 +708,10 @@ TEST_CASE("build_env: crafted IPI string lists are rejected, not expanded") {
     SUBCASE("an ordinary multi-piece string still resolves") {
         Ipi ipi;
         const std::uint32_t cwd = ipi.string_id("C:\\x");
+        const std::uint32_t p1 = ipi.string_id("a");
         const std::uint32_t p2 = ipi.string_id("b");
-        const std::uint32_t p3 = ipi.string_id("c");
-        const std::uint32_t list = ipi.substr_list({p2, p3});
-        const std::uint32_t cmd = ipi.string_id("a", list);
+        const std::uint32_t list = ipi.substr_list({p1, p2});
+        const std::uint32_t cmd = ipi.string_id("c", list);  // the record's own text is the last piece
         const std::uint32_t bi = ipi.buildinfo({cwd, 0, 0, 0, cmd});
         auto [spec, m] = make(std::move(ipi));
         m.symbols.buildinfo(bi);

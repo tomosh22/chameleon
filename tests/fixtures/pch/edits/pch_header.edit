@@ -1,0 +1,11 @@
+--- a/pch.h
++++ b/pch.h
+@@ -16,7 +16,7 @@
+
+ inline int pch_base()
+ {
+-    return PCH_BASE;
++    return PCH_BASE + 1;
+ }
+
+ struct PchPoint {
