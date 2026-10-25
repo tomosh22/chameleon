@@ -14,7 +14,7 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-06 | cml_coff writer: anchors and binding object | 2 | done | wp/06-coff-writer | #11 | — |
 | WP-13 | Test harness cmltest | 2 | done (partial scenario per ADR-0022 until WP-12) | wp/13-cmltest | #12 | — |
 | WP-07 | Bind planner | 3 | in progress | wp/07-bind-planner | — | — |
-| WP-08 | Address-space reservation and patch loading (agent) | 3 | in progress | wp/08-agent-loading | — | — |
+| WP-08 | Address-space reservation and patch loading (agent) | 3 | in review (7 high-effort findings) | wp/08-agent-loading | #18 | — |
 | WP-09 | Linker driver (settles §13 Q2: lld-link default?) | 3 | in progress | wp/09-linker-driver | — | — |
 | WP-10 | Hook installer (agent) | 3 | in progress | wp/10-hook-installer | — | — |
 | WP-12 | Broker core (orchestrator integration) | 4 | todo | — | — | wave 3 |
@@ -41,3 +41,4 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | FU-07 | WP-05 fix (#15) | No-job fallback (AssignProcessToJobObject failed) kills only the driver on cancel/timeout | WP-18 |
 | FU-08 | WP-05 fix (#15) | `is_pdb_server` treats an image-name query failure (e.g. >520-char path) as mspdbsrv; use a growing buffer | WP-18 |
 | FU-09 | WP-11 fix (#16) | Test watchdog only fires inside a test case; hangs in static destructors or doctest teardown stay silent until ctest TIMEOUT | WP-13 owner / orchestrator |
+| FU-10 | WP-08 (#18) | Dedup `hex()` (3 copies) into cml_util; `restore_reservation` should reuse `proc::query_free_regions`; single rollback helper in `try_load_candidate` | WP-12 |
