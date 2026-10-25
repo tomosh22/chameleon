@@ -54,6 +54,8 @@ add_subdirectory(third_party)
 add_subdirectory(core)
 add_subdirectory(agent)
 add_subdirectory(broker)
+# WP-03 throwaway end-to-end spike (see spike/README.md).
+add_subdirectory(spike)
 
 if(CML_BUILD_TESTS)
     add_subdirectory(tests)
