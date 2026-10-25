@@ -1,0 +1,549 @@
+#include "cml/ipc/messages.h"
+
+#include <cstring>
+#include <type_traits>
+
+#include "cml/proc/diag_ids.h"
+
+namespace cml::ipc {
+
+namespace {
+
+constexpr const char* kSameBuildAdvice =
+    "Use an agent and a broker from the same Chameleon build; if they are, report this as a bug "
+    "with the broker log.";
+
+Diag malformed(const char* type_name, const char* what) {
+    return Diag::make(ids::kPayloadMalformed,
+                      std::string("malformed ") + type_name + " payload: " + what,
+                      kSameBuildAdvice);
+}
+
+// Smallest encoded ModuleEntry: base + size + empty string.
+constexpr std::size_t kMinModuleEntryBytes = 8 + 8 + 4;
+
+// --- little-endian writer -----------------------------------------------------------------------
+
+class Writer {
+public:
+    explicit Writer(std::vector<std::uint8_t>& out) : out_(out) {}
+
+    void u32(std::uint32_t v) {
+        for (int i = 0; i < 4; ++i) {
+            out_.push_back(static_cast<std::uint8_t>(v >> (8 * i)));
+        }
+    }
+    void u64(std::uint64_t v) {
+        for (int i = 0; i < 8; ++i) {
+            out_.push_back(static_cast<std::uint8_t>(v >> (8 * i)));
+        }
+    }
+    void str(std::string_view s) {
+        if (s.size() > kMaxStringBytes) {
+            too_large_ = true;
+            u32(0);
+            return;
+        }
+        u32(static_cast<std::uint32_t>(s.size()));
+        out_.insert(out_.end(), s.begin(), s.end());
+    }
+    void entry(const ModuleEntry& e) {
+        u64(e.base);
+        u64(e.size);
+        str(e.path);
+    }
+    bool too_large() const noexcept { return too_large_; }
+
+private:
+    std::vector<std::uint8_t>& out_;
+    bool too_large_ = false;
+};
+
+// --- bounds-checked little-endian reader --------------------------------------------------------
+
+class Reader {
+public:
+    Reader(const std::uint8_t* data, std::size_t size) : data_(data), size_(size) {}
+
+    bool ok() const noexcept { return error_ == nullptr; }
+    const char* error() const noexcept { return error_; }
+    std::size_t remaining() const noexcept { return size_ - pos_; }
+    bool at_end() const noexcept { return pos_ == size_; }
+
+    std::uint32_t u32() { return static_cast<std::uint32_t>(take(4)); }
+    std::uint64_t u64() { return take(8); }
+
+    std::string str() {
+        const std::uint32_t length = u32();
+        if (!ok()) {
+            return {};
+        }
+        if (length > kMaxStringBytes) {
+            fail("string longer than the 256 KiB field limit");
+            return {};
+        }
+        if (length > remaining()) {
+            fail("string runs past the end of the payload");
+            return {};
+        }
+        std::string s(reinterpret_cast<const char*>(data_ + pos_), length);
+        pos_ += length;
+        if (!is_valid_utf8(s)) {
+            fail("string is not valid UTF-8");
+            return {};
+        }
+        return s;
+    }
+
+    ModuleEntry entry() {
+        ModuleEntry e;
+        e.base = u64();
+        e.size = u64();
+        e.path = str();
+        return e;
+    }
+
+    void fail(const char* what) noexcept {
+        if (error_ == nullptr) {
+            error_ = what;
+        }
+    }
+
+private:
+    std::uint64_t take(std::size_t bytes) {
+        if (error_ != nullptr) {
+            return 0;
+        }
+        if (bytes > remaining()) {
+            fail("payload is truncated");
+            return 0;
+        }
+        std::uint64_t v = 0;
+        for (std::size_t i = 0; i < bytes; ++i) {
+            v |= static_cast<std::uint64_t>(data_[pos_ + i]) << (8 * i);
+        }
+        pos_ += bytes;
+        return v;
+    }
+
+    const std::uint8_t* data_;
+    std::size_t size_;
+    std::size_t pos_ = 0;
+    const char* error_ = nullptr;
+};
+
+// --- per-message encoders -----------------------------------------------------------------------
+
+void encode(Writer& w, const Hello& m) {
+    w.u64(m.request_id);
+    w.u32(m.protocol_version);
+    w.u32(m.agent_abi_version);
+    w.u32(m.pid);
+    w.u32(static_cast<std::uint32_t>(m.mode));
+    w.str(m.agent_path);
+    w.str(m.command_line);
+}
+void encode(Writer& w, const Welcome& m) {
+    w.u64(m.request_id);
+    w.u32(m.protocol_version);
+    w.u64(m.agent_id);
+    w.str(m.broker_version);
+}
+void encode(Writer& w, const ModuleList& m) {
+    w.u64(m.request_id);
+    w.u32(static_cast<std::uint32_t>(m.modules.size()));
+    for (const ModuleEntry& e : m.modules) {
+        w.entry(e);
+    }
+}
+void encode(Writer& w, const EnableModule& m) {
+    w.u64(m.request_id);
+    w.u32(m.options);
+    w.str(m.path);
+}
+void encode(Writer& w, const DisableModule& m) {
+    w.u64(m.request_id);
+    w.str(m.path);
+}
+void encode(Writer& w, const ModuleLoaded& m) {
+    w.entry(m.module);
+}
+void encode(Writer& w, const ModuleUnloaded& m) {
+    w.entry(m.module);
+}
+void encode(Writer& w, const Log& m) {
+    w.u32(m.level);
+    w.str(m.text);
+}
+void encode(Writer& w, const Reply& m) {
+    w.u64(m.request_id);
+    w.u32(m.status);
+    w.str(m.message);
+}
+
+// --- per-message decoders -----------------------------------------------------------------------
+
+Message decode_hello(Reader& r) {
+    Hello m;
+    m.request_id = r.u64();
+    m.protocol_version = r.u32();
+    m.agent_abi_version = r.u32();
+    m.pid = r.u32();
+    const std::uint32_t mode = r.u32();
+    if (r.ok() && mode > static_cast<std::uint32_t>(AgentMode::Synchronized)) {
+        r.fail("unknown agent mode");
+    }
+    m.mode = static_cast<AgentMode>(mode);
+    m.agent_path = r.str();
+    m.command_line = r.str();
+    return m;
+}
+Message decode_welcome(Reader& r) {
+    Welcome m;
+    m.request_id = r.u64();
+    m.protocol_version = r.u32();
+    m.agent_id = r.u64();
+    m.broker_version = r.str();
+    return m;
+}
+Message decode_module_list(Reader& r) {
+    ModuleList m;
+    m.request_id = r.u64();
+    const std::uint32_t count = r.u32();
+    if (r.ok() && count > kMaxModuleCount) {
+        r.fail("module count above the limit of 16384");
+    }
+    // Each entry needs at least kMinModuleEntryBytes, so a lying count cannot force a huge
+    // allocation: it must be backed by real payload bytes.
+    if (r.ok() && static_cast<std::uint64_t>(count) * kMinModuleEntryBytes > r.remaining()) {
+        r.fail("module count is larger than the payload can hold");
+    }
+    if (r.ok()) {
+        m.modules.reserve(count);
+        for (std::uint32_t i = 0; i < count && r.ok(); ++i) {
+            m.modules.push_back(r.entry());
+        }
+    }
+    return m;
+}
+Message decode_enable(Reader& r) {
+    EnableModule m;
+    m.request_id = r.u64();
+    m.options = r.u32();
+    m.path = r.str();
+    return m;
+}
+Message decode_disable(Reader& r) {
+    DisableModule m;
+    m.request_id = r.u64();
+    m.path = r.str();
+    return m;
+}
+Message decode_loaded(Reader& r) {
+    ModuleLoaded m;
+    m.module = r.entry();
+    return m;
+}
+Message decode_unloaded(Reader& r) {
+    ModuleUnloaded m;
+    m.module = r.entry();
+    return m;
+}
+Message decode_log(Reader& r) {
+    Log m;
+    m.level = r.u32();
+    if (r.ok() && m.level > 4) {
+        r.fail("unknown log level");
+    }
+    m.text = r.str();
+    return m;
+}
+Message decode_reply(Reader& r) {
+    Reply m;
+    m.request_id = r.u64();
+    m.status = r.u32();
+    m.message = r.str();
+    return m;
+}
+
+// Lower-case hex of `value`, zero-padded to at least `min_digits` digits.
+std::string hex(std::uint64_t value, std::size_t min_digits = 1) {
+    static const char kHex[] = "0123456789abcdef";
+    std::string s;
+    do {
+        s.insert(s.begin(), kHex[value & 0xF]);
+        value >>= 4;
+    } while (value != 0);
+    while (s.size() < min_digits) {
+        s.insert(s.begin(), '0');
+    }
+    return s;
+}
+
+std::string clip(const std::string& s, std::size_t limit = 260) {
+    if (s.size() <= limit) {
+        return s;
+    }
+    return s.substr(0, limit) + "...";
+}
+
+std::string quoted(const std::string& s) {
+    return "\"" + clip(s) + "\"";
+}
+
+}  // namespace
+
+const char* to_string(MessageType type) noexcept {
+    switch (type) {
+        case MessageType::Hello: return "Hello";
+        case MessageType::Welcome: return "Welcome";
+        case MessageType::Reply: return "Reply";
+        case MessageType::ModuleList: return "ModuleList";
+        case MessageType::EnableModule: return "EnableModule";
+        case MessageType::DisableModule: return "DisableModule";
+        case MessageType::ModuleLoaded: return "ModuleLoaded";
+        case MessageType::ModuleUnloaded: return "ModuleUnloaded";
+        case MessageType::ReserveRange: return "ReserveRange";
+        case MessageType::ReleaseRange: return "ReleaseRange";
+        case MessageType::LoadPatch: return "LoadPatch";
+        case MessageType::PatchLoaded: return "PatchLoaded";
+        case MessageType::ApplyFixups: return "ApplyFixups";
+        case MessageType::RunInitializers: return "RunInitializers";
+        case MessageType::InstallHooks: return "InstallHooks";
+        case MessageType::HooksInstalled: return "HooksInstalled";
+        case MessageType::SyncPointReady: return "SyncPointReady";
+        case MessageType::Exception: return "Exception";
+        case MessageType::ExceptionAction: return "ExceptionAction";
+        case MessageType::Log: return "Log";
+        case MessageType::Restart: return "Restart";
+    }
+    return "Unknown";
+}
+
+bool is_implemented(MessageType type) noexcept {
+    switch (type) {
+        case MessageType::Hello:
+        case MessageType::Welcome:
+        case MessageType::Reply:
+        case MessageType::ModuleList:
+        case MessageType::EnableModule:
+        case MessageType::DisableModule:
+        case MessageType::ModuleLoaded:
+        case MessageType::ModuleUnloaded:
+        case MessageType::Log:
+            return true;
+        default:
+            return false;
+    }
+}
+
+MessageType type_of(const Message& message) noexcept {
+    struct Visitor {
+        MessageType operator()(const Hello&) const noexcept { return MessageType::Hello; }
+        MessageType operator()(const Welcome&) const noexcept { return MessageType::Welcome; }
+        MessageType operator()(const ModuleList&) const noexcept { return MessageType::ModuleList; }
+        MessageType operator()(const EnableModule&) const noexcept { return MessageType::EnableModule; }
+        MessageType operator()(const DisableModule&) const noexcept { return MessageType::DisableModule; }
+        MessageType operator()(const ModuleLoaded&) const noexcept { return MessageType::ModuleLoaded; }
+        MessageType operator()(const ModuleUnloaded&) const noexcept { return MessageType::ModuleUnloaded; }
+        MessageType operator()(const Log&) const noexcept { return MessageType::Log; }
+        MessageType operator()(const Reply&) const noexcept { return MessageType::Reply; }
+    };
+    return std::visit(Visitor{}, message);
+}
+
+bool is_valid_utf8(std::string_view text) noexcept {
+    const auto* p = reinterpret_cast<const unsigned char*>(text.data());
+    const std::size_t n = text.size();
+    std::size_t i = 0;
+    while (i < n) {
+        const unsigned char c = p[i];
+        if (c < 0x80) {
+            ++i;
+            continue;
+        }
+        std::size_t extra = 0;
+        std::uint32_t code = 0;
+        std::uint32_t min_code = 0;
+        if (c >= 0xC2 && c <= 0xDF) {
+            extra = 1;
+            code = c & 0x1Fu;
+            min_code = 0x80;
+        } else if (c >= 0xE0 && c <= 0xEF) {
+            extra = 2;
+            code = c & 0x0Fu;
+            min_code = 0x800;
+        } else if (c >= 0xF0 && c <= 0xF4) {
+            extra = 3;
+            code = c & 0x07u;
+            min_code = 0x10000;
+        } else {
+            return false;  // continuation byte, overlong lead (C0/C1) or invalid lead (F5..FF)
+        }
+        if (i + extra >= n) {
+            return false;  // sequence runs past the end
+        }
+        for (std::size_t k = 1; k <= extra; ++k) {
+            const unsigned char cc = p[i + k];
+            if ((cc & 0xC0u) != 0x80u) {
+                return false;
+            }
+            code = (code << 6) | (cc & 0x3Fu);
+        }
+        if (code < min_code || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)) {
+            return false;
+        }
+        i += extra + 1;
+    }
+    return true;
+}
+
+Result<FrameHeader> parse_frame_header(const std::uint8_t* bytes, std::size_t size) {
+    if (bytes == nullptr || size < kFrameHeaderSize) {
+        return Diag::make(ids::kFrameHeaderInvalid,
+                          "frame header is shorter than 8 bytes (" + std::to_string(size) + ")",
+                          kSameBuildAdvice);
+    }
+    FrameHeader h;
+    h.payload_size = static_cast<std::uint32_t>(bytes[0]) | (static_cast<std::uint32_t>(bytes[1]) << 8) |
+                     (static_cast<std::uint32_t>(bytes[2]) << 16) |
+                     (static_cast<std::uint32_t>(bytes[3]) << 24);
+    h.type = static_cast<std::uint16_t>(bytes[4] | (bytes[5] << 8));
+    h.version = static_cast<std::uint16_t>(bytes[6] | (bytes[7] << 8));
+    if (h.payload_size > kMaxPayloadSize) {
+        return Diag::make(ids::kFrameHeaderInvalid,
+                          "frame announces " + std::to_string(h.payload_size) +
+                              " payload bytes, above the limit of " +
+                              std::to_string(kMaxPayloadSize),
+                          kSameBuildAdvice);
+    }
+    return h;
+}
+
+Result<std::vector<std::uint8_t>> encode_frame(const Message& message) {
+    std::vector<std::uint8_t> frame(kFrameHeaderSize, 0);
+    Writer writer(frame);
+    std::visit([&writer](const auto& m) { encode(writer, m); }, message);
+    const MessageType type = type_of(message);
+    const std::size_t payload_size = frame.size() - kFrameHeaderSize;
+    if (writer.too_large() || payload_size > kMaxPayloadSize) {
+        return Diag::make(ids::kMessageTooLarge,
+                          std::string("cannot send ") + to_string(type) +
+                              ": a string or the whole payload exceeds the protocol limit",
+                          "Shorten the path or text, or report it if this is a real-world size.");
+    }
+    const auto size32 = static_cast<std::uint32_t>(payload_size);
+    const auto type16 = static_cast<std::uint16_t>(type);
+    for (int i = 0; i < 4; ++i) {
+        frame[static_cast<std::size_t>(i)] = static_cast<std::uint8_t>(size32 >> (8 * i));
+    }
+    frame[4] = static_cast<std::uint8_t>(type16);
+    frame[5] = static_cast<std::uint8_t>(type16 >> 8);
+    frame[6] = static_cast<std::uint8_t>(kMessageVersion);
+    frame[7] = static_cast<std::uint8_t>(kMessageVersion >> 8);
+    return frame;
+}
+
+Result<Message> decode_message(std::uint16_t type, std::uint16_t version, const std::uint8_t* payload,
+                               std::size_t size) {
+    const auto message_type = static_cast<MessageType>(type);
+    if (!is_implemented(message_type)) {
+        return Diag::make(ids::kMessageTypeUnsupported,
+                          "message type 0x" + hex(type, 4) + " (" + to_string(message_type) +
+                              ") is unknown or not implemented in this build",
+                          kSameBuildAdvice);
+    }
+    if (version != kMessageVersion) {
+        return Diag::make(ids::kMessageVersionUnsupported,
+                          std::string(to_string(message_type)) + " uses payload version " +
+                              std::to_string(version) + " but this build understands version " +
+                              std::to_string(kMessageVersion),
+                          kSameBuildAdvice);
+    }
+    if (payload == nullptr && size != 0) {
+        return malformed(to_string(message_type), "null payload with a non-zero size");
+    }
+    Reader reader(payload, size);
+    Message message;
+    switch (message_type) {
+        case MessageType::Hello: message = decode_hello(reader); break;
+        case MessageType::Welcome: message = decode_welcome(reader); break;
+        case MessageType::Reply: message = decode_reply(reader); break;
+        case MessageType::ModuleList: message = decode_module_list(reader); break;
+        case MessageType::EnableModule: message = decode_enable(reader); break;
+        case MessageType::DisableModule: message = decode_disable(reader); break;
+        case MessageType::ModuleLoaded: message = decode_loaded(reader); break;
+        case MessageType::ModuleUnloaded: message = decode_unloaded(reader); break;
+        case MessageType::Log: message = decode_log(reader); break;
+        default: break;  // unreachable: is_implemented() was checked above
+    }
+    if (!reader.ok()) {
+        return malformed(to_string(message_type), reader.error());
+    }
+    if (!reader.at_end()) {
+        return malformed(to_string(message_type), "unexpected trailing bytes");
+    }
+    return message;
+}
+
+Result<Message> decode_frame(const std::uint8_t* frame, std::size_t size) {
+    Result<FrameHeader> header = parse_frame_header(frame, size);
+    if (!header) {
+        return header.error();
+    }
+    if (size - kFrameHeaderSize != header->payload_size) {
+        return Diag::make(ids::kFrameHeaderInvalid,
+                          "frame header announces " + std::to_string(header->payload_size) +
+                              " payload bytes but " + std::to_string(size - kFrameHeaderSize) +
+                              " are present",
+                          kSameBuildAdvice);
+    }
+    return decode_message(header->type, header->version, frame + kFrameHeaderSize,
+                          header->payload_size);
+}
+
+std::string describe(const Message& message) {
+    struct Visitor {
+        std::string operator()(const Hello& m) const {
+            return "Hello request=" + std::to_string(m.request_id) +
+                   " protocol=" + std::to_string(m.protocol_version) +
+                   " abi=" + std::to_string(m.agent_abi_version) + " pid=" + std::to_string(m.pid) +
+                   " mode=" + (m.mode == AgentMode::Synchronized ? "synchronized" : "immediate") +
+                   " agent=" + quoted(m.agent_path) + " cmdline=" + quoted(m.command_line);
+        }
+        std::string operator()(const Welcome& m) const {
+            return "Welcome request=" + std::to_string(m.request_id) +
+                   " protocol=" + std::to_string(m.protocol_version) +
+                   " agent_id=" + std::to_string(m.agent_id) + " broker=" + quoted(m.broker_version);
+        }
+        std::string operator()(const ModuleList& m) const {
+            return "ModuleList request=" + std::to_string(m.request_id) +
+                   " modules=" + std::to_string(m.modules.size());
+        }
+        std::string operator()(const EnableModule& m) const {
+            return "EnableModule request=" + std::to_string(m.request_id) +
+                   " options=" + std::to_string(m.options) + " path=" + quoted(m.path);
+        }
+        std::string operator()(const DisableModule& m) const {
+            return "DisableModule request=" + std::to_string(m.request_id) + " path=" + quoted(m.path);
+        }
+        std::string operator()(const ModuleLoaded& m) const {
+            return "ModuleLoaded base=0x" + hex(m.module.base) + " size=" +
+                   std::to_string(m.module.size) + " path=" + quoted(m.module.path);
+        }
+        std::string operator()(const ModuleUnloaded& m) const {
+            return "ModuleUnloaded base=0x" + hex(m.module.base) + " size=" +
+                   std::to_string(m.module.size) + " path=" + quoted(m.module.path);
+        }
+        std::string operator()(const Log& m) const {
+            return "Log level=" + std::to_string(m.level) + " text=" + quoted(m.text);
+        }
+        std::string operator()(const Reply& m) const {
+            return "Reply request=" + std::to_string(m.request_id) +
+                   " status=" + std::to_string(m.status) + " message=" + quoted(m.message);
+        }
+    };
+    return std::visit(Visitor{}, message);
+}
+
+}  // namespace cml::ipc

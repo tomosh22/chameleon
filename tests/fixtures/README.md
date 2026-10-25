@@ -11,9 +11,16 @@ Flags: `/Gy /hotpatch`, link `/DEBUG:FULL /INCREMENTAL:NO /OPT:NOREF /OPT:NOICF 
 `_HAS_EXCEPTIONS=0` is removed for this directory). Everything else is the compiler's ordinary
 Debug/RelWithDebInfo flags, as in a user project.
 
+Fixtures can use the agent (`agent/include/Chameleon_API.h` is on their include path). They never link
+it: the header loads `cml_agent.dll` and finds it beside the fixture exe, because the whole project
+builds into one runtime output directory; `cml_add_fixture` only adds build-order dependencies on
+`cml_agent` and `cml_broker`. `--agent` (opt-in, WP-11) makes `basic` and `c_only` create the agent and
+enable their own module; `--agent-wait MS` bounds the wait for the broker's answer at exit.
+
 Each fixture keeps its unified-diff edits in `<name>/edits/*.edit` (applied with `-p1` relative
 to the fixture directory).
 
 | Fixture | Status | Notes |
 |---|---|---|
 | `basic` | present | `logic.cpp` is the patch target (two externals: `g_tick`, `fixture_note`); `extras.cpp` covers COFF features for reader tests; edit `value_2.edit` changes the printed value 1 → 2 |
+| `c_only` | present (WP-11) | one C99 TU using the C API of `Chameleon_API.h`; `main.c` prints `TICK n=<k> value=7`; `--agent` creates the agent, enables its own module, calls the sync point every iteration |

@@ -1,0 +1,131 @@
+#pragma once
+
+// Overlapped named-pipe transport shared by the agent and the broker (plan section 4.13).
+//
+// Windows-only; no exceptions, no RTTI, no third-party code. Frames are those of messages.h on a
+// byte-mode pipe.
+//
+// Threading rules for PipeConnection:
+//   * one thread at a time may call receive() and one thread at a time may call send(); the two
+//     may run concurrently with each other;
+//   * cancel() may be called from any thread at any time and is sticky: every blocked or later
+//     receive()/send() returns IoStatus::Cancelled;
+//   * the destructor and close() must not race with receive()/send(): cancel(), join the user
+//     threads, then destroy.
+//
+// Security: the server restricts the pipe to the current user with a protected DACL, rejects
+// remote clients and refuses to start if another process already owns the pipe name; clients open
+// the pipe at SECURITY_IDENTIFICATION level (the server cannot impersonate them) and check that
+// the server process runs as the same user. See docs/wp/WP-11.md.
+
+#if defined(_WIN32)
+
+#include <cstdint>
+#include <memory>
+#include <string>
+
+#include "cml/ipc/messages.h"
+#include "cml/util/result.h"
+
+namespace cml::ipc {
+
+// Result of a blocking operation that did not fail with an error.
+enum class IoStatus {
+    Ok,         // completed
+    Timeout,    // the timeout elapsed first (a partially received frame is kept for next time)
+    Woken,      // receive(): the caller's wake event was signalled
+    Closed,     // the peer closed the pipe (or the connection was closed locally)
+    Cancelled,  // cancel() was called
+};
+
+inline constexpr std::uint32_t kInfiniteTimeout = 0xFFFFFFFFu;
+
+class PipeConnection {
+public:
+    PipeConnection() noexcept;
+    ~PipeConnection();
+    PipeConnection(PipeConnection&&) noexcept;
+    PipeConnection& operator=(PipeConnection&&) noexcept;
+    PipeConnection(const PipeConnection&) = delete;
+    PipeConnection& operator=(const PipeConnection&) = delete;
+
+    bool is_open() const noexcept;
+
+    // Writes one complete frame. Ok, Timeout (the connection is unusable afterwards because a
+    // partial frame may have been written), Closed or Cancelled. A Diag (CML5200..5206) for
+    // encoding errors and unexpected OS errors.
+    Result<IoStatus> send(const Message& message, std::uint32_t timeout_ms);
+
+    struct Received {
+        IoStatus status = IoStatus::Closed;
+        Message message;  // valid only when status == Ok
+    };
+
+    // Waits for one complete frame. `wake_event` (a Win32 event HANDLE, may be null) makes the call
+    // return Woken as soon as it is signalled, so one thread can wait for both pipe traffic and
+    // its own work queue. A malformed frame returns a Diag and the connection should be closed.
+    Result<Received> receive(std::uint32_t timeout_ms, void* wake_event = nullptr);
+
+    void cancel() noexcept;
+    void close() noexcept;
+
+    // Process id of the other end of the pipe (0 if unknown).
+    std::uint32_t peer_process_id() const noexcept;
+
+    struct Impl;  // opaque; defined in pipe.cpp
+
+private:
+    friend class PipeServer;
+    friend Result<PipeConnection> connect_pipe(const std::string&, std::uint32_t);
+    explicit PipeConnection(std::unique_ptr<Impl> impl) noexcept;
+    std::unique_ptr<Impl> impl_;
+};
+
+// Opens a client connection to `pipe_name` ("\\.\pipe\..."). Waits up to `timeout_ms` when all
+// pipe instances are busy; returns immediately with CML5205 when the pipe does not exist. Also
+// CML5205 (access denied) and CML5209 (server runs as another user).
+Result<PipeConnection> connect_pipe(const std::string& pipe_name, std::uint32_t timeout_ms);
+
+// True if a pipe with this name exists (without connecting to it).
+bool pipe_exists(const std::string& pipe_name);
+
+class PipeServer {
+public:
+    PipeServer() noexcept;
+    ~PipeServer();
+    PipeServer(PipeServer&&) noexcept;
+    PipeServer& operator=(PipeServer&&) noexcept;
+    PipeServer(const PipeServer&) = delete;
+    PipeServer& operator=(const PipeServer&) = delete;
+
+    // Creates the first pipe instance. Fails with CML5207 when the name is taken by another
+    // process or the security descriptor cannot be built, CML5208 for a malformed name.
+    static Result<PipeServer> create(const std::string& pipe_name);
+
+    struct Accepted {
+        IoStatus status = IoStatus::Closed;  // Ok, Timeout, Woken or Cancelled
+        PipeConnection connection;           // valid only when status == Ok
+    };
+
+    // Waits for the next client. Any number of connections may be open at once.
+    Result<Accepted> accept(std::uint32_t timeout_ms, void* wake_event = nullptr);
+
+    // Any thread; sticky. Makes accept() return Cancelled.
+    void cancel() noexcept;
+
+    const std::string& name() const noexcept;
+
+private:
+    struct Impl;
+    explicit PipeServer(std::unique_ptr<Impl> impl) noexcept;
+    std::unique_ptr<Impl> impl_;
+};
+
+// Pipe name resolution (plan section 4.13): `explicit_name` (e.g. --pipe) if non-empty, else the
+// CML_PIPE_NAME environment variable, else `\\.\pipe\cml_broker_<logon session SID>`. Names must
+// start with `\\.\pipe\` (CML5208).
+Result<std::string> resolve_pipe_name(const std::string& explicit_name);
+
+}  // namespace cml::ipc
+
+#endif  // _WIN32
