@@ -369,7 +369,7 @@ TEST_CASE("prefix handling") {
     expect_unknown(fifteen);
     // An instruction that would be longer than 15 bytes is invalid.
     Bytes too_long(13, 0x66);
-    for (std::uint8_t b : {0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00}) {
+    for (const std::uint8_t b : std::initializer_list<std::uint8_t>{0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00}) {
         too_long.push_back(b);
     }
     expect_unknown(too_long);
