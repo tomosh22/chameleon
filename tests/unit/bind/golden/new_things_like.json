@@ -1,0 +1,139 @@
+{
+  "version": 1,
+  "object": "logic.cpp.obj",
+  "module": "old.exe",
+  "compiland": "C:\\proj\\obj\\logic.cpp.obj",
+  "module_base": 5368709120,
+  "summary": {
+    "hooks": 1,
+    "bind_old_data": 0,
+    "thunks": 1,
+    "new": 2,
+    "fixups": 1
+  },
+  "decisions": [
+    {
+      "symbol": "?compute_value@@YAHXZ",
+      "display": "compute_value",
+      "type": "function",
+      "defined": true,
+      "static": false,
+      "decision": "patch-hooked",
+      "source": "pdb-public",
+      "module": "old.exe",
+      "rva": 4112,
+      "va": 5368713232,
+      "reason": "defined function present in the old image (public at rva 0x1010): old entry is hooked to the patch definition"
+    },
+    {
+      "symbol": "?new_helper@@YAHXZ",
+      "display": "new_helper",
+      "type": "function",
+      "defined": true,
+      "static": false,
+      "decision": "patch-new-function",
+      "source": "none",
+      "reason": "defined function not in the old image: new canonical symbol, no hook"
+    },
+    {
+      "symbol": "?g_tracker@?A0x9@@3UTracker@@A",
+      "display": "(anonymous namespace)::g_tracker",
+      "type": "data",
+      "defined": true,
+      "static": true,
+      "decision": "patch-new-data",
+      "source": "none",
+      "reason": "static data 'g_tracker' has no record in compiland 0: new"
+    },
+    {
+      "symbol": "??__Eg_tracker@?A0x9@@YAXXZ",
+      "display": "`dynamic initializer for '(anonymous namespace)::g_tracker''",
+      "type": "function",
+      "defined": true,
+      "static": true,
+      "decision": "patch-fresh",
+      "source": "none",
+      "reason": "dynamic initialiser or atexit stub: run through the initialiser list, never hooked"
+    },
+    {
+      "symbol": "??__Fg_tracker@?A0x9@@YAXXZ",
+      "display": "`dynamic atexit destructor for '(anonymous namespace)::g_tracker''",
+      "type": "function",
+      "defined": true,
+      "static": true,
+      "decision": "patch-fresh",
+      "source": "none",
+      "reason": "dynamic initialiser or atexit stub: run through the initialiser list, never hooked"
+    },
+    {
+      "symbol": "atexit",
+      "display": "atexit",
+      "type": "function",
+      "defined": false,
+      "static": false,
+      "decision": "bind-old-function",
+      "source": "export",
+      "module": "ucrtbase.dll",
+      "va": 140716281958400,
+      "reason": "undefined function resolved (export of ucrtbase.dll): thunk and slot"
+    }
+  ],
+  "hooks": [
+    {
+      "new_symbol": "?compute_value@@YAHXZ",
+      "display": "compute_value",
+      "old_rva": 4112,
+      "old_va": 5368713232,
+      "old_size": 32,
+      "source": "pdb-public"
+    }
+  ],
+  "thunks": [
+    {
+      "name": "atexit",
+      "display": "atexit",
+      "slot": "__cml_slot_atexit",
+      "source": "export",
+      "module": "ucrtbase.dll",
+      "va": 140716281958400
+    }
+  ],
+  "placeholders": [],
+  "new_functions": [
+    {
+      "name": "?new_helper@@YAHXZ",
+      "display": "new_helper",
+      "static": false
+    }
+  ],
+  "new_globals": [
+    {
+      "name": "?g_tracker@?A0x9@@3UTracker@@A",
+      "display": "(anonymous namespace)::g_tracker",
+      "static": true,
+      "initialisers": [
+        "??__Eg_tracker@?A0x9@@YAXXZ"
+      ]
+    }
+  ],
+  "initialisers": [
+    {
+      "function": "??__Eg_tracker@?A0x9@@YAXXZ",
+      "display": "`dynamic initializer for '(anonymous namespace)::g_tracker''",
+      "table_section": ".CRT$XCU",
+      "table_offset": 0,
+      "tu_wide": false,
+      "globals": [
+        "?g_tracker@?A0x9@@3UTracker@@A"
+      ]
+    }
+  ],
+  "fixups": [
+    {
+      "kind": "SLOT",
+      "symbol": "__cml_slot_atexit",
+      "target_va": 140716281958400
+    }
+  ],
+  "warnings": []
+}

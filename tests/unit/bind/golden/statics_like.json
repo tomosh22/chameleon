@@ -1,0 +1,193 @@
+{
+  "version": 1,
+  "object": "logic.cpp.obj",
+  "module": "old.exe",
+  "compiland": "C:\\proj\\obj\\logic.cpp.obj",
+  "module_base": 5368709120,
+  "summary": {
+    "hooks": 2,
+    "bind_old_data": 5,
+    "thunks": 0,
+    "new": 0,
+    "fixups": 5
+  },
+  "decisions": [
+    {
+      "symbol": "?statics_value@@YAHXZ",
+      "display": "statics_value",
+      "type": "function",
+      "defined": true,
+      "static": false,
+      "decision": "patch-hooked",
+      "source": "pdb-public",
+      "module": "old.exe",
+      "rva": 4176,
+      "va": 5368713296,
+      "reason": "defined function present in the old image (public at rva 0x1050): old entry is hooked to the patch definition"
+    },
+    {
+      "symbol": "?make_base@@YAHXZ",
+      "display": "make_base",
+      "type": "function",
+      "defined": true,
+      "static": true,
+      "decision": "patch-hooked",
+      "source": "compiland-static",
+      "module": "old.exe",
+      "rva": 4240,
+      "va": 5368713360,
+      "reason": "static function present in the old compiland: matched record 'make_base' at rva 0x1090 in compiland 0 (compiland-static)"
+    },
+    {
+      "symbol": "?s_calls@?A0x5a5a5a5a@@3HA",
+      "display": "(anonymous namespace)::s_calls",
+      "type": "data",
+      "defined": true,
+      "static": true,
+      "decision": "bind-old-data",
+      "source": "compiland-static",
+      "module": "old.exe",
+      "rva": 12304,
+      "va": 5368721424,
+      "reason": "static data present in the old compiland: matched record '`anonymous namespace'::s_calls' at rva 0x3010 in compiland 0 (compiland-static)"
+    },
+    {
+      "symbol": "?g@?1??statics_value@@YAHXZ@4UGuarded@@A",
+      "display": "statics_value::g",
+      "type": "data",
+      "defined": true,
+      "static": true,
+      "decision": "bind-old-data",
+      "source": "compiland-static",
+      "module": "old.exe",
+      "rva": 12320,
+      "va": 5368721440,
+      "reason": "static data present in the old compiland: matched record 'g' at rva 0x3020 in compiland 0 (compiland-static)"
+    },
+    {
+      "symbol": "?$TSS0@?1??statics_value@@YAHXZ@4HA",
+      "display": "statics_value::$TSS0",
+      "type": "data",
+      "defined": true,
+      "static": true,
+      "decision": "bind-old-data",
+      "source": "compiland-layout",
+      "module": "old.exe",
+      "rva": 12324,
+      "va": 5368721444,
+      "reason": "guard variable of a function-local static: inferred at rva 0x3024 from the unchanged layout of object section 3 (every matched static there agrees)"
+    },
+    {
+      "symbol": "?k_weights@@3QBHB",
+      "display": "k_weights",
+      "type": "data",
+      "defined": true,
+      "static": true,
+      "decision": "bind-old-data",
+      "source": "compiland-static",
+      "module": "old.exe",
+      "rva": 12352,
+      "va": 5368721472,
+      "reason": "static data present in the old compiland: matched record 'k_weights' at rva 0x3040 in compiland 0 (compiland-static)"
+    },
+    {
+      "symbol": "?total@Accum@@2HA",
+      "display": "Accum::total",
+      "type": "data",
+      "defined": false,
+      "static": false,
+      "decision": "bind-old-data",
+      "source": "pdb-public",
+      "module": "old.exe",
+      "rva": 12432,
+      "va": 5368721552,
+      "reason": "undefined data resolved (public at rva 0x3090): placeholder, references retargeted"
+    }
+  ],
+  "hooks": [
+    {
+      "new_symbol": "?statics_value@@YAHXZ",
+      "display": "statics_value",
+      "old_rva": 4176,
+      "old_va": 5368713296,
+      "old_size": 48,
+      "source": "pdb-public"
+    },
+    {
+      "new_symbol": "?make_base@@YAHXZ",
+      "display": "make_base",
+      "old_rva": 4240,
+      "old_va": 5368713360,
+      "old_size": 16,
+      "source": "compiland-static"
+    }
+  ],
+  "thunks": [],
+  "placeholders": [
+    {
+      "name": "?total@Accum@@2HA",
+      "display": "Accum::total",
+      "source": "pdb-public",
+      "synthesized_import_slot": false,
+      "module": "old.exe",
+      "rva": 12432,
+      "va": 5368721552
+    }
+  ],
+  "new_functions": [],
+  "new_globals": [],
+  "initialisers": [],
+  "fixups": [
+    {
+      "kind": "REL32",
+      "section": 1,
+      "section_name": ".text$mn",
+      "offset": 16,
+      "addend": 0,
+      "symbol": "?$TSS0@?1??statics_value@@YAHXZ@4HA",
+      "target_rva": 12324,
+      "target_va": 5368721444
+    },
+    {
+      "kind": "REL32",
+      "section": 1,
+      "section_name": ".text$mn",
+      "offset": 24,
+      "addend": 0,
+      "symbol": "?g@?1??statics_value@@YAHXZ@4UGuarded@@A",
+      "target_rva": 12320,
+      "target_va": 5368721440
+    },
+    {
+      "kind": "REL32_1",
+      "section": 1,
+      "section_name": ".text$mn",
+      "offset": 32,
+      "addend": 0,
+      "symbol": "?s_calls@?A0x5a5a5a5a@@3HA",
+      "target_rva": 12304,
+      "target_va": 5368721424
+    },
+    {
+      "kind": "REL32",
+      "section": 1,
+      "section_name": ".text$mn",
+      "offset": 40,
+      "addend": 0,
+      "symbol": "?k_weights@@3QBHB",
+      "target_rva": 12352,
+      "target_va": 5368721472
+    },
+    {
+      "kind": "REL32_1",
+      "section": 1,
+      "section_name": ".text$mn",
+      "offset": 48,
+      "addend": 0,
+      "symbol": "?total@Accum@@2HA",
+      "target_rva": 12432,
+      "target_va": 5368721552
+    }
+  ],
+  "warnings": []
+}

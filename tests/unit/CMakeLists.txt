@@ -80,6 +80,7 @@ cml_add_unit_test(agent
     SOURCES agent/test_sync_queue.cpp agent/test_module_diff.cpp
     LIBS cml_agent_core)
 cml_add_unit_test(broker_core SOURCES broker/test_core.cpp broker/test_session.cpp LIBS cml_core)
+add_subdirectory(bind)  # WP-07: unit.bind
 if(NOT MSVC)
     # Portable pieces are tested on non-Windows hosts too (CML_ALLOW_NON_WINDOWS).
     target_link_libraries(cml_test_agent PRIVATE Threads::Threads)
