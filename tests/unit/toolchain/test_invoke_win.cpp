@@ -223,17 +223,17 @@ TEST_CASE("cancelling a /Zi compile does not break a concurrent /Zi compile (msp
     fs::create_directories(dir, ec);
     {
         std::ofstream src(dir / "slow.cpp");
-        src << "#include <map>\n#include <string>\n#include <vector>\n";
-        for (int i = 0; i < 1500; ++i) {
-            src << "int f" << i << "(int x) { std::map<int, std::string> m; m[x] = \"v" << i << "\"; std::vector<int> v(x, " << i
-                << "); return static_cast<int>(m.size() + v.size()); }\n";
+        // No #include: the VS-generator job has no INCLUDE environment variable.
+        for (int i = 0; i < 6000; ++i) {
+            src << "struct S" << i << " { int a; int b[8]; int get(int k) const { return a + b[k & 7] + " << i << "; } };\n"
+                << "int f" << i << "(int x) { S" << i << " s{}; s.a = x; for (int k = 0; k < 8; ++k) s.b[k] = k * x; return s.get(x); }\n";
         }
     }
     const auto compile = [&](const char* tag) {
         ProcessSpec spec;
         spec.exe = CML_TEST_CXX_COMPILER;
         spec.cwd = dir.string();
-        spec.args = {"/nologo", "/c", "/Zi", "/Od", "/EHsc", "/FS", std::string("/Fd") + (dir / (std::string(tag) + ".pdb")).string(),
+        spec.args = {"/nologo", "/c", "/Zi", "/Od", "/FS", std::string("/Fd") + (dir / (std::string(tag) + ".pdb")).string(),
                      std::string("/Fo") + (dir / (std::string(tag) + ".obj")).string(), "slow.cpp"};
         spec.timeout_ms = 240000;
         return spec;
