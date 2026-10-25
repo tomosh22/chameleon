@@ -29,3 +29,6 @@ compile_commands.json
 *.cml-cache
 *.log
 ci-logs/
+
+# WP-03 spike working directory
+/spike-work/
