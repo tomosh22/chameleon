@@ -269,3 +269,69 @@ private-bytes growth plus the mapped file, is 1.40× the PDB size, against a bud
 PDB fails with `ERROR_USER_MAPPED_FILE`. **WP-12 must release the module's index (or switch it to
 a copy-in-memory mode) before anything relinks that module**, e.g. before hot-restart rebuilds.
 Patch PDBs are separate files and are unaffected.
+
+## ADR-0018 Review convergence policy
+
+**Date:** 2026-10-25 · **Status:** Accepted
+
+WP-11 needed six review rounds. Each high-effort review of the previous round's delta found
+new edge cases, several of them introduced by the fixes themselves. Policy from now on:
+1. The first review covers the whole PR at the required effort. Every finding with a realistic
+   path gets fixed.
+2. Later reviews cover only the fix delta and report only high-severity bugs: crash, UAF,
+   deadlock, hang, lost requests, security.
+3. When the same area keeps producing findings, the orchestrator stops issuing open-ended fix
+   lists. It makes the design decision itself (exact rules, invariants), sends that as the spec,
+   and merges on green CI. Remaining minor findings become tracked follow-ups (`PROGRESS.md`).
+4. Prefer reverting a fix that caused regressions over patching it again.
+
+## ADR-0019 Agent API contract details settled in WP-11
+
+**Date:** 2026-10-25 · **Status:** Accepted
+
+- `cml_destroy_agent` / `cml::DestroyAgent` return `cml_status`. Destroy is refused, with
+  `CML_STATUS_INVALID_ARGUMENT`, when it is called from inside another agent call on the same
+  thread, e.g. from work run in `SyncPoint()`. The ABI version stays at 2: no external
+  consumer existed before this merge.
+- `DestroyAgent` must not race with other calls on the same agent, except threads already
+  blocked in `WaitForRequest`. Those are released with CML5215 and destroy waits for them to
+  leave.
+- Only an explicit, successful `DisableModule` removes a module from the agent's enabled set.
+  Refused internal re-enables are retried after the next accepted module list.
+- Auto-started broker launches back off 1 s → 60 s; refused module-list resends back off
+  1 s → 30 s. Both back-offs reset once a module list is accepted.
+
+## ADR-0021 Control-pipe protocol for tests and IDEs (WP-13 defines, WP-12 implements)
+
+**Date:** 2026-10-25 · **Status:** Accepted
+
+- **Transport:** named pipe `\\.\pipe\cml_control_<logon-session SID>` with the same
+  current-user-only DACL as the agent pipe. Overrides: `CML_CONTROL_PIPE` and
+  `cml_broker --control-pipe NAME`.
+- **Framing:** newline-delimited JSON in UTF-8.
+  - Request: `{"id","cmd","args"}`.
+  - Response: `{"id","ok","result","diag"}`.
+  - Unsolicited events: `{"event",...}`.
+  - JSON lines were chosen over the agent's binary framing because the consumers are IDE
+    extensions (WP-30/31) and scripts.
+- **Commands:** `status` (includes `capabilities`), `reload`, `wait`, `set-option`, `subscribe`.
+- **Parsing:** a hand-rolled, bounds-checked JSON codec in `cml_ipc`. No new third-party
+  dependency.
+
+## ADR-0022 Harness capability gate until the pipeline exists
+
+**Date:** 2026-10-25 · **Status:** Accepted (temporary)
+
+WP-13's acceptance ("harness runs the `basic` scenario in CI") comes before WP-12 delivers
+`reload`. cmltest therefore queries `status.capabilities` and reports any step whose capability
+is missing, and all later steps, as **skipped**. It prints a loud `PARTIAL:` summary line.
+Skipped steps never count as passes. WP-12's acceptance switches CI to
+`--require-all-capabilities`, which turns skips into failures. That switch removes the gate.
+
+## ADR-0023 Spike runs externally, not through the agent
+
+**Date:** 2026-10-25 · **Status:** Accepted
+
+WP-03 drives fixture `basic` from outside (`VirtualAllocEx`, remote `LoadLibraryW` thread,
+`WriteProcessMemory`, external `SuspendThread`) as its "stub agent". WP-11's agent is not
+involved. This isolates the gate from agent bugs. Patching from inside the agent is WP-08 and WP-10.
