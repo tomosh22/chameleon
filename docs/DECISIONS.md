@@ -300,3 +300,38 @@ new edge cases, several of them introduced by the fixes themselves. Policy from 
   Refused internal re-enables are retried after the next accepted module list.
 - Auto-started broker launches back off 1 s → 60 s; refused module-list resends back off
   1 s → 30 s. Both back-offs reset once a module list is accepted.
+
+## ADR-0021 Control-pipe protocol for tests and IDEs (WP-13 defines, WP-12 implements)
+
+**Date:** 2026-10-25 · **Status:** Accepted
+
+- **Transport:** named pipe `\\.\pipe\cml_control_<logon-session SID>` with the same
+  current-user-only DACL as the agent pipe. Overrides: `CML_CONTROL_PIPE` and
+  `cml_broker --control-pipe NAME`.
+- **Framing:** newline-delimited JSON in UTF-8.
+  - Request: `{"id","cmd","args"}`.
+  - Response: `{"id","ok","result","diag"}`.
+  - Unsolicited events: `{"event",...}`.
+  - JSON lines were chosen over the agent's binary framing because the consumers are IDE
+    extensions (WP-30/31) and scripts.
+- **Commands:** `status` (includes `capabilities`), `reload`, `wait`, `set-option`, `subscribe`.
+- **Parsing:** a hand-rolled, bounds-checked JSON codec in `cml_ipc`. No new third-party
+  dependency.
+
+## ADR-0022 Harness capability gate until the pipeline exists
+
+**Date:** 2026-10-25 · **Status:** Accepted (temporary)
+
+WP-13's acceptance ("harness runs the `basic` scenario in CI") comes before WP-12 delivers
+`reload`. cmltest therefore queries `status.capabilities` and reports any step whose capability
+is missing, and all later steps, as **skipped**. It prints a loud `PARTIAL:` summary line.
+Skipped steps never count as passes. WP-12's acceptance switches CI to
+`--require-all-capabilities`, which turns skips into failures. That switch removes the gate.
+
+## ADR-0023 Spike runs externally, not through the agent
+
+**Date:** 2026-10-25 · **Status:** Accepted
+
+WP-03 drives fixture `basic` from outside (`VirtualAllocEx`, remote `LoadLibraryW` thread,
+`WriteProcessMemory`, external `SuspendThread`) as its "stub agent". WP-11's agent is not
+involved. This isolates the gate from agent bugs. Patching from inside the agent is WP-08 and WP-10.
