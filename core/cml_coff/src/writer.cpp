@@ -240,6 +240,10 @@ Result<std::uint32_t> ObjectModel::add_string(std::string_view text) {
 
 Result<std::array<std::uint8_t, 8>> ObjectModel::encode_symbol_name(std::string_view name) {
     std::array<std::uint8_t, 8> raw{};
+    if (name.empty()) {
+        return make_diag(diag::kBadSymbol, "symbol name is empty",
+                         "Give the symbol a non-empty name (an all-zero name field means string-table offset 0, which is invalid).");
+    }
     if (name.size() <= 8 && name.find('\0') == std::string_view::npos) {
         for (std::size_t i = 0; i < name.size(); ++i) {
             raw[i] = static_cast<std::uint8_t>(name[i]);
@@ -296,7 +300,7 @@ Result<std::uint32_t> ObjectModel::add_section(std::string_view name, std::uint3
     }
     ModelSection s;
     s.name = std::string(name);
-    if (name.size() <= 8) {
+    if (name.size() <= 8 && name[0] != '/') {  // a leading '/' would read as a string-table reference
         std::memcpy(s.raw_name.data(), name.data(), name.size());
     } else {
         auto off = add_string(name);
@@ -329,7 +333,7 @@ ByteVector make_section_definition_aux(bool bigobj, std::uint32_t length, std::u
     ByteVector aux(bigobj ? 20u : 18u, std::byte{0});
     std::byte* p = aux.data();
     set32(p + 0, length);
-    set16(p + 4, relocation_count);
+    set16(p + 4, relocation_count > 0xFFFFu ? 0xFFFFu : relocation_count);  // 0xFFFF with NRELOC_OVFL sections
     set16(p + 6, 0);
     set32(p + 8, checksum);
     set16(p + 12, associated_section & 0xFFFFu);
@@ -388,6 +392,10 @@ Result<ByteVector> write(const ObjectModel& m) {
     }
     for (std::size_t i = 0; i < m.symbols.size(); ++i) {
         const ModelSymbol& s = m.symbols[i];
+        if (std::all_of(s.raw_name.begin(), s.raw_name.end(), [](std::uint8_t b) { return b == 0; })) {
+            return make_diag(diag::kBadSymbol, format("symbol %zu has an empty name (all-zero name field)", i),
+                             "Give the symbol a non-empty name.");
+        }
         if (s.aux.size() % rec != 0 || s.aux.size() / rec > 255) {
             return make_diag(diag::kBadSymbol,
                              format("symbol '%.*s' has %zu aux bytes (not a whole number of %zu-byte records, or more than 255)",
@@ -406,6 +414,16 @@ Result<ByteVector> write(const ObjectModel& m) {
                              format("symbol '%.*s' has invalid section number %d", static_cast<int>(std::min<std::size_t>(s.name.size(), 64)),
                                     s.name.data(), static_cast<int>(s.section_number)),
                              "Use 0 (undefined), -1 (absolute), -2 (debug) or a section index.");
+        }
+    }
+    for (std::size_t si = 0; si < m.sections.size(); ++si) {
+        const ModelSection& s = m.sections[si];
+        if (!s.linenumbers.empty() && s.linenumbers.size() != static_cast<std::size_t>(s.linenumber_count) * kLineNumberSize) {
+            return make_diag(diag::kUnrepresentable,
+                             format("section %zu '%s' declares %u line numbers but holds %zu bytes of them (%zu expected)", si + 1,
+                                    s.name.c_str(), static_cast<unsigned>(s.linenumber_count), s.linenumbers.size(),
+                                    static_cast<std::size_t>(s.linenumber_count) * kLineNumberSize),
+                             "Keep linenumber_count equal to linenumbers.size() / 6.");
         }
     }
     // Relocation targets must exist.
@@ -511,9 +529,10 @@ Result<ByteVector> write(const ObjectModel& m) {
         const bool has_reloc = reloc_at[i] != kNoOffset;
         const bool ext = section_needs_extended(s);
         set32(sec + 24, has_reloc ? static_cast<std::uint32_t>(reloc_at[i]) : s.pointer_to_relocations);
-        set32(sec + 28, lines_at[i] != kNoOffset ? static_cast<std::uint32_t>(lines_at[i]) : s.pointer_to_linenumbers);
+        // Without a line-number table both fields are written as 0 (the format is obsolete).
+        set32(sec + 28, lines_at[i] != kNoOffset ? static_cast<std::uint32_t>(lines_at[i]) : 0u);
         set16(sec + 32, has_reloc ? (ext ? 0xFFFFu : static_cast<std::uint32_t>(s.relocations.size())) : 0u);
-        set16(sec + 34, s.linenumber_count);
+        set16(sec + 34, lines_at[i] != kNoOffset ? s.linenumber_count : 0u);
         set32(sec + 36, ext ? (s.characteristics | scn::LnkNrelocOvfl) : s.characteristics);
     }
 

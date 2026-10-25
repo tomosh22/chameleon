@@ -14,6 +14,7 @@
 #include <initializer_list>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "cml/coff/anchors.h"
@@ -449,19 +450,20 @@ TEST_CASE("coff writer: errors carry CML33xx ids") {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Anchors
+// Anchors and section locators
 // ---------------------------------------------------------------------------------------------
 
 namespace {
 
 // Checks everything add_anchors() promises, comparing the object before and after.
-void check_anchored(const coff::Object& before, const coff::Object& after, const std::vector<coff::Anchor>& anchors,
-                    const coff::AnchorOptions& options, const std::string& what) {
+void check_anchored(const coff::Object& before, const coff::Object& after, const std::vector<coff::SectionLocator>& locators,
+                    const std::string& tag, const std::string& what) {
     INFO(what);
     REQUIRE(before.sections().size() == after.sections().size());
+    REQUIRE(locators.size() == before.sections().size());
     CHECK(before.is_bigobj() == after.is_bigobj());
 
-    // Sections: headers (except nothing), data and relocation tables untouched.
+    // Sections: headers, data and relocation tables untouched.
     for (std::size_t i = 0; i < before.sections().size(); ++i) {
         const coff::Section& a = before.sections()[i];
         const coff::Section& b = after.sections()[i];
@@ -476,20 +478,22 @@ void check_anchored(const coff::Object& before, const coff::Object& after, const
         CHECK(a.has_extended_relocations == b.has_extended_relocations);
     }
 
+    std::size_t anchors = 0;
+    for (const coff::SectionLocator& l : locators) {
+        anchors += l.kind == coff::LocatorKind::Anchor ? 1u : 0u;
+    }
     // Symbols: the old table is an exact prefix of the new one, appended records are the anchors.
     const coff::ByteSpan old_syms = before.symbol_table_bytes();
     const coff::ByteSpan new_syms = after.symbol_table_bytes();
     REQUIRE(new_syms.size() >= old_syms.size());
     CHECK(spans_equal(old_syms, new_syms.subspan(0, old_syms.size())));
-    CHECK(after.header().symbol_count == before.header().symbol_count + anchors.size());
-    // The string table only grew at its end.
+    CHECK(after.header().symbol_count == before.header().symbol_count + anchors);
     const coff::ByteSpan old_str = before.string_table_bytes();
     const coff::ByteSpan new_str = after.string_table_bytes();
     if (!old_str.empty()) {
         REQUIRE(new_str.size() >= old_str.size());
         CHECK(spans_equal(old_str.subspan(4), new_str.subspan(4, old_str.size() - 4)));
     }
-    // Existing symbols: same names, indices and attributes.
     for (const coff::Symbol& s : before.symbols()) {
         const coff::Symbol* t = after.symbol_at(s.index);
         REQUIRE(t != nullptr);
@@ -520,135 +524,235 @@ void check_anchored(const coff::Object& before, const coff::Object& after, const
         }
     }
 
-    // Anchors: one per anchorable section, in section order, appended in order.
-    std::vector<std::uint32_t> expected;
-    for (const coff::Section& sec : before.sections()) {
+    // Locators.
+    std::uint32_t next = before.header().symbol_count;
+    for (const coff::SectionLocator& l : locators) {
+        INFO("locator of section " << l.section_index);
+        const coff::Section* sec = before.section(l.section_index);
+        REQUIRE(sec != nullptr);
         coff::ModelSection ms;
-        ms.name = std::string(sec.name);
-        ms.characteristics = sec.characteristics;
-        if (coff::is_anchorable(ms)) {
-            expected.push_back(sec.index);
+        ms.name = std::string(sec->name);
+        ms.characteristics = sec->characteristics;
+        CHECK(l.section_index == sec->index);
+        switch (l.kind) {
+            case coff::LocatorKind::Anchor: {
+                CHECK(coff::is_anchorable(ms));
+                CHECK_FALSE(sec->is_comdat());
+                CHECK(l.symbol_name == coff::anchor_name(l.section_index, tag));
+                CHECK(l.symbol_index == next);
+                const coff::Symbol* s = after.symbol_at(l.symbol_index);
+                REQUIRE(s != nullptr);
+                CHECK(s->name == l.symbol_name);
+                CHECK(s->value == 0);
+                CHECK(l.offset == 0);
+                CHECK(s->section_number == static_cast<std::int32_t>(l.section_index));
+                CHECK(s->type == 0);
+                CHECK(s->aux_count == 0);
+                CHECK(s->storage_class == coff::StorageClass::External);
+                ++next;
+                break;
+            }
+            case coff::LocatorKind::ComdatLeader: {
+                CHECK(coff::is_anchorable(ms));
+                const auto c = before.comdat(*sec);
+                REQUIRE(c.has_value());
+                REQUIRE(c->leader != nullptr);
+                CHECK(c->selection != coff::ComdatSelection::Associative);
+                CHECK(l.symbol_name == c->leader->name);
+                CHECK(l.symbol_index == c->leader->index);
+                CHECK(l.offset == c->leader->value);
+                CHECK(c->leader->storage_class == coff::StorageClass::External);
+                const coff::Symbol* s = after.symbol_at(l.symbol_index);
+                REQUIRE(s != nullptr);
+                CHECK(s->name == l.symbol_name);
+                break;
+            }
+            case coff::LocatorKind::None: {
+                CHECK(l.symbol_name.empty());
+                CHECK(l.reason != coff::NoLocatorReason::HasLocator);
+                CHECK_FALSE(coff::require_locator(l).has_value());
+                if (l.reason == coff::NoLocatorReason::NotLinked) {
+                    CHECK_FALSE(coff::is_anchorable(ms));
+                }
+                if (l.reason == coff::NoLocatorReason::Associative) {
+                    const auto c = before.comdat(*sec);
+                    REQUIRE(c.has_value());
+                    CHECK(c->selection == coff::ComdatSelection::Associative);
+                }
+                break;
+            }
         }
     }
-    REQUIRE(anchors.size() == expected.size());
-    std::uint32_t next = before.header().symbol_count;
-    for (std::size_t i = 0; i < anchors.size(); ++i) {
-        const coff::Anchor& a = anchors[i];
-        CHECK(a.section_index == expected[i]);
-        CHECK(a.symbol_name == coff::anchor_name(a.section_index, options.tag));
-        CHECK(a.symbol_index == next);
-        const coff::Symbol* s = after.symbol_at(a.symbol_index);
-        REQUIRE(s != nullptr);
-        CHECK(s->name == a.symbol_name);
-        CHECK(s->value == 0);
-        CHECK(s->section_number == static_cast<std::int32_t>(a.section_index));
-        CHECK(s->type == 0);
-        CHECK(s->aux_count == 0);
-        CHECK(s->storage_class == (options.external ? coff::StorageClass::External : coff::StorageClass::Static));
-        ++next;
+}
+
+// Three COMDAT sections: a static leader, no leader, an external leader at value 8.
+ObjSpec leader_cases_spec(bool big) {
+    ObjSpec o;
+    o.bigobj = big;
+    for (int i = 0; i < 3; ++i) {
+        SectionSpec s;
+        s.name = ".text$mn";
+        s.characteristics = coff::scn::CntCode | coff::scn::MemExecute | coff::scn::MemRead | coff::scn::LnkComdat;
+        s.data = Bytes(16, 0xC3);
+        o.sections.push_back(s);
     }
+    const auto sym = [&](const char* name, std::uint32_t value, std::int32_t sec, std::uint16_t type, std::uint8_t cls,
+                         std::vector<Bytes> aux = {}) {
+        SymbolSpec s;
+        s.name = name;
+        s.value = value;
+        s.section = sec;
+        s.type = type;
+        s.storage_class = cls;
+        s.aux = std::move(aux);
+        o.symbols.push_back(s);
+    };
+    sym(".text$mn", 0, 1, 0, 3, {aux_section_def(big, 16, 0, 0, 1, 0, 2)});   // 0 (+1)
+    sym("static_leader", 0, 1, 0x20, 3);                                       // 2  static leader
+    sym(".text$mn", 0, 2, 0, 3, {aux_section_def(big, 16, 0, 0, 2, 0, 2)});   // 3 (+4)  no leader
+    sym(".text$mn", 0, 3, 0, 3, {aux_section_def(big, 16, 0, 0, 3, 0, 2)});   // 5 (+6)
+    sym("leader_at_8", 8, 3, 0x20, 2);                                         // 7  external leader, offset 8
+    return o;
 }
 
 }  // namespace
 
-TEST_CASE("coff anchors: rules on a synthetic COMDAT object (regular and bigobj)") {
+TEST_CASE("coff anchors: locator rules on a synthetic COMDAT object (regular and bigobj)") {
     for (bool big : {false, true}) {
-        for (bool external : {false, true}) {
-            const Built b = build_object(comdat_spec(big));
-            auto before = coff::Object::parse(span_of(b.bytes));
-            REQUIRE(before.has_value());
-            auto m = coff::ObjectModel::from_object(*before);
-            REQUIRE(m.has_value());
-            coff::AnchorOptions opt;
-            opt.external = external;
-            if (external) {
-                opt.tag = "t1";
-            }
-            auto anchors = coff::add_anchors(*m, opt);
-            REQUIRE_MESSAGE(anchors.has_value(), anchors.error().format());
-            // Sections 1,2,3,6,7,9 are anchored; .drectve (4), .debug$S (5), .llvm_addrsig (8) are not.
-            REQUIRE(anchors->size() == 6);
-            std::vector<std::uint32_t> got;
-            for (const coff::Anchor& a : *anchors) {
-                got.push_back(a.section_index);
-            }
-            CHECK(got == std::vector<std::uint32_t>{1, 2, 3, 6, 7, 9});
-            CHECK((*anchors)[0].symbol_name == (external ? "__cml_anchor_t1_1" : "__cml_anchor_1"));
-            auto w = coff::write(*m);
-            REQUIRE_MESSAGE(w.has_value(), w.error().format());
-            auto after = coff::Object::parse(coff::ByteSpan(w->data(), w->size()));
-            REQUIRE_MESSAGE(after.has_value(), after.error().format());
-            check_anchored(*before, *after, *anchors, opt, std::string(big ? "bigobj " : "regular ") + (external ? "external" : "static"));
-            // The oracle agrees with the reader on the anchored object.
-            CHECK(compare_with_reader(independent_parse(to_u8(*w)), *after).empty());
-
-            // COMDAT leader rule spelled out: section 1's leader is still symbol 1, directly after
-            // its definition symbol 0, and the associative sections have no leader.
-            const auto c1 = after->comdat(*after->section(1));
-            REQUIRE(c1.has_value());
-            REQUIRE(c1->leader != nullptr);
-            CHECK(c1->section_symbol->index == 0);
-            CHECK(c1->leader->index == 2);  // definition (0) + its aux (1) + leader (2)
-            CHECK(c1->leader->name == "?leader_fn@@YAXXZ");
-            const auto c2 = after->comdat(*after->section(2));
-            REQUIRE(c2.has_value());
-            CHECK(c2->selection == coff::ComdatSelection::Associative);
-            CHECK(c2->associated_section == 1);
-            CHECK(c2->leader == nullptr);
+        const Built b = build_object(comdat_spec(big));
+        auto before = coff::Object::parse(span_of(b.bytes));
+        REQUIRE(before.has_value());
+        auto m = coff::ObjectModel::from_object(*before);
+        REQUIRE(m.has_value());
+        auto loc = coff::add_anchors(*m);
+        REQUIRE_MESSAGE(loc.has_value(), loc.error().format());
+        REQUIRE(loc->size() == 9);
+        using K = coff::LocatorKind;
+        using R = coff::NoLocatorReason;
+        // 1 COMDAT with leader, 2 and 3 associative, 4 .drectve, 5 .debug$S, 6 .data, 7 .bss, 8 .llvm_addrsig, 9 .CRT$XCU
+        const K kinds[9] = {K::ComdatLeader, K::None, K::None, K::None, K::None, K::Anchor, K::Anchor, K::None, K::Anchor};
+        for (std::size_t i = 0; i < 9; ++i) {
+            CHECK_MESSAGE((*loc)[i].kind == kinds[i], "section " << (i + 1));
         }
-    }
-}
-
-TEST_CASE("coff anchors: comdat_static keeps COMDAT anchors static in external mode") {
-    const Built b = build_object(comdat_spec(false));
-    auto before = coff::Object::parse(span_of(b.bytes));
-    REQUIRE(before.has_value());
-    auto m = coff::ObjectModel::from_object(*before);
-    REQUIRE(m.has_value());
-    coff::AnchorOptions opt;
-    opt.external = true;
-    opt.comdat_static = true;
-    opt.tag = "cs";
-    auto anchors = coff::add_anchors(*m, opt);
-    REQUIRE(anchors.has_value());
-    auto w = coff::write(*m);
-    REQUIRE(w.has_value());
-    auto after = coff::Object::parse(coff::ByteSpan(w->data(), w->size()));
-    REQUIRE(after.has_value());
-    for (const coff::Anchor& a : *anchors) {
-        const coff::Symbol* s = after->symbol_at(a.symbol_index);
-        REQUIRE(s != nullptr);
-        const bool comdat = before->section(a.section_index)->is_comdat();
-        CHECK(s->storage_class == (comdat ? coff::StorageClass::Static : coff::StorageClass::External));
-    }
-}
-
-TEST_CASE("coff anchors: errors") {
-    const Built b = build_object(comdat_spec(false));
-    auto before = coff::Object::parse(span_of(b.bytes));
-    REQUIRE(before.has_value());
-    auto m = coff::ObjectModel::from_object(*before);
-    REQUIRE(m.has_value());
-
-    SUBCASE("external anchors without a tag get a content-derived 16-digit tag, unique per object") {
-        const std::string tag = coff::content_tag(*m);  // before the anchors are added
-        auto r = coff::add_anchors(*m);
-        REQUIRE(r.has_value());
+        CHECK((*loc)[1].reason == R::Associative);
+        CHECK((*loc)[2].reason == R::Associative);
+        CHECK((*loc)[3].reason == R::NotLinked);
+        CHECK((*loc)[4].reason == R::NotLinked);
+        CHECK((*loc)[7].reason == R::NotLinked);
+        CHECK((*loc)[0].symbol_name == "?leader_fn@@YAXXZ");
+        CHECK((*loc)[0].symbol_index == 2);  // definition (0) + its aux (1) + leader (2)
+        CHECK((*loc)[0].offset == 0);
+        // The default tag is the hash of the file; the parsed object re-serialises to the same bytes.
+        const std::string tag = coff::content_tag(span_of(b.bytes));
         CHECK(tag.size() == 16);
-        CHECK((*r)[0].symbol_name == "__cml_anchor_" + tag + "_1");
-        auto other = coff::ObjectModel::from_object(*before);
-        REQUIRE(other.has_value());
-        other->sections[0].data[0] = std::byte{0x42};
-        CHECK(coff::content_tag(*other) != tag);
+        CHECK((*loc)[5].symbol_name == "__cml_anchor_" + tag + "_6");
+
+        auto w = coff::write(*m);
+        REQUIRE_MESSAGE(w.has_value(), w.error().format());
+        auto after = coff::Object::parse(coff::ByteSpan(w->data(), w->size()));
+        REQUIRE_MESSAGE(after.has_value(), after.error().format());
+        check_anchored(*before, *after, *loc, tag, big ? "bigobj" : "regular");
+        CHECK(compare_with_reader(independent_parse(to_u8(*w)), *after).empty());
+        // COMDAT leader rule: section 1's leader is still symbol 2, directly after its definition symbol 0.
+        const auto c1 = after->comdat(*after->section(1));
+        REQUIRE(c1.has_value());
+        REQUIRE(c1->leader != nullptr);
+        CHECK(c1->section_symbol->index == 0);
+        CHECK(c1->leader->index == 2);
+        // Every locator that exists can be demanded; the others yield CML3309.
+        CHECK((coff::require_locator((*loc)[0])).has_value());
+        auto none = coff::require_locator((*loc)[1]);
+        REQUIRE_FALSE(none.has_value());
+        CHECK(none.error().code == coff::diag::kNoLocator);
+    }
+}
+
+TEST_CASE("coff anchors: static leader, missing leader and leader offset") {
+    for (bool big : {false, true}) {
+        const Built b = build_object(leader_cases_spec(big));
+        auto before = coff::Object::parse(span_of(b.bytes));
+        REQUIRE(before.has_value());
+        auto m = coff::ObjectModel::from_object(*before);
+        REQUIRE(m.has_value());
+        auto loc = coff::add_anchors(*m);
+        REQUIRE(loc.has_value());
+        REQUIRE(loc->size() == 3);
+        CHECK((*loc)[0].kind == coff::LocatorKind::None);
+        CHECK((*loc)[0].reason == coff::NoLocatorReason::StaticLeader);
+        CHECK((*loc)[1].kind == coff::LocatorKind::None);
+        CHECK((*loc)[1].reason == coff::NoLocatorReason::NoLeader);
+        CHECK((*loc)[2].kind == coff::LocatorKind::ComdatLeader);
+        CHECK((*loc)[2].symbol_name == "leader_at_8");
+        CHECK((*loc)[2].offset == 8);
+        CHECK(coff::require_locator((*loc)[0]).error().code == coff::diag::kNoLocator);
+        // No symbol was added.
+        auto w = coff::write(*m);
+        REQUIRE(w.has_value());
+        auto after = coff::Object::parse(coff::ByteSpan(w->data(), w->size()));
+        REQUIRE(after.has_value());
+        CHECK(after->header().symbol_count == before->header().symbol_count);
+    }
+}
+
+TEST_CASE("coff anchors: tags") {
+    const Built b = build_object(comdat_spec(false));
+    auto before = coff::Object::parse(span_of(b.bytes));
+    REQUIRE(before.has_value());
+    auto make = [&] {
+        auto m = coff::ObjectModel::from_object(*before);
+        REQUIRE(m.has_value());
+        return std::move(*m);
+    };
+
+    SUBCASE("a caller tag is used verbatim") {
+        auto m = make();
+        coff::AnchorOptions o;
+        o.tag = "ci7";
+        auto r = coff::add_anchors(m, o);
+        REQUIRE(r.has_value());
+        CHECK((*r)[5].symbol_name == "__cml_anchor_ci7_6");
     }
     SUBCASE("tags use [A-Za-z0-9_] only") {
+        auto m = make();
         coff::AnchorOptions o;
         o.tag = "a-b";
-        CHECK(coff::add_anchors(*m, o).error().code == coff::diag::kBadAnchorOptions);
+        CHECK(coff::add_anchors(m, o).error().code == coff::diag::kBadAnchorOptions);
+    }
+    SUBCASE("different objects get different default tags; equal ones are refused through used_tags") {
+        std::unordered_set<std::string> used;
+        coff::AnchorOptions o;
+        o.used_tags = &used;
+        auto m1 = make();
+        REQUIRE(coff::add_anchors(m1, o).has_value());
+        auto m2 = make();
+        m2.sections[0].data[0] = std::byte{0x42};
+        REQUIRE(coff::add_anchors(m2, o).has_value());
+        CHECK(used.size() == 2);
+        auto m3 = make();  // identical to m1
+        auto r = coff::add_anchors(m3, o);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().code == coff::diag::kAnchorTagCollision);
+        CHECK(m3.symbols.size() == make().symbols.size());  // refused before touching the model
+        coff::AnchorOptions caller;
+        caller.tag = "x1";
+        caller.used_tags = &used;
+        auto m4 = make();
+        REQUIRE(coff::add_anchors(m4, caller).has_value());
+        auto m5 = make();
+        CHECK(coff::add_anchors(m5, caller).error().code == coff::diag::kAnchorTagCollision);
+    }
+    SUBCASE("check_unique_tags") {
+        const std::vector<std::string> ok = {"a", "b", "c"};
+        const std::vector<std::string> bad = {"a", "b", "a"};
+        CHECK(coff::check_unique_tags(ok).has_value());
+        auto r = coff::check_unique_tags(bad);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().code == coff::diag::kAnchorTagCollision);
     }
     SUBCASE("anchoring twice is refused") {
-        REQUIRE(coff::add_anchors(*m).has_value());
-        auto again = coff::add_anchors(*m);
+        auto m = make();
+        REQUIRE(coff::add_anchors(m).has_value());
+        auto again = coff::add_anchors(m);
         REQUIRE_FALSE(again.has_value());
         CHECK(again.error().code == coff::diag::kAnchorNameClash);
         CHECK(again.error().message.find("__cml_anchor_") != std::string::npos);
@@ -659,7 +763,9 @@ TEST_CASE("coff anchors: on every fixture object, anchored objects keep the orig
     const FixturePaths& p = FixturePaths::get();
     REQUIRE(p.loaded());
     std::size_t checked = 0;
+    std::size_t tags = 0;
     for (const char* key : {"basic_objs", "cov_extras_objs", "bigobj_objs"}) {
+        std::unordered_set<std::string> used_tags;  // the objects of one list are linked together: tags must be unique
         const std::string list = p.value(key);
         std::size_t start = 0;
         while (start < list.size()) {
@@ -674,32 +780,35 @@ TEST_CASE("coff anchors: on every fixture object, anchored objects keep the orig
             }
             auto owned = coff::load_object_file(path);
             REQUIRE_MESSAGE(owned.has_value(), owned.error().format());
-            for (bool external : {false, true}) {
-                auto m = coff::ObjectModel::from_object(owned->object);
-                REQUIRE_MESSAGE(m.has_value(), m.error().format());
-                coff::AnchorOptions opt;
-                opt.external = external;
-                if (external) {
-                    opt.tag = "fx";
-                }
-                auto anchors = coff::add_anchors(*m, opt);
-                REQUIRE_MESSAGE(anchors.has_value(), path << ": " << anchors.error().format());
-                auto w = coff::write(*m);
-                REQUIRE_MESSAGE(w.has_value(), path << ": " << w.error().format());
-                auto after = coff::Object::parse(coff::ByteSpan(w->data(), w->size()));
-                REQUIRE_MESSAGE(after.has_value(), path << ": " << after.error().format());
-                check_anchored(owned->object, *after, *anchors, opt, path + (external ? " (external)" : " (static)"));
-                CHECK_MESSAGE(!anchors->empty(), path);
-                // Anchored output is itself a fixed point of the writer.
-                auto again = coff::rewrite(*after);
-                REQUIRE(again.has_value());
-                CHECK(to_u8(*again) == to_u8(*w));
+            auto m = coff::ObjectModel::from_object(owned->object);
+            REQUIRE_MESSAGE(m.has_value(), m.error().format());
+            coff::AnchorOptions opt;
+            opt.used_tags = &used_tags;
+            auto loc = coff::add_anchors(*m, opt);
+            REQUIRE_MESSAGE(loc.has_value(), path << ": " << loc.error().format());
+            const std::string tag = coff::content_tag(coff::ByteSpan(owned->bytes.data(), owned->bytes.size()));
+            auto w = coff::write(*m);
+            REQUIRE_MESSAGE(w.has_value(), path << ": " << w.error().format());
+            auto after = coff::Object::parse(coff::ByteSpan(w->data(), w->size()));
+            REQUIRE_MESSAGE(after.has_value(), path << ": " << after.error().format());
+            check_anchored(owned->object, *after, *loc, tag, path);
+            std::size_t with = 0;
+            for (const coff::SectionLocator& l : *loc) {
+                with += l.kind == coff::LocatorKind::None ? 0u : 1u;
             }
+            CHECK_MESSAGE(with > 0, path);
+            // Anchored output is itself a fixed point of the writer.
+            auto again = coff::rewrite(*after);
+            REQUIRE(again.has_value());
+            CHECK(to_u8(*again) == to_u8(*w));
             ++checked;
         }
+        tags += used_tags.size();
     }
     CHECK(checked >= 6u);
+    CHECK(tags == checked);
 }
+
 
 // ---------------------------------------------------------------------------------------------
 // Binding object
@@ -929,5 +1038,75 @@ TEST_CASE("coff binding: errors") {
         CHECK(coff::make_binding_object(s).error().code == coff::diag::kBindNameDuplicate);
         const std::vector<coff::BindSymbol> s2 = {{"__cml_slot_a", coff::BindKind::Data}, {"a", coff::BindKind::Function}};
         CHECK(coff::make_binding_object(s2).error().code == coff::diag::kBindNameDuplicate);
+    }
+}
+
+TEST_CASE("coff writer: review fixes (empty names, '/' names, line numbers, relocation count in aux)") {
+    SUBCASE("empty symbol names are refused") {
+        auto m = coff::ObjectModel::make_empty(coff::Machine::Amd64);
+        auto r = m.add_symbol("", 0, 0, 0, coff::StorageClass::External);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().code == coff::diag::kBadSymbol);
+        // A hand-built symbol with an all-zero name field is refused on write.
+        coff::ModelSymbol s;
+        m.symbols.push_back(s);
+        auto w = coff::write(m);
+        REQUIRE_FALSE(w.has_value());
+        CHECK(w.error().code == coff::diag::kBadSymbol);
+    }
+    SUBCASE("short section names starting with '/' go through the string table") {
+        auto m = coff::ObjectModel::make_empty(coff::Machine::Amd64);
+        REQUIRE(m.add_string("padding").has_value());  // so that the section name is not at offset 4 ("/4")
+        REQUIRE(m.add_section("/4", coff::scn::CntInitializedData | coff::scn::MemRead, coff::ByteVector(4, std::byte{1})).has_value());
+        auto w = coff::write(m);
+        REQUIRE_MESSAGE(w.has_value(), w.error().format());
+        auto o = coff::Object::parse(coff::ByteSpan(w->data(), w->size()));
+        REQUIRE_MESSAGE(o.has_value(), o.error().format());
+        CHECK(o->sections()[0].name == "/4");  // resolved through the string table, not read as a reference
+        CHECK(o->sections()[0].raw_name[0] == '/');
+        CHECK(o->sections()[0].raw_name[1] == '1');  // "/12": offset 4 + 8
+    }
+    SUBCASE("line numbers: empty table writes count 0 and pointer 0; a mismatching count is refused") {
+        const Bytes in = hand_object();
+        auto obj = coff::Object::parse(span_of(in));
+        REQUIRE(obj.has_value());
+        auto m = coff::ObjectModel::from_object(*obj);
+        REQUIRE(m.has_value());
+        m->sections[0].linenumber_count = 3;  // table holds 1 record
+        auto bad = coff::write(*m);
+        REQUIRE_FALSE(bad.has_value());
+        CHECK(bad.error().code == coff::diag::kUnrepresentable);
+        m->sections[0].linenumber_count = 1;
+        m->sections[0].linenumbers.clear();  // table gone, stale count / pointer must not leak out
+        auto w = coff::write(*m);
+        REQUIRE(w.has_value());
+        auto o = coff::Object::parse(coff::ByteSpan(w->data(), w->size()));
+        REQUIRE(o.has_value());
+        CHECK(o->sections()[0].linenumber_count == 0);
+        CHECK(o->sections()[0].pointer_to_linenumbers == 0);
+    }
+    SUBCASE("binding .text with more than 65535 thunks: section definition aux holds 0xFFFF, section uses NRELOC_OVFL") {
+        std::vector<coff::BindSymbol> many;
+        for (int i = 0; i < 70000; ++i) {
+            many.push_back({"f" + std::to_string(i), coff::BindKind::Function});
+        }
+        auto b = coff::make_binding_object(many);
+        REQUIRE_MESSAGE(b.has_value(), b.error().format());
+        auto o = coff::Object::parse(coff::ByteSpan(b->data(), b->size()));
+        REQUIRE_MESSAGE(o.has_value(), o.error().format());
+        const coff::Section* text = o->find_section(".text");
+        REQUIRE(text != nullptr);
+        CHECK(text->has_extended_relocations);
+        CHECK(text->relocation_count == 70000);
+        const coff::Symbol* sym = nullptr;
+        for (const coff::Symbol& s : o->symbols()) {
+            if (s.name == ".text" && s.storage_class == coff::StorageClass::Static) {
+                sym = &s;
+            }
+        }
+        REQUIRE(sym != nullptr);
+        const auto def = o->section_definition(*sym);
+        REQUIRE(def.has_value());
+        CHECK(def->relocation_count == 0xFFFF);
     }
 }

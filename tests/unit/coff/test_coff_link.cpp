@@ -21,6 +21,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <set>
@@ -496,14 +497,19 @@ SectionDiff compare_images(const std::string& a_path, const std::string& b_path)
         d.layout_equal = false;
         return d;
     }
-    const auto bytes_of = [](const cml::pe::OwnedImage& img, const cml::pe::SectionHeader& s) {
-        const std::size_t off = s.pointer_to_raw_data;
-        const std::size_t len = s.size_of_raw_data;
-        if (off > img.bytes.size() || len > img.bytes.size() - off) {
-            return std::vector<std::byte>();
+    // A section range outside the file is a failure of the test (never an empty "equal" section).
+    const auto bytes_of = [&d](const cml::pe::OwnedImage& img, const cml::pe::SectionHeader& sh, std::vector<std::byte>* out) {
+        const std::size_t off = sh.pointer_to_raw_data;
+        const std::size_t len = sh.size_of_raw_data;
+        if (len != 0 && (off > img.bytes.size() || len > img.bytes.size() - off)) {
+            d.ok = false;
+            d.error = "section '" + std::string(sh.name()) + "' has raw data (offset " + std::to_string(off) + ", size " +
+                      std::to_string(len) + ") outside the " + std::to_string(img.bytes.size()) + "-byte image";
+            return false;
         }
-        return std::vector<std::byte>(img.bytes.begin() + static_cast<std::ptrdiff_t>(off),
-                                      img.bytes.begin() + static_cast<std::ptrdiff_t>(off + len));
+        out->assign(img.bytes.begin() + static_cast<std::ptrdiff_t>(off),
+                    img.bytes.begin() + static_cast<std::ptrdiff_t>(off + len));
+        return true;
     };
     for (std::size_t i = 0; i < sa.size(); ++i) {
         if (sa[i].raw_name != sb[i].raw_name || sa[i].virtual_address != sb[i].virtual_address ||
@@ -512,7 +518,12 @@ SectionDiff compare_images(const std::string& a_path, const std::string& b_path)
             d.layout_equal = false;
             continue;
         }
-        const bool same = bytes_of(*a, sa[i]) == bytes_of(*b, sb[i]);
+        std::vector<std::byte> ba;
+        std::vector<std::byte> bb;
+        if (!bytes_of(*a, sa[i], &ba) || !bytes_of(*b, sb[i], &bb)) {
+            return d;
+        }
+        const bool same = ba == bb;
         if ((sa[i].characteristics & coff::scn::CntCode) != 0) {
             d.code_equal = d.code_equal && same;
         } else if (!same) {
@@ -571,20 +582,83 @@ std::size_t count_module_anchors(const PdbFacts& pdb, const std::string& obj_bas
     return n;
 }
 
-// ---------------------------------------------------------------------------------------------
-// One object set
-// ---------------------------------------------------------------------------------------------
-
 struct SetSpec {
     std::string name;
     std::vector<std::pair<const char*, std::string>> objects;  // {fixture list key, file stem}
-    bool single_object() const { return objects.size() == 1; }
 };
 
-struct Variant {
-    std::vector<std::string> files;                   // object files to link (binding.obj last)
-    std::vector<std::vector<coff::Anchor>> anchors;   // per object (empty for the plain variant)
-};
+// ---------------------------------------------------------------------------------------------
+// Synthetic objects that share a COMDAT (built with the writer itself)
+// ---------------------------------------------------------------------------------------------
+
+// Object `which` ("a" or "b"): both define the COMDAT functions/data `shared_fn` / `shared_const`
+// (selection Any, identical bytes) which the linker keeps once; each also has its own COMDAT function,
+// an associative section, a COMDAT with a static leader, plain .data and .bss, and references the
+// undefined externals `ext_f` (call) and `ext_d` (data pointer) that binding.obj has to provide.
+coff::ByteVector make_shared_comdat_object(const std::string& which) {
+    namespace sc = coff::scn;
+    coff::ObjectModel m = coff::ObjectModel::make_empty(coff::Machine::Amd64);
+    const std::uint32_t code = sc::CntCode | sc::MemExecute | sc::MemRead | sc::LnkComdat | (5u << sc::AlignShift);
+    const std::uint32_t rdata = sc::CntInitializedData | sc::MemRead | sc::LnkComdat | (4u << sc::AlignShift);
+    const std::uint32_t data = sc::CntInitializedData | sc::MemRead | sc::MemWrite | (4u << sc::AlignShift);
+    const auto bytes_of = [](std::initializer_list<unsigned> v) {
+        coff::ByteVector b;
+        for (unsigned x : v) {
+            b.push_back(static_cast<std::byte>(x));
+        }
+        b.resize(16, std::byte{0xCC});
+        return b;
+    };
+    // Symbol indices (primary + aux), in the order added below:
+    //  0 .text$mn(1) +1   2 shared_fn   3 .text$mn(2) +4   5 unique_<w>   6 .xdata(3) +7   8 .rdata(4) +9
+    //  10 shared_const   11 .text$mn(5) +12   13 static_fn   14 .data(6) +15   16 .bss(7) +17
+    //  18 ext_f   19 ext_d   20 data_<w>
+    auto s1 = m.add_section(".text$mn", code, bytes_of({0xC3}));                                  // shared_fn
+    auto s2 = m.add_section(".text$mn", code, bytes_of({0xE8, 0, 0, 0, 0, 0xC3}), {{1, 18, 4}});  // unique: call ext_f
+    auto s3 = m.add_section(".xdata", sc::CntInitializedData | sc::MemRead | sc::LnkComdat | (2u << sc::AlignShift),
+                            coff::ByteVector(8, std::byte{0}));                                    // associative -> 2
+    auto s4 = m.add_section(".rdata", rdata, coff::ByteVector(8, std::byte{0x11}));                // shared_const
+    auto s5 = m.add_section(".text$mn", code, bytes_of({0xC3}));                                  // static leader
+    auto s6 = m.add_section(".data", data, coff::ByteVector(8, std::byte{0}), {{0, 19, 1}});      // ADDR64 ext_d
+    (void)s1; (void)s2; (void)s3; (void)s4; (void)s5; (void)s6;
+    coff::ModelSection bss;
+    bss.name = ".bss";
+    std::memcpy(bss.raw_name.data(), ".bss", 4);
+    bss.characteristics = sc::CntUninitializedData | sc::MemRead | sc::MemWrite | (4u << sc::AlignShift);
+    bss.size_of_raw_data = 16;
+    m.sections.push_back(bss);
+
+    const auto add = [&](const std::string& n, std::uint32_t value, std::int32_t sec, std::uint16_t type, coff::StorageClass cls,
+                         coff::ByteVector aux = {}) {
+        auto r = m.add_symbol(n, value, sec, type, cls, std::move(aux));
+        REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    };
+    const auto def = [](std::uint32_t len, std::uint32_t relocs, std::uint32_t assoc, std::uint8_t sel) {
+        return coff::make_section_definition_aux(false, len, relocs, 0, assoc, sel);
+    };
+    using C = coff::StorageClass;
+    add(".text$mn", 0, 1, 0, C::Static, def(16, 0, 0, 2));
+    add("shared_fn", 0, 1, 0x20, C::External);
+    add(".text$mn", 0, 2, 0, C::Static, def(16, 1, 0, 2));
+    add("unique_" + which, 0, 2, 0x20, C::External);
+    add(".xdata", 0, 3, 0, C::Static, def(8, 0, 2, 5));
+    add(".rdata", 0, 4, 0, C::Static, def(8, 0, 0, 2));
+    add("shared_const", 0, 4, 0, C::External);
+    add(".text$mn", 0, 5, 0, C::Static, def(16, 0, 0, 2));
+    add("static_fn_" + which, 0, 5, 0x20, C::Static);
+    add(".data", 0, 6, 0, C::Static, def(8, 1, 0, 0));
+    add(".bss", 0, 7, 0, C::Static, def(16, 0, 0, 0));
+    add("ext_f", 0, 0, 0x20, C::External);
+    add("ext_d", 0, 0, 0, C::External);
+    add("data_" + which, 0, 6, 0, C::External);
+    auto bytes = coff::write(m);
+    REQUIRE_MESSAGE(bytes.has_value(), bytes.error().format());
+    return std::move(*bytes);
+}
+
+// ---------------------------------------------------------------------------------------------
+// One link set
+// ---------------------------------------------------------------------------------------------
 
 void check_binding_in_image(const char* where, const Linked& linked, const PdbFacts& pdb,
                             const std::vector<coff::BindSymbol>& bind) {
@@ -627,9 +701,17 @@ void check_binding_in_image(const char* where, const Linked& linked, const PdbFa
     evidence("%s: %zu thunks verified (FF 25 -> slot, slot is a writable public), %zu data placeholders are publics", where, functions, datas);
 }
 
-void run_set(const SetSpec& spec) {
+// Links `originals` (object files) as unanchored and as anchored objects, per linker, and checks:
+//   * binding.obj satisfies the linker and every thunk/slot is right;
+//   * the anchored image equals the unanchored one in every byte except the timestamp/checksum and
+//     the debug directory (so in every section: .text .rdata .data .pdata .xdata ...);
+//   * every section locator resolves through cml_pdb::find_public-equivalent publics and matches a
+//     section contribution of the PDB (start, and size and compiland unless the COMDAT is shared).
+// `static_probe`: additionally links a variant whose anchors are flipped to STATIC and asserts that
+// none of them is visible anywhere in the PDB (the ADR-0020 finding).
+void run_files(const std::string& name, const std::vector<std::string>& originals, bool static_probe) {
     const std::vector<Linker> linkers = linkers_under_test();
-    const fs::path dir = work_root() / spec.name;
+    const fs::path dir = work_root() / name;
     {
         std::error_code ec;
         fs::remove_all(dir, ec);
@@ -637,11 +719,9 @@ void run_set(const SetSpec& spec) {
     }
 
     // ---- objects, bind list, binding object ----
-    std::vector<std::string> originals;
     std::vector<coff::OwnedObject> objects;
-    for (const auto& [key, stem] : spec.objects) {
-        originals.push_back(find_object(key, stem));
-        auto o = coff::load_object_file(originals.back());
+    for (const std::string& path : originals) {
+        auto o = coff::load_object_file(path);
         REQUIRE_MESSAGE(o.has_value(), o.error().format());
         objects.push_back(std::move(*o));
     }
@@ -655,44 +735,59 @@ void run_set(const SetSpec& spec) {
     const fs::path binding_path = dir / "binding.obj";
     REQUIRE(write_file(binding_path, *binding));
 
-    // ---- variants ----
-    Variant plain;
-    Variant statics;
-    Variant externals;
+    // ---- anchored copies (one tag set for the whole link) ----
+    std::unordered_set<std::string> used_tags;
+    std::vector<std::string> plain_files = originals;
+    std::vector<std::string> anchored_files;
+    std::vector<std::string> probe_files;
+    std::vector<std::vector<coff::SectionLocator>> locators;
+    std::unordered_map<std::string, std::size_t> leader_copies;  // COMDAT leader name -> number of objects defining it
     for (std::size_t i = 0; i < objects.size(); ++i) {
-        plain.files.push_back(originals[i]);
-        plain.anchors.emplace_back();
-        for (bool external : {false, true}) {
-            auto m = coff::ObjectModel::from_object(objects[i].object);
-            REQUIRE_MESSAGE(m.has_value(), m.error().format());
-            coff::AnchorOptions opt;
-            opt.external = external;
-            if (external) {
-                // tag left empty: the content-derived default is used
-                // lld-link rejects external anchors inside COMDATs that are discarded as duplicates.
-                opt.comdat_static = objects.size() > 1;
+        auto m = coff::ObjectModel::from_object(objects[i].object);
+        REQUIRE_MESSAGE(m.has_value(), m.error().format());
+        coff::AnchorOptions opt;
+        opt.used_tags = &used_tags;
+        auto loc = coff::add_anchors(*m, opt);
+        REQUIRE_MESSAGE(loc.has_value(), loc.error().format());
+        for (const coff::SectionLocator& l : *loc) {
+            if (l.kind == coff::LocatorKind::ComdatLeader) {
+                ++leader_copies[l.symbol_name];
             }
-            auto anchors = coff::add_anchors(*m, opt);
-            REQUIRE_MESSAGE(anchors.has_value(), anchors.error().format());
-            auto bytes = coff::write(*m);
-            REQUIRE_MESSAGE(bytes.has_value(), bytes.error().format());
-            const std::string file = (dir / (stem_of(originals[i]) + (external ? "_ext" : "_static") + ".obj")).string();
-            REQUIRE(write_file(file, *bytes));
-            (external ? externals : statics).files.push_back(file);
-            (external ? externals : statics).anchors.push_back(std::move(*anchors));
+        }
+        auto bytes = coff::write(*m);
+        REQUIRE_MESSAGE(bytes.has_value(), bytes.error().format());
+        const std::string file = (dir / (std::to_string(i) + "_" + stem_of(originals[i]) + ".obj")).string();
+        REQUIRE(write_file(file, *bytes));
+        anchored_files.push_back(file);
+        locators.push_back(std::move(*loc));
+        if (static_probe) {
+            for (coff::ModelSymbol& s : m->symbols) {
+                if (s.name.compare(0, coff::kAnchorPrefix.size(), coff::kAnchorPrefix) == 0) {
+                    s.storage_class = static_cast<std::uint8_t>(coff::StorageClass::Static);
+                }
+            }
+            auto pb = coff::write(*m);
+            REQUIRE(pb.has_value());
+            const std::string pfile = (dir / (std::to_string(i) + "_" + stem_of(originals[i]) + "_s.obj")).string();
+            REQUIRE(write_file(pfile, *pb));
+            probe_files.push_back(pfile);
         }
     }
-    for (Variant* v : {&plain, &statics, &externals}) {
-        v->files.push_back(binding_path.string());
+    std::size_t shared_leaders = 0;
+    for (const auto& [leader, copies] : leader_copies) {
+        shared_leaders += copies > 1 ? 1 : 0;
     }
+    plain_files.push_back(binding_path.string());
+    anchored_files.push_back(binding_path.string());
+    probe_files.push_back(binding_path.string());
 
     for (const Linker& lk : linkers) {
-        INFO("set " << spec.name << ", linker " << lk.label);
-        const std::string tag = spec.name + "/" + lk.label;
-
-        // 1. plain link with the binding object: must succeed, thunks and slots must be right.
+        INFO("set " << name << ", linker " << lk.label);
+        const std::string tag = name + "/" + lk.label;
         const fs::path ldir = dir / lk.label;
-        const Linked lp = do_link(lk, ldir / "p0", plain.files);
+
+        // 1. unanchored link with the binding object.
+        const Linked lp = do_link(lk, ldir / "p0", plain_files);
         CHECK_MESSAGE(lp.ok, "link of the unanchored objects + binding.obj failed:\n" << lp.output);
         REQUIRE(lp.ok);
         for (const char* needle : {"LNK2001", "LNK2019", "unresolved external", "undefined symbol"}) {
@@ -704,118 +799,134 @@ void run_set(const SetSpec& spec) {
             check_binding_in_image(tag.c_str(), lp, pdb, bind);
         }
 
-        // 2. + 3. anchored variants.
-        for (bool external : {false, true}) {
-            const Variant& v = external ? externals : statics;
-            const char* vname = external ? "external" : "static";
-            const Linked la = do_link(lk, ldir / (external ? "e0" : "s0"), v.files);
-            CHECK_MESSAGE(la.ok, vname << " anchored link failed:\n" << la.output);
-            REQUIRE(la.ok);
-            const SectionDiff diff = compare_images(lp.dll, la.dll);
-            REQUIRE_MESSAGE(diff.ok, diff.error);
-            CHECK_MESSAGE(diff.layout_equal, tag << " " << vname << ": section table (names, RVAs, sizes, characteristics) differs from the unanchored link");
-            CHECK_MESSAGE(diff.code_equal, tag << " " << vname << ": a code section differs from the unanchored link");
+        // 2. anchored link: identical image, locators resolve.
+        const Linked la = do_link(lk, ldir / "a0", anchored_files);
+        CHECK_MESSAGE(la.ok, "anchored link failed:\n" << la.output);
+        REQUIRE(la.ok);
+        const SectionDiff diff = compare_images(lp.dll, la.dll);
+        REQUIRE_MESSAGE(diff.ok, diff.error);
+        CHECK_MESSAGE(diff.layout_equal, tag << ": section table (names, RVAs, sizes, characteristics) differs from the unanchored link");
+        CHECK_MESSAGE(diff.code_equal, tag << ": a code section differs from the unanchored link");
+        CHECK_MESSAGE(diff.bytes_differing_outside_debug_info == 0,
+                      tag << ": " << diff.bytes_differing_outside_debug_info << " bytes differ from the unanchored image outside the "
+                          << "debug directory and timestamp/checksum, first in section '" << diff.first_difference_in << "'");
 
-            // Where do the anchors show up?
-            PdbFacts pdb = read_pdb(la.pdb);
-            REQUIRE_MESSAGE(pdb.ok, pdb.error);
-            std::size_t expected = 0;
-            std::size_t in_publics = 0;
-            std::size_t in_module = 0;
-            std::size_t contrib_total = 0;
-            std::size_t contrib_match = 0;
-            std::size_t contrib_total_nopdata = 0;  // same, without .pdata (link.exe records no contribution for it)
-            std::size_t contrib_match_nopdata = 0;
-            std::size_t comdat_missing = 0;
-            std::size_t plain_missing = 0;
-            std::unordered_map<std::uint64_t, std::uint32_t> contribs;  // (compiland << 32 | rva) -> size
-            std::vector<cml::pdb::SectionContribution> sorted_contribs;
-            std::size_t unmatched_shown = 0;
-            if (external) {
-                sorted_contribs = pdb.index->contributions();  // sorted by rva
-                contribs.reserve(sorted_contribs.size());
-                for (const cml::pdb::SectionContribution& c : sorted_contribs) {
-                    contribs.emplace((static_cast<std::uint64_t>(c.compiland) << 32) | c.rva, c.size);
-                }
-            }
-            for (std::size_t i = 0; i < v.anchors.size(); ++i) {
-                expected += v.anchors[i].size();
-                const std::string obj_base = basename_of(v.files[i]);
-                if (!external) {
-                    in_module += count_module_anchors(pdb, obj_base);
-                    for (const coff::Anchor& a : v.anchors[i]) {
-                        in_publics += pdb.public_rva.count(a.symbol_name);
-                    }
+        PdbFacts pdb = read_pdb(la.pdb);
+        REQUIRE_MESSAGE(pdb.ok, pdb.error);
+        // Section contributions by start RVA.
+        std::unordered_multimap<std::uint32_t, cml::pdb::SectionContribution> by_start;
+        for (const cml::pdb::SectionContribution& c : pdb.index->contributions()) {
+            by_start.emplace(c.rva, c);
+        }
+        std::size_t anchors = 0, leaders = 0, resolved = 0, start_ok = 0, size_ok = 0, compiland_ok = 0, shared_resolved = 0, no_loc = 0;
+        std::size_t exact_checked = 0, failures_shown = 0;
+        std::map<std::string, std::size_t> no_loc_reasons;
+        for (std::size_t i = 0; i < objects.size(); ++i) {
+            const auto compilands = pdb.index->compilands_by_object_name(basename_of(anchored_files[i]));
+            for (const coff::SectionLocator& l : locators[i]) {
+                if (l.kind == coff::LocatorKind::None) {
+                    ++no_loc;
+                    ++no_loc_reasons[l.reason == coff::NoLocatorReason::NotLinked      ? "not-linked"
+                                 : l.reason == coff::NoLocatorReason::Associative ? "associative"
+                                 : l.reason == coff::NoLocatorReason::NoLeader    ? "no-leader"
+                                                                                  : "static-leader"];
                     continue;
                 }
-                const auto compilands = pdb.index->compilands_by_object_name(obj_base);
-                for (const coff::Anchor& a : v.anchors[i]) {
-                    const auto it = pdb.public_rva.find(a.symbol_name);
-                    const coff::Section* sec = objects[i].object.section(a.section_index);
-                    if (it == pdb.public_rva.end()) {
-                        if (sec != nullptr && sec->is_comdat()) {
-                            ++comdat_missing;
-                        } else {
-                            ++plain_missing;
-                        }
-                        continue;
-                    }
-                    ++in_publics;
-                    if (sec != nullptr && sec->size_of_raw_data != 0 && !compilands.empty()) {
-                        ++contrib_total;
-                        const bool is_pdata = sec->name == ".pdata";
-                        contrib_total_nopdata += is_pdata ? 0 : 1;
-                        const auto c = contribs.find((static_cast<std::uint64_t>(compilands.front()) << 32) | it->second);
-                        if (c != contribs.end() && c->second == sec->size_of_raw_data) {
-                            ++contrib_match;
-                            contrib_match_nopdata += is_pdata ? 0 : 1;
-                        } else if (unmatched_shown < 6) {
-                            ++unmatched_shown;
-                            // What the PDB has around that address, to see why the contribution does not match.
-                            std::string near_text = "no contribution covers the rva";
-                            auto up = std::upper_bound(sorted_contribs.begin(), sorted_contribs.end(), it->second,
-                                                       [](std::uint32_t rva, const cml::pdb::SectionContribution& x) { return rva < x.rva; });
-                            if (up != sorted_contribs.begin()) {
-                                const cml::pdb::SectionContribution& x = *(up - 1);
-                                near_text = "contribution rva=" + std::to_string(x.rva) + " size=" + std::to_string(x.size) +
-                                            " compiland=" + std::to_string(x.compiland);
-                            }
-                            evidence("UNMATCHED set=%s linker=%s section=%u '%s' comdat=%d raw_size=%u anchor_rva=%u expected_compiland=%u | %s",
-                                     spec.name.c_str(), lk.label.c_str(), static_cast<unsigned>(a.section_index),
-                                     std::string(sec->name).c_str(), sec->is_comdat() ? 1 : 0, static_cast<unsigned>(sec->size_of_raw_data),
-                                     static_cast<unsigned>(it->second), static_cast<unsigned>(compilands.front()), near_text.c_str());
-                        }
-                    }
+                (l.kind == coff::LocatorKind::Anchor ? anchors : leaders) += 1;
+                const auto pub = pdb.public_rva.find(l.symbol_name);
+                const bool found = pub != pdb.public_rva.end();
+                CHECK_MESSAGE(found, tag << ": locator '" << l.symbol_name << "' (section " << l.section_index << " of object " << i
+                                         << ") is not a public in the PDB");
+                if (!found) {
+                    continue;
+                }
+                ++resolved;
+                const coff::Section* sec = objects[i].object.section(l.section_index);
+                const bool shared = l.kind == coff::LocatorKind::ComdatLeader && leader_copies[l.symbol_name] > 1;
+                shared_resolved += shared ? 1 : 0;
+                if (sec == nullptr || sec->size_of_raw_data == 0 || pub->second < l.offset) {
+                    continue;
+                }
+                const std::uint32_t start = pub->second - l.offset;
+                const auto range = by_start.equal_range(start);
+                bool has_start = range.first != range.second;
+                bool has_size = false;
+                bool has_compiland = false;
+                for (auto it = range.first; it != range.second; ++it) {
+                    has_size = has_size || it->second.size == sec->size_of_raw_data;
+                    has_compiland = has_compiland || (!compilands.empty() && it->second.compiland == compilands.front());
+                }
+                start_ok += has_start ? 1 : 0;
+                size_ok += has_size ? 1 : 0;
+                compiland_ok += has_compiland ? 1 : 0;
+                ++exact_checked;
+                // A COMDAT kept once for several objects: the start must exist; its size/compiland belong to the kept copy.
+                const bool ok = shared ? has_start : (has_start && has_size && has_compiland);
+                CHECK_MESSAGE(ok, tag << ": locator '" << l.symbol_name << "' (section " << l.section_index << " '" << std::string(sec->name)
+                                      << "' of object " << i << ") start rva " << start << ": contribution at start=" << has_start
+                                      << " same size=" << has_size << " same compiland=" << has_compiland);
+                if (!ok && failures_shown++ < 5) {
+                    evidence("MISMATCH %s section=%u '%s' raw_size=%u locator_rva=%u offset=%u", tag.c_str(), static_cast<unsigned>(l.section_index),
+                             std::string(sec->name).c_str(), static_cast<unsigned>(sec->size_of_raw_data), static_cast<unsigned>(pub->second),
+                             static_cast<unsigned>(l.offset));
                 }
             }
-            if (external) {
-                // Every anchor of a non-COMDAT section must be published. A COMDAT anchor may be
-                // missing only when the section was dropped as a duplicate of another object's.
-                CHECK_MESSAGE(plain_missing == 0, tag << ": " << plain_missing << " anchors of ordinary sections are not publics in the PDB");
-                if (spec.single_object()) {
-                    CHECK_MESSAGE(comdat_missing == 0, tag << ": " << comdat_missing << " anchors of COMDAT sections are not publics in the PDB");
-                }
-                CHECK(in_publics > 0);
-            }
-            std::string joined;
-            for (const std::string& n : diff.data_diffs) {
-                joined += (joined.empty() ? "" : ",") + n;
-            }
-            evidence("set=%s linker=%s anchors=%s | link ok, bound=%zu (%zu functions) | layout_identical=%s code_identical=%s whole_image_identical=%s "
-                     "differing_data_sections=[%s] outside_debug_info_bytes_differing=%zu(first in %s) | anchors_expected=%zu in_pdb_publics=%zu in_pdb_module_symbols=%zu comdat_anchors_missing=%zu "
-                     "other_anchors_missing=%zu section_contributions_matching_anchor_rva=%zu/%zu (without .pdata %zu/%zu)",
-                     spec.name.c_str(), lk.label.c_str(), vname, bind.size(), bind_functions, diff.layout_equal ? "yes" : "NO",
-                     diff.code_equal ? "yes" : "NO", diff.whole_equal ? "yes" : "no", joined.c_str(),
-                     diff.bytes_differing_outside_debug_info, diff.first_difference_in.c_str(), expected, in_publics, in_module, comdat_missing, plain_missing, contrib_match, contrib_total, contrib_match_nopdata, contrib_total_nopdata);
-            pdb.index.reset();
-            std::error_code ec;
-            fs::remove(la.dll, ec);
-            fs::remove(la.pdb, ec);
         }
+        std::string reasons;
+        for (const auto& [r, n] : no_loc_reasons) {
+            reasons += " " + r + "=" + std::to_string(n);
+        }
+        evidence("set=%s linker=%s | link ok, bound=%zu (%zu functions) | image identical outside timestamp/checksum/debug directory: %s "
+                 "(layout %s, code %s, %zu bytes differ) | locators: %zu anchors + %zu comdat leaders resolved %zu/%zu in PDB publics, "
+                 "%zu without locator (reasons:%s) | section contributions with same start %zu, same size %zu, same compiland %zu of %zu checked | "
+                 "shared COMDAT leaders in this link: %zu (locators of them resolved: %zu)",
+                 name.c_str(), lk.label.c_str(), bind.size(), bind_functions, diff.bytes_differing_outside_debug_info == 0 ? "YES" : "NO",
+                 diff.layout_equal ? "identical" : "DIFFERENT", diff.code_equal ? "identical" : "DIFFERENT",
+                 diff.bytes_differing_outside_debug_info, anchors, leaders, resolved, anchors + leaders, no_loc, reasons.c_str(), start_ok,
+                 size_ok, compiland_ok, exact_checked, shared_leaders, shared_resolved);
+
+        // 3. the static probe: STATIC anchors are invisible in the PDB.
+        if (static_probe) {
+            pdb.index.reset();
+            const Linked ls = do_link(lk, ldir / "s0", probe_files);
+            CHECK_MESSAGE(ls.ok, "static-anchor link failed:\n" << ls.output);
+            REQUIRE(ls.ok);
+            PdbFacts spdb = read_pdb(ls.pdb);
+            REQUIRE_MESSAGE(spdb.ok, spdb.error);
+            std::size_t in_publics = 0;
+            std::size_t in_module = 0;
+            for (std::size_t i = 0; i < objects.size(); ++i) {
+                in_module += count_module_anchors(spdb, basename_of(probe_files[i]));
+                for (const coff::SectionLocator& l : locators[i]) {
+                    if (l.kind == coff::LocatorKind::Anchor) {
+                        in_publics += spdb.public_rva.count(l.symbol_name);
+                    }
+                }
+            }
+            CHECK_MESSAGE(in_publics == 0, tag << ": " << in_publics << " STATIC anchors are publics in the PDB");
+            CHECK_MESSAGE(in_module == 0, tag << ": " << in_module << " STATIC anchors are module symbols in the PDB");
+            evidence("set=%s linker=%s | static-anchor probe: in PDB publics %zu, in module symbols %zu", name.c_str(), lk.label.c_str(), in_publics,
+                     in_module);
+            spdb.index.reset();
+            std::error_code ec;
+            fs::remove(ls.dll, ec);
+            fs::remove(ls.pdb, ec);
+        }
+        pdb.index.reset();
         std::error_code ec;
+        fs::remove(la.dll, ec);
+        fs::remove(la.pdb, ec);
         fs::remove(lp.dll, ec);
         fs::remove(lp.pdb, ec);
     }
+}
+
+void run_set(const SetSpec& spec) {
+    std::vector<std::string> files;
+    for (const auto& [key, stem] : spec.objects) {
+        files.push_back(find_object(key, stem));
+    }
+    run_files(spec.name, files, false);
 }
 
 }  // namespace
@@ -825,7 +936,7 @@ TEST_CASE("coff link: basic/extras.obj (COMDATs, associative .pdata/.xdata, .CRT
     run_set({"basic_extras", {{"basic_objs", "extras"}}});
 }
 TEST_CASE("coff link: basic/main.obj") { run_set({"basic_main", {{"basic_objs", "main"}}}); }
-TEST_CASE("coff link: basic main+logic+extras together") {
+TEST_CASE("coff link: basic main+logic+extras together (shared COMDATs)") {
     run_set({"basic_all", {{"basic_objs", "main"}, {"basic_objs", "logic"}, {"basic_objs", "extras"}}});
 }
 TEST_CASE("coff link: extras.cpp compiled /Od (every construct present)") {
@@ -833,4 +944,23 @@ TEST_CASE("coff link: extras.cpp compiled /Od (every construct present)") {
 }
 TEST_CASE("coff link: bigobj fixture (bigobj_funcs + main)") {
     run_set({"bigobj", {{"bigobj_objs", "bigobj_funcs"}, {"bigobj_objs", "main"}}});
+}
+
+// Two objects that both define the COMDATs shared_fn and shared_const: the linker keeps one copy and
+// drops the other. Every locator must still resolve (both objects' locators to the same address) and
+// match the PDB's section contributions; STATIC anchors are probed as invisible.
+TEST_CASE("coff link: two objects sharing a COMDAT, locators under both linkers") {
+    const fs::path dir = work_root() / "synthetic_inputs";
+    {
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir, ec);
+    }
+    std::vector<std::string> files;
+    for (const char* which : {"a", "b"}) {
+        const std::string path = (dir / (std::string("shared_") + which + ".obj")).string();
+        REQUIRE(write_file(path, make_shared_comdat_object(which)));
+        files.push_back(path);
+    }
+    run_files("shared_comdat", files, true);
 }

@@ -14,6 +14,19 @@ bool starts_with(std::string_view s, std::string_view prefix) noexcept {
     return s.size() >= prefix.size() && s.substr(0, prefix.size()) == prefix;
 }
 
+constexpr std::uint8_t kSelectionAssociative = 5;
+
+const char* reason_text(NoLocatorReason r) noexcept {
+    switch (r) {
+        case NoLocatorReason::HasLocator: return "has a locator";
+        case NoLocatorReason::NotLinked: return "the section is not linked into the image";
+        case NoLocatorReason::Associative: return "associative COMDAT sections have no locator (they never need retargeting to old data)";
+        case NoLocatorReason::NoLeader: return "the COMDAT section has no symbol after its definition";
+        case NoLocatorReason::StaticLeader: return "the COMDAT leader is a static symbol, which is not in the PDB";
+    }
+    return "unknown";
+}
+
 }  // namespace
 
 bool is_anchorable(const ModelSection& s) noexcept {
@@ -26,30 +39,23 @@ bool is_anchorable(const ModelSection& s) noexcept {
     return true;
 }
 
-std::string content_tag(const ObjectModel& m) {
-    // Chain hash64 over the pieces; order and sizes are part of the input.
-    std::uint64_t h = 0x9E3779B97F4A7C15ull;
-    const auto mix = [&h](const void* p, std::size_t n) {
-        std::string buf(reinterpret_cast<const char*>(&h), sizeof(h));
-        buf.append(reinterpret_cast<const char*>(p), n);
-        h = hash64(buf.data(), buf.size());
-    };
-    for (const ModelSection& s : m.sections) {
-        mix(s.raw_name.data(), s.raw_name.size());
-        mix(&s.characteristics, sizeof(s.characteristics));
-        const std::uint64_t n = s.data.size();
-        mix(&n, sizeof(n));
-        mix(s.data.data(), s.data.size());
-        const std::uint64_t r = s.relocations.size();
-        mix(&r, sizeof(r));
-    }
-    for (const ModelSymbol& s : m.symbols) {
-        mix(s.name.data(), s.name.size());
-        mix(&s.value, sizeof(s.value));
-    }
+std::string content_tag(ByteSpan object_bytes) {
     char out[17];
-    std::snprintf(out, sizeof(out), "%016llx", static_cast<unsigned long long>(h));
+    std::snprintf(out, sizeof(out), "%016llx",
+                  static_cast<unsigned long long>(hash64(object_bytes.data(), object_bytes.size())));
     return std::string(out);
+}
+
+Result<void> check_unique_tags(std::span<const std::string> tags) {
+    std::unordered_set<std::string> seen;
+    seen.reserve(tags.size());
+    for (const std::string& t : tags) {
+        if (!seen.insert(t).second) {
+            return Diag::make(diag::kAnchorTagCollision, "anchor tag '" + t + "' is used by two objects of one link",
+                              "Give every object of a link its own tag (for example its compiland index).");
+        }
+    }
+    return {};
 }
 
 std::string anchor_name(std::uint32_t section_index, std::string_view tag) {
@@ -60,7 +66,16 @@ std::string anchor_name(std::uint32_t section_index, std::string_view tag) {
     return name.append(std::to_string(section_index));
 }
 
-Result<std::vector<Anchor>> add_anchors(ObjectModel& m, const AnchorOptions& options) {
+Result<void> require_locator(const SectionLocator& l) {
+    if (l.kind != LocatorKind::None) {
+        return {};
+    }
+    return Diag::make(diag::kNoLocator,
+                      "section " + std::to_string(l.section_index) + " has no locator: " + reason_text(l.reason),
+                      "Locate the section through its COMDAT parent or the PDB section contributions instead.");
+}
+
+Result<std::vector<SectionLocator>> add_anchors(ObjectModel& m, const AnchorOptions& options) {
     for (char c : options.tag) {
         const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
         if (!ok) {
@@ -68,7 +83,6 @@ Result<std::vector<Anchor>> add_anchors(ObjectModel& m, const AnchorOptions& opt
                               "Use only letters, digits and '_' in the tag.");
         }
     }
-    const std::string tag = options.tag.empty() && options.external ? content_tag(m) : options.tag;
     for (const ModelSymbol& s : m.symbols) {
         if (starts_with(s.name, kAnchorPrefix)) {
             return Diag::make(diag::kAnchorNameClash,
@@ -76,45 +90,119 @@ Result<std::vector<Anchor>> add_anchors(ObjectModel& m, const AnchorOptions& opt
                               "Anchor the compiler's original object, not an already anchored one.");
         }
     }
-    std::uint64_t next_index = m.raw_symbol_count();
-    std::vector<Anchor> anchors;
-    std::size_t wanted = 0;
-    for (const ModelSection& s : m.sections) {
-        wanted += is_anchorable(s) ? 1u : 0u;
+
+    std::string tag = options.tag;
+    if (tag.empty()) {
+        auto bytes = write(m);  // for a parsed, unmodified object these are the compiler's file bytes
+        if (!bytes) {
+            return bytes.error();
+        }
+        tag = content_tag(ByteSpan(bytes->data(), bytes->size()));
     }
-    if (next_index + wanted > 0xFFFFFFFFull) {
+    if (options.used_tags != nullptr && !options.used_tags->insert(tag).second) {
+        return Diag::make(diag::kAnchorTagCollision, "anchor tag '" + tag + "' is already used by another object of this link",
+                          "Give every object of a link its own tag (for example its compiland index); identical objects cannot be linked twice.");
+    }
+
+    // Per section: position of the definition symbol and of the leader, both as indices into
+    // m.symbols, plus raw indices; same rule as Object::comdat().
+    const std::size_t nsec = m.sections.size();
+    const std::size_t rec = m.symbol_record_size();
+    constexpr std::int64_t kNone = -1;
+    std::vector<std::int64_t> def_pos(nsec + 1, kNone);
+    std::vector<std::int64_t> leader_pos(nsec + 1, kNone);
+    std::vector<std::uint32_t> leader_raw(nsec + 1, 0);
+    std::uint64_t raw = 0;
+    for (std::size_t pos = 0; pos < m.symbols.size(); ++pos) {
+        const ModelSymbol& s = m.symbols[pos];
+        if (s.section_number > 0 && static_cast<std::size_t>(s.section_number) <= nsec) {
+            const std::size_t sec = static_cast<std::size_t>(s.section_number);
+            const bool is_def = s.storage_class == static_cast<std::uint8_t>(StorageClass::Static) && s.aux.size() >= rec &&
+                                s.value == 0 && ((s.type >> 4) & 0xFu) != 2u;
+            if (def_pos[sec] == kNone) {
+                if (is_def) {
+                    def_pos[sec] = static_cast<std::int64_t>(pos);
+                }
+            } else if (leader_pos[sec] == kNone && !is_def) {
+                leader_pos[sec] = static_cast<std::int64_t>(pos);
+                leader_raw[sec] = static_cast<std::uint32_t>(raw);
+            }
+        }
+        raw += 1 + s.aux.size() / rec;
+    }
+
+    std::uint64_t wanted = 0;
+    std::vector<SectionLocator> out(nsec);
+    for (std::size_t i = 0; i < nsec; ++i) {
+        const ModelSection& sec = m.sections[i];
+        SectionLocator& loc = out[i];
+        loc.section_index = static_cast<std::uint32_t>(i + 1);
+        if (!is_anchorable(sec)) {
+            loc.reason = NoLocatorReason::NotLinked;
+            continue;
+        }
+        if (!sec.is_comdat()) {
+            loc.kind = LocatorKind::Anchor;
+            loc.reason = NoLocatorReason::HasLocator;
+            ++wanted;
+            continue;
+        }
+        const std::int64_t def = def_pos[i + 1];
+        if (def != kNone) {
+            const ModelSymbol& d = m.symbols[static_cast<std::size_t>(def)];
+            if (d.aux.size() > 14 && std::to_integer<std::uint8_t>(d.aux[14]) == kSelectionAssociative) {
+                loc.reason = NoLocatorReason::Associative;
+                continue;
+            }
+        }
+        const std::int64_t lp = leader_pos[i + 1];
+        if (lp == kNone) {
+            loc.reason = NoLocatorReason::NoLeader;
+            continue;
+        }
+        const ModelSymbol& leader = m.symbols[static_cast<std::size_t>(lp)];
+        if (leader.storage_class != static_cast<std::uint8_t>(StorageClass::External) || leader.name.empty()) {
+            loc.reason = NoLocatorReason::StaticLeader;
+            continue;
+        }
+        loc.kind = LocatorKind::ComdatLeader;
+        loc.reason = NoLocatorReason::HasLocator;
+        loc.symbol_name = leader.name;
+        loc.symbol_index = leader_raw[i + 1];
+        loc.offset = leader.value;
+    }
+
+    if (raw + wanted > 0xFFFFFFFFull) {
         return Diag::make(diag::kSizeOverflow, "adding anchors would push the symbol table past 2^32 records",
                           "Split the module into smaller objects.");
     }
-    anchors.reserve(wanted);
-    m.symbols.reserve(m.symbols.size() + wanted);
-    for (std::size_t i = 0; i < m.sections.size(); ++i) {
-        if (!is_anchorable(m.sections[i])) {
+    m.symbols.reserve(m.symbols.size() + static_cast<std::size_t>(wanted));
+    for (SectionLocator& loc : out) {
+        if (loc.kind != LocatorKind::Anchor) {
             continue;
         }
-        const std::uint32_t section_index = static_cast<std::uint32_t>(i + 1);
-        std::string name = anchor_name(section_index, tag);
-        auto raw = m.encode_symbol_name(name);
-        if (!raw) {
-            return raw.error();
+        std::string name = anchor_name(loc.section_index, tag);
+        auto encoded = m.encode_symbol_name(name);
+        if (!encoded) {
+            return encoded.error();
         }
         ModelSymbol sym;
         sym.name = name;
-        sym.raw_name = *raw;
+        sym.raw_name = *encoded;
         sym.value = 0;
-        sym.section_number = static_cast<std::int32_t>(section_index);
+        sym.section_number = static_cast<std::int32_t>(loc.section_index);
         sym.type = 0;
-        const bool external = options.external && !(options.comdat_static && m.sections[i].is_comdat());
-        sym.storage_class = static_cast<std::uint8_t>(external ? StorageClass::External : StorageClass::Static);
+        sym.storage_class = static_cast<std::uint8_t>(StorageClass::External);
         m.symbols.push_back(std::move(sym));
-        anchors.push_back({section_index, static_cast<std::uint32_t>(next_index), std::move(name)});
-        ++next_index;
+        loc.symbol_name = std::move(name);
+        loc.symbol_index = static_cast<std::uint32_t>(raw);
+        loc.offset = 0;
+        ++raw;
     }
     m.has_symbol_table = true;
     m.has_string_table = true;  // never leave a symbol table without its string-table size field
-    CML_LOG(Trace, "coff: added %zu anchors to %zu sections (symbol records now %llu)", anchors.size(), m.sections.size(),
-            static_cast<unsigned long long>(next_index));
-    return anchors;
+    CML_LOG(Trace, "coff: located %zu sections (%llu new anchors, tag %s)", nsec, static_cast<unsigned long long>(wanted), tag.c_str());
+    return out;
 }
 
 }  // namespace cml::coff
