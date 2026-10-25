@@ -64,8 +64,8 @@ endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     target_compile_definitions(cml_test_pdb PRIVATE CML_TEST_COMPILER_IS_CL=1)  # cl.exe, not clang-cl
 endif()
-cml_add_unit_test(ipc SOURCES lib/test_ipc.cpp LIBS cml_ipc)
-cml_add_unit_test(proc SOURCES lib/test_proc.cpp LIBS cml_proc)
+cml_add_unit_test(ipc SOURCES lib/test_ipc.cpp lib/test_ipc_loader.cpp LIBS cml_ipc)
+cml_add_unit_test(proc SOURCES lib/test_proc.cpp lib/test_proc_address_space.cpp LIBS cml_proc)
 if(WIN32)
     # WP-11: named-pipe transport tests (real pipes, in-process client and server threads).
     target_sources(cml_test_ipc PRIVATE lib/test_ipc_pipe.cpp)
@@ -107,6 +107,9 @@ if(WIN32)
     add_library(cml_test_dummy_module SHARED agent/dummy_module.cpp)
     cml_apply_warnings(cml_test_dummy_module)
     set_target_properties(cml_test_dummy_module PROPERTIES FOLDER "tests")
+
+    # WP-08: the agent's patch loader inside a test host (needs cml_test_dummy_module above).
+    add_subdirectory(agent_loader)
 
     # A fake cml_agent.dll with the wrong ABI version, in its own directory next to the test
     # exe, for the "ABI mismatch fails gracefully" test.
