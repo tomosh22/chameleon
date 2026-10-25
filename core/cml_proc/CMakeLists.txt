@@ -1,5 +1,5 @@
 cml_add_core_library(cml_proc
-    SOURCES src/proc.cpp
+    SOURCES src/proc.cpp src/address_space.cpp
     LIBS cml_util)
 if(WIN32)
     # advapi32: tokens and SIDs. Deliberately no shell32: this library is linked into the agent DLL,

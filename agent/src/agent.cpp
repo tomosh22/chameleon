@@ -18,6 +18,7 @@
 #include "cml/proc/proc.h"
 #include "cml/util/log.h"
 #include "cml/util/path.h"
+#include "loader/patch_loader.h"
 #include "module_diff.h"
 
 namespace cml::agent {
@@ -904,9 +905,31 @@ void Agent::serve(ipc::PipeConnection& connection) {
         }
         switch (received->status) {
             case ipc::IoStatus::Ok:
+                if (loader::PatchLoader::is_loader_request(received->message)) {
+                    // WP-08: address space and patch loading. Runs on the agent thread; the answer
+                    // (PatchLoaded / ReserveRange / Reply) is sent when the work is done.
+                    CML_LOG(Debug, "<- %s", ipc::describe(received->message).c_str());
+                    if (!send_message(connection, loader::PatchLoader::shared().handle_request(received->message))) {
+                        return;
+                    }
+                    break;
+                }
                 handle_message(received->message);
                 break;
             case ipc::IoStatus::Rejected:
+                // A broker request whose payload we cannot decode is answered with an error Reply,
+                // so the broker is not left waiting (WP-08 requests; the broker owns the ids).
+                if (received->is_request && received->request_id.has_value()) {
+                    ipc::Reply refusal;
+                    refusal.request_id = *received->request_id;
+                    refusal.status = received->error.code;
+                    refusal.message = ipc::sanitize_utf8(received->error.format(), 512);
+                    if (!send_message(connection, refusal)) {
+                        return;
+                    }
+                    CML_LOG(Warn, "refused an undecodable request from the broker: %s", received->error.format().c_str());
+                    break;
+                }
                 // An answer we cannot decode would leave its request waiting for ever (and hold an
                 // in-flight slot): drop the connection, which fails everything in flight and
                 // reconnects. Anything else (a stray event) can be skipped.
