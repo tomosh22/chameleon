@@ -10,14 +10,14 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-04 | cml_pdb index | 1 | done | wp/04-pdb-index | #5 | — |
 | WP-11 | Agent skeleton, public header and IPC | 1 | done (post-merge fix #16: ScriptedBroker shutdown race, test watchdog) | wp/11-agent-ipc | #6, #16 | — |
 | WP-03 | End-to-end spike (M1 gate) | 2 | done — **gate passed** (verified by orchestrator from CI logs, all 8 cells) | wp/03-e2e-spike | #10 | — |
-| WP-05 | Toolchain command parsing and rewriting | 2 | done (post-merge fix #15: never kill mspdbsrv on cancel) | wp/05-toolchain | #13, #15 | — |
+| WP-05 | Toolchain command parsing and rewriting | 2 | done (post-merge fixes #15, #21) | wp/05-toolchain | #13, #15, #21 | — |
 | WP-06 | cml_coff writer: anchors and binding object | 2 | done | wp/06-coff-writer | #11 | — |
 | WP-13 | Test harness cmltest | 2 | done (partial scenario per ADR-0022 until WP-12) | wp/13-cmltest | #12 | — |
-| WP-07 | Bind planner | 3 | in review (high effort: 7 findings, silent mis-binding) | wp/07-bind-planner | #19 | — |
+| WP-07 | Bind planner (settles ADR-0010; ADR-0028/0029) | 3 | done | wp/07-bind-planner | #19 | — |
 | WP-08 | Address-space reservation and patch loading (agent) | 3 | done | wp/08-agent-loading | #18 | — |
 | WP-09 | Linker driver (Q2 settled: ADR-0027) | 3 | done | wp/09-linker-driver | #17 | — |
 | WP-10 | Hook installer (agent) | 3 | done | wp/10-hook-installer | #20 | — |
-| WP-12 | Broker core (orchestrator integration) | 4 | todo | — | — | wave 3 |
+| WP-12 | Broker core (orchestrator integration) | 4 | in progress | wp/12-broker-core | — | — |
 
 ## Orchestrator integration work
 

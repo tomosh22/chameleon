@@ -55,3 +55,7 @@ diagnostic is planned, not live.
   overflow in the test host crashed one CI cell (WP-08). If the stack cannot be restored, the
   agent refuses to run further initialisers on that thread; hot-restart.
 - Patch DLLs never appear in the module list the agent sends to the broker (WP-08).
+- A *static* (TU-private) function whose parameter types change, keeping its name, is matched to
+  its old namesake (the PDB carries no signatures for the planner yet; ADR-0029). Callers inside
+  the patched TU are recompiled and are fine; an old function pointer to it held elsewhere would
+  be called with the old signature. Rename the function when changing its signature, or hot-restart.
