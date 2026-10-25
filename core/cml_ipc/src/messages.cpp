@@ -553,6 +553,41 @@ Result<Message> decode_frame(const std::uint8_t* frame, std::size_t size) {
                           header->payload_size);
 }
 
+bool is_request_type(std::uint16_t type) noexcept {
+    switch (static_cast<MessageType>(type)) {
+        case MessageType::Hello:
+        case MessageType::ModuleList:
+        case MessageType::EnableModule:
+        case MessageType::DisableModule:
+            return true;
+        default:
+            return false;
+    }
+}
+
+std::optional<std::uint64_t> peek_request_id(std::uint16_t type, const std::uint8_t* payload,
+                                             std::size_t size) noexcept {
+    switch (static_cast<MessageType>(type)) {
+        case MessageType::Hello:
+        case MessageType::Welcome:
+        case MessageType::Reply:
+        case MessageType::ModuleList:
+        case MessageType::EnableModule:
+        case MessageType::DisableModule:
+            break;
+        default:
+            return std::nullopt;
+    }
+    if (payload == nullptr || size < 8) {
+        return std::nullopt;
+    }
+    std::uint64_t id = 0;
+    for (std::size_t i = 0; i < 8; ++i) {
+        id |= static_cast<std::uint64_t>(payload[i]) << (8 * i);
+    }
+    return id;
+}
+
 std::string describe(const Message& message) {
     struct Visitor {
         std::string operator()(const Hello& m) const {

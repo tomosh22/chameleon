@@ -27,8 +27,13 @@ constexpr DWORD kSendTimeoutMs = 5000;
 constexpr DWORD kHandshakeTimeoutMs = 5000;
 constexpr ULONGLONG kModulePollMs = 500;
 constexpr DWORD kReceiveSliceMs = 250;       // longest the agent thread sleeps without re-checking
-constexpr std::size_t kMaxOutstanding = 1024;  // queued + sent requests plus unconsumed answers
-constexpr std::size_t kMaxUnconsumedAnswers = 1024;
+// The request table. Answers nobody has collected are kept only up to kMaxUnconsumedAnswers (the
+// oldest are dropped first) and are evicted when the table is full, so they can never keep new
+// requests out; kReenableReserve is extra room for the internal re-enables after a reconnect.
+constexpr std::size_t kMaxOutstanding = 1024;
+constexpr std::size_t kMaxUnconsumedAnswers = 512;
+constexpr std::size_t kMaxTrackedModules = 256;
+constexpr std::size_t kReenableReserve = kMaxTrackedModules;
 constexpr std::size_t kMaxLogsPerPass = 16;
 // Requests sent but not yet answered. Bounded so that the agent keeps reading replies while it
 // writes: with an unbounded burst both pipe buffers could fill up and stall both ends.
@@ -144,13 +149,15 @@ void Agent::stop() {
     // Wake every waiter: whatever was still open will never be answered.
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (auto& [id, entry] : entries_) {
+        std::vector<std::uint64_t> open;
+        for (const auto& [id, entry] : entries_) {
             if (entry.state != State::Done) {
-                entry.state = State::Done;
-                entry.status = ids::kRequestCancelled;
-                entry.text = "the agent was destroyed before the broker answered";
-                done_order_.push_back(id);
+                open.push_back(id);
             }
+        }
+        for (const std::uint64_t id : open) {
+            const auto it = entries_.find(id);
+            finish_locked(it, ids::kRequestCancelled, "the agent was destroyed before the broker answered", false);
         }
         outgoing_.clear();
     }
@@ -165,17 +172,25 @@ void Agent::stop() {
 
 // --- application-facing calls -------------------------------------------------------------------
 
-cml_status Agent::enqueue(std::uint64_t id, ipc::Message message) {
+cml_status Agent::enqueue(std::uint64_t id, ipc::Message message, bool wanted) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (stopping_.load(std::memory_order_acquire)) {
             return static_cast<cml_status>(ids::kRequestCancelled);
         }
-        if (entries_.size() >= kMaxOutstanding) {
+        // Answers nobody collected must never lock new requests out: make room by evicting the
+        // oldest of them. Only genuinely open requests can fill the table.
+        while (entries_.size() >= kMaxOutstanding + kReenableReserve && !done_order_.empty()) {
+            entries_.erase(done_order_.front());
+            done_order_.pop_front();
+        }
+        if (entries_.size() >= kMaxOutstanding + kReenableReserve) {
             return static_cast<cml_status>(ids::kRequestQueueFull);
         }
         Entry entry;
         entry.message = std::move(message);
+        entry.wanted = wanted;
+        entry.seq = queue_seq_.fetch_add(1, std::memory_order_acq_rel) + 1;
         entries_.emplace(id, std::move(entry));
         outgoing_.push_back(id);
     }
@@ -190,7 +205,8 @@ cml_status Agent::submit_path_request(const wchar_t* path, std::uint64_t* reques
         return CML_STATUS_INVALID_ARGUMENT;
     }
     const std::uint64_t id = next_id_.fetch_add(1, std::memory_order_relaxed);
-    const cml_status status = enqueue(id, build(id, std::move(utf8)));
+    // Without a request_id out-parameter nobody can ask for the answer, so none is kept.
+    const cml_status status = enqueue(id, build(id, std::move(utf8)), request_id != nullptr);
     if (status == CML_STATUS_OK && request_id != nullptr) {
         *request_id = id;
     }
@@ -457,6 +473,7 @@ bool Agent::handshake(ipc::PipeConnection& connection) {
 bool Agent::send_module_list(ipc::PipeConnection& connection) {
     ipc::ModuleList list;
     list.request_id = next_id_.fetch_add(1, std::memory_order_relaxed);
+    const std::uint64_t seq_mark = queue_seq_.load(std::memory_order_acquire);
     Result<std::vector<proc::ModuleInfo>> modules = proc::enumerate_modules(0);
     if (!modules) {
         CML_LOG(Warn, "%s", modules.error().format().c_str());
@@ -466,23 +483,24 @@ bool Agent::send_module_list(ipc::PipeConnection& connection) {
     {
         // Register before sending so the Reply cannot race the registration.
         Entry entry;
-        entry.state = State::Sent;
         entry.internal = true;
         std::lock_guard<std::mutex> lock(mutex_);
-        entries_.emplace(list.request_id, std::move(entry));
+        const auto inserted = entries_.emplace(list.request_id, std::move(entry));
+        note_sent_locked(inserted.first->second);
     }
     if (!send_message(connection, list)) {
         return false;
     }
     known_modules_ = list.modules;
     last_module_poll_ = GetTickCount64();
+    polled_seq_ = seq_mark;
     return true;
 }
 
 bool Agent::flush_outgoing(ipc::PipeConnection& connection) {
-    bool polled = false;
     for (;;) {
         std::uint64_t id = 0;
+        std::uint64_t seq = 0;
         ipc::Message message;
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -491,11 +509,7 @@ bool Agent::flush_outgoing(ipc::PipeConnection& connection) {
             }
             // Leave the rest queued while a full window of requests awaits answers; serve() reads
             // replies and calls us again.
-            std::size_t in_flight = 0;
-            for (const auto& [entry_id, entry] : entries_) {
-                in_flight += entry.state == State::Sent ? 1 : 0;
-            }
-            if (in_flight >= kMaxInFlight) {
+            if (sent_count_ >= kMaxInFlight) {
                 return true;
             }
             id = outgoing_.front();
@@ -505,12 +519,13 @@ bool Agent::flush_outgoing(ipc::PipeConnection& connection) {
                 continue;
             }
             message = it->second.message;
+            seq = it->second.seq;
         }
-        // The broker checks EnableModule against the module list it has, so bring it up to date
-        // once per pass, before the first request of the pass goes out.
+        // The broker checks EnableModule against the module list it has, so it must have seen
+        // every module that was loaded before the request was made. One poll serves all the
+        // requests queued before it started; a request queued after the last poll needs a new one.
         bool ok = true;
-        if (!polled) {
-            polled = true;
+        if (seq > polled_seq_) {
             ok = poll_modules(connection);
         }
         ok = ok && send_message(connection, message);
@@ -523,7 +538,7 @@ bool Agent::flush_outgoing(ipc::PipeConnection& connection) {
             return false;
         }
         if (it != entries_.end()) {
-            it->second.state = State::Sent;
+            note_sent_locked(it->second);
         }
     }
 }
@@ -544,6 +559,9 @@ bool Agent::flush_logs(ipc::PipeConnection& connection) {
 
 bool Agent::poll_modules(ipc::PipeConnection& connection) {
     last_module_poll_ = GetTickCount64();
+    // Everything queued before this point was queued after the modules it refers to were loaded,
+    // so the snapshot taken now covers it.
+    const std::uint64_t seq_mark = queue_seq_.load(std::memory_order_acquire);
     Result<std::vector<proc::ModuleInfo>> modules = proc::enumerate_modules(0);
     if (!modules) {
         CML_LOG(Debug, "%s", modules.error().format().c_str());
@@ -562,6 +580,7 @@ bool Agent::poll_modules(ipc::PipeConnection& connection) {
         }
     }
     known_modules_ = std::move(current);
+    polled_seq_ = seq_mark;
     return true;
 }
 
@@ -569,11 +588,19 @@ bool Agent::same_module(const std::string& a, const std::string& b) {
     return path::matches_module(a, b) || path::matches_module(b, a);
 }
 
+void Agent::note_sent_locked(Entry& entry) {
+    entry.state = State::Sent;
+    ++sent_count_;
+}
+
 void Agent::track_enabled_locked(const Entry& entry, std::uint32_t status) {
     if (const auto* enable = std::get_if<ipc::EnableModule>(&entry.message)) {
         const auto same = [enable](const EnabledModule& m) { return same_module(m.path, enable->path); };
         if (status == 0) {
-            if (std::none_of(enabled_.begin(), enabled_.end(), same)) {
+            const auto existing = std::find_if(enabled_.begin(), enabled_.end(), same);
+            if (existing != enabled_.end()) {
+                existing->options = enable->options;  // a later enable may change the options
+            } else if (enabled_.size() < kMaxTrackedModules) {
                 enabled_.push_back(EnabledModule{enable->path, enable->options});
             }
         } else if (entry.internal) {
@@ -589,17 +616,56 @@ void Agent::track_enabled_locked(const Entry& entry, std::uint32_t status) {
     }
 }
 
+// Ends an open request. A request whose answer is wanted becomes Done and waits to be collected
+// (bounded; the oldest uncollected answers are dropped); internal ones and ones created without a
+// request id are simply forgotten.
+void Agent::finish_locked(std::map<std::uint64_t, Entry>::iterator it, std::uint32_t status, const char* text,
+                          bool answered_by_broker) {
+    Entry& entry = it->second;
+    if (entry.state == State::Sent) {
+        --sent_count_;
+    }
+    if (answered_by_broker) {
+        track_enabled_locked(entry, status);  // a lost connection says nothing about the module
+    }
+    if (entry.internal || !entry.wanted) {
+        entries_.erase(it);
+        return;
+    }
+    entry.state = State::Done;
+    entry.status = status;
+    entry.text = text;
+    done_order_.push_back(it->first);
+    while (done_order_.size() > kMaxUnconsumedAnswers) {
+        entries_.erase(done_order_.front());
+        done_order_.pop_front();
+    }
+}
+
 // After a reconnect the new broker session knows nothing of what the application enabled. Queue
-// an EnableModule for each tracked module ahead of everything else that is waiting.
+// an EnableModule for each tracked module ahead of everything else that is waiting. Re-enables
+// left over from the previous session (still queued, or sent and unanswered) are dropped first, so
+// reconnecting repeatedly never piles up duplicates.
 void Agent::queue_reenables() {
     std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = entries_.begin(); it != entries_.end();) {
+        if (it->second.internal && std::holds_alternative<ipc::EnableModule>(it->second.message)) {
+            if (it->second.state == State::Sent) {
+                --sent_count_;
+            }
+            outgoing_.erase(std::remove(outgoing_.begin(), outgoing_.end(), it->first), outgoing_.end());
+            it = entries_.erase(it);
+        } else {
+            ++it;
+        }
+    }
     for (auto it = enabled_.rbegin(); it != enabled_.rend(); ++it) {
         ipc::EnableModule request;
         request.request_id = next_id_.fetch_add(1, std::memory_order_relaxed);
         request.options = it->options;
         request.path = it->path;
         Entry entry;
-        entry.internal = true;
+        entry.internal = true;  // seq stays 0: no module poll needed, they refer to known modules
         entry.message = request;
         entries_.emplace(request.request_id, std::move(entry));
         outgoing_.push_front(request.request_id);
@@ -612,26 +678,14 @@ void Agent::queue_reenables() {
 
 void Agent::complete(std::uint64_t request_id, std::uint32_t status, std::string text) {
     bool known = false;
-    bool internal = false;
+    bool wake = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto it = entries_.find(request_id);
         if (it != entries_.end() && it->second.state != State::Done) {
             known = true;
-            internal = it->second.internal;
-            track_enabled_locked(it->second, status);
-            if (internal) {
-                entries_.erase(it);
-            } else {
-                it->second.state = State::Done;
-                it->second.status = status;
-                it->second.text = text;
-                done_order_.push_back(request_id);
-                while (done_order_.size() > kMaxUnconsumedAnswers) {
-                    entries_.erase(done_order_.front());  // nobody collected it: drop the oldest
-                    done_order_.pop_front();
-                }
-            }
+            wake = !it->second.internal && it->second.wanted;
+            finish_locked(it, status, text.c_str(), true);
         }
     }
     if (!known) {
@@ -644,7 +698,7 @@ void Agent::complete(std::uint64_t request_id, std::uint32_t status, std::string
     } else {
         CML_LOG(Debug, "request %llu answered: %s", static_cast<unsigned long long>(request_id), text.c_str());
     }
-    if (!internal) {
+    if (wake) {
         done_.notify_all();
     }
 }
@@ -652,19 +706,14 @@ void Agent::complete(std::uint64_t request_id, std::uint32_t status, std::string
 void Agent::fail_in_flight(std::uint32_t status, const char* text) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (auto it = entries_.begin(); it != entries_.end();) {
-            Entry& entry = it->second;
-            if (entry.state != State::Sent) {
-                ++it;
-            } else if (entry.internal) {
-                it = entries_.erase(it);
-            } else {
-                entry.state = State::Done;
-                entry.status = status;
-                entry.text = text;
-                done_order_.push_back(it->first);
-                ++it;
+        std::vector<std::uint64_t> sent;
+        for (const auto& [id, entry] : entries_) {
+            if (entry.state == State::Sent) {
+                sent.push_back(id);
             }
+        }
+        for (const std::uint64_t id : sent) {
+            finish_locked(entries_.find(id), status, text, false);
         }
     }
     done_.notify_all();
@@ -697,6 +746,15 @@ void Agent::serve(ipc::PipeConnection& connection) {
                 handle_message(received->message);
                 break;
             case ipc::IoStatus::Rejected:
+                // An answer we cannot decode would leave its request waiting for ever (and hold an
+                // in-flight slot): drop the connection, which fails everything in flight and
+                // reconnects. Anything else (a stray event) can be skipped.
+                if (received->raw_type == static_cast<std::uint16_t>(ipc::MessageType::Reply) ||
+                    received->raw_type == static_cast<std::uint16_t>(ipc::MessageType::Welcome)) {
+                    CML_LOG(Warn, "an undecodable answer from the broker (%s); dropping the connection",
+                            received->error.format().c_str());
+                    return;
+                }
                 CML_LOG(Warn, "dropped one message from the broker: %s", received->error.format().c_str());
                 break;
             case ipc::IoStatus::Timeout:

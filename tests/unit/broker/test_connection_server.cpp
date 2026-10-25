@@ -376,4 +376,59 @@ TEST_CASE("a client that connects and immediately leaves does not stop the broke
     CHECK_FALSE(server.finished());
 }
 
+TEST_CASE("a request that arrives with a bad payload is answered with an error, not left hanging") {
+    QuietLogs quiet;
+    ServerOptions options;
+    options.pipe_name = unique_pipe_name("badrequest");
+    RunningServer server(options);
+    REQUIRE(ipc::pipe_exists(options.pipe_name));
+
+    HANDLE raw = open_raw_client(options.pipe_name);
+    REQUIRE(raw != INVALID_HANDLE_VALUE);
+    raw_send(raw, hello(1));
+    REQUIRE(std::holds_alternative<ipc::Welcome>(raw_receive(raw)));
+
+    // EnableModule, request id 77, options 0, path of two bytes FF FE (not UTF-8).
+    std::vector<std::uint8_t> bad = {0x12, 0x00, 0x00, 0x00, 0x11, 0x00, 0x01, 0x00,  // header: 18 bytes, EnableModule
+                                     77,   0,    0,    0,    0,    0,    0,    0,     // request id
+                                     0,    0,    0,    0,                             // options
+                                     2,    0,    0,    0,    0xFF, 0xFE};              // path
+    // payload is 8 + 4 + 4 + 2 = 18 bytes
+    raw_write(raw, bad);
+    const ipc::Message answer = raw_receive(raw);
+    REQUIRE(std::holds_alternative<ipc::Reply>(answer));
+    CHECK(std::get<ipc::Reply>(answer).request_id == 77);
+    CHECK(std::get<ipc::Reply>(answer).status == ids::kPayloadMalformed);
+
+    // The session is still usable afterwards.
+    ipc::ModuleList list;
+    list.request_id = 78;
+    raw_send(raw, list);
+    const ipc::Message next = raw_receive(raw);
+    REQUIRE(std::holds_alternative<ipc::Reply>(next));
+    CHECK(std::get<ipc::Reply>(next).request_id == 78);
+    CHECK(std::get<ipc::Reply>(next).status == 0);
+    CloseHandle(raw);
+}
+
+TEST_CASE("a request whose id cannot even be read closes the connection") {
+    QuietLogs quiet;
+    ServerOptions options;
+    options.pipe_name = unique_pipe_name("noid");
+    RunningServer server(options);
+    REQUIRE(ipc::pipe_exists(options.pipe_name));
+
+    HANDLE raw = open_raw_client(options.pipe_name);
+    REQUIRE(raw != INVALID_HANDLE_VALUE);
+    raw_send(raw, hello(1));
+    REQUIRE(std::holds_alternative<ipc::Welcome>(raw_receive(raw)));
+
+    // An EnableModule with a 3-byte payload: no request id to answer.
+    raw_write(raw, {0x03, 0x00, 0x00, 0x00, 0x11, 0x00, 0x01, 0x00, 0x01, 0x02, 0x03});
+    std::uint8_t byte = 0;
+    DWORD read = 0;
+    CHECK_FALSE(ReadFile(raw, &byte, 1, &read, nullptr));  // the server hung up
+    CloseHandle(raw);
+}
+
 #endif  // _WIN32

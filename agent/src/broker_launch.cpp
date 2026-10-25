@@ -79,8 +79,75 @@ std::wstring broker_command_line(const std::wstring& broker_path, const std::str
     return command;
 }
 
+std::wstring broker_working_directory(const std::wstring& broker_path) {
+    std::wstring directory(path::parent_directory(std::wstring_view(broker_path)));
+    if (directory.empty()) {
+        return {};
+    }
+    if (directory.size() == 2 && directory[1] == L':') {
+        directory.push_back(L'\\');  // a bare drive becomes its root directory
+    }
+    if (directory.size() >= MAX_PATH) {
+        return {};  // CreateProcess cannot take it; the broker then inherits the host's directory
+    }
+    return directory;
+}
+
+std::string absolutize_log_argument(const std::string& args, const std::wstring& host_directory) {
+    const auto blank = [](char c) { return c == ' ' || c == '\t'; };
+    for (std::size_t at = args.find("--log"); at != std::string::npos; at = args.find("--log", at + 1)) {
+        const bool starts_token = at == 0 || blank(args[at - 1]);
+        const std::size_t after = at + 5;
+        if (!starts_token || after >= args.size() || !blank(args[after])) {
+            continue;
+        }
+        std::size_t begin = after;
+        while (begin < args.size() && blank(args[begin])) {
+            ++begin;
+        }
+        if (begin >= args.size()) {
+            return args;
+        }
+        std::size_t end = 0;
+        std::string value;
+        std::size_t resume = 0;
+        if (args[begin] == '"') {
+            end = args.find('"', begin + 1);
+            if (end == std::string::npos) {
+                return args;  // unbalanced quote: leave it for the broker to complain about
+            }
+            value = args.substr(begin + 1, end - begin - 1);
+            resume = end + 1;
+        } else {
+            end = begin;
+            while (end < args.size() && !blank(args[end])) {
+                ++end;
+            }
+            value = args.substr(begin, end - begin);
+            resume = end;
+        }
+        const bool rooted = !value.empty() && (value[0] == '\\' || value[0] == '/' ||
+                                              (value.size() >= 2 && value[1] == ':'));
+        if (value.empty() || rooted || host_directory.empty()) {
+            return args;
+        }
+        std::string absolute = proc::utf8_from_wide(host_directory);
+        if (!absolute.empty() && absolute.back() != '\\' && absolute.back() != '/') {
+            absolute.push_back('\\');
+        }
+        absolute += value;
+        return args.substr(0, begin) + "\"" + absolute + "\"" + args.substr(resume);
+    }
+    return args;
+}
+
 Result<void> launch_broker(const std::wstring& broker_path, const std::string& pipe_name,
-                           const std::string& extra_args) {
+                           const std::string& extra_args_in) {
+    wchar_t host_directory[MAX_PATH];
+    const DWORD host_length = GetCurrentDirectoryW(MAX_PATH, host_directory);
+    const std::string extra_args = absolutize_log_argument(
+        extra_args_in, host_length > 0 && host_length < MAX_PATH ? std::wstring(host_directory, host_length)
+                                                                  : std::wstring());
     const DWORD attributes = GetFileAttributesW(broker_path.c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
         return start_failed(broker_path, "the file does not exist");
@@ -88,7 +155,7 @@ Result<void> launch_broker(const std::wstring& broker_path, const std::string& p
 
     const std::wstring command = broker_command_line(broker_path, pipe_name, extra_args);
     // Run it from its own directory, not from whatever the host's working directory is.
-    const std::wstring directory(path::parent_directory(std::wstring_view(broker_path)));
+    const std::wstring directory = broker_working_directory(broker_path);
     std::vector<wchar_t> mutable_command(command.begin(), command.end());
     mutable_command.push_back(L'\0');  // CreateProcessW may modify the buffer
 

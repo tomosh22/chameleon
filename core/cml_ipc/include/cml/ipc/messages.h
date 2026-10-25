@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -176,6 +177,17 @@ Result<Message> decode_message(std::uint16_t type, std::uint16_t version, const 
 
 // Convenience for tests and tools: decodes a whole frame (header + payload) held in memory.
 Result<Message> decode_frame(const std::uint8_t* frame, std::size_t size);
+
+// True for the message types that expect an answer (Hello, ModuleList, EnableModule,
+// DisableModule). Takes the raw wire value, so it also works for frames that failed to decode.
+bool is_request_type(std::uint16_t type) noexcept;
+
+// The request id of a frame whose payload may be malformed: every type whose payload starts with a
+// request id (Hello, Welcome, Reply, ModuleList, EnableModule, DisableModule) carries it in the
+// first 8 bytes. nullopt for other types or when fewer than 8 bytes are present. Used to answer
+// a request that arrived with a bad payload instead of leaving its sender waiting.
+std::optional<std::uint64_t> peek_request_id(std::uint16_t type, const std::uint8_t* payload,
+                                             std::size_t size) noexcept;
 
 // One-line description for logs, e.g. `EnableModule request=3 path="C:\x.dll" options=1`.
 std::string describe(const Message& message);

@@ -58,7 +58,10 @@ std::wstring read_growing_string(Fetch fetch, std::size_t initial_capacity = 260
         if (n == 0) {
             return {};
         }
-        if (n < buffer.size()) {
+        // GetModuleFileNameW reports truncation by returning the buffer size, but
+        // GetModuleFileNameExW may return size-1 (it writes the terminator and cuts the string):
+        // a result that fills all but the last character is therefore treated as possibly cut.
+        if (n + 1 < buffer.size()) {
             buffer.resize(n);
             return buffer;
         }

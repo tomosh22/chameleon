@@ -30,17 +30,21 @@ enum class ServerExit {
 class ConnectionServer {
 public:
     explicit ConnectionServer(ServerOptions options);
+    ~ConnectionServer();
+    ConnectionServer(const ConnectionServer&) = delete;
+    ConnectionServer& operator=(const ConnectionServer&) = delete;
 
     // Serves until stop(), the idle timeout or the startup timeout. Blocks the calling thread.
     // Fails (CML5207 and friends) only if the pipe cannot be created.
     Result<ServerExit> run();
 
-    // Any thread. Idempotent.
-    void stop() noexcept { stop_requested_.store(true, std::memory_order_release); }
+    // Any thread. Idempotent. Wakes run() at once, even while it waits for a client.
+    void stop() noexcept;
 
 private:
     ServerOptions options_;
     std::atomic<bool> stop_requested_{false};
+    void* stop_event_ = nullptr;  // manual-reset event, set by stop()
 };
 
 }  // namespace cml::core

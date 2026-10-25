@@ -26,6 +26,18 @@ inline constexpr unsigned kDefaultStartupTimeoutMs = 60 * 1000;
 std::wstring broker_command_line(const std::wstring& broker_path, const std::string& pipe_name,
                                  const std::string& extra_args);
 
+// The working directory for the broker: its own directory. Empty (meaning: inherit the host's) when
+// that directory is too long for CreateProcess's lpCurrentDirectory (MAX_PATH) or cannot be told.
+// A drive root keeps its trailing separator ("C:\\", not "C:", which means "the current directory
+// of drive C").
+std::wstring broker_working_directory(const std::wstring& broker_path);
+
+// The broker runs in its own directory, so a relative path in CML_BROKER_ARGS would be resolved
+// against that directory, not against the host's. For `--log` (the one option that takes a path)
+// the agent therefore makes a relative path absolute against `host_directory` first. Other options
+// are passed through untouched.
+std::string absolutize_log_argument(const std::string& args, const std::wstring& host_directory);
+
 Result<void> launch_broker(const std::wstring& broker_path, const std::string& pipe_name,
                            const std::string& extra_args);
 

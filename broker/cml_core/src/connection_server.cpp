@@ -12,6 +12,7 @@
 
 #include "cml/core/session.h"
 #include "cml/core/version.h"
+#include "cml/proc/diag_ids.h"
 #include "cml/ipc/pipe.h"
 #include "cml/util/log.h"
 
@@ -68,12 +69,31 @@ void serve_connection(Connection& connection, std::uint64_t agent_id, Shared& sh
                 }
                 break;
             }
-            case ipc::IoStatus::Rejected:
-                // One bad message (invalid UTF-8, unsupported version or type) is logged and
-                // skipped; framing is intact, so the connection and the session carry on.
-                CML_LOG(Warn, "agent#%llu: dropped one message: %s", static_cast<unsigned long long>(agent_id),
-                        received->error.format().c_str());
+            case ipc::IoStatus::Rejected: {
+                // Framing is intact, so the connection survives one bad message. But a request
+                // that is silently skipped would leave its sender waiting forever: answer it with
+                // the error when its id can be read, and give up on the connection when it cannot.
+                const ipc::PipeConnection::Received& bad = *received;
+                CML_LOG(Warn, "agent#%llu: rejected a %s message: %s", static_cast<unsigned long long>(agent_id),
+                        ipc::to_string(static_cast<ipc::MessageType>(bad.raw_type)), bad.error.format().c_str());
+                if (bad.is_request) {
+                    if (!bad.request_id) {
+                        CML_LOG(Warn, "agent#%llu: the request id is unreadable; closing the connection",
+                                static_cast<unsigned long long>(agent_id));
+                        running = false;
+                        break;
+                    }
+                    ipc::Reply error_reply;
+                    error_reply.request_id = *bad.request_id;
+                    error_reply.status = bad.error.code;
+                    error_reply.message = ipc::sanitize_utf8(bad.error.message + " " + bad.error.what_to_do, 1000);
+                    Result<ipc::IoStatus> sent = connection.pipe.send(error_reply, kSendTimeoutMs);
+                    if (!sent || *sent != ipc::IoStatus::Ok) {
+                        running = false;
+                    }
+                }
                 break;
+            }
             case ipc::IoStatus::Timeout:
             case ipc::IoStatus::Woken:
                 break;
@@ -108,9 +128,28 @@ void reap_finished(std::vector<std::unique_ptr<Connection>>& connections) {
 
 }  // namespace
 
-ConnectionServer::ConnectionServer(ServerOptions options) : options_(std::move(options)) {}
+ConnectionServer::ConnectionServer(ServerOptions options) : options_(std::move(options)) {
+    stop_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+}
+
+ConnectionServer::~ConnectionServer() {
+    if (stop_event_ != nullptr) {
+        CloseHandle(stop_event_);
+    }
+}
+
+void ConnectionServer::stop() noexcept {
+    stop_requested_.store(true, std::memory_order_release);
+    if (stop_event_ != nullptr) {
+        SetEvent(stop_event_);
+    }
+}
 
 Result<ServerExit> ConnectionServer::run() {
+    if (stop_event_ == nullptr) {
+        return Diag::make(ids::kPipeCreateFailed, "cannot create the broker's stop event",
+                          "Close other programs to free system resources and retry.");
+    }
     Result<ipc::PipeServer> created = ipc::PipeServer::create(options_.pipe_name);
     if (!created) {
         return created.error();
@@ -128,20 +167,21 @@ Result<ServerExit> ConnectionServer::run() {
     std::optional<Diag> failure;
 
     while (!stop_requested_.load(std::memory_order_acquire)) {
-        Result<ipc::PipeServer::Accepted> accepted = server.accept(kAcceptPollMs);
+        // stop() signals stop_event_, which also ends a wait for a client at once.
+        Result<ipc::PipeServer::Accepted> accepted = server.accept(kAcceptPollMs, stop_event_);
         if (!accepted) {
             // One failed accept (resource shortage, a client that misbehaved) must not take the
             // broker down; only a long unbroken run of failures means the pipe is really broken.
+            // Pause (interruptibly), then fall through to the housekeeping below so that stop
+            // requests, finished connections and the idle timers are still looked after.
             CML_LOG(Error, "%s", accepted.error().format().c_str());
             if (++consecutive_accept_failures >= kMaxConsecutiveAcceptFailures) {
                 failure = accepted.error();
                 break;
             }
-            Sleep(kAcceptRetryPauseMs);
-            continue;
-        }
-        consecutive_accept_failures = 0;
-        if (accepted->status == ipc::IoStatus::Ok) {
+            WaitForSingleObject(stop_event_, kAcceptRetryPauseMs);
+        } else if (accepted->status == ipc::IoStatus::Ok) {
+            consecutive_accept_failures = 0;
             const std::uint64_t agent_id = next_agent_id++;
             ever_connected = true;
             shared.active.fetch_add(1, std::memory_order_acq_rel);
@@ -153,6 +193,8 @@ Result<ServerExit> ConnectionServer::run() {
             raw->thread = std::thread(serve_connection, std::ref(*raw), agent_id, std::ref(shared),
                                       std::cref(stop_requested_));
             connections.push_back(std::move(connection));
+        } else {
+            consecutive_accept_failures = 0;
         }
         reap_finished(connections);
 

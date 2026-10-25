@@ -196,4 +196,24 @@ TEST_CASE("module paths longer than MAX_PATH are not truncated") {
     for (auto it = created.rbegin(); it != created.rend(); ++it) RemoveDirectoryW(it->c_str());
 }
 
+TEST_CASE("read_growing_string also grows when truncation is reported as capacity - 1") {
+    // GetModuleFileNameExW style: writes the terminator and returns the cut length (capacity - 1).
+    const std::wstring wanted(600, L'q');
+    const auto fetch = [&](wchar_t* buffer, unsigned long capacity) -> std::size_t {
+        const std::size_t n = std::min<std::size_t>(wanted.size(), capacity - 1);
+        std::copy(wanted.begin(), wanted.begin() + static_cast<std::ptrdiff_t>(n), buffer);
+        return n;
+    };
+    CHECK(proc::read_growing_string(fetch) == wanted);
+
+    // A string that is exactly capacity - 1 long is indistinguishable from a cut one: still correct.
+    const std::wstring exact(259, L'x');
+    const auto fetch_exact = [&](wchar_t* buffer, unsigned long capacity) -> std::size_t {
+        const std::size_t n = std::min<std::size_t>(exact.size(), capacity - 1);
+        std::copy(exact.begin(), exact.begin() + static_cast<std::ptrdiff_t>(n), buffer);
+        return n;
+    };
+    CHECK(proc::read_growing_string(fetch_exact) == exact);
+}
+
 #endif  // _WIN32

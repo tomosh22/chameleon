@@ -357,10 +357,18 @@ Result<PipeConnection::Received> PipeConnection::receive(std::uint32_t timeout_m
             const FrameHeader header = s.parsed;
             Result<Message> message =
                 decode_message(header.type, header.version, s.payload.data(), s.payload.size());
+            std::vector<std::uint8_t> rejected_payload;
+            if (!message) {
+                rejected_payload.assign(s.payload.begin(),
+                                        s.payload.begin() + static_cast<std::ptrdiff_t>(std::min<std::size_t>(s.payload.size(), 8)));
+            }
             s.reset_receive_state();
             if (!message) {
                 out.status = IoStatus::Rejected;  // the stream is still frame-aligned
                 out.error = message.error();
+                out.raw_type = header.type;
+                out.is_request = is_request_type(header.type);
+                out.request_id = peek_request_id(header.type, rejected_payload.data(), rejected_payload.size());
                 return out;
             }
             out.status = IoStatus::Ok;
@@ -572,6 +580,19 @@ void PipeServer::cancel() noexcept {
     }
 }
 
+namespace {
+
+// After an unexpected error the instance may be in an unusable state: close it, so that the next
+// accept() creates a fresh one instead of failing again on the same handle.
+void drop_listening_instance(PipeServer::Impl& s) {
+    if (s.listening != INVALID_HANDLE_VALUE) {
+        CloseHandle(s.listening);
+        s.listening = INVALID_HANDLE_VALUE;
+    }
+}
+
+}  // namespace
+
 Result<PipeServer::Accepted> PipeServer::accept(std::uint32_t timeout_ms, void* wake_event) {
     Accepted out;
     if (!impl_) {
@@ -618,6 +639,7 @@ Result<PipeServer::Accepted> PipeServer::accept(std::uint32_t timeout_ms, void* 
             continue;
         }
         if (error != ERROR_IO_PENDING) {
+            drop_listening_instance(s);  // do not keep retrying on a handle that is broken
             return io_diag("waiting for a client", error);
         }
 
@@ -631,7 +653,9 @@ Result<PipeServer::Accepted> PipeServer::accept(std::uint32_t timeout_ms, void* 
             } else if (GetLastError() == ERROR_NO_DATA) {
                 DisconnectNamedPipe(s.listening);
             } else {
-                return io_diag("accepting a client", GetLastError());
+                const DWORD accept_error = GetLastError();
+                drop_listening_instance(s);
+                return io_diag("accepting a client", accept_error);
             }
         } else {
             // Stop waiting. A client may connect in the instant before the cancel takes effect;
@@ -650,6 +674,7 @@ Result<PipeServer::Accepted> PipeServer::accept(std::uint32_t timeout_ms, void* 
                 out.status = IoStatus::Woken;
                 return out;
             } else {
+                drop_listening_instance(s);
                 return io_diag("waiting for a client", wait_error);
             }
         }

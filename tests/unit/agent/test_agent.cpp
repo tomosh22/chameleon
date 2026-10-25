@@ -9,11 +9,16 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cstddef>
 #include <cstring>
+#include <functional>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "broker_launch.h"
@@ -383,54 +388,95 @@ TEST_CASE("an auto-started broker runs from its own directory and does not live 
 
 namespace {
 
-// Names of the DLLs a PE file imports (normal and delay-load), lower-cased.
+// Names of the DLLs a PE file imports (normal and delay-load), lower-cased. Every RVA, structure
+// and name is bounds-checked against the file image; anything that cannot be mapped or read fails
+// the test instead of being read from some default place.
 std::vector<std::string> imported_dlls(const std::wstring& path) {
     std::vector<std::string> names;
     HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     REQUIRE(file != INVALID_HANDLE_VALUE);
-    std::vector<unsigned char> image(GetFileSize(file, nullptr));
+    const DWORD file_size = GetFileSize(file, nullptr);
+    REQUIRE(file_size != INVALID_FILE_SIZE);
+    std::vector<unsigned char> image(file_size);
     DWORD read = 0;
-    REQUIRE(ReadFile(file, image.data(), static_cast<DWORD>(image.size()), &read, nullptr));
+    REQUIRE(ReadFile(file, image.data(), file_size, &read, nullptr));
+    REQUIRE(read == file_size);
     CloseHandle(file);
 
-    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image.data());
+    // A pointer to `length` bytes at `offset` in the file, or a test failure.
+    const auto at = [&](std::size_t offset, std::size_t length) -> const unsigned char* {
+        REQUIRE_MESSAGE((offset <= image.size() && length <= image.size() - offset),
+                        "read of " << length << " bytes at offset " << offset << " is outside the file (" << image.size() << ")");
+        return image.data() + offset;
+    };
+
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(at(0, sizeof(IMAGE_DOS_HEADER)));
     REQUIRE(dos->e_magic == IMAGE_DOS_SIGNATURE);
-    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(image.data() + dos->e_lfanew);
+    REQUIRE(dos->e_lfanew > 0);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+        at(static_cast<std::size_t>(dos->e_lfanew), sizeof(IMAGE_NT_HEADERS64)));
     REQUIRE(nt->Signature == IMAGE_NT_SIGNATURE);
-    REQUIRE(nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC);
-    const IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(nt);
-    const auto to_offset = [&](DWORD rva) -> std::size_t {
-        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
-            const IMAGE_SECTION_HEADER& s = sections[i];
-            if (rva >= s.VirtualAddress && rva < s.VirtualAddress + std::max(s.Misc.VirtualSize, s.SizeOfRawData)) {
-                return s.PointerToRawData + (rva - s.VirtualAddress);
+    REQUIRE_MESSAGE(nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC, "not a PE32+ image (x86 is out of scope)");
+    const std::size_t sections_offset = static_cast<std::size_t>(dos->e_lfanew) + offsetof(IMAGE_NT_HEADERS64, OptionalHeader) +
+                                        nt->FileHeader.SizeOfOptionalHeader;
+    const std::size_t section_count = nt->FileHeader.NumberOfSections;
+    const auto* sections = reinterpret_cast<const IMAGE_SECTION_HEADER*>(
+        at(sections_offset, section_count * sizeof(IMAGE_SECTION_HEADER)));
+
+    // Maps an RVA to a file offset through the section table; fails the test if no section holds it.
+    const auto to_offset = [&](std::size_t rva) -> std::size_t {
+        for (std::size_t i = 0; i < section_count; ++i) {
+            const IMAGE_SECTION_HEADER& section = sections[i];
+            const std::size_t extent = std::min<std::size_t>(section.Misc.VirtualSize, section.SizeOfRawData);
+            if (rva >= section.VirtualAddress && rva - section.VirtualAddress < extent) {
+                return static_cast<std::size_t>(section.PointerToRawData) + (rva - section.VirtualAddress);
             }
         }
+        FAIL("RVA " << rva << " is not inside any section");
         return 0;
     };
-    const auto add_name = [&](DWORD name_rva) {
+    // A NUL-terminated name at `rva`, not running past the end of the file.
+    const auto add_name = [&](std::size_t name_rva) {
         const std::size_t offset = to_offset(name_rva);
-        if (offset == 0) {
-            return;
-        }
-        std::string name(reinterpret_cast<const char*>(image.data() + offset));
+        const unsigned char* start = at(offset, 1);
+        const std::size_t room = image.size() - offset;
+        const void* nul = std::memchr(start, 0, room);
+        REQUIRE_MESSAGE(nul != nullptr, "an import name is not terminated inside the file");
+        std::string name(reinterpret_cast<const char*>(start), static_cast<const unsigned char*>(nul) - start);
         std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         names.push_back(name);
     };
 
+    constexpr std::size_t kMaxDescriptors = 1024;  // a corrupt table must not loop for ever
     const IMAGE_DATA_DIRECTORY imports = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (imports.VirtualAddress != 0) {
-        const auto* descriptor = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(image.data() + to_offset(imports.VirtualAddress));
-        for (; descriptor->Name != 0; ++descriptor) {
-            add_name(descriptor->Name);
+        const std::size_t table = to_offset(imports.VirtualAddress);
+        bool terminated = false;
+        for (std::size_t i = 0; i < kMaxDescriptors && !terminated; ++i) {
+            const auto* descriptor = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(
+                at(table + i * sizeof(IMAGE_IMPORT_DESCRIPTOR), sizeof(IMAGE_IMPORT_DESCRIPTOR)));
+            if (descriptor->Name == 0) {
+                terminated = true;
+            } else {
+                add_name(descriptor->Name);
+            }
         }
+        REQUIRE_MESSAGE(terminated, "the import table has no terminating entry");
     }
     const IMAGE_DATA_DIRECTORY delayed = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
     if (delayed.VirtualAddress != 0) {
-        const auto* descriptor = reinterpret_cast<const IMAGE_DELAYLOAD_DESCRIPTOR*>(image.data() + to_offset(delayed.VirtualAddress));
-        for (; descriptor->DllNameRVA != 0; ++descriptor) {
-            add_name(descriptor->DllNameRVA);
+        const std::size_t table = to_offset(delayed.VirtualAddress);
+        bool terminated = false;
+        for (std::size_t i = 0; i < kMaxDescriptors && !terminated; ++i) {
+            const auto* descriptor = reinterpret_cast<const IMAGE_DELAYLOAD_DESCRIPTOR*>(
+                at(table + i * sizeof(IMAGE_DELAYLOAD_DESCRIPTOR), sizeof(IMAGE_DELAYLOAD_DESCRIPTOR)));
+            if (descriptor->DllNameRVA == 0) {
+                terminated = true;
+            } else {
+                add_name(descriptor->DllNameRVA);
+            }
         }
+        REQUIRE_MESSAGE(terminated, "the delay-import table has no terminating entry");
     }
     return names;
 }
@@ -538,4 +584,378 @@ TEST_CASE("creating and destroying agents leaves the private heap balanced") {
         cml::DestroyAgent(agent);
     }
     CHECK(live() == baseline);
+}
+
+// ---- a scripted broker on raw pipe handles, for protocol-level behaviour ------------------------
+
+namespace {
+
+// A broker that speaks the protocol by hand over a blocking pipe, records everything it receives
+// (per connection) and can be told to misbehave: answer with a corrupt frame, or hang up.
+class ScriptedBroker {
+public:
+    enum class Action { Answer, CorruptAnswer, Hangup };
+    using Hook = std::function<Action(const cml::ipc::Message&)>;
+
+    ScriptedBroker(std::string pipe, Hook hook = nullptr) : pipe_(std::move(pipe)), hook_(std::move(hook)) {
+        thread_ = std::thread([this] { run(); });
+        ready_ = wait_until([this] { return cml::ipc::pipe_exists(pipe_); }, 10000);
+    }
+    ~ScriptedBroker() {
+        stopping_.store(true);
+        // Unblock a pending ConnectNamedPipe with a throw-away client.
+        const std::wstring wide = widen(pipe_);
+        HANDLE poke = CreateFileW(wide.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (poke != INVALID_HANDLE_VALUE) {
+            CloseHandle(poke);
+        }
+        SetEvent(hangup_event_);
+        thread_.join();
+        CloseHandle(hangup_event_);
+    }
+    bool ready() const { return ready_; }
+
+    // Closes the current connection (the agent will reconnect).
+    void hang_up() { SetEvent(hangup_event_); }
+
+    std::size_t connections() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return sessions_.size();
+    }
+    // Messages received on connection `index` (0 = first), a copy.
+    std::vector<cml::ipc::Message> messages(std::size_t index) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return index < sessions_.size() ? sessions_[index] : std::vector<cml::ipc::Message>();
+    }
+    std::size_t count(std::size_t index, bool (*predicate)(const cml::ipc::Message&)) const {
+        std::size_t n = 0;
+        for (const cml::ipc::Message& m : messages(index)) {
+            n += predicate(m) ? 1 : 0;
+        }
+        return n;
+    }
+
+private:
+    // Reads exactly `size` bytes by polling (PeekNamedPipe), so the wait can be abandoned when the
+    // test hangs up or stops the broker. False on end of stream, error or abandonment.
+    bool read_exactly(HANDLE pipe, void* buffer, DWORD size) {
+        auto* bytes = static_cast<unsigned char*>(buffer);
+        DWORD done = 0;
+        while (done < size) {
+            DWORD available = 0;
+            if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) {
+                return false;  // the client closed its end
+            }
+            if (available == 0) {
+                if (stopping_.load() || WaitForSingleObject(hangup_event_, 0) == WAIT_OBJECT_0) {
+                    return false;
+                }
+                Sleep(1);
+                continue;
+            }
+            DWORD n = 0;
+            if (!ReadFile(pipe, bytes + done, std::min<DWORD>(available, size - done), &n, nullptr) || n == 0) {
+                return false;
+            }
+            done += n;
+        }
+        return true;
+    }
+    static bool write_all(HANDLE pipe, const std::vector<std::uint8_t>& bytes) {
+        DWORD written = 0;
+        return WriteFile(pipe, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) && written == bytes.size();
+    }
+    static bool send(HANDLE pipe, const cml::ipc::Message& message) {
+        cml::Result<std::vector<std::uint8_t>> frame = cml::ipc::encode_frame(message);
+        return frame.has_value() && write_all(pipe, *frame);
+    }
+
+    void run() {
+        const std::wstring wide = widen(pipe_);
+        while (!stopping_.load()) {
+            HANDLE pipe = CreateNamedPipeW(wide.c_str(), PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                                           PIPE_UNLIMITED_INSTANCES, 65536, 65536, 0, nullptr);
+            if (pipe == INVALID_HANDLE_VALUE) {
+                return;
+            }
+            if (ConnectNamedPipe(pipe, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED) {
+                if (!stopping_.load()) {
+                    serve(pipe);
+                }
+            }
+            CloseHandle(pipe);
+        }
+    }
+
+    void serve(HANDLE pipe) {
+        std::size_t index = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            sessions_.emplace_back();
+            index = sessions_.size() - 1;
+        }
+        for (;;) {
+            std::vector<std::uint8_t> header(cml::ipc::kFrameHeaderSize);
+            if (!read_exactly(pipe, header.data(), static_cast<DWORD>(header.size()))) {
+                break;
+            }
+            cml::Result<cml::ipc::FrameHeader> parsed = cml::ipc::parse_frame_header(header.data(), header.size());
+            if (!parsed) {
+                break;
+            }
+            std::vector<std::uint8_t> payload(parsed->payload_size);
+            if (!payload.empty() && !read_exactly(pipe, payload.data(), static_cast<DWORD>(payload.size()))) {
+                break;
+            }
+            cml::Result<cml::ipc::Message> message =
+                cml::ipc::decode_message(parsed->type, parsed->version, payload.data(), payload.size());
+            if (!message) {
+                continue;
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                sessions_[index].push_back(*message);
+            }
+            if (!answer(pipe, *message)) {
+                break;
+            }
+        }
+        DisconnectNamedPipe(pipe);  // run() closes the handle
+        ResetEvent(hangup_event_);  // consumed: the next session starts clean
+    }
+
+    bool answer(HANDLE pipe, const cml::ipc::Message& message) {
+        namespace ipc = cml::ipc;
+        if (const auto* hello = std::get_if<ipc::Hello>(&message)) {
+            ipc::Welcome welcome;
+            welcome.request_id = hello->request_id;
+            welcome.agent_id = 1;
+            welcome.broker_version = "scripted";
+            return send(pipe, welcome);
+        }
+        std::uint64_t id = 0;
+        if (const auto* list = std::get_if<ipc::ModuleList>(&message)) {
+            id = list->request_id;
+        } else if (const auto* enable = std::get_if<ipc::EnableModule>(&message)) {
+            id = enable->request_id;
+        } else if (const auto* disable = std::get_if<ipc::DisableModule>(&message)) {
+            id = disable->request_id;
+        } else {
+            return true;  // events: no answer
+        }
+        const Action action = hook_ ? hook_(message) : Action::Answer;
+        if (action == Action::Hangup) {
+            return false;
+        }
+        if (action == Action::CorruptAnswer) {
+            // A Reply with the right id whose text is not UTF-8.
+            std::vector<std::uint8_t> frame = {18, 0, 0, 0, 0x03, 0x00, 0x01, 0x00};
+            for (int i = 0; i < 8; ++i) {
+                frame.push_back(static_cast<std::uint8_t>(id >> (8 * i)));
+            }
+            const std::uint8_t tail[] = {0, 0, 0, 0, 2, 0, 0, 0, 0xFF, 0xFE};
+            frame.insert(frame.end(), tail, tail + sizeof(tail));
+            return write_all(pipe, frame);
+        }
+        ipc::Reply reply;
+        reply.request_id = id;
+        reply.message = "scripted ok";
+        return send(pipe, reply);
+    }
+
+    std::string pipe_;
+    Hook hook_;
+    std::thread thread_;
+    std::atomic<bool> stopping_{false};
+    bool ready_ = false;
+    HANDLE hangup_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);  // manual-reset: reset per session
+    mutable std::mutex mutex_;
+    std::vector<std::vector<cml::ipc::Message>> sessions_;
+};
+
+bool is_enable(const cml::ipc::Message& m) { return std::holds_alternative<cml::ipc::EnableModule>(m); }
+
+}  // namespace
+
+TEST_CASE("an answer the agent cannot decode drops the connection instead of hanging the request") {
+    const std::string pipe = unique_pipe_name("corrupt");
+    ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));
+    ScopedEnv broker_env(L"CML_BROKER_PATH", exe_directory() + L"\\no_such_broker.exe");
+    std::atomic<int> enables{0};
+    ScriptedBroker broker(pipe, [&](const cml::ipc::Message& m) {
+        return is_enable(m) && enables.fetch_add(1) == 0 ? ScriptedBroker::Action::CorruptAnswer
+                                                         : ScriptedBroker::Action::Answer;
+    });
+    REQUIRE(broker.ready());
+    cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str());
+    REQUIRE(agent.IsValid());
+    REQUIRE(wait_until([&] { return agent.IsConnected(); }, 20000));
+
+    const cml::Request first = agent.EnableModule(L"corrupt_target.dll");
+    REQUIRE(first.status == CML_STATUS_OK);
+    cml::Reply reply;
+    REQUIRE(agent.WaitForRequest(first, 15000, &reply) == CML_STATUS_OK);
+    CHECK(reply.status == 5216);  // connection lost before a usable answer
+    // The agent reconnects and works again.
+    REQUIRE(wait_until([&] { return broker.connections() >= 2; }, 20000));
+    REQUIRE(wait_until([&] { return agent.IsConnected(); }, 20000));
+    const cml::Request second = agent.EnableModule(L"corrupt_target.dll");
+    REQUIRE(agent.WaitForRequest(second, 15000, &reply) == CML_STATUS_OK);
+    CHECK(reply.status == 0);
+    cml::DestroyAgent(agent);
+}
+
+TEST_CASE("repeated reconnects re-enable each module exactly once and keep accepting requests") {
+    const std::string pipe = unique_pipe_name("reconnects");
+    ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));
+    ScopedEnv broker_env(L"CML_BROKER_PATH", exe_directory() + L"\\no_such_broker.exe");
+    ScriptedBroker broker(pipe);
+    REQUIRE(broker.ready());
+    cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str());
+    REQUIRE(agent.IsValid());
+    REQUIRE(wait_until([&] { return agent.IsConnected(); }, 20000));
+
+    constexpr int kModules = 40;  // more than the 16-request in-flight window
+    cml::Reply reply;
+    for (int i = 0; i < kModules; ++i) {
+        const cml::Request r = agent.EnableModule(L"module_" + std::to_wstring(i) + L".dll");
+        REQUIRE(agent.WaitForRequest(r, 15000, &reply) == CML_STATUS_OK);
+        REQUIRE(reply.status == 0);
+    }
+    // Option changes of an already enabled module are remembered: first no options, then all imports.
+    REQUIRE(agent.WaitForRequest(agent.EnableModule(L"module_0.dll", cml::ModuleOptions::None), 15000, &reply) == CML_STATUS_OK);
+    REQUIRE(agent.WaitForRequest(agent.EnableModule(L"module_0.dll", cml::ModuleOptions::AllImports), 15000, &reply) == CML_STATUS_OK);
+
+    // Reconnect twice in quick succession: the second hang-up comes as soon as the second session is
+    // registered, while the first re-enables are still on their way.
+    broker.hang_up();
+    REQUIRE(wait_until([&] { return broker.connections() >= 2 && broker.count(1, [](const cml::ipc::Message& m) { return std::holds_alternative<cml::ipc::ModuleList>(m); }) == 1; }, 20000));
+    broker.hang_up();
+    REQUIRE(wait_until([&] { return broker.connections() >= 3 && agent.IsConnected(); }, 30000));
+
+    // The app can still make requests, and they are answered.
+    const cml::Request extra = agent.EnableModule(L"after_reconnects.dll");
+    REQUIRE(extra.status == CML_STATUS_OK);
+    REQUIRE(agent.WaitForRequest(extra, 20000, &reply) == CML_STATUS_OK);
+    CHECK(reply.status == 0);
+
+    // On the last connection every module was enabled once (plus the app's new request), none twice.
+    const std::vector<cml::ipc::Message> last = broker.messages(2);
+    std::map<std::string, int> seen;
+    std::uint32_t options_of_module_0 = 99;
+    for (const cml::ipc::Message& m : last) {
+        if (const auto* enable = std::get_if<cml::ipc::EnableModule>(&m)) {
+            ++seen[enable->path];
+            if (enable->path == "module_0.dll") {
+                options_of_module_0 = enable->options;
+            }
+        }
+    }
+    CHECK(seen.size() == static_cast<std::size_t>(kModules) + 1);
+    for (const auto& [path, count] : seen) {
+        CHECK_MESSAGE(count == 1, path << " was enabled " << count << " times");
+    }
+    CHECK(options_of_module_0 == 1);  // the later, AllImports enable won
+    cml::DestroyAgent(agent);
+}
+
+TEST_CASE("fire-and-forget and uncollected requests never lock new requests out") {
+    const std::string pipe = unique_pipe_name("forget");
+    ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));
+    ScopedEnv broker_env(L"CML_BROKER_PATH", exe_directory() + L"\\no_such_broker.exe");
+    ScriptedBroker broker(pipe);
+    REQUIRE(broker.ready());
+    cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str());
+    REQUIRE(agent.IsValid());
+    REQUIRE(wait_until([&] { return agent.IsConnected(); }, 20000));
+
+    const auto push = [&](bool keep_id, int n) {
+        for (int i = 0; i < n; ++i) {
+            for (;;) {  // a full queue is back-pressure, not failure: wait for room
+                cml_status status;
+                if (keep_id) {
+                    uint64_t id = 0;
+                    status = cml_enable_module(agent.NativeHandle(), L"forget.dll", CML_MODULE_NONE, &id);
+                } else {
+                    status = cml_enable_module(agent.NativeHandle(), L"forget.dll", CML_MODULE_NONE, nullptr);
+                }
+                if (status == CML_STATUS_OK) {
+                    break;
+                }
+                REQUIRE(status == 5217);
+                Sleep(2);
+            }
+        }
+    };
+    push(false, 5000);  // no request id: nothing is kept
+    push(true, 1500);   // ids nobody ever asks for: kept only up to a bounded number
+    cml::Reply reply;
+    // Queued requests are real work and may still fill the table right after the burst: that is
+    // back-pressure (CML5217), so wait for room. What must not happen is room never coming back.
+    cml::Request waited = agent.EnableModule(L"waited.dll");
+    for (int attempt = 0; waited.status == 5217 && attempt < 15000; ++attempt) {
+        Sleep(2);
+        waited = agent.EnableModule(L"waited.dll");
+    }
+    REQUIRE(waited.status == CML_STATUS_OK);
+    REQUIRE(agent.WaitForRequest(waited, 30000, &reply) == CML_STATUS_OK);
+    CHECK(reply.status == 0);
+    cml::DestroyAgent(agent);
+}
+
+TEST_CASE("a module loaded just before an EnableModule is known to the broker, even in a busy pass") {
+    const std::string pipe = unique_pipe_name("busy");
+    ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));
+    TestBroker broker(pipe);
+    REQUIRE_MESSAGE(broker.ready(), broker.error());
+    cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str());
+    REQUIRE(agent.IsValid());
+    REQUIRE(wait_until([&] { return agent.IsConnected(); }, 20000));
+
+    std::atomic<bool> stop{false};
+    std::thread noise([&] {  // keeps the agent's flush passes busy with unrelated requests
+        const std::wstring self = cml::GetCurrentModulePath();
+        while (!stop.load()) {
+            cml_enable_module(agent.NativeHandle(), self.c_str(), CML_MODULE_NONE, nullptr);
+            Sleep(1);
+        }
+    });
+    const std::wstring dummy = exe_directory() + L"\\cml_test_dummy_module.dll";
+    int failures = 0;
+    for (int i = 0; i < 15; ++i) {
+        HMODULE module = LoadLibraryW(dummy.c_str());
+        REQUIRE(module != nullptr);
+        cml::Reply reply;
+        const cml::Request r = agent.EnableModule(dummy);
+        REQUIRE(r.status == CML_STATUS_OK);
+        REQUIRE(agent.WaitForRequest(r, 20000, &reply) == CML_STATUS_OK);
+        failures += reply.status == 0 ? 0 : 1;
+        FreeLibrary(module);
+    }
+    stop.store(true);
+    noise.join();
+    CHECK(failures == 0);
+    cml::DestroyAgent(agent);
+}
+
+TEST_CASE("the broker's working directory and relative --log paths") {
+    using cml::agent::absolutize_log_argument;
+    using cml::agent::broker_working_directory;
+    CHECK(broker_working_directory(L"C:\\tools\\cml_broker.exe") == L"C:\\tools");
+    CHECK(broker_working_directory(L"C:\\cml_broker.exe") == L"C:\\");  // a drive root keeps its backslash
+    CHECK(broker_working_directory(L"\\\\server\\share\\cml_broker.exe") == L"\\\\server\\share");
+    CHECK(broker_working_directory(L"cml_broker.exe").empty());           // no directory: inherit
+    const std::wstring too_long = L"C:\\" + std::wstring(300, L'd') + L"\\cml_broker.exe";
+    CHECK(broker_working_directory(too_long).empty());                    // CreateProcess could not take it
+
+    const std::wstring cwd = L"C:\\work";
+    CHECK(absolutize_log_argument("--log run.log", cwd) == "--log \"C:\\work\\run.log\"");
+    CHECK(absolutize_log_argument("--exit-when-idle 5 --log \"sub dir\\x.log\" --verbose", L"C:\\work\\") ==
+          "--exit-when-idle 5 --log \"C:\\work\\sub dir\\x.log\" --verbose");
+    CHECK(absolutize_log_argument("--log C:\\abs.log", cwd) == "--log C:\\abs.log");
+    CHECK(absolutize_log_argument("--log \\\\srv\\s\\x.log", cwd) == "--log \\\\srv\\s\\x.log");
+    CHECK(absolutize_log_argument("--verbose", cwd) == "--verbose");
+    CHECK(absolutize_log_argument("--logfile x.log", cwd) == "--logfile x.log");  // a different option
+    CHECK(absolutize_log_argument("--log", cwd) == "--log");
+    CHECK(absolutize_log_argument("--log run.log", L"") == "--log run.log");       // no host directory known
 }

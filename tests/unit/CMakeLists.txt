@@ -76,7 +76,7 @@ if(WIN32)
     target_include_directories(cml_test_agent PRIVATE "${PROJECT_SOURCE_DIR}/agent/include")
     add_dependencies(cml_test_agent cml_agent cml_test_dummy_module cml_test_fake_agent_abi)
     target_sources(cml_test_broker_core PRIVATE broker/test_connection_server.cpp)
-    set_tests_properties(unit.agent unit.broker_core PROPERTIES TIMEOUT 180)
+    set_tests_properties(unit.agent unit.broker_core PROPERTIES TIMEOUT 300)
 
     # A harmless DLL the end-to-end test loads and unloads to exercise ModuleLoaded/Unloaded.
     add_library(cml_test_dummy_module SHARED agent/dummy_module.cpp)

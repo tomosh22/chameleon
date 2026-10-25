@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "cml/ipc/messages.h"
@@ -61,7 +62,11 @@ public:
     struct Received {
         IoStatus status = IoStatus::Closed;
         Message message;  // valid only when status == Ok
-        Diag error;       // valid only when status == Rejected
+        // Valid only when status == Rejected: why, and what is known about the frame.
+        Diag error;
+        std::uint16_t raw_type = 0;       // wire type value (may not be a known MessageType)
+        bool is_request = false;          // a type that expects an answer
+        std::optional<std::uint64_t> request_id;  // readable even if the rest of the payload is bad
     };
 
     // Waits for one complete frame. `wake_event` (a Win32 event HANDLE, may be null) makes the call
@@ -120,8 +125,9 @@ public:
 
     const std::string& name() const noexcept;
 
+    struct Impl;  // opaque; defined in pipe.cpp
+
 private:
-    struct Impl;
     explicit PipeServer(std::unique_ptr<Impl> impl) noexcept;
     std::unique_ptr<Impl> impl_;
 };
