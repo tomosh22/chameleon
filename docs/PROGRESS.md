@@ -8,12 +8,15 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-01 | Repository skeleton and CI | 0 | done | wp/01-skeleton-ci | #2 | — |
 | WP-02 | cml_coff and cml_pe readers | 1 | done | wp/02-coff-pe-readers | #4 | — |
 | WP-04 | cml_pdb index | 1 | done | wp/04-pdb-index | #5 | — |
-| WP-11 | Agent skeleton, public header and IPC | 1 | done | wp/11-agent-ipc | #6 | — |
+| WP-11 | Agent skeleton, public header and IPC | 1 | done (post-merge fix #16: ScriptedBroker shutdown race, test watchdog) | wp/11-agent-ipc | #6, #16 | — |
 | WP-03 | End-to-end spike (M1 gate) | 2 | done — **gate passed** (verified by orchestrator from CI logs, all 8 cells) | wp/03-e2e-spike | #10 | — |
 | WP-05 | Toolchain command parsing and rewriting | 2 | done (post-merge fix #15: never kill mspdbsrv on cancel) | wp/05-toolchain | #13, #15 | — |
 | WP-06 | cml_coff writer: anchors and binding object | 2 | done | wp/06-coff-writer | #11 | — |
 | WP-13 | Test harness cmltest | 2 | done (partial scenario per ADR-0022 until WP-12) | wp/13-cmltest | #12 | — |
-| WP-07..WP-10 | Wave 3 | 3 | todo | — | — | WP-11 fix: intermittent `unit.agent` hang (ctest timeout) being root-caused on `wp/11-fix-agent-test-hang` |
+| WP-07 | Bind planner | 3 | in progress | wp/07-bind-planner | — | — |
+| WP-08 | Address-space reservation and patch loading (agent) | 3 | in progress | wp/08-agent-loading | — | — |
+| WP-09 | Linker driver (settles §13 Q2: lld-link default?) | 3 | in progress | wp/09-linker-driver | — | — |
+| WP-10 | Hook installer (agent) | 3 | in progress | wp/10-hook-installer | — | — |
 | WP-12 | Broker core (orchestrator integration) | 4 | todo | — | — | wave 3 |
 
 ## Orchestrator integration work
