@@ -121,3 +121,47 @@ Layout: `logic.cpp` is the patch target with exactly two externals (`g_tick` dat
 `fixture_note` function), as the WP-03 spike requires. `extras.cpp` holds the WP-02 coverage
 items (COMDAT, static data, string literals, `.pdata/.xdata` with C++ EH, `.CRT$XCU`,
 `/alternatename` plus clang `weak`, and `__imp_`). WP-11 adds the agent link to fixtures.
+
+## ADR-0008 Diagnostic sub-ranges per work package
+
+**Date:** 2026-10-25 · **Status:** Accepted
+
+So parallel WPs never collide (refines ADR-0003):
+
+| Range | Owner |
+|---|---|
+| CML1200–1299 | WP-02 COFF reader |
+| CML1300–1399 | WP-02 PE reader |
+| CML1400–1499 | WP-04 PDB index |
+| CML1500–1599 | WP-05 toolchain parsing |
+| CML2200–2299 | WP-05 compile invocation |
+| CML3200–3299 | WP-07 bind planner |
+| CML3300–3399 | WP-06/WP-09 COFF writer, linker driver |
+| CML4200–4299 | WP-08 reservation and patch load |
+| CML4300–4399 | WP-10 hook installer |
+| CML5200–5299 | WP-11 agent lifecycle and IPC |
+| CML5300–5399 | WP-12 broker pipeline |
+
+## ADR-0009 PDB index benchmark strategy (WP-04)
+
+**Date:** 2026-10-25 · **Status:** Accepted
+
+Plan §8 WP-04 allows LLVM or a synthetic PDB. **Decision: synthetic.** A Python generator in the
+repo emits a large C++ project (many TUs, functions, UDTs, statics). A dedicated CI job
+(windows-2022, MSVC, RelWithDebInfo) builds it with `/Zi /DEBUG:FULL` and caches the result with
+`actions/cache`, keyed by the generator's hash. The benchmark asserts the §8 budgets: 2 s per
+500 MB, scaled linearly to the actual PDB size, with 2× slack for shared runners, and memory
+at most 1.5× the PDB size. It always prints the measured numbers. The job is a separate
+required check; it does not run in the 8 build cells. An LLVM-scale run can be added to the
+WP-27 perf suite.
+
+## ADR-0010 Open issue: matching obj symbols of statics to PDB symbols
+
+**Date:** 2026-10-25 · **Status:** Open (WP-03 spike to inform, WP-07 to decide)
+
+Plan §4.5 keys statics by (mangled name, object file). Module symbol records (`S_LPROC32`,
+`S_LDATA32`) carry display names, not the obj's decorated names, and statics have no
+`S_PUB32`. WP-04 therefore exposes, per compiland symbol, the display name, kind, RVA and size,
+plus an RVA→public map for externals. The bind planner must bridge decorated obj names to PDB
+records. Candidate methods: undecorate the obj name and compare with the display name scoped by
+compiland; or match by section contribution plus offset order. The spike records what works.
