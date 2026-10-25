@@ -30,6 +30,7 @@
 #include "cml/ipc/messages.h"
 #include "cml/ipc/pipe.h"
 #include "cml/util/result.h"
+#include "hook/installer.h"
 #include "sync_queue.h"
 
 namespace cml::agent {
@@ -155,6 +156,16 @@ private:
     void fail_in_flight(std::uint32_t status, const char* text);
     void register_connection(ipc::PipeConnection* connection);
 
+    // WP-10: broker -> agent InstallHooks. handle_install_hooks (agent thread) hands the request to
+    // post_main_thread_work, so in synchronised mode the hooks are applied inside SyncPoint() on the
+    // application's thread and in immediate mode right here; the answer (HooksInstalled) is queued
+    // in replies_ and sent by the agent thread. See docs/wp/WP-10.md.
+    void handle_install_hooks(const ipc::InstallHooks& request);
+    static void run_hook_job(void* context);
+    void apply_install_hooks(const ipc::InstallHooks& request);
+    void queue_reply(ipc::Message message);
+    bool flush_replies(ipc::PipeConnection& connection);
+
     // Any thread ------------------------------------------------------------------------------
     cml_status enqueue(std::uint64_t id, ipc::Message message, bool wanted);
     template <class Build>
@@ -203,6 +214,7 @@ private:
     std::size_t sent_count_ = 0;            // entries in State::Sent (the in-flight window)
     std::size_t open_app_ = 0;              // application entries not yet Done (the 1024 limit)
     std::vector<EnabledModule> enabled_;    // modules the broker accepted and that were not disabled
+    std::deque<ipc::Message> replies_;      // answers to broker requests (HooksInstalled), oldest first
 
     std::mutex connection_mutex_;  // guards active_connection_
     ipc::PipeConnection* active_connection_ = nullptr;

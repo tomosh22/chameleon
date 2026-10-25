@@ -64,7 +64,7 @@ endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     target_compile_definitions(cml_test_pdb PRIVATE CML_TEST_COMPILER_IS_CL=1)  # cl.exe, not clang-cl
 endif()
-cml_add_unit_test(ipc SOURCES lib/test_ipc.cpp lib/test_ipc_loader.cpp LIBS cml_ipc)
+cml_add_unit_test(ipc SOURCES lib/test_ipc.cpp lib/test_ipc_hooks.cpp lib/test_ipc_loader.cpp LIBS cml_ipc)
 cml_add_unit_test(proc SOURCES lib/test_proc.cpp lib/test_proc_address_space.cpp LIBS cml_proc)
 if(WIN32)
     # WP-11: named-pipe transport tests (real pipes, in-process client and server threads).
@@ -79,6 +79,15 @@ cml_add_unit_test(watch SOURCES lib/test_watch.cpp LIBS cml_watch)
 cml_add_unit_test(agent
     SOURCES agent/test_sync_queue.cpp agent/test_module_diff.cpp
     LIBS cml_agent_core)
+if(WIN32)
+    # WP-10: out-of-process hang watchdog (the in-process one is stopped together with every other thread
+    # when the hook installer stops the world). Started by doctest_main.cpp when CML_TEST_HANG_WATCH_EXE is set.
+    add_executable(cml_test_hang_watch hang_watch/hang_watch.cpp)
+    target_link_libraries(cml_test_hang_watch PRIVATE psapi)
+    cml_apply_warnings(cml_test_hang_watch)
+    set_target_properties(cml_test_hang_watch PROPERTIES FOLDER "tests")
+endif()
+add_subdirectory(agent_hook)  # WP-10: unit.agent_hook, unit.agent_hook_stress
 cml_add_unit_test(broker_core SOURCES broker/test_core.cpp broker/test_session.cpp LIBS cml_core)
 if(NOT MSVC)
     # Portable pieces are tested on non-Windows hosts too (CML_ALLOW_NON_WINDOWS).

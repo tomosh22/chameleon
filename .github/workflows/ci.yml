@@ -113,6 +113,28 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
+      # WP-10: the hook installer's instruction-length decoder against the first 16 bytes of EVERY
+      # function of fixture_basic (functions enumerated from its PDB): `LDE <fn> lens=... unknown=0|1`,
+      # then LDE-SUMMARY / LDE-PLAN / LDE-UNKNOWN lines. docs/wp/WP-10.md quotes the summary.
+      - name: WP-10 length-decoder evidence (cml_lde_probe on fixture_basic)
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          & "$env:BUILD_DIR/bin/cml_lde_probe.exe" "$env:BUILD_DIR/bin/fixture_basic.exe" *>&1 | Tee-Object -FilePath "$env:LOG_DIR/lde-evidence.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # WP-10: the stress test (unit.agent_hook_stress) writes its WP10-STRESS lines here.
+      - name: WP-10 hook stress evidence
+        if: always()
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          $e = "$env:BUILD_DIR/test_work/agent_hook/evidence.txt"
+          if (Test-Path $e) {
+            Copy-Item $e "$env:LOG_DIR/wp10-stress-evidence.txt"
+            Get-Content $e
+          } else {
+            Write-Host "no WP-10 evidence file (unit.agent_hook_stress did not run)"
+          }
+
       # WP-06: what the anchored-vs-unanchored link comparisons and the PDB lookups found (written by
       # unit.coff_link). docs/wp/WP-06.md quotes these lines.
       - name: WP-06 link evidence (anchors, binding object)

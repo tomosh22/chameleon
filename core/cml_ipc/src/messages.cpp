@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <type_traits>
+#include <utility>
 
 #include "cml/proc/diag_ids.h"
 
@@ -22,6 +23,9 @@ Diag malformed(const char* type_name, const char* what) {
 
 // Smallest encoded ModuleEntry: base + size + empty string.
 constexpr std::size_t kMinModuleEntryBytes = 8 + 8 + 4;
+// Smallest encoded HookSpec (two addresses + empty name) and HookResult (three u32 + empty text).
+constexpr std::size_t kMinHookSpecBytes = 8 + 8 + 4;
+constexpr std::size_t kMinHookResultBytes = 4 + 4 + 4 + 4;
 
 // --- little-endian writer -----------------------------------------------------------------------
 
@@ -268,6 +272,32 @@ void encode(Writer& w, const Reply& m) {
     w.u32(m.status);
     w.str(m.message);
 }
+void encode(Writer& w, const InstallHooks& m) {
+    w.u64(m.request_id);
+    w.u32(m.flags);
+    w.u32(static_cast<std::uint32_t>(m.hooks.size()));
+    for (const HookSpec& h : m.hooks) {
+        w.u64(h.old_entry);
+        w.u64(h.new_entry);
+        w.str(h.name);
+    }
+}
+void encode(Writer& w, const HooksInstalled& m) {
+    w.u64(m.request_id);
+    w.u32(m.status);
+    w.str(m.message);
+    w.u32(m.attempts);
+    w.u32(m.retries);
+    w.u32(m.threads);
+    w.u32(m.window_ms);
+    w.u32(static_cast<std::uint32_t>(m.results.size()));
+    for (const HookResult& r : m.results) {
+        w.u32(static_cast<std::uint32_t>(r.strategy));
+        w.u32(static_cast<std::uint32_t>(r.status));
+        w.u32(r.diag);
+        w.str(r.message);
+    }
+}
 
 // --- WP-08 encoders (append-only block) ---
 void encode(Writer& w, const ReserveRange& m) {
@@ -424,6 +454,70 @@ Message decode_reply(Reader& r) {
     m.request_id = r.u64();
     m.status = r.u32();
     m.message = r.str();
+    return m;
+}
+Message decode_install_hooks(Reader& r) {
+    InstallHooks m;
+    m.request_id = r.u64();
+    m.flags = r.u32();
+    if (r.ok() && (m.flags & ~kInstallHooksKnownFlags) != 0) {
+        r.fail("unknown InstallHooks flags");
+    }
+    const std::uint32_t count = r.u32();
+    if (r.ok() && count > kMaxHooksPerRequest) {
+        r.fail("hook count above the limit of 16384");
+    }
+    // As for ModuleList: a lying count must be backed by real payload bytes before anything is reserved.
+    if (r.ok() && static_cast<std::uint64_t>(count) * kMinHookSpecBytes > r.remaining()) {
+        r.fail("hook count is larger than the payload can hold");
+    }
+    if (r.ok()) {
+        m.hooks.reserve(count);
+        for (std::uint32_t i = 0; i < count && r.ok(); ++i) {
+            HookSpec h;
+            h.old_entry = r.u64();
+            h.new_entry = r.u64();
+            h.name = r.str();
+            m.hooks.push_back(std::move(h));
+        }
+    }
+    return m;
+}
+Message decode_hooks_installed(Reader& r) {
+    HooksInstalled m;
+    m.request_id = r.u64();
+    m.status = r.u32();
+    m.message = r.str();
+    m.attempts = r.u32();
+    m.retries = r.u32();
+    m.threads = r.u32();
+    m.window_ms = r.u32();
+    const std::uint32_t count = r.u32();
+    if (r.ok() && count > kMaxHooksPerRequest) {
+        r.fail("hook result count above the limit of 16384");
+    }
+    if (r.ok() && static_cast<std::uint64_t>(count) * kMinHookResultBytes > r.remaining()) {
+        r.fail("hook result count is larger than the payload can hold");
+    }
+    if (r.ok()) {
+        m.results.reserve(count);
+        for (std::uint32_t i = 0; i < count && r.ok(); ++i) {
+            HookResult h;
+            const std::uint32_t strategy = r.u32();
+            const std::uint32_t status = r.u32();
+            if (r.ok() && strategy > static_cast<std::uint32_t>(HookStrategy::FiveByte)) {
+                r.fail("unknown hook strategy");
+            }
+            if (r.ok() && status > static_cast<std::uint32_t>(HookResultStatus::Unchanged)) {
+                r.fail("unknown hook status");
+            }
+            h.strategy = static_cast<HookStrategy>(strategy);
+            h.status = static_cast<HookResultStatus>(status);
+            h.diag = r.u32();
+            h.message = r.str();
+            m.results.push_back(std::move(h));
+        }
+    }
     return m;
 }
 
@@ -590,6 +684,8 @@ bool is_implemented(MessageType type) noexcept {
         case MessageType::DisableModule:
         case MessageType::ModuleLoaded:
         case MessageType::ModuleUnloaded:
+        case MessageType::InstallHooks:
+        case MessageType::HooksInstalled:
         case MessageType::Log:
         case MessageType::ReserveRange:
         case MessageType::ReserveRangeResult:
@@ -615,6 +711,8 @@ MessageType type_of(const Message& message) noexcept {
         MessageType operator()(const ModuleUnloaded&) const noexcept { return MessageType::ModuleUnloaded; }
         MessageType operator()(const Log&) const noexcept { return MessageType::Log; }
         MessageType operator()(const Reply&) const noexcept { return MessageType::Reply; }
+        MessageType operator()(const InstallHooks&) const noexcept { return MessageType::InstallHooks; }
+        MessageType operator()(const HooksInstalled&) const noexcept { return MessageType::HooksInstalled; }
         MessageType operator()(const ReserveRange&) const noexcept { return MessageType::ReserveRange; }
         MessageType operator()(const ReserveRangeResult&) const noexcept { return MessageType::ReserveRangeResult; }
         MessageType operator()(const ReleaseRange&) const noexcept { return MessageType::ReleaseRange; }
@@ -792,6 +890,8 @@ Result<Message> decode_message(std::uint16_t type, std::uint16_t version, const 
         case MessageType::ModuleLoaded: message = decode_loaded(reader); break;
         case MessageType::ModuleUnloaded: message = decode_unloaded(reader); break;
         case MessageType::Log: message = decode_log(reader); break;
+        case MessageType::InstallHooks: message = decode_install_hooks(reader); break;
+        case MessageType::HooksInstalled: message = decode_hooks_installed(reader); break;
         case MessageType::ReserveRange: message = decode_reserve_range(reader); break;
         case MessageType::ReserveRangeResult: message = decode_reserve_result(reader); break;
         case MessageType::ReleaseRange: message = decode_release_range(reader); break;
@@ -832,6 +932,7 @@ bool is_request_type(std::uint16_t type) noexcept {
         case MessageType::ModuleList:
         case MessageType::EnableModule:
         case MessageType::DisableModule:
+        case MessageType::InstallHooks:
         case MessageType::ReserveRange:
         case MessageType::ReleaseRange:
         case MessageType::LoadPatch:
@@ -852,6 +953,8 @@ std::optional<std::uint64_t> peek_request_id(std::uint16_t type, const std::uint
         case MessageType::ModuleList:
         case MessageType::EnableModule:
         case MessageType::DisableModule:
+        case MessageType::InstallHooks:
+        case MessageType::HooksInstalled:
         case MessageType::ReserveRange:
         case MessageType::ReserveRangeResult:
         case MessageType::ReleaseRange:
@@ -912,6 +1015,18 @@ std::string describe(const Message& message) {
         std::string operator()(const Reply& m) const {
             return "Reply request=" + std::to_string(m.request_id) +
                    " status=" + std::to_string(m.status) + " message=" + quoted(m.message);
+        }
+        std::string operator()(const InstallHooks& m) const {
+            return std::string("InstallHooks request=") + std::to_string(m.request_id) +
+                   " flags=" + std::to_string(m.flags) + ((m.flags & kInstallHooksRevert) != 0 ? " (revert)" : "") +
+                   " hooks=" + std::to_string(m.hooks.size());
+        }
+        std::string operator()(const HooksInstalled& m) const {
+            return "HooksInstalled request=" + std::to_string(m.request_id) +
+                   " status=" + std::to_string(m.status) + " results=" + std::to_string(m.results.size()) +
+                   " attempts=" + std::to_string(m.attempts) + " retries=" + std::to_string(m.retries) +
+                   " threads=" + std::to_string(m.threads) + " window_ms=" + std::to_string(m.window_ms) +
+                   (m.message.empty() ? std::string() : " message=" + quoted(m.message));
         }
         std::string operator()(const ReserveRangeResult& m) const {
             return "ReserveRangeResult request=" + std::to_string(m.request_id) +

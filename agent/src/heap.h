@@ -35,6 +35,15 @@ void release_aligned(void* block, std::size_t alignment) noexcept;
 // While set, any allocation or release aborts the process (WP-10: threads are suspended).
 void set_alloc_forbidden(bool forbidden) noexcept;
 bool alloc_forbidden() noexcept;
+// Id of the thread that set the flag (0 while it is clear). Tests use it to tell the thread that
+// owns the stopped window from the threads that were not stopped yet.
+unsigned long alloc_forbidden_thread() noexcept;
+
+// Tests only. While set, an allocation or release during a forbidden window calls `hook` and then
+// goes ahead, instead of aborting the process: the hook decides (count it, ignore a thread that is
+// not the window's owner, terminate). nullptr restores the abort.
+using ViolationHook = void (*)() noexcept;
+void set_violation_hook_for_test(ViolationHook hook) noexcept;
 
 // Number of blocks currently allocated and not yet released (for tests and leak checks).
 std::size_t live_blocks() noexcept;
