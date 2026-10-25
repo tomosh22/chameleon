@@ -200,6 +200,7 @@ public:
         return s;
     }
     bool empty() const { return next_ == 0x1000; }
+    std::uint32_t next_id() const { return next_; }  // the id the next record added will get
 
 private:
     Records recs_;
@@ -223,6 +224,10 @@ struct Spec {
     bool empty_info_stream = false;
     bool bad_contrib_version = false;
     bool bad_fileinfo_offset = false;
+    // Age written to the PDB info stream when it should differ from the DBI age (spec.age).
+    std::uint32_t info_age_override = 0xFFFFFFFFu;
+    // Number of modules the source-info table covers (the module records still claim their files).
+    std::size_t fileinfo_modules = static_cast<std::size_t>(-1);
 };
 
 // Builds the PDB image.
@@ -233,7 +238,7 @@ inline Bytes build(const Spec& spec) {
         Bytes& info = streams[1];
         put32(info, 20000404);
         put32(info, 0x12345678);
-        put32(info, spec.age);
+        put32(info, spec.info_age_override != 0xFFFFFFFFu ? spec.info_age_override : spec.age);
         info.insert(info.end(), spec.guid.begin(), spec.guid.end());
     }
     if (spec.empty_info_stream) {
@@ -315,7 +320,9 @@ inline Bytes build(const Spec& spec) {
         Bytes names;
         std::vector<std::string> seen;
         std::vector<std::uint32_t> seen_off;
-        for (const Module& m : spec.modules) {
+        const std::size_t covered = std::min(spec.modules.size(), spec.fileinfo_modules);
+        for (std::size_t mi = 0; mi < covered; ++mi) {
+            const Module& m = spec.modules[mi];
             for (const std::string& f : m.files) {
                 auto it = std::find(seen.begin(), seen.end(), f);
                 if (it == seen.end()) {
@@ -327,15 +334,15 @@ inline Bytes build(const Spec& spec) {
                 name_offsets.push_back(seen_off[static_cast<std::size_t>(it - seen.begin())]);
             }
         }
-        put16(fileinfo, static_cast<std::uint16_t>(spec.modules.size()));
+        put16(fileinfo, static_cast<std::uint16_t>(covered));
         put16(fileinfo, static_cast<std::uint16_t>(seen.size()));
         std::uint16_t start = 0;
-        for (const Module& m : spec.modules) {
+        for (std::size_t mi = 0; mi < covered; ++mi) {
             put16(fileinfo, start);
-            start = static_cast<std::uint16_t>(start + m.files.size());
+            start = static_cast<std::uint16_t>(start + spec.modules[mi].files.size());
         }
-        for (const Module& m : spec.modules) {
-            put16(fileinfo, static_cast<std::uint16_t>(m.files.size()));
+        for (std::size_t mi = 0; mi < covered; ++mi) {
+            put16(fileinfo, static_cast<std::uint16_t>(spec.modules[mi].files.size()));
         }
         for (std::uint32_t o : name_offsets) {
             put32(fileinfo, spec.bad_fileinfo_offset ? 0x7FFFFFFFu : o);
@@ -453,8 +460,10 @@ inline Bytes build(const Spec& spec) {
 }
 
 // A minimal PE32+ image whose debug directory holds one RSDS record.
+// `section_raw_size` is the section's SizeOfRawData; the debug directory sits at offset 0x10 of the
+// section, so a value of 0x10 or less puts it in the section's virtual-only tail.
 inline Bytes build_pe(const std::array<std::uint8_t, 16>& guid, std::uint32_t age, const std::string& pdb_path,
-                      bool with_debug_dir = true) {
+                      bool with_debug_dir = true, std::uint32_t section_raw_size = 0x200) {
     Bytes f(0x400, 0);
     auto poke16 = [&f](std::size_t at, std::uint16_t v) {
         f[at] = static_cast<std::uint8_t>(v);
@@ -483,7 +492,7 @@ inline Bytes build_pe(const std::array<std::uint8_t, 16>& guid, std::uint32_t ag
     std::memcpy(&f[sec], ".rdata\0\0", 8);
     poke32(sec + 8, 0x200);   // virtual size
     poke32(sec + 12, 0x1000); // rva
-    poke32(sec + 16, 0x200);  // raw size
+    poke32(sec + 16, section_raw_size);  // raw size
     poke32(sec + 20, 0x200);  // raw pointer
     // Debug directory at file offset 0x200 + 0x10.
     const std::size_t dd = 0x210;

@@ -73,7 +73,9 @@ Result<CodeViewRef> read_codeview_ref_from_image(const void* data_in, std::size_
         return bad_pe("section table outside the file");
     }
     std::uint64_t dir_file_off = 0;
+    std::uint64_t dir_raw_avail = 0;  // bytes of the directory that are really in the file
     bool found = false;
+    bool in_virtual_tail = false;
     for (std::uint16_t i = 0; i < section_count; ++i) {
         const std::uint8_t* s = data + sections + static_cast<std::size_t>(i) * 40;
         const std::uint32_t vsize = rd32(s + 8);
@@ -82,15 +84,28 @@ Result<CodeViewRef> read_codeview_ref_from_image(const void* data_in, std::size_
         const std::uint32_t rawptr = rd32(s + 20);
         const std::uint32_t span = vsize > rawsize ? vsize : rawsize;
         if (debug_rva >= vaddr && debug_rva - vaddr < span) {
+            // Only bytes below SizeOfRawData exist in the file; the rest of the section is
+            // zero-filled by the loader and has no file offset.
+            if (debug_rva - vaddr >= rawsize) {
+                in_virtual_tail = true;
+                continue;
+            }
             dir_file_off = static_cast<std::uint64_t>(rawptr) + (debug_rva - vaddr);
+            dir_raw_avail = rawsize - (debug_rva - vaddr);
             found = true;
             break;
         }
     }
     if (!found) {
+        if (in_virtual_tail) {
+            return bad_pe("the debug directory is in a section's virtual-only tail (past SizeOfRawData), not in the file");
+        }
         return bad_pe("debug directory RVA does not lie in any section");
     }
-    const std::uint32_t entries = debug_size / 28;
+    std::uint32_t entries = debug_size / 28;
+    if (static_cast<std::uint64_t>(entries) * 28 > dir_raw_avail) {
+        return bad_pe("the debug directory extends past the section's data in the file");
+    }
     for (std::uint32_t e = 0; e < entries; ++e) {
         const std::uint64_t eo = dir_file_off + static_cast<std::uint64_t>(e) * 28;
         if (eo + 28 > size) {

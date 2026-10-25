@@ -36,6 +36,20 @@ TEST_CASE("normalize_path: relative paths and cwd") {
     CHECK(normalize_path("f.h", "rel\\dir") == "f.h");
 }
 
+TEST_CASE("normalize_path: UNC roots") {
+    // A rooted path against a UNC cwd stays on that server and share.
+    CHECK(normalize_path("\\inc\\a.h", "\\\\srv\\share\\work") == "\\\\srv\\share\\inc\\a.h");
+    CHECK(normalize_path("/inc/A.h", "//Srv/Share/work/deep") == "\\\\srv\\share\\inc\\a.h");
+    // ".." never climbs above \\server\share.
+    CHECK(normalize_path("\\\\Server\\Share\\..\\..\\x") == "\\\\server\\share\\x");
+    CHECK(normalize_path("\\\\Server\\Share\\a\\..\\..\\..\\x.h") == "\\\\server\\share\\x.h");
+    CHECK(normalize_path("..\\..\\..\\a.h", "\\\\srv\\share\\w") == "\\\\srv\\share\\a.h");
+    CHECK(normalize_path("..\\up.h", "\\\\srv\\share\\w\\x") == "\\\\srv\\share\\w\\up.h");
+    CHECK(normalize_path("\\\\?\\UNC\\Srv\\Share\\..\\..\\q") == "\\\\srv\\share\\q");
+    // A drive cwd and a rooted path still work as before.
+    CHECK(normalize_path("\\inc\\a.h", "D:\\work") == "d:\\inc\\a.h");
+}
+
 TEST_CASE("is_absolute_path") {
     CHECK(is_absolute_path("C:\\x"));
     CHECK(is_absolute_path("c:/x"));

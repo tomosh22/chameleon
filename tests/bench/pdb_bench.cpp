@@ -64,6 +64,18 @@ std::string fmt(const char* f, double a, double b = 0, double c = 0) {
 }
 
 #if defined(_WIN32)
+// Private bytes of the process (committed memory not shared with a file): what the index really
+// costs, independent of what cml_pdb's own counter sees (STL internals, thread stacks, heap
+// fragmentation all show up here).
+bool private_bytes(double& out) {
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof pmc)) {
+        return false;
+    }
+    out = static_cast<double>(pmc.PrivateUsage);
+    return true;
+}
+
 void print_process_memory() {
     PROCESS_MEMORY_COUNTERS pmc{};
     if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)) {
@@ -72,6 +84,9 @@ void print_process_memory() {
     }
 }
 #else
+bool private_bytes(double&) {
+    return false;
+}
 void print_process_memory() {}
 #endif
 
@@ -127,6 +142,8 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(file_bytes), size_mb, prefetch_ms);
 
     // ---- load -------------------------------------------------------------------------------
+    double private_before = 0;
+    const bool have_private = private_bytes(private_before);
     cml::pdb::reset_memory_peaks();
     cml::pdb::OpenOptions opts;
     opts.use_cache = false;
@@ -151,6 +168,10 @@ int main(int argc, char** argv) {
     auto all_ok = idx.load_all();
     const double all_ms = ms_since(t_all);
 
+    double private_after = 0;
+    if (have_private) {
+        private_bytes(private_after);
+    }
     const cml::pdb::MemoryStats mem = cml::pdb::memory_stats();
     const cml::pdb::Timings tm = idx.timings();
     const double load_ms = open_ms + pub_ms + all_ms;
@@ -180,8 +201,19 @@ int main(int argc, char** argv) {
                 mib(static_cast<double>(mem.tracked_bytes)), mib(static_cast<double>(after_open.tracked_bytes)),
                 mib(static_cast<double>(after_pub.tracked_bytes)), mib(static_cast<double>(mem.tracked_bytes)));
     std::printf("  mapped file                       %9.1f MiB\n", mib(mapped));
-    std::printf("  budget accounting (peak + mapped) %9.1f MiB = %.2f x PDB size\n", mib(total_mem),
+    std::printf("  counted accounting (peak + mapped) %8.1f MiB = %.2f x PDB size   [information only on Windows]\n", mib(total_mem),
                 file_bytes > 0 ? total_mem / static_cast<double>(file_bytes) : 0.0);
+    // The budget is asserted on a real process measure: the growth of the process's private bytes
+    // across the load, plus the whole mapped file. (Off Windows only the counted figure exists.)
+    const double private_delta = have_private && private_after > private_before ? private_after - private_before : 0.0;
+    const double budget_mem = have_private ? private_delta + mapped : total_mem;
+    if (have_private) {
+        std::printf("  process private bytes: %.1f MiB before, %.1f MiB after, growth %.1f MiB\n", mib(private_before),
+                    mib(private_after), mib(private_delta));
+    }
+    std::printf("  BUDGET MEASURE (%s + mapped) %8.1f MiB = %.2f x PDB size\n",
+                have_private ? "process private-bytes growth" : "counted peak", mib(budget_mem),
+                file_bytes > 0 ? budget_mem / static_cast<double>(file_bytes) : 0.0);
     print_process_memory();
 
     // ---- lookups (sanity and a rough per-query cost) ---------------------------------------------
@@ -238,8 +270,8 @@ int main(int argc, char** argv) {
         check.expect(load_ms <= budget_ms, "load time within budget",
                      fmt("%.0f ms <= %.0f ms (2 s per 500 MB x slack %.1f)", load_ms, budget_ms, slack));
         const double mem_budget = 1.5 * static_cast<double>(file_bytes);
-        check.expect(total_mem <= mem_budget, "memory within budget",
-                     fmt("%.1f MiB <= %.1f MiB (1.5 x PDB size)", mib(total_mem), mib(mem_budget)));
+        check.expect(budget_mem <= mem_budget, "memory within budget",
+                     fmt("%.1f MiB <= %.1f MiB (1.5 x PDB size)", mib(budget_mem), mib(mem_budget)));
         if (min_size_mb > 0) {
             check.expect(size_mb >= min_size_mb, "PDB is big enough to be a meaningful benchmark",
                          fmt("%.1f MiB >= %.1f MiB", size_mb, min_size_mb));

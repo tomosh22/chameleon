@@ -125,6 +125,7 @@ struct PdbIndex::Impl {
     std::shared_ptr<const detail::MappedFile> file;
     std::unique_ptr<detail::Msf> msf;
     PdbId id;
+    std::uint32_t info_age = 0;
     std::string path;
     std::uint16_t machine = 0;
     std::uint32_t dbi_age = 0;
@@ -191,7 +192,8 @@ struct PdbIndex::Impl {
 struct PdbProbe {
     std::shared_ptr<const detail::MappedFile> file;
     std::unique_ptr<detail::Msf> msf;
-    PdbId id;
+    PdbId id;                       // GUID from the info stream, age from the DBI stream
+    std::uint32_t info_age = 0;     // age from the info stream (informational)
     double map_ms = 0;
     double msf_ms = 0;
 };
@@ -204,6 +206,9 @@ Result<void> build_index(PdbIndex::Impl& impl);
 namespace detail {
 Result<std::unique_ptr<ModuleSymbols>> parse_module_symbols(const PdbIndex::Impl& impl, std::uint32_t compiland);
 Result<std::unique_ptr<GlobalSymbols>> parse_global_symbols(const PdbIndex::Impl& impl);
+// The current directory recorded in a compiland's S_BUILDINFO (IPI), if it has one. Used while
+// open() builds the file map, before the lazy tables exist.
+std::optional<std::string> buildinfo_cwd(const PdbIndex::Impl& impl, std::uint32_t compiland);
 }  // namespace detail
 
 }  // namespace cml::pdb

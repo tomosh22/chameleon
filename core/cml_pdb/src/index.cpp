@@ -91,9 +91,30 @@ struct CacheSlot {
     std::weak_ptr<const PdbIndex> index;
 };
 
+// Identity alone is not enough: a /PDBSTRIPPED PDB and the full PDB share GUID and age but not
+// content, so the canonical file path is part of the key.
+struct CacheKey {
+    PdbId id;
+    std::string path;
+    bool operator<(const CacheKey& o) const noexcept { return id != o.id ? id < o.id : path < o.path; }
+};
+
 struct Cache {
     std::mutex mutex;
-    std::map<PdbId, std::shared_ptr<CacheSlot>> slots;
+    std::map<CacheKey, std::shared_ptr<CacheSlot>> slots;
+
+    // Drops entries whose index is gone and that nobody is building. Caller holds `mutex`.
+    void sweep() {
+        for (auto it = slots.begin(); it != slots.end();) {
+            std::unique_lock<std::mutex> slot_lock(it->second->mutex, std::try_to_lock);
+            if (slot_lock.owns_lock() && it->second->index.expired()) {
+                slot_lock.unlock();
+                it = slots.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
 };
 
 Cache& cache() {
@@ -133,8 +154,24 @@ Result<PdbProbe> probe_pdb(const std::string& path) {
         return Diag::make(diag::kBadInfoStream, "The PDB info stream of '" + path + "' is missing or too short.",
                           "Rebuild the module so the linker regenerates the PDB.");
     }
-    probe.id.age = rd32(info.data() + 8);
+    probe.info_age = rd32(info.data() + 8);
     std::memcpy(probe.id.guid.data(), info.data() + 12, 16);
+    // Debuggers match the image's RSDS age against the DBI age, so that is the age of the identity.
+    // A PDB whose DBI stream cannot be read yet falls back to the info-stream age (open() then
+    // fails with a DBI diagnostic anyway).
+    probe.id.age = probe.info_age;
+    {
+        CountedBuffer scratch;
+        std::size_t got = 0;
+        const std::uint8_t* dbi = probe.msf->read_range(3, 0, 12, scratch, got);
+        if (dbi != nullptr && got >= 12 && rd32(dbi) == 0xFFFFFFFFu) {
+            probe.id.age = rd32(dbi + 8);
+        }
+    }
+    if (probe.id.age != probe.info_age) {
+        CML_LOG(Debug, "cml_pdb: '%s': info-stream age %u differs from DBI age %u; using the DBI age", path.c_str(), probe.info_age,
+                probe.id.age);
+    }
     probe.msf_ms = ms_since(t_msf);
     return probe;
 }
@@ -149,6 +186,7 @@ struct IndexBuilder {
         impl->file = std::move(probe.file);
         impl->msf = std::move(probe.msf);
         impl->id = probe.id;
+        impl->info_age = probe.info_age;
         impl->path = path;
         impl->open_timings.map_ms = probe.map_ms;
         impl->open_timings.msf_ms = probe.msf_ms;
@@ -183,6 +221,21 @@ struct IndexBuilder {
 
 namespace {
 
+// Preload options are honoured on a shared index too: the tables are built (once) if they are not
+// there yet, so a caller asking for preload_all_symbols always gets them.
+Result<void> apply_preload(const PdbIndex& index, const OpenOptions& options) {
+    if (options.preload_all_symbols) {
+        if (auto r = index.load_publics(); !r) {
+            return r.error();
+        }
+        return index.load_all();
+    }
+    if (options.preload_publics) {
+        return index.load_publics();
+    }
+    return Result<void>();
+}
+
 Result<std::shared_ptr<const PdbIndex>> open_probed(PdbProbe&& probe, const std::string& path, const OpenOptions& options) {
     if (!options.symbol_server.empty()) {
         CML_LOG(Debug, "cml_pdb: symbol server '%s' ignored (not implemented)", options.symbol_server.c_str());
@@ -194,15 +247,19 @@ Result<std::shared_ptr<const PdbIndex>> open_probed(PdbProbe&& probe, const std:
     std::shared_ptr<CacheSlot> slot;
     {
         std::lock_guard<std::mutex> lock(c.mutex);
-        std::shared_ptr<CacheSlot>& s = c.slots[probe.id];
-        if (!s) {
-            s = std::make_shared<CacheSlot>();
+        c.sweep();
+        std::shared_ptr<CacheSlot>& entry = c.slots[CacheKey{probe.id, canonical_file_path(path)}];
+        if (!entry) {
+            entry = std::make_shared<CacheSlot>();
         }
-        slot = s;
+        slot = entry;
     }
     std::lock_guard<std::mutex> build_lock(slot->mutex);
     if (std::shared_ptr<const PdbIndex> existing = slot->index.lock()) {
         CML_LOG(Trace, "cml_pdb: cache hit for %s", probe.id.to_string().c_str());
+        if (auto r = apply_preload(*existing, options); !r) {
+            return r.error();
+        }
         return existing;
     }
     auto built = IndexBuilder::build(std::move(probe), path, options);
@@ -292,14 +349,14 @@ Result<std::shared_ptr<const PdbIndex>> PdbIndex::open_for_pe(const std::string&
 std::size_t PdbIndex::cache_size() {
     Cache& c = cache();
     std::lock_guard<std::mutex> lock(c.mutex);
-    std::size_t n = 0;
-    for (const auto& kv : c.slots) {
-        std::unique_lock<std::mutex> slot_lock(kv.second->mutex, std::try_to_lock);
-        if (!slot_lock.owns_lock() || !kv.second->index.expired()) {
-            ++n;
-        }
-    }
-    return n;
+    c.sweep();
+    return c.slots.size();  // alive or being built: the sweep removed the rest
+}
+
+std::size_t PdbIndex::cache_slot_count() {
+    Cache& c = cache();
+    std::lock_guard<std::mutex> lock(c.mutex);
+    return c.slots.size();
 }
 
 void PdbIndex::cache_clear() {
@@ -312,6 +369,9 @@ void PdbIndex::cache_clear() {
 
 const PdbId& PdbIndex::id() const noexcept {
     return impl_->id;
+}
+std::uint32_t PdbIndex::info_age() const noexcept {
+    return impl_->info_age;
 }
 const std::string& PdbIndex::path() const noexcept {
     return impl_->path;

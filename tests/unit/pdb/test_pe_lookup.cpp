@@ -77,6 +77,40 @@ TEST_CASE("RSDS extraction from a PE image") {
     }
 }
 
+TEST_CASE("RSDS extraction: a debug directory in a section's virtual-only tail is not in the file") {
+    // Directory at section offset 0x10; SizeOfRawData 0x10 leaves it in the zero-filled tail.
+    const Bytes pe = build_pe(kGuid, 5, "C:\\build\\app.pdb", true, 0x10);
+    auto r = cml::pdb::read_codeview_ref_from_image(pe.data(), pe.size());
+    REQUIRE_FALSE(r);
+    CHECK(r.error().code == dg::kBadPeImage);
+    CHECK(r.error().message.find("not in the file") != std::string::npos);
+    // The same image with the directory inside the raw data is fine.
+    const Bytes ok = build_pe(kGuid, 5, "C:\\build\\app.pdb", true, 0x200);
+    REQUIRE(cml::pdb::read_codeview_ref_from_image(ok.data(), ok.size()));
+    // A directory that starts in the raw data but extends past it is rejected too.
+    const Bytes partial = build_pe(kGuid, 5, "C:\\build\\app.pdb", true, 0x20);
+    auto p2 = cml::pdb::read_codeview_ref_from_image(partial.data(), partial.size());
+    REQUIRE_FALSE(p2);
+    CHECK(p2.error().code == dg::kBadPeImage);
+}
+
+TEST_CASE("open_for_pe matches the RSDS age against the DBI age") {
+    TempDir dir;
+    Spec spec = standard_spec();
+    spec.age = 1;
+    spec.info_age_override = 5;  // info stream disagrees: informational only
+    write_file(dir.file("app.pdb"), build(spec));
+    write_file(dir.file("one.exe"), build_pe(kGuid, 1, dir.file("app.pdb")));
+    write_file(dir.file("five.exe"), build_pe(kGuid, 5, dir.file("app.pdb")));
+    auto ok = PdbIndex::open_for_pe(dir.file("one.exe"), no_cache());
+    REQUIRE(ok);
+    CHECK((*ok)->id().age == 1);
+    CHECK((*ok)->info_age() == 5);
+    auto bad = PdbIndex::open_for_pe(dir.file("five.exe"), no_cache());
+    REQUIRE_FALSE(bad);
+    CHECK(bad.error().code == dg::kPdbMismatch);
+}
+
 TEST_CASE("RSDS extraction survives truncation and corruption") {
     const Bytes pe = build_pe(kGuid, 5, "C:\\build\\app.pdb");
     for (std::size_t n = 0; n < pe.size(); ++n) {

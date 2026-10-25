@@ -160,7 +160,7 @@ void check_standard(const PdbIndex& idx) {
         const auto norm1 = idx.compiland_files_normalized(1);
         CHECK(norm1[0] == "c:\\proj\\src\\main.cpp");
         CHECK(norm1[1] == "c:\\proj\\src\\logic.h");   // ".." resolved
-        CHECK(norm1[2] == "..\\include\\rel.h");        // relative and no cwd: stays relative
+        CHECK(norm1[2] == "c:\\include\\rel.h");        // relative: resolved against the S_BUILDINFO cwd (C:\proj)
 
         const auto norm2 = idx.compiland_files_normalized(2);
         REQUIRE(norm2.size() == 2);
@@ -173,7 +173,8 @@ void check_standard(const PdbIndex& idx) {
         CHECK(idx.compilands_for_file("C:/PROJ/src/../src/Logic.H") == std::vector<std::uint32_t>{0, 1});
         CHECK(idx.compilands_for_file("c:\\proj\\src\\main.cpp") == std::vector<std::uint32_t>{1});
         CHECK(idx.compilands_for_file("D:\\Work\\Include\\Rel.h") == std::vector<std::uint32_t>{2});
-        CHECK(idx.compilands_for_file("..\\include\\rel.h") == std::vector<std::uint32_t>{1});
+        CHECK(idx.compilands_for_file("C:\\include\\rel.h") == std::vector<std::uint32_t>{1});
+        CHECK(idx.compilands_for_file("..\\include\\rel.h").empty());  // unresolved spellings no longer match
         CHECK(idx.compilands_for_file("c:\\nope.h").empty());
         CHECK(idx.compilands_for_file("").empty());
         CHECK(idx.distinct_file_count() == 7);
@@ -474,7 +475,7 @@ TEST_CASE("synthetic PDB: preload options build the tables during open") {
     CHECK((*r)->public_count() == 5);
 }
 
-TEST_CASE("cache: one shared index per (GUID, age)") {
+TEST_CASE("cache: keyed by (GUID, age, canonical path)") {
     TempDir dir;
     Spec a = standard_spec();
     write_file(dir.file("one.pdb"), build(a));
@@ -485,21 +486,40 @@ TEST_CASE("cache: one shared index per (GUID, age)") {
     Spec c = standard_spec();
     c.guid[3] ^= 0x55;
     write_file(dir.file("guid2.pdb"), build(c));
+    Spec stripped = standard_spec();  // same GUID and age, less content (what /PDBSTRIPPED produces)
+    stripped.modules.resize(2);
+    stripped.contributions.clear();
+    write_file(dir.file("stripped.pdb"), build(stripped));
 
-    const std::size_t before = PdbIndex::cache_size();
+    PdbIndex::cache_clear();
     auto r1 = PdbIndex::open_pdb(dir.file("one.pdb"));
     REQUIRE(r1);
+    auto r1b = PdbIndex::open_pdb(dir.file("one.pdb"));
+    REQUIRE(r1b);
+    CHECK(r1->get() == r1b->get());  // same file: shared
+
+    // Another spelling of the same file ("." component, other case on Windows) is the same file.
+    auto r1c = PdbIndex::open_pdb(dir.dir() + "/./one.pdb");
+    REQUIRE(r1c);
+    CHECK(r1->get() == r1c->get());
+
+    // Same GUID and age, different file: a different index (a stripped PDB must not be served for a full one).
     auto r2 = PdbIndex::open_pdb(dir.file("copy.pdb"));
     REQUIRE(r2);
-    CHECK(r1->get() == r2->get());  // shared
+    CHECK(r2->get() != r1->get());
+    auto rs = PdbIndex::open_pdb(dir.file("stripped.pdb"));
+    REQUIRE(rs);
+    CHECK(rs->get() != r1->get());
+    CHECK((*rs)->id() == (*r1)->id());
+    CHECK((*rs)->compiland_count() == 2);
+    CHECK((*r1)->compiland_count() == 5);
+
     auto r3 = PdbIndex::open_pdb(dir.file("age2.pdb"));
     REQUIRE(r3);
-    CHECK(r3->get() != r1->get());
     CHECK((*r3)->id().age == 2);
     auto r4 = PdbIndex::open_pdb(dir.file("guid2.pdb"));
     REQUIRE(r4);
-    CHECK(r4->get() != r1->get());
-    CHECK(PdbIndex::cache_size() == before + 3);
+    CHECK(PdbIndex::cache_size() == 5);
 
     OpenOptions no_cache;
     no_cache.use_cache = false;
@@ -507,14 +527,12 @@ TEST_CASE("cache: one shared index per (GUID, age)") {
     REQUIRE(r5);
     CHECK(r5->get() != r1->get());
 
-    // The cache does not keep indexes alive: once every user lets go, the next open rebuilds.
-    r3 = PdbIndex::open_pdb(dir.file("one.pdb"));  // drops the age-2 index
-    REQUIRE(r3);
-    CHECK(PdbIndex::cache_size() == before + 2);
-    auto r6 = PdbIndex::open_pdb(dir.file("age2.pdb"));
-    REQUIRE(r6);
-    CHECK((*r6)->id().age == 2);
-    CHECK(PdbIndex::cache_size() == before + 3);
+    // Expired entries are erased: drop two indexes, the next sweep removes their slots.
+    r2 = PdbIndex::open_pdb(dir.file("one.pdb"));  // drops copy.pdb's index
+    rs = PdbIndex::open_pdb(dir.file("one.pdb"));  // drops stripped.pdb's index
+    CHECK(PdbIndex::cache_slot_count() >= 3);      // expired slots may linger until a sweep
+    CHECK(PdbIndex::cache_size() == 3);            // sweeps
+    CHECK(PdbIndex::cache_slot_count() == 3);
 
     PdbIndex::cache_clear();
     CHECK(PdbIndex::cache_size() == 0);
@@ -522,6 +540,229 @@ TEST_CASE("cache: one shared index per (GUID, age)") {
     REQUIRE(r7);
     CHECK(r7->get() != r1->get());  // forgotten entry: a new index is built, the old one stays valid
     CHECK((*r1)->compiland_count() == 5);
+}
+
+TEST_CASE("cache: preload options are honoured on a shared index") {
+    TempDir dir;
+    write_file(dir.file("p.pdb"), build(standard_spec()));
+    PdbIndex::cache_clear();
+    auto first = PdbIndex::open_pdb(dir.file("p.pdb"));
+    REQUIRE(first);
+    CHECK_FALSE((*first)->compiland_loaded(0));  // lazy by default
+    OpenOptions preload;
+    preload.preload_all_symbols = true;
+    auto again = PdbIndex::open_pdb(dir.file("p.pdb"), preload);
+    REQUIRE(again);
+    CHECK(again->get() == first->get());
+    for (std::uint32_t i = 0; i < 5; ++i) {
+        CHECK((*first)->compiland_loaded(i));
+    }
+    CHECK((*first)->timings().publics_ms >= 0);
+    CHECK((*first)->public_count() == 5);
+}
+
+TEST_CASE("find_proc_by_rva loads only the owning compiland") {
+    TempDir dir;
+    write_file(dir.file("q.pdb"), build(standard_spec()));
+    OpenOptions opts;
+    opts.use_cache = false;
+    auto r = PdbIndex::open_pdb(dir.file("q.pdb"), opts);
+    REQUIRE(r);
+    const PdbIndex& idx = **r;
+    for (std::uint32_t i = 0; i < 5; ++i) {
+        REQUIRE_FALSE(idx.compiland_loaded(i));
+    }
+    // 0x3010 is in .data, contributed by compiland 0: a miss there is a miss, nothing else is touched.
+    auto data = idx.find_proc_by_rva(0x3010);
+    REQUIRE(data);
+    CHECK_FALSE(data->has_value());
+    CHECK(idx.compiland_loaded(0));
+    for (std::uint32_t i = 1; i < 5; ++i) {
+        CHECK_FALSE(idx.compiland_loaded(i));
+    }
+    // No contribution covers 0x1150 and contributions exist: still nothing else is loaded.
+    auto gap = idx.find_proc_by_rva(0x1150);
+    REQUIRE(gap);
+    CHECK_FALSE(gap->has_value());
+    for (std::uint32_t i = 1; i < 5; ++i) {
+        CHECK_FALSE(idx.compiland_loaded(i));
+    }
+    // A hit loads its owner (compiland 1) only.
+    auto hit = idx.find_proc_by_rva(0x2FF);  // below .text: nothing
+    REQUIRE(hit);
+    auto main_proc = idx.find_proc_by_rva(0x1210);
+    REQUIRE(main_proc);
+    REQUIRE(main_proc->has_value());
+    CHECK((*main_proc)->name == "main");
+    CHECK(idx.compiland_loaded(1));
+    CHECK_FALSE(idx.compiland_loaded(2));
+}
+
+TEST_CASE("corrupt compilands are skipped by lookups and recorded per compiland") {
+    Spec spec = standard_spec();
+    spec.modules[2].symbols.raw(Bytes{0xF0, 0xFF, 0x10, 0x11, 0, 0, 0, 0});  // rel.cpp.obj: record leaves the stream
+    TempDir dir;
+    OpenOptions opts;
+    opts.use_cache = false;
+
+    SUBCASE("owning compiland corrupt: nullopt, not an error; the error is kept") {
+        write_file(dir.file("a.pdb"), build(spec));
+        auto r = PdbIndex::open_pdb(dir.file("a.pdb"), opts);
+        REQUIRE(r);
+        const PdbIndex& idx = **r;
+        auto owner = idx.find_proc_by_rva(0x1300);  // contributed by compiland 2
+        REQUIRE(owner);
+        CHECK_FALSE(owner->has_value());
+        REQUIRE(idx.compiland_error(2).has_value());
+        CHECK(idx.compiland_error(2)->code == cml::pdb::diag::kBadModuleSymbols);
+        CHECK_FALSE(idx.compiland_error(0).has_value());
+        auto fine = idx.find_proc_by_rva(0x1105);  // other compilands are unaffected
+        REQUIRE(fine);
+        REQUIRE(fine->has_value());
+        CHECK((*fine)->name == "compute_value");
+    }
+    SUBCASE("no contributions: the search skips the corrupt compiland") {
+        spec.contributions.clear();
+        write_file(dir.file("b.pdb"), build(spec));
+        auto r = PdbIndex::open_pdb(dir.file("b.pdb"), opts);
+        REQUIRE(r);
+        const PdbIndex& idx = **r;
+        auto fine = idx.find_proc_by_rva(0x1205);
+        REQUIRE(fine);
+        REQUIRE(fine->has_value());
+        CHECK((*fine)->name == "main");
+        auto nothing = idx.find_proc_by_rva(0x1300);  // would be in the corrupt one
+        REQUIRE(nothing);
+        CHECK_FALSE(nothing->has_value());
+        CHECK(idx.compiland_error(2).has_value());
+        CHECK(idx.compiland_loaded(0));
+        CHECK(idx.compiland_loaded(1));
+    }
+    SUBCASE("load_all tries every compiland after a failure") {
+        write_file(dir.file("c.pdb"), build(spec));
+        auto r = PdbIndex::open_pdb(dir.file("c.pdb"), opts);
+        REQUIRE(r);
+        const PdbIndex& idx = **r;
+        auto all = idx.load_all(1);  // one thread: the failing compiland (2) comes before 3 and 4
+        REQUIRE_FALSE(all);
+        CHECK(all.error().code == cml::pdb::diag::kBadModuleSymbols);
+        for (std::uint32_t i : {0u, 1u, 3u, 4u}) {
+            CHECK(idx.compiland_loaded(i));
+        }
+        CHECK_FALSE(idx.compiland_loaded(2));
+        CHECK(idx.compiland_error(2).has_value());
+        CHECK_FALSE(idx.compiland_error(99).has_value());
+    }
+}
+
+TEST_CASE("build_env: crafted IPI string lists are rejected, not expanded") {
+    TempDir dir;
+    OpenOptions opts;
+    opts.use_cache = false;
+    auto make = [&](Ipi&& ipi) {
+        Spec spec;
+        spec.ipi = std::move(ipi);
+        Module m;
+        m.name = "C:\\o\\a.obj";
+        m.symbols.compile3(1, 0, 0xD0, "T");
+        // The module's S_BUILDINFO points at the last LF_BUILDINFO added (the id the builder returned).
+        return std::make_pair(std::move(spec), std::move(m));
+    };
+    SUBCASE("a substring list that refers back to its own string") {
+        Ipi ipi;
+        const std::uint32_t cwd = ipi.string_id("C:\\x");
+        const std::uint32_t str = ipi.next_id();
+        ipi.string_id("loop", str + 1);  // continues in the list that follows
+        ipi.substr_list({str});          // ... which names the string again
+        const std::uint32_t bi = ipi.buildinfo({cwd, 0, 0, 0, str});
+        auto [spec, m] = make(std::move(ipi));
+        m.symbols.buildinfo(bi);
+        spec.modules.push_back(std::move(m));
+        write_file(dir.file("cyc.pdb"), build(spec));
+        auto r = PdbIndex::open_pdb(dir.file("cyc.pdb"), opts);
+        REQUIRE(r);
+        auto env = (*r)->build_env(0);
+        REQUIRE_FALSE(env);
+        CHECK(env.error().code == cml::pdb::diag::kBadBuildInfo);
+        CHECK(env.error().id() == "CML1419");
+    }
+    SUBCASE("fan-out: lists of 300 references, four levels deep, would be 300^4 lookups") {
+        Ipi ipi;
+        const std::uint32_t cwd = ipi.string_id("C:\\x");
+        std::uint32_t cur = ipi.string_id("leaf");
+        for (int level = 0; level < 4; ++level) {
+            const std::uint32_t list = ipi.substr_list(std::vector<std::uint32_t>(300, cur));
+            cur = ipi.string_id("level", list);
+        }
+        const std::uint32_t bi = ipi.buildinfo({cwd, 0, 0, 0, cur});
+        auto [spec, m] = make(std::move(ipi));
+        m.symbols.buildinfo(bi);
+        spec.modules.push_back(std::move(m));
+        write_file(dir.file("bomb.pdb"), build(spec));
+        auto r = PdbIndex::open_pdb(dir.file("bomb.pdb"), opts);
+        REQUIRE(r);
+        auto env = (*r)->build_env(0);
+        REQUIRE_FALSE(env);
+        CHECK(env.error().code == cml::pdb::diag::kBadBuildInfo);
+    }
+    SUBCASE("an ordinary multi-piece string still resolves") {
+        Ipi ipi;
+        const std::uint32_t cwd = ipi.string_id("C:\\x");
+        const std::uint32_t p2 = ipi.string_id("b");
+        const std::uint32_t p3 = ipi.string_id("c");
+        const std::uint32_t list = ipi.substr_list({p2, p3});
+        const std::uint32_t cmd = ipi.string_id("a", list);
+        const std::uint32_t bi = ipi.buildinfo({cwd, 0, 0, 0, cmd});
+        auto [spec, m] = make(std::move(ipi));
+        m.symbols.buildinfo(bi);
+        spec.modules.push_back(std::move(m));
+        write_file(dir.file("ok.pdb"), build(spec));
+        auto r = PdbIndex::open_pdb(dir.file("ok.pdb"), opts);
+        REQUIRE(r);
+        auto env = (*r)->build_env(0);
+        REQUIRE(env);
+        CHECK(env->command().value() == "abc");
+    }
+}
+
+TEST_CASE("file_count matches compiland_files(), also for modules the source-info table does not cover") {
+    TempDir dir;
+    OpenOptions opts;
+    opts.use_cache = false;
+    Spec spec = standard_spec();
+    spec.fileinfo_modules = 1;  // only module 0 has a file list; modules 1 and 2 still claim 3 and 2 files
+    write_file(dir.file("f.pdb"), build(spec));
+    auto r = PdbIndex::open_pdb(dir.file("f.pdb"), opts);
+    REQUIRE(r);
+    const PdbIndex& idx = **r;
+    for (std::uint32_t i = 0; i < idx.compiland_count(); ++i) {
+        CHECK(idx.compiland(i).file_count == idx.compiland_files(i).size());
+    }
+    CHECK(idx.compiland(0).file_count == 3);
+    CHECK(idx.compiland(1).file_count == 0);
+    CHECK(idx.compiland(2).file_count == 0);
+
+    write_file(dir.file("g.pdb"), build(standard_spec()));
+    auto full = PdbIndex::open_pdb(dir.file("g.pdb"), opts);
+    REQUIRE(full);
+    for (std::uint32_t i = 0; i < (*full)->compiland_count(); ++i) {
+        CHECK((*full)->compiland(i).file_count == (*full)->compiland_files(i).size());
+    }
+}
+
+TEST_CASE("identity: the DBI age is what is matched, the info-stream age is informational") {
+    TempDir dir;
+    OpenOptions opts;
+    opts.use_cache = false;
+    Spec spec = standard_spec();
+    spec.age = 3;
+    spec.info_age_override = 8;
+    write_file(dir.file("age.pdb"), build(spec));
+    auto r = PdbIndex::open_pdb(dir.file("age.pdb"), opts);
+    REQUIRE(r);
+    CHECK((*r)->id().age == 3);
+    CHECK((*r)->info_age() == 8);
+    CHECK((*r)->dbi_age() == 3);
 }
 
 TEST_CASE("cache and lazy loading are thread-safe") {

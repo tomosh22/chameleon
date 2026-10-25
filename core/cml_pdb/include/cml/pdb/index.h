@@ -53,7 +53,10 @@ public:
                                                                const OpenOptions& options = {});
 
     // ---- Identity ------------------------------------------------------------------------
+    // GUID from the info stream; age from the DBI stream (what debuggers match against the image's
+    // RSDS age). An info-stream age that differs is logged at debug level and exposed as info_age().
     const PdbId& id() const noexcept;
+    std::uint32_t info_age() const noexcept;
     const std::string& path() const noexcept;
     std::uint64_t file_size() const noexcept;
     std::uint16_t machine() const noexcept;  // DBI machine type (0x8664 = AMD64)
@@ -117,13 +120,23 @@ public:
     Result<std::vector<SymbolView>> find_in_compiland(std::uint32_t ci, std::string_view name) const;
     // Every recorded symbol of a compiland in stream order (index == SymbolView::index).
     Result<std::vector<SymbolView>> compiland_symbols(std::uint32_t ci) const;
-    // The proc (S_GPROC32 / S_LPROC32) whose [rva, rva+size) contains `rva`.
+    // The proc (S_GPROC32 / S_LPROC32) whose [rva, rva+size) contains `rva`. The compiland that
+    // contributed `rva` (section contributions) is the only one loaded; a miss there is a miss. Only
+    // when the PDB has no section contributions at all are the other compilands searched, and
+    // compilands whose symbols are corrupt are then skipped (see compiland_error()). Corrupt owning
+    // compiland: nullopt, not an error.
     Result<std::optional<SymbolView>> find_proc_by_rva(std::uint32_t rva) const;
 
     // ---- Loading control -----------------------------------------------------------------
     Result<void> load_publics() const;
     Result<void> load_compiland(std::uint32_t ci) const;
-    // Loads every compiland's symbols using `threads` workers (0 = options.threads default).
+    // True when the compiland's symbols are loaded (does not load them).
+    bool compiland_loaded(std::uint32_t ci) const noexcept;
+    // The error remembered for a compiland whose symbols failed to load, if any.
+    std::optional<Diag> compiland_error(std::uint32_t ci) const;
+    // Loads every compiland's symbols using `threads` workers (0 = options.threads default). Every
+    // compiland is attempted even after a failure; the first error is returned and each failing
+    // compiland keeps its own error (compiland_error()).
     Result<void> load_all(unsigned threads = 0) const;
 
     Timings timings() const;
@@ -131,6 +144,8 @@ public:
     // ---- Cache ---------------------------------------------------------------------------
     // Number of live entries in the process-wide cache (entries whose index is still alive).
     static std::size_t cache_size();
+    // All entries, including expired ones not yet swept (they are swept on the next open or cache_size).
+    static std::size_t cache_slot_count();
     // Forgets all cache entries (indexes that callers still hold stay valid).
     static void cache_clear();
 

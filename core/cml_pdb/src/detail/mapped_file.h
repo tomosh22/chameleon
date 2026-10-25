@@ -34,6 +34,10 @@ private:
 // True when `path_utf8` names an existing regular file.
 bool file_exists(const std::string& path_utf8);
 
+// Absolute, symlink-free (POSIX) / normalised (Windows: full path, backslashes, lower case) spelling
+// of a file path, for use as an identity. Falls back to the input when the OS cannot resolve it.
+std::string canonical_file_path(const std::string& path_utf8);
+
 // Joins a directory and a file name with a native-style separator ("\\" when the directory uses
 // it, "/" otherwise). Directory may be empty.
 std::string join_path(const std::string& dir, const std::string& name);

@@ -510,34 +510,52 @@ bool ipi_find(const IpiTable& t, std::uint32_t id, IpiRecord& out) {
 }
 
 constexpr std::size_t kMaxBuildString = 4u << 20;
+// Upper bound on record lookups while resolving the strings of one compiland. A legitimate command
+// line is a handful of pieces (clang splits at 64 KiB); a crafted substring list could otherwise fan
+// out as count^depth.
+constexpr std::uint32_t kStringLookupBudget = 4096;
+constexpr int kMaxStringDepth = 4;
 
-// LF_STRING_ID, followed by the strings of its LF_SUBSTR_LIST when it has one.
-bool ipi_string(const IpiTable& t, std::uint32_t id, std::string& out, int depth) {
+enum class StrResult { Ok, Missing, Abuse };
+
+// LF_STRING_ID, followed by the strings of its LF_SUBSTR_LIST when it has one. Missing: a record is
+// absent or has the wrong kind (tolerated, the value is left empty). Abuse: the budget, the nesting
+// depth or the size cap was exceeded (a cycle or a fan-out bomb): reported as CML1419.
+StrResult ipi_string(const IpiTable& t, std::uint32_t id, std::string& out, int depth, std::uint32_t& budget) {
+    if (budget == 0 || depth > kMaxStringDepth) {
+        return StrResult::Abuse;
+    }
+    --budget;
     IpiRecord r;
-    if (depth > 4 || !ipi_find(t, id, r) || r.kind != cv::LF_STRING_ID || r.body_len < 5) {
-        return false;
+    if (!ipi_find(t, id, r) || r.kind != cv::LF_STRING_ID || r.body_len < 5) {
+        return StrResult::Missing;
     }
     const std::uint32_t substr = rd32(r.body);
     out.append(reinterpret_cast<const char*>(r.body + 4), cv::cstr_len(r.body + 4, r.body_len - 4));
     if (out.size() > kMaxBuildString) {
-        return false;
+        return StrResult::Abuse;
     }
     if (substr != 0) {
+        if (budget == 0) {
+            return StrResult::Abuse;
+        }
+        --budget;
         IpiRecord list;
         if (!ipi_find(t, substr, list) || list.kind != cv::LF_SUBSTR_LIST || list.body_len < 4) {
-            return false;
+            return StrResult::Missing;
         }
         const std::uint32_t count = rd32(list.body);
         if (static_cast<std::uint64_t>(count) * 4 + 4 > list.body_len) {
-            return false;
+            return StrResult::Missing;
         }
         for (std::uint32_t i = 0; i < count; ++i) {
-            if (!ipi_string(t, rd32(list.body + 4 + static_cast<std::size_t>(i) * 4), out, depth + 1)) {
-                return false;
+            const StrResult child = ipi_string(t, rd32(list.body + 4 + static_cast<std::size_t>(i) * 4), out, depth + 1, budget);
+            if (child != StrResult::Ok) {
+                return child;
             }
         }
     }
-    return true;
+    return StrResult::Ok;
 }
 
 }  // namespace
@@ -581,16 +599,64 @@ Result<BuildEnv> PdbIndex::build_env(std::uint32_t ci) const {
     }
     static const char* const kKeys[5] = {"cwd", "cl", "src", "pdb", "cmd"};
     env.source = EnvSource::BuildInfo;
+    std::uint32_t budget = kStringLookupBudget;
     for (std::uint32_t i = 0; i < count && i < 5; ++i) {
         const std::uint32_t id = rd32(bi.body + 2 + static_cast<std::size_t>(i) * 4);
         std::string value;
-        if (id != 0 && !ipi_string(t, id, value, 0)) {
-            value.clear();
+        if (id != 0) {
+            const StrResult sr = ipi_string(t, id, value, 0, budget);
+            if (sr == StrResult::Abuse) {
+                return Diag::make(diag::kBadBuildInfo,
+                                  "The build-information strings of module '" + std::string(c.object_name) +
+                                      "' are cyclic or unreasonably large (more than " + std::to_string(kStringLookupBudget) +
+                                      " record lookups); they were not read.",
+                                  "Rebuild the module so the compiler regenerates the debug info.");
+            }
+            if (sr == StrResult::Missing) {
+                value.clear();
+            }
         }
         env.pairs.emplace_back(kKeys[i], std::move(value));
     }
     return env;
 }
+
+namespace detail {
+
+std::optional<std::string> buildinfo_cwd(const PdbIndex::Impl& impl, std::uint32_t ci) {
+    const Compiland& c = impl.compilands[ci];
+    if (c.symbol_stream == 0xFFFF || c.symbol_bytes <= 4 || c.symbol_bytes > impl.msf->stream_size(c.symbol_stream)) {
+        return std::nullopt;
+    }
+    CountedBuffer scratch;
+    std::size_t got = 0;
+    const std::uint8_t* data = impl.msf->read_range(c.symbol_stream, 0, c.symbol_bytes, scratch, got);
+    if (data == nullptr || got < c.symbol_bytes) {
+        return std::nullopt;
+    }
+    std::uint32_t id = 0;
+    cv::for_each_record(data, 4, c.symbol_bytes, [&](const cv::Record& r) {
+        if (r.kind == cv::S_BUILDINFO && r.body_len >= 4) {
+            id = rd32(r.body);
+        }
+    });
+    if (id == 0 || !ensure_ipi(impl)) {
+        return std::nullopt;
+    }
+    IpiRecord bi;
+    if (!ipi_find(*impl.ipi, id, bi) || bi.kind != cv::LF_BUILDINFO || bi.body_len < 6) {
+        return std::nullopt;
+    }
+    std::string cwd;
+    std::uint32_t budget = kStringLookupBudget;
+    const std::uint32_t arg = rd32(bi.body + 2);  // CurrentDirectory
+    if (arg == 0 || ipi_string(*impl.ipi, arg, cwd, 0, budget) != StrResult::Ok || cwd.empty()) {
+        return std::nullopt;
+    }
+    return cwd;
+}
+
+}  // namespace detail
 
 // ---- Public queries on the lazily loaded tables ---------------------------------------------------
 
@@ -785,27 +851,32 @@ const SymRec* proc_containing(const ModuleSymbols& ms, const std::vector<Section
 Result<std::optional<SymbolView>> PdbIndex::find_proc_by_rva(std::uint32_t rva) const {
     const auto comp = compiland_for_rva(rva);
     if (comp) {
+        // The contributing compiland is the only candidate; nothing else is loaded for this lookup.
         if (auto r = impl_->ensure_compiland(*comp); !r) {
-            return r.error();
+            CML_LOG(Debug, "cml_pdb: find_proc_by_rva(0x%X): owning compiland %u skipped: %s", rva, *comp, r.error().format().c_str());
+            return std::optional<SymbolView>();
         }
         const ModuleSymbols& ms = *impl_->module(*comp);
         std::uint32_t index = 0;
         if (const SymRec* s = proc_containing(ms, impl_->sections, rva, index)) {
             return std::optional<SymbolView>(view_of(*impl_, *s, ms.pool.data(), *comp, index, &ms));
         }
+        return std::optional<SymbolView>();
     }
-    // Fallback (no contribution covers rva, or the contributing compiland has no such proc, e.g.
-    // after identical COMDAT folding): search every compiland.
-    if (auto r = load_all(); !r) {
-        return r.error();
+    if (!impl_->contributions.empty()) {
+        return std::optional<SymbolView>();  // contributions exist and none covers rva
     }
+    // The PDB has no section contributions: search every compiland, skipping corrupt ones (their
+    // errors stay available through compiland_error()).
+    (void)load_all();
     for (std::uint32_t i = 0; i < impl_->compilands.size(); ++i) {
+        if (!compiland_loaded(i)) {
+            continue;
+        }
         const ModuleSymbols* ms = impl_->module(i);
         std::uint32_t index = 0;
-        if (ms != nullptr) {
-            if (const SymRec* s = proc_containing(*ms, impl_->sections, rva, index)) {
-                return std::optional<SymbolView>(view_of(*impl_, *s, ms->pool.data(), i, index, ms));
-            }
+        if (const SymRec* s = proc_containing(*ms, impl_->sections, rva, index)) {
+            return std::optional<SymbolView>(view_of(*impl_, *s, ms->pool.data(), i, index, ms));
         }
     }
     return std::optional<SymbolView>();
@@ -819,26 +890,37 @@ Result<void> PdbIndex::load_compiland(std::uint32_t ci) const {
     return impl_->ensure_compiland(ci);
 }
 
+bool PdbIndex::compiland_loaded(std::uint32_t ci) const noexcept {
+    return ci < impl_->compilands.size() &&
+           impl_->module_state[ci].load(std::memory_order_acquire) == static_cast<std::uint8_t>(LazyState::Ready);
+}
+
+std::optional<Diag> PdbIndex::compiland_error(std::uint32_t ci) const {
+    if (ci >= impl_->compilands.size() ||
+        impl_->module_state[ci].load(std::memory_order_acquire) != static_cast<std::uint8_t>(LazyState::Failed)) {
+        return std::nullopt;
+    }
+    return impl_->module_errors[ci];
+}
+
 Result<void> PdbIndex::load_all(unsigned threads) const {
     const auto t0 = Clock::now();
     const std::size_t n = impl_->compilands.size();
     if (threads == 0) {
         threads = impl_->options.threads;
     }
-    std::atomic<bool> failed{false};
     std::mutex err_mutex;
     std::optional<Diag> first_error;
+    std::uint32_t first_error_index = 0xFFFFFFFFu;
     parallel_for(n, threads, [&](std::size_t i) {
-        if (failed.load(std::memory_order_relaxed)) {
-            return;
-        }
+        // Every compiland is attempted, whatever happens to the others.
         auto r = impl_->ensure_compiland(static_cast<std::uint32_t>(i));
         if (!r) {
             std::lock_guard<std::mutex> lock(err_mutex);
-            if (!first_error) {
-                first_error = r.error();
+            if (!first_error || static_cast<std::uint32_t>(i) < first_error_index) {
+                first_error = r.error();  // lowest failing index: deterministic
+                first_error_index = static_cast<std::uint32_t>(i);
             }
-            failed.store(true, std::memory_order_relaxed);
         }
     });
     impl_->load_all_ns.store(ns_since(t0), std::memory_order_relaxed);

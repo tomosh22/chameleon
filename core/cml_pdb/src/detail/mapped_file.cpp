@@ -1,9 +1,11 @@
 #include "detail/mapped_file.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
 #include "cml/pdb/diag_ids.h"
+#include "cml/pdb/index.h"
 #include "detail/counting.h"
 
 #if defined(_WIN32)
@@ -141,6 +143,40 @@ bool file_exists(const std::string& path_utf8) {
 #else
     struct stat st {};
     return ::stat(path_utf8.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+#endif
+}
+
+std::string canonical_file_path(const std::string& path_utf8) {
+#if defined(_WIN32)
+    const std::wstring wide = widen(path_utf8);
+    if (wide.empty()) {
+        return path_utf8;
+    }
+    std::wstring full(512, L'\0');
+    DWORD n = GetFullPathNameW(wide.c_str(), static_cast<DWORD>(full.size()), full.data(), nullptr);
+    if (n >= full.size()) {
+        full.assign(static_cast<std::size_t>(n) + 1, L'\0');
+        n = GetFullPathNameW(wide.c_str(), static_cast<DWORD>(full.size()), full.data(), nullptr);
+    }
+    if (n == 0 || n >= full.size()) {
+        return cml::pdb::normalize_path(path_utf8);
+    }
+    full.resize(n);
+    const int bytes = WideCharToMultiByte(CP_UTF8, 0, full.data(), static_cast<int>(full.size()), nullptr, 0, nullptr, nullptr);
+    if (bytes <= 0) {
+        return cml::pdb::normalize_path(path_utf8);
+    }
+    std::string utf8(static_cast<std::size_t>(bytes), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, full.data(), static_cast<int>(full.size()), utf8.data(), bytes, nullptr, nullptr);
+    return cml::pdb::normalize_path(utf8);
+#else
+    char* resolved = ::realpath(path_utf8.c_str(), nullptr);
+    if (resolved == nullptr) {
+        return path_utf8;
+    }
+    std::string out(resolved);
+    std::free(resolved);
+    return out;
 #endif
 }
 

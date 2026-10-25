@@ -26,7 +26,6 @@ double ms_since(Clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 }
 
-constexpr std::uint32_t kInfoStream = 1;
 constexpr std::uint32_t kDbiStream = 3;
 constexpr std::uint32_t kDbiHeaderSize = 64;
 constexpr std::uint32_t kModuleInfoFixed = 64;
@@ -182,16 +181,7 @@ Result<void> build_index(PdbIndex::Impl& impl) {
     const auto t_total = Clock::now();
     Msf& msf = *impl.msf;
 
-    // ---- PDB info stream: GUID and age ---------------------------------------------------
-    {
-        const StreamData info = msf.read_stream(kInfoStream);
-        if (info.size() < 28) {
-            return Diag::make(diag::kBadInfoStream, "The PDB info stream of " + file_label(impl) + " is missing or too short.",
-                              "Rebuild the module so the linker regenerates the PDB.");
-        }
-        impl.id.age = rd32(info.data() + 8);
-        std::memcpy(impl.id.guid.data(), info.data() + 12, 16);
-    }
+    // GUID and age come from probe_pdb(), which already read the info stream: impl.id is set.
 
     // ---- DBI header -----------------------------------------------------------------------
     auto t = Clock::now();
@@ -343,6 +333,11 @@ Result<void> build_index(PdbIndex::Impl& impl) {
     // ---- Source info: per-compiland file lists and the inverted file map -----------------
     t = Clock::now();
     impl.compiland_file_start.assign(module_count + 1, 0);
+    // file_count describes what compiland_files() returns: the module record's own count is only a
+    // hint, and modules the source-info table does not cover have no list.
+    for (Compiland& c : impl.compilands) {
+        c.file_count = 0;
+    }
     if (fileinfo_size >= 4) {
         const std::uint8_t* fi = dbi + fileinfo_off;
         const std::uint32_t fi_modules = rd16(fi);
@@ -383,7 +378,11 @@ Result<void> build_index(PdbIndex::Impl& impl) {
                 continue;
             }
             const std::uint32_t count = rd16(fi + counts_off + static_cast<std::uint64_t>(m) * 2);
-            const std::optional<std::string_view> cwd = impl.compilands[m].cwd();
+            // Relative names resolve against the compiland's cwd: S_ENVBLOCK's, else (clang-cl and cl
+            // record only S_BUILDINFO) the one in S_BUILDINFO, which is looked up on first need.
+            const std::optional<std::string_view> env_cwd = impl.compilands[m].cwd();
+            std::optional<std::string> info_cwd;
+            bool info_cwd_tried = false;
             for (std::uint32_t k = 0; k < count; ++k, ++cursor) {
                 const std::uint32_t name_off = rd32(fi + names_ptr_off + cursor * 4);
                 if (name_off >= impl.source_names_len) {
@@ -405,7 +404,21 @@ Result<void> build_index(PdbIndex::Impl& impl) {
                 if (found != by_offset.end()) {
                     entry_id = found->second;
                 } else {
-                    const std::string norm = normalize_path(raw, cwd ? *cwd : std::string_view());
+                    std::string_view use_cwd;
+                    if (!absolute) {
+                        if (env_cwd) {
+                            use_cwd = *env_cwd;
+                        } else {
+                            if (!info_cwd_tried) {
+                                info_cwd_tried = true;
+                                info_cwd = buildinfo_cwd(impl, m);
+                            }
+                            if (info_cwd) {
+                                use_cwd = *info_cwd;
+                            }
+                        }
+                    }
+                    const std::string norm = normalize_path(raw, use_cwd);
                     if (impl.file_pool.size() + norm.size() >= 0xFFFFFFF0u || impl.file_entries.size() >= 0xFFFFFFF0u) {
                         return Diag::make(diag::kCapacityExceeded, "The file table of " + file_label(impl) + " exceeds 4 GiB.",
                                           "This PDB is too large for the index.");

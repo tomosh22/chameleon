@@ -37,6 +37,25 @@ void strip_extended_prefix(std::string& s) {
     }
 }
 
+// "\\server\share" of a UNC path (without anything below it); "" when `base` is not UNC.
+std::string unc_root(const std::string& base) {
+    if (base.size() < 2 || base[0] != '\\' || base[1] != '\\') {
+        return std::string();
+    }
+    std::size_t pos = 2;
+    std::string root = "\\\\";
+    for (int part = 0; part < 2 && pos <= base.size(); ++part) {
+        const std::size_t end = base.find('\\', pos);
+        const std::size_t stop = end == std::string::npos ? base.size() : end;
+        if (stop == pos) {
+            break;
+        }
+        root += (part == 0 ? "" : "\\") + base.substr(pos, stop - pos);
+        pos = stop + 1;
+    }
+    return root;
+}
+
 }  // namespace
 
 bool is_absolute_path(std::string_view path) noexcept {
@@ -54,9 +73,12 @@ std::string normalize_path(std::string_view path, std::string_view cwd) {
         std::string base = with_backslashes(cwd);
         strip_extended_prefix(base);
         if (is_absolute_path(base)) {
-            // A rooted path ("\foo") keeps the cwd's drive; a drive-relative one ("c:foo") is left alone.
+            // A rooted path ("\foo") keeps the cwd's drive, or the cwd's UNC server and share; a
+            // drive-relative one ("c:foo") is left alone.
             if (!s.empty() && s[0] == '\\' && has_drive(base)) {
                 s = base.substr(0, 2) + s;
+            } else if (!s.empty() && s[0] == '\\') {
+                s = unc_root(base) + s;
             } else if (!has_drive(s)) {
                 s = base + "\\" + s;
             }
@@ -92,7 +114,9 @@ std::string normalize_path(std::string_view path, std::string_view cwd) {
             continue;
         }
         if (seg == "..") {
-            if (!segments.empty() && segments.back() != "..") {
+            // The server and share of a UNC path are its root: ".." stops there.
+            const std::size_t fixed = prefix == "\\\\" ? 2 : 0;
+            if (segments.size() > fixed && segments.back() != "..") {
                 segments.pop_back();
             } else if (!anchored) {
                 segments.push_back(seg);
