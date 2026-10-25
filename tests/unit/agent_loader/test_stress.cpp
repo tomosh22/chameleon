@@ -263,6 +263,7 @@ TEST_CASE("failure injection: a thief thread that works concurrently with the re
             if (cursor >= block.end()) {
                 cursor = block.base;
             }
+            Sleep(0);  // yield: a thief that never lets go would make every load collide
         }
     });
     unsigned loaded = 0;
