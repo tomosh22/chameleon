@@ -87,6 +87,13 @@ struct AnchorOptions {
     // The compiler's original file bytes, for the default tag (avoids serialising the model just to
     // hash it). Ignored when `tag` is set.
     ByteSpan object_bytes;
+    // 1-based indices of ASSOCIATIVE COMDAT sections that must get a locator after all (WP-07 evidence:
+    // cl's EH funclets live in `.text$x` associative sections and reference bound statics, e.g. the
+    // guard variable `$TSS0`, so their relocations must be retargeted). Such a section is located like
+    // any other COMDAT (external leader, else an external anchor). Ask only for the sections the bind
+    // plan lists (BindPlan::associative_locator_sections): if the PARENT COMDAT is discarded as a
+    // duplicate by the linker, an anchor inside the child is left undefined (lld-link: error).
+    std::vector<std::uint32_t> anchor_associative;
 };
 
 // True when the section is linked into the image (see the rules above).

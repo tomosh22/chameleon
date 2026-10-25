@@ -1,0 +1,14 @@
+{
+  "fixture": "new_function",
+  "edit": "add_helper.edit (logic.cpp)",
+  "exact_hooks": true,
+  "min_new_functions": 1,
+  "expect": [
+    { "symbol": "compute_value", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol": "new_helper", "decision": "patch-new-function" }
+  ],
+  "absent": [
+    { "symbol": "new_helper", "decision": "patch-hooked" },
+    { "symbol": "new_helper", "decision": "bind-old-function" }
+  ]
+}

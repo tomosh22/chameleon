@@ -1,0 +1,14 @@
+{
+  "fixture": "lambdas",
+  "edit": "lambda_times_10.edit (lambdas.cpp)",
+  "min_hooks": 3,
+  "expect": [
+    { "symbol": "lambdas_init", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol": "lambdas_value", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol_contains": "lambdas_init::<lambda_", "decision": "patch-hooked" },
+    { "symbol": "(anonymous namespace)::g_fn", "decision": "bind-old-data", "source": "compiland-static" }
+  ],
+  "absent": [
+    { "symbol": "(anonymous namespace)::g_fn", "decision": "patch-new-data" }
+  ]
+}

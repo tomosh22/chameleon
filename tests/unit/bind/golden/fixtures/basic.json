@@ -1,0 +1,16 @@
+{
+  "fixture": "basic",
+  "edit": "value_2.edit (logic.cpp)",
+  "exact_hooks": true,
+  "min_thunks": 1,
+  "min_bind_old_data": 1,
+  "min_fixups": 2,
+  "expect": [
+    { "symbol": "compute_value", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol": "g_tick", "decision": "bind-old-data", "source": "pdb-public" },
+    { "symbol": "fixture_note", "decision": "bind-old-function", "source": "pdb-public" }
+  ],
+  "absent": [
+    { "symbol": "compute_value", "decision": "patch-new-function" }
+  ]
+}
