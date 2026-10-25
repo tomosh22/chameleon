@@ -76,6 +76,17 @@ public:
     // consumed and reported as IoStatus::Rejected so the caller can log it and carry on.
     Result<Received> receive(std::uint32_t timeout_ms, void* wake_event = nullptr);
 
+    // Raw byte-stream access for protocols that are not frame based (the control pipe, WP-13). A
+    // connection is used either with send()/receive() or with these two, never both. Same
+    // threading, timeout and cancel rules as above.
+    //   send_bytes: writes all `size` bytes (Ok, Timeout, Closed, Cancelled; a Timeout leaves the
+    //               stream unusable, as for send()).
+    //   receive_some: appends whatever arrives (at least one byte) to `out` and returns Ok; Timeout,
+    //               Woken, Closed or Cancelled otherwise. Data completed after a Timeout is
+    //               delivered by the next call.
+    Result<IoStatus> send_bytes(const void* data, std::size_t size, std::uint32_t timeout_ms);
+    Result<IoStatus> receive_some(std::string& out, std::uint32_t timeout_ms, void* wake_event = nullptr);
+
     void cancel() noexcept;
     void close() noexcept;
 

@@ -118,6 +118,9 @@ struct PipeConnection::Impl {
     std::vector<std::uint8_t> payload;
     std::size_t payload_have = 0;
 
+    // Raw mode (receive_some): the buffer a pending read writes into; it must outlive a timeout.
+    std::uint8_t raw_buffer[4096];
+
     Impl() {
         std::memset(&read_ov, 0, sizeof(read_ov));
         std::memset(&write_ov, 0, sizeof(write_ov));
@@ -193,6 +196,23 @@ Result<IoStatus> PipeConnection::send(const Message& message, std::uint32_t time
     if (!is_open()) {
         return IoStatus::Closed;
     }
+    if (impl_->write_broken) {
+        return IoStatus::Closed;
+    }
+    if (signalled(impl_->cancel_event)) {
+        return IoStatus::Cancelled;
+    }
+    Result<std::vector<std::uint8_t>> frame = encode_frame(message);
+    if (!frame) {
+        return frame.error();
+    }
+    return send_bytes(frame->data(), frame->size(), timeout_ms);
+}
+
+Result<IoStatus> PipeConnection::send_bytes(const void* data, std::size_t size, std::uint32_t timeout_ms) {
+    if (!is_open()) {
+        return IoStatus::Closed;
+    }
     Impl& s = *impl_;
     if (s.write_broken) {
         return IoStatus::Closed;
@@ -200,19 +220,15 @@ Result<IoStatus> PipeConnection::send(const Message& message, std::uint32_t time
     if (signalled(s.cancel_event)) {
         return IoStatus::Cancelled;
     }
-    Result<std::vector<std::uint8_t>> frame = encode_frame(message);
-    if (!frame) {
-        return frame.error();
-    }
-    const std::vector<std::uint8_t>& bytes = *frame;
+    const auto* bytes = static_cast<const std::uint8_t*>(data);
     const ULONGLONG deadline = deadline_after(timeout_ms);
     std::size_t offset = 0;
-    while (offset < bytes.size()) {
+    while (offset < size) {
         ResetEvent(s.write_event);
         std::memset(&s.write_ov, 0, sizeof(s.write_ov));
         s.write_ov.hEvent = s.write_event;
-        const auto chunk = static_cast<DWORD>(std::min<std::size_t>(bytes.size() - offset, 1u << 20));
-        const BOOL started = WriteFile(s.pipe, bytes.data() + offset, chunk, nullptr, &s.write_ov);
+        const auto chunk = static_cast<DWORD>(std::min<std::size_t>(size - offset, 1u << 20));
+        const BOOL started = WriteFile(s.pipe, bytes + offset, chunk, nullptr, &s.write_ov);
         if (!started) {
             const DWORD error = GetLastError();
             if (error != ERROR_IO_PENDING) {
@@ -245,7 +261,7 @@ Result<IoStatus> PipeConnection::send(const Message& message, std::uint32_t time
         DWORD written = 0;
         if (GetOverlappedResult(s.pipe, &s.write_ov, &written, TRUE)) {
             offset += written;
-            if (offset == bytes.size()) {
+            if (offset == size) {
                 return IoStatus::Ok;
             }
         }
@@ -378,6 +394,71 @@ Result<PipeConnection::Received> PipeConnection::receive(std::uint32_t timeout_m
             out.message = std::move(*message);
             return out;
         }
+    }
+}
+
+Result<IoStatus> PipeConnection::receive_some(std::string& out, std::uint32_t timeout_ms, void* wake_event) {
+    if (!is_open()) {
+        return IoStatus::Closed;
+    }
+    Impl& s = *impl_;
+    const ULONGLONG deadline = deadline_after(timeout_ms);
+    for (;;) {
+        if (s.peer_closed) {
+            return IoStatus::Closed;
+        }
+        if (signalled(s.cancel_event)) {
+            return IoStatus::Cancelled;
+        }
+        if (!s.read_pending) {
+            ResetEvent(s.read_event);
+            std::memset(&s.read_ov, 0, sizeof(s.read_ov));
+            s.read_ov.hEvent = s.read_event;
+            const BOOL started =
+                ReadFile(s.pipe, s.raw_buffer, static_cast<DWORD>(sizeof(s.raw_buffer)), nullptr, &s.read_ov);
+            if (!started) {
+                const DWORD error = GetLastError();
+                if (error != ERROR_IO_PENDING) {
+                    if (is_peer_gone(error)) {
+                        s.peer_closed = true;
+                        return IoStatus::Closed;
+                    }
+                    return io_diag("reading from the pipe", error);
+                }
+            }
+            s.read_pending = true;
+        }
+        HANDLE waits[3] = {s.read_event, s.cancel_event, static_cast<HANDLE>(wake_event)};
+        const DWORD count = wake_event != nullptr ? 3 : 2;
+        const DWORD w = WaitForMultipleObjects(count, waits, FALSE, remaining_ms(timeout_ms, deadline));
+        if (w == WAIT_TIMEOUT) {
+            return IoStatus::Timeout;
+        }
+        if (w == WAIT_OBJECT_0 + 1) {
+            return IoStatus::Cancelled;
+        }
+        if (w == WAIT_OBJECT_0 + 2) {
+            return IoStatus::Woken;
+        }
+        if (w != WAIT_OBJECT_0) {
+            return io_diag("waiting for pipe data", GetLastError());
+        }
+        DWORD got = 0;
+        const BOOL done = GetOverlappedResult(s.pipe, &s.read_ov, &got, FALSE);
+        s.read_pending = false;
+        if (!done) {
+            const DWORD error = GetLastError();
+            if (is_peer_gone(error)) {
+                s.peer_closed = true;
+                return IoStatus::Closed;
+            }
+            return io_diag("reading from the pipe", error);
+        }
+        if (got == 0) {
+            continue;  // a zero-length write by the peer; wait again
+        }
+        out.append(reinterpret_cast<const char*>(s.raw_buffer), got);
+        return IoStatus::Ok;
     }
 }
 

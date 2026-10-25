@@ -1,0 +1,40 @@
+# Scenario `basic`: build fixture `basic` from a scratch copy, run it with the agent against a
+# headless broker (with a control pipe), check its output and its registration with the broker,
+# patch the COPY of the sources and reload.
+#
+# The reload half needs the broker pipeline of WP-12. Until the broker advertises the `reload`
+# capability, cmltest reports `reload` and every later step as SKIPPED (not passed) and the run as
+# PARTIAL; WP-12 switches CI to --require-all-capabilities, which turns that into a failure.
+name = "basic"
+description = "fixture basic: value=1 -> edit -> reload -> value=2"
+fixture = "basic"
+timeout_s = 120
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1"
+within_s = 10
+
+# `status` over the control pipe lists the fixture process with its own module enabled (the
+# fixture's --agent mode calls EnableModule on itself).
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_basic.exe"
+within_s = 10
+
+# Applied to the scratch copy of tests/fixtures/basic, never to the repository.
+[[step]]
+kind = "edit"
+patch = "edits/value_2.edit"
+
+[[step]]
+kind = "reload"
+within_s = 60
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2"
+within_s = 10
