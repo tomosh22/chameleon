@@ -14,9 +14,9 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-06 | cml_coff writer: anchors and binding object | 2 | done | wp/06-coff-writer | #11 | — |
 | WP-13 | Test harness cmltest | 2 | done (partial scenario per ADR-0022 until WP-12) | wp/13-cmltest | #12 | — |
 | WP-07 | Bind planner | 3 | in progress | wp/07-bind-planner | — | — |
-| WP-08 | Address-space reservation and patch loading (agent) | 3 | in review (7 high-effort findings) | wp/08-agent-loading | #18 | — |
+| WP-08 | Address-space reservation and patch loading (agent) | 3 | done | wp/08-agent-loading | #18 | — |
 | WP-09 | Linker driver (Q2 settled: ADR-0027) | 3 | done | wp/09-linker-driver | #17 | — |
-| WP-10 | Hook installer (agent) | 3 | in progress | wp/10-hook-installer | — | — |
+| WP-10 | Hook installer (agent) | 3 | in review (high effort: 8 findings) | wp/10-hook-installer | #20 | — |
 | WP-12 | Broker core (orchestrator integration) | 4 | todo | — | — | wave 3 |
 
 ## Orchestrator integration work
