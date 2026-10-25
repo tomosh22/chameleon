@@ -22,4 +22,4 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 |---|---|---|
 | Housekeeping docs (DECISIONS, KNOWN_LIMITATIONS, PROGRESS) | done | #1 |
 | Shared fixture `basic` + `cml_add_fixture`; flaky log test fix | done | #3 |
-| Make `extras.cpp` opaque so constructs survive clang-cl /O2 (WP-02 note) | todo, after wave 1 merges | — |
+| Make `extras.cpp` opaque so constructs survive clang-cl /O2 (WP-02 note) | in review | #8 |
