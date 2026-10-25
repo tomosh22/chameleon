@@ -19,6 +19,7 @@
 #include "cml/util/log.h"
 #include "cml/util/path.h"
 #include "hook/installer.h"
+#include "loader/patch_loader.h"
 #include "module_diff.h"
 
 namespace cml::agent {
@@ -51,6 +52,11 @@ Result<std::vector<proc::ModuleInfo>> enumerate_loaded_modules() {
     if (g_enumeration_failures.load() > 0 && g_enumeration_failures.fetch_sub(1) > 0) {
         return Diag::make(ids::kModuleEnumFailed, "module enumeration failed (injected failure)",
                           "Test hook: set_enumeration_failures_for_testing.");
+    }
+    // Patch DLLs loaded by the WP-08 loader are not application modules: never report them. The
+    // snapshot is taken under the loader's lock so it cannot race a patch load or unload.
+    if (loader::PatchLoader* patch_loader = loader::PatchLoader::shared_if_created()) {
+        return patch_loader->enumerate_modules_without_patches();
     }
     return proc::enumerate_modules(0);
 }
@@ -909,9 +915,31 @@ void Agent::serve(ipc::PipeConnection& connection) {
         }
         switch (received->status) {
             case ipc::IoStatus::Ok:
+                if (loader::PatchLoader::is_loader_request(received->message)) {
+                    // WP-08: address space and patch loading. Runs on the agent thread; the answer
+                    // (PatchLoaded / ReserveRange / Reply) is sent when the work is done.
+                    CML_LOG(Debug, "<- %s", ipc::describe(received->message).c_str());
+                    if (!send_message(connection, loader::PatchLoader::shared().handle_request(received->message))) {
+                        return;
+                    }
+                    break;
+                }
                 handle_message(received->message);
                 break;
             case ipc::IoStatus::Rejected:
+                // A broker request whose payload we cannot decode is answered with an error Reply,
+                // so the broker is not left waiting (WP-08 requests; the broker owns the ids).
+                if (received->is_request && received->request_id.has_value()) {
+                    ipc::Reply refusal;
+                    refusal.request_id = *received->request_id;
+                    refusal.status = received->error.code;
+                    refusal.message = ipc::sanitize_utf8(received->error.format(), 512);
+                    if (!send_message(connection, refusal)) {
+                        return;
+                    }
+                    CML_LOG(Warn, "refused an undecodable request from the broker: %s", received->error.format().c_str());
+                    break;
+                }
                 // An answer we cannot decode would leave its request waiting for ever (and hold an
                 // in-flight slot): drop the connection, which fails everything in flight and
                 // reconnects. Anything else (a stray event) can be skipped.

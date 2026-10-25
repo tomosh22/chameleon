@@ -53,15 +53,16 @@ enum class MessageType : std::uint16_t {
     ModuleLoaded = 0x0013,    // implemented  agent -> broker (event)
     ModuleUnloaded = 0x0014,  // implemented  agent -> broker (event)
 
-    // Address space (later work packages).
-    ReserveRange = 0x0020,
-    ReleaseRange = 0x0021,
+    // Address space (WP-08).
+    ReserveRange = 0x0020,  // implemented  broker -> agent (request, answered by ReserveRangeResult)
+    ReleaseRange = 0x0021,  // implemented  broker -> agent (request, answered by Reply)
+    ReserveRangeResult = 0x0022,  // implemented  agent -> broker (answer to ReserveRange; appended, ids above are unchanged)
 
-    // Patch pipeline (later work packages).
-    LoadPatch = 0x0030,
-    PatchLoaded = 0x0031,
-    ApplyFixups = 0x0032,
-    RunInitializers = 0x0033,
+    // Patch pipeline (WP-08).
+    LoadPatch = 0x0030,         // implemented  broker -> agent (request, answered by PatchLoaded)
+    PatchLoaded = 0x0031,       // implemented  agent -> broker (answer to LoadPatch)
+    ApplyFixups = 0x0032,       // implemented  broker -> agent (request, answered by Reply)
+    RunInitializers = 0x0033,   // implemented  broker -> agent (request, answered by Reply)
 
     // Hooks (WP-10) and synchronisation (later work package).
     InstallHooks = 0x0040,    // implemented  broker -> agent (request, answered by HooksInstalled)
@@ -198,8 +199,123 @@ struct HooksInstalled {
     std::vector<HookResult> results;  // one per hook, in request order
 };
 
+// --- address space and patch loading (WP-08) ---------------------------------------------------
+//
+// All of these are broker -> agent requests; ids are chosen by the broker. The agent answers
+// LoadPatch with PatchLoaded and ReserveRange with ReserveRangeResult (both carry
+// status 0 or a CML42xx id, so a refusal still says why); everything else is answered with Reply.
+// A request whose payload cannot be decoded is answered with Reply (CML5201..5203).
+
+inline constexpr std::uint32_t kMaxFixupsPerMessage = 60000;   // 16 bytes each: fits the 1 MiB frame
+inline constexpr std::uint32_t kMaxInitializersPerMessage = 16384;
+inline constexpr std::uint32_t kMaxLoadCandidates = 5;         // plan section 4.7: retry up to 5 times
+inline constexpr std::uint32_t kMaxReservedBlocks = 64;
+
+// One fix-up: a place in the patch image (RVA) and what to write there. ADR-0025: the broker reads
+// the in-place addend and sends the ABSOLUTE target (symbol + addend) in `value`; the agent
+// computes the REL32 displacement itself, so it can range-check it against the real site address:
+//   Rel32     writes int32(value - (site_va + 4 + n)); n (0..5) is the number of immediate bytes
+//             that follow the displacement (REL32 .. REL32_5). Fails with CML4207 when it does not fit.
+//   Addr64    writes uint64(value) (8 bytes, no alignment required).
+//   SlotWrite writes uint64(value) atomically into an 8-byte-aligned thunk slot (__cml_slot_<name>).
+// ADDR32NB never reaches the agent: the broker rejects it (CML33xx).
+enum class FixupKind : std::uint8_t { Rel32 = 1, Addr64 = 2, SlotWrite = 3 };
+
+struct Fixup {
+    std::uint32_t rva = 0;  // site, relative to the patch image base
+    FixupKind kind = FixupKind::Addr64;
+    std::uint8_t n = 0;     // Rel32 only: 0..5; must be 0 for the other kinds
+    std::uint64_t value = 0;
+};
+
+// Wire layout of a Fixup: u32 rva, u8 kind, u8 n, u16 reserved(0), u64 value.
+inline constexpr std::uint32_t kFixupWireBytes = 16;
+
+// A way to place the patch: the DLL file, linked `/FIXED /BASE:image_base`, and its fix-ups (which
+// depend on the base, so they travel with the candidate). The agent tries candidates in order and
+// moves to the next one only when the range was taken by someone else between release and load.
+struct PatchCandidate {
+    std::string path;                // absolute path of the patch DLL, UTF-8
+    std::uint64_t image_base = 0;    // the /BASE the DLL was linked at; 64 KiB aligned
+    std::uint32_t image_size = 0;    // SizeOfImage of that DLL
+    std::vector<Fixup> fixups;       // applied in order, after the load
+};
+
+struct LoadPatch {
+    std::uint64_t request_id = 0;
+    std::uint64_t patch_id = 0;      // broker's handle, echoed in PatchLoaded
+    std::uint32_t flags = 0;         // reserved, must be 0
+    std::vector<PatchCandidate> candidates;       // 1..kMaxLoadCandidates
+    std::vector<std::uint32_t> initializer_rvas;  // RVAs of .CRT$XCU entries, run in this order
+};
+
+struct PatchLoaded {
+    std::uint64_t request_id = 0;
+    std::uint64_t patch_id = 0;
+    std::uint32_t status = 0;        // 0 or the CML42xx id
+    std::string message;
+    std::uint64_t image_base = 0;    // where it was loaded (0 on failure)
+    std::uint32_t image_size = 0;
+    std::uint32_t candidate_index = 0;  // which candidate (0-based) was loaded
+    std::uint32_t attempts = 0;         // load attempts made, including the successful one
+    std::uint32_t fixups_applied = 0;
+    std::uint32_t initializers_run = 0;
+};
+
+struct ApplyFixups {
+    std::uint64_t request_id = 0;
+    std::uint64_t image_base = 0;    // base of a patch loaded by LoadPatch
+    std::vector<Fixup> fixups;
+};
+
+struct RunInitializers {
+    std::uint64_t request_id = 0;
+    std::uint64_t image_base = 0;
+    std::vector<std::uint32_t> rvas;
+};
+
+struct AddressBlock {
+    std::uint64_t base = 0;
+    std::uint64_t size = 0;
+};
+
+// Reserve up to `block_count` blocks of `block_size` bytes inside the window around
+// [module_base, module_base + module_size) that keeps every REL32 between module and block in
+// range (and within `reach` of the module).
+struct ReserveRange {
+    std::uint64_t request_id = 0;
+    std::uint64_t module_base = 0;
+    std::uint64_t module_size = 0;
+    std::uint64_t block_size = 64ull << 20;
+    std::uint64_t reach = 1536ull << 20;
+    std::uint32_t block_count = 4;
+};
+
+// The answer to ReserveRange: status 0 or a CML42xx id, and the blocks actually reserved (fewer
+// than asked is still status 0; none is CML4201).
+struct ReserveRangeResult {
+    std::uint64_t request_id = 0;
+    std::uint32_t status = 0;
+    std::string message;
+    std::vector<AddressBlock> blocks;
+};
+
+enum class ReleaseMode : std::uint32_t {
+    Free = 0,         // give [base, base+size) of reserved address space back to the OS
+    UnloadPatch = 1,  // FreeLibrary the patch loaded at `base` and return its range to the reserved state
+};
+
+struct ReleaseRange {
+    std::uint64_t request_id = 0;
+    std::uint64_t base = 0;
+    std::uint64_t size = 0;  // Free: the extent; UnloadPatch: ignored (0)
+    ReleaseMode mode = ReleaseMode::Free;
+};
+
 using Message = std::variant<Hello, Welcome, ModuleList, EnableModule, DisableModule, ModuleLoaded,
-                             ModuleUnloaded, Log, Reply, InstallHooks, HooksInstalled>;
+                             ModuleUnloaded, Log, Reply, ReserveRange, ReleaseRange, LoadPatch,
+                             PatchLoaded, ApplyFixups, RunInitializers, ReserveRangeResult, InstallHooks,
+                             HooksInstalled>;
 
 MessageType type_of(const Message& message) noexcept;
 
@@ -230,13 +346,13 @@ Result<Message> decode_message(std::uint16_t type, std::uint16_t version, const 
 Result<Message> decode_frame(const std::uint8_t* frame, std::size_t size);
 
 // True for the message types that expect an answer (Hello, ModuleList, EnableModule,
-// DisableModule, InstallHooks). Takes the raw wire value, so it also works for frames that failed
-// to decode.
+// DisableModule, InstallHooks, and the WP-08 requests ReserveRange, ReleaseRange, LoadPatch, ApplyFixups,
+// RunInitializers). Takes the raw wire value, so it also works for frames that failed to decode.
 bool is_request_type(std::uint16_t type) noexcept;
 
 // The request id of a frame whose payload may be malformed: every type whose payload starts with a
-// request id (Hello, Welcome, Reply, ModuleList, EnableModule, DisableModule, InstallHooks,
-// HooksInstalled) carries it in the
+// request id (Hello, Welcome, Reply, ModuleList, EnableModule, DisableModule, InstallHooks, HooksInstalled and the WP-08 types)
+// carries it in the
 // first 8 bytes. nullopt for other types or when fewer than 8 bytes are present. Used to answer
 // a request that arrived with a bad payload instead of leaving its sender waiting.
 std::optional<std::uint64_t> peek_request_id(std::uint16_t type, const std::uint8_t* payload,

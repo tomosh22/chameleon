@@ -21,7 +21,10 @@ set(CML_AGENT_WINDOWS_SOURCES
     src/heap.cpp
     src/hook/thread_set.cpp
     src/hook/installer.cpp
-    src/hook/dispatch.cpp)
+    src/hook/dispatch.cpp
+    # WP-08: address-space reservation and patch loading
+    src/loader/image_writer.cpp
+    src/loader/patch_loader.cpp)
 
 add_library(cml_agent_core STATIC ${CML_AGENT_PORTABLE_SOURCES} ${CML_AGENT_WINDOWS_SOURCES})
 target_include_directories(cml_agent_core
