@@ -724,6 +724,8 @@ void run_set(const SetSpec& spec) {
             std::size_t in_module = 0;
             std::size_t contrib_total = 0;
             std::size_t contrib_match = 0;
+            std::size_t contrib_total_nopdata = 0;  // same, without .pdata (link.exe records no contribution for it)
+            std::size_t contrib_match_nopdata = 0;
             std::size_t comdat_missing = 0;
             std::size_t plain_missing = 0;
             std::unordered_map<std::uint64_t, std::uint32_t> contribs;  // (compiland << 32 | rva) -> size
@@ -761,9 +763,12 @@ void run_set(const SetSpec& spec) {
                     ++in_publics;
                     if (sec != nullptr && sec->size_of_raw_data != 0 && !compilands.empty()) {
                         ++contrib_total;
+                        const bool is_pdata = sec->name == ".pdata";
+                        contrib_total_nopdata += is_pdata ? 0 : 1;
                         const auto c = contribs.find((static_cast<std::uint64_t>(compilands.front()) << 32) | it->second);
                         if (c != contribs.end() && c->second == sec->size_of_raw_data) {
                             ++contrib_match;
+                            contrib_match_nopdata += is_pdata ? 0 : 1;
                         } else if (unmatched_shown < 6) {
                             ++unmatched_shown;
                             // What the PDB has around that address, to see why the contribution does not match.
@@ -798,10 +803,10 @@ void run_set(const SetSpec& spec) {
             }
             evidence("set=%s linker=%s anchors=%s | link ok, bound=%zu (%zu functions) | layout_identical=%s code_identical=%s whole_image_identical=%s "
                      "differing_data_sections=[%s] outside_debug_info_bytes_differing=%zu(first in %s) | anchors_expected=%zu in_pdb_publics=%zu in_pdb_module_symbols=%zu comdat_anchors_missing=%zu "
-                     "other_anchors_missing=%zu section_contributions_matching_anchor_rva=%zu/%zu",
+                     "other_anchors_missing=%zu section_contributions_matching_anchor_rva=%zu/%zu (without .pdata %zu/%zu)",
                      spec.name.c_str(), lk.label.c_str(), vname, bind.size(), bind_functions, diff.layout_equal ? "yes" : "NO",
                      diff.code_equal ? "yes" : "NO", diff.whole_equal ? "yes" : "no", joined.c_str(),
-                     diff.bytes_differing_outside_debug_info, diff.first_difference_in.c_str(), expected, in_publics, in_module, comdat_missing, plain_missing, contrib_match, contrib_total);
+                     diff.bytes_differing_outside_debug_info, diff.first_difference_in.c_str(), expected, in_publics, in_module, comdat_missing, plain_missing, contrib_match, contrib_total, contrib_match_nopdata, contrib_total_nopdata);
             pdb.index.reset();
             std::error_code ec;
             fs::remove(la.dll, ec);
