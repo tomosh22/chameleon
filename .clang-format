@@ -1,0 +1,13 @@
+# Style: LLVM-derived, 4-space indent, 100 columns, attached braces. Format with clang-format 15+.
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 100
+AccessModifierOffset: -4
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+PointerAlignment: Left
+SortIncludes: CaseSensitive
+IncludeBlocks: Regroup
+NamespaceIndentation: None
+FixNamespaceComments: true
