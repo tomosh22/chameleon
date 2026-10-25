@@ -17,7 +17,11 @@ namespace cml::core {
 
 struct ServerOptions {
     std::string pipe_name;                    // full \\.\pipe\ name
-    std::uint32_t exit_when_idle_ms = 0;      // 0 = never; else exit this long after the last agent left
+    // Full name of the control pipe (cml_ipc/control.h). Empty = no control pipe. When set, the pipe
+    // must be creatable: run() fails with the pipe's Diag otherwise. Control clients do not count
+    // as agents for the idle and startup timers.
+    std::string control_pipe_name;
+    std::uint32_t exit_when_idle_ms = 0;     // 0 = never; else exit this long after the last agent left
     std::uint32_t startup_timeout_ms = 0;     // 0 = never; else exit if no agent ever connected in time
     // Optional manual-reset event handle owned by the caller (never closed by the server). Setting
     // it stops the server, exactly like stop(); meant for signal handlers (Ctrl+C), which must not
