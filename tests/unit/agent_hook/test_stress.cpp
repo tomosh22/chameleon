@@ -25,6 +25,7 @@
 #include <thread>
 #include <vector>
 
+#include "crash_report.h"
 #include "doctest.h"
 #include "hook/diag_ids.h"
 #include "hook/installer.h"
@@ -108,24 +109,6 @@ LONG CALLBACK count_crashes(PEXCEPTION_POINTERS info) {
         default:
             break;
     }
-    return EXCEPTION_CONTINUE_SEARCH;
-}
-
-LONG WINAPI report_unhandled(PEXCEPTION_POINTERS info) {
-    HMODULE module = nullptr;
-    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       static_cast<LPCSTR>(info->ExceptionRecord->ExceptionAddress), &module);
-    char name[MAX_PATH] = "?";
-    if (module != nullptr) {
-        GetModuleFileNameA(module, name, MAX_PATH);
-    }
-    std::fprintf(stderr, "WP10-STRESS unhandled exception 0x%08lx at %p (%s + 0x%llx), thread %lu\n",
-                 static_cast<unsigned long>(info->ExceptionRecord->ExceptionCode), info->ExceptionRecord->ExceptionAddress,
-                 name,
-                 static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info->ExceptionRecord->ExceptionAddress) -
-                                                 reinterpret_cast<std::uintptr_t>(module)),
-                 static_cast<unsigned long>(GetCurrentThreadId()));
-    std::fflush(stderr);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -241,7 +224,6 @@ TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy mul
         REQUIRE_MESSAGE(call_target(t.entry, argument) == expected(t, 0, argument), t.name);
     }
 
-    SetUnhandledExceptionFilter(&report_unhandled);  // stays installed: names a crash at process exit too
     void* const veh = AddVectoredExceptionHandler(1, &count_crashes);
     g_crashes = 0;
 

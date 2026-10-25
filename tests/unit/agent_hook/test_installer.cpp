@@ -14,6 +14,7 @@
 #include <thread>
 #include <vector>
 
+#include "crash_report.h"
 #include "doctest.h"
 #include "heap.h"
 #include "hook/diag_ids.h"
