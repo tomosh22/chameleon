@@ -24,3 +24,4 @@ to the fixture directory).
 |---|---|---|
 | `basic` | present | `logic.cpp` is the patch target (two externals: `g_tick`, `fixture_note`); `extras.cpp` covers COFF features for reader tests; edit `value_2.edit` changes the printed value 1 → 2 |
 | `c_only` | present (WP-11) | one C99 TU using the C API of `Chameleon_API.h`; `main.c` prints `TICK n=<k> value=7`; `--agent` creates the agent, enables its own module, calls the sync point every iteration |
+| `pch` | present (WP-05) | `target_precompile_headers(pch.h)`: a generated `/Yc` TU (`cmake_pch.cxx`) and two `/Yu` TUs (`main.cpp`, `logic.cpp`); `TICK n=<k> value=<v> base=100`; edits `value_2.edit` (TU change) and `pch_header.edit` (PCH header change, must be rejected). Used for the `/Zi` + `/Yu` recompile investigation in `docs/wp/WP-05.md` |

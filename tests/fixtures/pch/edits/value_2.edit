@@ -1,0 +1,9 @@
+--- a/logic.cpp
++++ b/logic.cpp
+@@ -14,5 +14,5 @@
+     // Uses types from the precompiled header so that the TU really depends on it.
+     const PchPoint p = {pch_base() - 99, 0};
+     const std::vector<int> values(static_cast<std::size_t>(p.x), p.y);
+-    return static_cast<int>(values.size());
++    return static_cast<int>(values.size()) + 1;
+ }
