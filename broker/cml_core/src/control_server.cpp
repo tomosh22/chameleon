@@ -15,36 +15,52 @@ std::vector<std::string> broker_capabilities() {
 
 namespace {
 
+std::size_t module_json_size(const RegisteredModule& module) {
+    ipc::json::Value value = ipc::json::Value::object();
+    value.set("path", ipc::json::Value::string(module.path));
+    value.set("enabled", ipc::json::Value::boolean(module.enabled));
+    return ipc::json::serialize(value).size() + 1;  // + the comma
+}
+
 ipc::json::Value status_result(const ControlContext& context) {
     ipc::StatusReport report;
     report.version = context.version;
     report.capabilities = broker_capabilities();
-    bool truncated = false;
+    report.control_pipe_healthy = context.pipe_healthy == nullptr || context.pipe_healthy->load();
+    // Fixed part of the response, with some slack for the per-process framing.
+    std::size_t used = 256 + report.version.size();
     if (context.registry != nullptr) {
+        constexpr std::size_t kProcessOverhead = 64;
+        bool full = false;
         for (const RegisteredProcess& process : context.registry->snapshot()) {
+            if (full || used + kProcessOverhead > kStatusByteBudget) {
+                report.truncated = true;  // this and the remaining processes do not fit
+                break;
+            }
+            used += kProcessOverhead;
             ipc::StatusProcess out;
             out.pid = process.pid;
-            // Enabled modules first so that the interesting ones survive the cap.
+            // Enabled modules first so that the interesting ones survive the cut.
             for (const bool want_enabled : {true, false}) {
                 for (const RegisteredModule& module : process.modules) {
-                    if (module.enabled != want_enabled) {
+                    if (module.enabled != want_enabled || out.modules_truncated) {
                         continue;
                     }
-                    if (out.modules.size() >= kMaxStatusModulesPerProcess) {
-                        truncated = true;
-                        break;
+                    const std::size_t size = module_json_size(module);
+                    if (out.modules.size() >= kMaxStatusModulesPerProcess || used + size > kStatusByteBudget) {
+                        out.modules_truncated = true;
+                        report.truncated = true;
+                        full = used + size > kStatusByteBudget;
+                        continue;
                     }
+                    used += size;
                     out.modules.push_back(ipc::StatusModule{module.path, module.enabled});
                 }
             }
             report.processes.push_back(std::move(out));
         }
     }
-    ipc::json::Value result = ipc::status_to_json(report);
-    if (truncated) {
-        result.set("modules_truncated", ipc::json::Value::boolean(true));
-    }
-    return result;
+    return ipc::status_to_json(report);
 }
 
 }  // namespace
@@ -119,6 +135,7 @@ Result<void> ControlServer::start() {
         return created.error();
     }
     pipe_ = std::move(*created);
+    context_.pipe_healthy = &healthy_;
     started_ = true;
     accept_thread_ = std::thread([this] { accept_loop(); });
     CML_LOG(Info, "control pipe listening on %s", pipe_name_.c_str());
@@ -146,19 +163,50 @@ void ControlServer::stop() noexcept {
     started_ = false;
 }
 
+namespace {
+std::atomic<int> g_injected_accept_failures{0};
+
+bool take_injected_failure() {
+    int n = g_injected_accept_failures.load();
+    while (n > 0) {
+        if (g_injected_accept_failures.compare_exchange_weak(n, n - 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+}  // namespace
+
+void ControlServer::set_accept_failures_for_testing(int count) {
+    g_injected_accept_failures.store(count);
+}
+
+// Never leaves the loop while the broker runs: a failed accept is logged at warn, the listening
+// instance is recreated, and accepting is retried with a growing pause (100 ms .. 2 s). `status`
+// reports control_pipe_healthy = false until an accept works again.
 void ControlServer::accept_loop() {
-    int consecutive_failures = 0;
+    constexpr std::uint32_t kMinBackoffMs = 100;
+    constexpr std::uint32_t kMaxBackoffMs = 2000;
+    std::uint32_t backoff_ms = kMinBackoffMs;
     while (!stopping_.load(std::memory_order_acquire)) {
-        Result<ipc::PipeServer::Accepted> accepted = pipe_.accept(kAcceptPollMs);
+        Result<ipc::PipeServer::Accepted> accepted =
+            take_injected_failure()
+                ? Result<ipc::PipeServer::Accepted>(Diag::make(ids::kPipeIoFailed, "accepting a control client failed (injected failure)",
+                                                               "Test hook: ControlServer::set_accept_failures_for_testing."))
+                : pipe_.accept(kAcceptPollMs);
         if (!accepted) {
-            CML_LOG(Error, "control pipe: %s", accepted.error().format().c_str());
-            if (++consecutive_failures >= 50) {
-                CML_LOG(Error, "control pipe: giving up after repeated accept failures");
-                return;
+            healthy_.store(false);
+            CML_LOG(Warn, "control pipe: %s; recreating the pipe instance and retrying in %u ms", accepted.error().format().c_str(), backoff_ms);
+            pipe_.refresh_instance();
+            for (std::uint32_t waited = 0; waited < backoff_ms && !stopping_.load(std::memory_order_acquire); waited += 20) {
+                Sleep(20);
             }
-            Sleep(100);
+            backoff_ms = std::min(backoff_ms * 2, kMaxBackoffMs);
         } else if (accepted->status == ipc::IoStatus::Ok) {
-            consecutive_failures = 0;
+            if (!healthy_.exchange(true)) {
+                CML_LOG(Info, "control pipe: accepting clients again");
+            }
+            backoff_ms = kMinBackoffMs;
             auto connection = std::make_unique<Connection>();
             connection->channel = ipc::ControlChannel(std::move(accepted->connection));
             CML_LOG(Info, "control client connected (pid %u)", connection->channel.peer_process_id());
@@ -167,6 +215,9 @@ void ControlServer::accept_loop() {
             connections_.push_back(std::move(connection));
         } else if (accepted->status == ipc::IoStatus::Cancelled) {
             return;
+        } else {
+            healthy_.store(true);  // a quiet poll timeout: the pipe works
+            backoff_ms = kMinBackoffMs;
         }
         // Reap finished connections.
         for (auto it = connections_.begin(); it != connections_.end();) {

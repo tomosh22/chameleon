@@ -277,9 +277,16 @@ json::Value status_to_json(const StatusReport& report) {
             modules.push(std::move(module));
         }
         process.set("modules", std::move(modules));
+        if (p.modules_truncated) {
+            process.set("modules_truncated", json::Value::boolean(true));
+        }
         processes.push(std::move(process));
     }
     out.set("processes", std::move(processes));
+    out.set("control_pipe_healthy", json::Value::boolean(report.control_pipe_healthy));
+    if (report.truncated) {
+        out.set("truncated", json::Value::boolean(true));
+    }
     return out;
 }
 
@@ -289,6 +296,8 @@ Result<StatusReport> status_from_json(const json::Value& result) {
     }
     StatusReport report;
     report.version = result.get_string("version");
+    report.truncated = result.get_bool("truncated", false);
+    report.control_pipe_healthy = result.get_bool("control_pipe_healthy", true);
     const json::Value* caps = result.find("capabilities");
     if (caps == nullptr || !caps->is_array()) {
         return response_invalid("status result needs a \"capabilities\" array");
@@ -312,6 +321,7 @@ Result<StatusReport> status_from_json(const json::Value& result) {
         }
         StatusProcess process;
         process.pid = static_cast<std::uint32_t>(pid->as_integer());
+        process.modules_truncated = p.get_bool("modules_truncated", false);
         for (const json::Value& m : modules->items()) {
             const json::Value* path = m.is_object() ? m.find("path") : nullptr;
             const json::Value* enabled = m.is_object() ? m.find("enabled") : nullptr;
@@ -405,19 +415,36 @@ Result<IoStatus> ControlChannel::send_line(std::string_view line, std::uint32_t 
 Result<ControlChannel::Line> ControlChannel::receive_line(std::uint32_t timeout_ms, void* wake_event) {
     const ULONGLONG deadline = deadline_after(timeout_ms);
     for (;;) {
-        const std::size_t newline = buffer_.find('\n');
+        // Linear: bytes already searched (scanned_) are never searched again, and consumed lines are
+        // dropped from the buffer in bulk (start_), not one erase per line.
+        const std::size_t from = scanned_ > start_ ? scanned_ : start_;
+        const std::size_t newline = buffer_.find('\n', from);
+        scan_work_ += (newline == std::string::npos ? buffer_.size() : newline + 1) - from;
         if (newline != std::string::npos) {
             Line out;
             out.status = IoStatus::Ok;
-            out.text = buffer_.substr(0, newline);
-            buffer_.erase(0, newline + 1);
+            out.text = buffer_.substr(start_, newline - start_);
+            start_ = newline + 1;
+            scanned_ = start_;
+            if (start_ == buffer_.size()) {
+                buffer_.clear();
+                start_ = 0;
+                scanned_ = 0;
+            } else if (start_ >= 65536 && start_ >= buffer_.size() / 2) {
+                buffer_.erase(0, start_);
+                start_ = 0;
+                scanned_ = 0;
+            }
             if (!out.text.empty() && out.text.back() == '\r') {
                 out.text.pop_back();
             }
             return out;
         }
-        if (buffer_.size() > kMaxControlLineBytes) {
+        scanned_ = buffer_.size();
+        if (buffer_.size() - start_ > kMaxControlLineBytes) {
             buffer_.clear();
+            start_ = 0;
+            scanned_ = 0;
             return Diag::make(ids::kControlLineTooLong, "a control message is longer than 1 MiB without a newline",
                               "Send one JSON object per line, each under 1 MiB.");
         }

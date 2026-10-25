@@ -42,7 +42,7 @@ public:
     const std::string& pattern() const { return pattern_; }
 
     struct Inst {
-        enum class Op : std::uint8_t { Char, Any, Class, Split, Jump, Bol, Eol, WordB, NotWordB, Match };
+        enum class Op : std::uint8_t { Char, Any, Class, Split, Jump, Mark, LoopBack, Bol, Eol, WordB, NotWordB, Match };
         Op op = Op::Match;
         char ch = 0;
         std::uint32_t x = 0;  // Class: index into classes_; Split/Jump: target
@@ -62,6 +62,7 @@ private:
     std::string pattern_;
     std::vector<Inst> program_;
     std::vector<ClassSet> classes_;
+    std::uint32_t slots_ = 0;  // loop registers used by Mark/LoopBack
     mutable bool budget_exceeded_ = false;
 };
 

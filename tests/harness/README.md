@@ -17,7 +17,8 @@ cmltest --scenario tests/harness/scenarios/basic.toml --build-dir build --genera
 | `--config Debug\|RelWithDebInfo` | fixture configuration |
 | `--cxx cl\|clang-cl\|PATH` | compiler for the fixture (looked up on `PATH`, or a full path such as CI's `CML_CXX`) |
 | `--junit FILE` | JUnit XML, one testcase per scenario, steps in `<system-out>` |
-| `--artifacts DIR` | logs, fixture stdout, dumps (default `<build-dir>/cmltest-artifacts/<scenario>-<generator>-<config>`) |
+| `--artifacts DIR` | base directory: cmltest creates `cmltest-<scenario>-<UTC timestamp>-p<pid>` inside it (marked with `.cmltest-artifacts`) for logs, fixture stdout and dumps; the base itself is never deleted or cleaned (default base `<build-dir>/cmltest-artifacts`) |
+| `--work-dir DIR` | scratch base, same rule; `--clean-work` deletes the scratch directory cmltest created after the run |
 | `--require-all-capabilities` | steps skipped for missing broker capabilities fail the run (WP-12 switches CI to this) |
 | `--repo-root`, `--broker`, `--agent-dir`, `--cmake`, `--work-dir`, `--vs-generator`, `--build-timeout-s` | locations and limits, see `--help` |
 | `--prebuilt-fixture EXE` | debugging aid: skip configure/build and run this fixture exe |

@@ -37,6 +37,9 @@ public:
     const std::string& command_line() const noexcept { return command_line_; }
     const std::vector<ipc::ModuleEntry>& modules() const noexcept { return modules_; }
     const std::vector<std::string>& enabled_modules() const noexcept { return enabled_; }
+    // Incremented whenever what a status report shows changes (handshake, module list, loaded/unloaded
+    // modules, enabled set). Messages that change none of that (Log, ...) leave it alone.
+    std::uint64_t revision() const noexcept { return revision_; }
 
     // Compares two module paths the way Windows would for display purposes: '/' equals '\',
     // a leading "\\?\" is ignored and ASCII letters compare case-insensitively.
@@ -53,6 +56,7 @@ private:
 
     std::uint64_t agent_id_;
     std::string broker_version_;
+    std::uint64_t revision_ = 0;
     bool handshaken_ = false;
     std::uint32_t pid_ = 0;
     std::string agent_path_;

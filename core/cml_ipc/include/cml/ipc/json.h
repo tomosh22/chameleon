@@ -24,7 +24,8 @@ namespace cml::ipc::json {
 inline constexpr std::size_t kMaxDocumentBytes = 1u << 20;   // 1 MiB
 inline constexpr std::size_t kMaxDepth = 32;
 inline constexpr std::size_t kMaxStringBytes = 256u * 1024u;
-inline constexpr std::size_t kMaxElements = 65536;           // per array / object
+inline constexpr std::size_t kMaxElements = 65536;           // per array
+inline constexpr std::size_t kMaxMembers = 4096;             // per object (control messages never need more)
 
 enum class Type { Null, Bool, Integer, Double, String, Array, Object };
 
@@ -64,6 +65,8 @@ public:
     const Value& value_at(std::size_t i) const noexcept { return values_[i]; }
     const Value* find(std::string_view key) const noexcept;  // nullptr when absent or not an object
     Value& set(std::string key, Value v);                    // no effect unless this is an object
+    // Appends without looking for an existing key (O(1)); the caller guarantees uniqueness (the parser).
+    Value& add_member(std::string key, Value v);
 
     // Typed lookups on objects; the fallback is returned when the key is missing or mistyped.
     std::string get_string(std::string_view key, const std::string& fallback = std::string()) const;

@@ -170,3 +170,24 @@ TEST_CASE("rx: catastrophic backtracking is cut off by the step budget instead o
     CHECK_FALSE(normal->search(big, 0, &m));
     CHECK_FALSE(normal->budget_exceeded());
 }
+
+TEST_CASE("rx: unbounded repeats of a body that can match the empty string terminate (review fix 1)") {
+    CHECK(find("(?:a*)*b", "b") == "b");
+    CHECK(find("(?:a*)*b", "xaab") == "aab");
+    CHECK(find("(a|)*b", "aab") == "aab");
+    CHECK(find("(?:)*x", "x") == "x");
+    CHECK(find("(?:a?)+$", "aa") == "aa");
+    CHECK(find("(?:a?)+?$", "aa") == "aa");
+    CHECK(find("(a*)+c", "aac") == "aac");
+    CHECK(find("((a|b?)*)*z", "abz") == "abz");
+    // none of these may need the step budget
+    for (const char* pattern : {"(?:a*)*b", "(a|)*b", "(?:)*x", "(?:a?)+$"}) {
+        cml::Result<Regex> r = Regex::compile(pattern);
+        REQUIRE(r.has_value());
+        Regex::Match m;
+        (void)r->search("aab", 0, &m);
+        CHECK_FALSE(r->budget_exceeded());
+    }
+    // a loop whose body matched empty after real iterations leaves the loop and goes on
+    CHECK(find("(?:a|b*)*c", "abbac") == "abbac");
+}

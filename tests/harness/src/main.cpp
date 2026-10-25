@@ -19,6 +19,7 @@
 #include "cml/proc/proc.h"
 #include "fixture_builder.h"
 #include "report.h"
+#include "run_dirs.h"
 #include "runner.h"
 #include "scenario.h"
 
@@ -41,12 +42,14 @@ void print_usage(std::FILE* out) {
         "  --config Debug|RelWithDebInfo   fixture build configuration (default: Debug)\n"
         "  --cxx cl|clang-cl|PATH    compiler for the fixture (default: cl)\n"
         "  --cmake EXE               cmake.exe (default: found on PATH)\n"
-        "  --work-dir DIR            scratch root (default: <build-dir>/cmltest_scratch)\n"
-        "  --artifacts DIR           logs, fixture stdout, dumps (default: <build-dir>/cmltest-artifacts/<run>)\n"
+        "  --work-dir DIR            scratch base, same rule as --artifacts (default: <build-dir>/cmltest_scratch)\n"
+        "  --artifacts DIR           base directory; cmltest creates cmltest-<scenario>-<timestamp> inside it for logs,\n"
+        "                            fixture stdout and dumps (default base: <build-dir>/cmltest-artifacts)\n"
         "  --junit FILE              write a JUnit XML report\n"
         "  --prebuilt-fixture EXE    debugging aid: skip configuring/building and run this fixture exe\n"
         "  --build-timeout-s N       limit for configuring + building the fixture (default: 900)\n"
         "  --require-all-capabilities  steps skipped for missing broker capabilities fail the run\n"
+        "  --clean-work              delete the scratch directory (the one cmltest created) after the run\n"
         "  --help\n"
         "\n"
         "exit code: 0 passed or partial, 1 failed, 2 usage error\n",
@@ -70,6 +73,7 @@ struct Args {
     std::string prebuilt_fixture;
     unsigned long build_timeout_s = 900;
     bool require_all = false;
+    bool clean_work = false;
     bool help = false;
 };
 
@@ -87,6 +91,7 @@ bool parse_args(const std::vector<std::string>& argv, Args* args) {
         std::string text;
         if (a == "--help" || a == "-h") args->help = true;
         else if (a == "--require-all-capabilities") args->require_all = true;
+        else if (a == "--clean-work") args->clean_work = true;
         else if (a == "--scenario") { if (!value(&args->scenario)) return false; }
         else if (a == "--repo-root") { if (!value(&args->repo_root)) return false; }
         else if (a == "--build-dir") { if (!value(&args->build_dir)) return false; }
@@ -249,15 +254,18 @@ int wmain(int argc, wchar_t** wargv) {
         options.cmake = make_absolute(to_path(args.cmake));
     }
 
-    const std::string run_name = scenario->name + "-" + args.generator + "-" + args.config;
-    options.artifacts_dir = args.artifacts.empty() ? build_dir / "cmltest-artifacts" / run_name : make_absolute(to_path(args.artifacts));
-    const fs::path work_root = args.work_dir.empty() ? build_dir / "cmltest_scratch" : make_absolute(to_path(args.work_dir));
-    options.work_dir = work_root / (run_name + "-" + std::to_string(GetCurrentProcessId()));
-
-    // Old artifacts of a previous run would be confusing next to the new ones.
-    fs::remove_all(options.artifacts_dir, ec);
-    ec.clear();
-    fs::remove_all(options.work_dir, ec);
+    // The user-supplied directories are only bases: cmltest creates its own subdirectory below them
+    // (marked with .cmltest-artifacts) and never deletes anything it did not create.
+    const fs::path artifacts_base = args.artifacts.empty() ? build_dir / "cmltest-artifacts" : make_absolute(to_path(args.artifacts));
+    const fs::path work_base = args.work_dir.empty() ? build_dir / "cmltest_scratch" : make_absolute(to_path(args.work_dir));
+    cml::Result<fs::path> artifacts_dir = cmltest::create_run_directory(artifacts_base, scenario->name);
+    cml::Result<fs::path> work_dir = artifacts_dir ? cmltest::create_run_directory(work_base, scenario->name) : artifacts_dir;
+    if (!artifacts_dir || !work_dir) {
+        std::fprintf(stderr, "%s\n", (artifacts_dir ? work_dir : artifacts_dir).error().format().c_str());
+        return 2;
+    }
+    options.artifacts_dir = *artifacts_dir;
+    options.work_dir = *work_dir;
 
     std::printf("cmltest: scenario '%s' (%s), fixture '%s', generator %s, config %s\n", scenario->name.c_str(),
                 scenario_path.string().c_str(), scenario->fixture.c_str(), args.generator.c_str(), args.config.c_str());
@@ -265,5 +273,12 @@ int wmain(int argc, wchar_t** wargv) {
     std::fflush(stdout);
 
     const cmltest::ScenarioReport report = cmltest::run_scenario(*scenario, options);
-    return finish(report, args);
+    const int exit_code = finish(report, args);
+    if (args.clean_work) {
+        const cml::Result<void> removed = cmltest::remove_run_directory(options.work_dir);  // refuses anything cmltest did not create
+        if (!removed) {
+            std::fprintf(stderr, "%s\n", removed.error().format().c_str());
+        }
+    }
+    return exit_code;
 }

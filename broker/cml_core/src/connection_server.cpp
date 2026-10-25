@@ -54,7 +54,7 @@ void serve_connection(Connection& connection, std::uint64_t agent_id, Shared& sh
         switch (received->status) {
             case ipc::IoStatus::Ok: {
                 SessionOutcome outcome = session.on_message(received->message);
-                shared.registry.update(session);
+                shared.registry.update_if_changed(session);  // rebuilds only when modules / enabled set changed
                 for (const ipc::Message& reply : outcome.replies) {
                     CML_LOG(Debug, "agent#%llu -> %s", static_cast<unsigned long long>(agent_id),
                             ipc::describe(reply).c_str());

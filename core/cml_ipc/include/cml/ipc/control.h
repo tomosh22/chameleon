@@ -98,12 +98,15 @@ struct StatusModule {
 struct StatusProcess {
     std::uint32_t pid = 0;
     std::vector<StatusModule> modules;
+    bool modules_truncated = false;  // the broker left modules out to keep the response small
 };
 
 struct StatusReport {
     std::string version;
     std::vector<std::string> capabilities;
     std::vector<StatusProcess> processes;
+    bool truncated = false;              // some processes or modules were left out (size bound)
+    bool control_pipe_healthy = true;    // false while the broker's control accept loop is recovering
 
     bool has_capability(std::string_view name) const;
     // The process with this pid, or nullptr.
@@ -151,10 +154,15 @@ public:
     void cancel() noexcept { pipe_.cancel(); }
     void close() noexcept { pipe_.close(); }
     std::uint32_t peer_process_id() const noexcept { return pipe_.peer_process_id(); }
+    // Total bytes examined by newline searches so far; stays within a small factor of the bytes received.
+    std::uint64_t scan_work() const noexcept { return scan_work_; }
 
 private:
     PipeConnection pipe_;
-    std::string buffer_;  // bytes received but not yet returned as lines
+    std::string buffer_;            // received bytes; [start_, size) are not yet returned as lines
+    std::size_t start_ = 0;         // first unconsumed byte of buffer_
+    std::size_t scanned_ = 0;       // bytes before this index are known to contain no newline
+    std::uint64_t scan_work_ = 0;   // bytes examined while looking for newlines (tests: must stay linear)
 };
 
 // Client used by cmltest and by tools: connects, sends requests, matches responses by id and

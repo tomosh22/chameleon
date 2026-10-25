@@ -499,13 +499,25 @@ private:
                         return r;
                     }
                     const std::uint32_t body = here();
+                    // Empty-iteration check: remember where the iteration started; at its end, jump
+                    // back only if input was consumed, otherwise leave the loop (an iteration that
+                    // matched the empty string cannot make progress, so the loop is satisfied).
+                    const std::uint32_t slot = out_->slots_++;
+                    inst = Regex::Inst();
+                    inst.op = Op::Mark;
+                    inst.y = slot;
+                    r = push(inst);
+                    if (!r) {
+                        return r;
+                    }
                     r = emit(child);
                     if (!r) {
                         return r;
                     }
                     inst = Regex::Inst();
-                    inst.op = Op::Jump;
+                    inst.op = Op::LoopBack;
                     inst.x = loop;
+                    inst.y = slot;
                     r = push(inst);
                     if (!r) {
                         return r;
@@ -562,17 +574,26 @@ cml::Result<Regex> Regex::compile(std::string_view pattern) {
 bool Regex::search(std::string_view text, std::size_t from, Match* match) const {
     budget_exceeded_ = false;
     std::size_t steps = 0;
+    // A frame is either a choice point (pc, pos) or, with pc == kRestore, an undo record that puts
+    // the loop register `slot` back to `pos` when backtracking passes it.
+    constexpr std::uint32_t kRestore = 0xFFFFFFFFu;
     struct Frame {
         std::uint32_t pc;
         std::size_t pos;
+        std::uint32_t slot;
     };
     std::vector<Frame> stack;
+    std::vector<std::size_t> regs(slots_, 0);
     for (std::size_t start = from; start <= text.size(); ++start) {
         stack.clear();
-        stack.push_back(Frame{0, start});
+        stack.push_back(Frame{0, start, 0});
         while (!stack.empty()) {
             Frame frame = stack.back();
             stack.pop_back();
+            if (frame.pc == kRestore) {
+                regs[frame.slot] = frame.pos;
+                continue;
+            }
             std::uint32_t pc = frame.pc;
             std::size_t pos = frame.pos;
             for (;;) {
@@ -625,11 +646,23 @@ bool Regex::search(std::string_view text, std::size_t from, Match* match) const 
                             budget_exceeded_ = true;
                             return false;
                         }
-                        stack.push_back(Frame{inst.y, pos});
+                        stack.push_back(Frame{inst.y, pos, 0});
                         pc = inst.x;
                         break;
                     case Inst::Op::Jump:
                         pc = inst.x;
+                        break;
+                    case Inst::Op::Mark:
+                        if (stack.size() >= kMaxStack) {
+                            budget_exceeded_ = true;
+                            return false;
+                        }
+                        stack.push_back(Frame{kRestore, regs[inst.y], inst.y});
+                        regs[inst.y] = pos;
+                        ++pc;
+                        break;
+                    case Inst::Op::LoopBack:
+                        pc = pos != regs[inst.y] ? inst.x : pc + 1;
                         break;
                     case Inst::Op::Match:
                         if (match != nullptr) {

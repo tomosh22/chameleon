@@ -252,6 +252,7 @@ cml::Result<std::string> apply_file_patch(std::string_view original, const FileP
     std::vector<FileLine> file = split_file(original);
     const std::string eol = dominant_eol(file);
     long delta = 0;  // lines added so far (new positions shift)
+    long floor = 0;  // first line after the previous hunk's applied region: later hunks never match before it
     int hunk_number = 0;
     for (const Hunk& hunk : patch.hunks) {
         ++hunk_number;
@@ -265,12 +266,17 @@ cml::Result<std::string> apply_file_patch(std::string_view original, const FileP
         for (const HunkLine& hl : hunk.lines) {
             if (hl.op != '+') ++old_lines;
         }
+        // Search window: never before the end of the previous hunk's applied region (`floor`), never
+        // past EOF. A stated position outside the window (e.g. a stale header past EOF) is clamped
+        // into it, and the whole remaining range is searched outwards from there.
         long found = -1;
         long offset = 0;
         const long file_size = static_cast<long>(file.size());
-        for (long d = 0; d <= file_size + 1 && found < 0; ++d) {
+        const long lo = std::min(floor, file_size);
+        stated = std::min(std::max(stated, lo), file_size);
+        for (long d = 0; d <= file_size - lo && found < 0; ++d) {
             for (const long candidate : {stated - d, stated + d}) {
-                if (candidate < 0 || candidate > file_size) {
+                if (candidate < lo || candidate > file_size) {
                     continue;
                 }
                 if (first_mismatch(file, hunk, static_cast<std::size_t>(candidate)) < 0) {
@@ -326,6 +332,7 @@ cml::Result<std::string> apply_file_patch(std::string_view original, const FileP
         file.erase(file.begin() + found, file.begin() + found + static_cast<long>(old_lines));
         file.insert(file.begin() + found, replacement.begin(), replacement.end());
         delta += static_cast<long>(replacement.size()) - static_cast<long>(old_lines);
+        floor = found + static_cast<long>(replacement.size());
     }
     std::string result;
     for (const FileLine& l : file) {
@@ -399,7 +406,14 @@ cml::Result<AppliedPatch> apply_patch_to_tree(const fs::path& root, std::string_
         item.relative = *relative;
         item.file = root / fs::path(*relative);
         std::string original;
-        if (!is_create) {
+        if (is_create) {
+            std::error_code exists_ec;
+            if (fs::exists(item.file, exists_ec)) {
+                return cml::Diag::make(cml::ids::kPatchMismatch,
+                                       "cannot create '" + item.relative + "' from the patch: file already exists",
+                                       "The patch creates a file that is already in the fixture; regenerate the .edit file.");
+            }
+        } else {
             std::ifstream in(item.file, std::ios::binary);
             if (!in) {
                 return cml::Diag::make(cml::ids::kEditFailed, "cannot read '" + item.file.string() + "' to apply the patch",
@@ -417,13 +431,26 @@ cml::Result<AppliedPatch> apply_patch_to_tree(const fs::path& root, std::string_
         }
         item.content = std::move(*patched);
         item.remove = is_delete;
+        if (is_delete && !item.content.empty()) {
+            // The removed lines matched, but the file has more: refuse to delete content the patch never showed.
+            return cml::Diag::make(cml::ids::kPatchMismatch,
+                                   "deleting '" + item.relative + "': the patch does not remove the whole file (" +
+                                       std::to_string(item.content.size()) + " bytes would remain)",
+                                   "The fixture file changed; regenerate the .edit file against the current sources.");
+        }
         applied.files.push_back(item.relative);
         pending.push_back(std::move(item));
     }
     for (const Pending& item : pending) {
         std::error_code ec;
         if (item.remove) {
-            fs::remove(item.file, ec);
+            const bool removed = fs::remove(item.file, ec);
+            if (ec || !removed) {
+                return cml::Diag::make(cml::ids::kEditFailed,
+                                       "cannot delete '" + item.file.string() + "' while applying the patch" +
+                                           (ec ? " (" + ec.message() + ")" : " (it does not exist)"),
+                                       "Check that the scratch directory is writable and the file is not locked by another process.");
+            }
         } else {
             fs::create_directories(item.file.parent_path(), ec);
             std::ofstream out(item.file, std::ios::binary | std::ios::trunc);

@@ -6,6 +6,7 @@
 #include <limits>
 #include <optional>
 #include <system_error>
+#include <unordered_set>
 #include <utility>
 
 #include "cml/ipc/control_ids.h"
@@ -96,6 +97,15 @@ const Value* Value::find(std::string_view key) const noexcept {
         }
     }
     return nullptr;
+}
+
+Value& Value::add_member(std::string key, Value v) {
+    if (type_ != Type::Object) {
+        return *this;
+    }
+    keys_.push_back(std::move(key));
+    values_.push_back(std::move(v));
+    return values_.back();
 }
 
 Value& Value::set(std::string key, Value v) {
@@ -457,6 +467,7 @@ private:
         }
         ++pos_;  // {
         Value object = Value::object();
+        std::unordered_set<std::string> seen_keys;  // O(1) duplicate detection
         skip_space();
         if (pos_ < text_.size() && text_[pos_] == '}') {
             ++pos_;
@@ -464,8 +475,8 @@ private:
             return true;
         }
         for (;;) {
-            if (object.size() >= kMaxElements) {
-                return set_error(pos_, "more than 65536 object members");
+            if (object.size() >= kMaxMembers) {
+                return set_error(pos_, "more than 4096 object members");
             }
             skip_space();
             if (pos_ >= text_.size() || text_[pos_] != '"') {
@@ -476,7 +487,7 @@ private:
             if (!parse_string(&key)) {
                 return false;
             }
-            if (object.find(key) != nullptr) {
+            if (!seen_keys.insert(key).second) {
                 return set_error(key_pos, "duplicate object key '" + key + "'");
             }
             skip_space();
@@ -489,7 +500,7 @@ private:
             if (!parse_value(&member, depth + 1)) {
                 return false;
             }
-            object.set(std::move(key), std::move(member));
+            object.add_member(std::move(key), std::move(member));  // uniqueness was checked above
             skip_space();
             if (pos_ >= text_.size()) {
                 return set_error(pos_, "unterminated object");

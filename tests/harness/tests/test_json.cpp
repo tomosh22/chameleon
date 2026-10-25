@@ -1,5 +1,6 @@
 // JSON reader/writer of the control protocol: valid documents, round trips, and a long list of
 // malformed inputs that must all be rejected with CML5400 (never crash, never accept).
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -235,4 +236,31 @@ TEST_CASE("json: an error names the byte offset") {
     Result<Value> r = parse("{\"a\": ?}");
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().message.find("byte 6") != std::string::npos);
+}
+
+TEST_CASE("json: objects are capped at 4096 members and duplicate detection is linear (review fix 2)") {
+    auto object_with = [](std::size_t n) {
+        std::string text = "{";
+        for (std::size_t i = 0; i < n; ++i) {
+            text += (i == 0 ? "\"k" : ",\"k") + std::to_string(i) + "\":" + std::to_string(i);
+        }
+        return text + "}";
+    };
+    CHECK(parse(object_with(kMaxMembers)).has_value());
+    check_rejected(object_with(kMaxMembers + 1));
+    // a duplicate of the first key at the very end of a full object is still found
+    std::string full = object_with(kMaxMembers - 1);
+    full.pop_back();
+    full += ",\"k0\":1}";
+    check_rejected(full);
+    // 65k keys: rejected fast (the cap), never quadratic
+    const auto start = std::chrono::steady_clock::now();
+    check_rejected(object_with(65000));
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    CHECK(ms < 100);
+    // many equal keys: the first duplicate is reported at once
+    std::string dups = "{";
+    for (int i = 0; i < 3000; ++i) dups += i == 0 ? "\"a\":1" : ",\"a\":1";
+    dups += "}";
+    check_rejected(dups);
 }

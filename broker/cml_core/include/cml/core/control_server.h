@@ -10,6 +10,7 @@
 // handle_control_line() is portable and unit-testable without pipes; ControlServer (Windows)
 // serves it on a named pipe with a thread per connection.
 
+#include <atomic>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -22,14 +23,18 @@ namespace cml::core {
 struct ControlContext {
     std::string version;                         // broker version string for `status`
     const ProcessRegistry* registry = nullptr;   // may be null (no processes)
+    // Health of the control accept loop (ControlServer sets it); null = healthy. Reported by `status`.
+    const std::atomic<bool>* pipe_healthy = nullptr;
 };
 
 // The capabilities this broker provides. A command is only available when its capability is here.
 std::vector<std::string> broker_capabilities();
 
-// Maximum modules per process listed by `status` (enabled ones first); the result carries
-// "modules_truncated": true when the list was cut.
+// `status` is bounded: modules per process (enabled ones first) and the total size of the response
+// (about 75% of the 1 MiB line limit). When anything is left out the result has "truncated": true and
+// the affected processes "modules_truncated": true. `status` never fails because of size.
 inline constexpr std::size_t kMaxStatusModulesPerProcess = 2000;
+inline constexpr std::size_t kStatusByteBudget = ipc::kMaxControlLineBytes / 4 * 3;
 
 ipc::ControlResponse handle_control_request(const ipc::ControlRequest& request, const ControlContext& context);
 
@@ -66,6 +71,12 @@ public:
 
     const std::string& pipe_name() const noexcept { return pipe_name_; }
 
+    // False while the accept loop is recovering from a failure (also reported by `status`).
+    bool healthy() const noexcept { return healthy_.load(); }
+
+    // Test hook: the next `count` accept attempts (in any ControlServer) fail as if the OS had.
+    static void set_accept_failures_for_testing(int count);
+
 private:
     struct Connection;
     void accept_loop();
@@ -75,6 +86,7 @@ private:
     ControlContext context_;
     ipc::PipeServer pipe_;
     std::atomic<bool> stopping_{false};
+    std::atomic<bool> healthy_{true};
     std::thread accept_thread_;
     std::vector<std::unique_ptr<Connection>> connections_;  // touched by the accept thread only (and stop() after joining it)
     bool started_ = false;

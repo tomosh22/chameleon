@@ -413,4 +413,83 @@ TEST_CASE("connection server: control clients do not keep an idle broker alive o
     CHECK(reason == core::ServerExit::StartupTimeout);
 }
 
+TEST_CASE("control pipe: accept failures never end the accept loop; it recovers and reports health (review fix 8)") {
+    QuietLogs quiet;
+    core::ProcessRegistry registry;
+    const std::string name = unique_name("recover");
+    core::ControlServer server(name, context(&registry));
+    core::ControlServer::set_accept_failures_for_testing(3);
+    REQUIRE(server.start().has_value());
+
+    // While the failures are being worked through (100 + 200 + 400 ms of backoff) the server reports it.
+    bool saw_unhealthy = false;
+    const ULONGLONG until = GetTickCount64() + kWaitMs;
+    while (GetTickCount64() < until && !(saw_unhealthy && server.healthy())) {
+        saw_unhealthy = saw_unhealthy || !server.healthy();
+        Sleep(5);
+    }
+    CHECK(saw_unhealthy);
+    CHECK(server.healthy());
+
+    // Afterwards a client can connect and is served; status says the pipe is healthy again.
+    ControlClient client = connect_client(name);
+    Result<StatusReport> status = client.status(kWaitMs);
+    REQUIRE_MESSAGE(status.has_value(), (status.has_value() ? "" : status.error().format()));
+    CHECK(status->control_pipe_healthy);
+
+    // A longer run of failures (still finite here) is survived too, with clients already connected.
+    core::ControlServer::set_accept_failures_for_testing(6);  // 100+200+400+800+1600+2000 ms of backoff
+    ControlClient early = connect_client(name);  // connects to the (recreated) instance while the loop backs off
+    Result<StatusReport> late = early.status(30000);  // served as soon as the loop accepts again
+    REQUIRE_MESSAGE(late.has_value(), (late.has_value() ? "" : late.error().format()));
+    CHECK(client.status(kWaitMs).has_value());
+    core::ControlServer::set_accept_failures_for_testing(0);
+    server.stop();
+}
+
+TEST_CASE("control channel: newline search is linear (review fix 10)") {
+    QuietLogs quiet;
+    const std::string name = unique_name("linear");
+    Result<PipeServer> raw = PipeServer::create(name);
+    REQUIRE(raw.has_value());
+    const std::string long_line(900 * 1000, 'q');
+    constexpr int kShortLines = 30000;
+    std::uint64_t scan_work = 0;
+    std::size_t received_bytes = 0;
+    bool all_ok = false;
+    std::thread reader([&] {
+        Result<PipeServer::Accepted> accepted = raw->accept(kWaitMs);
+        if (!accepted || accepted->status != IoStatus::Ok) {
+            return;
+        }
+        ControlChannel channel(std::move(accepted->connection));
+        Result<ControlChannel::Line> first = channel.receive_line(kWaitMs);
+        if (!first || first->status != IoStatus::Ok || first->text != long_line) {
+            return;
+        }
+        received_bytes += first->text.size() + 1;
+        for (int i = 0; i < kShortLines; ++i) {
+            Result<ControlChannel::Line> line = channel.receive_line(kWaitMs);
+            if (!line || line->status != IoStatus::Ok || line->text != "L" + std::to_string(i)) {
+                return;
+            }
+            received_bytes += line->text.size() + 1;
+        }
+        scan_work = channel.scan_work();
+        all_ok = true;
+    });
+    Result<PipeConnection> connection = connect_pipe(name, kWaitMs);
+    REQUIRE(connection.has_value());
+    std::string payload = long_line + "\n";
+    for (int i = 0; i < kShortLines; ++i) {
+        payload += "L" + std::to_string(i) + "\n";
+    }
+    REQUIRE(connection->send_bytes(payload.data(), payload.size(), kWaitMs).has_value());
+    reader.join();
+    REQUIRE(all_ok);
+    CHECK(received_bytes == payload.size());
+    // Quadratic scanning would examine ~ (900000 / 4096) * 450000 = 100 MB for the long line alone.
+    CHECK(scan_work <= 2 * payload.size());
+}
+
 #endif  // _WIN32

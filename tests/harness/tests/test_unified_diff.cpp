@@ -329,3 +329,82 @@ TEST_CASE("diff: the fixture's real edit file parses") {
 #endif
 #endif
 }
+
+TEST_CASE("diff: a stated start past EOF is clamped and the whole remaining range searched (review fix 4)") {
+    const std::string base = "l1\nl2\nl3\nl4\nl5\n";
+    const std::string far =
+        "--- a/f\n+++ b/f\n@@ -50,2 +50,2 @@\n l4\n-l5\n+L5\n";
+    std::vector<std::string> notes;
+    CHECK(apply_ok(base, far, &notes) == "l1\nl2\nl3\nl4\nL5\n");
+    REQUIRE(notes.size() == 1);
+    CHECK(notes[0].find("offset -") != std::string::npos);
+    // a pure insertion stated past EOF appends at EOF
+    const std::string append = "--- a/f\n+++ b/f\n@@ -99,0 +100,1 @@\n+tail\n";
+    CHECK(apply_ok(base, append) == "l1\nl2\nl3\nl4\nl5\ntail\n");
+    // far past EOF in a short file, match at the very start
+    const std::string start = "--- a/f\n+++ b/f\n@@ -1000,1 +1000,1 @@\n-l1\n+L1\n";
+    CHECK(apply_ok(base, start) == "L1\nl2\nl3\nl4\nl5\n");
+    // and still a clean mismatch when it is nowhere
+    cml::Result<std::vector<FilePatch>> patches = parse_unified_diff("--- a/f\n+++ b/f\n@@ -500,1 +500,1 @@\n-nothing\n+x\n");
+    REQUIRE(patches.has_value());
+    CHECK_FALSE(apply_file_patch(base, (*patches)[0]).has_value());
+}
+
+TEST_CASE("diff: a later hunk never matches before the end of the previous hunk's region (review fix 5)") {
+    const std::string base = "x\ny\nx\ny\n";
+    // hunk 2's header points at the first 'y' (line 2) but hunk 1 already covered up to line 3
+    const std::string overlapping =
+        "--- a/f\n+++ b/f\n"
+        "@@ -3,1 +3,1 @@\n-x\n+X\n"
+        "@@ -2,1 +2,1 @@\n-y\n+Y\n";
+    CHECK(apply_ok(base, overlapping) == "x\ny\nX\nY\n");  // the LAST y, not the one before hunk 1
+    // matches only before the floor: refused
+    const std::string only_before =
+        "--- a/f\n+++ b/f\n"
+        "@@ -3,1 +3,1 @@\n-x\n+X\n"
+        "@@ -1,1 +1,1 @@\n-x\n+Z\n";
+    cml::Result<std::vector<FilePatch>> patches = parse_unified_diff(only_before);
+    REQUIRE(patches.has_value());
+    cml::Result<std::string> out = apply_file_patch("x\ny\nx\ny\n", (*patches)[0]);
+    REQUIRE_FALSE(out.has_value());
+    CHECK(out.error().code == cml::ids::kPatchMismatch);
+    CHECK(out.error().message.find("hunk 2") != std::string::npos);
+    // hunks that grow the file: the floor follows the new layout
+    const std::string growing =
+        "--- a/f\n+++ b/f\n"
+        "@@ -1,1 +1,3 @@\n x\n+n1\n+n2\n"
+        "@@ -3,1 +5,1 @@\n-x\n+X\n";
+    CHECK(apply_ok(base, growing) == "x\nn1\nn2\ny\nX\ny\n");
+}
+
+TEST_CASE("diff: creation of an existing file and deletion of a different file are refused (review fix 6)") {
+    TempDir dir;
+    dir.write("exists.txt", "old\n");
+    cml::Result<AppliedPatch> create = apply_patch_to_tree(dir.path, "--- /dev/null\n+++ b/exists.txt\n@@ -0,0 +1 @@\n+new\n", 1);
+    REQUIRE_FALSE(create.has_value());
+    CHECK(create.error().code == cml::ids::kPatchMismatch);
+    CHECK(create.error().message.find("file already exists") != std::string::npos);
+    CHECK(dir.read("exists.txt") == "old\n");
+
+    // deletion: content differs -> refused, file kept
+    dir.write("victim.txt", "one\ntwo\n");
+    cml::Result<AppliedPatch> wrong = apply_patch_to_tree(dir.path, "--- a/victim.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-other\n", 1);
+    REQUIRE_FALSE(wrong.has_value());
+    CHECK(wrong.error().code == cml::ids::kPatchMismatch);
+    CHECK(fs::exists(dir.path / "victim.txt"));
+    // deletion that shows only part of the file: refused too
+    cml::Result<AppliedPatch> partial = apply_patch_to_tree(dir.path, "--- a/victim.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-one\n", 1);
+    REQUIRE_FALSE(partial.has_value());
+    CHECK(partial.error().message.find("does not remove the whole file") != std::string::npos);
+    CHECK(fs::exists(dir.path / "victim.txt"));
+    // the exact deletion works
+    CHECK(apply_patch_to_tree(dir.path, "--- a/victim.txt\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-one\n-two\n", 1).has_value());
+    CHECK_FALSE(fs::exists(dir.path / "victim.txt"));
+
+    // a deletion whose remove fails reports CML5422 (a directory that is not empty cannot be removed as a file)
+    fs::create_directories(dir.path / "d" / "inner");
+    std::error_code ec;
+    cml::Result<AppliedPatch> not_a_file = apply_patch_to_tree(dir.path, "--- a/d\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n", 1);
+    REQUIRE_FALSE(not_a_file.has_value());
+    CHECK((not_a_file.error().code == cml::ids::kEditFailed || not_a_file.error().code == cml::ids::kPatchMismatch));
+}

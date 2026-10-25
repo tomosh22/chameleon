@@ -1,4 +1,6 @@
 // Control protocol codec (portable) and the broker's request handler, including malformed input.
+#include <atomic>
+#include <chrono>
 #include <string>
 #include <variant>
 #include <vector>
@@ -347,9 +349,11 @@ TEST_CASE("broker control: status truncates huge module lists, enabled first") {
     registry.update(session);
     const ControlResponse r = respond("{\"id\":1,\"cmd\":\"status\"}", context_with(&registry));
     REQUIRE(r.ok);
-    CHECK(r.result.get_bool("modules_truncated"));
+    CHECK(r.result.get_bool("truncated"));
     Result<StatusReport> report = status_from_json(r.result);
     REQUIRE(report.has_value());
+    CHECK(report->truncated);
+    CHECK(report->processes[0].modules_truncated);
     CHECK(report->processes[0].modules.size() == core::kMaxStatusModulesPerProcess);
     CHECK(report->processes[0].modules[0].enabled);  // the enabled one survived the cut
 }
@@ -401,4 +405,201 @@ TEST_CASE("broker control: handler without a registry still answers status") {
     const ControlResponse r = respond("{\"id\":1,\"cmd\":\"status\"}", context);
     REQUIRE(r.ok);
     CHECK(status_from_json(r.result)->processes.empty());
+}
+
+TEST_CASE("broker control: status stays under 75% of the line limit with many large modules (review fix 3)") {
+    QuietLogs quiet;
+    core::ProcessRegistry registry;
+    core::Session first(1, "9.9.9");
+    core::Session second(2, "9.9.9");
+    core::Session third(3, "9.9.9");
+    core::Session* sessions[] = {&first, &second, &third};
+    std::uint32_t pid = 100;
+    for (core::Session* session : sessions) {
+        ipc::Hello hello;
+        hello.request_id = 1;
+        hello.pid = pid++;
+        session->on_message(hello);
+        ipc::ModuleList list;
+        list.request_id = 2;
+        for (std::size_t i = 0; i < 1900; ++i) {
+            // ~600 byte paths, some with characters that JSON escapes (backslashes double)
+            list.modules.push_back({0x1000ull * (i + 1), 0x1000, "C:\\very\\long\\directory\\" + std::string(560, 'x') + std::to_string(i) + ".dll"});
+        }
+        session->on_message(list);
+        registry.update(*session);
+    }
+    const std::string answer = core::handle_control_line("{\"id\":5,\"cmd\":\"status\"}", context_with(&registry));
+    CHECK(answer.size() <= core::kStatusByteBudget + 4096);
+    CHECK(answer.size() < ipc::kMaxControlLineBytes);
+    Result<std::variant<ControlResponse, ControlEvent>> decoded = decode_server_message(answer);
+    REQUIRE(decoded.has_value());
+    const ControlResponse& r = std::get<ControlResponse>(*decoded);
+    REQUIRE_MESSAGE(r.ok, "status must never be replaced by an error");
+    CHECK(r.result.get_bool("truncated"));
+    Result<StatusReport> report = status_from_json(r.result);
+    REQUIRE(report.has_value());
+    REQUIRE_FALSE(report->processes.empty());
+    CHECK(report->processes[0].modules_truncated);
+    CHECK_FALSE(report->processes[0].modules.empty());
+    // later processes are either listed (possibly without modules) or left out, never invented
+    CHECK(report->processes.size() <= 3);
+
+    // a single module whose path alone exceeds the budget is dropped, status still succeeds
+    core::ProcessRegistry huge_registry;
+    core::Session huge(9, "9.9.9");
+    ipc::Hello hello;
+    hello.request_id = 1;
+    hello.pid = 777;
+    huge.on_message(hello);
+    ipc::ModuleList huge_list;
+    huge_list.request_id = 2;
+    huge_list.modules.push_back({0x1000ull, 0x1000, "C:\\" + std::string(900 * 1024, 'y')});
+    huge_list.modules.push_back({0x2000ull, 0x1000, "C:\\small.dll"});
+    huge.on_message(huge_list);
+    huge_registry.update(huge);
+    const ControlResponse huge_response = respond("{\"id\":6,\"cmd\":\"status\"}", context_with(&huge_registry));
+    REQUIRE(huge_response.ok);
+    CHECK(huge_response.result.get_bool("truncated"));
+    Result<StatusReport> huge_report = status_from_json(huge_response.result);
+    REQUIRE(huge_report.has_value());
+    CHECK(huge_report->processes.size() == 1);
+    CHECK(huge_report->processes[0].pid == 777);
+    CHECK(huge_report->processes[0].modules_truncated);
+
+    // an untruncated status carries no "truncated" member
+    core::ProcessRegistry empty;
+    const ControlResponse plain = respond("{\"id\":7,\"cmd\":\"status\"}", context_with(&empty));
+    CHECK(plain.result.find("truncated") == nullptr);
+    CHECK(plain.result.get_bool("control_pipe_healthy", false));
+}
+
+// --- review fix 9: the registry is rebuilt only when something it shows changed ---------------
+
+TEST_CASE("process registry: rebuilt only when the module list or the enabled set changes (review fix 9)") {
+    QuietLogs quiet;
+    core::ProcessRegistry registry;
+    core::Session session(1, "9.9.9");
+    CHECK_FALSE(registry.update_if_changed(session));  // no handshake yet
+    CHECK(registry.rebuilds() == 0);
+
+    ipc::Hello hello;
+    hello.request_id = 1;
+    hello.pid = 321;
+    session.on_message(hello);
+    CHECK(registry.update_if_changed(session));
+    CHECK_FALSE(registry.update_if_changed(session));
+    CHECK(registry.rebuilds() == 1);
+
+    ipc::Log log;
+    log.level = 2;
+    log.text = "noise";
+    for (int i = 0; i < 100; ++i) {
+        session.on_message(log);  // traffic that changes nothing the status shows
+        CHECK_FALSE(registry.update_if_changed(session));
+    }
+    CHECK(registry.rebuilds() == 1);
+
+    ipc::ModuleList list;
+    list.request_id = 2;
+    list.modules.push_back({0x1000ull, 0x1000, "C:\\a\\one.dll"});
+    list.modules.push_back({0x2000ull, 0x1000, "C:\\a\\two.dll"});
+    session.on_message(list);
+    CHECK(registry.update_if_changed(session));
+    CHECK(registry.rebuilds() == 2);
+
+    ipc::EnableModule enable;
+    enable.request_id = 3;
+    enable.path = "C:\\a\\one.dll";
+    session.on_message(enable);
+    CHECK(registry.update_if_changed(session));
+    session.on_message(enable);  // already enabled: nothing changes
+    CHECK_FALSE(registry.update_if_changed(session));
+    CHECK(registry.rebuilds() == 3);
+
+    ipc::EnableModule refused;
+    refused.request_id = 4;
+    refused.path = "C:\\a\\missing.dll";
+    session.on_message(refused);  // rejected request: nothing changes
+    CHECK_FALSE(registry.update_if_changed(session));
+
+    ipc::ModuleLoaded loaded;
+    loaded.module = {0x3000ull, 0x1000, "C:\\a\\three.dll"};
+    session.on_message(loaded);
+    CHECK(registry.update_if_changed(session));
+    ipc::ModuleUnloaded unloaded;
+    unloaded.module = {0x3000ull, 0x1000, "C:\\a\\three.dll"};
+    session.on_message(unloaded);
+    CHECK(registry.update_if_changed(session));
+
+    ipc::DisableModule disable;
+    disable.request_id = 5;
+    disable.path = "C:\\a\\one.dll";
+    session.on_message(disable);
+    CHECK(registry.update_if_changed(session));
+    CHECK(registry.rebuilds() == 6);
+
+    const std::vector<core::RegisteredProcess> snapshot = registry.snapshot();
+    REQUIRE(snapshot.size() == 1);
+    CHECK(snapshot[0].pid == 321);
+    REQUIRE(snapshot[0].modules.size() == 2);
+    CHECK_FALSE(snapshot[0].modules[0].enabled);
+}
+
+TEST_CASE("process registry: enabled matching uses normalised paths and scales") {
+    CHECK(core::normalized_path_key("C:/Games/GAME.exe") == core::normalized_path_key("c:\\games\\game.EXE"));
+    CHECK(core::normalized_path_key("\\\\?\\C:\\x.dll") == core::normalized_path_key("c:\\X.DLL"));
+    CHECK(core::normalized_path_key("C:\\x.dll") != core::normalized_path_key("C:\\y.dll"));
+    CHECK(core::normalized_path_key("").empty());
+
+    QuietLogs quiet;
+    core::Session session(1, "9.9.9");
+    ipc::Hello hello;
+    hello.request_id = 1;
+    hello.pid = 9;
+    session.on_message(hello);
+    ipc::ModuleList list;
+    list.request_id = 2;
+    constexpr std::size_t kModules = 8000;
+    for (std::size_t i = 0; i < kModules; ++i) {
+        list.modules.push_back({0x1000ull * (i + 1), 0x1000, "C:\\mods\\Mod" + std::to_string(i) + ".dll"});
+    }
+    session.on_message(list);
+    for (std::size_t i = 0; i < kModules; i += 2) {
+        ipc::EnableModule enable;
+        enable.request_id = 10 + i;
+        enable.path = "c:/MODS/mod" + std::to_string(i) + ".DLL";  // different spelling than the list
+        session.on_message(enable);
+    }
+    REQUIRE(session.enabled_modules().size() == kModules / 2);
+    core::ProcessRegistry registry;
+    const auto start = std::chrono::steady_clock::now();
+    registry.update(session);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    CHECK(ms < 500);
+    const std::vector<core::RegisteredProcess> snapshot = registry.snapshot();
+    REQUIRE(snapshot.size() == 1);
+    std::size_t enabled = 0;
+    for (const core::RegisteredModule& m : snapshot[0].modules) {
+        enabled += m.enabled ? 1 : 0;
+    }
+    CHECK(enabled == kModules / 2);
+    CHECK(snapshot[0].modules[0].enabled);
+    CHECK_FALSE(snapshot[0].modules[1].enabled);
+}
+
+TEST_CASE("broker control: status reports control_pipe_healthy (review fix 8)") {
+    core::ProcessRegistry registry;
+    std::atomic<bool> healthy{true};
+    core::ControlContext context = context_with(&registry);
+    context.pipe_healthy = &healthy;
+    CHECK(respond("{\"id\":1,\"cmd\":\"status\"}", context).result.get_bool("control_pipe_healthy", false));
+    healthy.store(false);
+    const ControlResponse r = respond("{\"id\":2,\"cmd\":\"status\"}", context);
+    REQUIRE(r.ok);
+    REQUIRE(r.result.find("control_pipe_healthy") != nullptr);
+    CHECK_FALSE(r.result.get_bool("control_pipe_healthy", true));
+    Result<StatusReport> report = status_from_json(r.result);
+    REQUIRE(report.has_value());
+    CHECK_FALSE(report->control_pipe_healthy);
 }
