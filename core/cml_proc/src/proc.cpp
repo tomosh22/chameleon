@@ -6,7 +6,6 @@
 
 #include <sddl.h>
 #include <psapi.h>
-#include <tlhelp32.h>
 
 #include <cstring>
 #include <cwchar>
@@ -80,45 +79,60 @@ Diag sid_diag(const char* what, DWORD error) {
 }  // namespace
 
 Result<std::vector<ModuleInfo>> enumerate_modules(std::uint32_t pid) {
+    // PSAPI rather than a toolhelp snapshot: the snapshot's names are limited to MAX_PATH and the
+    // snapshot call itself can fail in processes that have modules loaded from long paths.
     const DWORD target = pid == 0 ? GetCurrentProcessId() : pid;
-    UniqueHandle snapshot;
-    DWORD last_error = 0;
-    // ERROR_BAD_LENGTH means the module list changed while the snapshot was taken; retry.
-    for (int attempt = 0; attempt < 8; ++attempt) {
-        HANDLE h = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, target);
-        if (h != INVALID_HANDLE_VALUE) {
-            snapshot.reset(h);
-            break;
+    const bool self = target == GetCurrentProcessId();
+    UniqueHandle opened;
+    HANDLE process = GetCurrentProcess();
+    if (!self) {
+        opened.reset(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, target));
+        process = opened.get();
+    }
+    DWORD last_error = process == nullptr ? GetLastError() : ERROR_SUCCESS;
+    std::vector<HMODULE> handles(256);
+    bool listed = false;
+    // The list can change between the size query and the copy; retry with the size it reported.
+    for (int attempt = 0; process != nullptr && attempt < 8 && !listed; ++attempt) {
+        DWORD needed = 0;
+        if (!K32EnumProcessModulesEx(process, handles.data(), static_cast<DWORD>(handles.size() * sizeof(HMODULE)),
+                                     &needed, LIST_MODULES_ALL)) {
+            last_error = GetLastError();
+            if (last_error != ERROR_PARTIAL_COPY && last_error != ERROR_BAD_LENGTH) {
+                break;
+            }
+            continue;
         }
-        last_error = GetLastError();
-        if (last_error != ERROR_BAD_LENGTH) {
-            break;
+        if (needed <= handles.size() * sizeof(HMODULE)) {
+            handles.resize(needed / sizeof(HMODULE));
+            listed = true;
+        } else {
+            handles.resize(needed / sizeof(HMODULE) + 16);
         }
     }
-    if (!snapshot) {
+    if (!listed) {
         return Diag::make(ids::kModuleEnumFailed,
                           "cannot enumerate the modules of process " + std::to_string(target) +
                               " (" + win_error_text(last_error) + ")",
                           "Check that the process still exists and that you may inspect it.");
     }
 
-    const bool self = target == GetCurrentProcessId();
-    // Another process's module names need a process handle; if it cannot be had we keep the
-    // (possibly truncated) toolhelp name.
-    UniqueHandle process(self ? nullptr : OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, target));
     std::vector<ModuleInfo> modules;
-    MODULEENTRY32W entry;
-    std::memset(&entry, 0, sizeof(entry));
-    entry.dwSize = sizeof(entry);
-    for (BOOL ok = Module32FirstW(snapshot.get(), &entry); ok;
-         ok = Module32NextW(snapshot.get(), &entry)) {
+    modules.reserve(handles.size());
+    for (HMODULE module : handles) {
+        MODULEINFO details;
+        std::memset(&details, 0, sizeof(details));
+        if (!K32GetModuleInformation(process, module, &details, sizeof(details))) {
+            continue;  // unloaded while we were looking
+        }
+        const std::wstring full = full_module_path(process, self, module);
+        if (full.empty()) {
+            continue;
+        }
         ModuleInfo info;
-        info.base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(entry.modBaseAddr));
-        info.size = entry.modBaseSize;
-        // szExePath is cut at MAX_PATH; ask the OS for the full name of the module instead.
-        std::wstring full = full_module_path(process.get(), self, entry.hModule);
-        info.path = full.empty() ? utf8_from_wide(entry.szExePath, std::wcslen(entry.szExePath))
-                                 : utf8_from_wide(full);
+        info.base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(details.lpBaseOfDll));
+        info.size = details.SizeOfImage;
+        info.path = utf8_from_wide(full);
         modules.push_back(std::move(info));
     }
     return modules;
