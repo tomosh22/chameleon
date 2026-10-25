@@ -42,10 +42,11 @@ namespace cml::toolchain {
 
 // What the PE says. Parsed from the raw bytes (DOS header, e_lfanew, optional header) so synthetic images work.
 struct PeLinkerFacts {
-    bool valid = false;         // a PE32+ header was found
+    bool valid = false;         // a PE32+ (optional header magic 0x20B) header was found; PE32 is not valid
     unsigned major = 0;         // OptionalHeader.MajorLinkerVersion (link.exe: 14, MinorLinkerVersion = toolset)
     unsigned minor = 0;
-    bool rich_header = false;   // "Rich" marker between the DOS header and the PE signature: written by link.exe,
+    bool rich_header = false;   // "Rich" marker between the DOS header and the PE signature: written by link.exe, its absence proves nothing;
+                                // (was: never by lld-link)
                                 // never by lld-link
 };
 PeLinkerFacts read_pe_linker_facts(std::span<const std::byte> pe_bytes) noexcept;
@@ -86,7 +87,9 @@ Result<LinkerDetection> decide_linker_family(const PeLinkerFacts& pe, const PdbL
 
 // Reads the PE at `pe_path` and its PDB (located like pdb::PdbIndex::open_for_pe), decides, and releases the PDB index
 // again before returning. A PDB that cannot be opened is a warning, not an error, as long as the PE alone decides.
-// CML3367 when the PE cannot be read.
+// The PE is loaded with cml_pe, whose diagnostic is returned as it is (CML1300 unreadable, CML1303 for PE32, ...).
+// lld-link is only inferred from the PE (linker version 14.0, no Rich header) when no PDB could be opened; that is the
+// warning CML3366 saying "inferred".
 Result<LinkerDetection> detect_module_linker(const std::string& pe_path, const pdb::OpenOptions& pdb_options = {},
                                              const DetectLinkerOptions& options = {});
 

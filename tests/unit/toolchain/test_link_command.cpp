@@ -104,12 +104,18 @@ TEST_CASE("link command: the plan 4.6 flags in order, then outputs, then objects
     CHECK(*args == expected);
 }
 
-TEST_CASE("link command: both families get the same command line") {
+TEST_CASE("link command: both families get the same command line, lld-link with /demangle:no after /OUT") {
     auto a = build_link_command(basic_spec(ToolFamily::Link));
     auto b = build_link_command(basic_spec(ToolFamily::LldLink));
     REQUIRE(a);
     REQUIRE(b);
-    CHECK(*a == *b);
+    REQUIRE(b->size() == a->size() + 1);
+    std::vector<std::string> expected = *a;
+    expected.insert(expected.begin() + 15, "/demangle:no");
+    CHECK(*b == expected);
+    for (const std::string& x : *a) {
+        CHECK(x != "/demangle:no");  // link.exe does not know the option
+    }
 }
 
 TEST_CASE("link command: /NOREF and /NOICF are always present and nothing re-enables REF or ICF") {
@@ -151,6 +157,11 @@ TEST_CASE("link command: /IGNORE is only passed when asked for") {
     auto args = build_link_command(s);
     REQUIRE(args);
     CHECK((*args)[15] == "/IGNORE:4001,4254,4281");
+    s.family = ToolFamily::LldLink;  // lld-link: /demangle:no comes first
+    auto lld = build_link_command(s);
+    REQUIRE(lld);
+    CHECK((*lld)[15] == "/demangle:no");
+    CHECK((*lld)[16] == "/IGNORE:4001,4254,4281");
 }
 
 TEST_CASE("link command: arguments with spaces are quoted as a whole when the line is built") {
@@ -212,7 +223,9 @@ TEST_CASE("link command: bad requests are CML3362") {
 TEST_CASE("link command: /OPT:REF and /OPT:ICF are refused in every spelling (CML3360)") {
     const char* bad[] = {"/OPT:REF",        "-OPT:REF",     "/opt:ref",        "/OPT:ICF",  "/OPT:ICF=3", "/OPT:icf=2",
                          "/OPT:REF,ICF",    "/OPT:NOREF,ICF", "/OPT:ICF,NOREF", "/OPT:LBR,REF", "/FORCE",   "/FORCE:UNRESOLVED",
-                         "/FORCE:MULTIPLE", "/INCREMENTAL", "/INCREMENTAL:YES", "/DYNAMICBASE", "/DYNAMICBASE:YES", "/FIXED:NO"};
+                         "/FORCE:MULTIPLE", "/INCREMENTAL", "/INCREMENTAL:YES", "/DYNAMICBASE", "/DYNAMICBASE:YES", "/FIXED:NO",
+                         "/OPT:SAFEICF", "/opt:safeicf", "/OPT:NOREF,SAFEICF", "/OPT:LBR,SAFEICF", "/PROFILE", "-profile",
+                         "/DEBUG:NONE", "/DEBUG:FASTLINK", "/debug:fastlink"};
     for (const char* arg : bad) {
         INFO("argument " << arg);
         LinkCommandSpec s = basic_spec();
@@ -229,7 +242,7 @@ TEST_CASE("link command: /OPT:REF and /OPT:ICF are refused in every spelling (CM
 
 TEST_CASE("link command: harmless extras are accepted") {
     const char* good[] = {"/OPT:NOREF", "/OPT:NOICF", "/OPT:NOREF,NOICF", "/OPT:LBR", "/INCREMENTAL:NO", "/DYNAMICBASE:NO",
-                          "/NODEFAULTLIB:libcmt", "/WX", "/LIBPATH:C:\\x", "/IGNORE:4099", "some.obj", "/FIXED"};
+                          "/NODEFAULTLIB:libcmt", "/WX", "/LIBPATH:C:\\x", "/IGNORE:4099", "some.obj", "/FIXED", "/RELEASE"};
     for (const char* arg : good) {
         INFO("argument " << arg);
         // /FIXED is owned by the driver, everything else is allowed.
@@ -245,7 +258,7 @@ TEST_CASE("link command: harmless extras are accepted") {
 
 TEST_CASE("link command: options the driver owns are refused (CML3361)") {
     const char* reserved[] = {"/OUT:x.dll", "/PDB:x.pdb", "/BASE:0x1000000", "/DLL", "/NOENTRY", "/ENTRY:main", "/MACHINE:X86",
-                              "/DEBUG:FASTLINK", "/DEBUG", "/FUNCTIONPADMIN", "/NODEFAULTLIB", "/nologo"};
+                              "/DEBUG:FULL", "/DEBUG", "/FUNCTIONPADMIN", "/NODEFAULTLIB", "/nologo", "/demangle:no"};
     for (const char* arg : reserved) {
         INFO("argument " << arg);
         auto r = check_extra_link_args({arg});
@@ -289,6 +302,13 @@ TEST_CASE("link command: a long command line goes into a response file") {
     std::vector<std::string> one = {std::string(90, 'a')};
     CHECK_FALSE(needs_response_file("x", one, 100));
     CHECK(needs_response_file(std::string(20, 'p'), one, 100));
+}
+
+TEST_CASE("link command: the response-file limit is on the exact command-line length") {
+    const std::vector<std::string> args = {"/nologo", "/DLL", "C:\\a b\\x.obj"};
+    const std::string line = quote_argument("C:\\tools\\link.exe") + " " + join_command_line(args);
+    CHECK_FALSE(needs_response_file("C:\\tools\\link.exe", args, line.size()));      // exactly the limit: no file
+    CHECK(needs_response_file("C:\\tools\\link.exe", args, line.size() - 1));        // one over: file
 }
 
 TEST_CASE("link command: response file bytes are UTF-16LE with a BOM, one quoted argument per line") {
@@ -335,6 +355,20 @@ TEST_CASE("link output: lld-link errors and warnings") {
     CHECK(s.unresolved[0] == "?helper@@YAHH@Z");
 }
 
+TEST_CASE("link output: both linkers yield the decorated name") {
+    const LinkOutputSummary a = summarize_link_output(
+        "x.obj : error LNK2019: unresolved external symbol \"void __cdecl fixture_note(char const *)\" (?fixture_note@@YAXPEBD@Z) referenced in function f\r\n");
+    const LinkOutputSummary b = summarize_link_output(
+        "lld-link: error: undefined symbol: ?fixture_note@@YAXPEBD@Z\n>>> referenced by x.obj:(f)\n");
+    REQUIRE(a.unresolved.size() == 1);
+    REQUIRE(b.unresolved.size() == 1);
+    CHECK(a.unresolved[0] == "?fixture_note@@YAXPEBD@Z");
+    CHECK(b.unresolved[0] == a.unresolved[0]);
+    // data symbols, with and without the "referenced" tail
+    CHECK(summarize_link_output("lld-link: error: undefined symbol: ?g_tick@@3HA\n").unresolved.at(0) == "?g_tick@@3HA");
+    CHECK(summarize_link_output("a.obj : error LNK2001: unresolved external symbol ?g_tick@@3HA\r\n").unresolved.at(0) == "?g_tick@@3HA");
+}
+
 TEST_CASE("link output: banner lines and empty output produce nothing") {
     CHECK(summarize_link_output("").errors.empty());
     const LinkOutputSummary s = summarize_link_output("   Creating library x.lib and object x.exp\r\n");
@@ -357,7 +391,7 @@ TEST_CASE("linker family: PE facts from synthetic images") {
     CHECK(lld.minor == 0);
     CHECK_FALSE(lld.rich_header);
 
-    CHECK(read_pe_linker_facts(make_pe(14, 44, true, 0x10B)).valid);  // PE32 is still a PE
+    CHECK_FALSE(read_pe_linker_facts(make_pe(14, 44, true, 0x10B)).valid);  // PE32 (0x10B): only PE32+ is handled
 }
 
 TEST_CASE("linker family: malformed PE input is invalid, never a crash") {
@@ -380,17 +414,41 @@ TEST_CASE("linker family: malformed PE input is invalid, never a crash") {
     CHECK_FALSE(read_pe_linker_facts(pe).valid);
 }
 
-TEST_CASE("linker family: the PE alone decides when there is no PDB") {
+TEST_CASE("linker family: with no PDB a Rich header means link.exe") {
     auto link = decide_linker_family(read_pe_linker_facts(make_pe(14, 44, true)), nullptr);
     REQUIRE(link);
     CHECK(link->family == ToolFamily::Link);
     CHECK(link->from_pdb == ToolFamily::Unknown);
     CHECK(link->version[0] == 14);
     CHECK(link->version[1] == 44);
+    CHECK(link->warnings.empty());
+}
+
+TEST_CASE("linker family: no Rich header is not evidence; lld-link is only inferred from 14.0 without a PDB (warning)") {
+    // 14.0, no Rich, no PDB: inferred, with the CML3366 warning that says so
     auto lld = decide_linker_family(read_pe_linker_facts(make_pe(14, 0, false)), nullptr);
     REQUIRE(lld);
     CHECK(lld->family == ToolFamily::LldLink);
-    CHECK_FALSE(lld->evidence.empty());
+    REQUIRE(lld->warnings.size() == 1);
+    CHECK(lld->warnings[0].code == diag::kLinkerEvidenceConflict);
+    CHECK(lld->warnings[0].message.find("inferred") != std::string::npos);
+    // any other version without Rich header: unknown
+    auto other = decide_linker_family(read_pe_linker_facts(make_pe(14, 44, false)), nullptr);
+    REQUIRE_FALSE(other);
+    CHECK(other.error().code == diag::kLinkerFamilyUnknown);
+    // 14.0, no Rich, but a PDB that says nothing: unknown (the inference is for "PDB unavailable" only)
+    PdbLinkerFacts silent;
+    silent.linker_module_found = true;
+    auto s2 = decide_linker_family(read_pe_linker_facts(make_pe(14, 0, false)), &silent);
+    REQUIRE_FALSE(s2);
+    CHECK(s2.error().code == diag::kLinkerFamilyUnknown);
+    // the user override replaces the inference
+    DetectLinkerOptions o;
+    o.override_family = ToolFamily::Link;
+    auto ov = decide_linker_family(read_pe_linker_facts(make_pe(14, 0, false)), nullptr, o);
+    REQUIRE(ov);
+    CHECK(ov->family == ToolFamily::Link);
+    CHECK(ov->warnings.empty());
 }
 
 TEST_CASE("linker family: PDB facts, in order of strength") {
@@ -452,6 +510,7 @@ TEST_CASE("linker family: PE and PDB that agree produce no warning") {
     auto l = decide_linker_family(read_pe_linker_facts(make_pe(14, 0, false)), &g_lld);
     REQUIRE(l);
     CHECK(l->family == ToolFamily::LldLink);
+    CHECK(l->from_pe == ToolFamily::Unknown);
     CHECK(l->warnings.empty());
 }
 
@@ -461,10 +520,11 @@ TEST_CASE("linker family: PE and PDB that disagree warn (CML3366) and the PDB wi
     CHECK(r->family == ToolFamily::LldLink);
     REQUIRE(r->warnings.size() == 1);
     CHECK(r->warnings[0].code == diag::kLinkerEvidenceConflict);
+    // No Rich header contradicts nothing: the PDB decides without a warning.
     auto r2 = decide_linker_family(read_pe_linker_facts(make_pe(14, 0, false)), &g_link);
     REQUIRE(r2);
     CHECK(r2->family == ToolFamily::Link);
-    CHECK(r2->warnings.size() == 1);
+    CHECK(r2->warnings.empty());
 }
 
 TEST_CASE("linker family: the user override wins and is reported") {

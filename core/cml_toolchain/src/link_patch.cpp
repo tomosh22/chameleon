@@ -74,6 +74,9 @@ PeLinkerFacts read_pe_linker_facts(std::span<const std::byte> bytes) noexcept {
         return facts;
     }
     const std::size_t opt = static_cast<std::size_t>(lfanew) + 24;
+    if (std::to_integer<unsigned>(bytes[opt]) != 0x0B || std::to_integer<unsigned>(bytes[opt + 1]) != 0x02) {
+        return facts;  // not PE32+ (0x20B): only x64 images are handled
+    }
     facts.major = std::to_integer<unsigned>(bytes[opt + 2]);
     facts.minor = std::to_integer<unsigned>(bytes[opt + 3]);
     facts.valid = true;
@@ -135,20 +138,21 @@ Result<LinkerDetection> decide_linker_family(const PeLinkerFacts& pe, const PdbL
     char buf[256];
 
     // ---- the PE ------------------------------------------------------------------------------------------
+    // A Rich header is written by link.exe only: positive evidence. Its absence is NOT evidence of lld-link (other
+    // linkers and tools strip it, /EMITTOOLVERSIONINFO:NO removes it from link.exe).
     if (pe.valid) {
         std::snprintf(buf, sizeof(buf), "PE: linker version %u.%u, Rich header %s", pe.major, pe.minor,
                       pe.rich_header ? "present" : "absent");
         d.evidence.push_back(buf);
         if (pe.rich_header) {
             d.from_pe = ToolFamily::Link;
-            d.evidence.push_back("PE: Rich header present: written by link.exe, never by lld-link -> link");
+            d.evidence.push_back("PE: Rich header present: written by link.exe -> link");
         } else {
-            d.from_pe = ToolFamily::LldLink;
-            d.evidence.push_back("PE: no Rich header: not link.exe -> lld-link");
+            d.evidence.push_back("PE: no Rich header: not evidence of any linker");
         }
         d.version = {pe.major, pe.minor, 0, 0};
     } else {
-        d.evidence.push_back("PE: no usable PE32/PE32+ header");
+        d.evidence.push_back("PE: no usable PE32+ header");
     }
 
     // ---- the PDB -----------------------------------------------------------------------------------------
@@ -200,6 +204,15 @@ Result<LinkerDetection> decide_linker_family(const PeLinkerFacts& pe, const PdbL
             "If the PDB belongs to another build, rebuild the module; or choose the linker explicitly."));
     }
     d.family = d.from_pdb != ToolFamily::Unknown ? d.from_pdb : d.from_pe;
+    if (d.family == ToolFamily::Unknown && pdb == nullptr && pe.valid && pe.major == 14 && pe.minor == 0 && !pe.rich_header) {
+        // lld-link writes linker version 14.0 and no Rich header; with no PDB to say so that is all there is.
+        d.family = ToolFamily::LldLink;
+        d.from_pe = ToolFamily::LldLink;
+        d.evidence.push_back("PE: linker version 14.0, no Rich header and no PDB -> lld-link (inferred)");
+        d.warnings.push_back(Diag::make(diag::kLinkerEvidenceConflict,
+                                        "the linker of the module is inferred to be lld-link from its PE linker version 14.0 alone (no PDB)",
+                                        "Provide the module's PDB or choose the linker explicitly."));
+    }
     if (d.family == ToolFamily::Unknown) {
         return Diag::make(diag::kLinkerFamilyUnknown, "neither the PE nor the PDB of the module identifies its linker",
                           "Choose the linker explicitly (link or lld-link).");
@@ -209,13 +222,15 @@ Result<LinkerDetection> decide_linker_family(const PeLinkerFacts& pe, const PdbL
 
 Result<LinkerDetection> detect_module_linker(const std::string& pe_path, const pdb::OpenOptions& pdb_options,
                                              const DetectLinkerOptions& options) {
-    Result<std::vector<std::byte>> bytes = pe::read_file(pe_path);
-    if (!bytes) {
-        return Diag::make(diag::kCannotReadModule, "cannot read the module '" + pe_path + "': " + bytes.error().message,
-                          "Check that the module file exists and is readable.");
+    // cml_pe refuses what is not an x64 PE32+ image (CML1300 unreadable, CML1303 PE32, ...): its diagnostic is returned.
+    PeLinkerFacts pe_facts;
+    {
+        Result<pe::OwnedImage> image = pe::load_image_file(pe_path);
+        if (!image) {
+            return image.error();
+        }
+        pe_facts = read_pe_linker_facts(image->bytes);
     }
-    const PeLinkerFacts pe_facts = read_pe_linker_facts(*bytes);
-    bytes = std::vector<std::byte>();
 
     // The index maps the PDB read-only for as long as it lives (ADR-0017): it is dropped before this function returns,
     // so nothing here can make a later relink of the module fail with ERROR_USER_MAPPED_FILE.
@@ -328,11 +343,17 @@ Result<void> check_extra_link_args(const std::vector<std::string>& extra_args) {
                 if (tok == "REF") {
                     return forbidden(arg, "/OPT:REF removes unreferenced COMDATs and the publics that locate them");
                 }
-                if (tok == "ICF" || tok.rfind("ICF=", 0) == 0) {
+                if (tok == "ICF" || tok.rfind("ICF=", 0) == 0 || tok == "SAFEICF" || tok.rfind("SAFEICF=", 0) == 0) {
                     return forbidden(arg, "/OPT:ICF folds identical sections, so two sections can share one address");
                 }
             }
             continue;
+        }
+        if (p.name == "PROFILE") {
+            return forbidden(arg, "/PROFILE turns on incremental-incompatible profiling changes and is not a patch option");
+        }
+        if (p.name == "DEBUG" && (upper(p.value) == "NONE" || upper(p.value) == "FASTLINK")) {
+            return forbidden(arg, "the patch PDB must be a full PDB (/DEBUG:FULL)");
         }
         if (p.name.rfind("FORCE", 0) == 0) {
             return forbidden(arg, "/FORCE can leave symbols unresolved or duplicated and produces jumps into nowhere");
@@ -348,7 +369,7 @@ Result<void> check_extra_link_args(const std::vector<std::string>& extra_args) {
         }
         static const char* const kReserved[] = {"OUT",   "PDB",   "BASE",           "DLL",   "ENTRY",
                                                 "NOENTRY", "MACHINE", "DEBUG",      "FUNCTIONPADMIN", "FIXED",
-                                                "NOLOGO", "DRIVER"};
+                                                "NOLOGO", "DRIVER", "DEMANGLE"};
         for (const char* r : kReserved) {
             if (p.name == r) {
                 return Diag::make(diag::kReservedLinkerOption, "the linker option '" + arg + "' is set by the patch linker driver",
@@ -397,6 +418,9 @@ Result<std::vector<std::string>> build_link_command(const LinkCommandSpec& spec)
                                      "/BASE:" + format_base_argument(spec.base),
                                      "/PDB:" + spec.out_pdb,
                                      "/OUT:" + spec.out_dll};
+    if (spec.family == ToolFamily::LldLink) {
+        args.push_back("/demangle:no");  // decorated names in diagnostics, like link.exe's
+    }
     if (!spec.ignore_warnings.empty()) {
         std::string ignore = "/IGNORE:";
         for (std::size_t i = 0; i < spec.ignore_warnings.size(); ++i) {
@@ -476,6 +500,28 @@ std::vector<std::byte> render_response_file(std::span<const std::string> args) {
     return out;
 }
 
+namespace {
+
+// The decorated name from the text after "unresolved external symbol " / "undefined symbol: ":
+//   "int __cdecl helper(int)" (?helper@@YAHH@Z) referenced in function ...   -> ?helper@@YAHH@Z   (link.exe)
+//   ?helper@@YAHH@Z                                                          -> ?helper@@YAHH@Z   (lld-link /demangle:no)
+//   g_tick referenced in function ...                                        -> g_tick
+std::string extract_symbol_name(const std::string& rest) {
+    if (!rest.empty() && rest[0] == '"') {
+        const std::size_t close = rest.find("\" (", 1);
+        if (close != std::string::npos) {
+            const std::size_t end = rest.find(')', close + 3);
+            if (end != std::string::npos) {
+                return rest.substr(close + 3, end - (close + 3));
+            }
+        }
+    }
+    const std::size_t ref = rest.find(" referenced");
+    return trim(ref == std::string::npos ? std::string_view(rest) : std::string_view(rest).substr(0, ref));
+}
+
+}  // namespace
+
 LinkOutputSummary summarize_link_output(std::string_view output) {
     LinkOutputSummary s;
     std::size_t pos = 0;
@@ -497,30 +543,16 @@ LinkOutputSummary summarize_link_output(std::string_view output) {
             s.errors.push_back(line);
             static const char kMsvc[] = "unresolved external symbol ";
             static const char kLld[] = "undefined symbol: ";
+            std::string rest;
             const std::size_t m = line.find(kMsvc);
+            const std::size_t l = line.find(kLld);
             if (m != std::string::npos) {
-                std::string rest = line.substr(m + sizeof(kMsvc) - 1);
-                std::string name;
-                if (!rest.empty() && rest[0] == '"') {
-                    // "int __cdecl foo(void)" (?foo@@YAHXZ) referenced in function ...
-                    const std::size_t close = rest.find("\" (", 1);
-                    if (close != std::string::npos) {
-                        const std::size_t end = rest.find(')', close + 3);
-                        if (end != std::string::npos) {
-                            name = rest.substr(close + 3, end - (close + 3));
-                        }
-                    }
-                }
-                if (name.empty()) {
-                    const std::size_t ref = rest.find(" referenced");
-                    name = trim(ref == std::string::npos ? std::string_view(rest) : std::string_view(rest).substr(0, ref));
-                }
-                s.unresolved.push_back(name);
-            } else {
-                const std::size_t l = line.find(kLld);
-                if (l != std::string::npos) {
-                    s.unresolved.push_back(trim(std::string_view(line).substr(l + sizeof(kLld) - 1)));
-                }
+                rest = line.substr(m + sizeof(kMsvc) - 1);
+            } else if (l != std::string::npos) {
+                rest = line.substr(l + sizeof(kLld) - 1);
+            }
+            if (!rest.empty()) {
+                s.unresolved.push_back(extract_symbol_name(rest));
             }
         } else if (msvc_warning || lld_warning) {
             s.warnings.push_back(line);

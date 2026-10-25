@@ -29,6 +29,16 @@ std::string env_value(const char* name) {
     return out;
 }
 
+// Absolute, lexically normal (the linker runs with cwd = out_dir, so every path it gets must not depend on that).
+std::string absolute_normal(const std::string& path) {
+    std::error_code ec;
+    fs::path p = fs::absolute(detail::to_path(path), ec);
+    if (ec) {
+        p = detail::to_path(path);
+    }
+    return detail::to_utf8(p.lexically_normal());
+}
+
 void add_candidate(std::vector<std::string>& out, const fs::path& p) {
     std::error_code ec;
     if (fs::is_regular_file(p, ec) && !ec) {
@@ -101,7 +111,8 @@ Result<LinkedPatch> link_patch(const LinkPatchRequest& request, LinkTrace* trace
         return Diag::make(diag::kLinkCancelled, "linking '" + request.name + "' was cancelled", "Save the file again to restart the patch.");
     }
 
-    const fs::path dir = detail::to_path(request.out_dir);
+    const std::string out_dir_abs = absolute_normal(request.out_dir);
+    const fs::path dir = detail::to_path(out_dir_abs);
     std::error_code ec;
     fs::create_directories(dir, ec);
     if (ec) {
@@ -118,10 +129,10 @@ Result<LinkedPatch> link_patch(const LinkPatchRequest& request, LinkTrace* trace
     LinkCommandSpec spec;
     spec.family = request.linker.family;
     for (const PatchObjectInput& o : request.objects) {
-        spec.objects.push_back(o.path);
+        spec.objects.push_back(absolute_normal(o.path));
     }
     if (!request.binding_object.empty()) {
-        spec.objects.push_back(request.binding_object);
+        spec.objects.push_back(absolute_normal(request.binding_object));
     } else {
         // Nothing to bind: link a padding binding object anyway (see make_padding_binding_object()).
         Result<std::vector<std::byte>> pad = make_padding_binding_object();
@@ -142,7 +153,11 @@ Result<LinkedPatch> link_patch(const LinkPatchRequest& request, LinkTrace* trace
     spec.out_dll = out_dll;
     spec.out_pdb = out_pdb;
     spec.base = request.base;
-    spec.extra_args = request.extra_args;
+    // `@file` arguments are resolved against the process's cwd and passed as absolute paths: the file that is checked
+    // for forbidden options is then the file the linker (cwd = out_dir) reads.
+    for (const std::string& a : request.extra_args) {
+        spec.extra_args.push_back(a.size() > 1 && a[0] == '@' ? "@" + absolute_normal(a.substr(1)) : a);
+    }
     spec.ignore_warnings = request.ignore_warnings;
     Result<std::vector<std::string>> args = build_link_command(spec);
     if (!args) {
@@ -152,9 +167,9 @@ Result<LinkedPatch> link_patch(const LinkPatchRequest& request, LinkTrace* trace
 
     ProcessSpec ps;
     ps.exe = request.linker.path;
-    ps.cwd = request.out_dir;
+    ps.cwd = out_dir_abs;
     ps.timeout_ms = request.timeout_ms;
-    ps.max_command_line = 32000;  // run_process must not wrap a second time: the response file is written here
+    ps.max_command_line = request.max_command_line;  // the same measure as needs_response_file(): run_process never wraps a second time
     ps.args = *args;
     if (request.force_response_file || needs_response_file(request.linker.path, *args, request.max_command_line)) {
         const fs::path rsp = dir / (request.name + ".rsp");

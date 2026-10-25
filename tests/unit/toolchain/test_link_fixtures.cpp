@@ -809,3 +809,92 @@ TEST_CASE("link patch: evidence for the lld-link crash on a patch without bindin
         run_variant("original_with_pad_binding_obj", {original, padobj.string()}, {}, {});
     }
 }
+
+TEST_CASE("link patch: relative out_dir, relative object paths and a relative @file are resolved against the process cwd") {
+    ModuleUnderTest m = open_module("basic");
+    const auto edits = edits_of("basic");
+    REQUIRE(!edits.empty());
+    Prepared p = prepare("basic", edits.front(), *m.pdb);
+    ToolInfo tool;
+    {
+        ResolveLinkerOptions ro;
+        ro.search_dirs = search_dirs_for(m.detection.family);
+        auto r = resolve_linker(m.detection.family, ro);
+        REQUIRE_MESSAGE(r, r.error().format());
+        tool = *r;
+    }
+    std::error_code ec;
+    const fs::path cwd = fs::current_path();
+    auto rel = [&](const fs::path& abs) { return fs::relative(abs, cwd, ec); };
+    const fs::path rel_out = rel(work_root() / "relative_out");
+    const fs::path ok_rsp = work_root() / "extra_ok.rsp";
+    const fs::path bad_rsp = work_root() / "extra_bad.rsp";
+    {
+        std::ofstream(ok_rsp) << "/IGNORE:4099\n";
+        std::ofstream(bad_rsp) << "/IGNORE:4099\n/OPT:REF\n";
+    }
+    const fs::path rel_ok = rel(ok_rsp);
+    const fs::path rel_bad = rel(bad_rsp);
+    if (ec || rel_out.empty() || rel_out.is_absolute() || rel_ok.is_absolute()) {
+        evidence("LINK-RELATIVE skipped: no relative path from %s to %s", cwd.string().c_str(), work_root().string().c_str());
+        return;
+    }
+    for (PatchObjectInput& o : p.objects) {
+        o.path = rel(o.path).string();
+    }
+    if (!p.binding.empty()) {
+        p.binding = rel(p.binding).string();
+    }
+    LinkPatchRequest req = request_for(p, tool, "unused");
+    req.out_dir = rel_out.string();
+    req.extra_args = {"@" + rel_ok.string()};
+    LinkTrace trace;
+    auto lp = link_patch(req, &trace);
+    REQUIRE_MESSAGE(lp, lp.error().format() << "\n" << trace.output);
+    CHECK(fs::path(lp->dll_path).is_absolute());
+    CHECK(fs::exists(lp->dll_path));
+    CHECK(trace.command_line.find(rel_ok.string()) == std::string::npos);  // the linker got the absolute path
+    evidence("LINK-RELATIVE basic linker=%s ok out_dir=%s rsp=%s -> dll=%s", to_string(lp->linker_family), rel_out.string().c_str(),
+             rel_ok.string().c_str(), lp->dll_path.c_str());
+    // The file that is checked is the file that is linked: a relative @file with /OPT:REF is refused before the linker runs.
+    req.extra_args = {"@" + rel_bad.string()};
+    LinkTrace bad_trace;
+    auto refused = link_patch(req, &bad_trace);
+    REQUIRE_FALSE(refused);
+    CHECK(refused.error().code == diag::kForbiddenLinkerOption);
+    CHECK(bad_trace.command_line.empty());
+}
+
+TEST_CASE("link patch: the response-file threshold is the exact length of the command line that is run") {
+    ModuleUnderTest m = open_module("basic");
+    const auto edits = edits_of("basic");
+    REQUIRE(!edits.empty());
+    Prepared p = prepare("basic", edits.front(), *m.pdb);
+    ResolveLinkerOptions ro;
+    ro.search_dirs = search_dirs_for(m.detection.family);
+    auto tool = resolve_linker(m.detection.family, ro);
+    REQUIRE_MESSAGE(tool, tool.error().format());
+    LinkPatchRequest req = request_for(p, *tool, "boundary");
+    LinkTrace plain;
+    auto first = link_patch(req, &plain);
+    REQUIRE_MESSAGE(first, first.error().format() << "\n" << plain.output);
+    CHECK(plain.response_file.empty());
+    const std::size_t length = plain.command_line.size();
+    REQUIRE(length > 100);
+    // limit == length: no response file and run_process does not wrap a second time
+    req.max_command_line = length;
+    LinkTrace at_limit;
+    auto a = link_patch(req, &at_limit);
+    REQUIRE_MESSAGE(a, a.error().format() << "\n" << at_limit.output);
+    CHECK(at_limit.response_file.empty());
+    CHECK(at_limit.command_line == plain.command_line);
+    // limit == length - 1: exactly one response file, passed as the only argument
+    req.max_command_line = length - 1;
+    LinkTrace over;
+    auto b = link_patch(req, &over);
+    REQUIRE_MESSAGE(b, b.error().format() << "\n" << over.output);
+    CHECK_FALSE(over.response_file.empty());
+    CHECK(over.command_line.find(".rsp") != std::string::npos);
+    CHECK(over.command_line.size() < length);
+    evidence("LINK-BOUNDARY basic linker=%s command_line_chars=%zu at_limit_rsp=no one_over_rsp=yes", to_string(tool->family), length);
+}
