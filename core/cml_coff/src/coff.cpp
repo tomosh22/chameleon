@@ -20,6 +20,7 @@ constexpr std::size_t kRelocationSize = 10;
 constexpr std::size_t kRegularSymbolSize = 18;
 constexpr std::size_t kBigobjSymbolSize = 20;
 constexpr std::uint32_t kNoPos = 0xFFFFFFFFu;
+constexpr std::uint32_t kMaxRegularSections = 65279;
 
 // {D1BA02C1... } ANON_OBJECT_HEADER_BIGOBJ class id, as stored in the file.
 constexpr std::array<std::uint8_t, 16> kBigobjClassId = {0xC7, 0xA1, 0xBA, 0xD1, 0xEE, 0xBA, 0xA9, 0x4B,
@@ -268,6 +269,14 @@ Result<Object> Object::parse(ByteSpan b) {
         h.characteristics = static_cast<std::uint16_t>(rd16(b, 18));
         h.header_size = kRegularHeaderSize;
         h.symbol_record_size = kRegularSymbolSize;
+        if (h.section_count > kMaxRegularSections) {
+            // As LLVM does: 0xFFFE / 0xFFFF are the debug / absolute section numbers, so a regular
+            // object cannot have more than 65279 sections.
+            return make_diag(1216,
+                             format("regular COFF object declares %u sections; the limit is 65279 (larger objects need the /bigobj format)",
+                                    static_cast<unsigned>(h.section_count)),
+                             "The object is corrupt; rebuild it (compile with /bigobj if it genuinely needs this many sections).");
+        }
     }
     h.section_table_offset = h.header_size + h.optional_header_size;
     o.header_bytes_ = b.subspan(0, h.header_size);
@@ -379,7 +388,8 @@ Result<Object> Object::parse(ByteSpan b) {
         }
 
         // Raw data.
-        if (s.pointer_to_raw_data != 0 && s.size_of_raw_data != 0) {
+        // IMAGE_SCN_CNT_UNINITIALIZED_DATA sections have no file contents whatever PointerToRawData says.
+        if ((s.characteristics & scn::CntUninitializedData) == 0 && s.pointer_to_raw_data != 0 && s.size_of_raw_data != 0) {
             if (!in_range(n, s.pointer_to_raw_data, s.size_of_raw_data)) {
                 return make_diag(1205,
                                  format("section %u '%.*s' raw data (offset %u, size %u) extends past the end of the %zu-byte object",
@@ -517,9 +527,13 @@ Result<Object> Object::parse(ByteSpan b) {
         const Symbol& s = o.symbols_[pos];
         if (s.section_number > 0) {
             const std::size_t sec = static_cast<std::size_t>(s.section_number);
-            if (o.section_def_pos_[sec] == kNoPos && o.section_definition(s).has_value()) {
-                o.section_def_pos_[sec] = pos;
-            } else if (o.leader_pos_[sec] == kNoPos && !o.section_definition(s).has_value()) {
+            const bool is_def = o.section_definition(s).has_value();
+            if (o.section_def_pos_[sec] == kNoPos) {
+                if (is_def) {
+                    o.section_def_pos_[sec] = pos;
+                }
+                // A symbol of this section that precedes its section-definition symbol is not the leader.
+            } else if (o.leader_pos_[sec] == kNoPos && !is_def) {
                 o.leader_pos_[sec] = pos;
             }
         }

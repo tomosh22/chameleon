@@ -19,6 +19,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "cml/util/result.h"
@@ -314,9 +315,16 @@ private:
 Result<std::vector<std::byte>> read_file(const std::string& path);  // CML1300
 
 // An on-disk Image together with the bytes it views.
+// Copying is deleted: a copy's Image would still point into the original's buffer.
 struct OwnedImage {
     std::vector<std::byte> bytes;
     Image image;
+
+    OwnedImage(std::vector<std::byte> b, Image i) : bytes(std::move(b)), image(std::move(i)) {}
+    OwnedImage(const OwnedImage&) = delete;
+    OwnedImage& operator=(const OwnedImage&) = delete;
+    OwnedImage(OwnedImage&&) noexcept = default;
+    OwnedImage& operator=(OwnedImage&&) noexcept = default;
 };
 Result<OwnedImage> load_image_file(const std::string& path);
 

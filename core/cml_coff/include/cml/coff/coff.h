@@ -21,6 +21,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "cml/util/result.h"
@@ -396,9 +397,16 @@ private:
 Result<std::vector<std::byte>> read_file(const std::string& path);
 
 // An Object together with the bytes it views (the bytes live on the heap, so moving is safe).
+// Copying is deleted: a copy's Object would still point into the original's buffer.
 struct OwnedObject {
     std::vector<std::byte> bytes;
     Object object;
+
+    OwnedObject(std::vector<std::byte> b, Object o) : bytes(std::move(b)), object(std::move(o)) {}
+    OwnedObject(const OwnedObject&) = delete;
+    OwnedObject& operator=(const OwnedObject&) = delete;
+    OwnedObject(OwnedObject&&) noexcept = default;
+    OwnedObject& operator=(OwnedObject&&) noexcept = default;
 };
 Result<OwnedObject> load_object_file(const std::string& path);
 

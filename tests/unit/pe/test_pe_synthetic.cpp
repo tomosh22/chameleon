@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <ostream>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -203,7 +204,8 @@ TEST_CASE("pe synthetic: RVA <-> file offset mapping differs between the two lay
     CHECK(d.rva_to_offset(kRdataRva + 0x123) == kRdataRaw + 0x123u);
     CHECK(d.rva_to_offset(kPdataRva) == kPdataRaw);
     CHECK_FALSE(d.rva_to_offset(0x0F00).has_value());           // gap between headers and .text
-    CHECK(d.rva_to_offset(kPdataRva + 0x30).has_value());        // past VirtualSize but inside raw data
+    CHECK(d.rva_to_offset(kPdataRva + 0x23).has_value());        // last byte of VirtualSize (0x24)
+    CHECK_FALSE(d.rva_to_offset(kPdataRva + 0x24).has_value());  // raw padding past VirtualSize is never mapped
     CHECK_FALSE(d.rva_to_offset(kPdataRva + 0x40).has_value());  // past the raw data
     CHECK_FALSE(d.rva_to_offset(kImageSize).has_value());
     CHECK(d.offset_to_rva(kTextRaw) == kTextRva);
@@ -578,4 +580,135 @@ TEST_CASE("pe robustness: every truncation and every byte flip is handled") {
             }
         }
     }
+}
+
+TEST_CASE("pe synthetic: only min(VirtualSize, SizeOfRawData) bytes are file-backed") {
+    const std::size_t pdata_header = kSections + 2 * 40;
+    // (a) VirtualSize 0x80 > SizeOfRawData 0x40: the tail is zero-fill.
+    PeBytes disk = build_pe_on_disk();
+    w32(disk, pdata_header + 8, 0x80);
+    const Image d = parse_ok(disk, ImageKind::OnDisk);
+    CHECK(d.section_for_rva(kPdataRva + 0x7F) == &d.sections()[2]);
+    CHECK(d.read_rva(kPdataRva + 0x3C, 4).has_value());
+    CHECK(d.rva_to_offset(kPdataRva + 0x3F).has_value());
+    CHECK_FALSE(d.rva_to_offset(kPdataRva + 0x40).has_value());
+    const auto zf = d.read_rva(kPdataRva + 0x40, 4);
+    REQUIRE_FALSE(zf.has_value());
+    CHECK(zf.error().code == 1307u);
+    CHECK(d.read_rva(kPdataRva + 0x3E, 4).error().code == 1308u);  // crosses from file-backed into zero-fill
+    // In memory the loader's zero-fill is real memory, so it reads as zeros.
+    PeBytes mem = build_pe_in_memory(disk);
+    const Image m = parse_ok(mem, ImageKind::InMemory);
+    const auto mz = m.read_rva(kPdataRva + 0x40, 4);
+    REQUIRE(mz.has_value());
+    CHECK(std::to_integer<int>((*mz)[0]) == 0);
+
+    // (b) VirtualSize 0x20 < SizeOfRawData 0x40: raw bytes past VirtualSize are padding, never mapped.
+    PeBytes disk2 = build_pe_on_disk();
+    w32(disk2, pdata_header + 8, 0x20);
+    const Image d2 = parse_ok(disk2, ImageKind::OnDisk);
+    CHECK(d2.section_for_rva(kPdataRva + 0x1F) == &d2.sections()[2]);
+    CHECK(d2.section_for_rva(kPdataRva + 0x20) == nullptr);
+    CHECK(d2.read_rva(kPdataRva + 0x1C, 4).has_value());
+    CHECK(d2.read_rva(kPdataRva + 0x1E, 4).error().code == 1308u);
+    CHECK(d2.read_rva(kPdataRva + 0x20, 4).error().code == 1307u);
+    CHECK_FALSE(d2.offset_to_rva(kPdataRaw + 0x20).has_value());
+    CHECK(d2.offset_to_rva(kPdataRaw + 0x1F) == kPdataRva + 0x1Fu);
+}
+
+TEST_CASE("pe synthetic: load config uses the structure's own Size, not the directory size") {
+    for (ImageKind kind : {ImageKind::OnDisk, ImageKind::InMemory}) {
+        const PeBytes disk = build_pe_on_disk();
+        const PeBytes good = kind == ImageKind::OnDisk ? disk : build_pe_in_memory(disk);
+        PeBytes b = good;
+        w32(b, kDirectories + 10 * 8 + 4, 0x10);  // directory claims 16 bytes, structure Size says 0x98
+        auto lc = parse_ok(b, kind).load_config();
+        REQUIRE_MESSAGE(lc.has_value(), lc.error().format());
+        CHECK(lc->has_guard_flags);
+        CHECK(lc->guard_flags == (guard::CfInstrumented | guard::CfFunctionTablePresent));
+        CHECK(lc->guard_cf_function_count == 5u);
+
+        // A Size larger than the image has bytes for is bounded by what is available.
+        b = good;
+        w32(b, kind == ImageKind::OnDisk ? rdata_off(kLoadConfig) : static_cast<std::size_t>(kLoadConfig), 0x7FFFFFFF);
+        lc = parse_ok(b, kind).load_config();
+        REQUIRE_MESSAGE(lc.has_value(), lc.error().format());
+        CHECK(lc->size == 0x7FFFFFFFu);
+        CHECK(lc->guard_flags == (guard::CfInstrumented | guard::CfFunctionTablePresent));
+    }
+}
+
+TEST_CASE("pe synthetic: bound imports without an import name table fail cleanly") {
+    for (ImageKind kind : {ImageKind::OnDisk, ImageKind::InMemory}) {
+        const PeBytes disk = build_pe_on_disk();
+        PeBytes b = kind == ImageKind::OnDisk ? disk : build_pe_in_memory(disk);
+        const std::size_t imp = kind == ImageKind::OnDisk ? rdata_off(kImportDir) : static_cast<std::size_t>(kImportDir);
+        w32(b, imp + 0, 0);           // OriginalFirstThunk = 0
+        w32(b, imp + 4, 0x5F123456);  // TimeDateStamp != 0: bound
+        const auto im = parse_ok(b, kind).imports();
+        REQUIRE_FALSE(im.has_value());
+        CHECK(im.error().code == 1311u);
+        CHECK(im.error().message.find("bound imports") != std::string::npos);
+    }
+}
+
+TEST_CASE("pe synthetic: CodeView scan skips non-RSDS entries and finds a later RSDS") {
+    for (ImageKind kind : {ImageKind::OnDisk, ImageKind::InMemory}) {
+        const PeBytes disk = build_pe_on_disk();
+        PeBytes b = kind == ImageKind::OnDisk ? disk : build_pe_in_memory(disk);
+        const auto at = [&](std::uint32_t rva) {
+            return kind == ImageKind::OnDisk ? rdata_off(rva) : static_cast<std::size_t>(rva);
+        };
+        // Entry 0: the existing record, turned into NB10. Entry 1: a fresh RSDS record at 0x2780.
+        w32(b, at(kRsds), 0x3031424E);
+        const std::size_t e0 = at(kDebugDir);
+        const std::size_t e1 = e0 + 28;
+        for (std::size_t i = 0; i < 28; ++i) {
+            b[e1 + i] = b[e0 + i];
+        }
+        w32(b, e1 + 20, 0x2780);
+        w32(b, e1 + 24, static_cast<std::uint32_t>(rdata_off(0x2780)));
+        const std::size_t rec = at(0x2780);
+        w32(b, rec, 0x53445352);
+        for (std::size_t i = 0; i < 16; ++i) {
+            b[rec + 4 + i] = static_cast<std::uint8_t>(0xA0 + i);
+        }
+        w32(b, rec + 20, 7);
+        wstr(b, rec + 24, "C:\\build\\test.pdb");
+        w32(b, kDirectories + 6 * 8 + 4, 56);  // two entries
+
+        const Image img = parse_ok(b, kind);
+        const auto cv = img.codeview();
+        REQUIRE_MESSAGE(cv.has_value(), cv.error().format());
+        REQUIRE(cv->present);
+        CHECK(cv->age == 7u);
+        CHECK(cv->guid.data4[0] == 0xA8u);
+        CHECK(cv->pdb_path == "C:\\build\\test.pdb");
+
+        // With only the NB10 entry left there is no RSDS: CML1313.
+        w32(b, kDirectories + 6 * 8 + 4, 28);
+        const auto none = parse_ok(b, kind).codeview();
+        REQUIRE_FALSE(none.has_value());
+        CHECK(none.error().code == 1313u);
+    }
+}
+
+TEST_CASE("pe: OwnedImage is move-only and a move keeps the views valid") {
+    static_assert(!std::is_copy_constructible_v<OwnedImage>);
+    static_assert(!std::is_copy_assignable_v<OwnedImage>);
+    static_assert(std::is_nothrow_move_constructible_v<OwnedImage>);
+    static_assert(std::is_nothrow_move_assignable_v<OwnedImage>);
+
+    const PeBytes disk = build_pe_on_disk();
+    std::vector<std::byte> bytes(pe_span(disk).begin(), pe_span(disk).end());
+    auto parsed = Image::parse(ByteSpan(bytes.data(), bytes.size()), ImageKind::OnDisk);
+    REQUIRE(parsed.has_value());
+    const std::byte* heap = bytes.data();
+    OwnedImage a(std::move(bytes), std::move(parsed).value());
+    OwnedImage b(std::move(a));  // move construct
+    CHECK(b.image.bytes().data() == b.bytes.data());
+    CHECK(b.bytes.data() == heap);
+    const auto ex = b.image.exports();
+    REQUIRE(ex.has_value());
+    CHECK(ex->find_by_name("alpha") != nullptr);
 }

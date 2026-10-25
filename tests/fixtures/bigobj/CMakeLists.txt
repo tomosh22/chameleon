@@ -10,10 +10,10 @@
 # clang-cl: accepts /bigobj but ignores it (verified with clang 18); LLVM switches to the bigobj
 # format only when an object has more than 65279 sections (below that it writes a regular object
 # whose 16-bit section numbers run up to 65279). Every function costs it 2 sections in
-# RelWithDebInfo and 4 in Debug (.text, .xdata/.pdata, .debug$S), so N is large enough to cross the
-# threshold in both.
+# RelWithDebInfo and 4 in Debug (.text, .xdata/.pdata, .debug$S). N = 66000 exceeds 65279 even at
+# ONE section per function, so the object is bigobj in every configuration (Release, MinSizeRel too).
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    set(CML_BIGOBJ_FUNCTION_COUNT 40000)
+    set(CML_BIGOBJ_FUNCTION_COUNT 66000)
 else()
     set(CML_BIGOBJ_FUNCTION_COUNT 200)
 endif()

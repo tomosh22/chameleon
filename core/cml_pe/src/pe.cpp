@@ -363,9 +363,22 @@ const SectionHeader* Image::find_section(std::string_view name) const noexcept {
     return nullptr;
 }
 
+namespace {
+// Address-mapping rule (documented in docs/wp/WP-02.md): the loader maps VirtualSize bytes of a
+// section (SizeOfRawData when VirtualSize is 0). Of those, only the first
+// min(VirtualSize, SizeOfRawData) bytes come from the file; the rest is zero-fill. Raw bytes past
+// VirtualSize are file padding and are never mapped.
+std::uint64_t mapped_extent(const SectionHeader& s) noexcept {
+    return s.virtual_size != 0 ? s.virtual_size : s.size_of_raw_data;
+}
+std::uint64_t file_backed_extent(const SectionHeader& s) noexcept {
+    return std::min<std::uint64_t>(mapped_extent(s), s.size_of_raw_data);
+}
+}  // namespace
+
 const SectionHeader* Image::section_for_rva(std::uint32_t rva) const noexcept {
     for (const SectionHeader& s : sections_) {
-        const std::uint64_t extent = std::max<std::uint64_t>(s.virtual_size, s.size_of_raw_data);
+        const std::uint64_t extent = mapped_extent(s);
         if (rva >= s.virtual_address && static_cast<std::uint64_t>(rva) - s.virtual_address < extent) {
             return &s;
         }
@@ -385,7 +398,7 @@ std::optional<std::uint64_t> Image::rva_to_offset(std::uint32_t rva) const noexc
         return std::nullopt;
     }
     const std::uint64_t in_section = static_cast<std::uint64_t>(rva) - s->virtual_address;
-    if (in_section >= s->size_of_raw_data) {
+    if (in_section >= file_backed_extent(*s)) {
         return std::nullopt;
     }
     const std::uint64_t off = static_cast<std::uint64_t>(s->pointer_to_raw_data) + in_section;
@@ -400,7 +413,7 @@ std::optional<std::uint32_t> Image::offset_to_rva(std::uint64_t offset) const no
         return static_cast<std::uint32_t>(offset);
     }
     for (const SectionHeader& s : sections_) {
-        if (offset >= s.pointer_to_raw_data && offset - s.pointer_to_raw_data < s.size_of_raw_data) {
+        if (offset >= s.pointer_to_raw_data && offset - s.pointer_to_raw_data < file_backed_extent(s)) {
             return static_cast<std::uint32_t>(s.virtual_address + (offset - s.pointer_to_raw_data));
         }
     }
@@ -433,8 +446,8 @@ Result<ByteSpan> region_at(const Image& img, std::uint32_t rva) {
         return make_diag(1307, format("RVA 0x%X is not inside any section", static_cast<unsigned>(rva)), "The image is corrupt.");
     }
     const std::uint64_t in_section = static_cast<std::uint64_t>(rva) - s->virtual_address;
-    if (in_section >= s->size_of_raw_data) {
-        return make_diag(1307, format("RVA 0x%X is in section '%.*s' but beyond its file data (zero-fill)", static_cast<unsigned>(rva),
+    if (in_section >= file_backed_extent(*s)) {
+        return make_diag(1307, format("RVA 0x%X is in section '%.*s' but beyond its file-backed bytes (zero-fill)", static_cast<unsigned>(rva),
                                       static_cast<int>(s->name().size()), s->name().data()),
                          "The image is corrupt.");
     }
@@ -444,7 +457,7 @@ Result<ByteSpan> region_at(const Image& img, std::uint32_t rva) {
                                       static_cast<unsigned long long>(off)),
                          "The image is truncated.");
     }
-    const std::uint64_t avail = std::min<std::uint64_t>(s->size_of_raw_data - in_section, all.size() - off);
+    const std::uint64_t avail = std::min<std::uint64_t>(file_backed_extent(*s) - in_section, all.size() - off);
     return all.subspan(static_cast<std::size_t>(off), static_cast<std::size_t>(avail));
 }
 
@@ -609,6 +622,13 @@ Result<std::vector<ImportModule>> Image::imports() const {
 
         std::uint32_t lookup = m.lookup_table_rva;
         if (lookup == 0) {
+            if (m.time_date_stamp != 0) {
+                // Bound import without an import name table: the IAT holds bound VAs, not RVAs.
+                return make_diag(1311,
+                                 format("bound imports without an import name table are not supported (DLL '%.*s' has OriginalFirstThunk 0 and TimeDateStamp 0x%X)",
+                                        static_cast<int>(m.dll_name.size()), m.dll_name.data(), static_cast<unsigned>(m.time_date_stamp)),
+                                 "Relink without /BIND (or unbind the image) so the import name table is present.");
+            }
             if (kind_ == ImageKind::InMemory) {
                 m.names_available = false;
                 out.push_back(std::move(m));
@@ -698,6 +718,8 @@ Result<std::vector<DebugEntry>> Image::debug_entries() const {
 
 Result<CodeViewInfo> Image::codeview() const {
     CodeViewInfo info;
+    bool skipped_other = false;
+    std::uint32_t skipped_sig = 0;
     Result<std::vector<DebugEntry>> entries = debug_entries();
     if (!entries) {
         return entries.error();
@@ -724,10 +746,10 @@ Result<CodeViewInfo> Image::codeview() const {
             return make_diag(1312, format("CodeView record is only %zu bytes", data.size()), "The image is corrupt.");
         }
         const std::uint32_t sig = rd32(data, 0);
-        if (sig != 0x53445352) {  // 'RSDS'
-            return make_diag(1313,
-                             format("CodeView record has signature 0x%08X; only RSDS (PDB 7.0) is supported", static_cast<unsigned>(sig)),
-                             "Link with /DEBUG so the linker emits an RSDS record (MSVC link and lld-link both do).");
+        if (sig != 0x53445352) {  // 'RSDS'; skip other formats (e.g. NB10) and keep scanning
+            skipped_sig = sig;
+            skipped_other = true;
+            continue;
         }
         if (data.size() < 25) {
             return make_diag(1312, format("RSDS record is only %zu bytes; 24 bytes plus a path are required", data.size()),
@@ -748,6 +770,12 @@ Result<CodeViewInfo> Image::codeview() const {
             return make_diag(1312, "RSDS PDB path is not NUL-terminated within the record", "The image is corrupt.");
         }
         return info;
+    }
+    if (skipped_other) {
+        return make_diag(1313,
+                         format("no RSDS CodeView record found; the only CodeView record has signature 0x%08X (only RSDS / PDB 7.0 is supported)",
+                                static_cast<unsigned>(skipped_sig)),
+                         "Link with /DEBUG so the linker emits an RSDS record (MSVC link and lld-link both do).");
     }
     return info;
 }
@@ -784,24 +812,22 @@ Result<LoadConfig> Image::load_config() const {
         return c;
     }
     constexpr const char* kWhat = "load config directory";
-    Result<ByteSpan> first = read_rva(dd.rva, 4);
-    if (!first) {
-        return rewrap(1315, kWhat, first.error());
+    // The loader (and LLVM) go by the structure's own Size field, not the data directory size
+    // (linkers often leave the latter smaller); bound it by the bytes actually available.
+    Result<ByteSpan> region = region_at(*this, dd.rva);
+    if (!region) {
+        return rewrap(1315, kWhat, region.error());
     }
-    std::uint64_t n = rd32(*first, 0);
-    if (n < 4) {
-        return make_diag(1315, format("load config Size field is %u (must be at least 4)", static_cast<unsigned>(n)), "The image is corrupt.");
+    if (region->size() < 4) {
+        return make_diag(1315, "load config directory has fewer than 4 readable bytes", "The image is corrupt or truncated.");
     }
-    n = std::min<std::uint64_t>(n, dd.size);
-    n = std::min<std::uint64_t>(n, 0x400);
-    if (n < 4) {
-        return make_diag(1315, "load config directory size in the data directory is below 4 bytes", "The image is corrupt.");
+    const std::uint64_t declared = rd32(*region, 0);
+    if (declared < 4) {
+        return make_diag(1315, format("load config Size field is %u (must be at least 4)", static_cast<unsigned>(declared)), "The image is corrupt.");
     }
-    Result<ByteSpan> body = read_rva(dd.rva, n);
-    if (!body) {
-        return rewrap(1315, kWhat, body.error());
-    }
-    const ByteSpan b = *body;
+    const std::uint64_t n = std::min<std::uint64_t>(declared, region->size());
+    const ByteSpan body = region->subspan(0, static_cast<std::size_t>(n));
+    const ByteSpan b = body;
     c.present = true;
     c.size = rd32(b, 0);
     if (n >= 8) c.time_date_stamp = rd32(b, 4);

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <ostream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "doctest.h"
@@ -744,4 +745,99 @@ TEST_CASE("coff robustness: every truncation and every byte flip is handled") {
             }
         }
     }
+}
+
+TEST_CASE("coff: the COMDAT leader is the first symbol after the section-definition symbol") {
+    ObjSpec o;
+    SectionSpec text;
+    text.name = ".text";
+    text.characteristics = scn::CntCode | scn::MemExecute | scn::MemRead | scn::LnkComdat;
+    text.data = Bytes(4, 0x90);
+    o.sections.push_back(text);
+    o.symbols.push_back(sym("early_label", 1, 0, 3));  // precedes the section definition: not the leader
+    SymbolSpec def = sym(".text", 1, 0, 3);
+    def.aux.push_back(aux_section_def(false, 4, 0, 0, 0, 0, 2));
+    o.symbols.push_back(def);
+    o.symbols.push_back(sym("the_leader", 1));
+    o.symbols.push_back(sym("later_symbol", 1, 2));
+    const Built b = build_object(o);
+    const auto r = Object::parse(as_span(b.bytes));
+    REQUIRE(r.has_value());
+    const auto c = r->comdat(r->sections()[0]);
+    REQUIRE(c.has_value());
+    CHECK(c->section_symbol == r->symbol_at(1));  // raw index 1: after early_label
+    REQUIRE(c->leader != nullptr);
+    CHECK(c->leader->name == "the_leader");
+
+    // No symbol follows the definition: no leader.
+    ObjSpec none = o;
+    none.symbols.resize(2);
+    const Built bn = build_object(none);
+    const auto rn = Object::parse(as_span(bn.bytes));
+    REQUIRE(rn.has_value());
+    const auto cn = rn->comdat(rn->sections()[0]);
+    REQUIRE(cn.has_value());
+    CHECK(cn->leader == nullptr);
+}
+
+TEST_CASE("coff: uninitialised-data sections have no file contents") {
+    ObjSpec o;
+    SectionSpec bss;
+    bss.name = ".bss";
+    bss.characteristics = scn::CntUninitializedData | scn::MemRead | scn::MemWrite;
+    bss.bss_size = 64;
+    o.sections.push_back(bss);
+    SectionSpec data;
+    data.name = ".data";
+    data.characteristics = scn::CntInitializedData | scn::MemRead | scn::MemWrite;
+    data.data = Bytes{1, 2, 3, 4};
+    o.sections.push_back(data);
+    Built b = build_object(o);
+    set32(b.bytes, b.section_table_off + 20, 0xFFFFFFF0u);  // bogus PointerToRawData on the .bss section
+    const auto r = Object::parse(as_span(b.bytes));
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    CHECK(r->sections()[0].data.empty());
+    CHECK(r->sections()[0].size_of_raw_data == 64u);
+    CHECK(r->sections()[0].pointer_to_raw_data == 0xFFFFFFF0u);  // raw field preserved
+    CHECK(r->sections()[1].data.size() == 4u);
+
+    // The same bogus pointer on an initialised section is still an error.
+    set32(b.bytes, b.section_table_off + 36, scn::CntInitializedData | scn::MemRead);
+    const auto bad = Object::parse(as_span(b.bytes));
+    REQUIRE_FALSE(bad.has_value());
+    CHECK(bad.error().code == 1205u);
+}
+
+TEST_CASE("coff malformed: a regular object cannot have more than 65279 sections") {
+    Bytes t = build_object(basic_spec()).bytes;
+    set16(t, 2, 65280);
+    const auto r = Object::parse(as_span(t));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().code == 1216u);
+    set16(t, 2, 0xFFFE);
+    CHECK(Object::parse(as_span(t)).error().code == 1216u);
+}
+
+TEST_CASE("coff: OwnedObject is move-only and a move keeps the views valid") {
+    static_assert(!std::is_copy_constructible_v<OwnedObject>);
+    static_assert(!std::is_copy_assignable_v<OwnedObject>);
+    static_assert(std::is_nothrow_move_constructible_v<OwnedObject>);
+    static_assert(std::is_nothrow_move_assignable_v<OwnedObject>);
+
+    const Built built = build_object(basic_spec());
+    const ByteSpan view = as_span(built.bytes);
+    std::vector<std::byte> bytes(view.begin(), view.end());
+    auto parsed = Object::parse(ByteSpan(bytes.data(), bytes.size()));
+    REQUIRE(parsed.has_value());
+    const std::byte* heap = bytes.data();
+    OwnedObject a(std::move(bytes), std::move(parsed).value());
+    OwnedObject b(std::move(a));
+    CHECK(b.bytes.data() == heap);
+    CHECK(b.object.bytes().data() == b.bytes.data());
+    const Symbol* named = b.object.find_symbol("a_rather_long_symbol_name");
+    REQUIRE(named != nullptr);
+    const std::byte* name_begin = reinterpret_cast<const std::byte*>(named->name.data());
+    CHECK(name_begin >= b.bytes.data());
+    CHECK(name_begin < b.bytes.data() + b.bytes.size());
+    CHECK(b.object.sections()[0].data.data() >= b.bytes.data());
 }

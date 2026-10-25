@@ -149,14 +149,16 @@ TEST_CASE("fixture basic exe: headers and sections") {
     for (const SectionHeader& s : img.sections()) {
         CHECK_MESSAGE(static_cast<std::uint64_t>(s.virtual_address) + s.virtual_size <= img.optional_header().size_of_image,
                       "section " << s.name() << " leaves the image");
-        if (s.size_of_raw_data != 0) {
+        // File-backed bytes of a section: min(VirtualSize, SizeOfRawData) (VirtualSize 0 means raw size).
+        const std::uint32_t backed = std::min<std::uint32_t>(s.virtual_size != 0 ? s.virtual_size : s.size_of_raw_data, s.size_of_raw_data);
+        if (backed != 0) {
             // Mapping round trip for the first and last byte of every section's file data.
             CHECK(img.rva_to_offset(s.virtual_address) == s.pointer_to_raw_data);
             CHECK(img.offset_to_rva(s.pointer_to_raw_data) == s.virtual_address);
-            const std::uint64_t last = static_cast<std::uint64_t>(s.pointer_to_raw_data) + s.size_of_raw_data - 1;
+            const std::uint64_t last = static_cast<std::uint64_t>(s.pointer_to_raw_data) + backed - 1;
             if (last < o.bytes.size()) {
-                CHECK(img.offset_to_rva(last) == s.virtual_address + s.size_of_raw_data - 1);
-                CHECK(img.rva_to_offset(s.virtual_address + s.size_of_raw_data - 1) == last);
+                CHECK(img.offset_to_rva(last) == s.virtual_address + backed - 1);
+                CHECK(img.rva_to_offset(s.virtual_address + backed - 1) == last);
             }
         }
     }

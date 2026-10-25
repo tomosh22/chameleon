@@ -481,9 +481,12 @@ TEST_CASE("fixture bigobj: bigobj_funcs.obj parses as /bigobj with 32-bit sectio
         }
     }
     CHECK(max_section > 0u);
-    if (o.header().section_count > 65279u) {
-        // clang-cl: LLVM only switches to bigobj when the section count needs it, so this object has
-        // symbols whose section numbers do not fit in 16 bits.
+#if defined(__clang__)
+    {
+        // clang-cl: LLVM only switches to bigobj when the section count needs it. The fixture has
+        // 66000 functions, so the object crosses the 65279-section limit in every configuration and
+        // has symbols whose section numbers do not fit in 16 bits.
+        CHECK_MESSAGE(o.header().section_count > 65279u, "section count " << o.header().section_count);
         CHECK_MESSAGE(max_section > 32767u, "max defined-symbol section number " << max_section);
         // The associated .xdata/.pdata sections are numbered after all the .text sections, so the
         // very last section has a section-definition symbol with a 32-bit section number.
@@ -495,6 +498,7 @@ TEST_CASE("fixture bigobj: bigobj_funcs.obj parses as /bigobj with 32-bit sectio
         CHECK(last_has_symbol);
         CHECK(last_section.index > 65279u);
     }
+#endif
     for (const Section& s : o.sections()) {
         if (s.name == ".xdata" || s.name == ".pdata") {
             // Associated unwind/exception data of a function in a high-numbered section.
