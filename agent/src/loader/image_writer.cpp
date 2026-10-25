@@ -84,6 +84,12 @@ std::uint32_t site_size(const ipc::Fixup& fixup) noexcept {
 
 // A site inside the image, in one committed image region.
 Result<void> check_site(RegionCache& cache, const ImageRef& image, std::size_t index, const ipc::Fixup& fixup) {
+    // The wire decoder only produces valid kinds; in-process callers get the same scrutiny.
+    const bool kind_ok = fixup.kind == ipc::FixupKind::Rel32 || fixup.kind == ipc::FixupKind::Addr64 ||
+                         fixup.kind == ipc::FixupKind::SlotWrite;
+    if (!kind_ok || (fixup.kind == ipc::FixupKind::Rel32 ? fixup.n > 5 : fixup.n != 0)) {
+        return invalid(ids::kLoaderFixupInvalid, "fix-up " + std::to_string(index) + " has an unknown kind or a bad REL32 length");
+    }
     const std::uint32_t length = site_size(fixup);
     if (fixup.rva > image.size || length > image.size - fixup.rva) {
         return invalid(ids::kLoaderFixupInvalid, "fix-up " + std::to_string(index) + " at RVA " + hex(fixup.rva) +

@@ -22,7 +22,7 @@ constexpr std::uint64_t kGranule = proc::kAllocationGranularity;
 constexpr std::uint64_t kMaxBlockSize = 1ull << 30;
 constexpr std::uint64_t kMaxImageSize = 1ull << 30;
 constexpr std::uint64_t kDefaultReach = 1536ull << 20;
-constexpr std::size_t kMaxAllocationsPerRange = 8;
+constexpr std::size_t kMaxAllocationsPerRange = 4096;
 constexpr std::size_t kMaxRegionsPerAllocation = 4096;
 
 std::string hex(std::uint64_t value) {
@@ -140,17 +140,20 @@ void PatchLoader::owned_remove(const AddressRange& range) {
     owned_ = std::move(kept);
 }
 
-// Makes exactly `range` free in the OS and no longer owned. The allocations that contain it are
-// released as a whole (VirtualFree cannot release part of a reservation); the parts of those
-// allocations outside `range` are re-reserved straight away. A part that cannot be re-reserved
-// (another thread was faster) is dropped from the owned set.
+// Makes the OS side of `range` free: the allocations that contain it are released as a whole
+// (VirtualFree cannot release part of a reservation) and the parts of those allocations outside
+// `range` are reserved again at once, so only `range` stays open to other threads. `range` itself
+// stays listed in owned_: the caller decides what it becomes (not owned after a successful load,
+// reserved again after a failed one). Everything that allocates memory is done before the first
+// VirtualFree; afterwards only Win32 calls run, except on the slow path where another thread has
+// already taken part of a neighbour.
 Result<void> PatchLoader::detach_range(const AddressRange& range) {
     struct Allocation {
         std::uint64_t base;
         std::uint64_t end;
     };
-    Allocation allocations[kMaxAllocationsPerRange];
-    std::size_t count = 0;
+    std::vector<Allocation> allocations;
+    allocations.reserve(8);
 
     std::uint64_t address = range.base;
     while (address < range.end()) {
@@ -180,24 +183,26 @@ Result<void> PatchLoader::detach_range(const AddressRange& range) {
                             "Report this with the agent log.");
             }
         }
-        if (allocation_end <= address || count == kMaxAllocationsPerRange ||
+        if (allocation_end <= address || allocations.size() >= kMaxAllocationsPerRange ||
             !owned_covers({allocation_base, allocation_end - allocation_base})) {
             return make(ids::kLoaderRangeNotReserved,
                         "the reservation containing " + hex(address) + " is not (entirely) owned by the agent",
                         "Only blocks reserved through ReserveRange can be released for a patch.");
         }
-        allocations[count++] = {allocation_base, allocation_end};
+        allocations.push_back({allocation_base, allocation_end});
         address = allocation_end;
     }
 
     // Release. If one release fails, put back what was already released.
-    for (std::size_t i = 0; i < count; ++i) {
+    for (std::size_t i = 0; i < allocations.size(); ++i) {
         if (!VirtualFree(reinterpret_cast<LPVOID>(allocations[i].base), 0, MEM_RELEASE)) {
             const DWORD error = GetLastError();
             for (std::size_t j = 0; j < i; ++j) {
                 const AddressRange whole{allocations[j].base, allocations[j].end - allocations[j].base};
-                owned_remove(whole);
-                restore_reservation(whole);
+                if (!reserve_at(whole.base, whole.size)) {
+                    owned_remove(whole);
+                    restore_reservation(whole);
+                }
             }
             return make(ids::kLoaderReleaseFailed,
                         "VirtualFree of the reservation at " + hex(allocations[i].base) + " failed (error " +
@@ -205,24 +210,23 @@ Result<void> PatchLoader::detach_range(const AddressRange& range) {
                         "Report this with the agent log.");
         }
     }
-    // Re-reserve everything that is not `range`: the race window is exactly `range`. A part that
-    // another thread already touched is re-reserved in the free fragments that remain.
-    owned_remove(range);
-    for (std::size_t i = 0; i < count; ++i) {
-        if (allocations[i].base < range.base) {
-            const AddressRange head{allocations[i].base, range.base - allocations[i].base};
-            owned_remove(head);
-            restore_reservation(head);
-            if (!owned_covers(head)) {
+    // Reserve the neighbours again (fast path: one call each). A neighbour that another thread
+    // touched meanwhile is reserved in the free fragments that remain; the rest is dropped.
+    for (const Allocation& allocation : allocations) {
+        if (allocation.base < range.base) {
+            const AddressRange head{allocation.base, range.base - allocation.base};
+            if (!reserve_at(head.base, head.size)) {
+                owned_remove(head);
+                restore_reservation(head);
                 CML_LOG(Warn, "CML%u: part of %llx+%llx next to a released range was taken by another thread",
                         ids::kLoaderRangeTaken, ull(head.base), ull(head.size));
             }
         }
-        if (allocations[i].end > range.end()) {
-            const AddressRange tail{range.end(), allocations[i].end - range.end()};
-            owned_remove(tail);
-            restore_reservation(tail);
-            if (!owned_covers(tail)) {
+        if (allocation.end > range.end()) {
+            const AddressRange tail{range.end(), allocation.end - range.end()};
+            if (!reserve_at(tail.base, tail.size)) {
+                owned_remove(tail);
+                restore_reservation(tail);
                 CML_LOG(Warn, "CML%u: part of %llx+%llx next to a released range was taken by another thread",
                         ids::kLoaderRangeTaken, ull(tail.base), ull(tail.size));
             }
@@ -255,13 +259,27 @@ void PatchLoader::restore_reservation(const AddressRange& range) {
 }
 
 PatchLoader::~PatchLoader() {
+    // Give every reservation we still hold back to the OS, allocation by allocation. Every
+    // allocation lies wholly inside an owned range (see detach_range / restore_reservation).
     std::lock_guard<std::mutex> lock(mutex_);
-    while (!owned_.empty()) {
-        const AddressRange range = owned_.back();
-        if (!detach_range(range)) {
-            owned_remove(range);  // not releasable (already gone); never loop
+    for (const AddressRange& range : owned_) {
+        std::uint64_t address = range.base;
+        while (address < range.end()) {
+            MEMORY_BASIC_INFORMATION info;
+            if (!query(address, &info)) {
+                break;
+            }
+            const std::uint64_t region_end = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
+            if (region_end <= address) {
+                break;
+            }
+            if (info.State == MEM_RESERVE && info.Type == MEM_PRIVATE) {
+                VirtualFree(info.AllocationBase, 0, MEM_RELEASE);
+            }
+            address = region_end;
         }
     }
+    owned_.clear();
 }
 
 PatchLoader& PatchLoader::shared() {
@@ -390,7 +408,11 @@ Result<void> PatchLoader::release_range(std::uint64_t base, std::uint64_t size) 
                     "range " + hex(base) + "+" + hex(size) + " is not (entirely) reserved and unused by the agent",
                     "Only unused parts of blocks from ReserveRange can be released; unload patches first.");
     }
-    return detach_range(range);
+    Result<void> detached = detach_range(range);
+    if (detached) {
+        owned_remove(range);
+    }
+    return detached;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -420,6 +442,7 @@ Result<void> PatchLoader::try_load_candidate(const ipc::PatchCandidate& candidat
     if (module == nullptr) {
         const DWORD error = GetLastError();
         const bool taken = !range_is_free(range);  // probe before restore_reservation changes the picture
+        owned_remove(range);
         restore_reservation(range);
         if (taken || error == ERROR_INVALID_ADDRESS || error == ERROR_ILLEGAL_DLL_RELOCATION ||
             error == ERROR_NOT_ENOUGH_MEMORY) {
@@ -439,6 +462,7 @@ Result<void> PatchLoader::try_load_candidate(const ipc::PatchCandidate& candidat
         if (!FreeLibrary(module)) {
             CML_LOG(Warn, "FreeLibrary failed after a base mismatch (error %lu)", GetLastError());
         }
+        owned_remove(range);
         restore_reservation(range);
         return make(ids::kLoaderBaseMismatch,
                     candidate.path + " loaded at " + hex(loaded_at) + " instead of " + hex(candidate.image_base),
@@ -449,10 +473,12 @@ Result<void> PatchLoader::try_load_candidate(const ipc::PatchCandidate& candidat
         if (!FreeLibrary(module)) {
             CML_LOG(Warn, "FreeLibrary failed after an image mismatch (error %lu)", GetLastError());
         }
+        owned_remove(range);
         restore_reservation(range);
         return make(ids::kLoaderImageMismatch, candidate.path + ": " + why,
                     "Send the SizeOfImage of the DLL that was actually linked.");
     }
+    owned_remove(range);  // the image owns the range now
     out->range = range;
     out->image_size = candidate.image_size;
     out->module = module;
