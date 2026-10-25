@@ -5,6 +5,7 @@
 // S_BUILDINFO, display names of statics and initialisers) the test checks structure and the CI log
 // of `cml_pdb_dump` records the actual names (see docs/wp/WP-04.md).
 #include <algorithm>
+#include <cctype>
 #include <string>
 #include <vector>
 

@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -34,14 +35,10 @@ std::string sv(std::string_view v) {
 }
 
 bool is_pe(const std::string& path) {
-    std::FILE* f = std::fopen(path.c_str(), "rb");
-    if (f == nullptr) {
-        return false;
-    }
+    std::ifstream in(path, std::ios::binary);
     char sig[2] = {0, 0};
-    const std::size_t n = std::fread(sig, 1, 2, f);
-    std::fclose(f);
-    return n == 2 && sig[0] == 'M' && sig[1] == 'Z';
+    in.read(sig, 2);
+    return in.gcount() == 2 && sig[0] == 'M' && sig[1] == 'Z';
 }
 
 void print_compile(const cml::pdb::Compiland& c) {
