@@ -244,6 +244,18 @@ jobs:
             build/.ninja_log
           if-no-files-found: warn
 
+      # TEMPORARY (WP-11 fix): run unit.agent ten times in every cell. Removed before the final push.
+      - name: STRESS unit.agent x10 (temporary)
+        if: always()
+        run: |
+          $pass = 0; $fail = 0
+          foreach ($i in 1..10) {
+            ctest --test-dir $env:BUILD_DIR -C ${{ matrix.config }} -R '^unit\.agent$' --output-on-failure *>&1 | Out-String | Write-Host
+            if ($LASTEXITCODE -eq 0) { $pass++ } else { $fail++ }
+          }
+          Write-Host "STRESS-RESULT ${{ matrix.os }}/${{ matrix.compiler }}/${{ matrix.config }} unit.agent pass=$pass fail=$fail"
+          if ($fail -gt 0) { exit 1 }
+
   # Not part of the 8-cell matrix: proves the Visual Studio generator still configures and
   # builds, which is what most developers use locally.
   vs-generator:
