@@ -45,6 +45,12 @@ struct PatchWrite {
     std::uint64_t va = 0;
     std::vector<std::uint8_t> bytes;
     std::string what;
+    // Filled for REL32-family fix-ups so that the result can be decoded and checked independently.
+    bool is_rel32 = false;
+    int rel_n = 0;                // 0..5 (REL32_N)
+    std::int64_t addend = 0;      // in-place addend of the object
+    std::uint64_t old_va = 0;     // address of the old symbol (without addend)
+    std::string symbol;
 };
 
 // For every relocation of the ORIGINAL (pre-anchor) object whose target is an undefined external of

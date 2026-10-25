@@ -161,16 +161,23 @@ std::uint64_t reserve_near(HANDLE process, std::uint64_t module_base, std::uint6
             const std::uint64_t usable_lo = std::max(r_start, lo);
             const std::uint64_t usable_hi = std::min(r_end, hi);
             if (usable_hi > usable_lo && usable_hi - usable_lo >= size) {
-                // Closest to the module from below (top of the region) and from above (bottom).
+                // Top and bottom of the region; distance = true gap between block and module.
+                const auto gap = [&](std::uint64_t start) -> std::uint64_t {
+                    if (start + size <= module_base) {
+                        return module_base - (start + size);
+                    }
+                    if (start >= module_end) {
+                        return start - module_end;
+                    }
+                    return 0;  // overlaps the module: cannot happen for a free region
+                };
                 const std::uint64_t top = align_down(usable_hi - size, kGranularity);
                 if (top >= align_up(usable_lo, kGranularity)) {
-                    const std::uint64_t d = top + size <= module_base ? module_base - (top + size) : 0;
-                    candidates.push_back({top, d});
+                    candidates.push_back({top, gap(top)});
                 }
                 const std::uint64_t bottom = align_up(usable_lo, kGranularity);
                 if (bottom + size <= usable_hi) {
-                    const std::uint64_t d = bottom >= module_end ? bottom - module_end : 0;
-                    candidates.push_back({bottom, d});
+                    candidates.push_back({bottom, gap(bottom)});
                 }
             }
         }
@@ -188,8 +195,25 @@ std::uint64_t reserve_near(HANDLE process, std::uint64_t module_base, std::uint6
         void* p = VirtualAllocEx(process, reinterpret_cast<LPVOID>(c.start), size, MEM_RESERVE, PAGE_NOACCESS);
         if (p != nullptr) {
             const std::uint64_t got = reinterpret_cast<std::uint64_t>(p);
-            log("reserve: reserved %s .. %s (distance from module %llu MB)", hex64(got).c_str(),
-                hex64(got + size).c_str(), static_cast<unsigned long long>(c.distance >> 20));
+            const std::uint64_t got_end = got + size;
+            const std::uint64_t true_gap = got_end <= module_base ? module_base - got_end : got >= module_end ? got - module_end : 0;
+            log("reserve: reserved %s .. %s, gap to the module %llu bytes (%llu MB) %s", hex64(got).c_str(),
+                hex64(got_end).c_str(), static_cast<unsigned long long>(true_gap),
+                static_cast<unsigned long long>(true_gap >> 20), got_end <= module_base ? "below" : "above");
+            // Asserted: within +-1.5 GB of the whole module and in REL32/E9 reach of every byte of it.
+            const auto sdiff = [](std::uint64_t x, std::uint64_t y) {
+                const std::int64_t d = static_cast<std::int64_t>(x) - static_cast<std::int64_t>(y);
+                return d < 0 ? -d : d;
+            };
+            const std::int64_t reach = std::max(sdiff(got_end, module_base), sdiff(module_end, got));
+            const bool near_ok = true_gap <= window && reach < (1ll << 31);
+            if (!near_ok || got_end <= got) {
+                VirtualFreeEx(process, p, 0, MEM_RELEASE);
+                die("ASSERT FAILED: the reserved block %s..%s is not within +-1.5 GB / 2 GB reach of the module [%s, %s)",
+                    hex64(got).c_str(), hex64(got_end).c_str(), hex64(module_base).c_str(), hex64(module_end).c_str());
+            }
+            log("ASSERT-OK reserve: block is %llu MB from the module, within +-1.5 GB and rel32 reach of all of it",
+                static_cast<unsigned long long>(true_gap >> 20));
             return got;
         }
         log("reserve: probe at %s failed (error %lu), trying the next candidate", hex64(c.start).c_str(),

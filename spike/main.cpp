@@ -335,10 +335,12 @@ int cmd_retarget(const Args& a)
     // ---- anchors: where did each object section land in the patch image? ----
     std::unordered_map<std::uint32_t, std::uint32_t> anchor_rva;
     std::size_t static_in_publics = 0;
+    std::size_t anchorable_sections = 0;
     for (const cml::coff::Section& sec : obj.object.sections()) {
         if (!is_anchorable(sec)) {
             continue;
         }
+        ++anchorable_sections;
         auto ext = patch_pdb->find_public(anchor_name(sec.index));
         if (!ext) {
             die("PDB lookup failed: %s", ext.error().format().c_str());
@@ -389,6 +391,18 @@ int cmd_retarget(const Args& a)
     }
     log("ANCHOR-SOURCE external anchors: found in PDB publics (%zu of them used); static anchors: %zu in publics, %zu in module symbols (of %zu)",
         anchor_rva.size(), static_in_publics, static_in_modules, module_symbol_total);
+    // Asserted (ADR-0020): every anchorable section has its external anchor in the publics, and the
+    // static probe anchors are NOT visible anywhere in the PDB.
+    if (anchor_rva.size() != anchorable_sections) {
+        die("ASSERT FAILED: %zu of %zu anchorable sections have an external anchor in the patch PDB publics", anchor_rva.size(),
+            anchorable_sections);
+    }
+    if (static_in_publics != 0 || static_in_modules != 0) {
+        die("ASSERT FAILED (unexpected evidence): static anchors ARE visible in the PDB (%zu in publics, %zu in module symbols); ADR-0020 item 1 must be revised",
+            static_in_publics, static_in_modules);
+    }
+    log("ASSERT-OK anchors: %zu/%zu external anchors found in publics; static anchors found: 0 in publics, 0 in module symbols",
+        anchor_rva.size(), anchorable_sections);
 
     // Cross-check: a function COMDAT's leader symbol sits at offset 0 of its section, so its public
     // RVA must equal the section's anchor RVA.
@@ -414,6 +428,9 @@ int cmd_retarget(const Args& a)
             it->second, s.section_number);
     }
     log("anchor cross-check: %zu symbol(s) at section offset 0 agree with their anchors", crosschecked);
+    if (crosschecked == 0) {
+        die("ASSERT FAILED: the anchor cross-check compared no symbol with its anchor");
+    }
 
     // ---- plan ----
     std::vector<PatchWrite> writes = plan_data_retargets(obj.object, externals, anchor_rva, patch_base, exe_base);
@@ -451,6 +468,46 @@ int cmd_retarget(const Args& a)
             }
             log("RETARGET %s | before=[%s] after=[%s]", w.what.c_str(), hex_bytes(before.data(), before.size()).c_str(),
                 hex_bytes(after.data(), after.size()).c_str());
+            if (w.is_rel32) {
+                // Independent check: decode the displacement from the TARGET's memory and compare the
+                // address the instruction will really access with the old module's symbol address
+                // (module base + RVA from the OLD PDB) and with the placeholder in the patch.
+                std::int32_t disp = 0;
+                std::memcpy(&disp, after.data(), 4);
+                const std::int64_t decoded = static_cast<std::int64_t>(w.va) + 4 + w.rel_n + disp;  // site + 4 + N + disp
+                const std::int64_t accessed = decoded - w.addend;  // the in-place addend is the size of a trailing immediate
+                auto op = old_pdb->find_public(w.symbol);
+                auto pp = patch_pdb->find_public(w.symbol);
+                if (!op || op->empty() || !pp || pp->empty()) {
+                    die("ASSERT FAILED: '%s' is not a public of both the old module and the patch", w.symbol.c_str());
+                }
+                const std::uint64_t old_addr = exe_base + op->front().rva;
+                const std::uint64_t placeholder = patch_base + pp->front().rva;
+                const std::vector<std::uint8_t> old_val = read_remote(h, old_addr, 4);
+                const std::vector<std::uint8_t> ph_val = read_remote(h, placeholder, 4);
+                log("RETARGET-CHECK %s: site=%s disp=%d site+4+N+disp=%s accessed=%s | OLD address=%s (value [%s]) | patch placeholder=%s (value [%s])",
+                    w.symbol.c_str(), hex64(w.va).c_str(), disp, hex64(static_cast<std::uint64_t>(decoded)).c_str(),
+                    hex64(static_cast<std::uint64_t>(accessed)).c_str(), hex64(old_addr).c_str(),
+                    hex_bytes(old_val.data(), 4).c_str(), hex64(placeholder).c_str(), hex_bytes(ph_val.data(), 4).c_str());
+                if (static_cast<std::uint64_t>(accessed) != old_addr) {
+                    die("ASSERT FAILED: the patched site accesses %s, not the old %s",
+                        hex64(static_cast<std::uint64_t>(accessed)).c_str(), hex64(old_addr).c_str());
+                }
+                if (static_cast<std::uint64_t>(accessed) == placeholder || old_addr == placeholder) {
+                    die("ASSERT FAILED: the patched site still accesses the placeholder");
+                }
+                if (old_addr != w.old_va) {
+                    die("ASSERT FAILED: planned old address %s differs from module base + PDB rva %s", hex64(w.old_va).c_str(),
+                        hex64(old_addr).c_str());
+                }
+                std::uint32_t pv = 0;
+                std::memcpy(&pv, ph_val.data(), 4);
+                if (pv != 0) {
+                    die("ASSERT FAILED: the placeholder is not zero (%u)", pv);
+                }
+                log("ASSERT-OK retarget: decoded target %s == OLD %s, != placeholder %s", hex64(static_cast<std::uint64_t>(accessed)).c_str(),
+                    w.symbol.c_str(), hex64(placeholder).c_str());
+            }
             continue;
         }
 #endif
@@ -507,7 +564,11 @@ int cmd_hook(const Args& a)
         all_cc = all_cc && before[static_cast<std::size_t>(i)] == 0xCC;
         all_nop = all_nop && before[static_cast<std::size_t>(i)] == 0x90;
     }
-    log("PADDING the 6 bytes before the entry are %s", all_cc ? "all 0xCC (padding present)" : all_nop ? "all 0x90 (padding present)" : "NOT uniform padding");
+    log("PADDING the 6 bytes before the entry are %s", all_cc ? "all 0xCC" : all_nop ? "all 0x90" : "NOT uniform padding");
+    if (!all_cc) {
+        die("ASSERT FAILED: the 6 bytes before the entry are not all 0xCC (padding expectation for WP-10)");
+    }
+    log("ASSERT-OK padding: >= 6 bytes of 0xCC precede the old entry (this is alignment and/or /FUNCTIONPADMIN, not distinguishable here)");
     if (before[16] == 0xE9 || (before[16] == 0xFF && before[17] == 0x25)) {
         die("the old entry starts with a jmp (%02x %02x): an incremental-link thunk? the fixture must link with /INCREMENTAL:NO",
             before[16], before[17]);
@@ -574,7 +635,9 @@ int cmd_exercise(const Args& a)
     HANDLE h = open_target(pid);
     const std::vector<std::uint8_t> before = read_remote(h, va, 4);
     const std::int32_t zero = 0;
+    SuspendedThreads threads = suspend_all(pid);
     write_remote(h, va, &zero, sizeof zero);
+    resume_all(threads);
     log("EXERCISE g_tick at %s: before=[%s], set to 0 so the patched code calls fixture_note() through its thunk",
         hex64(va).c_str(), hex_bytes(before.data(), 4).c_str());
     CloseHandle(h);

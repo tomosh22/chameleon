@@ -32,3 +32,4 @@ ci-logs/
 
 # WP-03 spike working directory
 /spike-work/
+__pycache__/

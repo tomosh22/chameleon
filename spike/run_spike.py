@@ -251,6 +251,17 @@ def run_pipeline(args, repo, build, work, logs, obj_dir, patch_dir, spike, fixtu
     link_cmd = [linker, "/nologo", "/DLL", "/NOENTRY", "/NODEFAULTLIB", "/DEBUG:FULL", "/INCREMENTAL:NO",
                 "/OPT:NOREF", "/OPT:NOICF", "/FUNCTIONPADMIN", "/FIXED", "/DYNAMICBASE:NO",
                 f"/BASE:0x{base:X}", f"/PDB:{pdb}", f"/OUT:{dll}", "/IGNORE:4001,4254,4281", anchored, binding]
+    # First link WITHOUT /IGNORE into a scratch directory to record what the linker really prints.
+    probe_dir = os.path.join(work, "probe")
+    os.makedirs(probe_dir)
+    probe_cmd = [c for c in link_cmd if not c.startswith("/IGNORE:")]
+    probe_cmd = [f"/PDB:{os.path.join(probe_dir, 'probe.pdb')}" if c.startswith("/PDB:") else c for c in probe_cmd]
+    probe_cmd = [f"/OUT:{os.path.join(probe_dir, 'probe.dll')}" if c.startswith("/OUT:") else c for c in probe_cmd]
+    _, probe_out = run(probe_cmd, os.path.join(logs, "link_without_ignore.txt"))
+    printed = [l for l in probe_out.splitlines() if l.strip()]
+    say(f"SPIKE-LINK-NOIGNORE the linker printed {len(printed)} line(s) without /IGNORE" + (":" if printed else ""))
+    for l in printed:
+        say("SPIKE-LINK-NOIGNORE   " + l)
     run(link_cmd, os.path.join(logs, "link.txt"))
     if not os.path.isfile(dll) or not os.path.isfile(pdb):
         fail("the linker produced no patch_1.dll / patch_1.pdb")
@@ -268,6 +279,8 @@ def run_pipeline(args, repo, build, work, logs, obj_dir, patch_dir, spike, fixtu
     run([spike, "retarget", "--pid", str(pid), "--exe", fixture, "--obj", logic_obj, "--dll", dll],
         os.path.join(logs, "retarget.txt"))
     say("STEP 7: install the 5-byte jump with all threads suspended")
+    with open(fixture_out, "rb") as f:
+        size_pre_hook = len(f.read())
     _, out = run([spike, "hook", str(pid), fixture, dll], os.path.join(logs, "hook.txt"))
     m = re.search(r"HOOK installed: old entry (0x[0-9a-f]+) -> new entry (0x[0-9a-f]+)", out)
     if not m:
@@ -348,19 +361,28 @@ def run_pipeline(args, repo, build, work, logs, obj_dir, patch_dir, spike, fixtu
         fail(f"cdb resolved compute_value outside the patch module: {xline!r}")
     if sx[0] != new_entry:
         fail(f"cdb resolves patch_1!compute_value to 0x{sx[0]:x} but the hook targets 0x{new_entry:x}")
-    ln = section(cdb_out, "LN") + "\n" + section(cdb_out, "LSA")
-    lm_src = re.search(r"logic\.cpp\s*(@|\()\s*(\d+)", ln)
-    if not lm_src:
-        fail("cdb shows no `logic.cpp @ <line>` for patch_1!compute_value")
-    say(f"SPIKE-CDB source: logic.cpp line {lm_src.group(2)}")
-    jline = next((l for l in (section(cdb_out, "U") + "\n" + section(cdb_out, "UADDR")).splitlines()
-                  if re.search(r"\bjmp\b", l)), "")
-    if not jline:
-        fail("cdb disassembly of the old entry shows no jmp")
-    say(f"SPIKE-CDB old entry: {jline.strip()}")
-    targets = [v for v in hexints(jline) if patch_base <= v < patch_base + patch_size]
-    if not targets and "patch_1!" not in jline:
-        fail("the jmp at the old entry does not point into the patch module")
+    ln_text = section(cdb_out, "LN")
+    lsa_text = section(cdb_out, "LSA")
+    expect_src = os.path.normcase(os.path.join(work, "src", "logic.cpp"))
+    m_src = re.search(r"^(\S.*logic\.cpp)\((\d+)\)\s*$", ln_text, re.M)
+    if not m_src:
+        fail("cdb `ln` shows no `<path>\\logic.cpp(<line>)` for patch_1!compute_value")
+    if os.path.normcase(os.path.normpath(m_src.group(1))) != os.path.normpath(expect_src):
+        fail(f"cdb reports the source {m_src.group(1)!r}, expected the patched copy {expect_src!r}")
+    if not re.search(r"^\s*\d+:\s+return 2;\s*$", lsa_text, re.M):
+        fail("cdb `lsa` does not show `return 2;` (the patched source)")
+    say(f"SPIKE-CDB source: {m_src.group(1)} line {m_src.group(2)} == the patched copy under spike-work\\src; lsa shows `return 2;`")
+    for name in ("U", "UADDR"):
+        jl = next((l for l in section(cdb_out, name).splitlines() if re.search(r"\bjmp\b", l)), "")
+        if not jl:
+            fail(f"cdb disassembly ({name}) of the old entry shows no jmp")
+        m_t = re.search(r"\bjmp\s+(?:\S+\s+)?\(?([0-9a-fA-F]{8}`[0-9a-fA-F]{8})\)?\s*$", jl.strip())
+        if not m_t:
+            fail(f"cannot parse the jmp target from {jl!r}")
+        target = int(m_t.group(1).replace("`", ""), 16)
+        if target != new_entry or "patch_1!compute_value" not in jl:
+            fail(f"jmp target 0x{target:x} in {jl.strip()!r} is not patch_1!compute_value at the hook target 0x{new_entry:x}")
+        say(f"SPIKE-CDB jmp ({name}): {jl.strip()}  -> parsed target 0x{target:x} == new_entry 0x{new_entry:x}")
 
     # ---- 10. still alive ------------------------------------------------------------------------
     n_before = read_ticks(fixture_out)[-1][0]
@@ -371,24 +393,45 @@ def run_pipeline(args, repo, build, work, logs, obj_dir, patch_dir, spike, fixtu
     if after[-1][0] <= n_before or after[-1][1] != 2:
         fail("the fixture stopped printing value=2 after the cdb session")
     # ---- 11. exercise the thunk + slot + retargeted data reference at run time -------------------
-    say("STEP 11: reset g_tick to 0 so the patched function reads the old g_tick and calls the old fixture_note()")
-    with open(fixture_out, "rb") as f:
-        size_before = len(f.read())
-    run([spike, "exercise", str(pid), fixture], os.path.join(logs, "exercise.txt"))
+    say("STEP 11: reset g_tick to 0 so the patched function reads the OLD g_tick and calls the old fixture_note()")
 
-    def note_seen():
+    def read_all():
         with open(fixture_out, "rb") as f:
-            return b"NOTE logic-start" in f.read()[size_before:]
+            return f.read()
 
-    if not wait_for(note_seen, 5):
-        fail("no `NOTE logic-start` line after resetting g_tick: the thunk/slot/data retarget path did not work")
-    time.sleep(0.5)
+    # (a) no NOTE between the hook and the exercise: the real g_tick is large; a failed data retarget
+    # (zero placeholder) would print NOTE on every tick.
+    data = read_all()
+    window = data[size_pre_hook:]
+    notes_window = window.count(b"NOTE ")
+    n_ticks_window = len(re.findall(rb"TICK n=", window))
+    say(f"SPIKE-NONOTE between the hook and the exercise: {n_ticks_window} TICK line(s) printed, {notes_window} NOTE line(s)")
+    if notes_window != 0 or n_ticks_window < 10:
+        fail("ASSERT FAILED: expected 0 NOTE lines and >= 10 ticks between the hook and the exercise")
+    mark = len(data)
+    seen = False
+    for attempt in range(1, 4):  # the reset can be lost to the non-atomic ++g_tick in the target
+        run([spike, "exercise", str(pid), fixture], os.path.join(logs, f"exercise{attempt}.txt"))
+        if wait_for(lambda: b"NOTE logic-start" in read_all()[mark:], 2.0):
+            seen = True
+            say(f"exercise attempt {attempt}: NOTE appeared")
+            break
+        say(f"exercise attempt {attempt}: no NOTE within 2 s (reset lost?), retrying")
+    if not seen:
+        fail("no `NOTE logic-start` after resetting g_tick: the thunk/slot/data retarget path did not work")
+    time.sleep(1.5)
     if proc.poll() is not None:
         fail("the fixture died after fixture_note() was called through the thunk")
+    after_text = read_all()[mark:]
+    n_notes = after_text.count(b"NOTE ")
+    n_logic = after_text.count(b"NOTE logic-start")
+    say(f"SPIKE-ONENOTE after the reset: {n_logic} `NOTE logic-start` line(s), {n_notes} NOTE line(s) in total")
+    if n_logic != 1 or n_notes != 1:
+        fail("ASSERT FAILED: expected exactly one `NOTE logic-start` after the reset")
     tail = read_ticks(fixture_out)
     if tail[-1][1] != 2:
         fail("the fixture does not print value=2 after the exercise")
-    say("SPIKE-THUNK `NOTE logic-start` printed by the OLD fixture_note() called from the patch via thunk and slot; "
+    say("SPIKE-THUNK `NOTE logic-start` printed once by the OLD fixture_note() called from the patch via thunk and slot; "
         f"fixture alive, last TICK {tail[-1]}")
     say(f"SPIKE-PASS value 1 -> 2, hook {old_entry:#x} -> {new_entry:#x}, patch at {patch_base:#x}, "
         f"cdb symbols + source + jmp verified, fixture alive (last {after[-1]})")

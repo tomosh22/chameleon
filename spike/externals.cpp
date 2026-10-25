@@ -196,6 +196,11 @@ std::vector<PatchWrite> plan_data_retargets(const coff::Object& obj, const std::
                 const std::int32_t rel32 = static_cast<std::int32_t>(rel);
                 PatchWrite w;
                 w.va = site_va;
+                w.is_rel32 = true;
+                w.rel_n = n;
+                w.addend = addend;
+                w.old_va = old_va;
+                w.symbol = ext.name;
                 w.bytes.resize(4);
                 std::memcpy(w.bytes.data(), &rel32, 4);
                 std::snprintf(what, sizeof what,
