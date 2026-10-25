@@ -606,6 +606,10 @@ void PipeServer::refresh_instance() {
     }
 }
 
+bool PipeServer::has_pending_connection() const noexcept {
+    return impl_ && impl_->pending != INVALID_HANDLE_VALUE;
+}
+
 void PipeServer::cancel() noexcept {
     if (impl_ && impl_->cancel_event != nullptr) {
         SetEvent(impl_->cancel_event);
@@ -643,6 +647,9 @@ Result<PipeServer::Accepted> PipeServer::accept(std::uint32_t timeout_ms, void* 
         out.status = IoStatus::Cancelled;
         return out;
     }
+    // The whole call (waiting for a client and creating the replacement instance) takes at most
+    // timeout_ms.
+    const ULONGLONG accept_deadline = deadline_after(timeout_ms);
     // A client that connects and vanishes before we get to it (ERROR_NO_DATA) is not an error of
     // ours: drop that instance's state and listen again. One bad client must never stop the
     // broker, so only a run of such events (a pathological flood) gives up for this call.
@@ -684,7 +691,7 @@ Result<PipeServer::Accepted> PipeServer::accept(std::uint32_t timeout_ms, void* 
 
         HANDLE waits[3] = {s.connect_event, s.cancel_event, static_cast<HANDLE>(wake_event)};
         const DWORD count = wake_event != nullptr ? 3 : 2;
-        const DWORD w = WaitForMultipleObjects(count, waits, FALSE, timeout_ms == kInfiniteTimeout ? INFINITE : timeout_ms);
+        const DWORD w = WaitForMultipleObjects(count, waits, FALSE, remaining_ms(timeout_ms, accept_deadline));
         DWORD transferred = 0;
         if (w == WAIT_OBJECT_0) {
             if (GetOverlappedResult(s.listening, &s.ov, &transferred, FALSE)) {
@@ -727,7 +734,6 @@ Result<PipeServer::Accepted> PipeServer::accept(std::uint32_t timeout_ms, void* 
         s.pending = s.listening;
         s.listening = INVALID_HANDLE_VALUE;
     }
-    const ULONGLONG replace_deadline = deadline_after(timeout_ms);
     bool warned = false;
     while (s.listening == INVALID_HANDLE_VALUE) {
         Result<HANDLE> next = s.create_instance();
@@ -739,7 +745,7 @@ Result<PipeServer::Accepted> PipeServer::accept(std::uint32_t timeout_ms, void* 
             CML_LOG(Warn, "%s; retrying", next.error().format().c_str());
             warned = true;
         }
-        const DWORD left = remaining_ms(timeout_ms, replace_deadline);
+        const DWORD left = remaining_ms(timeout_ms, accept_deadline);
         if (left == 0) {
             out.status = IoStatus::Timeout;
             return out;

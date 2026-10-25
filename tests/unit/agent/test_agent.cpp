@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <share.h>
+#include <cstdio>
 #include <cctype>
 #include <chrono>
 #include <cstddef>
@@ -1130,5 +1132,139 @@ TEST_CASE("300 enabled modules are all re-enabled after a reconnect") {
         }
     }
     CHECK(seen.size() == static_cast<std::size_t>(kModules));
+    cml::DestroyAgent(agent);
+}
+
+TEST_CASE("destroying the agent from inside a call into it is refused") {
+    NoBrokerEnv env("selfdestroy");
+    cml::Agent agent = cml::CreateSynchronizedAgent(exe_directory().c_str());
+    REQUIRE(agent.IsValid());
+    const PostWorkFn post = agent_export<PostWorkFn>("cml_agent_testing_post_work");
+    REQUIRE(post != nullptr);
+
+    struct Context {
+        cml::Agent* agent;
+        cml_status status;
+    } context{&agent, CML_STATUS_OK};
+    REQUIRE(post(agent.NativeHandle()->impl,
+                 [](void* raw) {
+                     auto* c = static_cast<Context*>(raw);
+                     c->status = cml::DestroyAgent(*c->agent);  // runs inside cml_sync_point()
+                 },
+                 &context) == CML_STATUS_OK);
+    agent.SyncPoint();
+    CHECK(context.status == CML_STATUS_INVALID_ARGUMENT);
+    CHECK(agent.IsValid());  // nothing was destroyed
+    const cml::Request request = agent.EnableModule(L"still_alive.dll");
+    CHECK(request.status == CML_STATUS_OK);
+    CHECK(cml::DestroyAgent(agent) == CML_STATUS_OK);  // from outside it works
+    CHECK_FALSE(agent.IsValid());
+}
+
+TEST_CASE("a refused re-enable never drops the module and is retried after the next accepted list") {
+    using TrackedFn = std::uint64_t (*)(void*);
+    using FailFn = void (*)(int);
+    const std::string pipe = unique_pipe_name("reenable");
+    ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));
+    ScopedEnv broker_env(L"CML_BROKER_PATH", exe_directory() + L"\\no_such_broker.exe");
+    cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str());
+    REQUIRE(agent.IsValid());
+    const TrackedFn tracked = agent_export<TrackedFn>("cml_agent_testing_tracked_modules");
+    const FailFn fail_enumeration = agent_export<FailFn>("cml_agent_testing_fail_enumeration");
+    void* const impl = agent.NativeHandle()->impl;
+    const std::wstring self = cml::GetCurrentModulePath();
+
+    cml::Reply reply;
+    {
+        TestBroker first(pipe);
+        REQUIRE_MESSAGE(first.ready(), first.error());
+        REQUIRE(wait_until([&] { return agent.IsConnected(); }, 20000));
+        const cml::Request enable = agent.EnableModule(self);
+        REQUIRE(agent.WaitForRequest(enable, 15000, &reply) == CML_STATUS_OK);
+        REQUIRE(reply.status == 0);
+    }
+    REQUIRE(wait_until([&] { return !agent.IsConnected(); }, 20000));
+    CHECK(tracked(impl) == 1);
+
+    // The next session cannot build its module list: the broker gets an empty one, so it refuses the
+    // re-enable. The module must stay tracked, and be enabled once a full list has been accepted.
+    fail_enumeration(3);
+    TestBroker second(pipe);
+    REQUIRE_MESSAGE(second.ready(), second.error());
+    REQUIRE(wait_until([&] { return agent.IsConnected(); }, 20000));
+    bool enabled_again = false;
+    const ULONGLONG deadline = GetTickCount64() + 30000;
+    while (!enabled_again && GetTickCount64() < deadline) {
+        const cml::Request disable = agent.DisableModule(self);
+        REQUIRE(disable.status == CML_STATUS_OK);
+        REQUIRE(agent.WaitForRequest(disable, 15000, &reply) == CML_STATUS_OK);
+        if (reply.status == 0) {
+            enabled_again = true;  // the broker had it enabled: the re-enable was retried and succeeded
+        } else {
+            CHECK(tracked(impl) == 1);  // refused so far, but never forgotten
+            Sleep(100);
+        }
+    }
+    fail_enumeration(0);
+    CHECK(enabled_again);
+    CHECK(tracked(impl) == 0);  // only the application's own disable removed it
+    cml::DestroyAgent(agent);
+}
+
+#ifdef CML_TEST_FAKE_BROKER_EXE
+TEST_CASE("a broker that keeps dying is not restarted in a tight loop") {
+    const std::string pipe = unique_pipe_name("backoff");
+    wchar_t temp[MAX_PATH];
+    REQUIRE(GetTempPathW(MAX_PATH, temp) > 0);
+    const std::wstring log = std::wstring(temp) + L"cml_fake_broker_" + std::to_wstring(GetCurrentProcessId()) + L"_" +
+                             std::to_wstring(GetTickCount64()) + L".log";
+    DeleteFileW(log.c_str());
+    ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));
+    std::wstring fake = L"" CML_TEST_FAKE_BROKER_EXE;
+    std::replace(fake.begin(), fake.end(), L'/', L'\\');
+    ScopedEnv broker_env(L"CML_BROKER_PATH", fake);
+    ScopedEnv log_env(L"CML_FAKE_BROKER_LOG", log);
+
+    cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str());
+    REQUIRE(agent.IsValid());
+    Sleep(10000);  // a fixed observation window, not a synchronisation point
+    cml::DestroyAgent(agent);
+
+    std::size_t launches = 0;
+    if (FILE* file = _wfsopen(log.c_str(), L"rb", _SH_DENYNO)) {
+        int c;
+        while ((c = std::fgetc(file)) != EOF) {
+            launches += c == '\n' ? 1 : 0;
+        }
+        std::fclose(file);
+    }
+    DeleteFileW(log.c_str());
+    // 1 s, 2 s, 4 s ... between launches: about four in ten seconds. Without back-off there would
+    // be dozens.
+    CHECK(launches >= 2);
+    CHECK(launches <= 5);
+}
+#endif
+
+TEST_CASE("a module list the broker keeps refusing is resent with a growing pause") {
+    const std::string pipe = unique_pipe_name("listbackoff");
+    ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));
+    ScopedEnv broker_env(L"CML_BROKER_PATH", exe_directory() + L"\\no_such_broker.exe");
+    ScriptedBroker broker(pipe, [](const cml::ipc::Message& m) {
+        return std::holds_alternative<cml::ipc::ModuleList>(m) ? ScriptedBroker::Action::Reject
+                                                               : ScriptedBroker::Action::Answer;
+    });
+    REQUIRE(broker.ready());
+    cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str());
+    REQUIRE(agent.IsValid());
+    REQUIRE(wait_until([&] { return agent.IsConnected(); }, 20000));
+    constexpr auto is_list = [](const cml::ipc::Message& m) { return std::holds_alternative<cml::ipc::ModuleList>(m); };
+    // Lists go out at about 0, 1, 3, 7 and 15 s: five in twenty seconds (an unbounded retry would
+    // send dozens). The wait is expected to run out.
+    CHECK_FALSE(wait_until([&] { return broker.count(0, is_list) >= 7; }, 20000));
+    const std::size_t lists = broker.count(0, is_list);
+    CHECK(lists >= 3);
+    CHECK(lists <= 6);
+    CHECK(broker.connections() == 1);
     cml::DestroyAgent(agent);
 }

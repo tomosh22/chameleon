@@ -12,6 +12,7 @@
 #include "agent.h"
 #include "heap.h"
 #include "cml/proc/diag_ids.h"
+#include "cml/util/log.h"
 
 #define CML_AGENT_EXPORT extern "C" __declspec(dllexport)
 
@@ -54,13 +55,34 @@ CML_AGENT_EXPORT cml_status cml_agent_create(const cml_agent_create_params* para
     return CML_STATUS_OK;
 }
 
-CML_AGENT_EXPORT void cml_agent_destroy(void* agent) {
+CML_AGENT_EXPORT cml_status cml_agent_destroy(void* agent) {
     if (agent == nullptr) {
-        return;
+        return CML_STATUS_OK;
+    }
+    if (Agent::in_guarded_call()) {
+        // Destroying the agent from inside a call into it (work run by SyncPoint, say) would wait
+        // for itself, or free the object under its own feet.
+        CML_LOG(Warn, "cml_destroy_agent called from inside a call into the agent; refused");
+        return CML_STATUS_INVALID_ARGUMENT;
     }
     // Wakes every waiter and waits until all of them have left the agent before freeing it.
     as_agent(agent)->stop_and_wait_for_calls();
     delete as_agent(agent);
+    return CML_STATUS_OK;
+}
+
+// Makes the next `count` module enumerations fail (tests only).
+CML_AGENT_EXPORT void cml_agent_testing_fail_enumeration(int count) {
+    cml::agent::set_enumeration_failures_for_testing(count);
+}
+
+// Number of modules the agent would re-enable after a reconnect (tests only).
+CML_AGENT_EXPORT uint64_t cml_agent_testing_tracked_modules(void* agent) {
+    if (agent == nullptr) {
+        return 0;
+    }
+    Agent::CallGuard guard(*as_agent(agent));
+    return as_agent(agent)->tracked_modules_for_testing();
 }
 
 CML_AGENT_EXPORT cml_status cml_agent_enable_module(void* agent, const wchar_t* path, uint32_t options,

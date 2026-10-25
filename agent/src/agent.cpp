@@ -5,6 +5,7 @@
 #include <process.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -43,6 +44,19 @@ constexpr int kEnumerateAttempts = 3;        // tries to list the loaded modules
 constexpr DWORD kEnumerateRetryMs = 20;
 constexpr DWORD kReconnectPauseMs = 200;   // pause after a session that was up, before reconnecting
 
+std::atomic<int> g_enumeration_failures{0};
+
+Result<std::vector<proc::ModuleInfo>> enumerate_loaded_modules() {
+    if (g_enumeration_failures.load() > 0 && g_enumeration_failures.fetch_sub(1) > 0) {
+        return Diag::make(ids::kModuleEnumFailed, "module enumeration failed (injected failure)",
+                          "Test hook: set_enumeration_failures_for_testing.");
+    }
+    return proc::enumerate_modules(0);
+}
+
+constexpr DWORD kMaxLaunchBackoffMs = 60000;   // broker auto-start back-off cap
+constexpr DWORD kMaxListBackoffMs = 30000;     // full module list resend back-off cap
+
 // Any address inside this module: used to find the path of cml_agent.dll.
 int g_module_anchor = 0;
 
@@ -75,6 +89,19 @@ void fill_reply(cml_reply* reply, std::uint32_t status, const std::string& text)
 }
 
 }  // namespace
+
+void set_enumeration_failures_for_testing(int count) {
+    g_enumeration_failures.store(count);
+}
+
+int& Agent::CallGuard::depth() noexcept {
+    thread_local int depth = 0;
+    return depth;
+}
+
+bool Agent::in_guarded_call() noexcept {
+    return CallGuard::depth() > 0;
+}
 
 Agent::Agent(std::uint32_t mode) : mode_(mode) {}
 
@@ -358,8 +385,12 @@ bool Agent::try_connect(ipc::PipeConnection& out, ConnectState& state) {
             CML_LOG(Debug, "%s", connection.error().format().c_str());
         }
     } else {
-        if (!state.launched) {
+        if (!state.launched && GetTickCount64() >= next_launch_at_) {
             state.launched = true;
+            // Launches back off exponentially (1 s, 2 s, 4 s ... 60 s); the back-off is reset only
+            // when a session got its ModuleList accepted (note_list_accepted()).
+            next_launch_at_ = GetTickCount64() + launch_backoff_ms_;
+            launch_backoff_ms_ = std::min(launch_backoff_ms_ * 2, kMaxLaunchBackoffMs);
             CML_LOG(Info, "no broker is listening on %s; starting %s", pipe_name_.c_str(),
                     proc::utf8_from_wide(broker_path_).c_str());
             Result<void> launched = launch_broker(broker_path_, pipe_name_, broker_args_);
@@ -411,7 +442,7 @@ bool Agent::run_session(ipc::PipeConnection& connection) {
     full_list_pending_ = false;
     const bool established = handshake(connection) && send_module_list(connection);
     if (established) {
-        queue_reenables();
+        queue_reenables(false);
         connected_.store(true, std::memory_order_release);
         serve(connection);
     }
@@ -521,13 +552,13 @@ bool Agent::send_module_list(ipc::PipeConnection& connection) {
     ipc::ModuleList list;
     list.request_id = next_id_.fetch_add(1, std::memory_order_relaxed);
     const std::uint64_t seq_mark = queue_seq_.load(std::memory_order_acquire);
-    Result<std::vector<proc::ModuleInfo>> modules = proc::enumerate_modules(0);
+    Result<std::vector<proc::ModuleInfo>> modules = enumerate_loaded_modules();
     for (int attempt = 1; !modules && attempt < kEnumerateAttempts; ++attempt) {
         CML_LOG(Debug, "%s", modules.error().format().c_str());
         if (WaitForSingleObject(stop_event_, kEnumerateRetryMs) == WAIT_OBJECT_0) {
             break;
         }
-        modules = proc::enumerate_modules(0);
+        modules = enumerate_loaded_modules();
     }
     if (modules) {
         list.modules = to_entries(*modules);
@@ -548,6 +579,13 @@ bool Agent::send_module_list(ipc::PipeConnection& connection) {
         note_sent_locked(inserted.first->second);
     }
     full_list_pending_ = false;
+    if (!modules) {
+        // Ask for a full list again later (rate-limited like a refusal), so that the broker ends up
+        // with the real module list instead of only the differences.
+        full_list_pending_ = true;
+        full_list_not_before_ = GetTickCount64() + list_backoff_ms_;
+        list_backoff_ms_ = std::min(list_backoff_ms_ * 2, kMaxListBackoffMs);
+    }
     if (!send_message(connection, list)) {
         return false;
     }
@@ -621,13 +659,13 @@ bool Agent::flush_logs(ipc::PipeConnection& connection) {
 
 bool Agent::poll_modules(ipc::PipeConnection& connection) {
     last_module_poll_ = GetTickCount64();
-    if (full_list_pending_) {
-        return send_module_list(connection);  // the broker refused the last full list
+    if (full_list_pending_ && GetTickCount64() >= full_list_not_before_) {
+        return send_module_list(connection);  // the broker refused (or we could not build) the last full list
     }
     // Everything queued before this point was queued after the modules it refers to were loaded,
     // so the snapshot taken now covers it.
     const std::uint64_t seq_mark = queue_seq_.load(std::memory_order_acquire);
-    Result<std::vector<proc::ModuleInfo>> modules = proc::enumerate_modules(0);
+    Result<std::vector<proc::ModuleInfo>> modules = enumerate_loaded_modules();
     if (!modules) {
         CML_LOG(Debug, "%s", modules.error().format().c_str());
         return true;  // a failed snapshot is not a connection problem; try again next time
@@ -665,6 +703,7 @@ void Agent::track_enabled_locked(const Entry& entry, std::uint32_t status) {
             const auto existing = std::find_if(enabled_.begin(), enabled_.end(), same);
             if (existing != enabled_.end()) {
                 existing->options = enable->options;  // a later enable may change the options
+                existing->needs_reenable = false;
             } else {
                 // No cap: the set is bounded by the modules the broker accepted, i.e. by the
                 // modules that are loaded in this process.
@@ -672,7 +711,12 @@ void Agent::track_enabled_locked(const Entry& entry, std::uint32_t status) {
             }
         } else if (entry.internal) {
             // Re-enabling after a reconnect failed (the module is gone): stop tracking it.
-            enabled_.erase(std::remove_if(enabled_.begin(), enabled_.end(), same), enabled_.end());
+            // Only the application's own DisableModule removes a module from the set. A refused
+            // re-enable marks it; it is sent again after the next accepted ModuleList.
+            const auto existing = std::find_if(enabled_.begin(), enabled_.end(), same);
+            if (existing != enabled_.end()) {
+                existing->needs_reenable = true;
+            }
         }
     } else if (const auto* disable = std::get_if<ipc::DisableModule>(&entry.message)) {
         if (status == 0) {
@@ -728,9 +772,9 @@ void Agent::evict_oldest_answers_locked() {
 // an EnableModule for each tracked module ahead of everything else that is waiting. Re-enables
 // left over from the previous session (still queued, or sent and unanswered) are dropped first, so
 // reconnecting repeatedly never piles up duplicates.
-void Agent::queue_reenables() {
+void Agent::queue_reenables(bool only_flagged) {
     std::lock_guard<std::mutex> lock(mutex_);
-    for (auto it = entries_.begin(); it != entries_.end();) {
+    for (auto it = entries_.begin(); !only_flagged && it != entries_.end();) {
         if (it->second.internal && std::holds_alternative<ipc::EnableModule>(it->second.message)) {
             if (it->second.state == State::Sent) {
                 --sent_count_;
@@ -741,7 +785,13 @@ void Agent::queue_reenables() {
             ++it;
         }
     }
+    std::size_t queued = 0;
     for (auto it = enabled_.rbegin(); it != enabled_.rend(); ++it) {
+        if (only_flagged && !it->needs_reenable) {
+            continue;
+        }
+        it->needs_reenable = false;
+        ++queued;
         ipc::EnableModule request;
         request.request_id = next_id_.fetch_add(1, std::memory_order_relaxed);
         request.options = it->options;
@@ -752,10 +802,20 @@ void Agent::queue_reenables() {
         entries_.emplace(request.request_id, std::move(entry));
         outgoing_.push_front(request.request_id);
     }
-    if (!enabled_.empty()) {
-        CML_LOG(Info, "re-enabling %llu module(s) in the new broker session",
-                static_cast<unsigned long long>(enabled_.size()));
+    if (queued != 0) {
+        CML_LOG(Info, "re-enabling %llu module(s)%s", static_cast<unsigned long long>(queued),
+                only_flagged ? " that were refused earlier" : " in the new broker session");
     }
+}
+
+// The broker accepted a ModuleList: it knows our modules now. Resets the back-offs and sends the
+// re-enables it refused while it did not.
+void Agent::note_list_accepted() {
+    launch_backoff_ms_ = 1000;
+    next_launch_at_ = 0;
+    list_backoff_ms_ = 1000;
+    full_list_not_before_ = 0;
+    queue_reenables(true);
 }
 
 void Agent::complete(std::uint64_t request_id, std::uint32_t status, std::string text) {
@@ -804,23 +864,26 @@ void Agent::fail_in_flight(std::uint32_t status, const char* text) {
 void Agent::handle_message(const ipc::Message& message) {
     CML_LOG(Debug, "<- %s", ipc::describe(message).c_str());
     if (const auto* reply = std::get_if<ipc::Reply>(&message)) {
-        if (reply->status != 0) {
-            bool refused_list = false;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                const auto it = entries_.find(reply->request_id);
-                refused_list = it != entries_.end() && it->second.module_list;
-            }
-            if (refused_list) {
-                // Keep the session; the next poll pass sends a full list again. Requests queued
-                // meanwhile go out normally and the broker answers them on their own merits.
-                CML_LOG(Warn, "the broker refused the module list: CML%u %s; will send it again",
-                        reply->status, reply->message.c_str());
-                full_list_pending_ = true;
-                polled_seq_ = 0;
-            }
+        bool is_list = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto it = entries_.find(reply->request_id);
+            is_list = it != entries_.end() && it->second.module_list;
+        }
+        if (is_list && reply->status != 0) {
+            // Keep the session; the next full list goes out after a growing pause. Requests queued
+            // meanwhile go out normally and the broker answers them on their own merits.
+            CML_LOG(Warn, "the broker refused the module list: CML%u %s; will send it again in %lu ms",
+                    reply->status, reply->message.c_str(), static_cast<unsigned long>(list_backoff_ms_));
+            full_list_pending_ = true;
+            full_list_not_before_ = GetTickCount64() + list_backoff_ms_;
+            list_backoff_ms_ = std::min(list_backoff_ms_ * 2, kMaxListBackoffMs);
+            polled_seq_ = 0;
         }
         complete(reply->request_id, reply->status, reply->message);
+        if (is_list && reply->status == 0) {
+            note_list_accepted();
+        }
         return;
     }
     CML_LOG(Warn, "ignoring unexpected %s from the broker", ipc::to_string(ipc::type_of(message)));

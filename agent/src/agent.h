@@ -34,6 +34,9 @@
 
 namespace cml::agent {
 
+// Test hook: the next `count` module enumerations made by the agent fail.
+void set_enumeration_failures_for_testing(int count);
+
 class Agent {
 public:
     // `mode` is CML_MODE_IMMEDIATE or CML_MODE_SYNCHRONIZED.
@@ -71,14 +74,24 @@ public:
     public:
         explicit CallGuard(Agent& agent) noexcept : agent_(agent) {
             agent_.active_calls_.fetch_add(1, std::memory_order_acq_rel);
+            ++depth();
         }
-        ~CallGuard() { agent_.active_calls_.fetch_sub(1, std::memory_order_acq_rel); }
+        ~CallGuard() {
+            --depth();
+            agent_.active_calls_.fetch_sub(1, std::memory_order_acq_rel);
+        }
         CallGuard(const CallGuard&) = delete;
         CallGuard& operator=(const CallGuard&) = delete;
+
+        static int& depth() noexcept;  // guards held by the calling thread (all agents)
 
     private:
         Agent& agent_;
     };
+
+    // True on a thread that is inside a guarded call (e.g. work run by SyncPoint): destroying the
+    // agent from there is refused.
+    static bool in_guarded_call() noexcept;
 
     // stop(), then wait until every thread has left every public call. Call this (not just the
     // destructor) before freeing an Agent that other threads may still be using.
@@ -149,6 +162,7 @@ private:
     struct EnabledModule {
         std::string path;  // as the application spelled it
         std::uint32_t options;
+        bool needs_reenable = false;  // a re-enable was refused: send it again after the next accepted ModuleList
     };
     static bool same_module(const std::string& a, const std::string& b);
     void track_enabled_locked(const Entry& entry, std::uint32_t status);
@@ -156,7 +170,8 @@ private:
     void finish_locked(std::map<std::uint64_t, Entry>::iterator it, std::uint32_t status, const char* text,
                        bool answered_by_broker, bool evict);
     void evict_oldest_answers_locked();
-    void queue_reenables();
+    void queue_reenables(bool only_flagged);
+    void note_list_accepted();
     void erase_done_locked(std::uint64_t id);
 
     const std::uint32_t mode_;
@@ -196,6 +211,11 @@ private:
     std::vector<ipc::ModuleEntry> known_modules_;
     ULONGLONG last_module_poll_ = 0;
     std::uint64_t polled_seq_ = 0;  // queue_seq_ as of the last module poll
+    // Back-off state, agent thread only (see run() and poll_modules()).
+    ULONGLONG next_launch_at_ = 0;          // earliest tick for the next broker auto-start
+    DWORD launch_backoff_ms_ = 1000;        // 1 s, 2 s, 4 s ... 60 s; reset when a session's list is accepted
+    ULONGLONG full_list_not_before_ = 0;    // earliest tick for the next full-list resend
+    DWORD list_backoff_ms_ = 1000;          // 1 s, 2 s ... 30 s; reset when a list is accepted
     bool full_list_pending_ = false;         // the broker refused a ModuleList: send a full one on the next poll
 };
 

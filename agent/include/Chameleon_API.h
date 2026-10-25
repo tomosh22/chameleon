@@ -14,7 +14,12 @@
  *     for (;;) { frame(); agent.SyncPoint(); }
  *     cml::DestroyAgent(agent);
  *
- * Threading: every function may be called from any thread. None of them blocks on the broker:
+ * Threading: every function may be called from any thread. DestroyAgent must not be called
+ * concurrently with other calls on the same agent, except threads already blocked in
+ * WaitForRequest, which are released with CML5215. Calling any function on a destroyed agent is
+ * undefined. DestroyAgent called from inside a call into the same agent (for example from work run
+ * by SyncPoint) is refused with CML_STATUS_INVALID_ARGUMENT and destroys nothing.
+ * None of them blocks on the broker:
  * requests are queued for the agent's own thread and answered later (see cml_wait_request). The
  * only function that may do real work on the caller's thread is cml_sync_point(), by design.
  * If the broker is not running the agent starts it, keeps retrying in the background and the
@@ -127,7 +132,7 @@ typedef struct cml_agent_create_params {
 
 typedef int (*cml_pfn_abi_version)(void);
 typedef cml_status (*cml_pfn_create)(const cml_agent_create_params* params, void** out_agent);
-typedef void (*cml_pfn_destroy)(void* agent);
+typedef cml_status (*cml_pfn_destroy)(void* agent);
 typedef cml_status (*cml_pfn_request)(void* agent, const wchar_t* path, uint32_t options,
                                       uint64_t* out_request_id);
 typedef cml_status (*cml_pfn_wait_request)(void* agent, uint64_t request_id, uint32_t timeout_ms,
@@ -378,13 +383,21 @@ CML_INLINE cml_agent cml_create_synchronized_agent(const wchar_t* agent_dir) {
 
 /* Stops the agent thread and disconnects from the broker; the agent handle is invalid afterwards.
  * Safe to call from any thread except from inside DllMain (it joins the agent thread). NULL is
- * ignored. The caller must make sure no other thread is still using the handle. */
-CML_INLINE void cml_destroy_agent(cml_agent agent) {
+ * ignored. Contract: must not be called concurrently with other calls on the same agent, except
+ * threads already blocked in cml_wait_request(), which are released with CML5215; calling any
+ * function on a destroyed agent is undefined. Called from inside a call into the same agent (for
+ * example from work run by cml_sync_point()) it destroys nothing and returns
+ * CML_STATUS_INVALID_ARGUMENT; the handle then stays valid. Otherwise returns CML_STATUS_OK. */
+CML_INLINE cml_status cml_destroy_agent(cml_agent agent) {
+    cml_status status;
     if (agent == NULL) {
-        return;
+        return CML_STATUS_OK;
     }
-    agent->destroy(agent->impl);
-    HeapFree(GetProcessHeap(), 0, agent);
+    status = agent->destroy(agent->impl);
+    if (status == CML_STATUS_OK) {
+        HeapFree(GetProcessHeap(), 0, agent);
+    }
+    return status;
 }
 
 /* Asks the broker to enable `path` (a full path, or a bare file name such as L"Game.dll" that
@@ -567,7 +580,7 @@ public:
 
 private:
     cml_agent handle_;
-    friend void DestroyAgent(Agent& agent);
+    friend cml_status DestroyAgent(Agent& agent);
 };
 
 /* Immediate mode: patches are applied as soon as they are ready, on the agent's thread.
@@ -581,10 +594,15 @@ inline Agent CreateSynchronizedAgent(const wchar_t* agent_dir, cml_status* statu
     return Agent(cml_create_agent(agent_dir, CML_MODE_SYNCHRONIZED, status));
 }
 
-/* Stops the agent and invalidates `agent`. */
-inline void DestroyAgent(Agent& agent) {
-    cml_destroy_agent(agent.handle_);
-    agent.handle_ = NULL;
+/* Stops the agent and invalidates `agent` (see cml_destroy_agent() for the threading contract).
+ * Returns CML_STATUS_INVALID_ARGUMENT, leaving `agent` valid, if called from inside a call into
+ * the same agent. */
+inline cml_status DestroyAgent(Agent& agent) {
+    const cml_status status = cml_destroy_agent(agent.handle_);
+    if (status == CML_STATUS_OK) {
+        agent.handle_ = NULL;
+    }
+    return status;
 }
 
 /* Full path of the module (exe or dll) that contains the code calling this function. */

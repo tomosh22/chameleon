@@ -74,11 +74,18 @@ if(WIN32)
     target_sources(cml_test_agent PRIVATE agent/test_heap.cpp agent/test_agent_log.cpp agent/test_agent_table.cpp agent/test_agent.cpp)
     target_link_libraries(cml_test_agent PRIVATE cml_core)
     target_include_directories(cml_test_agent PRIVATE "${PROJECT_SOURCE_DIR}/agent/include")
-    add_dependencies(cml_test_agent cml_agent cml_broker cml_test_dummy_module cml_test_fake_agent_abi)
+    add_dependencies(cml_test_agent cml_agent cml_broker cml_test_dummy_module cml_test_fake_agent_abi cml_test_fake_broker)
+    target_compile_definitions(cml_test_agent PRIVATE "CML_TEST_FAKE_BROKER_EXE=\"$<TARGET_FILE:cml_test_fake_broker>\"")
     # The real broker, for the test that lets the agent auto-start one (and kills it).
     target_compile_definitions(cml_test_agent PRIVATE "CML_TEST_BROKER_EXE=\"$<TARGET_FILE:cml_broker>\"")
     target_sources(cml_test_broker_core PRIVATE broker/test_connection_server.cpp)
     set_tests_properties(unit.agent unit.broker_core PROPERTIES TIMEOUT 300)
+
+    # A broker that accepts one connection and exits at once (relaunch back-off test).
+    add_executable(cml_test_fake_broker agent/fake_broker.cpp)
+    target_link_libraries(cml_test_fake_broker PRIVATE cml_ipc)
+    cml_apply_warnings(cml_test_fake_broker)
+    set_target_properties(cml_test_fake_broker PROPERTIES FOLDER "tests")
 
     # A harmless DLL the end-to-end test loads and unloads to exercise ModuleLoaded/Unloaded.
     add_library(cml_test_dummy_module SHARED agent/dummy_module.cpp)

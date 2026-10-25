@@ -209,7 +209,7 @@ Result<ServerExit> ConnectionServer::run() {
 
         const ULONGLONG now = GetTickCount64();
         if (options_.exit_when_idle_ms != 0 && ever_connected &&
-            shared.active.load(std::memory_order_acquire) == 0 &&
+            shared.active.load(std::memory_order_acquire) == 0 && !server.has_pending_connection() &&
             now - shared.last_idle_tick.load(std::memory_order_acquire) >= options_.exit_when_idle_ms) {
             CML_LOG(Info, "no agents for %u ms; exiting", options_.exit_when_idle_ms);
             exit_reason = ServerExit::Idle;

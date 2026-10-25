@@ -133,6 +133,11 @@ public:
     // so the pipe name is never without an instance and cannot be taken by another process.
     void refresh_instance();
 
+    // True while a client is connected but accept() could not yet hand the connection over (the
+    // replacement listening instance is still missing). Same thread as accept() only. A server
+    // that exits when idle must count this as activity.
+    bool has_pending_connection() const noexcept;
+
     // Any thread; sticky. Makes accept() return Cancelled.
     void cancel() noexcept;
 

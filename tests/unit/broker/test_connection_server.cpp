@@ -451,4 +451,27 @@ TEST_CASE("a caller-owned stop event stops the server and is left open") {
     CloseHandle(event);
 }
 
+TEST_CASE("a client waiting for its replacement pipe instance keeps the server from exiting as idle") {
+    QuietLogs quiet;
+    ServerOptions options;
+    options.pipe_name = unique_pipe_name("pendingidle");
+    options.exit_when_idle_ms = 700;
+    RunningServer server(options);
+    REQUIRE(ipc::pipe_exists(options.pipe_name));
+    {
+        PipeConnection first = connect(options.pipe_name);
+        exchange(first, hello(1));
+        ipc::set_instance_create_failures_for_testing(1000000);
+    }  // the first agent leaves: the idle clock starts
+    PipeConnection second = connect(options.pipe_name);  // connected, but it cannot be handed over yet
+    Sleep(2000);  // well past the idle limit
+    CHECK_FALSE(server.finished());
+    ipc::set_instance_create_failures_for_testing(0);
+    exchange(second, hello(2));  // the hand-over completes and the connection is served
+    CHECK_FALSE(server.finished());
+    second.close();
+    REQUIRE(server.join());  // now it is really idle
+    CHECK(server.reason() == ServerExit::Idle);
+}
+
 #endif  // _WIN32
