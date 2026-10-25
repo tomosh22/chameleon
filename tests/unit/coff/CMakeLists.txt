@@ -14,7 +14,8 @@
 add_library(coff_cov_extras_objs OBJECT "${CMAKE_CURRENT_SOURCE_DIR}/../../fixtures/basic/extras.cpp")
 cml_target_exceptions_allowed(coff_cov_extras_objs)
 if(MSVC)
-    target_compile_options(coff_cov_extras_objs PRIVATE /Od /Gy /hotpatch)
+    # /Ob0 as well: CMake's RelWithDebInfo flags carry /Ob1, which still inlines at /Od under cl.
+    target_compile_options(coff_cov_extras_objs PRIVATE /Od /Ob0 /Gy /hotpatch)
 else()
     target_compile_options(coff_cov_extras_objs PRIVATE -O0)
 endif()

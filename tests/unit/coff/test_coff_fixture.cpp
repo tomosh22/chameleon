@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "doctest.h"
+#include "coff_independent.h"
 #include "fixture_paths.h"
 
 using namespace cml::coff;
@@ -122,6 +123,47 @@ bool contains_bytes(ByteSpan data, std::string_view text) {
     return false;
 }
 
+
+// The symbol (reached through a REL32-family relocation from any section) that holds `text` at its
+// address. cl without /GF names string literals $SG<n> (static, in a plain .rdata); with /GF or
+// clang they are ??_C@_... COMDATs (selection Any).
+const Symbol* find_string_symbol(const Object& o, std::string_view text) {
+    for (const Section& sec : o.sections()) {
+        if (!sec.is_code()) {
+            continue;
+        }
+        for (const ResolvedRelocation& r : resolved(o, sec)) {
+            if (!is_rel32_family(r.reloc.type)) {
+                continue;
+            }
+            const Section* ts = o.section_of(*r.target);
+            if (ts == nullptr || r.target->value + text.size() > ts->data.size()) {
+                continue;
+            }
+            if (contains_bytes(ts->data.subspan(r.target->value, text.size()), text)) {
+                return r.target;
+            }
+        }
+    }
+    return nullptr;
+}
+
+void check_string_symbol(const Object& o, std::string_view text) {
+    const Symbol* lit = find_string_symbol(o, text);
+    REQUIRE_MESSAGE(lit != nullptr, "no symbol referenced by a REL32 relocation holds \"" << text << "\"");
+    const Section* sec = o.section_of(*lit);
+    REQUIRE(sec != nullptr);
+    CHECK_MESSAGE((starts_with(sec->name, ".rdata") || starts_with(sec->name, ".data")), "literal in " << sec->name);
+    CHECK((sec->characteristics & scn::MemWrite) == 0u);
+    if (sec->is_comdat()) {
+        const auto c = o.comdat(*sec);
+        REQUIRE(c.has_value());
+        CHECK(c->selection == ComdatSelection::Any);
+        REQUIRE(c->leader != nullptr);
+        CHECK(c->leader->name == lit->name);
+    }
+}
+
 // Facts about the static-CRT default-lib directive, shared by all objects.
 void check_default_lib(const Object& o) {
     bool found = false;
@@ -172,18 +214,8 @@ TEST_CASE("fixture basic: logic.obj defines compute_value and references g_tick 
     CHECK(has_rel32_to(o, *text, "?g_tick@@3HA"));
     CHECK(has_rel32_to(o, *text, "?fixture_note@@YAXPEBD@Z"));
 
-    // The string literal passed to fixture_note: a COMDAT (selection Any) in .rdata that holds the text.
-    const Symbol* lit = find_prefix(o, "??_C@_0");
-    REQUIRE(lit != nullptr);
-    const Section* lit_sec = o.section_of(*lit);
-    REQUIRE(lit_sec != nullptr);
-    CHECK(contains_bytes(lit_sec->data, "logic-start"));
-    const auto lit_comdat = o.comdat(*lit_sec);
-    REQUIRE(lit_comdat.has_value());
-    CHECK(lit_comdat->selection == ComdatSelection::Any);
-    REQUIRE(lit_comdat->leader != nullptr);
-    CHECK(lit_comdat->leader->name == lit->name);
-    CHECK(has_rel32_to(o, *text, lit->name));
+    // The string literal passed to fixture_note.
+    check_string_symbol(o, "logic-start");
 
     check_default_lib(o);
 }
@@ -381,13 +413,8 @@ void check_extras(const Object& o, bool full) {
     }
     CHECK_MESSAGE(personality, "no .xdata relocation to __CxxFrameHandler*");
 
-    // ---- string literal: COMDAT in .rdata ----
-    const Symbol* lit = find_prefix(o, "??_C@_0");
-    REQUIRE(lit != nullptr);
-    const Section* lit_sec = o.section_of(*lit);
-    REQUIRE(lit_sec != nullptr);
-    CHECK(contains_bytes(lit_sec->data, "extras-string-literal"));
-    CHECK(lit_sec->is_comdat());
+    // ---- string literal ----
+    check_string_symbol(o, "extras-string-literal");
 
     // ---- static data (.data) and const table (.rdata) ----
     const Symbol* counter = find_prefix(o, "?s_counter@");
@@ -483,9 +510,13 @@ TEST_CASE("fixture bigobj: bigobj_funcs.obj parses as /bigobj with 32-bit sectio
     }
 }
 
-TEST_CASE("fixture bigobj: main.obj is an ordinary object") {
+TEST_CASE("fixture bigobj: main.obj") {
     const Object& o = load("bigobj_objs", "main");
-    CHECK_FALSE(o.is_bigobj());
+#if defined(__clang__)
+    CHECK_FALSE(o.is_bigobj());  // clang-cl ignores /bigobj and only switches format when needed
+#else
+    CHECK(o.is_bigobj());        // cl: /bigobj applies to every TU of the target
+#endif
     const Symbol& sum = need(o, "bigobj_sum");
     CHECK(sum.is_undefined());
     const Symbol& sink = need(o, "?g_bigobj_sink@@3HA");
@@ -526,5 +557,39 @@ TEST_CASE("SURVEY extras objects") {
             out += "D " + d.text + "\n";
         }
     }
+    FAIL_CHECK(out);
+}
+
+TEST_CASE("SURVEY bigobj raw") {
+    std::string out;
+    const std::string path = object_path("bigobj_objs", "bigobj_funcs");
+    auto bytes = read_file(path);
+    REQUIRE(bytes.has_value());
+    std::vector<std::uint8_t> raw(bytes->size());
+    for (std::size_t i = 0; i < raw.size(); ++i) raw[i] = std::to_integer<std::uint8_t>((*bytes)[i]);
+    const cml_test::IndObject ind = cml_test::independent_parse(raw);
+    char line[512];
+    std::snprintf(line, sizeof(line), "ok=%d big=%d sections=%zu symrecords=%u symtab=%u first bytes:", ind.ok ? 1 : 0, ind.big ? 1 : 0,
+                  ind.sections.size(), ind.nsyms, ind.symtab);
+    out += line;
+    for (int i = 0; i < 56; ++i) { std::snprintf(line, sizeof(line), " %02X", raw[static_cast<std::size_t>(i)]); out += line; }
+    out += "\n";
+    int shown = 0;
+    std::size_t bad = 0;
+    for (const auto& sym : ind.symbols) {
+        if (sym.section < -2 || sym.section > static_cast<std::int32_t>(ind.sections.size())) {
+            ++bad;
+            if (shown++ < 12) {
+                const std::size_t off = ind.symtab + static_cast<std::size_t>(sym.index) * 20u;
+                std::snprintf(line, sizeof(line), "BAD idx=%u name=%s sec=%d cls=%u naux=%u raw:", sym.index, sym.name.c_str(), sym.section,
+                              static_cast<unsigned>(sym.cls), static_cast<unsigned>(sym.naux));
+                out += line;
+                for (std::size_t k = 0; k < 20; ++k) { std::snprintf(line, sizeof(line), " %02X", raw[off + k]); out += line; }
+                out += "\n";
+            }
+        }
+    }
+    std::snprintf(line, sizeof(line), "bad symbols=%zu\n", bad);
+    out += line;
     FAIL_CHECK(out);
 }

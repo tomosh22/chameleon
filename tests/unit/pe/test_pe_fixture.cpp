@@ -4,6 +4,7 @@
 #include "cml/pe/pe.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdint>
 #include <fstream>
 #include <map>
@@ -280,11 +281,14 @@ TEST_CASE("fixture basic exe: load config GuardFlags and TLS directory") {
     CHECK(read_u32_at(o, *off + 0x90) == lc->guard_flags);
     CHECK(read_u64_at(o, *off + 0x58) == lc->security_cookie);
 
-    // The fixture is not built with /guard:cf, and the header bit and the load-config flag must agree
-    // either way.
-    const bool header_says_cf = (img.optional_header().dll_characteristics & dllchar::GuardCf) != 0;
-    CHECK(header_says_cf == lc->cf_instrumented());
-    CHECK_FALSE(lc->cf_instrumented());
+    // The linker sets CF_INSTRUMENTED in GuardFlags whenever the CRT objects it links were compiled
+    // with /guard:cf, even without /guard:cf on the fixture itself; the DllCharacteristics GuardCf bit
+    // is only set by /guard:cf at link time. So the two are NOT required to agree; what must hold is
+    // that GuardFlags is read from the right place (checked against the raw file above) and that
+    // the function table flag implies a table.
+    if ((lc->guard_flags & guard::CfFunctionTablePresent) != 0) {
+        CHECK(lc->guard_cf_function_table != 0u);
+    }
     CHECK(lc->security_cookie != 0u);  // /GS is on, so the cookie slot exists
 
     const DataDirectory& tls_dir = img.data_directory(dir::Tls);
@@ -475,3 +479,25 @@ TEST_CASE("in-memory: the fixture exe mapped as an image resource matches its on
 }
 
 #endif  // _WIN32
+
+TEST_CASE("SURVEY pe") {
+    const OwnedImage& o = load_exe("basic_exe");
+    const auto lc = o.image.load_config();
+    char line[512];
+    std::snprintf(line, sizeof(line), "dllchars=0x%X guardflags=0x%X size=0x%X table=0x%llX count=%llu cookie=0x%llX sections=%zu tls=%d entry=0x%X\n",
+                  static_cast<unsigned>(o.image.optional_header().dll_characteristics), static_cast<unsigned>(lc->guard_flags),
+                  static_cast<unsigned>(lc->size), static_cast<unsigned long long>(lc->guard_cf_function_table),
+                  static_cast<unsigned long long>(lc->guard_cf_function_count), static_cast<unsigned long long>(lc->security_cookie),
+                  o.image.sections().size(), o.image.has_tls() ? 1 : 0, static_cast<unsigned>(o.image.optional_header().address_of_entry_point));
+    std::string out = line;
+    for (const SectionHeader& s : o.image.sections()) {
+        out += std::string(s.name()) + " ";
+    }
+    const auto imports = o.image.imports();
+    for (const ImportModule& m : *imports) {
+        out += "\n" + std::string(m.dll_name) + " (" + std::to_string(m.entries.size()) + ")";
+    }
+    const auto cv = o.image.codeview();
+    out += "\npdb=" + std::string(cv->pdb_path) + " age=" + std::to_string(cv->age);
+    FAIL_CHECK(out);
+}
