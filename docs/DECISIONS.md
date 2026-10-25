@@ -448,3 +448,24 @@ with an addend of 0, while clang-cl emits plain `REL32` with an in-place addend 
 same access. The retargeter therefore computes `target = S + A` (A read from the original
 object's section bytes at the site) and writes `target − (site + 4 + N)`. ADDR64 likewise adds
 the in-place 64-bit addend.
+
+## ADR-0026 Toolchain facts from WP-05
+
+**Date:** 2026-10-25 · **Status:** Accepted
+
+- **clang-cl replay:** the recorded cc1 command is replayed as `<clang> -cc1 <rewritten args>`.
+  This is option (a). Translating cc1 back to driver flags was lossy, so it was rejected.
+  Symbol sets match the original in clang 17.0.6, 18.1.8, 19.1.7 and 20.1.8. **The minimum
+  supported clang-cl is 17** (plan §13 Q3). Older versions are untested.
+- **cl PCH + `/Zi`:** forcing `/Z7` fails with C2855 against a `/Zi` PCH. Default mode
+  `KeepZiPrivatePdb` keeps `/Zi /Yu /Fp` and points `/Fd` at a private copy of the recorded
+  compiler PDB. This amends plan §4.4's "replace `/Zi` with `/Z7`" for PCH users.
+- **`/Gy` detection (plan §13 Q1):** in priority order, an explicit command-line flag, then
+  functions in COMDAT sections in the recorded object, then implied by other flags
+  (`/ZI`, `/O1`, `/O2`), then absent.
+- **`/hotpatch`:** the `S_COMPILE3` hotpatch bit is set for every x64 object, and cl ignores
+  `/hotpatch` on x64 (D9002). The flag fact therefore means "x64 entry is patchable", not
+  "option passed".
+- **MSVC STL vs older clang:** STL 14.44+ rejects clang < 19 (STL1000) unless
+  `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` is defined. This affects users on clang 17/18 with
+  current MSVC.
