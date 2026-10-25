@@ -599,23 +599,35 @@ public:
     enum class Action { Answer, CorruptAnswer, Reject, Hangup };
     using Hook = std::function<Action(const cml::ipc::Message&)>;
 
-    ScriptedBroker(std::string pipe, Hook hook = nullptr) : pipe_(std::move(pipe)), hook_(std::move(hook)) {
-        thread_ = std::thread([this] { run(); });
+    // `before_listen` (tests only) runs on the listener thread each time it is about to create the
+    // next pipe instance, i.e. in the gap where no instance of the pipe exists.
+    ScriptedBroker(std::string pipe, Hook hook = nullptr, std::function<void()> before_listen = nullptr)
+        : pipe_(std::move(pipe)), hook_(std::move(hook)), before_listen_(std::move(before_listen)) {
+        thread_ = std::thread([this] {
+            run();
+            exited_.store(true);
+        });
         ready_ = wait_until([this] { return cml::ipc::pipe_exists(pipe_); }, 10000);
     }
     ~ScriptedBroker() {
         stopping_.store(true);
-        // Unblock a pending ConnectNamedPipe with a throw-away client.
-        const std::wstring wide = widen(pipe_);
-        HANDLE poke = CreateFileW(wide.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-        if (poke != INVALID_HANDLE_VALUE) {
-            CloseHandle(poke);
+        // The listener blocks in ConnectNamedPipe, which only a client can end. A throw-away client
+        // helps only if an instance exists at that moment: between two sessions the listener may
+        // not have created the next one yet (it may even have passed its stopping_ check already),
+        // and then a single poke finds nothing and the join below would wait for ever. So keep
+        // poking until the thread has really exited.
+        const ULONGLONG deadline = GetTickCount64() + 30000;
+        while (!exited_.load() && GetTickCount64() < deadline) {
+            poke();
+            SetEvent(hangup_event_);
+            Sleep(1);
         }
-        SetEvent(hangup_event_);
         thread_.join();
         CloseHandle(hangup_event_);
     }
     bool ready() const { return ready_; }
+    // Throw-away client connections made by the destructor so far (tests only).
+    int pokes() const { return pokes_.load(); }
 
     // Closes the current connection (the agent will reconnect).
     void hang_up() { SetEvent(hangup_event_); }
@@ -672,9 +684,21 @@ private:
         return frame.has_value() && write_all(pipe, *frame);
     }
 
+    void poke() {
+        const std::wstring wide = widen(pipe_);
+        HANDLE client = CreateFileW(wide.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (client != INVALID_HANDLE_VALUE) {
+            CloseHandle(client);
+        }
+        pokes_.fetch_add(1);
+    }
+
     void run() {
         const std::wstring wide = widen(pipe_);
         while (!stopping_.load()) {
+            if (before_listen_) {
+                before_listen_();
+            }
             HANDLE pipe = CreateNamedPipeW(wide.c_str(), PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                                            PIPE_UNLIMITED_INSTANCES, 65536, 65536, 0, nullptr);
             if (pipe == INVALID_HANDLE_VALUE) {
@@ -773,7 +797,10 @@ private:
     std::string pipe_;
     Hook hook_;
     std::thread thread_;
+    std::function<void()> before_listen_;
     std::atomic<bool> stopping_{false};
+    std::atomic<bool> exited_{false};
+    std::atomic<int> pokes_{0};
     bool ready_ = false;
     HANDLE hangup_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);  // manual-reset: reset per session
     mutable std::mutex mutex_;
@@ -1267,4 +1294,58 @@ TEST_CASE("a module list the broker keeps refusing is resent with a growing paus
     CHECK(lists <= 6);
     CHECK(broker.connections() == 1);
     cml::DestroyAgent(agent);
+}
+
+TEST_CASE("a scripted broker destroyed between two sessions still stops") {
+    // The listener thread of ScriptedBroker has a gap, after a session ended and before the next
+    // pipe instance exists, in which a destructor that pokes once finds no instance to connect to.
+    // The listener then creates one, blocks in ConnectNamedPipe and the join never returns. Park
+    // the listener in that gap, start the destructor, let it poke into the void, then release.
+    const std::string pipe = unique_pipe_name("brokerstop");
+    HANDLE in_gap = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    REQUIRE(in_gap != nullptr);
+    REQUIRE(release != nullptr);
+    std::atomic<int> passes{0};
+    auto broker = std::make_unique<ScriptedBroker>(pipe, nullptr, [&] {
+        if (passes.fetch_add(1) == 1) {  // the second pass: the first session is over
+            SetEvent(in_gap);
+            WaitForSingleObject(release, 20000);
+        }
+    });
+    ScriptedBroker* const raw = broker.get();
+    REQUIRE(raw->ready());
+
+    const std::wstring wide = widen(pipe);
+    HANDLE client = CreateFileW(wide.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+    REQUIRE(client != INVALID_HANDLE_VALUE);
+    CloseHandle(client);  // a session that ends at once
+    REQUIRE(WaitForSingleObject(in_gap, 10000) == WAIT_OBJECT_0);
+
+    std::atomic<bool> destroyed{false};
+    std::thread destroyer([&] {
+        broker.reset();
+        destroyed.store(true);
+    });
+    // The destructor has poked once and found no pipe: the interleaving is in place.
+    const bool poked = wait_until([&] { return raw->pokes() >= 1; }, 10000);
+    SetEvent(release);
+    const bool stopped = wait_until([&] { return destroyed.load(); }, 10000);
+    if (!stopped) {
+        // A broker that cannot stop: free it by hand so that the failure is reported, not a hang.
+        wait_until(
+            [&] {
+                HANDLE rescue = CreateFileW(wide.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+                if (rescue != INVALID_HANDLE_VALUE) {
+                    CloseHandle(rescue);
+                }
+                return destroyed.load();
+            },
+            10000);
+    }
+    destroyer.join();
+    CloseHandle(in_gap);
+    CloseHandle(release);
+    CHECK(poked);
+    CHECK_MESSAGE(stopped, "the scripted broker's destructor did not finish on its own");
 }
