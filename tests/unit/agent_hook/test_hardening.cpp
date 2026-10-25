@@ -169,7 +169,10 @@ TEST_CASE("negative test: an allocation inside the stopped window is detected") 
         MESSAGE("Release CRT: no allocation hook, only the agent heap path is checked in this cell");
     }
     CHECK_FALSE(agent_heap::alloc_forbidden());
-    REQUIRE(revert_one(installer, old_fn.entry, "fn").ok());
+    {
+        const BatchResult checked = revert_one(installer, old_fn.entry, "fn");
+        REQUIRE_MESSAGE(checked.ok(), checked.diag.format());
+    }
 }
 
 TEST_CASE("positive control: installing and reverting allocate nothing while the world is stopped") {
@@ -184,9 +187,18 @@ TEST_CASE("positive control: installing and reverting allocate nothing while the
     CountingScope counting;
     std::vector<HookOutcome> out;
     const HookRequest requests[] = {{a.entry, repl.entry, "a"}, {b.entry, repl.entry, "b"}, {c.entry, repl.entry, "c"}};
-    REQUIRE(installer.install(requests, 3, out).ok());
-    REQUIRE(installer.install(requests, 3, out).ok());  // unchanged
-    REQUIRE(installer.revert(requests, 3, out).ok());
+    {
+        const BatchResult checked = installer.install(requests, 3, out);
+        REQUIRE_MESSAGE(checked.ok(), checked.diag.format());
+    }
+    {
+        const BatchResult checked = installer.install(requests, 3, out);
+        REQUIRE_MESSAGE(checked.ok(), checked.diag.format());
+    }  // unchanged
+    {
+        const BatchResult checked = installer.revert(requests, 3, out);
+        REQUIRE_MESSAGE(checked.ok(), checked.diag.format());
+    }
     CHECK(g_alloc_violations.agent_heap.load() == 0);
     CHECK(g_alloc_violations.crt.load() == 0);
 }
@@ -333,7 +345,10 @@ TEST_CASE("an offender that leaves while only it runs is handled inside ONE stop
     CHECK(outcome.status == HookStatus::Installed);
     CHECK(result.load() == 7);  // the call that was running finished normally
     CHECK(slow.entry[0] == 0xE9);
-    REQUIRE(revert_one(installer, slow.entry, "slow_const").ok());
+    {
+        const BatchResult checked = revert_one(installer, slow.entry, "slow_const");
+        REQUIRE_MESSAGE(checked.ok(), checked.diag.format());
+    }
     CHECK(around(slow) == before);
 }
 
@@ -470,7 +485,10 @@ TEST_CASE("an odd entry never gets strategy 1, an even one that is not 16-aligne
         CHECK(old_fn.entry[0] == 0xE9);
         CHECK(old_fn.entry[-1] == 0xCC);  // the padding was not used
         CHECK(old_fn.as_int()(1) == 101);
-        REQUIRE(revert_one(installer, old_fn.entry, "odd").ok());
+        {
+            const BatchResult checked = revert_one(installer, old_fn.entry, "odd");
+            REQUIRE_MESSAGE(checked.ok(), checked.diag.format());
+        }
         CHECK(around(old_fn) == before);
     }
     for (std::size_t misalign : {2u, 4u, 6u, 14u}) {
@@ -482,10 +500,16 @@ TEST_CASE("an odd entry never gets strategy 1, an even one that is not 16-aligne
         REQUIRE((reinterpret_cast<std::uintptr_t>(old_fn.entry) & 1) == 0);
         Installer installer;
         HookOutcome outcome;
-        REQUIRE(install_one(installer, old_fn.entry, new_fn.entry, "even", &outcome).ok());
+        {
+            const BatchResult checked = install_one(installer, old_fn.entry, new_fn.entry, "even", &outcome);
+            REQUIRE_MESSAGE(checked.ok(), checked.diag.format());
+        }
         CHECK(outcome.strategy == Strategy::PaddingTwoByte);
         CHECK(old_fn.as_int()(1) == 101);
-        REQUIRE(revert_one(installer, old_fn.entry, "even").ok());
+        {
+            const BatchResult checked = revert_one(installer, old_fn.entry, "even");
+            REQUIRE_MESSAGE(checked.ok(), checked.diag.format());
+        }
     }
 }
 
@@ -511,7 +535,10 @@ TEST_CASE("padding in a page that is not executable falls back to strategy 2") {
     CHECK(old_fn.entry[-1] == 0xCC);  // nothing written into the data page
     CHECK(protection_of(arena.base()) == PAGE_READONLY);
     CHECK(old_fn.as_int()(1) == 101);
-    REQUIRE(revert_one(installer, old_fn.entry, "split").ok());
+    {
+        const BatchResult checked = revert_one(installer, old_fn.entry, "split");
+        REQUIRE_MESSAGE(checked.ok(), checked.diag.format());
+    }
     CHECK(around(old_fn) == before);
     CHECK(protection_of(arena.base()) == PAGE_READONLY);
 }
