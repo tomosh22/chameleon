@@ -254,10 +254,13 @@ TEST_CASE("json: objects are capped at 4096 members and duplicate detection is l
     full += ",\"k0\":1}";
     check_rejected(full);
     // 65k keys: rejected fast (the cap), never quadratic
+    const std::string big = object_with(65000);  // built before the clock starts: only parsing is timed
     const auto start = std::chrono::steady_clock::now();
-    check_rejected(object_with(65000));
+    const Result<Value> big_result = parse(big);
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
     CHECK(ms < 100);
+    CHECK_FALSE(big_result.has_value());
+    check_rejected(big);
     // many equal keys: the first duplicate is reported at once
     std::string dups = "{";
     for (int i = 0; i < 3000; ++i) dups += i == 0 ? "\"a\":1" : ",\"a\":1";
