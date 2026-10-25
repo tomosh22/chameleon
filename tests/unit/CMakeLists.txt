@@ -64,7 +64,7 @@ endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     target_compile_definitions(cml_test_pdb PRIVATE CML_TEST_COMPILER_IS_CL=1)  # cl.exe, not clang-cl
 endif()
-cml_add_unit_test(ipc SOURCES lib/test_ipc.cpp LIBS cml_ipc)
+cml_add_unit_test(ipc SOURCES lib/test_ipc.cpp lib/test_ipc_hooks.cpp LIBS cml_ipc)
 cml_add_unit_test(proc SOURCES lib/test_proc.cpp LIBS cml_proc)
 if(WIN32)
     # WP-11: named-pipe transport tests (real pipes, in-process client and server threads).
@@ -79,6 +79,7 @@ cml_add_unit_test(watch SOURCES lib/test_watch.cpp LIBS cml_watch)
 cml_add_unit_test(agent
     SOURCES agent/test_sync_queue.cpp agent/test_module_diff.cpp
     LIBS cml_agent_core)
+add_subdirectory(agent_hook)  # WP-10: unit.agent_hook, unit.agent_hook_stress
 cml_add_unit_test(broker_core SOURCES broker/test_core.cpp broker/test_session.cpp LIBS cml_core)
 if(NOT MSVC)
     # Portable pieces are tested on non-Windows hosts too (CML_ALLOW_NON_WINDOWS).

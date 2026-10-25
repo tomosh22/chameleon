@@ -11,12 +11,17 @@
 
 set(CML_AGENT_PORTABLE_SOURCES
     src/sync_queue.cpp
-    src/module_diff.cpp)
+    src/module_diff.cpp
+    src/hook/length_decoder.cpp
+    src/hook/hook_plan.cpp)
 set(CML_AGENT_WINDOWS_SOURCES
     src/agent.cpp
     src/agent_log.cpp
     src/broker_launch.cpp
-    src/heap.cpp)
+    src/heap.cpp
+    src/hook/thread_set.cpp
+    src/hook/installer.cpp
+    src/hook/dispatch.cpp)
 
 add_library(cml_agent_core STATIC ${CML_AGENT_PORTABLE_SOURCES} ${CML_AGENT_WINDOWS_SOURCES})
 target_include_directories(cml_agent_core
