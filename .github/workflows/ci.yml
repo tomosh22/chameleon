@@ -157,6 +157,7 @@ jobs:
         if: always()
         run: |
           New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          if (Test-Path "$env:LOG_DIR/wp10-repeat.txt") { Get-Content "$env:LOG_DIR/wp10-repeat.txt" }
           $e = "$env:BUILD_DIR/test_work/agent_hook/evidence.txt"
           if (Test-Path $e) {
             Copy-Item $e "$env:LOG_DIR/wp10-stress-evidence.txt"
