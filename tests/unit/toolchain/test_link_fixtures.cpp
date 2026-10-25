@@ -244,6 +244,7 @@ struct Prepared {
     std::string source_rel;
     std::string object;            // anchored object
     std::string binding;           // binding.obj ("" when nothing to bind)
+    std::vector<std::string> original_objects;  // the compiler's objects, before anchoring
     std::vector<PatchObjectInput> objects;
     std::vector<coff::BindSymbol> binds;
     std::vector<std::string> new_functions;
@@ -318,6 +319,7 @@ Prepared prepare(const std::string& fixture, const fs::path& edit_file, const cm
         auto compiled = compile_tu(req, out);
         REQUIRE_MESSAGE(compiled, compiled.error().format() << "\ncommand: " << out.command_line << "\n" << out.output);
         p.compile_seconds += out.seconds;
+        p.original_objects.push_back(out.object_path);
 
         auto obj = coff::load_object_file(out.object_path);
         REQUIRE_MESSAGE(obj, obj.error().format());
@@ -739,5 +741,70 @@ TEST_CASE("link patch: link time of `basic` (median of 5 after a warm-up) for ea
         if (tool == &mirrored && relwithdebinfo) {
             CHECK_MESSAGE(median < 300.0, "median link time of `basic` is " << median << " ms; the budget is 300 ms");
         }
+    }
+}
+
+// Evidence only (never fails): lld-link 20.1.8 crashed (0xC0000005) on the clang-cl object of fixture new_function, which
+// has nothing to bind, and succeeded on the cl object. Which input or option triggers it?
+TEST_CASE("link patch: evidence for the lld-link crash on a patch without binding.obj") {
+    ModuleUnderTest m = open_module("new_function");
+    const auto edits = edits_of("new_function");
+    REQUIRE(!edits.empty());
+    Prepared p = prepare("new_function", edits.front(), *m.pdb);
+    ToolInfo lld;
+    if (!optional_linker(ToolFamily::LldLink, lld)) {
+        evidence("LLD-PROBE skipped: no lld-link");
+        return;
+    }
+    const fs::path dir = work_root() / "lld_probe";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    auto run_variant = [&](const char* name, const std::vector<std::string>& objects, const std::vector<std::string>& drop,
+                           const std::vector<std::string>& add) {
+        LinkCommandSpec spec;
+        spec.family = ToolFamily::LldLink;
+        spec.objects = objects;
+        spec.out_dll = (dir / (std::string(name) + ".dll")).string();
+        spec.out_pdb = (dir / (std::string(name) + ".pdb")).string();
+        spec.base = kBase;
+        auto args = build_link_command(spec);
+        REQUIRE(args);
+        std::vector<std::string> a;
+        for (const std::string& x : *args) {
+            if (std::find(drop.begin(), drop.end(), x) == drop.end()) {
+                a.push_back(x);
+            }
+        }
+        for (const std::string& x : add) {
+            a.push_back(x);
+        }
+        ProcessSpec ps;
+        ps.exe = lld.path;
+        ps.args = a;
+        ps.cwd = dir.string();
+        ps.timeout_ms = 60000;
+        auto r = run_process(ps);
+        REQUIRE(r);
+        std::string first = r->output.substr(0, r->output.find('\n'));
+        evidence("LLD-PROBE variant=%s exit=%d first_output_line=%s", name, r->exit_code, first.c_str());
+    };
+    const std::string anchored = p.objects[0].path;
+    const std::string original = p.original_objects[0];
+    run_variant("as_is", {anchored}, {}, {});
+    run_variant("original_object_no_anchors", {original}, {}, {});
+    run_variant("without_functionpadmin", {anchored}, {"/FUNCTIONPADMIN"}, {});
+    run_variant("without_debug_full", {anchored}, {"/DEBUG:FULL"}, {});
+    run_variant("without_nodefaultlib", {anchored}, {"/NODEFAULTLIB"}, {});
+    run_variant("without_noentry", {anchored}, {"/NOENTRY"}, {"/ENTRY:compute_value"});
+    run_variant("without_fixed_dynamicbase", {anchored}, {"/FIXED", "/DYNAMICBASE:NO"}, {});
+    run_variant("with_opt_ref_icf", {anchored}, {"/OPT:NOREF", "/OPT:NOICF"}, {"/OPT:REF", "/OPT:ICF", "/EXPORT:compute_value"});
+    {
+        std::vector<coff::BindSymbol> pad = {{"__cml_probe_pad", coff::BindKind::Data}};
+        auto bo = coff::make_binding_object(pad);
+        REQUIRE(bo);
+        const fs::path padobj = dir / "pad_binding.obj";
+        REQUIRE(write_bytes(padobj, *bo));
+        run_variant("with_pad_binding_obj", {anchored, padobj.string()}, {}, {});
+        run_variant("original_with_pad_binding_obj", {original, padobj.string()}, {}, {});
     }
 }

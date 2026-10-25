@@ -127,20 +127,6 @@ jobs:
             Write-Host "no WP-06 evidence file (unit.coff_link did not run)"
           }
 
-      # WP-09: linker detection, the LINK lines of every fixture under both linkers, link times and the
-      # /IGNORE evidence (written by unit.link_patch). docs/wp/WP-09.md quotes these lines.
-      - name: WP-09 link evidence (linker driver)
-        if: always()
-        run: |
-          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
-          $e = "$env:BUILD_DIR/test_work/link_patch/evidence.txt"
-          if (Test-Path $e) {
-            Copy-Item $e "$env:LOG_DIR/wp09-evidence.txt"
-            Get-Content $e
-          } else {
-            Write-Host "no WP-09 evidence file (unit.link_patch did not run)"
-          }
-
       # WP-05: what the toolchain library makes of the fixtures built by this cell: recorded commands
       # (the real command lines the unit corpus is checked against), rewrites, build-flag facts, the
       # recompile check against the original objects, and every PCH strategy (/Zi + /Yu question).
@@ -257,6 +243,20 @@ jobs:
             build/CMakeFiles/CMakeConfigureLog.yaml
             build/.ninja_log
           if-no-files-found: warn
+
+      # WP-09: linker detection, the LINK lines of every fixture under both linkers, link times and the /IGNORE
+      # evidence (written by unit.link_patch). The last step of the job so the lines are easy to read from the log
+      # tail; docs/wp/WP-09.md quotes them. The complete file is in the logs artifact (ci-logs/wp09-evidence.txt).
+      - name: WP-09 link evidence (linker driver)
+        if: always()
+        run: |
+          $e = "$env:BUILD_DIR/test_work/link_patch/evidence.txt"
+          if (Test-Path $e) {
+            Copy-Item $e "$env:LOG_DIR/wp09-evidence.txt"
+            Get-Content $e | Where-Object { $_ -match '^(LINK |LINK-TIME|LINK-NOIGNORE|LINK-IGNORE|LINK-RSP|LINK-SKIP|LINK-WARNING|LLD-PROBE|NEGATIVE|LINKER-DETECT fixture=basic|PREPARED fixture=(basic|new_function))' } | Select-Object -Unique
+          } else {
+            Write-Host "no WP-09 evidence file (unit.link_patch did not run)"
+          }
 
   # Not part of the 8-cell matrix: proves the Visual Studio generator still configures and
   # builds, which is what most developers use locally.
