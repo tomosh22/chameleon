@@ -215,7 +215,9 @@ struct Symbol {
     std::uint32_t name_offset = 0;  // string-table offset when name_in_string_table
 
     std::uint32_t value = 0;
-    std::int32_t section_number = 0;  // 16-bit values are sign-extended
+    // Regular objects: 16-bit field, 0xFFFF = -1 (absolute), 0xFFFE = -2 (debug), everything else
+    // unsigned (toolchains use 1..65279). Bigobj: a plain signed 32-bit value.
+    std::int32_t section_number = 0;
     std::uint16_t type = 0;
     StorageClass storage_class = StorageClass::Null;
     std::uint8_t aux_count = 0;

@@ -218,7 +218,9 @@ inline IndObject independent_parse(const std::vector<std::uint8_t>& f) {
             RawSym16 r{};
             if (!take(f, at, &r)) { o.error = "symbol"; return o; }
             std::memcpy(name8, r.name, 8);
-            s.value = r.value; s.section = r.section; s.type = r.type; s.cls = r.cls; s.naux = r.naux;
+            const std::uint16_t u = static_cast<std::uint16_t>(r.section);
+            s.value = r.value; s.section = u >= 0xFFFE ? static_cast<std::int16_t>(u) : static_cast<std::int32_t>(u);
+            s.type = r.type; s.cls = r.cls; s.naux = r.naux;
         }
         std::uint32_t zero = 0, off = 0;
         std::memcpy(&zero, name8, 4);

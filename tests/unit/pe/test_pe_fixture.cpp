@@ -4,7 +4,6 @@
 #include "cml/pe/pe.h"
 
 #include <algorithm>
-#include <cstdio>
 #include <cstdint>
 #include <fstream>
 #include <map>
@@ -480,24 +479,3 @@ TEST_CASE("in-memory: the fixture exe mapped as an image resource matches its on
 
 #endif  // _WIN32
 
-TEST_CASE("SURVEY pe") {
-    const OwnedImage& o = load_exe("basic_exe");
-    const auto lc = o.image.load_config();
-    char line[512];
-    std::snprintf(line, sizeof(line), "dllchars=0x%X guardflags=0x%X size=0x%X table=0x%llX count=%llu cookie=0x%llX sections=%zu tls=%d entry=0x%X\n",
-                  static_cast<unsigned>(o.image.optional_header().dll_characteristics), static_cast<unsigned>(lc->guard_flags),
-                  static_cast<unsigned>(lc->size), static_cast<unsigned long long>(lc->guard_cf_function_table),
-                  static_cast<unsigned long long>(lc->guard_cf_function_count), static_cast<unsigned long long>(lc->security_cookie),
-                  o.image.sections().size(), o.image.has_tls() ? 1 : 0, static_cast<unsigned>(o.image.optional_header().address_of_entry_point));
-    std::string out = line;
-    for (const SectionHeader& s : o.image.sections()) {
-        out += std::string(s.name()) + " ";
-    }
-    const auto imports = o.image.imports();
-    for (const ImportModule& m : *imports) {
-        out += "\n" + std::string(m.dll_name) + " (" + std::to_string(m.entries.size()) + ")";
-    }
-    const auto cv = o.image.codeview();
-    out += "\npdb=" + std::string(cv->pdb_path) + " age=" + std::to_string(cv->age);
-    FAIL_CHECK(out);
-}

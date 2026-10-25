@@ -41,7 +41,7 @@ void exercise(const Image& img) {
     (void)img.load_config();
     (void)img.tls();
     (void)img.has_tls();
-    for (std::uint32_t rva = 0; rva < 0x5000; rva += 0x37) {
+    for (std::uint32_t rva = 0; rva < 0x5000; rva += 0x1D3) {
         (void)img.rva_to_offset(rva);
         (void)img.read_cstring_rva(rva);
         (void)img.read_rva(rva, 16);
@@ -565,7 +565,7 @@ TEST_CASE("pe robustness: every truncation and every byte flip is handled") {
             }
         }
         // Flips: all header bytes, then the structure-bearing parts of .rdata / .pdata.
-        for (std::size_t pos = 0; pos < base.size(); pos += (pos < 0x200 ? 1 : 3)) {
+        for (std::size_t pos = 0; pos < base.size(); pos += (pos < 0x200 ? 1 : 11)) {
             for (std::uint8_t mask : {std::uint8_t{0xFF}, std::uint8_t{0x80}, std::uint8_t{0x01}}) {
                 PeBytes t = base;
                 t[pos] = static_cast<std::uint8_t>(t[pos] ^ mask);

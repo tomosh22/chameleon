@@ -8,10 +8,12 @@
 # cl: /bigobj makes the compiler always emit the ANON_OBJECT_HEADER_BIGOBJ format, so a small N
 # is enough.
 # clang-cl: accepts /bigobj but ignores it (verified with clang 18); LLVM switches to the bigobj
-# format only when an object has more than 65279 sections. Every function costs it three sections
-# (.text, .xdata, .pdata), so N is large enough to cross that threshold.
+# format only when an object has more than 65279 sections (below that it writes a regular object
+# whose 16-bit section numbers run up to 65279). Every function costs it 2 sections in
+# RelWithDebInfo and 4 in Debug (.text, .xdata/.pdata, .debug$S), so N is large enough to cross the
+# threshold in both.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    set(CML_BIGOBJ_FUNCTION_COUNT 25000)
+    set(CML_BIGOBJ_FUNCTION_COUNT 40000)
 else()
     set(CML_BIGOBJ_FUNCTION_COUNT 200)
 endif()

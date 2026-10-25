@@ -17,7 +17,6 @@
 #include "cml/coff/coff.h"
 
 #include <algorithm>
-#include <cstdio>
 #include <cstdint>
 #include <map>
 #include <ostream>
@@ -26,7 +25,6 @@
 #include <vector>
 
 #include "doctest.h"
-#include "coff_independent.h"
 #include "fixture_paths.h"
 
 using namespace cml::coff;
@@ -523,73 +521,3 @@ TEST_CASE("fixture bigobj: main.obj") {
     CHECK_FALSE(sink.is_undefined());
 }
 
-// TEMPORARY SURVEY (removed before the final push): dumps what this compiler produced.
-TEST_CASE("SURVEY extras objects") {
-    std::string out;
-    for (const char* key : {"cov_extras_objs", "basic_objs"}) {
-        const Object& o = load(key, "extras");
-        out += std::string("\n=== ") + key + " extras (" + FixturePaths::get().config() + ") bigobj=" + (o.is_bigobj() ? "1" : "0") + "\n";
-        for (const Section& s : o.sections()) {
-            char line[256];
-            std::snprintf(line, sizeof(line), "S%u %.*s chars=%08X size=%u nreloc=%u", s.index, static_cast<int>(s.name.size()),
-                          s.name.data(), s.characteristics, s.size_of_raw_data, s.relocation_count);
-            out += line;
-            const auto c = o.comdat(s);
-            if (c) {
-                const std::string leader = c->leader ? std::string(c->leader->name) : std::string("-");
-                std::snprintf(line, sizeof(line), " COMDAT sel=%d leader=%s assoc=%u", static_cast<int>(c->selection),
-                              leader.c_str(), c->associated_section);
-                out += line;
-            }
-            out += "\n";
-            for (const ResolvedRelocation& r : resolved(o, s)) {
-                out += "    " + std::string(reloc_type_name(r.reloc.type)) + " -> " + std::string(r.target->name) + "\n";
-            }
-        }
-        for (const Symbol& s : o.symbols()) {
-            char line[512];
-            std::snprintf(line, sizeof(line), "Y%u %.*s cls=%u sec=%d type=%x value=%u naux=%u\n", s.index,
-                          static_cast<int>(s.name.size()), s.name.data(), static_cast<unsigned>(s.storage_class), s.section_number,
-                          static_cast<unsigned>(s.type), s.value, static_cast<unsigned>(s.aux_count));
-            out += line;
-        }
-        for (const Directive& d : o.directives()) {
-            out += "D " + d.text + "\n";
-        }
-    }
-    FAIL_CHECK(out);
-}
-
-TEST_CASE("SURVEY bigobj raw") {
-    std::string out;
-    const std::string path = object_path("bigobj_objs", "bigobj_funcs");
-    auto bytes = read_file(path);
-    REQUIRE(bytes.has_value());
-    std::vector<std::uint8_t> raw(bytes->size());
-    for (std::size_t i = 0; i < raw.size(); ++i) raw[i] = std::to_integer<std::uint8_t>((*bytes)[i]);
-    const cml_test::IndObject ind = cml_test::independent_parse(raw);
-    char line[512];
-    std::snprintf(line, sizeof(line), "ok=%d big=%d sections=%zu symrecords=%u symtab=%u first bytes:", ind.ok ? 1 : 0, ind.big ? 1 : 0,
-                  ind.sections.size(), ind.nsyms, ind.symtab);
-    out += line;
-    for (int i = 0; i < 56; ++i) { std::snprintf(line, sizeof(line), " %02X", raw[static_cast<std::size_t>(i)]); out += line; }
-    out += "\n";
-    int shown = 0;
-    std::size_t bad = 0;
-    for (const auto& sym : ind.symbols) {
-        if (sym.section < -2 || sym.section > static_cast<std::int32_t>(ind.sections.size())) {
-            ++bad;
-            if (shown++ < 12) {
-                const std::size_t off = ind.symtab + static_cast<std::size_t>(sym.index) * 20u;
-                std::snprintf(line, sizeof(line), "BAD idx=%u name=%s sec=%d cls=%u naux=%u raw:", sym.index, sym.name.c_str(), sym.section,
-                              static_cast<unsigned>(sym.cls), static_cast<unsigned>(sym.naux));
-                out += line;
-                for (std::size_t k = 0; k < 20; ++k) { std::snprintf(line, sizeof(line), " %02X", raw[off + k]); out += line; }
-                out += "\n";
-            }
-        }
-    }
-    std::snprintf(line, sizeof(line), "bad symbols=%zu\n", bad);
-    out += line;
-    FAIL_CHECK(out);
-}

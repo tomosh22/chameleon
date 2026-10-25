@@ -464,6 +464,34 @@ TEST_CASE("coff: /bigobj header, 32-bit section numbers and 32-bit aux numbers")
     CHECK((*rel)[0].target->name == "undef");
 }
 
+TEST_CASE("coff: regular object with more than 32767 sections keeps unsigned 16-bit section numbers") {
+    // clang-cl writes regular (non-bigobj) objects with up to 65279 sections; a symbol in section
+    // 40000 is stored as 0x9C40, which a signed reading would turn into a negative number.
+    ObjSpec o;
+    constexpr std::uint32_t kSections = 65279;
+    for (std::uint32_t i = 0; i < kSections; ++i) {
+        SectionSpec sec;
+        sec.name = ".text";
+        sec.characteristics = scn::CntCode | scn::MemExecute | scn::MemRead;
+        sec.data = Bytes{0xC3};
+        o.sections.push_back(std::move(sec));
+    }
+    o.symbols.push_back(sym("mid", 40000));
+    o.symbols.push_back(sym("last", static_cast<std::int32_t>(kSections)));
+    o.symbols.push_back(sym("abs", -1, 0, 3));
+    o.symbols.push_back(sym("dbg", -2, 0, 3));
+    const Built b = build_object(o);
+    const auto r = Object::parse(as_span(b.bytes));
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    CHECK_FALSE(r->is_bigobj());
+    CHECK(r->find_symbol("mid")->section_number == 40000);
+    CHECK(r->section_of(*r->find_symbol("mid")) == r->section(40000));
+    CHECK(r->find_symbol("last")->section_number == 65279);
+    CHECK(r->section_of(*r->find_symbol("last")) == r->section(65279));
+    CHECK(r->find_symbol("abs")->section_number == kSectionAbsolute);
+    CHECK(r->find_symbol("dbg")->section_number == kSectionDebug);
+}
+
 TEST_CASE("coff: extended relocation count (IMAGE_SCN_LNK_NRELOC_OVFL)") {
     ObjSpec o = basic_spec();
     constexpr std::uint32_t kCount = 70000;

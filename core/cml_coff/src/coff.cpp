@@ -450,7 +450,13 @@ Result<Object> Object::parse(ByteSpan b) {
             s.storage_class = static_cast<StorageClass>(rd8(b, off + 18));
             s.aux_count = static_cast<std::uint8_t>(rd8(b, off + 19));
         } else {
-            s.section_number = static_cast<std::int32_t>(static_cast<std::int16_t>(rd16(b, off + 12)));
+            // The spec calls this field signed, but cl, clang-cl and lld all use the whole unsigned range
+            // for real sections (up to 65279; clang-cl emits regular objects with 50000+ sections);
+            // only 0xFFFF (absolute) and 0xFFFE (debug) are special.
+            const std::uint32_t raw_section = rd16(b, off + 12);
+            s.section_number = raw_section == 0xFFFFu ? kSectionAbsolute
+                               : raw_section == 0xFFFEu ? kSectionDebug
+                                                        : static_cast<std::int32_t>(raw_section);
             s.type = static_cast<std::uint16_t>(rd16(b, off + 14));
             s.storage_class = static_cast<StorageClass>(rd8(b, off + 16));
             s.aux_count = static_cast<std::uint8_t>(rd8(b, off + 17));
