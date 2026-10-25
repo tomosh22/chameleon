@@ -457,9 +457,8 @@ TEST_CASE("every failure unloads the DLL and returns the block to the reserved s
         const ipc::PatchLoaded answer = session.loader.load_patch(request);
         CHECK(answer.status == ids::kLoaderRangeNotReserved);
         CHECK(answer.attempts == 1);
-        // A range sticking out of the end of the block.
-        ipc::LoadPatch edge = make_request(session.blocks[0].end() - kGranule, "edge", false, false);
-        edge.candidates[0].image_size = 0x20000;
+        // The first granule behind the end of the block (the announcement is honest: only the range is wrong).
+        ipc::LoadPatch edge = make_request(session.blocks[0].end(), "edge", false, false);
         CHECK(session.loader.load_patch(edge).status == ids::kLoaderRangeNotReserved);
     }
     SUBCASE("fix-ups that fail after a successful load") {
