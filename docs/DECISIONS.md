@@ -270,6 +270,85 @@ PDB fails with `ERROR_USER_MAPPED_FILE`. **WP-12 must release the module's index
 a copy-in-memory mode) before anything relinks that module**, e.g. before hot-restart rebuilds.
 Patch PDBs are separate files and are unaffected.
 
+## ADR-0020 WP-03 spike findings
+
+**Date:** 2026-10-25 · **Status:** Accepted (evidence: CI run 40162572353 of branch `wp/03-e2e-spike`, details in `docs/wp/WP-03.md`)
+
+The end-to-end mechanism of plan §4.1–§4.8 works in all 8 matrix cells (windows-2022 and
+windows-2025, cl and clang-cl, Debug and RelWithDebInfo). Each finding is tagged **[asserted]**
+(`run_spike.py` / `cml_spike` fails the job if it does not hold) or **[log only]** (observed in the
+CI log, not enforced; re-check before relying on it).
+
+1. **Static anchor symbols are invisible; anchors must be EXTERNAL.** [asserted] Neither link.exe nor
+   lld-link writes obj-local (`IMAGE_SYM_CLASS_STATIC`) symbols to the PDB, neither as publics nor
+   as module symbols: the spike adds a static probe `__cml_sanchor_<n>` next to every external
+   anchor and fails if any probe is found anywhere (0 found in all cells). All anchorable sections
+   (4 to 7 per cell) have their `__cml_anchor_<n>` as an S_PUB32 public, which `cml_pdb::find_public`
+   returns (asserted n/n). The external anchors sit in COMDAT sections too (`.text$mn`/`.text`,
+   `.xdata`, `.pdata`, `.rdata`, `.rtc$*`), appended after all original symbols.
+   A function COMDAT's leader and its section anchor have equal RVAs (asserted, at least one
+   comparison). Sections that get no anchor [log only]: `.debug*`, `.drectve`, `.sxdata`, `.gfids`,
+   `.giats`, `.gljmp`, `.gehcont`, `.voltbl`, anything `LNK_INFO`/`LNK_REMOVE` (`.chks64`,
+   `.llvm_addrsig`).
+2. **The REL32 retarget is correct and proven.** [asserted] After the fix-up the displacement is
+   decoded from the target's memory; `site + 4 + N + disp - in-place addend` must equal the OLD
+   module's `g_tick` (module base + RVA from the old PDB), must differ from the placeholder in the
+   patch, and the placeholder must still be zero. Behaviourally [asserted]: between the hook and the
+   exercise the fixture prints no `NOTE` (37 to 97 ticks per cell); after resetting `g_tick` to 0
+   exactly one `NOTE logic-start` appears (it comes from the OLD `fixture_note()` reached through
+   thunk and slot). The in-place addend differs by compiler [log only]: cl emits `REL32_1` (addend 0)
+   for `cmp dword ptr [g_tick], 0`; clang-cl emits plain `REL32` with addend -1. The fix-up must read
+   the addend: `target = sym + addend; value = target - (site + 4 + N)`.
+3. **Function-vs-data classification must come from the PDB, not the object.** [log only] cl marks
+   undefined function externals DTYPE_FUNCTION, clang-cl does not (the spike logs a NOTE for each
+   mismatch). Classification uses PDB publics (flag / executable section); an external found nowhere
+   fails the bind step [asserted].
+4. **`/hotpatch` is ignored by cl on x64** [log only] (`cl : Command line warning D9002: ignoring
+   unknown option '/hotpatch'` in every msvc cell, also for the fixture build). Entry bytes seen in
+   the logs [log only]: `40 57 48 83 ec 20` (cl Debug), `48 83 ec 28` (others). The 5-byte jump
+   therefore splits an instruction (`sub rsp, 20h`); the stray bytes are never executed. WP-10 needs
+   the length decoder.
+5. **Padding.** [asserted: at least 6 bytes of 0xCC precede the old entry in every cell] The logs show
+   7 (cl Debug), 8 (cl Release) and 16 (clang-cl) `CC` bytes. This cannot be told apart from 16-byte
+   function alignment, so it is not evidence that `/FUNCTIONPADMIN` did anything.
+6. **/RTC1 (cl Debug) adds externals `_RTC_InitBase` and `_RTC_Shutdown`** [log only] (code, from the
+   CRT, via ADDR64 pointers in `.rtc$IMZ`/`.rtc$TMZ`). They are bound through thunks like any
+   function and never run for the patch. clang-cl ignores `/RTC1`. No `/GS` cookie,
+   `__security_cookie`, `__CxxFrameHandler*`, `__imp_*` or weak externals appeared (logic.cpp has no
+   arrays or EH); other code is unproven.
+7. **Linkers.** clang-cl cells use lld-link (`CMAKE_LINKER=C:/Program Files/LLVM/bin/lld-link.exe`),
+   msvc cells link.exe 14.44 / 14.51 [log only: `LINKER-USED`]. The plan §4.6 command is accepted by
+   both with exit code 0 [asserted]. Linking once WITHOUT `/IGNORE:4001,4254,4281` printed **0
+   lines** (no warnings at all) in all 8 cells [log only: `SPIKE-LINK-NOIGNORE`], so `/IGNORE` was not
+   needed for this input and no LNK4001/LNK4254/LNK4281 had to be dealt with. An earlier draft of
+   this ADR implied warnings were involved; they were not.
+8. **`/FIXED` load works**, including with bases above 4 GB. [asserted] The DLL is confirmed at exactly
+   its `/BASE` after a remote `LoadLibraryW` (else the spike fails). The 64 MB block is reserved within
+   +-1.5 GB and rel32 reach of the whole module [asserted]; it was directly adjacent below the image in
+   every cell (gap 0 bytes; the distance log of the first version was wrong for blocks on the other
+   side of the module and is fixed). The remote thread's stack allocation is not controlled; it did
+   not collide [log only].
+9. **Debugger (cdb -pv).** [asserted] `patch_1` is listed with `(private pdb symbols)` (cl) or
+   `(pdb symbols)` (lld-link); `x patch_1!compute_value*` resolves to exactly the hook target; `ln`
+   reports the patched copy `...\spike-work\src\logic.cpp(8)` and `lsa` shows `return 2;`; `u` at the
+   old entry shows `jmp patch_1!compute_value (<addr>)` with the parsed address equal to the hook's
+   new entry. cdb needs `.reload /f patch_1.dll` first (symbols are deferred). cdb 10.0.26100.4202 is
+   at `C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe` on both images [log only].
+10. **cml_pdb is sufficient**: publics of the old module (functions, data, CRT `_RTC_*`), publics of
+    the patch (anchors, `__cml_slot_*`, the patched function). The patch's module symbols contain
+    only `compute_value` [log only]. ADR-0010 was not needed for externals.
+11. **Tooling** [log only]: `git apply --ignore-whitespace` applies `edits/*.edit` to a copy outside
+    any repository; Python 3 and git are on PATH on both images.
+
+Anchor-rewriter pitfalls for WP-06: new symbols must go after the existing ones (relocation and
+`.sxdata`/`.llvm_addrsig` symbol indices stay valid); the string table (4-byte size included) must be
+at the end of the file and its first dword and the header's symbol count rewritten; long names need
+string-table offsets that include the size field; regular COFF section numbers are 16-bit (bigobj
+needs the 20-byte symbol form, not implemented).
+
+Not exercised: the "RIP inside the window, retry" path of the hook (one thread, the first attempt
+always succeeded), bigobj, non-trivial externals, unload on failure.
+
 ## ADR-0018 Review convergence policy
 
 **Date:** 2026-10-25 · **Status:** Accepted
