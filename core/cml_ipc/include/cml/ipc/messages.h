@@ -34,6 +34,7 @@ inline constexpr std::uint32_t kFrameHeaderSize = 8;
 inline constexpr std::uint32_t kMaxPayloadSize = 1u << 20;  // 1 MiB hard limit per frame
 inline constexpr std::uint32_t kMaxStringBytes = 1u << 18;  // 256 KiB per string field
 inline constexpr std::uint32_t kMaxModuleCount = 16384;     // entries in one ModuleList
+inline constexpr std::uint32_t kMaxHooksPerRequest = 16384; // entries in one InstallHooks / HooksInstalled
 inline constexpr std::uint16_t kMessageVersion = 1;         // payload layout version of every type
 inline constexpr std::uint32_t kProtocolVersion = 1;        // exchanged in Hello / Welcome
 
@@ -63,9 +64,9 @@ enum class MessageType : std::uint16_t {
     ApplyFixups = 0x0032,       // implemented  broker -> agent (request, answered by Reply)
     RunInitializers = 0x0033,   // implemented  broker -> agent (request, answered by Reply)
 
-    // Hooks and synchronisation (later work packages).
-    InstallHooks = 0x0040,
-    HooksInstalled = 0x0041,
+    // Hooks (WP-10) and synchronisation (later work package).
+    InstallHooks = 0x0040,    // implemented  broker -> agent (request, answered by HooksInstalled)
+    HooksInstalled = 0x0041,  // implemented  agent -> broker (the answer; repeats the request id)
     SyncPointReady = 0x0042,
 
     // Exceptions (later work packages).
@@ -146,6 +147,56 @@ struct Reply {
     std::uint64_t request_id = 0;
     std::uint32_t status = 0;
     std::string message;  // UTF-8, human readable
+};
+
+// --- hooks (WP-10, plan section 4.8) -------------------------------------------------------------
+
+// Bit flags of InstallHooks::flags. Unknown bits are rejected by the decoder.
+// Revert is folded into InstallHooks (rather than a message of its own) because it is the same
+// operation on the same list, applied under the same stop-the-world window, and answered by the
+// same HooksInstalled; with the flag set `new_entry` is ignored and the original bytes come back.
+inline constexpr std::uint32_t kInstallHooksRevert = 1u;
+inline constexpr std::uint32_t kInstallHooksKnownFlags = kInstallHooksRevert;
+
+struct HookSpec {
+    std::uint64_t old_entry = 0;  // entry of the function being replaced (its first hook's target)
+    std::uint64_t new_entry = 0;  // entry of the new implementation
+    std::string name;             // for diagnostics only
+};
+
+// One request is applied all or nothing, in one stop-the-world window.
+struct InstallHooks {
+    std::uint64_t request_id = 0;
+    std::uint32_t flags = 0;
+    std::vector<HookSpec> hooks;
+};
+
+enum class HookStrategy : std::uint32_t { None = 0, PaddingTwoByte = 1, FiveByte = 2 };
+enum class HookResultStatus : std::uint32_t {
+    Installed = 0,
+    Repointed = 1,
+    Reverted = 2,
+    Failed = 3,        // this hook is why the request failed
+    NotAttempted = 4,  // not changed: the request failed
+    Unchanged = 5,     // already hooked to this very new_entry
+};
+
+struct HookResult {
+    HookStrategy strategy = HookStrategy::None;
+    HookResultStatus status = HookResultStatus::NotAttempted;
+    std::uint32_t diag = 0;  // CML43xx for Failed / NotAttempted, else 0
+    std::string message;     // diagnostic text; only filled for Failed entries
+};
+
+struct HooksInstalled {
+    std::uint64_t request_id = 0;  // the InstallHooks' id
+    std::uint32_t status = 0;      // 0: every hook applied; else the CML number of the first failure
+    std::string message;           // text of that failure
+    std::uint32_t attempts = 0;    // times the application's threads were stopped
+    std::uint32_t retries = 0;     // RIP-in-window conflicts that forced another look
+    std::uint32_t threads = 0;     // threads stopped in the largest window
+    std::uint32_t window_ms = 0;   // longest time they were stopped
+    std::vector<HookResult> results;  // one per hook, in request order
 };
 
 // --- address space and patch loading (WP-08) ---------------------------------------------------
@@ -263,7 +314,8 @@ struct ReleaseRange {
 
 using Message = std::variant<Hello, Welcome, ModuleList, EnableModule, DisableModule, ModuleLoaded,
                              ModuleUnloaded, Log, Reply, ReserveRange, ReleaseRange, LoadPatch,
-                             PatchLoaded, ApplyFixups, RunInitializers, ReserveRangeResult>;
+                             PatchLoaded, ApplyFixups, RunInitializers, ReserveRangeResult, InstallHooks,
+                             HooksInstalled>;
 
 MessageType type_of(const Message& message) noexcept;
 
@@ -294,12 +346,12 @@ Result<Message> decode_message(std::uint16_t type, std::uint16_t version, const 
 Result<Message> decode_frame(const std::uint8_t* frame, std::size_t size);
 
 // True for the message types that expect an answer (Hello, ModuleList, EnableModule,
-// DisableModule, and the WP-08 requests ReserveRange, ReleaseRange, LoadPatch, ApplyFixups,
+// DisableModule, InstallHooks, and the WP-08 requests ReserveRange, ReleaseRange, LoadPatch, ApplyFixups,
 // RunInitializers). Takes the raw wire value, so it also works for frames that failed to decode.
 bool is_request_type(std::uint16_t type) noexcept;
 
 // The request id of a frame whose payload may be malformed: every type whose payload starts with a
-// request id (Hello, Welcome, Reply, ModuleList, EnableModule, DisableModule and the WP-08 types)
+// request id (Hello, Welcome, Reply, ModuleList, EnableModule, DisableModule, InstallHooks, HooksInstalled and the WP-08 types)
 // carries it in the
 // first 8 bytes. nullopt for other types or when fewer than 8 bytes are present. Used to answer
 // a request that arrived with a bad payload instead of leaving its sender waiting.

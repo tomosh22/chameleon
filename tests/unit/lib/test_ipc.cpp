@@ -321,7 +321,7 @@ TEST_CASE("pseudo-random garbage never crashes the decoder") {
         return state >> 8;
     };
     const std::uint16_t types[] = {0x0001, 0x0002, 0x0003, 0x0010, 0x0011,
-                                   0x0012, 0x0013, 0x0014, 0x0060};
+                                   0x0012, 0x0013, 0x0014, 0x0040, 0x0041, 0x0060};
     for (int i = 0; i < 4000; ++i) {
         std::vector<std::uint8_t> payload(next() % 64);
         for (std::uint8_t& b : payload) {
