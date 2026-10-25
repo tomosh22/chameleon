@@ -265,14 +265,22 @@ TEST_CASE("cancelling a /Zi compile does not break a concurrent /Zi compile (msp
         return running;
     };
     int rounds_with_server = 0;
+    int rounds_cancelled = 0;
     for (int round = 0; round < 5; ++round) {
         INFO("round " << round);
         std::filesystem::remove(dir / "b.obj", ec);
         CancelToken token;
+        // A is expected to outlive the cancel, but a stalled runner can oversleep the waits below; then A
+        // finishes on its own first and "not cancelled" is correct. A process that is not reported as
+        // cancelled must therefore have completed successfully (a killed compile exits with code 1).
+        std::filesystem::remove(dir / "a.obj", ec);
+        bool a_cancelled = false;
+        int a_exit = -1;
         std::thread a([&] {
             auto r = run_process(compile("a"), &token);
             REQUIRE(r);
-            CHECK(r->cancelled);
+            a_cancelled = r->cancelled;
+            a_exit = r->exit_code;
         });
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
         // B starts while A runs; both use the shared PDB server.
@@ -287,6 +295,11 @@ TEST_CASE("cancelling a /Zi compile does not break a concurrent /Zi compile (msp
         const std::vector<DWORD> before = pdb_servers();  // sampled just before the cancel
         token.cancel();
         a.join();  // A's tree is dead now
+        if (!a_cancelled) {
+            CHECK_MESSAGE(a_exit == 0, "compile A was not reported as cancelled, yet it did not complete (exit code " << a_exit << ")");
+            CHECK_MESSAGE(std::filesystem::exists(dir / "a.obj"), "compile A was not reported as cancelled, yet produced no object");
+        }
+        if (a_cancelled) ++rounds_cancelled;
         for (const DWORD pid : before) {
             CHECK_MESSAGE(alive(pid), "mspdbsrv.exe pid " << pid << " was running before the cancel and is gone after it");
         }
@@ -296,7 +309,8 @@ TEST_CASE("cancelling a /Zi compile does not break a concurrent /Zi compile (msp
         CHECK_MESSAGE(b.exit_code == 0, "compile B failed with exit code " << b.exit_code << "\n" << b.output);
         CHECK(std::filesystem::exists(dir / "b.obj"));
     }
-    std::printf("CANCEL-ZI rounds_with_running_mspdbsrv=%d of 5\n", rounds_with_server);
+    std::printf("CANCEL-ZI rounds_with_running_mspdbsrv=%d of 5 rounds_cancelled=%d of 5\n", rounds_with_server, rounds_cancelled);
+    REQUIRE_MESSAGE(rounds_cancelled >= 3, "fewer than 3 of 5 rounds cancelled a running compile: the test did not exercise cancellation");
     REQUIRE_MESSAGE(rounds_with_server > 0, "no round saw a running mspdbsrv.exe: the test did not exercise the shared PDB server");
 }
 #endif
