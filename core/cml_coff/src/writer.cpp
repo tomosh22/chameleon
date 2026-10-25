@@ -143,6 +143,13 @@ Result<ObjectModel> ObjectModel::from_object(const Object& o) {
             ms.reloc_offset = s.pointer_to_relocations;
             regions.push_back({s.pointer_to_relocations, s.relocation_table.size(), Kind::Reloc, si});
         }
+        if ((s.linenumber_count != 0) != (s.pointer_to_linenumbers != 0)) {
+            return make_diag(diag::kUnrepresentable,
+                             format("section %u '%.*s' has %u line numbers but line-number pointer %u (one of them is zero): no table to reproduce",
+                                    static_cast<unsigned>(s.index), static_cast<int>(s.name.size()), s.name.data(),
+                                    static_cast<unsigned>(s.linenumber_count), static_cast<unsigned>(s.pointer_to_linenumbers)),
+                             "The object is corrupt; rebuild it.");
+        }
         if (s.linenumber_count != 0 && s.pointer_to_linenumbers != 0) {
             const std::uint64_t size = static_cast<std::uint64_t>(s.linenumber_count) * kLineNumberSize;
             if (static_cast<std::uint64_t>(s.pointer_to_linenumbers) + size > file_size) {
@@ -223,7 +230,7 @@ std::uint64_t ObjectModel::raw_symbol_count() const noexcept {
 Result<std::uint32_t> ObjectModel::add_string(std::string_view text) {
     const std::uint64_t offset = 4ull + string_table.size();
     const std::uint64_t end = offset + text.size() + 1;
-    if (end > kMax32) {
+    if (end > string_table_limit) {
         return make_diag(diag::kSizeOverflow,
                          format("string table would reach %llu bytes adding '%.*s'; the COFF limit is 4 GiB",
                                 static_cast<unsigned long long>(end), static_cast<int>(std::min<std::size_t>(text.size(), 64)),
@@ -418,6 +425,12 @@ Result<ByteVector> write(const ObjectModel& m) {
     }
     for (std::size_t si = 0; si < m.sections.size(); ++si) {
         const ModelSection& s = m.sections[si];
+        if (s.linenumbers.empty() && (s.linenumber_count != 0 || s.pointer_to_linenumbers != 0)) {
+            return make_diag(diag::kUnrepresentable,
+                             format("section %zu '%s' declares %u line numbers (pointer %u) but has no line-number table", si + 1,
+                                    s.name.c_str(), static_cast<unsigned>(s.linenumber_count), static_cast<unsigned>(s.pointer_to_linenumbers)),
+                             "Clear linenumber_count and pointer_to_linenumbers, or provide the table.");
+        }
         if (!s.linenumbers.empty() && s.linenumbers.size() != static_cast<std::size_t>(s.linenumber_count) * kLineNumberSize) {
             return make_diag(diag::kUnrepresentable,
                              format("section %zu '%s' declares %u line numbers but holds %zu bytes of them (%zu expected)", si + 1,

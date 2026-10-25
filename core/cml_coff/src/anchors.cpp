@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <utility>
 
+#include "cml/coff/section_symbols.h"
 #include "cml/util/hash.h"
 #include "cml/util/log.h"
 
@@ -18,11 +19,14 @@ constexpr std::uint8_t kSelectionAssociative = 5;
 
 const char* reason_text(NoLocatorReason r) noexcept {
     switch (r) {
-        case NoLocatorReason::HasLocator: return "has a locator";
-        case NoLocatorReason::NotLinked: return "the section is not linked into the image";
-        case NoLocatorReason::Associative: return "associative COMDAT sections have no locator (they never need retargeting to old data)";
-        case NoLocatorReason::NoLeader: return "the COMDAT section has no symbol after its definition (located by an anchor)";
-        case NoLocatorReason::StaticLeader: return "the COMDAT leader is a static symbol (located by an anchor)";
+        case NoLocatorReason::NotLinked:
+            return "the section is not linked into the image (.drectve, .debug*, LNK_REMOVE / LNK_INFO / discardable)";
+        case NoLocatorReason::Associative:
+            return "the section is an associative COMDAT child (.pdata/.xdata/...): it is placed with its parent section and has no locator of its own";
+        case NoLocatorReason::HasLocator:
+        case NoLocatorReason::NoLeader:
+        case NoLocatorReason::StaticLeader:
+            return "the section has a locator";
     }
     return "unknown";
 }
@@ -72,7 +76,7 @@ Result<void> require_locator(const SectionLocator& l) {
     }
     return Diag::make(diag::kNoLocator,
                       "section " + std::to_string(l.section_index) + " has no locator: " + reason_text(l.reason),
-                      "Locate the section through its COMDAT parent or the PDB section contributions instead.");
+                      "Locate the section through its parent section (associated section number) or the PDB section contributions.");
 }
 
 Result<std::vector<SectionLocator>> add_anchors(ObjectModel& m, const AnchorOptions& options) {
@@ -91,42 +95,23 @@ Result<std::vector<SectionLocator>> add_anchors(ObjectModel& m, const AnchorOpti
         }
     }
 
-    std::string tag = options.tag;
-    if (tag.empty()) {
-        auto bytes = write(m);  // for a parsed, unmodified object these are the compiler's file bytes
-        if (!bytes) {
-            return bytes.error();
-        }
-        tag = content_tag(ByteSpan(bytes->data(), bytes->size()));
-    }
-    if (options.used_tags != nullptr && !options.used_tags->insert(tag).second) {
-        return Diag::make(diag::kAnchorTagCollision, "anchor tag '" + tag + "' is already used by another object of this link",
-                          "Give every object of a link its own tag (for example its compiland index); identical objects cannot be linked twice.");
-    }
-
-    // Per section: position of the definition symbol and of the leader, both as indices into
-    // m.symbols, plus raw indices; same rule as Object::comdat().
+    // ---- analysis (read only): the leader rule is shared with the reader ----
     const std::size_t nsec = m.sections.size();
     const std::size_t rec = m.symbol_record_size();
+    SectionSymbolTracker tracker(nsec);
     constexpr std::int64_t kNone = -1;
-    std::vector<std::int64_t> def_pos(nsec + 1, kNone);
-    std::vector<std::int64_t> leader_pos(nsec + 1, kNone);
-    std::vector<std::uint32_t> leader_raw(nsec + 1, 0);
+    std::vector<std::uint32_t> raw_of(m.symbols.size());
+    std::vector<std::int64_t> first_external(nsec + 1, kNone);  // any external symbol defined in the section
     std::uint64_t raw = 0;
     for (std::size_t pos = 0; pos < m.symbols.size(); ++pos) {
         const ModelSymbol& s = m.symbols[pos];
-        if (s.section_number > 0 && static_cast<std::size_t>(s.section_number) <= nsec) {
-            const std::size_t sec = static_cast<std::size_t>(s.section_number);
-            const bool is_def = s.storage_class == static_cast<std::uint8_t>(StorageClass::Static) && s.aux.size() >= rec &&
-                                s.value == 0 && ((s.type >> 4) & 0xFu) != 2u;
-            if (def_pos[sec] == kNone) {
-                if (is_def) {
-                    def_pos[sec] = static_cast<std::int64_t>(pos);
-                }
-            } else if (leader_pos[sec] == kNone && !is_def) {
-                leader_pos[sec] = static_cast<std::int64_t>(pos);
-                leader_raw[sec] = static_cast<std::uint32_t>(raw);
-            }
+        raw_of[pos] = static_cast<std::uint32_t>(raw);
+        tracker.add(static_cast<std::uint32_t>(pos), s.section_number,
+                    is_section_definition_symbol(s.storage_class, s.section_number, s.aux.size() / rec, s.value, s.type));
+        if (s.section_number > 0 && static_cast<std::size_t>(s.section_number) <= nsec &&
+            s.storage_class == static_cast<std::uint8_t>(StorageClass::External) && !s.name.empty() &&
+            first_external[static_cast<std::size_t>(s.section_number)] == kNone) {
+            first_external[static_cast<std::size_t>(s.section_number)] = static_cast<std::int64_t>(pos);
         }
         raw += 1 + s.aux.size() / rec;
     }
@@ -141,49 +126,87 @@ Result<std::vector<SectionLocator>> add_anchors(ObjectModel& m, const AnchorOpti
             loc.reason = NoLocatorReason::NotLinked;
             continue;
         }
-        if (!sec.is_comdat()) {
+        const auto anchor = [&](NoLocatorReason why) {
             loc.kind = LocatorKind::Anchor;
-            loc.reason = NoLocatorReason::HasLocator;
+            loc.reason = why;
             ++wanted;
+        };
+        if (!sec.is_comdat()) {
+            anchor(NoLocatorReason::HasLocator);
             continue;
         }
-        const std::int64_t def = def_pos[i + 1];
-        if (def != kNone) {
-            const ModelSymbol& d = m.symbols[static_cast<std::size_t>(def)];
+        const std::uint32_t def = tracker.definition(i + 1);
+        if (def != SectionSymbolTracker::kNone) {
+            const ModelSymbol& d = m.symbols[def];
             if (d.aux.size() > 14 && std::to_integer<std::uint8_t>(d.aux[14]) == kSelectionAssociative) {
                 loc.reason = NoLocatorReason::Associative;
                 continue;
             }
         }
-        const std::int64_t lp = leader_pos[i + 1];
-        if (lp == kNone) {
-            // No external symbol to find it by: an external anchor. Safe even in a COMDAT: the linkers
-            // fold COMDATs across objects by the external leader name, so a leaderless COMDAT is never
-            // discarded as a duplicate (and patches link with /OPT:NOREF).
-            loc.kind = LocatorKind::Anchor;
-            loc.reason = NoLocatorReason::NoLeader;
-            ++wanted;
+        // The leader, if external, is the locator. If the symbol after the definition is not external
+        // (a static function), any other external symbol defined in the section serves; only when
+        // there is none, an external anchor is added. That anchor is safe inside a COMDAT because
+        // the linkers fold COMDATs across objects by the external leader name: a COMDAT without an
+        // external symbol is never selected against another copy, and /OPT:REF is off in patch links.
+        const std::uint32_t lp = tracker.leader(i + 1);
+        std::int64_t use = kNone;
+        if (lp != SectionSymbolTracker::kNone &&
+            m.symbols[lp].storage_class == static_cast<std::uint8_t>(StorageClass::External) && !m.symbols[lp].name.empty()) {
+            use = lp;
+        } else if (first_external[i + 1] != kNone) {
+            use = first_external[i + 1];
+        }
+        if (use == kNone) {
+            anchor(lp == SectionSymbolTracker::kNone ? NoLocatorReason::NoLeader : NoLocatorReason::StaticLeader);
             continue;
         }
-        const ModelSymbol& leader = m.symbols[static_cast<std::size_t>(lp)];
-        if (leader.storage_class != static_cast<std::uint8_t>(StorageClass::External) || leader.name.empty()) {
-            loc.kind = LocatorKind::Anchor;  // static leader: same reasoning as above
-            loc.reason = NoLocatorReason::StaticLeader;
-            ++wanted;
-            continue;
-        }
+        const ModelSymbol& ext = m.symbols[static_cast<std::size_t>(use)];
         loc.kind = LocatorKind::ComdatLeader;
         loc.reason = NoLocatorReason::HasLocator;
-        loc.symbol_name = leader.name;
-        loc.symbol_index = leader_raw[i + 1];
-        loc.offset = leader.value;
+        loc.symbol_name = ext.name;
+        loc.symbol_index = raw_of[static_cast<std::size_t>(use)];
+        loc.offset = ext.value;
     }
 
+    if (wanted == 0) {
+        return out;  // nothing to add: no tag, no used_tags entry, no change
+    }
     if (raw + wanted > 0xFFFFFFFFull) {
         return Diag::make(diag::kSizeOverflow, "adding anchors would push the symbol table past 2^32 records",
                           "Split the module into smaller objects.");
     }
-    m.symbols.reserve(m.symbols.size() + static_cast<std::size_t>(wanted));
+
+    // ---- tag ----
+    std::string tag = options.tag;
+    if (tag.empty()) {
+        if (!options.object_bytes.empty()) {
+            tag = content_tag(options.object_bytes);
+        } else {
+            auto bytes = write(m);  // for a parsed, unmodified object these are the compiler's file bytes
+            if (!bytes) {
+                return bytes.error();
+            }
+            tag = content_tag(ByteSpan(bytes->data(), bytes->size()));
+        }
+    }
+    if (options.used_tags != nullptr && options.used_tags->count(tag) != 0) {
+        return Diag::make(diag::kAnchorTagCollision, "anchor tag '" + tag + "' is already used by another object of this link",
+                          "Give every object of a link its own tag (for example its compiland index); identical objects cannot be linked twice.");
+    }
+
+    // ---- append (transactional: undone completely on failure) ----
+    const std::size_t old_symbols = m.symbols.size();
+    const std::size_t old_strings = m.string_table.size();
+    const bool old_has_symbol_table = m.has_symbol_table;
+    const bool old_has_string_table = m.has_string_table;
+    const auto rollback = [&] {
+        m.symbols.resize(old_symbols);
+        m.string_table.resize(old_strings);
+        m.has_symbol_table = old_has_symbol_table;
+        m.has_string_table = old_has_string_table;
+    };
+    m.symbols.reserve(old_symbols + static_cast<std::size_t>(wanted));
+    std::uint64_t next = raw;
     for (SectionLocator& loc : out) {
         if (loc.kind != LocatorKind::Anchor) {
             continue;
@@ -191,23 +214,25 @@ Result<std::vector<SectionLocator>> add_anchors(ObjectModel& m, const AnchorOpti
         std::string name = anchor_name(loc.section_index, tag);
         auto encoded = m.encode_symbol_name(name);
         if (!encoded) {
+            rollback();
             return encoded.error();
         }
         ModelSymbol sym;
         sym.name = name;
         sym.raw_name = *encoded;
-        sym.value = 0;
         sym.section_number = static_cast<std::int32_t>(loc.section_index);
-        sym.type = 0;
         sym.storage_class = static_cast<std::uint8_t>(StorageClass::External);
         m.symbols.push_back(std::move(sym));
         loc.symbol_name = std::move(name);
-        loc.symbol_index = static_cast<std::uint32_t>(raw);
+        loc.symbol_index = static_cast<std::uint32_t>(next);
         loc.offset = 0;
-        ++raw;
+        ++next;
     }
     m.has_symbol_table = true;
     m.has_string_table = true;  // never leave a symbol table without its string-table size field
+    if (options.used_tags != nullptr) {
+        options.used_tags->insert(tag);  // only now that everything succeeded
+    }
     CML_LOG(Trace, "coff: located %zu sections (%llu new anchors, tag %s)", nsec, static_cast<unsigned long long>(wanted), tag.c_str());
     return out;
 }

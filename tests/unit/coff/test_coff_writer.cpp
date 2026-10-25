@@ -587,11 +587,12 @@ void check_anchored(const coff::Object& before, const coff::Object& after, const
     }
 }
 
-// Three COMDAT sections: a static leader, no leader, an external leader at value 8.
+// Four COMDAT sections: a static leader, no leader, an external leader at value 8, and a static
+// first symbol followed by an external symbol at value 4 (fallback leader).
 ObjSpec leader_cases_spec(bool big) {
     ObjSpec o;
     o.bigobj = big;
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i) {
         SectionSpec s;
         s.name = ".text$mn";
         s.characteristics = coff::scn::CntCode | coff::scn::MemExecute | coff::scn::MemRead | coff::scn::LnkComdat;
@@ -614,6 +615,9 @@ ObjSpec leader_cases_spec(bool big) {
     sym(".text$mn", 0, 2, 0, 3, {aux_section_def(big, 16, 0, 0, 2, 0, 2)});   // 3 (+4)  no leader
     sym(".text$mn", 0, 3, 0, 3, {aux_section_def(big, 16, 0, 0, 3, 0, 2)});   // 5 (+6)
     sym("leader_at_8", 8, 3, 0x20, 2);                                         // 7  external leader, offset 8
+    sym(".text$mn", 0, 4, 0, 3, {aux_section_def(big, 16, 0, 0, 4, 0, 2)});   // 8 (+9)
+    sym("static_first", 0, 4, 0x20, 3);                                        // 10 static symbol after the definition
+    sym("later_ext", 4, 4, 0x20, 2);                                           // 11 external symbol, offset 4
     return o;
 }
 
@@ -678,7 +682,11 @@ TEST_CASE("coff anchors: static leader and missing leader get anchors, external 
         REQUIRE(m.has_value());
         auto loc = coff::add_anchors(*m);
         REQUIRE(loc.has_value());
-        REQUIRE(loc->size() == 3);
+        REQUIRE(loc->size() == 4);
+        CHECK((*loc)[3].kind == coff::LocatorKind::ComdatLeader);  // fallback: the static first symbol is skipped
+        CHECK((*loc)[3].symbol_name == "later_ext");
+        CHECK((*loc)[3].offset == 4);
+        CHECK((*loc)[3].symbol_index == 11);
         CHECK((*loc)[0].kind == coff::LocatorKind::Anchor);
         CHECK((*loc)[0].reason == coff::NoLocatorReason::StaticLeader);
         CHECK((*loc)[1].kind == coff::LocatorKind::Anchor);
@@ -760,6 +768,83 @@ TEST_CASE("coff anchors: tags") {
         REQUIRE_FALSE(again.has_value());
         CHECK(again.error().code == coff::diag::kAnchorNameClash);
         CHECK(again.error().message.find("__cml_anchor_") != std::string::npos);
+    }
+}
+
+TEST_CASE("coff anchors: transactional, and no tag work when nothing is anchored") {
+    const Built b = build_object(comdat_spec(false));
+    auto before = coff::Object::parse(span_of(b.bytes));
+    REQUIRE(before.has_value());
+
+    SUBCASE("a failure half way leaves the model and used_tags untouched") {
+        auto m = coff::ObjectModel::from_object(*before);
+        REQUIRE(m.has_value());
+        const std::size_t symbols = m->symbols.size();
+        const std::size_t strings = m->string_table.size();
+        const bool had_strtab = m->has_string_table;
+        m->string_table_limit = 4 + strings + 40;  // room for two of the three anchor names, not the third
+        std::unordered_set<std::string> used;
+        coff::AnchorOptions o;
+        o.tag = "tt";
+        o.used_tags = &used;
+        auto r = coff::add_anchors(*m, o);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().code == coff::diag::kSizeOverflow);
+        CHECK(m->symbols.size() == symbols);
+        CHECK(m->string_table.size() == strings);
+        CHECK(m->has_string_table == had_strtab);
+        CHECK(used.empty());
+        // The same model works afterwards, and only then is the tag claimed.
+        m->string_table_limit = 0xFFFFFFFFull;
+        REQUIRE(coff::add_anchors(*m, o).has_value());
+        CHECK(used.count("tt") == 1);
+    }
+    SUBCASE("a failure writing the default tag leaves used_tags untouched") {
+        auto m = coff::ObjectModel::from_object(*before);
+        REQUIRE(m.has_value());
+        m->header.resize(7);  // write() refuses this model
+        std::unordered_set<std::string> used;
+        coff::AnchorOptions o;
+        o.used_tags = &used;
+        CHECK_FALSE(coff::add_anchors(*m, o).has_value());
+        CHECK(used.empty());
+    }
+    SUBCASE("nothing to anchor: no tag is computed or claimed, the model is not touched") {
+        auto m = coff::ObjectModel::make_empty(coff::Machine::Amd64);
+        REQUIRE(m.add_section(".drectve", coff::scn::LnkInfo | coff::scn::LnkRemove, coff::ByteVector(4, std::byte{'x'})).has_value());
+        m.header.resize(7);  // would make the default-tag write() fail if the tag were computed
+        std::unordered_set<std::string> used;
+        coff::AnchorOptions o;
+        o.used_tags = &used;
+        auto r = coff::add_anchors(m, o);
+        REQUIRE(r.has_value());
+        CHECK(used.empty());
+        CHECK(m.symbols.empty());
+        REQUIRE(r->size() == 1);
+        CHECK((*r)[0].kind == coff::LocatorKind::None);
+        CHECK((*r)[0].reason == coff::NoLocatorReason::NotLinked);
+        auto why = coff::require_locator((*r)[0]);
+        REQUIRE_FALSE(why.has_value());
+        CHECK(why.error().message.find("not linked") != std::string::npos);
+    }
+    SUBCASE("object_bytes gives the default tag without serialising the model") {
+        auto m = coff::ObjectModel::from_object(*before);
+        REQUIRE(m.has_value());
+        coff::AnchorOptions o;
+        o.object_bytes = span_of(b.bytes);
+        auto r = coff::add_anchors(*m, o);
+        REQUIRE(r.has_value());
+        CHECK((*r)[5].symbol_name == "__cml_anchor_" + coff::content_tag(span_of(b.bytes)) + "_6");
+    }
+    SUBCASE("the associative reason is spelled out in CML3309") {
+        auto m = coff::ObjectModel::from_object(*before);
+        REQUIRE(m.has_value());
+        auto r = coff::add_anchors(*m);
+        REQUIRE(r.has_value());
+        auto why = coff::require_locator((*r)[1]);  // .xdata, associative
+        REQUIRE_FALSE(why.has_value());
+        CHECK(why.error().code == coff::diag::kNoLocator);
+        CHECK(why.error().message.find("associative") != std::string::npos);
     }
 }
 
@@ -1070,7 +1155,7 @@ TEST_CASE("coff writer: review fixes (empty names, '/' names, line numbers, relo
         CHECK(o->sections()[0].raw_name[0] == '/');
         CHECK(o->sections()[0].raw_name[1] == '1');  // "/12": offset 4 + 8
     }
-    SUBCASE("line numbers: empty table writes count 0 and pointer 0; a mismatching count is refused") {
+    SUBCASE("line numbers: a stale count without table is refused, a count that disagrees with the table too, and a count/pointer mismatch in the input is unrepresentable") {
         const Bytes in = hand_object();
         auto obj = coff::Object::parse(span_of(in));
         REQUIRE(obj.has_value());
@@ -1081,13 +1166,27 @@ TEST_CASE("coff writer: review fixes (empty names, '/' names, line numbers, relo
         REQUIRE_FALSE(bad.has_value());
         CHECK(bad.error().code == coff::diag::kUnrepresentable);
         m->sections[0].linenumber_count = 1;
-        m->sections[0].linenumbers.clear();  // table gone, stale count / pointer must not leak out
+        m->sections[0].linenumbers.clear();  // table gone but the count is still there: refused, not silently zeroed
+        auto stale = coff::write(*m);
+        REQUIRE_FALSE(stale.has_value());
+        CHECK(stale.error().code == coff::diag::kUnrepresentable);
+        m->sections[0].linenumber_count = 0;
+        m->sections[0].pointer_to_linenumbers = 0;
         auto w = coff::write(*m);
         REQUIRE(w.has_value());
         auto o = coff::Object::parse(coff::ByteSpan(w->data(), w->size()));
         REQUIRE(o.has_value());
         CHECK(o->sections()[0].linenumber_count == 0);
         CHECK(o->sections()[0].pointer_to_linenumbers == 0);
+    }
+    SUBCASE("a header with a line-number pointer but no count (or the reverse) is unrepresentable on input") {
+        Bytes in = hand_object();
+        set16(in, 20 + 4 + 34, 0);  // section 1: NumberOfLinenumbers = 0, pointer stays
+        auto obj = coff::Object::parse(span_of(in));
+        REQUIRE(obj.has_value());
+        auto m = coff::ObjectModel::from_object(*obj);
+        REQUIRE_FALSE(m.has_value());
+        CHECK(m.error().code == coff::diag::kUnrepresentable);
     }
     SUBCASE("binding .text with more than 65535 thunks: section definition aux holds 0xFFFF, section uses NRELOC_OVFL") {
         std::vector<coff::BindSymbol> many;

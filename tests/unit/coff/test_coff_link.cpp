@@ -1,16 +1,20 @@
-// WP-06 acceptance: the writer's output through the real linkers.
+// WP-06 acceptance: the writer's output through the real linkers (link.exe and lld-link).
 //
-// For each set of fixture objects (and for every linker: link.exe and lld-link):
+// For each set of objects (fixture objects, and a synthetic pair that shares COMDATs):
 //   1. binding.obj is generated for every external symbol the set leaves undefined and linked with
-//      the objects as `/DLL /NOENTRY /NODEFAULTLIB` (plan 4.6 command line); the link must succeed
-//      (no /FORCE:UNRESOLVED), every thunk must be `FF 25 rel32` landing on its slot, and every slot
-//      must be a public in the PDB (read with cml_pdb);
-//   2. the same objects with STATIC anchors (the plan's form) are linked and compared with the
-//      unanchored link: section layout and all code sections must be byte-identical;
-//   3. the same with EXTERNAL tagged anchors (the alternative evaluated for PDB visibility).
-// Where the anchors show up in the PDB (publics / module symbols / neither) and how well the
-// section contributions reproduce the anchor addresses is printed as EVIDENCE lines and appended to
-// <work dir>/evidence.txt (CI prints it).
+//      the objects as `/DLL /NOENTRY /NODEFAULTLIB /OPT:NOREF /OPT:NOICF` (plan 4.6 command line);
+//      the link must succeed (no /FORCE:UNRESOLVED), every thunk must be `FF 25 rel32` landing on
+//      its slot, and every slot must be a public in the PDB (read with cml_pdb);
+//   2. the same objects after add_anchors() (section locators: external anchors for non-COMDAT
+//      sections and for COMDATs without an external symbol, the COMDAT leader otherwise, none for
+//      associative sections) are linked; the image must equal the unanchored one in every byte
+//      except the timestamp/checksum and the debug directory;
+//   3. every locator must be a public in the patch PDB and match a section contribution (start, and
+//      size + compiland unless the COMDAT is shared by several objects); every linked,
+//      non-associative section must have a locator (X/X);
+//   4. probes: anchors flipped to STATIC are invisible in the PDB (ADR-0020); under /OPT:REF an
+//      unreferenced COMDAT leader disappears from the PDB (why locators require /OPT:NOREF).
+// The numbers are printed as EVIDENCE lines and appended to <work dir>/evidence.txt (CI prints it).
 //
 // Environment (local runs only): CML_TEST_LINKERS=lld-link restricts the linkers; CI runs both and
 // fails when one is missing.
@@ -21,6 +25,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <initializer_list>
 #include <map>
 #include <memory>
@@ -411,7 +416,7 @@ struct Linked {
 // Every variant of one linker links into its own directory under the same file name, and the
 // directory names have equal length: the PDB path is embedded in the image (RSDS record), so
 // different path lengths would shift the .rdata layout and make the images incomparable.
-Linked do_link(const Linker& lk, const fs::path& variant_dir, const std::vector<std::string>& objs) {
+Linked do_link(const Linker& lk, const fs::path& variant_dir, const std::vector<std::string>& objs, bool opt_ref = false) {
     Linked r;
     std::error_code mk;
     fs::create_directories(variant_dir, mk);
@@ -425,6 +430,14 @@ Linked do_link(const Linker& lk, const fs::path& variant_dir, const std::vector<
                                      "/INCREMENTAL:NO", "/OPT:NOREF", "/OPT:NOICF", "/FUNCTIONPADMIN", "/FIXED",
                                      "/DYNAMICBASE:NO", "/BASE:0x180000000", "/BREPRO", "/PDB:" + r.pdb, "/OUT:" + r.dll,
                                      "/IGNORE:4001,4254,4281"};
+    if (opt_ref) {
+        // The probe: let the linker drop unreferenced COMDATs; keep one root so the image is not empty.
+        for (std::string& a : args) {
+            if (a == "/OPT:NOREF") a = "/OPT:REF";
+            if (a == "/OPT:NOICF") a = "/OPT:ICF";
+        }
+        args.push_back("/EXPORT:shared_fn");
+    }
     for (const std::string& o : objs) {
         args.push_back(o);
     }
@@ -709,7 +722,10 @@ void check_binding_in_image(const char* where, const Linked& linked, const PdbFa
 //     section contribution of the PDB (start, and size and compiland unless the COMDAT is shared).
 // `static_probe`: additionally links a variant whose anchors are flipped to STATIC and asserts that
 // none of them is visible anywhere in the PDB (the ADR-0020 finding).
-void run_files(const std::string& name, const std::vector<std::string>& originals, bool static_probe) {
+using LocatorVerifier = std::function<void(std::size_t object, const std::vector<coff::SectionLocator>&)>;
+
+void run_files(const std::string& name, const std::vector<std::string>& originals, bool static_probe,
+               const LocatorVerifier& verify = {}) {
     const std::vector<Linker> linkers = linkers_under_test();
     const fs::path dir = work_root() / name;
     {
@@ -759,6 +775,9 @@ void run_files(const std::string& name, const std::vector<std::string>& original
         const std::string file = (dir / (std::to_string(i) + "_" + stem_of(originals[i]) + ".obj")).string();
         REQUIRE(write_file(file, *bytes));
         anchored_files.push_back(file);
+        if (verify) {
+            verify(i, *loc);
+        }
         locators.push_back(std::move(*loc));
         if (static_probe) {
             for (coff::ModelSymbol& s : m->symbols) {
@@ -819,7 +838,7 @@ void run_files(const std::string& name, const std::vector<std::string>& original
             by_start.emplace(c.rva, c);
         }
         std::size_t anchors = 0, leaders = 0, resolved = 0, start_ok = 0, size_ok = 0, compiland_ok = 0, shared_resolved = 0, no_loc = 0;
-        std::size_t exact_checked = 0, failures_shown = 0;
+        std::size_t exact_checked = 0, failures_shown = 0, empty_sections = 0;
         std::map<std::string, std::size_t> no_loc_reasons;
         for (std::size_t i = 0; i < objects.size(); ++i) {
             const auto compilands = pdb.index->compilands_by_object_name(basename_of(anchored_files[i]));
@@ -844,9 +863,13 @@ void run_files(const std::string& name, const std::vector<std::string>& original
                 const coff::Section* sec = objects[i].object.section(l.section_index);
                 const bool shared = l.kind == coff::LocatorKind::ComdatLeader && leader_copies[l.symbol_name] > 1;
                 shared_resolved += shared ? 1 : 0;
-                if (sec == nullptr || sec->size_of_raw_data == 0 || pub->second < l.offset) {
+                REQUIRE_MESSAGE(sec != nullptr, tag << ": locator names section " << l.section_index << " which does not exist");
+                if (sec->size_of_raw_data == 0) {
+                    ++empty_sections;  // documented: an empty section has no contribution to match; counted and asserted below
                     continue;
                 }
+                REQUIRE_MESSAGE(pub->second >= l.offset, tag << ": locator '" << l.symbol_name << "' rva " << pub->second
+                                                             << " is below its own offset " << l.offset);
                 const std::uint32_t start = pub->second - l.offset;
                 const auto range = by_start.equal_range(start);
                 bool has_start = range.first != range.second;
@@ -892,6 +915,18 @@ void run_files(const std::string& name, const std::vector<std::string>& original
             }
         }
         CHECK(eligible == located);
+        // The empty sections skipped above are exactly those the objects themselves declare empty.
+        std::size_t expected_empty = 0;
+        for (std::size_t i = 0; i < objects.size(); ++i) {
+            for (const coff::Section& sec : objects[i].object.sections()) {
+                if (sec.size_of_raw_data == 0 && locators[i][sec.index - 1].kind != coff::LocatorKind::None) {
+                    ++expected_empty;
+                }
+            }
+        }
+        CHECK_MESSAGE(empty_sections == expected_empty, tag << ": " << empty_sections << " empty sections skipped, " << expected_empty << " expected");
+        CHECK_MESSAGE(exact_checked + empty_sections == resolved, tag << ": " << resolved << " locators resolved but " << exact_checked
+                                                                      << " checked against contributions and " << empty_sections << " empty");
         if (static_probe) {
             CHECK_MESSAGE(anchored_comdat >= 2, tag << ": the static-leader COMDAT of each object should have been anchored");
         }
@@ -901,11 +936,11 @@ void run_files(const std::string& name, const std::vector<std::string>& original
         }
         evidence("set=%s linker=%s | link ok, bound=%zu (%zu functions) | image identical outside timestamp/checksum/debug directory: %s "
                  "(layout %s, code %s, %zu bytes differ) | locators: %zu anchors + %zu comdat leaders resolved %zu/%zu in PDB publics, "
-                 "%zu without locator (reasons:%s); sections with a locator %zu/%zu (%zu of them COMDATs located by anchor: static or missing leader) | section contributions with same start %zu, same size %zu, same compiland %zu of %zu checked | "
+                 "%zu without locator (reasons:%s); empty sections %zu; sections with a locator %zu/%zu (%zu of them COMDATs located by anchor: static or missing leader) | section contributions with same start %zu, same size %zu, same compiland %zu of %zu checked | "
                  "shared COMDAT leaders in this link: %zu (locators of them resolved: %zu)",
                  name.c_str(), lk.label.c_str(), bind.size(), bind_functions, diff.bytes_differing_outside_debug_info == 0 ? "YES" : "NO",
                  diff.layout_equal ? "identical" : "DIFFERENT", diff.code_equal ? "identical" : "DIFFERENT",
-                 diff.bytes_differing_outside_debug_info, anchors, leaders, resolved, anchors + leaders, no_loc, reasons.c_str(), located, eligible, anchored_comdat, start_ok,
+                 diff.bytes_differing_outside_debug_info, anchors, leaders, resolved, anchors + leaders, no_loc, reasons.c_str(), empty_sections, located, eligible, anchored_comdat, start_ok,
                  size_ok, compiland_ok, exact_checked, shared_leaders, shared_resolved);
 
         // 3. the static probe: STATIC anchors are invisible in the PDB.
@@ -985,5 +1020,50 @@ TEST_CASE("coff link: two objects sharing a COMDAT, locators under both linkers"
         REQUIRE(write_file(path, make_shared_comdat_object(which)));
         files.push_back(path);
     }
-    run_files("shared_comdat", files, true);
+    using K = coff::LocatorKind;
+    using R = coff::NoLocatorReason;
+    const auto verify = [](std::size_t object, const std::vector<coff::SectionLocator>& loc) {
+        const std::string w = object == 0 ? "a" : "b";
+        INFO("object " << object);
+        REQUIRE(loc.size() == 7);
+        // 1 shared_fn, 2 unique, 3 .xdata (associative), 4 shared_const, 5 static_fn, 6 .data, 7 .bss
+        const K kinds[7] = {K::ComdatLeader, K::ComdatLeader, K::None, K::ComdatLeader, K::Anchor, K::Anchor, K::Anchor};
+        const R reasons[7] = {R::HasLocator, R::HasLocator, R::Associative, R::HasLocator, R::StaticLeader, R::HasLocator, R::HasLocator};
+        const std::string names[7] = {"shared_fn", "unique_" + w, "", "shared_const", "", "", ""};
+        for (std::size_t k = 0; k < 7; ++k) {
+            CHECK_MESSAGE(loc[k].kind == kinds[k], "section " << (k + 1));
+            CHECK_MESSAGE(loc[k].reason == reasons[k], "section " << (k + 1));
+            if (kinds[k] == K::ComdatLeader) {
+                CHECK(loc[k].symbol_name == names[k]);
+            }
+            if (kinds[k] == K::Anchor) {
+                CHECK(loc[k].symbol_name.rfind("__cml_anchor_", 0) == 0);
+            }
+        }
+    };
+    run_files("shared_comdat", files, true, verify);
+
+    // Why the locators require /OPT:NOREF: under /OPT:REF the linker drops the unreferenced COMDAT
+    // leader `unique_a`, so it is no longer a public.
+    const fs::path binding = work_root() / "shared_comdat" / "binding.obj";
+    REQUIRE(fs::exists(binding));
+    std::vector<std::string> link_files = files;
+    link_files.push_back(binding.string());
+    for (const Linker& lk : linkers_under_test()) {
+        INFO("linker " << lk.label);
+        const fs::path d = work_root() / "shared_comdat" / (lk.label + "_optref");
+        const Linked keep = do_link(lk, d / "n0", link_files, false);
+        REQUIRE_MESSAGE(keep.ok, keep.output);
+        const Linked drop = do_link(lk, d / "r0", link_files, true);
+        REQUIRE_MESSAGE(drop.ok, "link with /OPT:REF failed:\n" << drop.output);
+        PdbFacts with_noref = read_pdb(keep.pdb);
+        PdbFacts with_ref = read_pdb(drop.pdb);
+        REQUIRE_MESSAGE(with_noref.ok, with_noref.error);
+        REQUIRE_MESSAGE(with_ref.ok, with_ref.error);
+        CHECK(with_noref.public_rva.count("unique_a") == 1);
+        CHECK_MESSAGE(with_ref.public_rva.count("unique_a") == 0, "/OPT:REF kept the unreferenced COMDAT leader unique_a");
+        CHECK(with_ref.public_rva.count("shared_fn") == 1);  // the exported root survives
+        evidence("opt-ref probe linker=%s: unique_a is a public with /OPT:NOREF (%zu) and %s with /OPT:REF", lk.label.c_str(),
+                 with_noref.public_rva.count("unique_a"), with_ref.public_rva.count("unique_a") == 0 ? "gone" : "STILL THERE");
+    }
 }

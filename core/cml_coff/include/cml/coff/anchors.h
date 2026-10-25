@@ -15,7 +15,8 @@
 //                 name; the only other discard path is /OPT:REF, and patches link with /OPT:NOREF),
 //                 so the anchor cannot be left undefined by a discarded section.
 //   ComdatLeader  COMDAT section with an external leader (the first symbol after the section
-//                 definition): NO new symbol. The leader is already a public; the section starts at
+//                 definition; if that one is not external, any other external symbol defined in the
+//                 section serves): NO new symbol. The leader is already a public; the section starts at
 //                 `leader RVA - SectionLocator::offset` (offset = the leader's value, usually 0). When
 //                 the linker discards the COMDAT as a duplicate, every copy resolves to the kept
 //                 section, which is what retargeting that section's relocations needs. (An external
@@ -28,11 +29,17 @@
 //                 A caller that needs a locator for such a section gets a diagnostic from
 //                 require_locator() (CML3309), never a silent gap.
 //
+// PRECONDITION of every locator: the patch is linked with /OPT:NOREF /OPT:NOICF. With /OPT:REF the
+// linker drops unreferenced COMDATs, and with it their leader publics (the unit.coff_link test
+// shows an unreferenced leader vanishing under /OPT:REF); /OPT:ICF can fold sections so that two
+// sections share one address. WP-09 enforces the flags.
+//
 // What add_anchors() guarantees:
 //   * Symbols are only APPENDED, after the last existing record (aux records included). No existing
 //     symbol moves, so every relocation's symbol index, every weak-external tag and every
 //     section-definition association stays valid; the COMDAT leader rule holds by construction.
 //   * Sections, relocations and data are not touched. No section is added, resized or reordered.
+//   * The leader / section-definition rule is the reader's (section_symbols.h), not a copy of it.
 //   * Verified in CI: anchored and unanchored links give identical images in every section except
 //     the timestamp/checksum and the debug directory, under link.exe and lld-link.
 //
@@ -77,6 +84,9 @@ struct AnchorOptions {
     // When set, the tag is inserted here and the call fails with CML3308 if it was already present:
     // share one set between all objects of a link.
     std::unordered_set<std::string>* used_tags = nullptr;
+    // The compiler's original file bytes, for the default tag (avoids serialising the model just to
+    // hash it). Ignored when `tag` is set.
+    ByteSpan object_bytes;
 };
 
 // True when the section is linked into the image (see the rules above).
@@ -94,7 +104,8 @@ std::string anchor_name(std::uint32_t section_index, std::string_view tag);
 // Adds the anchors and returns one locator per section (element i describes section i + 1).
 // CML3306 when the object already holds a symbol named __cml_anchor_*; CML3307 for invalid tag
 // characters; CML3308 for a tag already in options.used_tags; CML3300 when the symbol or string
-// table would overflow.
+// table would overflow. Transactional: on any failure the model and used_tags are unchanged. When no
+// section needs an anchor nothing is touched and no tag is computed or claimed.
 Result<std::vector<SectionLocator>> add_anchors(ObjectModel& model, const AnchorOptions& options = {});
 
 // CML3309 when the section has no locator (names the section and the reason).

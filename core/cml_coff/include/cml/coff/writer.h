@@ -69,7 +69,8 @@ struct ModelSection {
     std::array<std::uint8_t, 6> overflow_record_tail{};  // bytes 4..9 of the overflow record, kept verbatim
     std::uint32_t pointer_to_relocations = 0;            // written verbatim while there is no relocation region
 
-    // Line numbers (obsolete; kept for losslessness). Raw 6-byte records when present.
+    // Line numbers (obsolete; kept for losslessness). Raw 6-byte records when present. Without a
+    // table both fields must be 0: write() refuses anything else (CML3304) instead of changing it.
     std::uint16_t linenumber_count = 0;
     std::uint32_t pointer_to_linenumbers = 0;  // written verbatim while linenumbers is empty
     ByteVector linenumbers;
@@ -111,6 +112,10 @@ public:
     ByteVector string_table;  // the bytes AFTER the 4-byte size field
 
     ByteVector trailing;  // bytes after the last region
+
+    // add_string() refuses to grow the string table beyond this many bytes (the size field counts
+    // itself). The COFF maximum; tests lower it to inject a failure.
+    std::uint64_t string_table_limit = 0xFFFFFFFFull;
 
     // An empty object of the given machine (no sections, no symbols).
     static ObjectModel make_empty(Machine machine, bool bigobj = false);
