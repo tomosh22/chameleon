@@ -155,6 +155,7 @@ TEST_CASE("negative test: an allocation inside the stopped window is detected") 
 
     InstallerOptions options;
     options.test_in_window = &allocate_in_window;
+    options.window_budget_ms = 30000;  // a stalled CI runner must not turn this into a timeout (CML4309)
     Installer installer(options);
 
     CountingScope counting;
@@ -183,7 +184,9 @@ TEST_CASE("positive control: installing and reverting allocate nothing while the
     const Placed repl = arena.place_padded(lea_ret(5), 8, 8);
     arena.seal();
     Workers workers(3);
-    Installer installer;
+    InstallerOptions options;
+    options.window_budget_ms = 30000;  // as above
+    Installer installer(options);
     CountingScope counting;
     std::vector<HookOutcome> out;
     const HookRequest requests[] = {{a.entry, repl.entry, "a"}, {b.entry, repl.entry, "b"}, {c.entry, repl.entry, "c"}};
