@@ -22,7 +22,7 @@ struct RunnerOptions {
     std::filesystem::path artifacts_dir;   // logs, stdout, dumps
     std::filesystem::path cmake;           // full path of cmake.exe
     std::string generator = "ninja";       // "ninja" | "msbuild"
-    std::string vs_generator = "Visual Studio 17 2022";
+    std::string vs_generator;             // empty = detect (`cmake --help` default)
     std::string config = "Debug";
     std::string cxx = "cl";                // "cl" | "clang-cl" | path
     std::filesystem::path prebuilt_fixture;  // debugging aid: skip configure/build and use this fixture exe

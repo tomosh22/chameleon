@@ -13,7 +13,7 @@ cmltest --scenario tests/harness/scenarios/basic.toml --build-dir build --genera
 |---|---|
 | `--scenario FILE` | scenario to run (required) |
 | `--build-dir DIR` | build tree holding `bin/cml_broker.exe` and `bin/cml_agent.dll` (default `<repo>/build`) |
-| `--generator ninja\|msbuild` | how the fixture is built: `-G Ninja` or `-G "Visual Studio 17 2022" -A x64` (`-T ClangCL` for clang-cl) |
+| `--generator ninja\|msbuild` | how the fixture is built: `-G Ninja` or `-G "Visual Studio NN YYYY" -A x64` (the version `cmake --help` marks as default; `--vs-generator` overrides) (`-T ClangCL` for clang-cl) |
 | `--config Debug\|RelWithDebInfo` | fixture configuration |
 | `--cxx cl\|clang-cl\|PATH` | compiler for the fixture (looked up on `PATH`, or a full path such as CI's `CML_CXX`) |
 | `--junit FILE` | JUnit XML, one testcase per scenario, steps in `<system-out>` |

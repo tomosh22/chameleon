@@ -34,7 +34,7 @@ struct BuildSettings {
     std::filesystem::path artifacts_dir;  // cmake logs go here
     std::filesystem::path agent_dir;      // directory containing cml_agent.dll (copied next to the fixture exe)
     std::string generator = "ninja";      // "ninja" or "msbuild"
-    std::string vs_generator = "Visual Studio 17 2022";
+    std::string vs_generator;             // empty = ask CMake which Visual Studio it would pick
     std::string config = "Debug";
     CompilerChoice compiler;
     std::filesystem::path cmake = "cmake";

@@ -226,7 +226,37 @@ cml::Result<BuiltFixture> build_fixture(Supervisor& supervisor, const BuildSetti
             configure += L" -DCMAKE_C_COMPILER=" + quote_argument(cmake_path(settings.compiler.path));
         }
     } else if (settings.generator == "msbuild") {
-        configure += L" -G " + quote_argument(cml::proc::wide_from_utf8(settings.vs_generator)) + L" -A x64";
+        std::string vs_generator = settings.vs_generator;
+        if (vs_generator.empty()) {
+            // Ask CMake which Visual Studio it would pick: the line marked `*` in `cmake --help`
+            // ("* Visual Studio 18 2026 = ..."). The images carry different VS versions over time.
+            ChildSpec help;
+            help.label = "cmake-help";
+            help.exe = settings.cmake;
+            help.arguments = L"--help";
+            help.working_directory = settings.work_dir;
+            help.output_file = settings.artifacts_dir / "cmake-help.txt";
+            cml::Result<std::size_t> started = supervisor.start(help);
+            vs_generator = "Visual Studio 17 2022";
+            if (started && supervisor.wait_exit(*started, 60000)) {
+                std::istringstream lines(last_lines(help.output_file, 100000));
+                std::string line;
+                while (std::getline(lines, line)) {
+                    if (line.rfind("* Visual Studio", 0) == 0) {
+                        const std::size_t eq = line.find('=');
+                        std::string name = line.substr(2, eq == std::string::npos ? std::string::npos : eq - 2);
+                        while (!name.empty() && (name.back() == ' ' || name.back() == '\r')) {
+                            name.pop_back();
+                        }
+                        if (!name.empty()) {
+                            vs_generator = name;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        configure += L" -G " + quote_argument(cml::proc::wide_from_utf8(vs_generator)) + L" -A x64";
         if (settings.compiler.is_clang_cl) {
             configure += L" -T ClangCL";
         }

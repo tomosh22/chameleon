@@ -37,7 +37,7 @@ void print_usage(std::FILE* out) {
         "  --broker EXE              cml_broker.exe (default: <build-dir>/bin[/<config>]/cml_broker.exe)\n"
         "  --agent-dir DIR           directory with cml_agent.dll (default: the broker's directory)\n"
         "  --generator ninja|msbuild how the fixture is built (default: ninja)\n"
-        "  --vs-generator NAME       CMake generator name for msbuild (default: \"Visual Studio 17 2022\")\n"
+        "  --vs-generator NAME       CMake generator name for msbuild (default: the one `cmake --help` marks with *)\n"
         "  --config Debug|RelWithDebInfo   fixture build configuration (default: Debug)\n"
         "  --cxx cl|clang-cl|PATH    compiler for the fixture (default: cl)\n"
         "  --cmake EXE               cmake.exe (default: found on PATH)\n"
@@ -60,7 +60,7 @@ struct Args {
     std::string broker;
     std::string agent_dir;
     std::string generator = "ninja";
-    std::string vs_generator = "Visual Studio 17 2022";
+    std::string vs_generator;  // empty = the generator CMake marks as default (`cmake --help`)
     std::string config = "Debug";
     std::string cxx = "cl";
     std::string cmake;
