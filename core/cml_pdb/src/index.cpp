@@ -103,12 +103,20 @@ struct Cache {
     std::mutex mutex;
     std::map<CacheKey, std::shared_ptr<CacheSlot>> slots;
 
-    // Drops entries whose index is gone and that nobody is building. Caller holds `mutex`.
+    // Drops entries whose index is gone and that no opener holds. Caller holds `mutex`.
+    // Openers copy the slot pointer under `mutex` and only then lock the slot, so a slot whose
+    // mutex is free may still be about to be built; use_count() == 1 (only the map) is the
+    // reliable "nobody else has it" test, because copies are only taken under `mutex`.
     void sweep() {
         for (auto it = slots.begin(); it != slots.end();) {
-            std::unique_lock<std::mutex> slot_lock(it->second->mutex, std::try_to_lock);
-            if (slot_lock.owns_lock() && it->second->index.expired()) {
-                slot_lock.unlock();
+            bool erase = false;
+            if (it->second.use_count() == 1) {
+                // Uncontended: nobody else holds the slot. Locking orders this read after the
+                // last builder's write of `index` (which happened under the slot mutex).
+                std::lock_guard<std::mutex> slot_lock(it->second->mutex);
+                erase = it->second->index.expired();
+            }
+            if (erase) {
                 it = slots.erase(it);
             } else {
                 ++it;

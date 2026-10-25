@@ -24,4 +24,10 @@ diagnostic is planned, not live.
 
 - Functions currently executing on a thread's stack keep running old code until they return;
   the next call runs the new code.
-- x86 (32-bit), ARM64, Linux and macOS targets are out of scope for v1 (CML1106 for modules).
+- x86 (32-bit), ARM64, Linux and macOS targets are out of scope for v1 (CML1106 for modules;
+  CML1303 when the PE reader sees a PE32 image).
+- Modules loaded or unloaded by the host are noticed by the agent within about 500 ms
+  (polling; ADR-0016). EnableModule always refreshes the list first.
+- The agent DLL stays loaded until the process exits, even after `DestroyAgent`.
+- Header changes on clang-cl builds may miss compilands whose included headers contain no code,
+  until WP-15 adds include tracking for clang-cl (ADR-0013).
