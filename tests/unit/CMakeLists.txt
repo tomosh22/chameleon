@@ -20,8 +20,8 @@ if(NOT MSVC)
     find_package(Threads REQUIRED)
     target_link_libraries(cml_test_util PRIVATE Threads::Threads)
 endif()
-cml_add_unit_test(coff SOURCES lib/test_coff.cpp LIBS cml_coff)
-cml_add_unit_test(pe SOURCES lib/test_pe.cpp LIBS cml_pe)
+add_subdirectory(coff)  # WP-02: unit.coff
+add_subdirectory(pe)    # WP-02: unit.pe
 cml_add_unit_test(pdb SOURCES lib/test_pdb.cpp LIBS cml_pdb)
 cml_add_unit_test(ipc SOURCES lib/test_ipc.cpp LIBS cml_ipc)
 cml_add_unit_test(proc SOURCES lib/test_proc.cpp LIBS cml_proc)
