@@ -8,6 +8,8 @@
 #include "cml/toolchain/compile_commands.h"
 #include "cml/toolchain/diag_ids.h"
 #include "cml/toolchain/invoke.h"
+#include "cml/toolchain/link_diag_ids.h"
+#include "cml/toolchain/link_patch.h"
 #include "cml/toolchain/record.h"
 #include "cml/toolchain/rewrite.h"
 #include "cml/toolchain/symbol_set.h"
