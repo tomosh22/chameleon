@@ -317,6 +317,25 @@ TEST_CASE("statics: a function-local static and its guard variable are bound; th
     CHECK(r->new_globals.empty());
 }
 
+TEST_CASE("statics: cl records the guard variable in the PDB: it is matched by name, no inference needed") {
+    SynthWorld w = basic_world(false);
+    w.proc_with_statics(w.tu(), "statics_value", 0x50, {{"g", 0x20}, {"$TSS0", 0x24}});
+    w.open();
+    SynthObj o;
+    const std::uint32_t g_sec = o.section(".bss", kData | coff::scn::LnkComdat, 4, coff::ComdatSelection::Any);
+    o.symbol("?g@?1??statics_value@@YAHXZ@4UGuarded@@A", 0, static_cast<std::int32_t>(g_sec), false, false);
+    const std::uint32_t t_sec = o.section(".bss", kData | coff::scn::LnkComdat, 4, coff::ComdatSelection::Any);
+    o.symbol("?$TSS0@?1??statics_value@@YAHXZ@4HA", 0, static_cast<std::int32_t>(t_sec), false, false);
+    Built b = o.build();
+    auto r = plan_bind(w.input(b));
+    REQUIRE_MESSAGE(r.has_value(), err(r));
+    const SymbolDecision* guard = find(*r, "?$TSS0@?1??statics_value@@YAHXZ@4HA");
+    CHECK(guard->decision == DecisionKind::BindOldData);
+    CHECK(guard->source == BindSource::CompilandStatic);
+    CHECK(guard->old_address.rva == 0x3024);
+    CHECK(r->warnings.empty());
+}
+
 TEST_CASE("statics: when the layout changed the guard is NOT guessed - it is new, with a warning") {
     SynthWorld w = basic_world(false);
     w.data(w.tu(), "`anonymous namespace'::s_calls", 0x10);

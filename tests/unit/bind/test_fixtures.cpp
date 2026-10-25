@@ -364,7 +364,7 @@ public:
 void emit_decisions(const std::string& tag, const BindPlan& p, const cml::pdb::PdbIndex& pdb_index) {
     for (const SymbolDecision& d : p.decisions) {
         if (d.decision == DecisionKind::BindOldData) {
-            line("BIND-OLD-DATA " + tag + " " + d.display + (d.defined ? " (defined" : " (undefined") + (d.is_static ? ", static)" : ")") +
+            (d.defined ? brief : line)("BIND-OLD-DATA " + tag + " " + d.display + (d.defined ? " (defined" : " (undefined") + (d.is_static ? ", static)" : ")") +
                  " source=" + to_string(d.source) + (d.old_address.rva != kNoRva ? " rva=" + hex(d.old_address.rva) : " va=" + hex(d.old_address.va)));
         }
         // ADR-0010 evidence: how each STATIC of the new object was bridged to the PDB.

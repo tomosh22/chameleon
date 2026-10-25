@@ -8,12 +8,13 @@
     { "symbol": "statics_value", "decision": "patch-hooked", "source": "pdb-public" },
     { "symbol": "statics_calls", "decision": "patch-hooked", "source": "pdb-public" },
     { "symbol": "statics_total", "decision": "patch-hooked", "source": "pdb-public" },
-    { "symbol": "make_base", "decision": "patch-hooked", "source": "compiland-static" },
+    { "symbol": "make_base", "decision": "patch-hooked", "source": "compiland-static", "when": "cl" },
     { "symbol": "Accum::total", "decision": "bind-old-data", "source": "pdb-public" },
     { "symbol": "(anonymous namespace)::s_calls", "decision": "bind-old-data", "source": "compiland-static" },
     { "symbol": "k_weights", "decision": "bind-old-data", "source": "compiland-static" },
     { "symbol": "statics_value::g", "decision": "bind-old-data", "source": "compiland-static" },
-    { "symbol": "statics_value::$TSS0", "decision": "bind-old-data", "source": "compiland-layout" }
+    { "symbol": "statics_value::$TSS0", "decision": "bind-old-data", "source": "compiland-static", "when": "cl" },
+    { "symbol": "statics_value::$TSS0", "decision": "bind-old-data", "source": "compiland-layout", "when": "clang" }
   ],
   "absent": [
     { "symbol": "Accum::total", "decision": "patch-new-data" },

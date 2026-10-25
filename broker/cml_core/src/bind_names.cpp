@@ -364,7 +364,17 @@ std::string display_name(std::string_view decorated) {
 }
 
 std::string base_identifier(std::string_view d) {
-    if (d.size() < 2 || d[0] != '?') {
+    if (!d.empty() && d[0] != '?') {
+        // clang names internal-linkage data and functions with the plain identifier ("k_weights").
+        for (const char c : d) {
+            const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+            if (!ok) {
+                return {};
+            }
+        }
+        return is_digit(d[0]) ? std::string() : std::string(d);
+    }
+    if (d.size() < 2) {
         return {};
     }
     std::string_view body = d.substr(1);

@@ -594,7 +594,11 @@ std::vector<const pdb::SymbolView*> Planner::static_candidates(const std::string
             return exact;
         }
     }
-    if (!encl.empty()) {
+    if (want_function) {
+        // Member functions of local classes (lambdas) are top-level procs in the PDB; the function scope
+        // in the decorated name only matters for data.
+        out = all;
+    } else if (!encl.empty()) {
         for (const pdb::SymbolView* v : all) {
             if (v->parent_proc != pdb::kNoSymbol && last_component(v->parent_name) == encl) {
                 out.push_back(v);
@@ -716,9 +720,6 @@ void Planner::bridge_statics() {
             continue;
         }
         const bool is_func = sy.dec.type == SymbolType::Function;
-        if (!is_func && is_guard_variable(sy.name)) {
-            continue;  // pass C
-        }
         if (is_func && starts_with(sy.name, "??$")) {
             // A static function template instantiation (typically over a local/lambda type): same base
             // name as unrelated instantiations, and the PDB spells the arguments differently. Not bridged.
@@ -766,6 +767,9 @@ void Planner::bridge_statics() {
         if (cands.empty()) {
             for (const std::uint32_t pos : g.members) {
                 Sym& sy = syms_[pos];
+                if (!g.is_func && is_guard_variable(sy.name)) {
+                    continue;  // compilers without a PDB record for the guard (clang): pass C
+                }
                 decide(sy, g.is_func ? DecisionKind::PatchNewFunction : DecisionKind::PatchNewData, BindSource::None, sy.dec.type, {},
                        std::string("static ") + (g.is_func ? "function" : "data") + " '" + g.base + "' has no record in compiland " + std::to_string(ci_) + ": new");
             }

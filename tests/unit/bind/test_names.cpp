@@ -65,7 +65,9 @@ TEST_CASE("base_identifier and enclosing_function") {
     CHECK(base_identifier("??R<lambda_0>@?0??lambdas_init@@YAXH@Z@QEBA?A?<auto>@@H@Z") == "operator()");
     CHECK(base_identifier("??HFoo@@QEBAHH@Z") == "operator+");
     CHECK(base_identifier("??_7Square@@6B@").empty());
-    CHECK(base_identifier("fixture_note").empty());
+    CHECK(base_identifier("k_weights") == "k_weights");  // clang: internal data keeps its plain name
+    CHECK(base_identifier("$SG1234").empty());
+    CHECK(base_identifier("__real@3ff0000000000000").empty());
     CHECK(enclosing_function("?g@?1??statics_value@@YAHXZ@4UGuarded@@A") == "statics_value");
     CHECK(enclosing_function("?s_calls@?A0x1@@3HA").empty());
     CHECK(enclosing_function("?compute_value@@YAHXZ").empty());
