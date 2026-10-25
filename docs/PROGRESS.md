@@ -37,3 +37,4 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | FU-06 | WP-11 | `DestroyAgent` waits with `Sleep(1)`; use an event | WP-12 |
 | FU-07 | WP-05 fix (#15) | No-job fallback (AssignProcessToJobObject failed) kills only the driver on cancel/timeout | WP-18 |
 | FU-08 | WP-05 fix (#15) | `is_pdb_server` treats an image-name query failure (e.g. >520-char path) as mspdbsrv; use a growing buffer | WP-18 |
+| FU-09 | WP-11 fix (#16) | Test watchdog only fires inside a test case; hangs in static destructors or doctest teardown stay silent until ctest TIMEOUT | WP-13 owner / orchestrator |
