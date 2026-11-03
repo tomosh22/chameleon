@@ -14,6 +14,7 @@
 #include "agent.h"
 #include "cml/proc/diag_ids.h"
 #include "cml/util/log.h"
+#include "crash/exception_gate.h"
 #include "hook/installer.h"
 #include "hook/user_hook_ids.h"
 #include "hook/user_hooks.h"
@@ -256,6 +257,11 @@ unsigned __stdcall Agent::compile_worker_entry(void* self) {
 
 void Agent::compile_worker_run() {
     ScopedHookThread scope(HookThread::Worker);
+    // WP-20: the agent's own thread is never held by the crash handler.
+    struct CrashIgnore {
+        CrashIgnore() { crash::ExceptionGate::shared().add_ignored_thread(GetCurrentThreadId()); }
+        ~CrashIgnore() { crash::ExceptionGate::shared().remove_ignored_thread(GetCurrentThreadId()); }
+    } crash_ignore;
     for (;;) {
         ipc::CompileEvent event;
         {
