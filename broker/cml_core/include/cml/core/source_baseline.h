@@ -68,6 +68,8 @@ public:
 
     // Re-baselines files with the stamps the sweep saw (after their patch was applied).
     void accept(const std::map<std::string, FileStamp>& stamps);
+    // The recorded stamps of the given files (those that are tracked). WP-22: a revert puts them back.
+    std::map<std::string, FileStamp> stamps_of(const std::vector<std::string>& files) const;
 
     std::size_t size() const;
     bool tracks(const std::string& path) const;

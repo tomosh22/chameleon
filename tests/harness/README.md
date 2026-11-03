@@ -91,6 +91,13 @@ regex = "TICK"
 kind = "expect_reload_result"  # an integer member of the last reload's result (compiled, compile_reused, load_attempts,
 key = "compiled"               # modules_patched, processes_patched, patched, hooks_installed, ...)
 value = 1
+
+# WP-22: undo reloads
+[[step]]
+kind = "revert"                # control command `revert`; needs capability "revert"; resets the output cursors
+scope = "last"                 # "last" (the newest reload; default) or "all"
+within_s = 30                  # 1..3600, default 30
+expect_error = "CML5850"       # optional: the broker must refuse with this id
 ```
 
 Keys added by WP-17 (synchronised mode and hooks):

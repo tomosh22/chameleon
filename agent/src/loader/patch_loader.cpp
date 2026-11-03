@@ -475,6 +475,17 @@ void PatchLoader::commit_hooked(const std::vector<std::pair<std::uint64_t, std::
     }
 }
 
+Result<void> PatchLoader::uncommit_patch(std::uint64_t image_base) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Patch* patch = find_patch(image_base);
+    if (patch == nullptr || !patch->live) {
+        return make(ids::kLoaderUnknownPatch, "no patch is loaded at " + hex(image_base), "Only patches loaded by LoadPatch can be uncommitted.");
+    }
+    patch->committed = false;
+    patch->target_base = 0;
+    return {};
+}
+
 std::vector<AddressRange> PatchLoader::owned_ranges() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return owned_;
@@ -1005,6 +1016,7 @@ ipc::Message PatchLoader::handle_request(const ipc::Message& request) {
     }
     if (const auto* release = std::get_if<ipc::ReleaseRange>(&request)) {
         Result<void> done = release->mode == ipc::ReleaseMode::UnloadPatch ? unload_patch(release->base)
+                            : release->mode == ipc::ReleaseMode::Uncommit  ? uncommit_patch(release->base)
                                                                             : release_range(release->base, release->size);
         return done ? reply(release->request_id, nullptr, "released") : reply(release->request_id, &done.error(), "");
     }

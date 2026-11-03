@@ -160,7 +160,10 @@ struct Reply {
 // operation on the same list, applied under the same stop-the-world window, and answered by the
 // same HooksInstalled; with the flag set `new_entry` is ignored and the original bytes come back.
 inline constexpr std::uint32_t kInstallHooksRevert = 1u;
-inline constexpr std::uint32_t kInstallHooksKnownFlags = kInstallHooksRevert;
+// WP-22: the request is part of a patch revert (a hook is re-pointed back at the previous patch). The application's
+// pre/post-patch hooks do not run and cml_last_patch_status() is not touched, as for a plain revert.
+inline constexpr std::uint32_t kInstallHooksQuiet = 0x100u;
+inline constexpr std::uint32_t kInstallHooksKnownFlags = kInstallHooksRevert | kInstallHooksQuiet;
 
 struct HookSpec {
     std::uint64_t old_entry = 0;  // entry of the function being replaced (its first hook's target)
@@ -373,12 +376,15 @@ struct ReserveRangeResult {
 enum class ReleaseMode : std::uint32_t {
     Free = 0,         // give [base, base+size) of reserved address space back to the OS
     UnloadPatch = 1,  // FreeLibrary the patch loaded at `base` and return its range to the reserved state
+    // WP-22: the patch loaded at `base` was reverted: its application-hook records (CML_PREPATCH_HOOK, ...) stop being
+    // collected again. The image stays loaded. An agent without this mode refuses the request ("unknown release mode").
+    Uncommit = 2,
 };
 
 struct ReleaseRange {
     std::uint64_t request_id = 0;
     std::uint64_t base = 0;
-    std::uint64_t size = 0;  // Free: the extent; UnloadPatch: ignored (0)
+    std::uint64_t size = 0;  // Free: the extent; UnloadPatch / Uncommit: ignored (0)
     ReleaseMode mode = ReleaseMode::Free;
 };
 
