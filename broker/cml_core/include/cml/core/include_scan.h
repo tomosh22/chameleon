@@ -12,6 +12,9 @@
 // The scan is independent of the compiler, so it also serves cl, where it adds headers the PDB list misses (a
 // forced include, a header that only declares).
 //
+// A quoted include is searched like cl and clang-cl do: in the directory of the including file, then in the directories
+// of the files further up the include stack, then in the -I list.
+//
 // Portable (the file reader is injectable); not thread-safe, one scanner per index run.
 
 #include <functional>
@@ -43,6 +46,7 @@ struct ScanRoots {
     std::vector<std::string> forced_includes;  // /FI, -include
     bool creates_pch = false;                  // /Yc, -emit-pch, -building-pch-with-obj
     bool uses_pch = false;                     // /Yu, -include-pch
+    std::string pch_header;                    // the header named by /Yc<hdr> or /Yu<hdr> ("" when none is named)
 };
 
 // Reads the roots out of a recorded command (response files are expanded; an unreadable one is skipped).
@@ -61,9 +65,24 @@ public:
     // followed.
     std::set<std::string> dependencies(const ScanRoots& roots);
 
+    // The files that make up the precompiled header this command builds or uses: the header named by /Yc / /Yu and the
+    // forced includes, with everything they include. Independent of the translation unit's own includes; empty when
+    // none of them can be found on disk.
+    std::set<std::string> pch_files(const ScanRoots& roots);
+
     std::size_t files_read() const noexcept { return parsed_.size(); }
 
 private:
+    struct Start {
+        std::string file;
+        std::set<std::string> inherited_dirs;  // directories of the "including" files above this one
+    };
+    std::vector<std::string> normalised_dirs(const ScanRoots& roots) const;
+    // Finds a forced include / PCH header: next to the source, in the cwd, then in the -I list ("" when absent).
+    std::string resolve_forced(const ScanRoots& roots, const std::string& name);
+    // Everything reachable from `starts` (the starts included).
+    std::set<std::string> walk(const std::vector<Start>& starts, const std::vector<std::string>& dirs);
+
     const std::vector<IncludeDirective>* includes_of(const std::string& normalised_path);
 
     ScanFileReader reader_;

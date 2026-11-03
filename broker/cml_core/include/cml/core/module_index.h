@@ -92,6 +92,8 @@ public:
         // Changed files that belong to a precompiled header (WP-15): the /Yc compiland's headers. A change to one
         // cannot be hot-reloaded (CML5550).
         std::vector<std::string> pch_headers;
+        // Compilands to recompile that use a precompiled header whose files could not be determined (CML5552).
+        std::vector<std::uint32_t> pch_unverified;
         std::map<std::string, FileStamp> stamps;
         std::size_t hashed = 0;
         std::size_t checked = 0;
@@ -122,7 +124,8 @@ private:
     std::function<Result<Sweep>()> sweep_override_;                       // guarded by mutex_
     std::vector<std::map<std::string, FileStamp>> accepted_for_testing_;  // guarded by mutex_
     std::map<std::string, std::vector<std::uint32_t>> header_deps_;       // guarded by mutex_: scanned header -> compilands
-    std::set<std::string> pch_files_;                                     // guarded by mutex_: headers of /Yc compilands
+    std::set<std::string> pch_files_;                                     // guarded by mutex_: files of the precompiled header(s)
+    std::set<std::uint32_t> pch_unverified_;                              // guarded by mutex_: /Yu compilands with an unknown PCH
     std::atomic<bool> cancel_{false};
     std::thread worker_;
 };

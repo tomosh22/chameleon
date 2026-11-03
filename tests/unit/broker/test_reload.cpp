@@ -100,6 +100,7 @@ struct Rig {
 
     // knobs of the fake compiler / linker / agent
     bool fail_compile = false;
+    bool short_results = false;                 // compile_all returns one result too few
     std::atomic<int> compile_calls{0};
     std::atomic<int> link_calls{0};
     std::atomic<int> resolve_calls{0};
@@ -126,11 +127,11 @@ struct Rig {
     Session session{1, "0.1.0"};
     std::shared_ptr<ModuleState> module;
 
-    explicit Rig(bool default_session_dir = false) {
+    explicit Rig(bool default_session_dir = false, const std::string& logic_flags = std::string()) {
         // basic_world() with the compiland's build environment recorded at the head of its module stream (before
         // the first proc), as the compilers do.
         SynthWorld w;
-        w.tu().symbols.envblock({{"cwd", dir.dir()}, {"cl", "C:\\VC\\bin\\cl.exe"}, {"cmd", "/c /Zi /Gy logic.cpp"}, {"src", "C:\\proj\\logic.cpp"}});
+        w.tu().symbols.envblock({{"cwd", dir.dir()}, {"cl", "C:\\VC\\bin\\cl.exe"}, {"cmd", "/c /Zi /Gy " + logic_flags + " logic.cpp"}, {"src", "C:\\proj\\logic.cpp"}});
         w.proc(w.tu(), "compute_value", 0x10);
         w.main_obj().symbols.envblock({{"cwd", dir.dir()}, {"cl", "C:\\VC\\bin\\cl.exe"}, {"cmd", "/c /Zi /Gy main.cpp"}, {"src", "C:\\proj\\main.cpp"}});
         w.proc(w.main_obj(), "fixture_note", 0x100);
@@ -148,7 +149,7 @@ struct Rig {
 
         PipelineEnv env;
         env.compile_all = [this](const std::vector<toolchain::CompileRequest>& requests_in, std::vector<toolchain::CompileOutcome>& outcomes, unsigned,
-                                 toolchain::CancelToken*) {
+                                 toolchain::CancelToken*, const std::function<void(std::size_t)>& on_done) {
             std::vector<Result<void>> results;
             for (std::size_t i = 0; i < requests_in.size(); ++i) {
                 ++compile_calls;
@@ -157,6 +158,12 @@ struct Rig {
                 }
                 outcomes[i].object_path = requests_in[i].output_object;
                 outcomes[i].compiler_used = "C:\\VC\\bin\\cl.exe";
+                if (on_done) {
+                    on_done(i);
+                }
+                if (short_results && i + 1 == requests_in.size() && requests_in.size() > 1) {
+                    break;  // the driver "loses" the last result
+                }
                 if (fail_compile) {
                     results.emplace_back(Diag::make(2200, "the compiler reported errors in logic.cpp", "Fix the errors."));
                     continue;
@@ -1123,14 +1130,56 @@ TEST_CASE("reload: more affected compilands than max_affected_compilands needs a
     }
 }
 
-TEST_CASE("reload: compiles run in batches of max_parallel_compiles and report progress events") {
+TEST_CASE("reload: one compile call for all units; progress is reported per finished unit") {
     QuietLogs quiet;
     Rig rig;
     rig.enable();
     rig.changed_both();
     rig.second_object = make_object({}, false, "no_such_function_anywhere");
-    rig.option("max_parallel_compiles", Value::integer(1));
     Result<Value> r = rig.reload();
     REQUIRE_FALSE(r.has_value());
     CHECK(rig.events->count("progress") == 3);  // 0/2, 1/2, 2/2
+}
+
+TEST_CASE("reload: a compile driver that returns too few results fails the missing units (CML5318)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed_both();
+    rig.short_results = true;
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML5318");
+    CHECK(r.error().message.find("main.cpp") != std::string::npos);
+    CHECK(rig.requests.empty());
+}
+
+TEST_CASE("reload: a /Yu compiland whose precompiled header cannot be determined is refused (CML5552), whatever the scan finds") {
+    QuietLogs quiet;
+    SUBCASE("/Yu without a header name: no file to track, no .pch known to be current") {
+        Rig rig(false, "/Yu");
+        rig.enable();
+        rig.changed();
+        Result<Value> r = rig.reload();
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().id() == "CML5552");
+        CHECK(r.error().message.find("precompiled header") != std::string::npos);
+        CHECK(rig.compile_calls == 0);
+    }
+    SUBCASE("/Yu naming a header that is not on disk is refused as well") {
+        Rig rig(false, "/Yupch.h");
+        rig.enable();
+        rig.changed();
+        Result<Value> r = rig.reload();
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().id() == "CML5552");
+        CHECK(rig.compile_calls == 0);
+    }
+    SUBCASE("a TU without a precompiled header is not affected") {
+        Rig rig;
+        rig.enable();
+        rig.changed();
+        Result<Value> r = rig.reload();
+        CHECK(r.has_value());
+    }
 }

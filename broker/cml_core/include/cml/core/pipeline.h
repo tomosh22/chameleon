@@ -59,8 +59,8 @@ struct ReloadOptions {
 // Replaceable effects.
 struct PipelineEnv {
     std::function<std::vector<Result<void>>(const std::vector<toolchain::CompileRequest>&, std::vector<toolchain::CompileOutcome>&, unsigned,
-                                            toolchain::CancelToken*)>
-        compile_all;
+                                            toolchain::CancelToken*, const std::function<void(std::size_t index)>& on_done)>
+        compile_all;  // on_done (may be empty) is called from a worker thread when unit `index` has finished
     // Finds the linker that mirrors the module's (ADR-0027).
     std::function<Result<toolchain::ToolInfo>(const std::string& module_path, const std::vector<std::string>& search_dirs, const ReloadOptions&,
                                               std::vector<Diag>* warnings)>

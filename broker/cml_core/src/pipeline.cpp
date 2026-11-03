@@ -1,13 +1,13 @@
 #include "cml/core/pipeline.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <optional>
 #include <set>
-#include <thread>
 #include <unordered_set>
 
 #include "cml/coff/anchors.h"
@@ -297,6 +297,16 @@ private:
                                                 " belong to the precompiled header of " + module_.name + "; a precompiled header cannot be hot-reloaded",
                                             "Revert the change, or rebuild and restart the application. Edit the translation units that use the precompiled header instead."));
         }
+        if (!swept->pch_unverified.empty()) {
+            std::string names;
+            for (const std::uint32_t ci : swept->pch_unverified) {
+                names += (names.empty() ? "'" : ", '") + std::string(pdb->compiland(ci).object_name) + "'";
+            }
+            return fail("sweep", Diag::make(header::diag::kPchUnknown,
+                                            "cannot tell which files make up the precompiled header used by " + names +
+                                                "; a recompile could use a stale .pch",
+                                            "Rebuild the project and hot-restart, or build with /Yu<header> naming the precompiled header."));
+        }
         if (options_.max_affected_compilands != 0 && swept->compilands.size() > options_.max_affected_compilands && !ctx_.confirm) {
             return fail("sweep", Diag::make(header::diag::kTooManyCompilands,
                                             "the change affects " + std::to_string(swept->compilands.size()) + " compilands of " + module_.name +
@@ -359,35 +369,21 @@ private:
             return *first_error;
         }
         std::vector<toolchain::CompileOutcome> outcomes(requests.size());
-        // WP-15: compile in batches of max_parallel_compiles and report after each one. A failed batch ends the stage.
-        std::vector<Result<void>> results;
-        results.reserve(requests.size());
-        {
-            std::size_t batch = options_.max_parallel_compiles;
-            if (batch == 0) {
-                batch = std::max<std::size_t>(1, std::thread::hardware_concurrency());
-            }
-            const std::size_t total = requests.size();
-            publish_progress("compile", 0, total);
-            for (std::size_t begin = 0; begin < total; begin += batch) {
-                const std::size_t end = std::min(total, begin + batch);
-                const std::vector<toolchain::CompileRequest> part(requests.begin() + static_cast<std::ptrdiff_t>(begin),
-                                                                  requests.begin() + static_cast<std::ptrdiff_t>(end));
-                std::vector<toolchain::CompileOutcome> part_outcomes(part.size());
-                std::vector<Result<void>> part_results = env_.compile_all(part, part_outcomes, options_.max_parallel_compiles, ctx_.cancel);
-                bool failed = false;
-                for (std::size_t i = 0; i < part.size(); ++i) {
-                    outcomes[begin + i] = std::move(part_outcomes[i]);
-                    results.push_back(i < part_results.size() ? std::move(part_results[i]) : Result<void>());
-                    failed = failed || !results.back();
-                }
-                publish_progress("compile", end, total);
-                if (failed) {
-                    break;
-                }
-            }
+        // One call for all units with the full parallelism and one deadline budget (each request carries the time that
+        // is left). WP-15 progress: the driver reports every finished unit, so no batch barrier is needed.
+        const std::size_t total = requests.size();
+        std::atomic<std::size_t> finished{0};
+        publish_progress("compile", 0, total);
+        std::vector<Result<void>> results = env_.compile_all(
+            requests, outcomes, options_.max_parallel_compiles, ctx_.cancel,
+            [&](std::size_t) { publish_progress("compile", finished.fetch_add(1) + 1, total); });
+        // A driver that returns fewer results than units has not compiled the missing ones: that is a failure, never a success.
+        while (results.size() < units.size()) {
+            const std::string& missing = units[results.size()].source;
+            results.emplace_back(Diag::make(pd::kStageFailed, "the compiler driver returned no result for '" + missing + "'",
+                                            "This is a bug in the compiler driver; see the broker log."));
         }
-        for (std::size_t i = 0; i < results.size(); ++i) {
+        for (std::size_t i = 0; i < units.size(); ++i) {
             units[i].outcome = outcomes[i];
             if (!results[i]) {
                 Diag d = results[i].error();

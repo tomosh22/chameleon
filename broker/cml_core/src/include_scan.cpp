@@ -18,62 +18,144 @@ bool is_space(char c) {
     return c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v';
 }
 
+bool is_ident(char c) {
+    return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+}
+
+// The identifier-like token that ends at out.back() (empty when out ends in something else).
+std::string_view trailing_token(const std::string& out) {
+    std::size_t start = out.size();
+    while (start > 0 && is_ident(out[start - 1])) {
+        --start;
+    }
+    return std::string_view(out).substr(start);
+}
+
+// Removes comments and the contents of raw string literals, keeping every newline (so line structure survives).
+// String and character literals are copied verbatim and never start a comment: `"assets/*"` hides nothing.
+std::string strip_comments(std::string_view text) {
+    std::string out;
+    out.reserve(text.size());
+    const std::size_t n = text.size();
+    std::size_t i = 0;
+    while (i < n) {
+        const char c = text[i];
+        if (c == '/' && i + 1 < n && text[i + 1] == '/') {
+            // Line comment; a backslash before the newline continues it.
+            while (i < n && text[i] != '\n') {
+                if (text[i] == '\\' && i + 1 < n && (text[i + 1] == '\n' || (text[i + 1] == '\r' && i + 2 < n && text[i + 2] == '\n'))) {
+                    i += text[i + 1] == '\r' ? 3 : 2;
+                    out.push_back('\n');
+                    continue;
+                }
+                ++i;
+            }
+            continue;
+        }
+        if (c == '/' && i + 1 < n && text[i + 1] == '*') {
+            i += 2;
+            while (i < n && !(text[i] == '*' && i + 1 < n && text[i + 1] == '/')) {
+                if (text[i] == '\n') out.push_back('\n');
+                ++i;
+            }
+            i = i + 2 <= n ? i + 2 : n;
+            out.push_back(' ');
+            continue;
+        }
+        if (c == '"') {
+            const std::string_view tok = trailing_token(out);
+            const bool raw_prefix = tok == "R" || tok == "LR" || tok == "uR" || tok == "UR" || tok == "u8R";
+            if (raw_prefix) {
+                // R"delim( ... )delim"
+                std::size_t d = i + 1;
+                while (d < n && d - (i + 1) <= 16 && text[d] != '(' && text[d] != '"' && text[d] != '\n' && text[d] != ' ' && text[d] != '\\' && text[d] != ')') {
+                    ++d;
+                }
+                if (d < n && text[d] == '(') {
+                    const std::string closing = ")" + std::string(text.substr(i + 1, d - (i + 1))) + "\"";
+                    const std::size_t end = text.find(closing, d + 1);
+                    const std::size_t stop = end == std::string_view::npos ? n : end + closing.size();
+                    out.push_back('"');
+                    for (std::size_t k = d + 1; k < stop; ++k) {
+                        if (text[k] == '\n') out.push_back('\n');
+                    }
+                    out.push_back('"');
+                    i = stop;
+                    continue;
+                }
+            }
+            out.push_back(c);
+            ++i;
+            while (i < n && text[i] != '"' && text[i] != '\n') {
+                if (text[i] == '\\' && i + 1 < n && text[i + 1] != '\n') {
+                    out.push_back(text[i++]);
+                }
+                out.push_back(text[i++]);
+            }
+            if (i < n && text[i] == '"') {
+                out.push_back(text[i++]);
+            }
+            continue;
+        }
+        if (c == '\'') {
+            // 1'000 is a digit separator; L'a', u8'a', '\n' are character literals.
+            const std::string_view tok = trailing_token(out);
+            if (!tok.empty() && std::isdigit(static_cast<unsigned char>(tok.front())) != 0) {
+                out.push_back(c);
+                ++i;
+                continue;
+            }
+            out.push_back(c);
+            ++i;
+            while (i < n && text[i] != '\'' && text[i] != '\n') {
+                if (text[i] == '\\' && i + 1 < n && text[i + 1] != '\n') {
+                    out.push_back(text[i++]);
+                }
+                out.push_back(text[i++]);
+            }
+            if (i < n && text[i] == '\'') {
+                out.push_back(text[i++]);
+            }
+            continue;
+        }
+        out.push_back(c);
+        ++i;
+    }
+    return out;
+}
+
 }  // namespace
 
 std::vector<IncludeDirective> parse_includes(std::string_view text) {
     std::vector<IncludeDirective> out;
-    bool in_block_comment = false;
+    const std::string clean = strip_comments(text);
     std::size_t pos = 0;
-    while (pos < text.size()) {
-        std::size_t end = text.find('\n', pos);
-        if (end == std::string_view::npos) {
-            end = text.size();
+    while (pos < clean.size()) {
+        std::size_t end = clean.find('\n', pos);
+        if (end == std::string::npos) {
+            end = clean.size();
         }
-        const std::string_view line = text.substr(pos, end - pos);
+        const std::string_view line = std::string_view(clean).substr(pos, end - pos);
         pos = end + 1;
 
-        // Comments are removed first (a block comment may span lines). String literals are not tracked, which only
-        // matters for a "//" inside a string on a line that is a directive, and an #include operand has none.
-        std::string clean;
-        clean.reserve(line.size());
-        for (std::size_t i = 0; i < line.size(); ++i) {
-            if (in_block_comment) {
-                if (line[i] == '*' && i + 1 < line.size() && line[i + 1] == '/') {
-                    in_block_comment = false;
-                    ++i;
-                    clean.push_back(' ');
-                }
-                continue;
-            }
-            if (line[i] == '/' && i + 1 < line.size() && line[i + 1] == '*') {
-                in_block_comment = true;
-                ++i;
-                continue;
-            }
-            if (line[i] == '/' && i + 1 < line.size() && line[i + 1] == '/') {
-                break;
-            }
-            clean.push_back(line[i]);
-        }
-
         std::size_t i = 0;
-        while (i < clean.size() && is_space(clean[i])) ++i;
-        if (i >= clean.size() || clean[i] != '#') continue;
+        while (i < line.size() && is_space(line[i])) ++i;
+        if (i >= line.size() || line[i] != '#') continue;
         ++i;
-        while (i < clean.size() && is_space(clean[i])) ++i;
+        while (i < line.size() && is_space(line[i])) ++i;
         const std::size_t word_start = i;
-        while (i < clean.size() && (std::isalnum(static_cast<unsigned char>(clean[i])) != 0 || clean[i] == '_')) ++i;
-        const std::string_view word(clean.data() + word_start, i - word_start);
+        while (i < line.size() && is_ident(line[i])) ++i;
+        const std::string_view word = line.substr(word_start, i - word_start);
         if (word != "include" && word != "include_next" && word != "import") continue;
-        while (i < clean.size() && is_space(clean[i])) ++i;
-        if (i >= clean.size()) continue;
-        const char open = clean[i];
+        while (i < line.size() && is_space(line[i])) ++i;
+        if (i >= line.size()) continue;
+        const char open = line[i];
         if (open != '"' && open != '<') continue;
         const char close = open == '"' ? '"' : '>';
         const std::size_t name_start = i + 1;
-        const std::size_t name_end = clean.find(close, name_start);
-        if (name_end == std::string::npos || name_end == name_start) continue;
-        out.push_back({clean.substr(name_start, name_end - name_start), open == '<'});
+        const std::size_t name_end = line.find(close, name_start);
+        if (name_end == std::string_view::npos || name_end == name_start) continue;
+        out.push_back({std::string(line.substr(name_start, name_end - name_start)), open == '<'});
     }
     return out;
 }
@@ -87,6 +169,8 @@ ScanRoots scan_roots_from_record(const toolchain::CompileRecord& record) {
     if (expanded) {
         args = std::move(*expanded);
     }
+    // Options whose value is either joined ("-isystemDIR") or the next argument ("-isystem", "DIR"), longest prefix first.
+    static const char* const kDirOptions[] = {"external:I", "idirafter", "isystem", "iquote", "imsvc"};
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string t = args[i];
         if (t.size() < 2 || (t[0] != '-' && t[0] != '/')) {
@@ -94,28 +178,36 @@ ScanRoots scan_roots_from_record(const toolchain::CompileRecord& record) {
         }
         const std::string_view opt = std::string_view(t).substr(1);
         const auto starts = [&](std::string_view p) { return opt.substr(0, p.size()) == p; };
-        // The value of an option that is either joined ("-Idir") or the next argument ("-I", "dir").
         const auto value = [&](std::string_view prefix) {
             if (opt.size() > prefix.size()) {
                 return std::string(opt.substr(prefix.size()));
             }
             return i + 1 < args.size() ? args[++i] : std::string();
         };
-        std::string v;
-        if (opt == "isystem" || opt == "iquote" || opt == "idirafter" || starts("external:I") || starts("imsvc")) {
-            const std::string_view prefix = starts("external:I") ? "external:I" : starts("imsvc") ? "imsvc" : opt;
-            v = value(prefix);
-            if (!v.empty()) roots.include_dirs.push_back(std::move(v));
-        } else if (opt[0] == 'I') {
-            v = value("I");
+        bool done = false;
+        for (const char* name : kDirOptions) {
+            if (starts(name)) {
+                std::string v = value(name);
+                if (!v.empty()) roots.include_dirs.push_back(std::move(v));
+                done = true;
+                break;
+            }
+        }
+        if (done) {
+            continue;
+        }
+        if (opt[0] == 'I') {
+            std::string v = value("I");
             if (!v.empty()) roots.include_dirs.push_back(std::move(v));
         } else if (opt == "include" || starts("FI")) {
-            v = value(opt == "include" ? "include" : "FI");
+            std::string v = value(opt == "include" ? "include" : "FI");
             if (!v.empty()) roots.forced_includes.push_back(std::move(v));
         } else if (starts("Yc") || opt == "emit-pch" || opt == "building-pch-with-obj") {
             roots.creates_pch = true;
+            if (starts("Yc") && opt.size() > 2) roots.pch_header = std::string(opt.substr(2));
         } else if (starts("Yu") || opt == "include-pch") {
             roots.uses_pch = true;
+            if (starts("Yu") && opt.size() > 2) roots.pch_header = std::string(opt.substr(2));
         }
     }
     return roots;
@@ -154,63 +246,111 @@ const std::vector<IncludeDirective>* IncludeScanner::includes_of(const std::stri
     return it->second ? &*it->second : nullptr;
 }
 
-std::set<std::string> IncludeScanner::dependencies(const ScanRoots& roots) {
-    std::set<std::string> found;
-    if (roots.source.empty()) {
-        return found;
-    }
-    const std::string source = pdb::normalize_path(roots.source, roots.cwd);
+std::vector<std::string> IncludeScanner::normalised_dirs(const ScanRoots& roots) const {
     std::vector<std::string> dirs;
     for (const std::string& d : roots.include_dirs) {
         dirs.push_back(pdb::normalize_path(d, roots.cwd));
     }
+    return dirs;
+}
 
-    std::vector<std::string> work{source};  // files whose includes still have to be followed; the source first
-    std::set<std::string> visited{source};
-    const auto add = [&](const std::string& normalised) {
-        if (!visited.insert(normalised).second) {
+std::string IncludeScanner::resolve_forced(const ScanRoots& roots, const std::string& name) {
+    if (name.empty()) {
+        return {};
+    }
+    const std::string source = roots.source.empty() ? std::string() : pdb::normalize_path(roots.source, roots.cwd);
+    const std::string source_dir(path::parent_directory(std::string_view(source)));
+    std::vector<std::string> bases;
+    if (!source_dir.empty()) bases.push_back(source_dir);
+    if (!roots.cwd.empty()) bases.push_back(roots.cwd);
+    for (const std::string& d : normalised_dirs(roots)) bases.push_back(d);
+    for (const std::string& base : bases) {
+        const std::string c = pdb::normalize_path(name, base);
+        if (includes_of(c) != nullptr) return c;
+    }
+    return {};
+}
+
+std::set<std::string> IncludeScanner::walk(const std::vector<Start>& starts, const std::vector<std::string>& dirs) {
+    // Every file keeps the union of the directories of the files that include it, directly or not: a quoted include is
+    // searched in the including file's directory, then in those of the files further up the include stack, then in -I.
+    std::map<std::string, std::set<std::string>> stack_dirs;
+    std::vector<std::string> work;
+    std::set<std::string> found;
+    const auto reach = [&](const std::string& file, const std::set<std::string>& inherited) {
+        if (is_system_path(file) || includes_of(file) == nullptr) {
             return;
         }
-        if (is_system_path(normalised)) {
-            return;  // not tracked, not followed
+        std::set<std::string>& mine = stack_dirs[file];
+        const std::size_t before = mine.size();
+        mine.insert(inherited.begin(), inherited.end());
+        mine.insert(std::string(path::parent_directory(std::string_view(file))));
+        const bool is_new = found.insert(file).second;
+        if (is_new || mine.size() != before) {
+            work.push_back(file);  // new, or reached with directories it has not searched yet
         }
-        found.insert(normalised);
-        work.push_back(normalised);
     };
-    // The first existing candidate of a name: the including file's directory (quoted form only), then -I in order.
-    const auto resolve = [&](const std::string& name, const std::string* first_dir, const std::string* second_dir) -> std::string {
-        if (first_dir != nullptr) {
-            const std::string c = pdb::normalize_path(name, *first_dir);
-            if (includes_of(c) != nullptr) return c;
-        }
-        if (second_dir != nullptr) {
-            const std::string c = pdb::normalize_path(name, *second_dir);
-            if (includes_of(c) != nullptr) return c;
-        }
-        for (const std::string& d : dirs) {
-            const std::string c = pdb::normalize_path(name, d);
-            if (includes_of(c) != nullptr) return c;
-        }
-        return {};
-    };
-
-    const std::string source_dir(path::parent_directory(std::string_view(source)));
-    for (const std::string& f : roots.forced_includes) {
-        const std::string hit = resolve(f, &source_dir, &roots.cwd);
-        if (!hit.empty()) add(hit);
+    for (const Start& s : starts) {
+        reach(s.file, s.inherited_dirs);
     }
     for (std::size_t next = 0; next < work.size(); ++next) {
-        const std::string current = work[next];  // copy: add() grows `work`
+        const std::string current = work[next];
         const std::vector<IncludeDirective>* includes = includes_of(current);
         if (includes == nullptr) {
             continue;
         }
+        const std::set<std::string> searched = stack_dirs[current];  // copy: reach() mutates the map
         const std::string here(path::parent_directory(std::string_view(current)));
         for (const IncludeDirective& inc : *includes) {
-            const std::string hit = resolve(inc.name, inc.angled ? nullptr : &here, nullptr);
-            if (!hit.empty()) add(hit);
+            std::string hit;
+            const auto try_dir = [&](const std::string& d) {
+                if (!hit.empty()) return;
+                const std::string c = pdb::normalize_path(inc.name, d);
+                if (includes_of(c) != nullptr) hit = c;
+            };
+            if (!inc.angled) {
+                try_dir(here);
+                for (const std::string& d : searched) try_dir(d);
+            }
+            for (const std::string& d : dirs) try_dir(d);
+            if (!hit.empty()) {
+                reach(hit, searched);
+            }
         }
     }
+    return found;
+}
+
+std::set<std::string> IncludeScanner::dependencies(const ScanRoots& roots) {
+    if (roots.source.empty()) {
+        return {};
+    }
+    const std::string source = pdb::normalize_path(roots.source, roots.cwd);
+    const std::string source_dir(path::parent_directory(std::string_view(source)));
+    std::vector<Start> starts;
+    starts.push_back({source, {}});
+    for (const std::string& f : roots.forced_includes) {
+        const std::string hit = resolve_forced(roots, f);
+        if (!hit.empty()) starts.push_back({hit, {source_dir}});
+    }
+    std::set<std::string> found = walk(starts, normalised_dirs(roots));
+    found.erase(source);
+    return found;
+}
+
+std::set<std::string> IncludeScanner::pch_files(const ScanRoots& roots) {
+    const std::string source = roots.source.empty() ? std::string() : pdb::normalize_path(roots.source, roots.cwd);
+    const std::string source_dir(path::parent_directory(std::string_view(source)));
+    std::vector<Start> starts;
+    if (const std::string named = resolve_forced(roots, roots.pch_header); !named.empty()) {
+        starts.push_back({named, {source_dir}});
+    }
+    for (const std::string& f : roots.forced_includes) {
+        const std::string hit = resolve_forced(roots, f);
+        if (!hit.empty()) starts.push_back({hit, {source_dir}});
+    }
+    std::set<std::string> found = walk(starts, normalised_dirs(roots));
+    found.erase(source);
     return found;
 }
 

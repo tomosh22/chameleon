@@ -133,3 +133,91 @@ TEST_CASE("scan_roots_from_record reads cl, clang-cl and cc1 spellings") {
     emit.args = {"-cc1", "-emit-pch", "-o", "x.pch"};
     CHECK(scan_roots_from_record(emit).creates_pch);
 }
+
+TEST_CASE("comment openers inside string and character literals do not hide later includes") {
+    const auto v = parse_includes(
+        "const char* a = \"assets/*\";\n"
+        "#include \"after_string.h\"\n"
+        "char c = '\"'; char d = '/'; char e = '*';\n"
+        "#include \"after_chars.h\"\n"
+        "const char* r = R\"x(/* #include \"inside_raw.h\" \n  )x\";\n"
+        "#include \"after_raw.h\"\n"
+        "const char* s = \"//\";\n"
+        "int n = 1'000'000;\n"
+        "#include \"after_separator.h\"\n"
+        "/* a comment with \"a quote */\n"
+        "#include \"after_comment.h\"\n"
+        "// a line comment with a backslash \\\n"
+        "#include \"continued_comment.h\"\n"
+        "#include \"last.h\"\n");
+    std::vector<std::string> names;
+    for (const IncludeDirective& d : v) names.push_back(d.name);
+    CHECK(names == std::vector<std::string>{"after_string.h", "after_chars.h", "after_raw.h", "after_separator.h", "after_comment.h", "last.h"});
+}
+
+TEST_CASE("a quoted include is also searched in the directories of the files further up the include stack") {
+    FakeFs fs;
+    fs.files["c:\\p\\a.cpp"] = "#include \"sub/x.h\"\n";
+    fs.files["c:\\p\\sub\\x.h"] = "#include \"y.h\"\n";
+    fs.files["c:\\p\\y.h"] = "";  // exists only next to a.cpp
+    IncludeScanner scanner(fs.reader());
+    ScanRoots roots;
+    roots.source = "c:\\p\\a.cpp";
+    CHECK(scanner.dependencies(roots) == std::set<std::string>{"c:\\p\\sub\\x.h", "c:\\p\\y.h"});
+}
+
+TEST_CASE("a header reached again through a longer include stack is searched in the new directories") {
+    FakeFs fs;
+    fs.files["c:\\p\\a.cpp"] = "#include \"shared.h\"\n#include \"deep/d.h\"\n";
+    fs.files["c:\\p\\shared.h"] = "#include \"needs_stack.h\"\n";
+    fs.files["c:\\p\\deep\\d.h"] = "#include \"../shared.h\"\n";
+    fs.files["c:\\p\\deep\\needs_stack.h"] = "";  // only resolvable when shared.h is reached from deep/d.h
+    IncludeScanner scanner(fs.reader());
+    ScanRoots roots;
+    roots.source = "c:\\p\\a.cpp";
+    CHECK(scanner.dependencies(roots).count("c:\\p\\deep\\needs_stack.h") == 1);
+}
+
+TEST_CASE("scan_roots_from_record reads joined and separate directory options of every kind") {
+    toolchain::CompileRecord r;
+    r.cwd = "c:\\b";
+    r.source = "c:\\s\\a.cpp";
+    r.args = {"-iquotec:\\q1", "-iquote", "c:\\q2", "-isystemc:\\s1", "-isystem", "c:\\s2", "-idirafterc:\\d1", "-idirafter", "c:\\d2",
+              "/external:Ic:\\e1", "/external:I", "c:\\e2", "/imsvcc:\\m1", "/imsvc", "c:\\m2", "-Ic:\\i1", "-I", "c:\\i2"};
+    const ScanRoots roots = scan_roots_from_record(r);
+    CHECK(roots.include_dirs == std::vector<std::string>{"c:\\q1", "c:\\q2", "c:\\s1", "c:\\s2", "c:\\d1", "c:\\d2", "c:\\e1", "c:\\e2", "c:\\m1", "c:\\m2",
+                                                         "c:\\i1", "c:\\i2"});
+}
+
+TEST_CASE("the precompiled header is the named header and the forced includes with everything they include") {
+    FakeFs fs;
+    fs.files["c:\\b\\cmake_pch.hxx"] = "#include \"c:/p/pch.h\"\n";
+    fs.files["c:\\p\\pch.h"] = "#include \"base.h\"\n";
+    fs.files["c:\\p\\base.h"] = "";
+    fs.files["c:\\p\\main.cpp"] = "#include \"other.h\"\n";
+    fs.files["c:\\p\\other.h"] = "";
+    IncludeScanner scanner(fs.reader());
+
+    toolchain::CompileRecord yu;
+    yu.cwd = "c:\\b";
+    yu.source = "c:\\p\\main.cpp";
+    yu.args = {"/Yuc:\\b\\cmake_pch.hxx", "/FIc:\\b\\cmake_pch.hxx", "/Fpc:\\b\\x.pch"};
+    ScanRoots roots = scan_roots_from_record(yu);
+    CHECK(roots.pch_header == "c:\\b\\cmake_pch.hxx");
+    CHECK(scanner.pch_files(roots) == std::set<std::string>{"c:\\b\\cmake_pch.hxx", "c:\\p\\pch.h", "c:\\p\\base.h"});
+
+    // A relative name is looked up next to the source, then in the cwd.
+    yu.args = {"/Yucmake_pch.hxx"};
+    roots = scan_roots_from_record(yu);
+    CHECK(scanner.pch_files(roots).count("c:\\p\\pch.h") == 1);
+
+    // Nothing named and nothing forced: unknown.
+    yu.args = {"/Yu"};
+    CHECK(scanner.pch_files(scan_roots_from_record(yu)).empty());
+
+    toolchain::CompileRecord yc = yu;
+    yc.args = {"/Yccmake_pch.hxx"};
+    roots = scan_roots_from_record(yc);
+    CHECK(roots.creates_pch);
+    CHECK(roots.pch_header == "cmake_pch.hxx");
+}

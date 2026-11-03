@@ -159,7 +159,7 @@ Result<void> compile_tu(const CompileRequest& request, CompileOutcome& outcome) 
 }
 
 std::vector<Result<void>> compile_all(const std::vector<CompileRequest>& requests, std::vector<CompileOutcome>& outcomes,
-                                      unsigned max_parallel, CancelToken* cancel) {
+                                      unsigned max_parallel, CancelToken* cancel, const std::function<void(std::size_t index)>& on_done) {
     outcomes.assign(requests.size(), CompileOutcome());
     std::vector<Result<void>> results;
     results.reserve(requests.size());
@@ -174,6 +174,9 @@ std::vector<Result<void>> compile_all(const std::vector<CompileRequest>& request
                 request.cancel = cancel;
             }
             results[i] = compile_tu(request, outcomes[i]);
+            if (on_done) {
+                on_done(i);
+            }
         },
         cancel);
     return results;
