@@ -1034,6 +1034,8 @@ TEST_CASE("the resolved linker follows set-option linker / linker_path") {
     QuietLogs quiet;
     Rig rig;
     rig.enable();
+    // WP-25: reloading identical code loads nothing; this test is about the linker of every reload, so hook everything.
+    rig.option("narrow_hooks", Value::boolean(false));
     rig.changed();
     REQUIRE(rig.reload().has_value());
     CHECK(rig.resolve_calls == 1);
@@ -1349,6 +1351,8 @@ TEST_CASE("compile cache: the same command line is compiled once for the modules
     QuietLogs quiet;
     Rig rig;
     rig.enable();
+    // WP-25: reloading identical code loads nothing; this test is about the compile cache, so hook everything.
+    rig.option("narrow_hooks", Value::boolean(false));
     const ReloadOptions options = rig.service->options();
     PipelineContext ctx;
     ctx.session_dir = rig.service->session_dir();
@@ -1579,3 +1583,137 @@ TEST_CASE("compile on save watches the headers that only the include scan finds 
     CHECK(watched);
 }
 #endif
+
+// ---- WP-25: unchanged-function elision ---------------------------------------------------------------------------------
+
+namespace {
+
+// The diag events of one severity and id the rig's listener has seen.
+int count_diag(Rig& rig, const std::string& id, const std::string& severity) {
+    std::lock_guard<std::mutex> lock(rig.events->mutex);
+    int n = 0;
+    for (const Event& e : rig.events->events) {
+        if (e.name == "diag" && e.body.get_string("id") == id && e.body.get_string("severity") == severity) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+}  // namespace
+
+TEST_CASE("elision: a reload that recompiles to identical code loads nothing, advances nothing and warns CML3450") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    Result<Value> first = rig.reload();
+    REQUIRE_MESSAGE(first.has_value(), first.error().format());
+    CHECK(first->get_integer("hooks_planned") == 1);
+    CHECK(first->get_integer("hooks_dropped") == 0);
+    CHECK(first->get_integer("hooks_installed") == 1);
+    CHECK_FALSE(first->get_bool("no_functional_change"));
+    CHECK(count_diag(rig, "CML3450", "warning") == 0);
+    REQUIRE(rig.module->generation == 1);
+
+    // The same object again: compute_value is hooked by patch 1 and equals what patch 1 put there.
+    rig.changed();
+    Result<Value> second = rig.reload();
+    REQUIRE_MESSAGE(second.has_value(), second.error().format());
+    CHECK(second->get_integer("patched") == 0);
+    CHECK(second->get_integer("hooks_planned") == 1);
+    CHECK(second->get_integer("hooks_dropped") == 1);
+    CHECK(second->get_integer("hooks_installed") == 0);
+    CHECK(second->get_integer("modules_unchanged") == 1);
+    CHECK(second->get_bool("no_functional_change"));
+    CHECK(second->get_integer("generation") == 1);
+    CHECK(rig.module->generation == 1);
+    CHECK(rig.service->generation() == 1);
+    // Nothing reached the agent for the second reload: one load, one hook request, no unload.
+    CHECK(rig.seen<ipc::LoadPatch>().size() == 1);
+    CHECK(rig.seen<ipc::InstallHooks>().size() == 1);
+    CHECK(rig.seen<ipc::ReleaseRange>().empty());
+    CHECK(rig.link_calls == 1);
+    // The warning is in the response and a diag event; no patch_applied event for the empty reload.
+    const Value* warnings = second->find("warnings");
+    REQUIRE(warnings != nullptr);
+    bool in_response = false;
+    for (const Value& w : warnings->items()) {
+        in_response = in_response || (w.as_string().find("CML3450") != std::string::npos && w.as_string().find("identical code") != std::string::npos);
+    }
+    CHECK(in_response);
+    CHECK(count_diag(rig, "CML3450", "warning") == 1);
+    CHECK(rig.events->count("patch_applied") == 1);
+    CHECK(rig.events->diag_ids().empty());  // a warning, not an error
+    // The source baseline moved on, so the next sweep does not report the file again.
+    CHECK(rig.module->index->accepted_for_testing().size() == 2);
+}
+
+TEST_CASE("elision: a partly unchanged reload reports how many hooks were dropped") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    REQUIRE(rig.reload().has_value());
+    // Patch 2: compute_value is unchanged, but the object now also defines a new function, so it is loaded without a hook.
+    rig.object = make_object({}, true);
+    rig.changed();
+    Result<Value> second = rig.reload();
+    REQUIRE_MESSAGE(second.has_value(), second.error().format());
+    CHECK(second->get_integer("patched") == 1);
+    CHECK(second->get_integer("hooks_planned") == 1);
+    CHECK(second->get_integer("hooks_dropped") == 1);
+    CHECK(second->get_integer("hooks_installed") == 0);
+    CHECK_FALSE(second->get_bool("no_functional_change"));
+    CHECK(count_diag(rig, "CML3450", "warning") == 0);
+    const auto patch_events = [&] {
+        std::lock_guard<std::mutex> lock(rig.events->mutex);
+        std::vector<Value> v;
+        for (const Event& e : rig.events->events) {
+            if (e.name == "patch_applied") {
+                v.push_back(e.body);
+            }
+        }
+        return v;
+    }();
+    REQUIRE(patch_events.size() == 2);
+    CHECK(patch_events[1].get_integer("hooks_planned") == 1);
+    CHECK(patch_events[1].get_integer("hooks_dropped") == 1);
+    CHECK(patch_events[1].get_integer("hooks") == 0);
+}
+
+TEST_CASE("elision: a function that changed since the earlier patch is hooked again, one that did not is not") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    REQUIRE(rig.reload().has_value());
+    // Patch 2 calls a function patch 1 did not know: other relocations, so compute_value differs from patch 1's code.
+    rig.object = make_object({}, true);
+    rig.changed();
+    REQUIRE(rig.reload().has_value());  // defines new_helper (loaded, compute_value dropped)
+    rig.object = make_object("?new_helper@@YAHXZ");
+    rig.changed();
+    Result<Value> third = rig.reload();
+    REQUIRE_MESSAGE(third.has_value(), third.error().format());
+    CHECK(third->get_integer("hooks_planned") == 1);
+    CHECK(third->get_integer("hooks_dropped") == 0);
+    CHECK(third->get_integer("hooks_installed") == 1);
+    CHECK_FALSE(third->get_bool("no_functional_change"));
+}
+
+TEST_CASE("elision: narrow_hooks false hooks everything again, and a no-op reload then still loads") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    REQUIRE(rig.reload().has_value());
+    rig.option("narrow_hooks", Value::boolean(false));
+    rig.changed();
+    Result<Value> second = rig.reload();
+    REQUIRE_MESSAGE(second.has_value(), second.error().format());
+    CHECK(second->get_integer("patched") == 1);
+    CHECK(second->get_integer("hooks_dropped") == 0);
+    CHECK(second->get_integer("hooks_installed") == 1);
+    CHECK_FALSE(second->get_bool("no_functional_change"));
+}

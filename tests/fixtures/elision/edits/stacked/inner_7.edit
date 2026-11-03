@@ -1,0 +1,11 @@
+--- a/elision.cpp
++++ b/elision.cpp
+@@ -24,7 +24,7 @@
+
+ __declspec(noinline) int elision_inner()
+ {
+-    return 5;
++    return 7;
+ }
+
+ // A small function that calls another: the call must still resolve to the same target.

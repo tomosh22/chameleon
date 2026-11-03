@@ -1,0 +1,108 @@
+# Scenario `only_one_function_changed` (WP-25, unchanged-function elision). Fixture `elision` has one translation unit with a
+# template (two instantiations), a string literal, and a small function called by another. Every reload recompiles the whole
+# unit, so the planner wants to hook all of its functions; the broker keeps only the ones whose code changed:
+#   1. edit elision_base 10 -> 20: exactly one hook is installed (the rest equals the running code);
+#   2. stacked edit elision_inner 5 -> 7: again exactly one hook. elision_base was hooked by patch 1; comparing it with what
+#      patch 1 put there (and not re-hooking it) is the second half of the work package;
+#   3. a comment-only edit compiles to identical code: no patch is loaded, the generation does not advance, and the broker
+#      warns CML3450 ("no functional change"). The program keeps printing the same values.
+name = "only_one_function_changed"
+description = "fixture elision: one edit -> one hook; a stacked edit of another function -> one hook again; a comment-only edit -> nothing loaded (CML3450)"
+fixture = "elision"
+timeout_s = 240
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ base=10 tmpl=18 text=alpha chain=6\\b"
+within_s = 15
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_elision.exe"
+within_s = 15
+
+# 1. one function changed
+[[step]]
+kind = "edit"
+patch = "edits/base_20.edit"
+
+[[step]]
+kind = "reload"
+within_s = 90
+expect_result_key = "hooks_installed"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_reload_result"
+key = "patched"
+value = 1
+
+[[step]]
+kind = "expect_reload_result"
+key = "generation"
+value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ base=20 tmpl=18 text=alpha chain=6\\b"
+within_s = 10
+
+# 2. a different function of the same unit
+[[step]]
+kind = "edit"
+patch = "edits/stacked/inner_7.edit"
+
+[[step]]
+kind = "reload"
+within_s = 90
+expect_result_key = "hooks_installed"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_reload_result"
+key = "generation"
+value = 2
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ base=20 tmpl=18 text=alpha chain=8\\b"
+within_s = 10
+
+# 3. a comment only
+[[step]]
+kind = "edit"
+patch = "edits/stacked/comment.edit"
+
+[[step]]
+kind = "reload"
+within_s = 90
+expect_result_key = "hooks_installed"
+expect_result_value = 0
+
+[[step]]
+kind = "expect_reload_result"
+key = "patched"
+value = 0
+
+[[step]]
+kind = "expect_reload_result"
+key = "generation"
+value = 2
+
+[[step]]
+kind = "expect_diag"
+id = "CML3450"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ base=20 tmpl=18 text=alpha chain=8\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ base=20 tmpl=18 text=alpha chain=8\\b"
+within_s = 10

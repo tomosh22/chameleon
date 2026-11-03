@@ -44,7 +44,7 @@ struct Scenario {
     std::uint64_t load_base = kPreferred;
     SynthObj::Func foo;
 
-    Scenario() { foo = obj.function("?foo@@YAHXZ", true, 16); }
+    explicit Scenario(std::uint32_t size = 16) { foo = obj.function("?foo@@YAHXZ", true, size); }
 
     void old_code(const std::vector<std::uint8_t>& bytes) {
         for (std::size_t i = 0; i < bytes.size(); ++i) {
@@ -85,6 +85,23 @@ struct Scenario {
         h.old_size = old_size;
         plan.hooks.push_back(h);
     }
+    // WP-25: what the earlier patch recorded for the entry; set by a test before run().
+    std::function<std::shared_ptr<const CodeImage>(std::uint64_t)> prior;
+
+    // The record narrowing makes of this scenario's function (what the broker keeps after the patch was applied).
+    std::shared_ptr<const CodeImage> capture() {
+        Built built = obj.build();
+        keep = std::move(built);
+        NarrowInput in;
+        in.object = &keep.obj();
+        in.plan = &plan;
+        in.load_base = load_base;
+        std::string why;
+        std::optional<CodeImage> image = capture_code(in, "?foo@@YAHXZ", &why);
+        REQUIRE_MESSAGE(image.has_value(), why);
+        return std::make_shared<const CodeImage>(std::move(*image));
+    }
+
     NarrowResult run(bool enabled = true, std::function<bool(std::uint64_t)> hooked = {}) {
         Built built = obj.build();
         keep = std::move(built);
@@ -96,6 +113,7 @@ struct Scenario {
         in.old_image = &*image;
         in.load_base = load_base;
         in.is_hooked = std::move(hooked);
+        in.prior_code = prior;
         in.enabled = enabled;
         return narrow_hooks(in);
     }
@@ -349,4 +367,259 @@ TEST_CASE("narrowing: a constant that holds pointers (a vtable) is never judged 
     const NarrowResult r = s.run();
     REQUIRE(r.hooks.size() == 1);
     CHECK(r.decisions[0].reason == NarrowReason::Unverifiable);
+}
+
+// ---- WP-25: functions an earlier patch hooked are compared with that patch's code --------------------------------------
+
+namespace {
+
+constexpr std::uint64_t kBarVa = kPreferred + kBarRva;
+
+// `call bar; ret` with the displacement field holding the in-place addend `addend` (clang writes -4, cl 0).
+void call_bar(Scenario& s, std::uint64_t bar_va, std::int32_t addend = 0, std::uint8_t first_byte = 0xE8) {
+    const std::uint32_t a = static_cast<std::uint32_t>(addend);
+    s.new_code({first_byte, static_cast<std::uint8_t>(a), static_cast<std::uint8_t>(a >> 8), static_cast<std::uint8_t>(a >> 16), static_cast<std::uint8_t>(a >> 24), 0xC3});
+    const std::uint32_t bar = s.obj.undefined("bar", true);
+    s.obj.reloc(s.foo.section, 1, bar, kRel32, addend);
+    s.hook();
+    SymbolDecision& d = s.decision(bar, "bar", DecisionKind::BindOldFunction);
+    d.old_address.valid = true;
+    d.old_address.va = bar_va;
+}
+
+bool entry_is_hooked(std::uint64_t va) { return va == kPreferred + kFnRva; }
+
+// The first scenario's record, the way the broker keeps it after patch 1.
+std::shared_ptr<const CodeImage> first_patch(std::uint64_t bar_va = kBarVa, std::int32_t addend = 0) {
+    Scenario first;
+    call_bar(first, bar_va, addend);
+    return first.capture();
+}
+
+}  // namespace
+
+TEST_CASE("elision: a function the earlier patch hooked and that is unchanged is dropped") {
+    QuietLogs quiet;
+    const std::shared_ptr<const CodeImage> prior = first_patch();
+    Scenario s;
+    call_bar(s, kBarVa);
+    s.prior = [&](std::uint64_t va) { return entry_is_hooked(va) ? prior : nullptr; };
+    const NarrowResult r = s.run(true, entry_is_hooked);
+    REQUIRE(r.decisions.size() == 1);
+    CHECK_MESSAGE(r.decisions[0].reason == NarrowReason::Unchanged, to_string(r.decisions[0].reason) << " " << r.decisions[0].detail);
+    CHECK(r.hooks.empty());
+    CHECK(r.dropped == 1);
+}
+
+TEST_CASE("elision: an already hooked function whose bytes changed keeps its hook") {
+    QuietLogs quiet;
+    const std::shared_ptr<const CodeImage> prior = first_patch();
+    Scenario s;
+    call_bar(s, kBarVa, 0, 0xE9);  // jmp instead of call
+    s.prior = [&](std::uint64_t) { return prior; };
+    const NarrowResult r = s.run(true, entry_is_hooked);
+    REQUIRE(r.hooks.size() == 1);
+    CHECK(r.decisions[0].reason == NarrowReason::BytesDiffer);
+    CHECK(r.decisions[0].detail.find("earlier patch") != std::string::npos);
+}
+
+TEST_CASE("elision: a different length keeps the hook") {
+    QuietLogs quiet;
+    Scenario first(24);
+    first.new_code({0xB8, 1, 0, 0, 0, 0xC3});
+    first.hook(24);
+    const std::shared_ptr<const CodeImage> prior = first.capture();
+    Scenario s;
+    s.new_code({0xB8, 1, 0, 0, 0, 0xC3});
+    s.hook();
+    s.prior = [&](std::uint64_t) { return prior; };
+    const NarrowResult r = s.run(true, entry_is_hooked);
+    REQUIRE(r.hooks.size() == 1);
+    CHECK(r.decisions[0].reason == NarrowReason::SizeDiffers);
+}
+
+TEST_CASE("elision: a relocation retargeted between the two patches keeps the hook") {
+    QuietLogs quiet;
+    const std::shared_ptr<const CodeImage> prior = first_patch();
+    Scenario s;
+    call_bar(s, kBarVa + 0x10);  // identical bytes, but `bar` now resolves elsewhere
+    s.prior = [&](std::uint64_t) { return prior; };
+    const NarrowResult r = s.run(true, entry_is_hooked);
+    REQUIRE(r.hooks.size() == 1);
+    CHECK(r.decisions[0].reason == NarrowReason::TargetChanged);
+}
+
+TEST_CASE("elision: the in-place addend is part of the target") {
+    QuietLogs quiet;
+    const std::shared_ptr<const CodeImage> prior = first_patch(kBarVa, -4);
+    Scenario s;
+    call_bar(s, kBarVa, 0);
+    s.prior = [&](std::uint64_t) { return prior; };
+    const NarrowResult r = s.run(true, entry_is_hooked);
+    REQUIRE(r.hooks.size() == 1);
+    CHECK(r.decisions[0].reason == NarrowReason::TargetChanged);
+}
+
+TEST_CASE("elision: a string literal is compared by content between patches") {
+    QuietLogs quiet;
+    const auto build = [](bool same, Scenario& s) {
+        s.new_code({0x48, 0x8D, 0x05, 0, 0, 0, 0, 0xC3});
+        const std::uint32_t sec = s.obj.section(".rdata$r", kRdata | coff::scn::LnkComdat, 8, coff::ComdatSelection::Any);
+        const std::uint32_t lit = s.obj.symbol("??_C@_05literal@", 0, static_cast<std::int32_t>(sec), false, true);
+        coff::ModelSection& ms = s.obj.model().sections[sec - 1];
+        const char text[8] = {'h', 'e', 'l', same ? 'l' : 'p', 'o', 0, 0, 0};
+        for (int i = 0; i < 8; ++i) {
+            ms.data[static_cast<std::size_t>(i)] = static_cast<std::byte>(text[i]);
+        }
+        s.obj.reloc(s.foo.section, 3, lit, kRel32, 0);
+        s.hook();
+        SymbolDecision& d = s.decision(lit, "??_C@_05literal@", DecisionKind::PatchFresh);
+        d.defined = true;
+        d.type = SymbolType::Data;
+        d.section = sec;
+        d.value = 0;
+    };
+    Scenario first;
+    build(true, first);
+    const std::shared_ptr<const CodeImage> prior = first.capture();
+    REQUIRE(prior->relocs.size() == 1);
+    CHECK(prior->relocs[0].target.kind == CodeTarget::Kind::Constant);
+    SUBCASE("same literal") {
+        Scenario s;
+        build(true, s);
+        s.prior = [&](std::uint64_t) { return prior; };
+        const NarrowResult r = s.run(true, entry_is_hooked);
+        CHECK_MESSAGE(r.decisions[0].reason == NarrowReason::Unchanged, to_string(r.decisions[0].reason) << " " << r.decisions[0].detail);
+    }
+    SUBCASE("edited literal") {
+        Scenario s;
+        build(false, s);
+        s.prior = [&](std::uint64_t) { return prior; };
+        const NarrowResult r = s.run(true, entry_is_hooked);
+        REQUIRE(r.hooks.size() == 1);
+        CHECK(r.decisions[0].reason == NarrowReason::TargetChanged);
+    }
+}
+
+TEST_CASE("elision: a reference to a symbol the earlier patch introduced is compared by address") {
+    QuietLogs quiet;
+    // Patch 1 defines `new_helper` and calls it (NewSymbol); once laid out it lives at kHelperVa.
+    constexpr std::uint64_t kHelperVa = 0x7FF500001000ull;
+    Scenario first;
+    first.new_code({0xE8, 0, 0, 0, 0, 0xC3});
+    const std::uint32_t helper = first.obj.undefined("new_helper", true);
+    first.obj.reloc(first.foo.section, 1, helper, kRel32, 0);
+    first.hook();
+    first.decision(helper, "new_helper", DecisionKind::PatchNewFunction);
+    const std::shared_ptr<const CodeImage> prior_raw = first.capture();
+    REQUIRE(prior_raw->relocs.size() == 1);
+    CHECK(prior_raw->relocs[0].target.kind == CodeTarget::Kind::NewSymbol);
+    CodeImage unresolved = *prior_raw;
+    CHECK_FALSE(finalize_code(unresolved, [](const std::string&) { return std::optional<std::uint64_t>(); }));
+    CodeImage laid_out = *prior_raw;
+    CHECK(finalize_code(laid_out, [&](const std::string& name) -> std::optional<std::uint64_t> {
+        return name == "new_helper" ? std::optional<std::uint64_t>(kHelperVa) : std::nullopt;
+    }));
+    REQUIRE(laid_out.relocs.size() == 1);
+    CHECK(laid_out.relocs[0].target.kind == CodeTarget::Kind::Address);
+    CHECK(laid_out.relocs[0].target.value == kHelperVa);
+    const std::shared_ptr<const CodeImage> prior = std::make_shared<const CodeImage>(laid_out);
+
+    SUBCASE("patch 2 binds it through the registry to the same address: dropped") {
+        Scenario s;
+        call_bar(s, kHelperVa);
+        s.prior = [&](std::uint64_t) { return prior; };
+        CHECK(s.run(true, entry_is_hooked).hooks.empty());
+    }
+    SUBCASE("it resolves elsewhere: kept") {
+        Scenario s;
+        call_bar(s, kHelperVa + 0x40);
+        s.prior = [&](std::uint64_t) { return prior; };
+        const NarrowResult r = s.run(true, entry_is_hooked);
+        REQUIRE(r.hooks.size() == 1);
+        CHECK(r.decisions[0].reason == NarrowReason::TargetChanged);
+    }
+    SUBCASE("patch 2 introduces another new symbol: kept") {
+        Scenario s;
+        s.new_code({0xE8, 0, 0, 0, 0, 0xC3});
+        const std::uint32_t other = s.obj.undefined("other_helper", true);
+        s.obj.reloc(s.foo.section, 1, other, kRel32, 0);
+        s.hook();
+        s.decision(other, "other_helper", DecisionKind::PatchNewFunction);
+        s.prior = [&](std::uint64_t) { return prior; };
+        const NarrowResult r = s.run(true, entry_is_hooked);
+        REQUIRE(r.hooks.size() == 1);
+        CHECK(r.decisions[0].reason == NarrowReason::TargetNew);
+    }
+}
+
+TEST_CASE("elision: a function an earlier patch introduced (no old entry in the module file) is compared with that patch") {
+    QuietLogs quiet;
+    const std::shared_ptr<const CodeImage> prior = first_patch();
+    const std::uint64_t entry = 0x7FF500002000ull;  // the function's address in patch 1
+    SUBCASE("unchanged") {
+        Scenario s;
+        call_bar(s, kBarVa);
+        s.plan.hooks[0].old_rva = bind::kNoRva;
+        s.plan.hooks[0].old_va = entry;
+        s.plan.hooks[0].old_size = 0;
+        s.prior = [&](std::uint64_t va) { return va == entry ? prior : nullptr; };
+        CHECK(s.run().hooks.empty());
+    }
+    SUBCASE("nothing recorded: kept as before") {
+        Scenario s;
+        call_bar(s, kBarVa);
+        s.plan.hooks[0].old_rva = bind::kNoRva;
+        s.plan.hooks[0].old_va = entry;
+        s.prior = [](std::uint64_t) { return std::shared_ptr<const CodeImage>(); };
+        const NarrowResult r = s.run();
+        REQUIRE(r.hooks.size() == 1);
+        CHECK(r.decisions[0].reason == NarrowReason::OldBytesUnavailable);
+    }
+}
+
+TEST_CASE("elision: nothing recorded for a hooked entry keeps it; narrowing off keeps it too") {
+    QuietLogs quiet;
+    const std::shared_ptr<const CodeImage> prior = first_patch();
+    SUBCASE("no record") {
+        Scenario s;
+        call_bar(s, kBarVa);
+        s.prior = [](std::uint64_t) { return std::shared_ptr<const CodeImage>(); };
+        const NarrowResult r = s.run(true, entry_is_hooked);
+        REQUIRE(r.hooks.size() == 1);
+        CHECK(r.decisions[0].reason == NarrowReason::AlreadyHooked);
+    }
+    SUBCASE("narrowing off") {
+        Scenario s;
+        call_bar(s, kBarVa);
+        s.prior = [&](std::uint64_t) { return prior; };
+        const NarrowResult r = s.run(false, entry_is_hooked);
+        REQUIRE(r.hooks.size() == 1);
+        CHECK(r.decisions[0].reason == NarrowReason::Disabled);
+    }
+}
+
+TEST_CASE("elision: a function that cannot be recorded (pointer-holding constant) yields no record") {
+    QuietLogs quiet;
+    Scenario s;
+    s.new_code({0x48, 0x8D, 0x05, 0, 0, 0, 0, 0xC3});
+    const std::uint32_t sec = s.obj.section(".rdata", kRdata | coff::scn::LnkComdat, 16, coff::ComdatSelection::Any);
+    const std::uint32_t vt = s.obj.symbol("??_7Foo@@6B@", 0, static_cast<std::int32_t>(sec), false, true);
+    const std::uint32_t target = s.obj.undefined("Foo::f", true);
+    s.obj.reloc(sec, 8, target, kAddr64, 0);
+    s.obj.reloc(s.foo.section, 3, vt, kRel32, 0);
+    s.hook();
+    SymbolDecision& d = s.decision(vt, "??_7Foo@@6B@", DecisionKind::PatchFresh);
+    d.defined = true;
+    d.type = SymbolType::Data;
+    d.section = sec;
+    Built built = s.obj.build();
+    s.keep = std::move(built);
+    NarrowInput in;
+    in.object = &s.keep.obj();
+    in.plan = &s.plan;
+    in.load_base = kPreferred;
+    std::string why;
+    CHECK_FALSE(capture_code(in, "?foo@@YAHXZ", &why).has_value());
+    CHECK(why.find("holds pointers") != std::string::npos);
 }

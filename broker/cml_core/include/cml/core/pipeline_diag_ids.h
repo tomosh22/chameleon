@@ -29,5 +29,7 @@ inline constexpr std::uint32_t kAgentLost = 5317;          // the agent disconne
 inline constexpr std::uint32_t kStageFailed = 5318;        // generic wrapper: a stage failed (message names stage and cause)
 inline constexpr std::uint32_t kNoChanges = 5319;          // (info) the sweep found no changed source
 inline constexpr std::uint32_t kAgentRequestTimeout = 5320;  // no answer within the time limit (the agent may still act on the request)
+// WP-25 owns CML3450-3499 (ADR-0032).
+inline constexpr std::uint32_t kNoFunctionalChange = 3450;   // (warning) the edit compiled to identical code: nothing was loaded
 
 }  // namespace cml::core::pipeline::diag

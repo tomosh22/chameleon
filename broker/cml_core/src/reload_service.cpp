@@ -440,11 +440,15 @@ Result<Value> ReloadService::run_reload(const Value& args, bool automatic) {
     Value result = Value::object();
     result.set("generation", Value::integer(static_cast<std::int64_t>(generation_.load())));
     std::size_t hooks = 0, run = 0, patched = 0, compiled = 0, reused = 0, attempts = 0, modules_patched = 0;
+    std::size_t hooks_planned = 0, hooks_dropped = 0, modules_unchanged = 0;  // WP-25
     std::set<std::uint32_t> patched_pids;
     Value patches = Value::array();
     Value changed = Value::array();
     for (const PatchReport& p : reports) {
         hooks += p.hooks_installed;
+        hooks_planned += p.hooks_planned;
+        hooks_dropped += p.hooks_dropped;
+        modules_unchanged += p.no_functional_change ? 1 : 0;
         run += p.initializers_run;
         patched += p.patches;
         compiled += p.compiled;
@@ -461,6 +465,13 @@ Result<Value> ReloadService::run_reload(const Value& args, bool automatic) {
     }
     result.set("patched", Value::integer(static_cast<std::int64_t>(patched)));
     result.set("hooks_installed", Value::integer(static_cast<std::int64_t>(hooks)));
+    // WP-25: "N functions changed" = hooks_planned - hooks_dropped (hooks_installed is what the agent installed).
+    // `no_functional_change`: the edit compiled to identical code in every module that was recompiled and nothing was
+    // loaded (CML3450 is in `warnings` and was published as a diag event).
+    result.set("hooks_planned", Value::integer(static_cast<std::int64_t>(hooks_planned)));
+    result.set("hooks_dropped", Value::integer(static_cast<std::int64_t>(hooks_dropped)));
+    result.set("modules_unchanged", Value::integer(static_cast<std::int64_t>(modules_unchanged)));
+    result.set("no_functional_change", Value::boolean(modules_unchanged != 0 && patched == 0));
     // WP-16: compiler runs of this reload, results taken from another module's identical command line, and the
     // modules / processes that received at least one patch.
     result.set("compiled", Value::integer(static_cast<std::int64_t>(compiled)));
@@ -471,6 +482,15 @@ Result<Value> ReloadService::run_reload(const Value& args, bool automatic) {
     result.set("initializers_run", Value::integer(static_cast<std::int64_t>(run)));
     result.set("changed_files", std::move(changed));
     result.set("patches", std::move(patches));
+    {
+        Value warnings = Value::array();  // WP-25: the warnings of every module report, one line each
+        for (const PatchReport& p : reports) {
+            for (const Diag& w : p.warnings) {
+                warnings.push(Value::string(w.format()));
+            }
+        }
+        result.set("warnings", std::move(warnings));
+    }
     sum.total = wall_ms;
     result.set("timing_ms", to_json(sum));
     std::string fixture = reports.empty() ? std::string() : reports.front().module;

@@ -89,6 +89,7 @@ ipc::json::Value to_json(const PatchReport& r) {
     v.set("hooks_planned", n(r.hooks_planned));
     v.set("hooks_installed", n(r.hooks_installed));
     v.set("hooks_dropped", n(r.hooks_dropped));
+    v.set("no_functional_change", Value::boolean(r.no_functional_change));
     v.set("new_functions", n(r.new_functions));
     v.set("new_globals", n(r.new_globals));
     v.set("thunks", n(r.thunks));
@@ -541,6 +542,15 @@ private:
             return *failure;
         }
         report.patched = report.generation != 0;
+        // WP-25: every compiled unit turned out identical to the running code and nothing else came with it: say so.
+        if (report.patches == 0 && !units.empty() && report.units_unchanged == units.size()) {
+            report.no_functional_change = true;
+            warn(report, "plan",
+                 Diag::make(pd::kNoFunctionalChange,
+                            "the edit compiled to identical code (" + std::to_string(report.hooks_dropped) + " of " + std::to_string(report.hooks_planned) +
+                                " planned hooks are identical to the running code, nothing new): no patch was loaded for " + module_.name,
+                            "Nothing to do. Change code or data that reaches the generated code, or set-option narrow_hooks false to hook everything."));
+        }
         return report;
     }
 
@@ -607,6 +617,7 @@ private:
         ni.load_base = module_.base;
         ni.is_hooked = [this](std::uint64_t va) { return module_.is_hooked(va); };
         ni.enabled = options_.narrow_hooks;
+        ni.prior_code = [this](std::uint64_t va) { return module_.code_running_at(va); };  // WP-25
         const NarrowResult narrowed = narrow_hooks(ni);
         report.hooks_planned += plan.hooks.size();
         report.hooks_dropped += narrowed.dropped;
@@ -642,6 +653,7 @@ private:
         if (!has_effect) {
             CML_LOG(Info, "reload: %s changes no code (all %zu planned hooks are identical to the running code); nothing to load", u.source.c_str(),
                     plan.hooks.size());
+            ++report.units_unchanged;  // WP-25: run() turns "every unit unchanged" into the CML3450 warning
             return Result<void>();
         }
 
@@ -892,6 +904,40 @@ private:
 
         // ---- hooks -------------------------------------------------------------------------------------------------
         std::vector<std::pair<std::uint64_t, std::uint64_t>> installed;
+        // WP-25: remember what the functions of this patch look like, so the next reload of the unit can compare with it
+        // (hooked functions: keyed by the patch entry the hook jumps to; new functions: by their own address).
+        const auto record_code = [&] {
+            const auto address_of = [&](const std::string& name) -> std::optional<std::uint64_t> {
+                const bind::SymbolDecision* d = plan.find_decision(name);
+                if (d == nullptr) {
+                    return std::nullopt;
+                }
+                return symbol_va(plan, linked, name, d->section, d->value);
+            };
+            const auto record_one = [&](const std::string& symbol, const std::string& display, std::uint64_t entry) {
+                std::string why;
+                std::optional<CodeImage> recorded = capture_code(ni, symbol, &why);
+                if (!recorded || !finalize_code(*recorded, address_of)) {
+                    CML_LOG(Trace, "reload: the code of %s is not recorded%s%s", display.c_str(), why.empty() ? "" : ": ", why.c_str());
+                    return;
+                }
+                recorded->display = display;
+                module_.record_code(entry, std::make_shared<const CodeImage>(std::move(*recorded)));
+            };
+            for (const std::pair<std::uint64_t, std::uint64_t>& h : installed) {
+                for (const bind::HookEntry& e : hooks) {
+                    if (e.old_va == h.first) {
+                        record_one(e.new_symbol, e.display, h.second);
+                        break;
+                    }
+                }
+            }
+            for (const bind::NewFunction& f : plan.new_functions) {
+                if (const std::optional<std::uint64_t> va = symbol_va(plan, linked, f.name, f.section, f.value)) {
+                    record_one(f.name, f.display, *va);
+                }
+            }
+        };
         if (!hooks.empty()) {
             ipc::InstallHooks req;
             req.request_id = link_.next_request_id();
@@ -911,10 +957,13 @@ private:
                 // patch must then stay loaded; remember the hooks as installed so the next reload re-points them.
                 const bool timed_out = answer.error().code == pd::kAgentRequestTimeout;  // a send failure or a lost agent is a plain failure
                 if (timed_out) {
-                    std::lock_guard<std::mutex> lock(module_.mutex);
-                    for (const auto& h : installed) {
-                        module_.hooked[h.first] = h.second;
+                    {
+                        std::lock_guard<std::mutex> lock(module_.mutex);
+                        for (const auto& h : installed) {
+                            module_.hooked[h.first] = h.second;
+                        }
                     }
+                    record_code();  // takes the module lock itself
                     return fail("hooks", Diag::make(pd::kHooksTimeout, "the agent did not confirm the hooks in time: " + answer.error().message,
                                                     "In synchronised mode the application must call SyncPoint(); the patch stays loaded and the hooks may still apply."));
                 }
@@ -948,6 +997,7 @@ private:
             report.generation = module_.generation;
             ++report.patches;
         }
+        record_code();
         for (const bind::NewFunction& f : plan.new_functions) {
             if (const std::optional<std::uint64_t> va = symbol_va(plan, linked, f.name, f.section, f.value)) {
                 SymbolAddress a;
@@ -975,7 +1025,8 @@ private:
         report.dll_path = linked.dll_path;
         report.patched = true;
         if (ctx_.events != nullptr) {
-            ctx_.events->publish(make_patch_applied_event(pid_, module_.name, report.generation, hooks.size(), plan.new_functions.size(), plan.new_globals.size()));
+            ctx_.events->publish(make_patch_applied_event(pid_, module_.name, report.generation, hooks.size(), plan.new_functions.size(), plan.new_globals.size(),
+                                                                  plan.hooks.size(), narrowed.dropped));
         }
         CML_LOG(Info, "reload: patch %llu of %s applied at %s (%zu hooks, %zu dropped, %zu new functions, %zu new globals, %zu fix-ups, %zu initialisers)",
                 static_cast<unsigned long long>(report.generation), module_.name.c_str(), hex(base).c_str(), hooks.size(), narrowed.dropped, plan.new_functions.size(),

@@ -67,4 +67,16 @@ bool ModuleState::is_hooked(std::uint64_t old_va) {
     return hooked.count(old_va) != 0;
 }
 
+void ModuleState::record_code(std::uint64_t patch_entry, std::shared_ptr<const CodeImage> image) {
+    std::lock_guard<std::mutex> lock(mutex);
+    code[patch_entry] = std::move(image);
+}
+
+std::shared_ptr<const CodeImage> ModuleState::code_running_at(std::uint64_t entry) {
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto hooked_to = hooked.find(entry);
+    const auto found = code.find(hooked_to != hooked.end() ? hooked_to->second : entry);
+    return found != code.end() ? found->second : nullptr;
+}
+
 }  // namespace cml::core
