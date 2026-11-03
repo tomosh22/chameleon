@@ -222,6 +222,7 @@ private:
     // the pre-restart hooks run inside SyncPoint() on the application's thread, in immediate mode on the agent thread.
     // The answer (RestartInfo) is queued in replies_.
     void handle_restart(const ipc::Restart& request);
+    void handle_restart_cancel(const ipc::RestartCancel& cancel);
     static void run_restart_job(void* context);
     void apply_restart(std::uint64_t request_id);
     // The broker asks the new process to enable modules the old one had enabled (ReenableModules): each becomes an
@@ -275,9 +276,12 @@ private:
     std::string broker_args_;
     std::string agent_path_;     // UTF-8, for Hello
     std::string command_line_;   // UTF-8, for Hello
+    std::atomic<std::uint64_t> restart_latest_{0};   // WP-21: id of the Restart request to serve (0 = none / cancelled)
+    std::atomic<bool> restart_job_queued_{false};    // WP-21: a restart job waits in the SyncPoint queue (at most one)
     std::string restart_token_;  // WP-21: CML_RESTART_TOKEN when the broker relaunched this process, for Hello
     struct LaunchInfo {
         bool valid = false;
+        bool had_console = false;  // GetConsoleProcessList() found a console when the agent started
         std::u16string image_path;
         std::u16string command_line;
         std::u16string working_directory;

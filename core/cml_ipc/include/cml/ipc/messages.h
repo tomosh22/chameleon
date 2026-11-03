@@ -79,6 +79,7 @@ enum class MessageType : std::uint16_t {
     Restart = 0x0061,        // implemented (WP-21)  broker -> agent (request, answered by RestartInfo)
     RestartInfo = 0x0062,    // implemented (WP-21)  agent -> broker (answer to Restart)
     ReenableModules = 0x0063,  // implemented (WP-21)  broker -> agent (request, answered by Reply)
+    RestartCancel = 0x0064,    // implemented (WP-21)  broker -> agent (event, no answer)
 
     // Compile notifications (WP-17).
     CompileEvent = 0x0070,  // implemented  broker -> agent (event, no answer)
@@ -405,6 +406,15 @@ struct Restart {
     std::uint32_t flags = 0;  // reserved, must be 0
 };
 
+// Broker -> agent, an event: the broker gave up waiting for the answer to Restart `request_id`. If its job has not run yet the
+// agent drops it (the pre-restart hooks never run for a restart nobody is going to carry out). A job that already runs finishes.
+struct RestartCancel {
+    std::uint64_t request_id = 0;
+};
+
+// Bit flags of RestartInfo::flags.
+inline constexpr std::uint32_t kRestartInfoHadConsole = 1u;  // the process had a console when the agent started
+
 struct RestartModule {
     std::uint32_t options = 0;  // kModuleOption* bits
     std::string path;           // as the application spelled it
@@ -417,6 +427,7 @@ struct RestartInfo {
     std::uint32_t status = 0;
     std::string message;
     std::uint32_t hooks_run = 0;           // CML_PRERESTART_HOOK functions that ran
+    std::uint32_t flags = 0;               // kRestartInfo*
     std::u16string image_path;             // GetModuleFileNameW(NULL)
     std::u16string command_line;           // GetCommandLineW() when the agent started
     std::u16string working_directory;      // GetCurrentDirectoryW() when the agent started
@@ -439,7 +450,7 @@ using Message = std::variant<Hello, Welcome, ModuleList, EnableModule, DisableMo
                              ModuleUnloaded, Log, Reply, ReserveRange, ReleaseRange, LoadPatch,
                              PatchLoaded, ApplyFixups, RunInitializers, ReserveRangeResult, InstallHooks,
                              HooksInstalled, CompileEvent, Exception, ExceptionAction, ExceptionConfig, Restart, RestartInfo,
-                             ReenableModules>;
+                             ReenableModules, RestartCancel>;
 
 MessageType type_of(const Message& message) noexcept;
 

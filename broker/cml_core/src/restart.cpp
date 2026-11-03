@@ -5,12 +5,14 @@
 #include <utility>
 
 #include "cml/core/agent_link.h"
+#include "cml/core/control_args.h"
 #include "cml/core/event_bus.h"
 #include "cml/core/module_state.h"
 #include "cml/core/pipeline_diag_ids.h"
 #include "cml/core/reload_service.h"
 #include "cml/core/restart_diag_ids.h"
 #include "cml/ipc/messages.h"
+#include "cml/util/format.h"
 #include "cml/util/hash.h"
 #include "cml/util/log.h"
 #include "cml/util/path.h"
@@ -25,6 +27,7 @@ namespace {
 
 constexpr const char* kTokenName = "CML_RESTART_TOKEN";
 constexpr std::uint32_t kDefaultTimeoutMs = 60000;
+constexpr std::uint32_t kDefaultRegistrationMs = 30000;  // after the old process is gone: registration, modules, indexes, re-applying the edits
 constexpr std::uint32_t kTerminateTimeoutMs = 10000;
 constexpr std::uint32_t kPollMs = 20;
 constexpr std::chrono::seconds kEnableWait{3};  // how long enabled modules may take to show up after the broker asked
@@ -52,37 +55,22 @@ int compare_names(const std::u16string& a, const std::u16string& b) {
     return a.size() == b.size() ? 0 : (a.size() < b.size() ? -1 : 1);
 }
 
+// The token names are ASCII: widen byte by byte.
 std::u16string widen_ascii(const std::string& text) {
-    std::u16string out;
-    out.reserve(text.size());
-    for (const char c : text) {
-        out.push_back(static_cast<char16_t>(static_cast<unsigned char>(c)));
-    }
-    return out;
+    return std::u16string(text.begin(), text.end());
 }
 
-std::string hex64(std::uint64_t v) {
-    static const char* const kDigits = "0123456789abcdef";
-    std::string out(16, '0');
-    for (int i = 15; i >= 0; --i) {
-        out[static_cast<std::size_t>(i)] = kDigits[v & 0xF];
-        v >>= 4;
-    }
-    return out;
+Diag bad_args(const std::string& message) {
+    return Diag::make(rd::kBadRequest, message, "Use `{\"pid\":N, \"timeout_ms\":N, \"registration_timeout_ms\":N}` (docs/wp/WP-21.md).");
 }
 
 bool read_uint(const Value& args, const char* key, std::uint32_t max, std::uint32_t* out, std::optional<Diag>* error) {
-    const Value* v = args.find(key);
-    if (v == nullptr || v->is_null()) {
-        return true;
-    }
-    if (!v->is_integer() || v->as_integer() < 0 || v->as_integer() > static_cast<std::int64_t>(max)) {
-        *error = Diag::make(rd::kBadRequest, std::string("argument '") + key + "' must be an integer from 0 to " + std::to_string(max),
-                            "Use `{\"pid\":N, \"timeout_ms\":N}` (docs/wp/WP-21.md).");
-        return false;
-    }
-    *out = static_cast<std::uint32_t>(v->as_integer());
-    return true;
+    return read_uint_arg(args, key, max, out, error, bad_args);
+}
+
+// "A=b\0C=d\0\0": at least one entry, every entry ends with a NUL, and a second NUL ends the block.
+bool environment_block_ok(const std::u16string& block) {
+    return block.size() >= 4 && block[block.size() - 1] == u'\0' && block[block.size() - 2] == u'\0' && block[0] != u'\0';
 }
 
 }  // namespace
@@ -128,11 +116,20 @@ Result<Value> RestartCoordinator::restart(const Value& args) {
     if (!read_uint(args, "pid", 0xFFFFFFFFu, &pid, &arg_error) || !read_uint(args, "timeout_ms", 3600u * 1000u, &timeout_ms, &arg_error)) {
         return *arg_error;
     }
+    std::uint32_t registration_ms = kDefaultRegistrationMs;
+    if (!read_uint(args, "registration_timeout_ms", 3600u * 1000u, &registration_ms, &arg_error)) {
+        return *arg_error;
+    }
     if (timeout_ms == 0) {
         timeout_ms = kDefaultTimeoutMs;
     }
+    if (registration_ms == 0) {
+        registration_ms = kDefaultRegistrationMs;
+    }
     const Clock::time_point start = Clock::now();
-    const Clock::time_point deadline = start + std::chrono::milliseconds(timeout_ms);
+    // `timeout_ms` bounds everything before the old process is terminated; the budget after it is separate (reassigned there), so
+    // a slow preparation cannot leave a killed process with no time to register.
+    Clock::time_point deadline = start + std::chrono::milliseconds(timeout_ms);
     const auto remaining_ms = [&]() -> std::uint32_t {
         const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
         return left <= 0 ? 0u : static_cast<std::uint32_t>(left);
@@ -153,8 +150,11 @@ Result<Value> RestartCoordinator::restart(const Value& args) {
         }
     };
 
+    // Reloads are held off for the whole restart: a patch applied to the old process after its baseline was taken would be lost in
+    // the new one. A reload that is running now makes this restart busy; one that arrives meanwhile is refused busy (CML5304).
     std::unique_lock<std::mutex> only_one(mutex_, std::try_to_lock);
-    if (!only_one.owns_lock() || service_.reload_running()) {
+    std::unique_lock<std::mutex> no_reloads = service_.lock_reloads();
+    if (!only_one.owns_lock() || !no_reloads.owns_lock()) {
         return fail(Diag::make(rd::kBusy, "another restart or a reload is still running", "Wait for it to finish (control command `wait`) and try again."), pid);
     }
 
@@ -186,29 +186,17 @@ Result<Value> RestartCoordinator::restart(const Value& args) {
     const LinkSnapshot old_snap = old_link->snapshot();
     const std::uint32_t old_pid = old_snap.pid;
 
-    // ---- what to carry over: the baselines of the enabled modules (their indexes die with the connection) ----
-    struct Carried {
-        std::string path;
-        BaselineSnapshot baseline;
-    };
-    std::vector<Carried> carried;
-    for (const std::shared_ptr<ModuleState>& state : service_.module_states(old_snap.agent_id)) {
-        std::shared_ptr<ModuleIndex> index;
-        {
-            std::lock_guard<std::mutex> lock(state->mutex);
-            index = state->index;
-        }
-        if (index && index->status().state == IndexState::Ready) {
-            carried.push_back(Carried{state->path, index->baseline_snapshot()});
-        }
-    }
-
     // ---- 1. the agent prepares: pre-restart hooks, launch parameters ----
     CML_LOG(Info, "restart: asking process %u to prepare", old_pid);
     ipc::Restart prepare;
     prepare.request_id = old_link->next_request_id();
     Result<ipc::Message> answer = old_link->request(prepare, std::max<std::uint32_t>(remaining_ms(), 1));
     if (!answer) {
+        // Nobody will carry this restart out: the agent must not run its pre-restart hooks for it later (a job may still wait for
+        // the application's next SyncPoint()).
+        ipc::RestartCancel cancel;
+        cancel.request_id = prepare.request_id;
+        (void)old_link->send(cancel);
         return fail(Diag::make(rd::kPrepareFailed,
                                "process " + std::to_string(old_pid) + " did not prepare for the restart: " + answer.error().message +
                                    " (the process was not touched)",
@@ -232,14 +220,19 @@ Result<Value> RestartCoordinator::restart(const Value& args) {
                                "See the agent's diagnostic for what to change."),
                     old_pid);
     }
-    if (info->image_path.empty() || info->command_line.empty()) {
-        return fail(Diag::make(rd::kPrepareFailed, "process " + std::to_string(old_pid) + " reported no image path or command line (the process was not touched)",
+    const std::string hooks_note = info->hooks_run == 0 ? std::string() : " " + std::to_string(info->hooks_run) + " pre-restart hook(s) ran; the process was not restarted.";
+    if (info->image_path.empty() || info->command_line.empty() || !environment_block_ok(info->environment)) {
+        // An environment that was not captured must not be replaced by "nothing" (no SystemRoot, no PATH): refuse before anything is killed.
+        return fail(Diag::make(rd::kPrepareFailed, "process " + std::to_string(old_pid) + " reported no usable image path, command line or environment (the process was not touched)." + hooks_note,
                                "Use an agent from the same Chameleon build as the broker."),
                     old_pid);
     }
     CML_LOG(Info, "restart: process %u prepared (%u pre-restart hook(s) ran, %llu module(s) enabled)", old_pid, info->hooks_run,
             static_cast<unsigned long long>(info->modules.size()));
 
+    if (trace_) {
+        trace_("prepared");
+    }
     // The modules to have enabled again: what the application enabled (with its options); the broker's own list when the
     // agent reports none.
     std::vector<ipc::RestartModule> modules = info->modules;
@@ -252,26 +245,51 @@ Result<Value> RestartCoordinator::restart(const Value& args) {
     // ---- 2. the old process goes, the new one starts ----
     const std::uint64_t std_handles[3] = {info->std_input, info->std_output, info->std_error};
     std::vector<Diag> open_warnings;
-    Result<std::unique_ptr<RestartableProcess>> opened = host_->open(old_pid, std_handles, &open_warnings);
+    Result<std::unique_ptr<RestartableProcess>> opened = host_->open(old_pid, std_handles, info->flags, &open_warnings);
     for (const Diag& w : open_warnings) {
         warn(w, old_pid);
     }
     if (!opened) {
-        return fail(Diag::make(rd::kOpenFailed, "cannot take over process " + std::to_string(old_pid) + ": " + opened.error().message + " (the process was not touched)",
+        return fail(Diag::make(rd::kOpenFailed, "cannot take over process " + std::to_string(old_pid) + ": " + opened.error().message + " (the process was not touched)." + hooks_note,
                                opened.error().what_to_do),
                     old_pid);
     }
     std::unique_ptr<RestartableProcess> process = std::move(*opened);
 
-    const std::string token = hex64(hash64(std::to_string(old_pid) + ":" + std::to_string(Clock::now().time_since_epoch().count()) + ":" +
-                                           std::to_string(++counter_))) +
-                              hex64(static_cast<std::uint64_t>(Clock::now().time_since_epoch().count()));
+    // Unique per restart (the token only matches a Hello to the restart that started it; it is not a secret).
+    const std::string token = hex(hash64(std::to_string(old_pid) + ":" + std::to_string(Clock::now().time_since_epoch().count()) + ":" +
+                                         std::to_string(++counter_)))
+                                  .substr(2) +
+                              hex(static_cast<std::uint64_t>(Clock::now().time_since_epoch().count())).substr(2);
     RelaunchSpec spec;
     spec.image_path = info->image_path;
     spec.command_line = info->command_line;
     spec.working_directory = info->working_directory;
     spec.environment = environment_with_token(info->environment, token);
 
+    // What to carry over: the baselines of the enabled modules (their indexes die with the connection). Taken now, after the
+    // preparation and with reloads held off, so every patch applied to the old process is in it.
+    struct Carried {
+        std::string path;
+        BaselineSnapshot baseline;
+    };
+    std::vector<Carried> carried;
+    for (const std::shared_ptr<ModuleState>& state : service_.module_states(old_snap.agent_id)) {
+        std::shared_ptr<ModuleIndex> index;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            index = state->index;
+        }
+        if (index && index->status().state == IndexState::Ready) {
+            carried.push_back(Carried{state->path, index->baseline_snapshot()});
+        }
+    }
+
+
+    if (trace_) {
+        trace_("snapshot");
+        trace_("terminate");
+    }
     CML_LOG(Info, "restart: terminating process %u", old_pid);
     Result<void> terminated = process->terminate(kTerminateTimeoutMs);
     if (!terminated) {
@@ -279,6 +297,7 @@ Result<Value> RestartCoordinator::restart(const Value& args) {
                                "Close it yourself and start the application again."),
                     old_pid);
     }
+    deadline = Clock::now() + std::chrono::milliseconds(registration_ms);  // the post-termination budget starts here
     Result<std::uint32_t> launched = process->relaunch(spec);
     if (!launched) {
         return fail(Diag::make(rd::kLaunchFailed,
@@ -291,7 +310,7 @@ Result<Value> RestartCoordinator::restart(const Value& args) {
     // ---- 3. the new agent registers ----
     std::shared_ptr<AgentLink> new_link;
     for (;;) {
-        new_link = service_.link_for_restart_token(token);
+        new_link = service_.link_for_restart_token(token, *launched);
         if (new_link) {
             break;
         }
@@ -303,9 +322,9 @@ Result<Value> RestartCoordinator::restart(const Value& args) {
         }
         if (remaining_ms() == 0) {
             return fail(Diag::make(rd::kNoRegistration,
-                                   "the new process (pid " + std::to_string(*launched) + ") did not register within " + std::to_string(timeout_ms) +
+                                   "the new process (pid " + std::to_string(*launched) + ") did not register within " + std::to_string(registration_ms) +
                                        " ms; it was left running",
-                                   "Check that the application creates its agent at start-up (and that it can reach the broker); raise `timeout_ms` if it starts slowly."),
+                                   "Check that the application creates its agent at start-up (and that it can reach the broker); raise `registration_timeout_ms` if it starts slowly."),
                         *launched);
         }
         pause_ms(kPollMs);
@@ -406,20 +425,15 @@ Result<Value> RestartCoordinator::restart(const Value& args) {
         reload_args.set("pid", Value::integer(new_pid));
         reload_args.set("confirm", Value::boolean(true));  // the user confirmed these edits when they were first reloaded
         reload_args.set("timeout_ms", Value::integer(std::max<std::uint32_t>(remaining_ms(), 1000)));
-        for (;;) {
-            Result<Value> reloaded = service_.reload(reload_args);
+        {
+            Result<Value> reloaded = service_.reload_locked(reload_args);  // this restart holds the reload lock
             if (reloaded) {
                 result.set("reapplied_files", Value::integer(static_cast<std::int64_t>(restored)));
                 result.set("patched", Value::integer(reloaded->get_integer("patched")));
                 if (const Value* changed = reloaded->find("changed_files")) {
                     result.set("changed_files", *changed);
                 }
-                break;
-            }
-            if (reloaded.error().code == pipeline::diag::kBusy && remaining_ms() > 0) {
-                pause_ms(50);  // a save-triggered reload is running; ours finds what it leaves
-                continue;
-            }
+            } else {
             Value error = Value::object();
             error.set("id", Value::string(reloaded.error().id()));
             error.set("message", Value::string(reloaded.error().message));
@@ -428,7 +442,7 @@ Result<Value> RestartCoordinator::restart(const Value& args) {
                                                     reloaded.error().format(),
                             "Fix the error and run `reload`."),
                  new_pid);
-            break;
+            }
         }
     }
 

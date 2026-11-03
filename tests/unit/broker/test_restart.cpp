@@ -181,7 +181,8 @@ private:
 class FakeHost final : public ProcessHost {
 public:
     explicit FakeHost(Rig& rig) : rig_(rig) {}
-    Result<std::unique_ptr<RestartableProcess>> open(std::uint32_t pid, const std::uint64_t std_handles[3], std::vector<Diag>* warnings) override;
+    Result<std::unique_ptr<RestartableProcess>> open(std::uint32_t pid, const std::uint64_t std_handles[3], std::uint32_t info_flags,
+                                                     std::vector<Diag>* warnings) override;
 
 private:
     Rig& rig_;
@@ -200,6 +201,13 @@ struct Rig {
     bool app_enables_exe = true;    // ... and game.exe
     int register_delay_ms = 40;
     std::uint32_t hooks_run = 3;
+    int prepare_delay_ms = 0;        // the old agent takes this long to answer Restart
+    bool empty_environment = false;  // the old agent captured no environment
+    std::uint32_t info_flags = 0;
+    std::uint32_t opened_flags = 0;
+    std::function<void()> during_prepare;   // runs on the broker's thread while the old agent "prepares"
+    std::vector<std::uint64_t> cancels;     // RestartCancel messages the old agent received
+    std::uint32_t spoof_pid = 0;            // an unrelated process that registers with the restart token first (0: none)
     std::vector<ipc::RestartModule> reported_modules{{1, kExe}, {1, kDll}};
 
     // what happened
@@ -214,6 +222,7 @@ struct Rig {
     std::shared_ptr<Collect> events = std::make_shared<Collect>();
     std::shared_ptr<SimAgent> old_agent;
     std::shared_ptr<SimAgent> new_agent;
+    std::shared_ptr<SimAgent> spoof_agent;
     std::vector<std::thread> threads;
     ReloadService service;
 
@@ -240,10 +249,19 @@ struct Rig {
     }
 
     void old_handles(const ipc::Message& m) {
+        if (const auto* cancel = std::get_if<ipc::RestartCancel>(&m)) {
+            std::lock_guard<std::mutex> lock(mutex);
+            cancels.push_back(cancel->request_id);
+            return;
+        }
         const auto* restart = std::get_if<ipc::Restart>(&m);
         if (restart == nullptr || !answer_prepare) {
             return;
         }
+        if (during_prepare) {
+            during_prepare();
+        }
+
         ipc::RestartInfo info;
         info.request_id = restart->request_id;
         info.status = prepare_status;
@@ -254,11 +272,20 @@ struct Rig {
             info.image_path = u"C:\\app\\game.exe";
             info.command_line = u"\"C:\\app\\game.exe\" --level \"a b\"";
             info.working_directory = u"C:\\app";
-            info.environment = block_of({"ALPHA=1", "CML_RESTART_TOKEN=stale", "ZED=2"});
+            info.flags = info_flags;
+            info.environment = empty_environment ? std::u16string() : block_of({"ALPHA=1", "CML_RESTART_TOKEN=stale", "ZED=2"});
             info.std_input = 4;
             info.std_output = 8;
             info.std_error = 8;
             info.modules = reported_modules;
+        }
+        if (prepare_delay_ms > 0) {
+            // A slow application: the answer comes later, from another thread, like a SyncPoint() that is reached late.
+            threads.emplace_back([this, info, delay = prepare_delay_ms] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+                old_agent->to_broker(info);
+            });
+            return;
         }
         old_agent->to_broker(info);
     }
@@ -304,6 +331,11 @@ struct Rig {
         if (!new_registers || new_exits) {
             return;
         }
+        if (spoof_pid != 0) {
+            // A child of some other process that inherited the token: it registers first and must be ignored.
+            spoof_agent = std::make_shared<SimAgent>(service, 9);
+            spoof_agent->register_process(spoof_pid, token, {kExe}, {kExe});
+        }
         threads.emplace_back([this, pid, token] {
             std::this_thread::sleep_for(std::chrono::milliseconds(register_delay_ms));
             new_agent = std::make_shared<SimAgent>(service, 2);
@@ -345,7 +377,9 @@ std::optional<std::uint32_t> FakeProcess::relaunched_exit_code() {
     return rig_.new_exits ? std::optional<std::uint32_t>(3) : std::nullopt;
 }
 
-Result<std::unique_ptr<RestartableProcess>> FakeHost::open(std::uint32_t pid, const std::uint64_t std_handles[3], std::vector<Diag>*) {
+Result<std::unique_ptr<RestartableProcess>> FakeHost::open(std::uint32_t pid, const std::uint64_t std_handles[3], std::uint32_t info_flags,
+                                                           std::vector<Diag>*) {
+    rig_.opened_flags = info_flags;
     rig_.note("open pid=" + std::to_string(pid) + " handles=" + std::to_string(std_handles[0]) + "," + std::to_string(std_handles[1]) + "," +
               std::to_string(std_handles[2]));
     if (rig_.fail_open) {
@@ -354,12 +388,13 @@ Result<std::unique_ptr<RestartableProcess>> FakeHost::open(std::uint32_t pid, co
     return std::unique_ptr<RestartableProcess>(new FakeProcess(rig_));
 }
 
-Value args_for(std::uint32_t pid, std::uint32_t timeout_ms) {
+Value args_for(std::uint32_t pid, std::uint32_t timeout_ms, std::uint32_t registration_ms = 5000) {
     Value args = Value::object();
     if (pid != 0) {
         args.set("pid", Value::integer(pid));
     }
     args.set("timeout_ms", Value::integer(timeout_ms));
+    args.set("registration_timeout_ms", Value::integer(registration_ms));
     return args;
 }
 
@@ -390,7 +425,7 @@ TEST_CASE("restart: the old process prepares, is terminated, the new one registe
     REQUIRE(env.size() == 3);
     CHECK(env[0] == "ALPHA=1");
     CHECK(env[1].rfind("CML_RESTART_TOKEN=", 0) == 0);
-    CHECK(env[1].size() == std::string("CML_RESTART_TOKEN=").size() + 32);
+    CHECK(env[1].size() >= std::string("CML_RESTART_TOKEN=").size() + 16);
     CHECK(env[1] != "CML_RESTART_TOKEN=stale");
     CHECK(env[2] == "ZED=2");
     CHECK(rig.relaunched.environment.size() >= 2);
@@ -457,6 +492,9 @@ TEST_CASE("restart: an agent that does not answer in time leaves the process unt
     CHECK(result.error().code == restart::diag::kPrepareFailed);
     CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds(5));
     CHECK(rig.logged().empty());
+    // The agent is told to drop the request, so its pre-restart hooks do not run later for a restart nobody carries out.
+    REQUIRE(rig.cancels.size() == 1);
+    CHECK(rig.cancels[0] != 0);
 }
 
 TEST_CASE("restart: failures to open, terminate and start are told apart") {
@@ -491,7 +529,7 @@ TEST_CASE("restart: a new process that never registers is reported and left runn
     QuietLogs quiet;
     Rig rig;
     rig.new_registers = false;
-    Result<Value> result = rig.service.restart(args_for(100, 400));
+    Result<Value> result = rig.service.restart(args_for(100, 30000, 400));  // the registration budget, not the preparation one
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().code == restart::diag::kNoRegistration);
     CHECK(result.error().message.find("pid 200") != std::string::npos);
@@ -598,4 +636,125 @@ TEST_CASE("environment_with_token: replaces any old token, keeps the block sorte
           std::vector<std::string>{"CML_RESTART_TOKEN=t", "CML_RESTART_TOKEN2=x"});
     const std::u16string result = environment_with_token(block_of({"A=1"}), "t");
     CHECK(result.substr(result.size() - 2) == std::u16string(2, u'\0'));
+}
+
+TEST_CASE("restart: reloads are refused busy while a restart runs, and the baselines are taken after the preparation") {
+    QuietLogs quiet;
+    Rig rig;
+    std::vector<std::string> trace;
+    std::mutex trace_mutex;
+    rig.service.set_restart_trace_for_testing([&](const std::string& step) {
+        std::lock_guard<std::mutex> lock(trace_mutex);
+        trace.push_back(step);
+    });
+    std::string refused;
+    rig.during_prepare = [&] {
+        // A reload (a save-triggered one, or `reload`) arrives while the old agent is still preparing.
+        Result<Value> reload = rig.service.reload(Value::object());
+        refused = reload.has_value() ? std::string("accepted") : reload.error().id();
+        trace_mutex.lock();
+        trace.push_back("reload-during-prepare");
+        trace_mutex.unlock();
+    };
+    Result<Value> result = rig.service.restart(args_for(100, 10000));
+    REQUIRE(result.has_value());
+    CHECK(refused == "CML5304");  // the existing busy diagnostic
+    const std::vector<std::string> expected{"reload-during-prepare", "prepared", "snapshot", "terminate"};
+    CHECK(trace == expected);  // prepare first, then the snapshot right before the old process is terminated
+    // The lock is released afterwards: a reload is no longer refused as busy (it fails for other reasons: no PDBs here).
+    Result<Value> after = rig.service.reload(Value::object());
+    if (!after.has_value()) {
+        CHECK(after.error().id() != "CML5304");
+    }
+}
+
+TEST_CASE("restart: a restart cannot start while a reload runs") {
+    QuietLogs quiet;
+    Rig rig;
+    std::unique_lock<std::mutex> running = rig.service.lock_reloads();  // what a running reload holds
+    REQUIRE(running.owns_lock());
+    Result<Value> result = rig.service.restart(args_for(100, 1000));
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().code == restart::diag::kBusy);
+    CHECK(rig.logged().empty());
+}
+
+TEST_CASE("restart: a slow preparation does not eat the time the new process needs to register") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.prepare_delay_ms = 700;       // almost all of timeout_ms ...
+    rig.register_delay_ms = 400;      // ... and the new process needs longer than what is left of it
+    Result<Value> result = rig.service.restart(args_for(100, 900, 5000));
+    REQUIRE_MESSAGE(result.has_value(), result.error().format());
+    CHECK(result->get_integer("new_pid") == 200);
+}
+
+TEST_CASE("restart: the preparation is bounded by timeout_ms and the registration by registration_timeout_ms") {
+    QuietLogs quiet;
+    {
+        Rig rig;
+        rig.prepare_delay_ms = 600;
+        Result<Value> result = rig.service.restart(args_for(100, 200, 5000));  // preparation too slow: nothing was touched
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().code == restart::diag::kPrepareFailed);
+        CHECK(rig.logged().empty());
+    }
+    {
+        Rig rig;
+        rig.new_registers = false;
+        const auto start = std::chrono::steady_clock::now();
+        Result<Value> result = rig.service.restart(args_for(100, 60000, 300));  // registration budget 300 ms although timeout_ms is a minute
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().code == restart::diag::kNoRegistration);
+        CHECK(result.error().message.find("300 ms") != std::string::npos);
+        CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds(10));
+    }
+}
+
+TEST_CASE("restart: once the hooks ran, a later failure says so") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.fail_open = true;
+    Result<Value> result = rig.service.restart(args_for(100, 5000));
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().code == restart::diag::kOpenFailed);
+    CHECK(result.error().message.find("3 pre-restart hook(s) ran; the process was not restarted") != std::string::npos);
+}
+
+TEST_CASE("restart: an agent that captured no environment is refused before anything is touched") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.empty_environment = true;
+    Result<Value> result = rig.service.restart(args_for(100, 5000));
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().code == restart::diag::kPrepareFailed);
+    CHECK(result.error().message.find("environment") != std::string::npos);
+    CHECK(rig.logged().empty());
+}
+
+TEST_CASE("restart: only the process the broker started is taken for the restarted one") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.spoof_pid = 999;  // a child that inherited CML_RESTART_TOKEN registers first
+    Result<Value> result = rig.service.restart(args_for(100, 10000));
+    REQUIRE(result.has_value());
+    CHECK(result->get_integer("new_pid") == 200);
+}
+
+TEST_CASE("restart: the console flag the agent reported reaches the process host") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.info_flags = ipc::kRestartInfoHadConsole;
+    Result<Value> result = rig.service.restart(args_for(100, 10000));
+    REQUIRE(result.has_value());
+    CHECK(rig.opened_flags == ipc::kRestartInfoHadConsole);
+}
+
+TEST_CASE("restart: a process host replaced during a restart does not pull the coordinator from under it") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.during_prepare = [&] { rig.service.set_process_host(std::make_shared<FakeHost>(rig)); };  // replaces the coordinator mid-call
+    Result<Value> result = rig.service.restart(args_for(100, 10000));
+    REQUIRE(result.has_value());  // the running restart kept its own coordinator
+    CHECK(result->get_integer("new_pid") == 200);
 }

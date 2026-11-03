@@ -30,6 +30,7 @@ RestartInfo sample_info() {
     RestartInfo info;
     info.request_id = 77;
     info.hooks_run = 2;
+    info.flags = kRestartInfoHadConsole;
     info.image_path = u"C:\\app\\game.exe";
     info.command_line = u"\"C:\\app\\game.exe\" --level \"a b\"";
     info.working_directory = u"C:\\app";
@@ -51,7 +52,10 @@ TEST_CASE("Restart, RestartInfo and ReenableModules: type ids, names, request se
     CHECK(std::string(to_string(MessageType::Restart)) == "Restart");
     CHECK(std::string(to_string(MessageType::RestartInfo)) == "RestartInfo");
     CHECK(std::string(to_string(MessageType::ReenableModules)) == "ReenableModules");
-    for (const MessageType t : {MessageType::Restart, MessageType::RestartInfo, MessageType::ReenableModules}) {
+    CHECK(static_cast<int>(MessageType::RestartCancel) == 0x0064);
+    CHECK(std::string(to_string(MessageType::RestartCancel)) == "RestartCancel");
+    CHECK_FALSE(is_request_type(0x0064));  // an event: nothing answers it
+    for (const MessageType t : {MessageType::Restart, MessageType::RestartInfo, MessageType::ReenableModules, MessageType::RestartCancel}) {
         CHECK(is_implemented(t));
     }
     // The broker sends Restart and ReenableModules and waits for an answer; RestartInfo is an answer.
@@ -91,6 +95,7 @@ TEST_CASE("RestartInfo round trip keeps wide text exactly, lone surrogates inclu
     CHECK(info->request_id == in.request_id);
     CHECK(info->status == 0);
     CHECK(info->hooks_run == 2);
+    CHECK(info->flags == kRestartInfoHadConsole);
     CHECK(info->image_path == in.image_path);
     CHECK(info->command_line == in.command_line);
     CHECK(info->working_directory == in.working_directory);
@@ -145,8 +150,8 @@ TEST_CASE("RestartInfo: truncation, trailing bytes, lying counts and oversized w
         RestartInfo in;
         in.request_id = 1;
         std::vector<std::uint8_t> frame = frame_bytes(in);
-        // request id (8) + status (4) + empty message (4) + hooks_run (4): the image_path unit count follows.
-        const std::size_t at = kFrameHeaderSize + 8 + 4 + 4 + 4;
+        // request id (8) + status (4) + empty message (4) + hooks_run (4) + flags (4): the image_path unit count follows.
+        const std::size_t at = kFrameHeaderSize + 8 + 4 + 4 + 4 + 4;
         frame[at] = 0xFF;
         frame[at + 1] = 0xFF;
         frame[at + 2] = 0x00;
@@ -231,4 +236,25 @@ TEST_CASE("Hello carries the restart token only when there is one, and old Hello
     extra.push_back(1);
     extra[0] = static_cast<std::uint8_t>(extra.size() - kFrameHeaderSize);
     CHECK(error_code(decode_frame(extra.data(), extra.size())) == ids::kPayloadMalformed);
+}
+
+TEST_CASE("RestartCancel round trip and unknown RestartInfo flags") {
+    RestartCancel in;
+    in.request_id = 4242;
+    const std::vector<std::uint8_t> frame = frame_bytes(in);
+    Result<Message> out = decode_frame(frame.data(), frame.size());
+    REQUIRE(out.has_value());
+    CHECK(std::get<RestartCancel>(*out).request_id == 4242);
+    CHECK(type_of(*out) == MessageType::RestartCancel);
+    CHECK_FALSE(describe(*out).empty());
+    std::vector<std::uint8_t> extra = frame;
+    extra.push_back(0);
+    extra[0] = static_cast<std::uint8_t>(extra.size() - kFrameHeaderSize);
+    CHECK(error_code(decode_frame(extra.data(), extra.size())) == ids::kPayloadMalformed);
+
+    RestartInfo info;
+    info.request_id = 1;
+    std::vector<std::uint8_t> bad = frame_bytes(info);
+    bad[kFrameHeaderSize + 8 + 4 + 4 + 4] = 0x80;  // flags: a bit nobody defined
+    CHECK(error_code(decode_frame(bad.data(), bad.size())) == ids::kPayloadMalformed);
 }

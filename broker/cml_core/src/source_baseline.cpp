@@ -117,13 +117,14 @@ void SourceBaseline::take(const std::vector<std::string>& files, const BaselineO
     stamps_ = std::move(taken);
 }
 
-SourceBaseline::SweepResult SourceBaseline::sweep() const {
+SourceBaseline::SweepResult SourceBaseline::sweep() {
     std::map<std::string, FileStamp> snapshot;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         snapshot = stamps_;
     }
     SweepResult out;
+    std::vector<std::pair<std::string, FileStamp>> refreshed;
     for (const auto& entry : snapshot) {
         ++out.checked;
         std::uint64_t size = 0;
@@ -144,6 +145,19 @@ SourceBaseline::SweepResult SourceBaseline::sweep() const {
         if (hash != entry.second.hash) {
             out.changed.push_back(entry.first);
             out.stamps[entry.first] = FileStamp{hash, size, mtime};
+        } else if (entry.second.size == kRestoredSize) {
+            refreshed.emplace_back(entry.first, FileStamp{hash, size, mtime});
+        }
+    }
+    if (!refreshed.empty()) {
+        // A restored original (see restore()) whose content is the original after all: from now on its real size and time let the cheap
+        // test skip it, instead of reading it on every sweep.
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& r : refreshed) {
+            const auto mine = stamps_.find(r.first);
+            if (mine != stamps_.end() && mine->second.size == kRestoredSize && mine->second.hash == r.second.hash) {
+                mine->second = r.second;
+            }
         }
     }
     return out;
@@ -184,7 +198,7 @@ std::size_t SourceBaseline::restore(const BaselineSnapshot& snapshot) {
         }
         originals_[entry.first] = entry.second;
         // Size and time that no file can have: the next sweep must read the file and compare its hash with the original.
-        mine->second = FileStamp{entry.second.hash, ~static_cast<std::uint64_t>(0), -1};
+        mine->second = FileStamp{entry.second.hash, kRestoredSize, -1};
         ++restored;
     }
     return restored;

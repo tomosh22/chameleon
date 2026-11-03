@@ -96,8 +96,9 @@ RestartStepOutcome run_restart_step(ipc::ControlClient& control, std::uint32_t o
 
     ipc::json::Value args = ipc::json::Value::object();
     args.set("pid", ipc::json::Value::integer(old_pid));
-    args.set("timeout_ms", ipc::json::Value::integer(limit_ms));
-    cml::Result<ipc::ControlResponse> response = control.call("restart", std::move(args), limit_ms + 15000);
+    args.set("timeout_ms", ipc::json::Value::integer(limit_ms));               // before the old process is terminated
+    args.set("registration_timeout_ms", ipc::json::Value::integer(limit_ms));  // after it: registration, modules, indexes, re-applying
+    cml::Result<ipc::ControlResponse> response = control.call("restart", std::move(args), 2 * limit_ms + 15000);
     if (!response) {
         return fail(cml::ids::kRestartStepFailed, response.error().format());
     }

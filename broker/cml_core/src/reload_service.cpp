@@ -7,6 +7,7 @@
 #include <set>
 #include <thread>
 
+#include "cml/core/control_args.h"
 #include "cml/core/header_diag_ids.h"
 #include "cml/core/pipeline_diag_ids.h"
 #include "cml/core/process_registry.h"
@@ -31,16 +32,7 @@ Diag bad_request(const std::string& message) {
 
 // Reads an optional unsigned integer argument; false (and *error set) when present with a wrong type or range.
 bool read_uint(const Value& args, const char* key, std::uint32_t max, std::uint32_t* out, std::optional<Diag>* error) {
-    const Value* v = args.find(key);
-    if (v == nullptr || v->is_null()) {
-        return true;
-    }
-    if (!v->is_integer() || v->as_integer() < 0 || v->as_integer() > static_cast<std::int64_t>(max)) {
-        *error = bad_request(std::string("argument '") + key + "' must be an integer from 0 to " + std::to_string(max));
-        return false;
-    }
-    *out = static_cast<std::uint32_t>(v->as_integer());
-    return true;
+    return read_uint_arg(args, key, max, out, error, bad_request);
 }
 
 std::string normalized_key(const std::string& p) { return normalized_path_key(p); }
@@ -288,7 +280,14 @@ void ReloadService::set_process_host(std::shared_ptr<ProcessHost> host) {
         restart_.reset();
         return;
     }
-    restart_ = std::make_unique<RestartCoordinator>(*this, events_, std::move(host));
+    restart_ = std::make_shared<RestartCoordinator>(*this, events_, std::move(host));
+}
+
+void ReloadService::set_restart_trace_for_testing(std::function<void(const std::string&)> trace) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (restart_) {
+        restart_->set_trace_for_testing(std::move(trace));
+    }
 }
 
 bool ReloadService::restart_available() const {
@@ -297,16 +296,16 @@ bool ReloadService::restart_available() const {
 }
 
 Result<Value> ReloadService::restart(const Value& args) {
-    RestartCoordinator* coordinator = nullptr;
+    std::shared_ptr<RestartCoordinator> coordinator;  // held for the whole call: set_process_host may replace it meanwhile
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        coordinator = restart_.get();
+        coordinator = restart_;
     }
     if (coordinator == nullptr) {
         return Diag::make(restart::diag::kUnavailable, "this broker cannot restart processes on this system",
                           "Restart the application yourself; hot-restart needs the Windows broker.");
     }
-    return coordinator->restart(args);  // the coordinator lives as long as the service; set_process_host is a start-up call
+    return coordinator->restart(args);
 }
 
 std::vector<std::shared_ptr<AgentLink>> ReloadService::links() const {
@@ -330,13 +329,13 @@ std::shared_ptr<AgentLink> ReloadService::link_for_pid(std::uint32_t pid) const 
     return nullptr;
 }
 
-std::shared_ptr<AgentLink> ReloadService::link_for_restart_token(const std::string& token) const {
+std::shared_ptr<AgentLink> ReloadService::link_for_restart_token(const std::string& token, std::uint32_t pid) const {
     if (token.empty()) {
         return nullptr;
     }
     for (const std::shared_ptr<AgentLink>& link : links()) {
         const LinkSnapshot snap = link->snapshot();
-        if (snap.handshaken && snap.restart_token == token && !link->closed()) {
+        if (snap.handshaken && snap.restart_token == token && snap.pid == pid && !link->closed()) {
             return link;
         }
     }
@@ -385,7 +384,15 @@ Result<Value> ReloadService::reload(const Value& args) {
     return run_reload(args, false);
 }
 
-Result<Value> ReloadService::run_reload(const Value& args, bool automatic) {
+std::unique_lock<std::mutex> ReloadService::lock_reloads() {
+    return std::unique_lock<std::mutex>(reload_mutex_, std::try_to_lock);
+}
+
+Result<Value> ReloadService::reload_locked(const Value& args) {
+    return run_reload(args, false, true);
+}
+
+Result<Value> ReloadService::run_reload(const Value& args, bool automatic, bool lock_held) {
     std::uint32_t pid = 0;
     std::uint32_t timeout_ms = 60000;
     std::optional<Diag> error;
@@ -407,8 +414,12 @@ Result<Value> ReloadService::run_reload(const Value& args, bool automatic) {
         confirm = c->as_bool();
     }
 
-    std::unique_lock<std::mutex> only_one(reload_mutex_, std::try_to_lock);
-    if (!only_one.owns_lock()) {
+    // WP-21: a restart holds the reload lock for its whole run and calls reload_locked(); everybody else is refused busy.
+    std::unique_lock<std::mutex> only_one(reload_mutex_, std::defer_lock);
+    if (!lock_held) {
+        (void)only_one.try_lock();
+    }
+    if (!lock_held && !only_one.owns_lock()) {
         const Diag d = Diag::make(pd::kBusy, "another reload is still running", "Wait for it to finish (control command `wait`) and try again.");
         if (automatic) {
             return d;  // the caller retries quietly

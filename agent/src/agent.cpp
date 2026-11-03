@@ -1023,6 +1023,10 @@ void Agent::handle_message(const ipc::Message& message) {
         handle_reenable(*reenable);
         return;
     }
+    if (const auto* cancel = std::get_if<ipc::RestartCancel>(&message)) {
+        handle_restart_cancel(*cancel);
+        return;
+    }
     if (const auto* config = std::get_if<ipc::ExceptionConfig>(&message)) {
         handle_exception_config(*config);
         return;

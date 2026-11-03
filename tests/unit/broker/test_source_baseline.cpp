@@ -254,6 +254,9 @@ TEST_CASE("restart: a file edited back to its original content is not reloaded; 
     SourceBaseline fresh;
     fresh.take({a}, BaselineOptions{}, nullptr);  // gone.cpp is not part of the relaunched module
     CHECK(fresh.restore(snapshot) == 1);
-    CHECK(fresh.sweep().changed.empty());  // same hash as the original: nothing to do
+    const SourceBaseline::SweepResult first = fresh.sweep();
+    CHECK(first.changed.empty());  // same hash as the original: nothing to do
+    CHECK(first.hashed == 1);      // it had to be read once ...
+    CHECK(fresh.sweep().hashed == 0);  // ... and its real size and time are recorded now: no re-hash on every sweep
     CHECK(fresh.size() == 1);
 }

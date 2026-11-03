@@ -742,6 +742,9 @@ TEST_CASE("hot-restart, immediate mode: the pre-restart hooks run on the agent t
     CHECK(info->std_input == handle_value(STD_INPUT_HANDLE));
     CHECK(info->std_output == handle_value(STD_OUTPUT_HANDLE));
     CHECK(info->std_error == handle_value(STD_ERROR_HANDLE));
+    DWORD console_processes[1] = {0};
+    const bool has_console = GetConsoleProcessList(console_processes, 1) != 0;
+    CHECK(((info->flags & ipc::kRestartInfoHadConsole) != 0) == has_console);  // the new process gets a console only if this one had one
     REQUIRE(info->modules.size() == 1);
     CHECK(info->modules[0].path == hooktest_user::module_path_utf8());
     agent.stop_and_wait_for_calls();
@@ -857,6 +860,119 @@ TEST_CASE("hot-restart: ReenableModules becomes EnableModule requests like the a
         Sleep(10);
     }
     CHECK(agent.tracked_modules_for_testing() == 2);
+    agent.stop_and_wait_for_calls();
+}
+
+
+TEST_CASE("hot-restart: a Restart the broker cancelled never runs its hooks, and only the newest of several runs") {
+    const std::string pipe = unique_pipe_name();
+    FakeBroker broker(pipe);
+    REQUIRE(broker.listening());
+    ScopedPipeEnv env(pipe);
+    hooktest_user::reset(nullptr);
+
+    Agent agent(CML_MODE_SYNCHRONIZED);
+    REQUIRE(agent.start().has_value());
+    REQUIRE(broker.handshake());
+    REQUIRE(enable_this_module(agent, broker));
+
+    // The broker gave up on request 91 while the job still waits for the application's SyncPoint().
+    ipc::Restart first;
+    first.request_id = 91;
+    REQUIRE(broker.send(first));
+    ipc::RestartCancel cancel;
+    cancel.request_id = 91;
+    REQUIRE(broker.send(cancel));
+    Sleep(200);  // let the agent thread handle both messages
+    for (int i = 0; i < 10; ++i) {
+        agent.sync_point();
+        Sleep(20);
+    }
+    CHECK_FALSE(broker.wait_for<ipc::RestartInfo>(200).has_value());
+    CHECK(hooktest_user::log().empty());  // the pre-restart hook did not run for a restart nobody carries out
+
+    // Two requests queued before the next SyncPoint(): one job, the newest request, one run of the hooks.
+    ipc::Restart second;
+    second.request_id = 92;
+    ipc::Restart third;
+    third.request_id = 93;
+    REQUIRE(broker.send(second));
+    REQUIRE(broker.send(third));
+    Sleep(200);
+    std::optional<ipc::RestartInfo> info;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (!info && std::chrono::steady_clock::now() < deadline) {
+        agent.sync_point();
+        info = broker.wait_for<ipc::RestartInfo>(100);
+    }
+    REQUIRE(info.has_value());
+    CHECK(info->request_id == 93);
+    CHECK(info->status == 0);
+    for (int i = 0; i < 10; ++i) {
+        agent.sync_point();
+        Sleep(20);
+    }
+    CHECK_FALSE(broker.wait_for<ipc::RestartInfo>(200).has_value());  // nothing for request 92
+    CHECK(hooktest_user::log().size() == 1);                           // the hooks ran once
+    agent.stop_and_wait_for_calls();
+    hooktest_user::reset(nullptr);
+}
+
+TEST_CASE("hot-restart: launch parameters that do not fit one message are refused with an answer, before any hook runs") {
+    const std::string pipe = unique_pipe_name();
+    FakeBroker broker(pipe);
+    REQUIRE(broker.listening());
+    ScopedPipeEnv env(pipe);
+    hooktest_user::reset(nullptr);
+    // More than 300 000 UTF-16 units of environment (every variable is limited to 32 767 characters).
+    std::vector<std::unique_ptr<ScopedVar>> big;
+    std::vector<std::wstring> names;
+    for (int i = 0; i < 12; ++i) {
+        names.push_back(std::wstring(L"CML_WP21_BIG") + static_cast<wchar_t>(L'A' + i));
+    }
+    const std::wstring value(30000, L'x');
+    for (const std::wstring& name : names) {
+        big.push_back(std::make_unique<ScopedVar>(name.c_str(), value.c_str()));
+    }
+
+    Agent agent(CML_MODE_IMMEDIATE);
+    REQUIRE(agent.start().has_value());
+    REQUIRE(broker.handshake());
+    REQUIRE(enable_this_module(agent, broker));
+    ipc::Restart restart;
+    restart.request_id = 95;
+    REQUIRE(broker.send(restart));
+    const std::optional<ipc::RestartInfo> info = broker.wait_for<ipc::RestartInfo>(15000);
+    REQUIRE(info.has_value());  // an answer, not a dropped connection
+    CHECK(info->status == 4451);
+    CHECK(info->hooks_run == 0);
+    CHECK(info->command_line.empty());
+    CHECK(hooktest_user::log().empty());  // nothing ran for a restart that cannot happen
+
+    // The connection is still good: a later request is served.
+    ipc::ReenableModules ask;
+    ask.request_id = 96;
+    ask.modules.push_back(ipc::RestartModule{0, "b.dll"});
+    REQUIRE(broker.send(ask));
+    std::optional<ipc::Reply> reply;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (!reply && std::chrono::steady_clock::now() < deadline) {
+        std::optional<ipc::Message> message = broker.receive(100);
+        if (!message) {
+            continue;
+        }
+        if (const auto* enable = std::get_if<ipc::EnableModule>(&*message)) {
+            ipc::Reply accepted;
+            accepted.request_id = enable->request_id;
+            broker.send(accepted);
+        } else if (const auto* answer = std::get_if<ipc::Reply>(&*message)) {
+            if (answer->request_id == 96) {
+                reply = *answer;
+            }
+        }
+    }
+    REQUIRE(reply.has_value());
+    CHECK(reply->status == 0);
     agent.stop_and_wait_for_calls();
 }
 

@@ -91,12 +91,19 @@ public:
     // scripted one. Without a host `restart` is refused (CML5800) and the capability is not advertised.
     void set_process_host(std::shared_ptr<ProcessHost> host);
     bool restart_available() const;
+    void set_restart_trace_for_testing(std::function<void(const std::string&)> trace);
     // {"pid"?:N, "timeout_ms"?:N}
     Result<ipc::json::Value> restart(const ipc::json::Value& args);
     // The agent connections (handshaken or not), their modules' states, and a lookup by pid / restart token.
     std::vector<std::shared_ptr<AgentLink>> links() const;
     std::shared_ptr<AgentLink> link_for_pid(std::uint32_t pid) const;
-    std::shared_ptr<AgentLink> link_for_restart_token(const std::string& token) const;
+    // The connection whose Hello carried `token` and came from process `pid` (the pid the broker started; a child that
+    // inherited the token cannot be mistaken for the restarted process).
+    std::shared_ptr<AgentLink> link_for_restart_token(const std::string& token, std::uint32_t pid) const;
+    // Holds off every reload (they are refused busy, CML5304) for as long as the returned lock lives. Not owned when a
+    // reload is running. A restart calls reload_locked() meanwhile.
+    std::unique_lock<std::mutex> lock_reloads();
+    Result<ipc::json::Value> reload_locked(const ipc::json::Value& args);
     std::vector<std::shared_ptr<ModuleState>> module_states(std::uint64_t agent_id) const;
 
 private:
@@ -115,7 +122,7 @@ private:
     std::optional<Diag> apply_compile_on_save(bool on);
     // The reload; `automatic` is a reload started by a save: it only touches modules whose index is ready, finds a
     // running reload or no module without publishing an error, and returns quietly (kBusy for "try again").
-    Result<ipc::json::Value> run_reload(const ipc::json::Value& args, bool automatic);
+    Result<ipc::json::Value> run_reload(const ipc::json::Value& args, bool automatic, bool lock_held = false);
     std::vector<std::string> tracked_files() const;
     std::vector<Target> targets(std::uint32_t pid, const std::string& module) const;
 
@@ -136,7 +143,7 @@ private:
     std::vector<std::future<void>> retiring_;  // stopped save watchers finishing a reload
     WatcherFactory watcher_factory_;
 
-    std::unique_ptr<RestartCoordinator> restart_;  // guarded by mutex_
+    std::shared_ptr<RestartCoordinator> restart_;  // guarded by mutex_; restart() works on a copy
     std::mutex observer_mutex_;
     OptionObserver option_observer_;
 

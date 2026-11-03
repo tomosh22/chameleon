@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "cml/core/restart_diag_ids.h"
+#include "cml/ipc/messages.h"
 #include "cml/util/log.h"
 
 namespace cml::core {
@@ -48,12 +49,14 @@ bool is_none(std::uint64_t value) {
 
 class WindowsRestartableProcess final : public RestartableProcess {
 public:
-    WindowsRestartableProcess(HANDLE old_process, const HANDLE duplicated[3]) : old_process_(old_process) {
+    WindowsRestartableProcess(HANDLE old_process, std::uint32_t old_pid, bool had_console, const HANDLE duplicated[3])
+        : old_process_(old_process), old_pid_(old_pid), had_console_(had_console) {
         for (int i = 0; i < 3; ++i) {
             duplicated_[i] = duplicated[i];
         }
     }
     ~WindowsRestartableProcess() override {
+        detach_console();
         close_duplicates();
         if (new_process_ != nullptr) {
             CloseHandle(new_process_);
@@ -62,6 +65,21 @@ public:
     }
 
     Result<void> terminate(std::uint32_t timeout_ms) override {
+        // Console (docs/wp/WP-21.md): the new process should end up where the old one was. A broker that has no console of its own
+        // (detached, e.g. started by the agent) takes the old process's console over while the old process still exists, so the child
+        // it creates inherits that console instead of getting a window of its own. A broker that has a console gives the child its own
+        // (the child cannot be attached to a different one by flags); a process that had none gets none (DETACHED_PROCESS).
+        if (had_console_) {
+            DWORD attached[1] = {0};
+            if (GetConsoleProcessList(attached, 1) == 0) {
+                if (AttachConsole(old_pid_)) {
+                    console_attached_ = true;
+                } else {
+                    CML_LOG(Warn, "restart: cannot take over the console of process %u (%s); the new process gets a console of its own", old_pid_,
+                            win32_error(GetLastError()).c_str());
+                }
+            }
+        }
         if (WaitForSingleObject(old_process_, 0) != WAIT_OBJECT_0) {
             if (!TerminateProcess(old_process_, 0)) {
                 const DWORD error = GetLastError();
@@ -125,6 +143,9 @@ public:
         PROCESS_INFORMATION info;
         ZeroMemory(&info, sizeof(info));
         DWORD flags = CREATE_UNICODE_ENVIRONMENT;
+        if (!had_console_) {
+            flags |= DETACHED_PROCESS;  // the old process had no console: a console application must not get a window now
+        }
         if (!inherited.empty()) {
             flags |= EXTENDED_STARTUPINFO_PRESENT;
         }
@@ -133,6 +154,7 @@ public:
         const DWORD create_error = GetLastError();
         DeleteProcThreadAttributeList(attributes);
         close_duplicates();  // the new process has its own copies now
+        detach_console();    // the broker lets go of the console it borrowed
         if (!created) {
             return fail("CreateProcessW failed for '" + utf8_of(image) + "' (" + win32_error(create_error) + ")");
         }
@@ -151,6 +173,13 @@ public:
     }
 
 private:
+    void detach_console() {
+        if (console_attached_) {
+            FreeConsole();
+            console_attached_ = false;
+        }
+    }
+
     void close_duplicates() {
         for (int i = 0; i < 3; ++i) {
             if (duplicated_[i] == nullptr) {
@@ -167,13 +196,17 @@ private:
     }
 
     HANDLE old_process_;
+    std::uint32_t old_pid_;
+    bool had_console_;
+    bool console_attached_ = false;
     HANDLE duplicated_[3] = {nullptr, nullptr, nullptr};
     HANDLE new_process_ = nullptr;
 };
 
 class WindowsProcessHost final : public ProcessHost {
 public:
-    Result<std::unique_ptr<RestartableProcess>> open(std::uint32_t pid, const std::uint64_t std_handles[3], std::vector<Diag>* warnings) override {
+    Result<std::unique_ptr<RestartableProcess>> open(std::uint32_t pid, const std::uint64_t std_handles[3], std::uint32_t info_flags,
+                                                     std::vector<Diag>* warnings) override {
         HANDLE process = OpenProcess(PROCESS_TERMINATE | PROCESS_DUP_HANDLE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
         if (process == nullptr) {
             return Diag::make(rd::kOpenFailed, "OpenProcess(" + std::to_string(pid) + ") failed (" + win32_error(GetLastError()) + ")",
@@ -210,7 +243,7 @@ public:
             }
             duplicated[i] = copy;
         }
-        return std::unique_ptr<RestartableProcess>(new WindowsRestartableProcess(process, duplicated));
+        return std::unique_ptr<RestartableProcess>(new WindowsRestartableProcess(process, pid, (info_flags & ipc::kRestartInfoHadConsole) != 0, duplicated));
     }
 };
 

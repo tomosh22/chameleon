@@ -58,6 +58,9 @@ struct BaselineSnapshot {
     std::map<std::string, FileStamp> originals;
 };
 
+// The size restore() gives a file that must be read by the next sweep (no file has it).
+inline constexpr std::uint64_t kRestoredSize = ~static_cast<std::uint64_t>(0);
+
 class SourceBaseline {
 public:
     // Hashes every existing file of `files` (a file that cannot be read gets a warning and is not tracked).
@@ -73,7 +76,8 @@ public:
         std::size_t hashed = 0;            // files that had to be read (size or time differed)
         std::size_t checked = 0;
     };
-    SweepResult sweep() const;
+    // (not const: a restored original that turns out unchanged gets its real size and time recorded, see restore())
+    SweepResult sweep();
 
     // Re-baselines files with the stamps the sweep saw (after their patch was applied). The first time a file is accepted
     // its previous stamp is remembered as its "original" (see BaselineSnapshot).

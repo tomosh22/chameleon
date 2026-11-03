@@ -316,6 +316,9 @@ void encode(Writer& w, const Restart& m) {
     w.u64(m.request_id);
     w.u32(m.flags);
 }
+void encode(Writer& w, const RestartCancel& m) {
+    w.u64(m.request_id);
+}
 void encode_module(Writer& w, const RestartModule& m) {
     w.u32(m.options);
     w.str(m.path);
@@ -325,6 +328,7 @@ void encode(Writer& w, const RestartInfo& m) {
     w.u32(m.status);
     w.str(m.message);
     w.u32(m.hooks_run);
+    w.u32(m.flags);
     w.wide(m.image_path);
     w.wide(m.command_line);
     w.wide(m.working_directory);
@@ -591,6 +595,10 @@ Message decode_restart_info(Reader& r) {
     m.status = r.u32();
     m.message = r.str();
     m.hooks_run = r.u32();
+    m.flags = r.u32();
+    if (r.ok() && (m.flags & ~kRestartInfoHadConsole) != 0) {
+        r.fail("unknown RestartInfo flags");
+    }
     m.image_path = r.wide();
     m.command_line = r.wide();
     m.working_directory = r.wide();
@@ -599,6 +607,11 @@ Message decode_restart_info(Reader& r) {
     m.std_output = r.u64();
     m.std_error = r.u64();
     m.modules = decode_restart_modules(r);
+    return m;
+}
+Message decode_restart_cancel(Reader& r) {
+    RestartCancel m;
+    m.request_id = r.u64();
     return m;
 }
 Message decode_reenable_modules(Reader& r) {
@@ -870,6 +883,7 @@ const char* to_string(MessageType type) noexcept {
         case MessageType::Restart: return "Restart";
         case MessageType::RestartInfo: return "RestartInfo";
         case MessageType::ReenableModules: return "ReenableModules";
+        case MessageType::RestartCancel: return "RestartCancel";
         case MessageType::CompileEvent: return "CompileEvent";
     }
     return "Unknown";
@@ -892,6 +906,7 @@ bool is_implemented(MessageType type) noexcept {
         case MessageType::Restart:
         case MessageType::RestartInfo:
         case MessageType::ReenableModules:
+        case MessageType::RestartCancel:
         case MessageType::Exception:
         case MessageType::ExceptionAction:
         case MessageType::ExceptionConfig:
@@ -922,6 +937,7 @@ MessageType type_of(const Message& message) noexcept {
         MessageType operator()(const Restart&) const noexcept { return MessageType::Restart; }
         MessageType operator()(const RestartInfo&) const noexcept { return MessageType::RestartInfo; }
         MessageType operator()(const ReenableModules&) const noexcept { return MessageType::ReenableModules; }
+        MessageType operator()(const RestartCancel&) const noexcept { return MessageType::RestartCancel; }
         MessageType operator()(const Reply&) const noexcept { return MessageType::Reply; }
         MessageType operator()(const Exception&) const noexcept { return MessageType::Exception; }
         MessageType operator()(const ExceptionAction&) const noexcept { return MessageType::ExceptionAction; }
@@ -1109,6 +1125,7 @@ Result<Message> decode_message(std::uint16_t type, std::uint16_t version, const 
         case MessageType::Restart: message = decode_restart(reader); break;
         case MessageType::RestartInfo: message = decode_restart_info(reader); break;
         case MessageType::ReenableModules: message = decode_reenable_modules(reader); break;
+        case MessageType::RestartCancel: message = decode_restart_cancel(reader); break;
         case MessageType::Exception: message = decode_exception(reader); break;
         case MessageType::ExceptionAction: message = decode_exception_action(reader); break;
         case MessageType::ExceptionConfig: message = decode_exception_config(reader); break;
@@ -1252,6 +1269,9 @@ std::string describe(const Message& message) {
                    " hooks_run=" + std::to_string(m.hooks_run) + " command_line_units=" + std::to_string(m.command_line.size()) +
                    " environment_units=" + std::to_string(m.environment.size()) + " modules=" + std::to_string(m.modules.size()) +
                    (m.message.empty() ? std::string() : " message=" + quoted(m.message));
+        }
+        std::string operator()(const RestartCancel& m) const {
+            return "RestartCancel request=" + std::to_string(m.request_id);
         }
         std::string operator()(const ReenableModules& m) const {
             return "ReenableModules request=" + std::to_string(m.request_id) + " modules=" + std::to_string(m.modules.size());
