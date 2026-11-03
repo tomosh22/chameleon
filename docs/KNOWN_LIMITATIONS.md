@@ -39,6 +39,17 @@ diagnostic is planned, not live.
   a patch per process. A process that is started after an edit was made enables its modules against the edited sources: its
   baseline is taken from the files on disk, while the process runs the binary it was built from, so that edit is not applied to
   it until the next change of the file (rebuild and restart such a process).
+- A reload that changes several source files makes one patch per file. If a later one fails,
+  the earlier patches stay applied (and are counted in `generation`); fix the error and reload
+  again (WP-12).
+- A patch initialiser that fails part-way leaves the objects it already constructed behind;
+  there is no undo (WP-12).
+- Control-pipe events (`patch_applied`, `diag`, `log`) are delivered asynchronously and may
+  arrive after the `reload` response they belong to. A subscriber that does not read for 5 s is
+  disconnected (WP-12).
+- When a header that holds no code changes on a clang-cl build, the broker warns CML5303
+  ("changed file maps to no compiland"). Edit a `.cpp` that includes the header; touching a file
+  is not a change, because only content hashes are compared (WP-12, ADR-0013).
 - Read-only data (`.rdata`, const tables, constants) is not bound to the old image: the patch uses a fresh copy, so edits to it take effect, but its ADDRESS changes across a patch (code of the old image that took and keeps the old address, or compares addresses, sees the old table).
 - Statics only match old records of exactly the same scope (same enclosing function, or file scope): a static that moved to another function is a new, fresh variable, and a lambda moved to another function is new code that is not hooked.
 - Functions currently executing on a thread's stack keep running old code until they return;

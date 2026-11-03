@@ -230,11 +230,14 @@ jobs:
       # WP-12: all seven M1 scenarios, every one with --require-all-capabilities (ADR-0022: a skipped step is a
       # failure). Each prints CMLTEST_RESULT and the RELOAD-TIMING line of its reload. A failing scenario does not
       # stop the others; the step fails at the end.
-      - name: cmltest M1 scenarios (Ninja)
+      - name: cmltest scenarios (Ninja)
         run: |
           New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
           $failed = @()
-          foreach ($s in 'basic', 'statics', 'virtuals', 'templates', 'lambdas', 'new_function', 'new_global') {
+          # Every checked-in scenario runs (wave 5 adds scenarios by adding .toml files only).
+          $scenarios = Get-ChildItem tests/harness/scenarios/*.toml | Sort-Object Name | ForEach-Object { $_.BaseName }
+          if ($scenarios.Count -lt 7) { Write-Host "expected at least the seven M1 scenarios, found $($scenarios.Count)"; exit 1 }
+          foreach ($s in $scenarios) {
             Write-Host "::group::cmltest $s"
             & "$env:BUILD_DIR/bin/cmltest.exe" --scenario "tests/harness/scenarios/$s.toml" `
               --build-dir $env:BUILD_DIR --generator ninja --config ${{ matrix.config }} --cxx $env:CML_CXX `
