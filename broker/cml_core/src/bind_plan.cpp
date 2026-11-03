@@ -347,6 +347,9 @@ private:
     void load_relocations();
     void decide_defined();
     void bridge_statics();
+    void reject_new_thread_locals();
+    void warn_thread_local_initialisers();
+    void new_thread_local_error(const Sym& sy);
     void resolve_undefined();
     void build_fixups();
     void assemble();
@@ -778,12 +781,9 @@ void Planner::decide_defined() {
         const SymbolType type = (si != nullptr && si->code) ? SymbolType::Function : SymbolType::Data;
         sy.dec.type = type;
 
-        if (si != nullptr && si->tls) {
-            error(diag::kThreadLocal, "'" + sy.dec.display + "' is thread_local data defined by " + in_.object_name + "; thread-local variables in patched code are not supported",
-                  "Move the thread_local to an unchanged source file, or hot-restart.");
-            decide(sy, DecisionKind::PatchFresh, BindSource::None, type, {}, "thread_local (CML3102)");
-            continue;
-        }
+        // thread_local data (WP-24): an external one is looked up like any other global below (the
+        // module's publics carry it with its offset in the old .tls section); a static one is matched in
+        // bridge_statics(). Whatever is not in the old image is rejected (new_thread_local_error).
         // Fresh copies (plan 4.5): vtables, RTTI, constants, unwind tables, initialiser stubs, funclets.
         if (type == SymbolType::Data && (is_fresh_data_name(sy.name) || sy.name.find("$rtc") != std::string::npos ||
                                          (si != nullptr && si->runtime_table))) {
@@ -834,7 +834,12 @@ void Planner::decide_defined() {
             }
         } else {
             if (old) {
-                decide(sy, DecisionKind::BindOldData, old->source, type, old->addr, "defined data present in the old image (" + old->note + "): references are retargeted, the patch's copy is dead");
+                decide(sy, DecisionKind::BindOldData, old->source, type, old->addr,
+                       (si != nullptr && si->tls ? "thread_local present in the old image (" : "defined data present in the old image (") + old->note +
+                           "): references are retargeted, the patch's copy is dead");
+            } else if (si != nullptr && si->tls) {
+                new_thread_local_error(sy);
+                decide(sy, DecisionKind::PatchNewData, BindSource::None, type, {}, "thread_local not in the old image (CML3400)");
             } else {
                 decide(sy, DecisionKind::PatchNewData, BindSource::None, type, {}, "defined data not in the old image: patch-local, its initialiser runs once");
             }
@@ -1045,6 +1050,65 @@ void Planner::bridge_statics() {
             decide(sy, sy.dec.type == SymbolType::Function ? DecisionKind::PatchNewFunction : DecisionKind::PatchNewData, BindSource::None, sy.dec.type, {}, "unmatched static: new");
         }
     }
+}
+
+// ---- thread_local (WP-24) ----------------------------------------------------------------------
+
+void Planner::new_thread_local_error(const Sym& sy) {
+    error(diag::kNewThreadLocal,
+          "'" + sy.dec.display + "' is a new thread_local: " + in_.object_name + " defines it but the old image has no such thread-local variable; patch-local thread-local storage is not supported",
+          "Hot-restart, or move the new thread_local to an unchanged source file (and rebuild).");
+}
+
+// Statics are decided in bridge_statics(); a thread_local static that did not match an old record (or whose
+// match is not bound) is new.
+void Planner::reject_new_thread_locals() {
+    for (Sym& sy : syms_) {
+        if (!sy.defined || !sy.decided || sy.dec.section == 0 || !secs_[sy.dec.section - 1].tls || !sy.is_static) {
+            continue;
+        }
+        if (sy.dec.decision == DecisionKind::BindOldData) {
+            continue;
+        }
+        new_thread_local_error(sy);
+    }
+}
+
+// A thread_local with a dynamic initialiser or a destructor: the old image's initialiser (the CRT's TLS
+// callback over the old module's .CRT$XD* table) stays in effect. The patch has no TLS directory, so
+// nothing of the patch's own table ever runs.
+void Planner::warn_thread_local_initialisers() {
+    std::vector<std::string> names;
+    for (std::size_t i = 0; i < secs_.size(); ++i) {
+        if (!starts_with(secs_[i].name, ".CRT$XD")) {
+            continue;
+        }
+        for (const coff::ResolvedRelocation& rr : relocs_[i]) {
+            names.push_back(std::string(rr.target->name));
+        }
+        if (relocs_[i].empty()) {
+            names.push_back(secs_[i].name);
+        }
+    }
+    for (const Sym& sy : syms_) {
+        if (!sy.defined && (sy.name == "__tlregdtor" || sy.name == "_tlregdtor" || starts_with(sy.name, "__dyn_tls_") || starts_with(sy.name, "_dyn_tls_"))) {
+            names.push_back(sy.name);
+        }
+    }
+    if (names.empty()) {
+        return;
+    }
+    std::string list;
+    for (std::size_t i = 0; i < names.size() && i < 4; ++i) {
+        list += (i != 0 ? ", " : "") + std::string("'") + names[i] + "'";
+    }
+    if (names.size() > 4) {
+        list += ", ...";
+    }
+    warn(diag::kThreadLocalInit,
+         in_.object_name + " has thread_local variables with dynamic initialisation or a destructor (" + list +
+             "); the old image's initialiser and destructor stay in effect (existing threads keep their values, new threads run the OLD initialiser), a changed initialiser is not run",
+         "Hot-restart if the changed initialiser must take effect.");
 }
 
 // ---- undefined symbols ------------------------------------------------------------------------
@@ -1271,6 +1335,14 @@ void Planner::build_fixups() {
                 continue;
             }
             const bool secrel = type == coff::RelocType::SecRel;
+            if (!secrel && ts.defined && ts.dec.section != 0 && secs_[ts.dec.section - 1].tls) {
+                // The address of a thread_local is per thread; only the SECREL access sequence is understood.
+                error(diag::kThreadLocal,
+                      std::string(coff::reloc_type_name(type)) + " reference to thread_local " + describe(ts) + " from " + where() + " in " + in_.object_name +
+                          "; only the SECREL access sequence of thread-local variables can be retargeted",
+                      "Hot-restart, or move the thread_local to an unchanged source file.");
+                continue;
+            }
             std::uint32_t section_offset = 0;
             if (secrel) {
                 // The offset of the target inside ITS section of the old image (what the linker would
@@ -1606,6 +1678,8 @@ Result<BindPlan> Planner::run(std::vector<Diag>* all_errors) {
     }
     decide_defined();
     bridge_statics();
+    reject_new_thread_locals();
+    warn_thread_local_initialisers();
     if (fatal_) {
         return finish_errors();
     }

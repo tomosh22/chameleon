@@ -181,7 +181,7 @@ TEST_CASE("SECREL against module data is retargeted (the CRT's thread-safe-stati
         auto r = plan_bind(w.input(b), &errors);
         REQUIRE(!r.has_value());
         REQUIRE(errors.size() == 1);
-        CHECK(errors[0].code == diag::kThreadLocal);
+        CHECK(errors[0].code == diag::kNewThreadLocal);  // WP-24: a thread_local the old image lacks is CML3400
         CHECK(contains(errors[0].message, "t_counter"));
     }
 }

@@ -1,0 +1,11 @@
+--- a/logic.cpp
++++ b/logic.cpp
+@@ -2,7 +2,7 @@
+ #include "logic.h"
+
+ namespace {
+-const int kStep = 1;
++const int kStep = 5;
+ } // namespace
+
+ thread_local int t_counter = 0;  // namespace scope, external linkage

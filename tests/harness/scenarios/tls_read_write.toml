@@ -1,0 +1,93 @@
+# Scenario `tls_read_write` (WP-24): thread_local variables. The fixture's main thread and its worker thread each own two
+# thread_locals (one at namespace scope, one function-local static) in the OLD image's TLS storage, and add STEP to both every
+# frame. The first edit changes STEP 1 -> 5: the patched code must read and write the SAME per-thread storage, so both
+# threads' values continue from where they were (a patch with its own copy would restart at 0) and grow by the new STEP.
+# The second edit ADDS a thread_local: the planner rejects it (CML3400), the app keeps running with the previous behaviour.
+name = "tls_read_write"
+description = "fixture tls: STEP 1 -> 5 keeps every thread's thread_local values; a new thread_local is rejected (CML3400)"
+fixture = "tls"
+timeout_s = 240
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ step=1 main_ns=\\d+ main_fn=\\d+ work_ns=\\d+ work_fn=\\d+"
+within_s = 15
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_tls.exe"
+within_s = 15
+
+# Let both threads' counters reach at least 20 before the patch: a reset afterwards cannot hide.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ step=1 main_ns=([2-9][0-9]|[1-9][0-9]{2,}) main_fn=([2-9][0-9]|[1-9][0-9]{2,}) work_ns=([2-9][0-9]|[1-9][0-9]{2,}) work_fn=([2-9][0-9]|[1-9][0-9]{2,})"
+within_s = 15
+
+[[step]]
+kind = "edit"
+patch = "edits/step_5.edit"
+
+[[step]]
+kind = "reload"
+within_s = 90
+
+# Both threads run the patched code (step=5) and carry on from their old values (>= 20, never restarted at 5).
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ step=5 main_ns=([2-9][0-9]|[1-9][0-9]{2,}) main_fn=([2-9][0-9]|[1-9][0-9]{2,}) work_ns=([2-9][0-9]|[1-9][0-9]{2,}) work_fn=([2-9][0-9]|[1-9][0-9]{2,})"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ step=5 main_ns=\\d+ main_fn=\\d+ work_ns=\\d+ work_fn=\\d+"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ step=5 main_ns=\\d+ main_fn=\\d+ work_ns=\\d+ work_fn=\\d+"
+within_s = 10
+
+# A new thread_local is rejected; nothing changes.
+[[step]]
+kind = "edit"
+patch = "edits/stacked/add_tls.edit"
+
+[[step]]
+kind = "reload"
+within_s = 90
+expect_error = "CML3400"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ step=5 main_ns=\\d+ main_fn=\\d+ work_ns=\\d+ work_fn=\\d+"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ step=5 main_ns=\\d+ main_fn=\\d+ work_ns=\\d+ work_fn=\\d+"
+within_s = 10
+
+# Every counter, of both threads, only ever grew: across the first reload and across the rejected one.
+[[step]]
+kind = "expect_monotonic"
+key = "main_ns"
+min_samples = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "main_fn"
+min_samples = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "work_ns"
+min_samples = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "work_fn"
+min_samples = 20

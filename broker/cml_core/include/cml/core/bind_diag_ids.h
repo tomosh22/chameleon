@@ -9,7 +9,7 @@ namespace cml::core::bind::diag {
 
 // By-design limitations (KNOWN_LIMITATIONS.md).
 inline constexpr std::uint32_t kAddr32NbToOldData = 3101;  // image-relative reference to old-module data
-inline constexpr std::uint32_t kThreadLocal = 3102;        // thread_local defined or referenced by the patched TU
+inline constexpr std::uint32_t kThreadLocal = 3102;        // thread-local reference shape that cannot be retargeted (WP-24 narrowed it)
 
 // Errors.
 inline constexpr std::uint32_t kUnresolved = 3200;         // undefined symbol found nowhere
@@ -24,6 +24,10 @@ inline constexpr std::uint32_t kBadRelocationSite = 3208;  // relocation site ou
 inline constexpr std::uint32_t kCompilandAmbiguous = 3209; // several compilands match the TU name
 inline constexpr std::uint32_t kAmbiguousOverloads = 3214; // same-scope static overloads cannot be told apart
 inline constexpr std::uint32_t kUnmatchedInitialiser = 3215; // dynamic initialiser without a global of the TU
+
+// WP-24 (ADR-0032: CML3400..CML3449).
+inline constexpr std::uint32_t kNewThreadLocal = 3400;     // thread_local the old image does not have (error)
+inline constexpr std::uint32_t kThreadLocalInit = 3401;    // dynamic initialiser/destructor of a thread_local stays the old one (warning)
 
 // Warnings (the plan is still produced).
 inline constexpr std::uint32_t kSharedInitialiser = 3210;  // TU-wide initialiser may re-run initialisers of bound globals

@@ -1,0 +1,18 @@
+--- a/logic.cpp
++++ b/logic.cpp
+@@ -7,6 +7,7 @@
+ } // namespace
+
+ thread_local int t_counter = 0;  // namespace scope, external linkage
++thread_local int t_extra = 100;  // NEW thread_local: rejected (CML3400)
+
+ TlsValues tls_step()
+ {
+@@ -16,5 +17,5 @@
+     TlsValues v;
+     v.step = kStep;
+     v.ns = t_counter;
+-    v.fn = calls;
++    v.fn = calls + t_extra;
+     return v;
+ }
