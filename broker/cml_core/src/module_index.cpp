@@ -53,6 +53,11 @@ bool ModuleIndex::wait(std::uint32_t timeout_ms) const {
     });
 }
 
+std::optional<ModuleAudit> ModuleIndex::audit() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return audit_;
+}
+
 std::shared_ptr<const pdb::PdbIndex> ModuleIndex::pdb() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return pdb_;
@@ -149,6 +154,36 @@ void ModuleIndex::run() {
     }
     if (cancel_.load(std::memory_order_acquire)) {
         return;
+    }
+    if (spec_.audit) {
+        set_status(IndexState::Loading, 20, "checking the build requirements");
+        ModuleAudit audit = audit_opened_module(spec_.module_path, *index);
+        for (const AuditFinding& f : audit.findings) {
+            if (f.verdict == Verdict::Fail) {
+                CML_LOG(Error, "index: %s", f.diag().format().c_str());
+            } else if (f.verdict == Verdict::Warn) {
+                CML_LOG(Warn, "index: %s", f.diag().format().c_str());
+            }
+        }
+        const AuditFinding* failure = audit.first_failure();
+        std::optional<Diag> failure_diag;
+        if (failure != nullptr) {
+            failure_diag = failure->diag();
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            audit_ = audit;
+            if (failure_diag) {
+                pdb_.reset();  // ADR-0017: a module that cannot be enabled must not keep its PDB mapped
+            }
+        }
+        if (spec_.on_audit) {
+            spec_.on_audit(audit);
+        }
+        if (failure_diag) {
+            set_status(IndexState::Failed, 0, "build requirements not met", failure_diag);
+            return;
+        }
     }
     set_status(IndexState::Loading, 30, "reading the file lists");
     std::set<std::string> files;

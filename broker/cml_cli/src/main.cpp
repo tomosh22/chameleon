@@ -1,6 +1,7 @@
 // cml_broker: command-line entry point of the Chameleon broker.
 //
 //   cml_broker --version | --help
+//   cml_broker check [--json] [--verbose] [--pdb-dir DIR] <module>     (WP-18: offline audit of one module)
 //   cml_broker --headless [--pipe NAME] [--control-pipe NAME] [--exit-when-idle MS] [--startup-timeout MS]
 //                         [--log FILE] [--verbose]
 //
@@ -14,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "cml/core/check_command.h"
 #include "cml/core/version.h"
 #include "cml/util/log.h"
 #include "cml/util/path.h"
@@ -40,10 +42,13 @@ namespace {
 void print_usage(std::FILE* out) {
     std::fputs(
         "usage: cml_broker --version | --help\n"
+        "       cml_broker check [--json] [--verbose] [--pdb-dir DIR]... <module.exe|module.dll>\n"
         "       cml_broker --headless [--pipe NAME] [--control-pipe NAME] [--exit-when-idle MS]\n"
         "                             [--startup-timeout MS]\n"
         "                             [--log FILE] [--log-format text|json] [--verbose] [--session-dir DIR]\n"
         "\n"
+        "  check                 audit one module against the build requirements, offline; exit code 1 on any FAIL\n"
+        "                        (cml_broker check --help)\n"
         "  --headless            run without a GUI and serve agents on the broker pipe\n"
         "  --pipe NAME           full pipe name (default: CML_PIPE_NAME, else\n"
         "                        \\\\.\\pipe\\cml_broker_<logon session SID>)\n"
@@ -261,6 +266,13 @@ int run_headless(const Options& options) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // WP-18: `cml_broker check <module>` is an offline command with its own arguments.
+    {
+        std::vector<std::string> all = collect_args(argc, argv);
+        if (all.size() >= 2 && all[1] == "check") {
+            return cml::core::run_check_command(std::vector<std::string>(all.begin() + 2, all.end()), stdout, stderr);
+        }
+    }
     Options options;
     if (!parse_args(collect_args(argc, argv), &options)) {
         print_usage(stderr);

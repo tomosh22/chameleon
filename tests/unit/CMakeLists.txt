@@ -100,6 +100,8 @@ cml_add_unit_test(broker_core
         broker/test_agent_link.cpp
         broker/test_events_and_log.cpp
         broker/test_reload.cpp
+        # WP-18: the module audit (cml_broker check, enable-time build requirements)
+        broker/test_audit.cpp
     LIBS cml_core)
 add_subdirectory(bind)  # WP-07: unit.bind
 if(NOT MSVC)

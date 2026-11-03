@@ -14,6 +14,7 @@
 #include "cml/coff/writer.h"
 #include "cml/core/bind_diag_ids.h"
 #include "cml/core/bind_plan.h"
+#include "cml/core/module_audit.h"
 #include "cml/core/patch_image.h"
 #include "cml/core/pipeline_diag_ids.h"
 #include "cml/toolchain/rewrite.h"
@@ -552,6 +553,12 @@ private:
                 if (seen.insert(h.old_va).second) {
                     hooks.push_back(h);
                 }
+            }
+        }
+        // WP-18, CML3104: a changed small function of an optimised compiland may be inlined into other translation units.
+        for (const bind::HookEntry& h : hooks) {
+            if (std::optional<Diag> stale = stale_inline_warning(pdb, u.compiland, h.display, h.old_size, module_.name)) {
+                warn(report, "plan", std::move(*stale));
             }
         }
         const bool has_effect = !hooks.empty() || !plan.new_functions.empty() || !plan.new_globals.empty() || !plan.initialisers.empty();

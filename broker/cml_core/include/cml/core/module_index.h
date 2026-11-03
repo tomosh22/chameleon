@@ -25,6 +25,7 @@
 #include <thread>
 #include <vector>
 
+#include "cml/core/module_audit.h"
 #include "cml/core/source_baseline.h"
 #include "cml/pdb/index.h"
 #include "cml/util/result.h"
@@ -52,6 +53,10 @@ struct ModuleIndexSpec {
     BaselineOptions baseline;      // progress / cancelled are set by the index itself
     // Called from the worker thread on every state or phase change (after the status was updated).
     std::function<void(const IndexStatus&)> on_change;
+    // WP-18: audit the module against the build requirements (module_audit.h) once its PDB is open. A FAIL finding fails
+    // the index with that finding's diagnostic (the PDB is released); `on_audit` hears every audit (worker thread).
+    bool audit = false;
+    std::function<void(const ModuleAudit&)> on_audit;
 };
 
 class ModuleIndex {
@@ -73,6 +78,8 @@ public:
     void release_pdb();
 
     const std::string& module_path() const noexcept { return spec_.module_path; }
+    // The enable-time audit (spec.audit); nullopt before it ran or when it was not asked for.
+    std::optional<ModuleAudit> audit() const;
 
     // Compilands that have at least one changed file (indices ascending), the changed files, and changed
     // files that no compiland lists. `stamps` goes to accept() once the files were patched.
@@ -107,6 +114,7 @@ private:
     mutable std::mutex mutex_;
     mutable std::condition_variable changed_;
     IndexStatus status_;
+    std::optional<ModuleAudit> audit_;
     std::shared_ptr<const pdb::PdbIndex> pdb_;
     SourceBaseline baseline_;
     std::function<Result<Sweep>()> sweep_override_;                       // guarded by mutex_

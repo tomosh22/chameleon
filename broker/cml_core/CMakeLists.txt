@@ -22,6 +22,8 @@ add_library(cml_core STATIC
     src/module_symbols.cpp
     src/patch_image.cpp
     src/source_baseline.cpp
+    src/module_audit.cpp
+    src/check_command.cpp
     src/module_index.cpp
     src/module_state.cpp
     src/agent_link.cpp
