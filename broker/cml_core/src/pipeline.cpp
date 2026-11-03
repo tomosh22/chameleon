@@ -529,6 +529,23 @@ private:
         // `/INCLUDE:sym` linker directives (cl writes `/INCLUDE:_fltused` into every object that uses floating
         // point) are no relocations, so the planner never sees them; with /NODEFAULTLIB nothing defines the symbol.
         // The patch gets an unused placeholder so the link resolves it.
+        // Undefined externals nothing relocates against (the same `_fltused` as an undefined symbol the /INCLUDE
+        // directive forces) are invisible to the planner too.
+        for (const coff::Symbol& sym : object->object.symbols()) {
+            if (!sym.is_external() || !sym.is_undefined() || sym.name.empty()) {
+                continue;
+            }
+            const std::string name(sym.name);
+            const bind::SymbolDecision* d = plan.find_decision(name);
+            if (d != nullptr && d->decision != bind::DecisionKind::PatchFresh && d->decision != bind::DecisionKind::Unresolved) {
+                continue;  // bound, linker-provided, weak default ...: the planner decided
+            }
+            const bool bound = std::any_of(binds.begin(), binds.end(), [&](const coff::BindSymbol& b) { return b.name == name; });
+            if (!bound && name != "__ImageBase") {
+                CML_LOG(Debug, "reload: undefined symbol %s is referenced by no relocation: placeholder", name.c_str());
+                binds.push_back(coff::BindSymbol{name, coff::BindKind::Data});
+            }
+        }
         for (const coff::Directive& dir : object->object.directives()) {
             if (dir.kind != coff::DirectiveKind::Include || dir.value.empty()) {
                 continue;
