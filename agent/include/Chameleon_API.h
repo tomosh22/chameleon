@@ -515,8 +515,9 @@ CML_INLINE int cml_is_connected(cml_agent agent) {
 
 /* ------------------------------------------------------------------------------------------ */
 /* Hook macros. Use at file scope, with a semicolon:  CML_POSTPATCH_HOOK(OnAfterPatch);       */
-/* The function must be defined (or declared) before the macro. The record is a constant in   */
-/* the section ".cmlhk$a" (pre-patch), ".cmlhk$b" (post-patch) or ".cmlhk$c" (the others).    */
+/* The function must be defined (or declared) before the macro. The record is NOT const on   */
+/* purpose: cl drops an unreferenced internal const, a plain static survives. Sections:       */
+/* ".cmlhk$a" (pre-patch), ".cmlhk$b" (post-patch), ".cmlhk$c" (the others).                  */
 /* ------------------------------------------------------------------------------------------ */
 
 #define CML_HOOK_CONCAT2_(a, b) a##b
@@ -528,7 +529,7 @@ CML_INLINE int cml_is_connected(cml_agent agent) {
 #endif
 #define CML_HOOK_REGISTER_(sec, kind_value, fn)                                                    \
     __pragma(section(sec, read))                                                                   \
-    __declspec(allocate(sec)) CML_HOOK_USED_ static const cml_hook_entry                           \
+    __declspec(allocate(sec)) CML_HOOK_USED_ static cml_hook_entry                                 \
         CML_HOOK_CONCAT_(cml_hook_entry_, __COUNTER__) = {CML_HOOK_MAGIC, (kind_value),            \
                                                           (cml_generic_fn)(fn), __FILE__ "|" #fn}
 
