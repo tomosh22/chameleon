@@ -308,6 +308,22 @@ TEST_CASE("hooks: a patch that is not committed contributes nothing") {
     CHECK(fns(select_hooks(Kind::PostPatch, {m, committed})) == std::vector<std::uint64_t>{0x1000, 0x9100});
 }
 
+TEST_CASE("hooks: WP-22 - once the newest patch is uncommitted (reverted) the older patch's record runs again") {
+    const Source m = module("game.exe", {rec(Kind::PostPatch, 0x1000, "b.cpp|Other")});
+    const Source older = patch("patch #1", {rec(Kind::PostPatch, 0x9000, "a.cpp|OnPost")}, 0x7000);
+    Source newer = patch("patch #2", {rec(Kind::PostPatch, 0x9800, "a.cpp|OnPost")}, 0x8000);
+    // (The module's own record has another key; a patch cannot override a record the module itself holds.) Newest wins: the second patch's function replaces the older one for the same key.
+    CHECK(fns(select_hooks(Kind::PostPatch, {m, older, newer})) == std::vector<std::uint64_t>{0x1000, 0x9800});
+    // Its revert un-commits it (PatchLoader::uncommit_patch): the older patch is the live one again.
+    newer.committed = false;
+    newer.target_base = 0;
+    CHECK(fns(select_hooks(Kind::PostPatch, {m, older, newer})) == std::vector<std::uint64_t>{0x1000, 0x9000});
+    // Everything reverted: the module's own record.
+    Source older_gone = older;
+    older_gone.committed = false;
+    CHECK(fns(select_hooks(Kind::PostPatch, {m, older_gone, newer})) == std::vector<std::uint64_t>{0x1000});
+}
+
 TEST_CASE("hooks: the patches of a module that is not enabled (any more) contribute nothing") {
     const Source game = module("game.exe", {rec(Kind::PostPatch, 0x1000, "a.cpp|OnPost")});
     const Source ext_patch = patch("patch of ext.dll", {rec(Kind::PostPatch, 0x9100, "e.cpp|Added")}, 0x7000, /*target=*/0x150000000ull);

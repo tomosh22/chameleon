@@ -23,6 +23,7 @@ std::vector<std::string> broker_capabilities(const ControlContext& context) {
                               ipc::capability::kDiagEvents}) {
             caps.emplace_back(c);
         }
+        caps.emplace_back(ipc::capability::kRevert);  // WP-22
     }
     if (context.exceptions != nullptr) {
         caps.emplace_back(ipc::capability::kExceptions);
@@ -110,7 +111,7 @@ ipc::ControlResponse answer(const ipc::ControlRequest& request, Result<ipc::json
 }
 
 ipc::ControlResponse subscribe_response(const ipc::ControlRequest& request, const ControlContext& context) {
-    static const char* const kEvents[] = {"diag", "patch_applied", "progress", "log", "exception"};
+    static const char* const kEvents[] = {"diag", "patch_applied", "patch_reverted", "progress", "log", "exception"};
     std::set<std::string> names;
     const ipc::json::Value* events = request.args.find("events");
     // An empty array is the same as no argument: the default set. (The bus reads an empty set as "every event", which would switch
@@ -122,7 +123,7 @@ ipc::ControlResponse subscribe_response(const ipc::ControlRequest& request, cons
             if (std::string(k) != "progress" && std::string(k) != "exception") names.insert(k);
         }
     } else if (!events->is_array()) {
-        return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "argument 'events' must be an array of event names", "Use [\"diag\", \"patch_applied\", \"progress\", \"log\", \"exception\"] or a subset."));
+        return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "argument 'events' must be an array of event names", "Use [\"diag\", \"patch_applied\", \"patch_reverted\", \"progress\", \"log\", \"exception\"] or a subset."));
     } else {
         for (const ipc::json::Value& e : events->items()) {
             bool known = false;
@@ -130,7 +131,7 @@ ipc::ControlResponse subscribe_response(const ipc::ControlRequest& request, cons
                 known = known || (e.is_string() && e.as_string() == k);
             }
             if (!known) {
-                return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "unknown event name in 'events'", "Known events: diag, patch_applied, progress, log, exception."));
+                return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "unknown event name in 'events'", "Known events: diag, patch_applied, patch_reverted, progress, log, exception."));
             }
             names.insert(e.as_string());
         }
@@ -156,6 +157,9 @@ ipc::ControlResponse handle_control_request(const ipc::ControlRequest& request, 
     if (context.service != nullptr) {
         if (request.cmd == "reload") {
             return answer(request, context.service->reload(request.args));
+        }
+        if (request.cmd == "revert") {
+            return answer(request, context.service->revert(request.args));
         }
         if (request.cmd == "wait") {
             return answer(request, context.service->wait(request.args));
