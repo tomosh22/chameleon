@@ -48,7 +48,7 @@ TEST_CASE("defaults: Ctrl+Alt+F11, compile on save off") {
     const Settings s;
     CHECK(format_hotkey(s.reload_hotkey) == "Ctrl+Alt+F11");
     CHECK(s.hotkey_enabled);
-    CHECK_FALSE(s.compile_on_save);
+    CHECK_FALSE(s.compile_on_save.has_value());
     CHECK(s.editor.kind == EditorKind::VSCode);
     CHECK(s.start_broker);
 }
@@ -74,7 +74,7 @@ TEST_CASE("settings survive a save and a load") {
     REQUIRE(back);
     CHECK(warnings.empty());
     CHECK(back->reload_hotkey == s.reload_hotkey);
-    CHECK(back->compile_on_save);
+    CHECK(back->compile_on_save.value_or(false));
     CHECK(back->jobs == 6);
     CHECK(back->max_affected_compilands == 40);
     CHECK(back->editor.kind == EditorKind::Custom);
@@ -113,7 +113,7 @@ TEST_CASE("bad members keep their defaults and warn; unknown members are ignored
     std::vector<std::string> warnings;
     const Settings s = settings_from_json(*parsed, &warnings);
     CHECK(format_hotkey(s.reload_hotkey) == "Ctrl+Alt+F11");
-    CHECK_FALSE(s.compile_on_save);
+    CHECK_FALSE(s.compile_on_save.has_value());
     CHECK(s.jobs == 0);
     CHECK(s.min_log_level == "info");
     CHECK(s.editor.kind == EditorKind::VSCode);
@@ -128,8 +128,21 @@ TEST_CASE("an empty hotkey string disables the hotkey") {
     CHECK_FALSE(s.hotkey_enabled);
 }
 
-TEST_CASE("settings become set-option calls") {
+TEST_CASE("a default ui.json sends no option: the broker's values stay") {
     Settings s;
+    CHECK(settings_broker_options(s).empty());
+    // ... also after a save and a load of the defaults
+    const std::string path = temp_file("defaults.json");
+    REQUIRE(save_settings(path, s));
+    const auto back = load_settings(path);
+    REQUIRE(back);
+    CHECK_FALSE(back->compile_on_save.has_value());
+    CHECK(settings_broker_options(*back).empty());
+}
+
+TEST_CASE("settings become set-option calls, only for what the user set") {
+    Settings s;
+    s.compile_on_save = false;  // an explicit "off" is sent
     auto options = settings_broker_options(s);
     REQUIRE(options.size() == 1);
     CHECK(options[0].name == "compile_on_save");
@@ -139,8 +152,37 @@ TEST_CASE("settings become set-option calls") {
     s.max_affected_compilands = 0;
     options = settings_broker_options(s);
     REQUIRE(options.size() == 3);
+    CHECK(options[0].value.as_bool());
     CHECK(options[1].name == "max_parallel_compiles");
     CHECK(options[1].value.as_integer() == 4);
     CHECK(options[2].name == "max_affected_compilands");
     CHECK(options[2].value.as_integer() == 0);
+}
+
+TEST_CASE("the log level filter lowers the broker's log_level, and restores it") {
+    Settings info;
+    CHECK(settings_broker_options(info).empty());
+    Settings debug = info;
+    debug.min_log_level = "debug";
+    auto options = settings_broker_options(debug);
+    REQUIRE(options.size() == 1);
+    CHECK(options[0].name == "log_level");
+    CHECK(options[0].value.as_string() == "debug");
+    // changes: only what differs
+    auto changes = settings_change_options(info, debug);
+    REQUIRE(changes.size() == 1);
+    CHECK(changes[0].value.as_string() == "debug");
+    CHECK(settings_change_options(debug, debug).empty());
+    Settings trace = debug;
+    trace.min_log_level = "trace";
+    CHECK(settings_change_options(debug, trace)[0].value.as_string() == "trace");
+    // back to info or above: the broker is told to stop producing debug lines
+    Settings warn = debug;
+    warn.min_log_level = "warn";
+    changes = settings_change_options(debug, warn);
+    REQUIRE(changes.size() == 1);
+    CHECK(changes[0].name == "log_level");
+    CHECK(changes[0].value.as_string() == "info");
+    // info to warn changes nothing on the broker
+    CHECK(settings_change_options(info, warn).empty());
 }

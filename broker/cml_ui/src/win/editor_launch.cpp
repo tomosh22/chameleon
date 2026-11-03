@@ -105,8 +105,30 @@ Result<std::wstring> resolve_editor_program(const std::string& program) {
     return found;
 }
 
-Result<void> launch_editor(const EditorConfig& config, const SourceLocation& location) {
-    Result<EditorLaunch> launch = make_editor_launch(config, location);
+Result<void> launch_editor(const EditorConfig& config, const SourceLocation& location, const std::vector<std::string>& search_dirs) {
+    SourceLocation resolved = location;
+    std::wstring working_directory;
+    const bool relative = !resolved.file.empty() && !(resolved.file.size() >= 2 && resolved.file[1] == ':') && resolved.file[0] != '\\' &&
+                          resolved.file[0] != '/';
+    if (relative) {
+        const std::wstring file = proc::wide_from_utf8(resolved.file);
+        for (const std::string& dir : search_dirs) {
+            std::wstring base = proc::wide_from_utf8(dir);
+            for (int level = 0; level < 5 && !base.empty() && working_directory.empty(); ++level) {
+                if (file_exists(base + L"\\" + file)) {
+                    working_directory = base;
+                    resolved.file = proc::utf8_from_wide(base + L"\\" + file);
+                } else {
+                    const std::size_t slash = base.find_last_of(L"\\/");
+                    base = slash == std::wstring::npos ? std::wstring() : base.substr(0, slash);
+                }
+            }
+            if (!working_directory.empty()) {
+                break;
+            }
+        }
+    }
+    Result<EditorLaunch> launch = make_editor_launch(config, resolved);
     if (!launch) {
         return launch.error();
     }
@@ -123,7 +145,8 @@ Result<void> launch_editor(const EditorConfig& config, const SourceLocation& loc
     STARTUPINFOW startup = {};
     startup.cb = sizeof startup;
     PROCESS_INFORMATION info = {};
-    if (!CreateProcessW(program->c_str(), mutable_line.data(), nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT, nullptr, nullptr, &startup,
+    if (!CreateProcessW(program->c_str(), mutable_line.data(), nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT, nullptr,
+                        working_directory.empty() ? nullptr : working_directory.c_str(), &startup,
                         &info)) {
         return Diag::make(ids::kUiEditorLaunch,
                           "cannot start the editor '" + proc::utf8_from_wide(*program) + "' (error " + std::to_string(GetLastError()) + ")",

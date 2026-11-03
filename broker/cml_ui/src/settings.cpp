@@ -153,7 +153,9 @@ json::Value settings_to_json(const Settings& s) {
     v.set("version", json::Value::integer(1));
     v.set("reload_hotkey", json::Value::string(format_hotkey(s.reload_hotkey)));
     v.set("hotkey_enabled", json::Value::boolean(s.hotkey_enabled));
-    v.set("compile_on_save", json::Value::boolean(s.compile_on_save));
+    if (s.compile_on_save) {
+        v.set("compile_on_save", json::Value::boolean(*s.compile_on_save));
+    }
     v.set("jobs", json::Value::integer(s.jobs));
     v.set("max_affected_compilands", json::Value::integer(s.max_affected_compilands));
     json::Value editor = json::Value::object();
@@ -223,7 +225,13 @@ Settings settings_from_json(const json::Value& v, std::vector<std::string>* warn
         }
     }
     boolean("hotkey_enabled", &s.hotkey_enabled);
-    boolean("compile_on_save", &s.compile_on_save);
+    if (const json::Value* m = v.find("compile_on_save"); m != nullptr && !m->is_null()) {
+        if (m->is_bool()) {
+            s.compile_on_save = m->as_bool();
+        } else {
+            warn("ui.json: 'compile_on_save' must be true or false; kept the default");
+        }
+    }
     number("jobs", 0, 256, &s.jobs);
     number("max_affected_compilands", -1, 1000000, &s.max_affected_compilands);
     if (const json::Value* e = v.find("editor")) {
@@ -326,14 +334,45 @@ Result<void> save_settings(const std::string& path, const Settings& settings) {
     return {};
 }
 
+namespace {
+
+bool lowers_broker_log(const std::string& level) {
+    return level == "trace" || level == "debug";
+}
+
+}  // namespace
+
 std::vector<OptionSetting> settings_broker_options(const Settings& s) {
     std::vector<OptionSetting> out;
-    out.push_back({"compile_on_save", json::Value::boolean(s.compile_on_save)});
+    if (s.compile_on_save) {
+        out.push_back({"compile_on_save", json::Value::boolean(*s.compile_on_save)});
+    }
     if (s.jobs > 0) {
         out.push_back({"max_parallel_compiles", json::Value::integer(s.jobs)});
     }
     if (s.max_affected_compilands >= 0) {
         out.push_back({"max_affected_compilands", json::Value::integer(s.max_affected_compilands)});
+    }
+    if (lowers_broker_log(s.min_log_level)) {
+        out.push_back({"log_level", json::Value::string(s.min_log_level)});
+    }
+    return out;
+}
+
+std::vector<OptionSetting> settings_change_options(const Settings& before, const Settings& after) {
+    std::vector<OptionSetting> out;
+    const std::vector<OptionSetting> old_options = settings_broker_options(before);
+    for (OptionSetting& option : settings_broker_options(after)) {
+        bool same = false;
+        for (const OptionSetting& old : old_options) {
+            same = same || (old.name == option.name && json::serialize(old.value) == json::serialize(option.value));
+        }
+        if (!same) {
+            out.push_back(std::move(option));
+        }
+    }
+    if (lowers_broker_log(before.min_log_level) && !lowers_broker_log(after.min_log_level)) {
+        out.push_back({"log_level", json::Value::string("info")});
     }
     return out;
 }

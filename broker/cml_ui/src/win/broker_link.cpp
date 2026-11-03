@@ -198,8 +198,7 @@ void BrokerLink::post(Task task) {
 void BrokerLink::update_settings(const Settings& settings) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        settings_ = settings;
-        settings_dirty_ = true;
+        settings_ = settings;  // used by the next (re)connect; the UI posts the changed options itself
     }
     cv_.notify_all();
 }
@@ -254,6 +253,7 @@ void BrokerLink::command_loop() {
             continue;
         }
         reported_failure = false;
+        ++connection_epoch_;  // before Connected is visible: the event thread then reads the epoch of this connection
         vm_.set_connection(ConnectionState::Connected, "broker " + vm_.broker_version());
         vm_.add_log(LogLevel::Info, "connected to broker " + vm_.broker_version());
         vm_.set_status_message("Connected to broker " + vm_.broker_version(), StatusSeverity::Info);
@@ -265,7 +265,6 @@ void BrokerLink::command_loop() {
         if (vm_.feature_available(Feature::Exceptions)) {
             static_cast<void>(controller.refresh_exceptions());
         }
-        ++connection_epoch_;
 
         bool broken = false;
         ULONGLONG next_poll = 0;

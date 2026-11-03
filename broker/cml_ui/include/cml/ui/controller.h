@@ -40,6 +40,9 @@ public:
     Result<void> wait(const std::string& what, std::uint32_t timeout_ms);
     Result<RestartSummary> restart(std::uint32_t pid);
     Result<RevertSummary> revert(std::uint32_t pid, const std::string& module, const std::string& scope);  // scope "last" | "all"
+    // Success resolves the exception. A failure because the thread is no longer held (CML4400 from the agent, CML5751
+    // from the broker) resolves it too: nothing is left to answer. Any other refusal (a Leave that cannot unwind,
+    // CML4401/4402, an unreachable agent) keeps it pending, as the thread stays held (WP-20).
     Result<void> exception_action(std::uint32_t pid, std::uint64_t exception_id, const std::string& action);
     Result<void> refresh_exceptions();
     // Makes the broker match the settings (set-option for each); returns the first failure after trying all.
@@ -50,7 +53,8 @@ public:
 
 private:
     // Gate on the capability, send, turn a failed response into a Diag (and tell the view model).
-    Result<ipc::json::Value> invoke(const Request& request, std::uint32_t timeout_ms, std::uint32_t pid = 0, const std::string& module = std::string());
+    Result<ipc::json::Value> invoke(const Request& request, std::uint32_t timeout_ms, std::uint32_t pid = 0, const std::string& module = std::string(),
+                                    std::uint64_t request_serial = 0);
 
     ViewModel& vm_;
     Transport& transport_;

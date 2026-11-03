@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "cml/ui/editor.h"
 #include "cml/util/result.h"
@@ -13,6 +14,8 @@ namespace cml::ui::win {
 Result<std::wstring> resolve_editor_program(const std::string& program);
 
 // Starts the editor on `location` with CreateProcessW (no shell). Returns once the process is created.
-Result<void> launch_editor(const EditorConfig& config, const SourceLocation& location);
+// A relative file name is looked up below each of `search_dirs` (and up to four parents of each); the first hit becomes the
+// absolute file name and the editor's working directory. Without a hit the editor starts in the UI's directory.
+Result<void> launch_editor(const EditorConfig& config, const SourceLocation& location, const std::vector<std::string>& search_dirs);
 
 }  // namespace cml::ui::win

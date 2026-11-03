@@ -31,7 +31,8 @@ struct InFlight {
 
 }  // namespace
 
-Result<json::Value> Controller::invoke(const Request& request, std::uint32_t timeout_ms, std::uint32_t pid, const std::string& module) {
+Result<json::Value> Controller::invoke(const Request& request, std::uint32_t timeout_ms, std::uint32_t pid, const std::string& module,
+                                       std::uint64_t request_serial) {
     if (const char* capability = capability_for_command(request.cmd); capability != nullptr && !vm_.capability_usable(capability)) {
         Diag diag = Diag::make(ids::kUiFeatureUnavailable, "this broker does not provide '" + request.cmd + "'",
                                std::string("Use a broker build that advertises the '") + capability + "' capability; the matching UI stays disabled.");
@@ -50,7 +51,7 @@ Result<json::Value> Controller::invoke(const Request& request, std::uint32_t tim
         } else {
             diag = Diag::make(ids::kControlResponseInvalid, "the broker answered '" + request.cmd + "' with an error and no diagnostic", "Use matching versions of cml_ui and cml_broker.");
         }
-        vm_.apply_command_failure(request.cmd, diag, pid, module);
+        vm_.apply_command_failure(request.cmd, diag, pid, module, request_serial);
         return diag;
     }
     return std::move(response->result);
@@ -80,9 +81,10 @@ Result<void> Controller::subscribe() {
 }
 
 Result<ReloadSummary> Controller::reload(std::uint32_t pid, const std::string& module, bool confirm) {
+    const std::uint64_t serial = vm_.begin_reload_request();
     InFlight in_flight(vm_);
     vm_.clear_confirm_prompt();
-    Result<json::Value> result = invoke(make_reload_request(pid, module, confirm, kReloadTimeoutMs), kReloadTimeoutMs + 10000, pid, module);
+    Result<json::Value> result = invoke(make_reload_request(pid, module, confirm, kReloadTimeoutMs), kReloadTimeoutMs + 10000, pid, module, serial);
     if (!result) {
         return result.error();
     }
@@ -131,7 +133,10 @@ Result<RevertSummary> Controller::revert(std::uint32_t pid, const std::string& m
 Result<void> Controller::exception_action(std::uint32_t pid, std::uint64_t exception_id, const std::string& action) {
     Result<json::Value> result = invoke(make_exception_action_request(pid, exception_id, action), kQuickTimeoutMs, pid);
     if (!result) {
-        // The exception is no longer pending (the process died, or another client answered): stop asking.
+        const std::uint32_t code = result.error().code;
+        if (code == 4400 || code == 5751) {
+            vm_.resolve_exception(pid, exception_id);  // not held any more (process gone, or answered elsewhere): stop asking
+        }
         return result.error();
     }
     vm_.resolve_exception(pid, exception_id);

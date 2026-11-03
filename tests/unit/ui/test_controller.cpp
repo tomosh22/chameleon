@@ -255,3 +255,40 @@ TEST_CASE("wait and set_option") {
     REQUIRE(controller.refresh_status());
     CHECK(controller.wait("idle", 1000));
 }
+
+TEST_CASE("exception-action: a thread that is gone is resolved, a refusal keeps it held (WP-20)") {
+    FakeBroker broker(kWave6);
+    std::uint32_t code = 4400;
+    broker.handlers["exception-action"] = [&](const json::Value&) {
+        return ipc::make_error_response(1, cml::Diag::make(code, "refused", "see WP-20"));
+    };
+    ViewModel vm;
+    Controller controller(vm, broker);
+    REQUIRE(controller.refresh_status());
+    for (const std::uint32_t gone : {4400u, 5751u}) {
+        vm.apply_event(cml::ui::test::event(R"({"event":"exception","pid":7,"tid":1,"exception_id":1,"code":"0x1"})"));
+        REQUIRE(vm.current_exception() != nullptr);
+        code = gone;
+        const auto r = controller.exception_action(7, 1, "continue");
+        REQUIRE_FALSE(r);
+        CHECK(r.error().code == gone);
+        CHECK(vm.current_exception() == nullptr);
+    }
+    for (const std::uint32_t refused : {4401u, 4402u, 5752u}) {
+        vm.apply_event(cml::ui::test::event(R"({"event":"exception","pid":7,"tid":1,"exception_id":2,"code":"0x1"})"));
+        code = refused;
+        REQUIRE_FALSE(controller.exception_action(7, 2, "leave"));
+        REQUIRE(vm.current_exception() != nullptr);  // the thread stays held; the user may choose another action
+        vm.resolve_exception(7, 2);
+    }
+}
+
+TEST_CASE("a default Settings sends nothing to the broker") {
+    FakeBroker broker;
+    ViewModel vm;
+    Controller controller(vm, broker);
+    REQUIRE(controller.refresh_status());
+    const std::size_t before = broker.calls.size();
+    REQUIRE(controller.apply_settings(Settings{}));
+    CHECK(broker.calls.size() == before);
+}

@@ -56,6 +56,7 @@ struct OutputLine {
     std::string text;
     SourceLocation location;  // clickable() = the line names a file and a line
     std::string diag_id;      // "CML2101" on the first line of a diagnostic
+    std::string full_message; // the whole diagnostic message, on that first line only (duplicate detection)
     std::uint32_t pid = 0;
     std::string stage;        // "compile", "link", "reload", "watch", "ui", ...
 };
@@ -166,8 +167,18 @@ public:
     void apply_revert_result(const RevertSummary& summary);
     // A command failed with `diag`; shown in the status line and, unless a diag event with the same id and text was
     // just shown, in the output panel. CML5551 on reload arms the confirm prompt; CML5402 disables the feature.
-    void apply_command_failure(const std::string& cmd, const Diag& diag, std::uint32_t pid = 0, const std::string& module = std::string());
+    // `request_serial` is the number begin_reload_request() gave the failed reload (0 = not a reload).
+    void apply_command_failure(const std::string& cmd, const Diag& diag, std::uint32_t pid = 0, const std::string& module = std::string(),
+                               std::uint64_t request_serial = 0);
     void set_reload_in_flight(bool in_flight);
+    // The one guarded entry for every reload trigger (button, hotkey, tray, menu, confirm prompt): refuses unless the
+    // broker is connected, advertises `reload` and no reload runs. On success the reload counts as running at once, so a
+    // second trigger before the first reaches the broker is refused too; `why` receives the reason otherwise (it is also
+    // shown in the status line).
+    bool try_begin_reload(std::string* why = nullptr);
+    // Called by Controller::reload: the number of this reload request (one confirm prompt per request).
+    std::uint64_t begin_reload_request();
+    std::uint64_t reload_serial() const;
     bool reload_in_flight() const { return reload_in_flight_; }
     // True while this UI or the broker is reloading.
     bool busy() const { return reload_in_flight_ || reload_running_; }
@@ -205,7 +216,8 @@ public:
     // The row for an `exception` event body or an entry of the `exceptions` answer.
     static ExceptionRow parse_exception(const ipc::json::Value& body);
     void resolve_exception(std::uint32_t pid, std::uint64_t exception_id);
-    void set_pending_exceptions(const std::vector<ExceptionRow>& rows);  // answer of the `exceptions` command
+    // The answer of the `exceptions` command is authoritative: it replaces the list (rows the broker no longer holds go away).
+    void set_pending_exceptions(const std::vector<ExceptionRow>& rows);
 
     // --- confirm prompt (CML5551) -------------------------------------------------------------------------------
     const std::optional<ConfirmPrompt>& confirm_prompt() const { return confirm_; }
@@ -220,6 +232,10 @@ public:
 private:
     std::int64_t now() const;
     void push_output(OutputLine line);
+    void count_line(const OutputLine& line, int delta);
+    void add_diag_lines(const std::string& id, const std::string& message, const std::string& action, OutputSeverity severity,
+                        const std::string& stage, std::uint32_t pid);
+    void arm_confirm(const std::string& message, std::uint32_t pid, const std::string& module, std::uint64_t request_serial);
     void add_change(const std::string& path, const std::string& state, const std::string& detail);
     PatchRecord& upsert_patch(std::uint32_t pid, const std::string& module, std::uint64_t generation);
     void on_diag(const ipc::json::Value& body);
@@ -229,7 +245,9 @@ private:
     void on_exception(const ipc::json::Value& body);
     void on_restarted(const ipc::json::Value& body);
     void on_patch_reverted(const ipc::json::Value& body);
-    bool recently_shown(const std::string& diag_id) const;
+    // A header line of this diagnostic (same id and full message) among the latest lines; `from_command` selects the
+    // lines made by a command failure instead of by a `diag` event.
+    bool recently_shown(const std::string& diag_id, const std::string& message, bool from_command) const;
 
     mutable std::recursive_mutex mutex_;
     Clock clock_;
@@ -251,6 +269,11 @@ private:
     std::deque<LogLine> log_;
     std::deque<ExceptionRow> exceptions_;
     std::optional<ConfirmPrompt> confirm_;
+    std::uint64_t reload_serial_ = 1;          // number of the latest reload request
+    std::uint64_t confirm_armed_serial_ = 0;   // request for which a CML5551 prompt was already armed (and maybe answered)
+    bool reload_reserved_ = false;             // try_begin_reload() ran, Controller::reload() has not started yet
+    std::size_t error_lines_ = 0;
+    std::size_t warning_lines_ = 0;
     std::optional<CompileProgress> progress_;
     std::uint64_t next_seq_ = 1;
     std::uint64_t ignored_events_ = 0;

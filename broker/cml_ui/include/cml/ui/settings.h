@@ -39,11 +39,11 @@ inline constexpr std::uint32_t kVkF11 = 0x7A;
 struct Settings {
     Hotkey reload_hotkey{true, true, false, false, kVkF11};  // Ctrl+Alt+F11 sends `reload`
     bool hotkey_enabled = true;
-    bool compile_on_save = false;        // set-option compile_on_save
+    std::optional<bool> compile_on_save;  // set-option compile_on_save; nullopt = leave the broker's value (the default)
     int jobs = 0;                        // set-option max_parallel_compiles; 0 = leave the broker's value
     int max_affected_compilands = -1;    // set-option max_affected_compilands; -1 = leave, 0 = no limit
     EditorConfig editor;
-    std::string min_log_level = "info";  // log view filter: trace|debug|info|warn|error
+    std::string min_log_level = "info";  // log view filter: trace|debug|info|warn|error; trace/debug also lower the broker's log_level
     bool minimize_to_tray = true;        // the close button hides the window to the tray
     bool start_broker = true;            // start cml_broker.exe next to cml_ui.exe when none answers
     std::string control_pipe;            // override of the control pipe name (empty = default)
@@ -60,11 +60,16 @@ Result<Settings> load_settings(const std::string& path, std::vector<std::string>
 Result<void> save_settings(const std::string& path, const Settings& settings);
 
 // The `set-option` calls that make the broker match the settings: {name, value}. Options at their "leave it"
-// value (jobs 0, max_affected_compilands -1) are not listed.
+// value (compile_on_save unset, jobs 0, max_affected_compilands -1, log level info or above) are not listed:
+// the UI never overrides a broker value the user did not choose.
 struct OptionSetting {
     std::string name;
     ipc::json::Value value;
 };
 std::vector<OptionSetting> settings_broker_options(const Settings& settings);
+
+// What to send when the user changes settings from `before` to `after`: every option whose value changed, plus
+// log_level "info" when the filter goes back from trace/debug (so the broker stops producing debug lines).
+std::vector<OptionSetting> settings_change_options(const Settings& before, const Settings& after);
 
 }  // namespace cml::ui

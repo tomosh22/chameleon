@@ -138,6 +138,9 @@ void ViewModel::set_connection(ConnectionState state, const std::string& text) {
     connection_text_ = text;
     if (state != ConnectionState::Connected) {
         reload_running_ = false;
+        reload_in_flight_ = false;
+        reload_reserved_ = false;
+        exceptions_.clear();  // the broker's list is authoritative; the reconnect asks for it again
     }
 }
 
@@ -235,10 +238,21 @@ bool ViewModel::apply_event_body(const json::Value& body) {
     return true;
 }
 
+void ViewModel::count_line(const OutputLine& line, int delta) {
+    std::size_t* counter = line.severity == OutputSeverity::Error ? &error_lines_ : line.severity == OutputSeverity::Warning ? &warning_lines_ : nullptr;
+    if (counter != nullptr) {
+        *counter = delta > 0 ? *counter + 1 : (*counter > 0 ? *counter - 1 : 0);
+    }
+}
+
 void ViewModel::push_output(OutputLine line) {
     line.seq = next_seq_++;
+    count_line(line, +1);
     output_.push_back(std::move(line));
-    trim_front(output_, kMaxOutput);
+    while (output_.size() > kMaxOutput) {
+        count_line(output_.front(), -1);
+        output_.pop_front();
+    }
 }
 
 void ViewModel::add_output_text(const std::string& text, OutputSeverity severity, const std::string& stage, std::uint32_t pid) {
@@ -263,15 +277,71 @@ void ViewModel::add_output_text(const std::string& text, OutputSeverity severity
     }
 }
 
-bool ViewModel::recently_shown(const std::string& diag_id) const {
-    const std::size_t count = std::min<std::size_t>(output_.size(), 20);
+bool ViewModel::recently_shown(const std::string& diag_id, const std::string& message, bool from_command) const {
+    const std::size_t count = std::min<std::size_t>(output_.size(), 60);
     for (std::size_t i = 0; i < count; ++i) {
         const OutputLine& line = output_[output_.size() - 1 - i];
-        if (line.diag_id == diag_id && line.stage != "command") {
+        if (!line.diag_id.empty() && line.diag_id == diag_id && line.full_message == message && (line.stage == "command") == from_command) {
             return true;
         }
     }
     return false;
+}
+
+void ViewModel::add_diag_lines(const std::string& id, const std::string& message, const std::string& action, OutputSeverity severity,
+                               const std::string& stage, std::uint32_t pid) {
+    std::vector<std::string> lines = split_output_lines(message);
+    if (lines.empty()) {
+        lines.emplace_back();
+    }
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        OutputLine o;
+        o.severity = i == 0 ? severity : OutputSeverity::Info;
+        o.text = lines[i];
+        o.stage = stage;
+        o.pid = pid;
+        if (i == 0) {
+            o.diag_id = id;
+            o.full_message = message;
+        }
+        if (std::optional<CompilerMessage> parsed = parse_compiler_line(lines[i])) {
+            o.severity = parsed->severity;
+            if (parsed->location.clickable()) {
+                o.location = parsed->location;
+            }
+        }
+        push_output(std::move(o));
+    }
+    if (!action.empty()) {
+        OutputLine o;
+        o.severity = OutputSeverity::Info;
+        o.text = "-> " + action;
+        o.stage = stage;
+        o.pid = pid;
+        push_output(std::move(o));
+    }
+}
+
+void ViewModel::arm_confirm(const std::string& message, std::uint32_t pid, const std::string& module, std::uint64_t request_serial) {
+    if (request_serial != 0) {
+        // From the answer of a reload request: stale answers and a prompt already armed for this request are ignored.
+        if (request_serial != reload_serial_ || confirm_armed_serial_ == request_serial) {
+            return;
+        }
+        confirm_armed_serial_ = request_serial;
+    } else if (reload_in_flight_) {
+        // The event of the reload this UI is running: one prompt per request.
+        if (confirm_armed_serial_ == reload_serial_) {
+            return;
+        }
+        confirm_armed_serial_ = reload_serial_;
+    } else {
+        // A reload the broker started itself (compile on save), or a late event of an answered request.
+        if (confirm_ || confirm_armed_serial_ == reload_serial_) {
+            return;
+        }
+    }
+    confirm_ = ConfirmPrompt{message, pid, module};
 }
 
 void ViewModel::on_diag(const json::Value& body) {
@@ -284,53 +354,16 @@ void ViewModel::on_diag(const json::Value& body) {
 
     progress_.reset();
 
-    // The answer of the command that caused this diagnostic may already have shown it.
-    bool already = false;
-    for (std::size_t i = output_.size(); i > 0 && output_.size() - i < 20; --i) {
-        const OutputLine& line = output_[i - 1];
-        if (line.diag_id == id && line.stage == "command") {
-            already = true;
-            break;
-        }
-    }
-
-    if (!already) {
-        std::vector<std::string> lines = split_output_lines(message);
-        if (lines.empty()) {
-            lines.emplace_back();
-        }
-        for (std::size_t i = 0; i < lines.size(); ++i) {
-            OutputLine o;
-            o.severity = i == 0 ? severity : OutputSeverity::Info;
-            o.text = lines[i];
-            o.stage = stage;
-            o.pid = pid;
-            if (i == 0) {
-                o.diag_id = id;
-            }
-            if (std::optional<CompilerMessage> parsed = parse_compiler_line(lines[i])) {
-                o.severity = parsed->severity;
-                if (parsed->location.clickable()) {
-                    o.location = parsed->location;
-                }
-            }
-            push_output(std::move(o));
-        }
-        if (!action.empty()) {
-            OutputLine o;
-            o.severity = OutputSeverity::Info;
-            o.text = "-> " + action;
-            o.stage = stage;
-            o.pid = pid;
-            push_output(std::move(o));
-        }
+    // The answer of the command that caused this diagnostic may already have shown it (same id and same text).
+    if (!recently_shown(id, message, true)) {
+        add_diag_lines(id, message, action, severity, stage, pid);
     }
 
     if (stage == "watch") {
         add_change(first_line_of(message), "watch", id);
     }
     if (id == "CML5551") {
-        confirm_ = ConfirmPrompt{first_line_of(message), pid, std::string()};
+        arm_confirm(first_line_of(message), pid, std::string(), 0);
     }
 }
 
@@ -494,7 +527,8 @@ void ViewModel::apply_revert_result(const RevertSummary& summary) {
     set_status_message("Reverted " + std::to_string(summary.reverted.size()) + " patch(es)", StatusSeverity::Info);
 }
 
-void ViewModel::apply_command_failure(const std::string& cmd, const Diag& diag, std::uint32_t pid, const std::string& module) {
+void ViewModel::apply_command_failure(const std::string& cmd, const Diag& diag, std::uint32_t pid, const std::string& module,
+                                      std::uint64_t request_serial) {
     auto guard = lock();
     progress_.reset();
     if (diag.code == 5402) {
@@ -503,43 +537,53 @@ void ViewModel::apply_command_failure(const std::string& cmd, const Diag& diag, 
         return;
     }
     if (cmd == "reload" && diag.code == 5551) {
-        confirm_ = ConfirmPrompt{diag.message, pid, module};
+        arm_confirm(diag.message, pid, module, request_serial != 0 ? request_serial : reload_serial_);
         set_status_message("This reload recompiles many files; confirm to continue", StatusSeverity::Warning);
     } else {
         set_status_message(diag.id() + ": " + diag.message, StatusSeverity::Error);
     }
     const std::string id = diag.id();
-    if (!recently_shown(id)) {
-        std::vector<std::string> lines = split_output_lines(diag.message);
-        if (lines.empty()) {
-            lines.emplace_back();
-        }
-        for (std::size_t i = 0; i < lines.size(); ++i) {
-            OutputLine o;
-            o.severity = i == 0 ? OutputSeverity::Error : OutputSeverity::Info;
-            o.text = lines[i];
-            o.stage = "command";
-            o.pid = pid;
-            if (i == 0) {
-                o.diag_id = id;
-            }
-            if (std::optional<CompilerMessage> parsed = parse_compiler_line(lines[i])) {
-                o.severity = parsed->severity;
-                if (parsed->location.clickable()) {
-                    o.location = parsed->location;
-                }
-            }
-            push_output(std::move(o));
-        }
-        if (!diag.what_to_do.empty()) {
-            OutputLine o;
-            o.severity = OutputSeverity::Info;
-            o.text = "-> " + diag.what_to_do;
-            o.stage = "command";
-            o.pid = pid;
-            push_output(std::move(o));
-        }
+    if (!recently_shown(id, diag.message, false)) {
+        add_diag_lines(id, diag.message, diag.what_to_do, OutputSeverity::Error, "command", pid);
     }
+}
+
+bool ViewModel::try_begin_reload(std::string* why) {
+    auto guard = lock();
+    std::string reason;
+    if (connection_ != ConnectionState::Connected) {
+        reason = "Not connected to a broker";
+    } else if (!feature_available(Feature::Reload)) {
+        reason = "This broker has no 'reload' command";
+    } else if (busy()) {
+        reason = "A reload is already running";
+    }
+    if (!reason.empty()) {
+        set_status_message(reason, StatusSeverity::Warning);
+        if (why != nullptr) {
+            *why = reason;
+        }
+        return false;
+    }
+    reload_reserved_ = true;
+    ++reload_serial_;
+    reload_in_flight_ = true;
+    return true;
+}
+
+std::uint64_t ViewModel::begin_reload_request() {
+    auto guard = lock();
+    if (reload_reserved_) {
+        reload_reserved_ = false;
+    } else {
+        ++reload_serial_;
+    }
+    return reload_serial_;
+}
+
+std::uint64_t ViewModel::reload_serial() const {
+    auto guard = lock();
+    return reload_serial_;
 }
 
 void ViewModel::set_reload_in_flight(bool in_flight) {
@@ -558,16 +602,18 @@ void ViewModel::set_status_message(const std::string& text, StatusSeverity sever
 void ViewModel::clear_output() {
     auto guard = lock();
     output_.clear();
+    error_lines_ = 0;
+    warning_lines_ = 0;
 }
 
 std::size_t ViewModel::error_count() const {
     auto guard = lock();
-    return static_cast<std::size_t>(std::count_if(output_.begin(), output_.end(), [](const OutputLine& l) { return l.severity == OutputSeverity::Error; }));
+    return error_lines_;
 }
 
 std::size_t ViewModel::warning_count() const {
     auto guard = lock();
-    return static_cast<std::size_t>(std::count_if(output_.begin(), output_.end(), [](const OutputLine& l) { return l.severity == OutputSeverity::Warning; }));
+    return warning_lines_;
 }
 
 void ViewModel::add_change(const std::string& path, const std::string& state, const std::string& detail) {
@@ -635,15 +681,7 @@ void ViewModel::resolve_exception(std::uint32_t pid, std::uint64_t exception_id)
 
 void ViewModel::set_pending_exceptions(const std::vector<ExceptionRow>& rows) {
     auto guard = lock();
-    for (const ExceptionRow& row : rows) {
-        bool known = false;
-        for (const ExceptionRow& e : exceptions_) {
-            known = known || (e.pid == row.pid && e.exception_id == row.exception_id);
-        }
-        if (!known) {
-            exceptions_.push_back(row);
-        }
-    }
+    exceptions_.assign(rows.begin(), rows.end());
     trim_front(exceptions_, kMaxExceptions);
 }
 

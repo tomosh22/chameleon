@@ -525,7 +525,8 @@ void App::unregister_hotkey() {
 // --- actions ---------------------------------------------------------------------------------------------------------
 
 void App::do_reload(std::uint32_t pid, const std::string& module, bool confirm) {
-    if (!link_) {
+    // Every trigger (button, menu, hotkey, tray, confirm prompt) passes the same guard in the view model.
+    if (!link_ || !vm_.try_begin_reload()) {
         return;
     }
     vm_.set_status_message("Reload requested...", StatusSeverity::Info);
@@ -562,7 +563,18 @@ void App::do_exception_action(const ExceptionRow& row, const std::string& action
 }
 
 void App::open_in_editor(const SourceLocation& location) {
-    Result<void> launched = launch_editor(settings_.editor, location);
+    // Compiler messages can carry paths relative to the compile directory, which the broker's diagnostics do not name:
+    // look for such a file below the directories of the modules the broker reports (and a few parents of each).
+    std::vector<std::string> search_dirs;
+    for (const ProcessRow& process : vm_.processes()) {
+        for (const ModuleRow& module : process.modules) {
+            const std::string_view parent = cml::path::parent_directory(std::string_view(module.path));
+            if (!parent.empty() && std::find(search_dirs.begin(), search_dirs.end(), parent) == search_dirs.end()) {
+                search_dirs.emplace_back(parent);
+            }
+        }
+    }
+    Result<void> launched = launch_editor(settings_.editor, location, search_dirs);
     if (!launched) {
         vm_.set_status_message(launched.error().id() + ": " + launched.error().message, StatusSeverity::Error);
         vm_.add_output_text(launched.error().format(), OutputSeverity::Error, "ui");
@@ -572,6 +584,7 @@ void App::open_in_editor(const SourceLocation& location) {
 }
 
 void App::apply_settings(const Settings& settings) {
+    const Settings before = settings_;
     settings_ = settings;
     Result<void> saved = save_settings(settings_path_, settings_);
     if (!saved) {
@@ -585,6 +598,14 @@ void App::apply_settings(const Settings& settings) {
     register_hotkey();
     if (link_) {
         link_->update_settings(settings_);
+        std::vector<OptionSetting> changes = settings_change_options(before, settings_);
+        if (!changes.empty()) {
+            link_->post([changes](Controller& controller) {
+                for (const OptionSetting& option : changes) {
+                    static_cast<void>(controller.set_option(option.name, option.value));
+                }
+            });
+        }
     }
     parse_log_level(settings_.min_log_level, &log_filter_.min_level);
 }
@@ -687,7 +708,7 @@ void App::draw_toolbar() {
 
     ImGui::SameLine();
     ImGui::BeginDisabled(!connected || !vm_.feature_available(Feature::SetOption));
-    bool compile_on_save = settings_.compile_on_save;
+    bool compile_on_save = settings_.compile_on_save.value_or(false);
     if (ImGui::Checkbox("Compile on save", &compile_on_save)) {
         Settings changed = settings_;
         changed.compile_on_save = compile_on_save;
@@ -971,6 +992,11 @@ void App::draw_log() {
     ImGui::SetNextItemWidth(100.0f);
     if (ImGui::Combo("Level", &level, kLevels, 5)) {
         log_filter_.min_level = static_cast<LogLevel>(level);
+        // Below info the broker has to produce the lines first (its log_level): go through the settings.
+        Settings changed = settings_;
+        changed.min_log_level = to_string(log_filter_.min_level);
+        apply_settings(changed);
+        load_edit_buffers();
     }
     ImGui::SameLine();
     ImGui::SetNextItemWidth(220.0f);
@@ -1028,7 +1054,14 @@ void App::draw_settings() {
     }
 
     ImGui::SeparatorText("Compilation");
-    ImGui::Checkbox("Compile on save", &edit_.compile_on_save);
+    {
+        int mode = edit_.compile_on_save ? (*edit_.compile_on_save ? 1 : 2) : 0;
+        static const char* const kModes[] = {"Leave the broker's setting", "On", "Off"};
+        ImGui::SetNextItemWidth(220.0f);
+        if (ImGui::Combo("Compile on save", &mode, kModes, 3)) {
+            edit_.compile_on_save = mode == 0 ? std::optional<bool>() : std::optional<bool>(mode == 1);
+        }
+    }
     ImGui::SetNextItemWidth(120.0f);
     ImGui::InputInt("Parallel compiles (0 = broker default)", &edit_.jobs);
     edit_.jobs = std::clamp(edit_.jobs, 0, 256);

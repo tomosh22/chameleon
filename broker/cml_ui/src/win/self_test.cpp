@@ -186,7 +186,10 @@ int run_self_test(const SelfTestOptions& options) {
     if (vm.feature_available(Feature::SetOption)) {
         Result<void> jobs = controller.set_option("max_parallel_compiles", ipc::json::Value::integer(2));
         t.check(jobs.has_value(), "set-option max_parallel_compiles");
-        Settings settings;  // defaults: compile_on_save off
+        Settings defaults;  // a default ui.json sends nothing: the broker's own values stay
+        t.check(controller.apply_settings(defaults).has_value() && settings_broker_options(defaults).empty(), "apply_settings with the defaults sends no option");
+        Settings settings;
+        settings.compile_on_save = false;
         Result<void> applied = controller.apply_settings(settings);
         t.check(applied.has_value(), "apply_settings (set-option compile_on_save false)");
         if (!applied) {
@@ -195,6 +198,16 @@ int run_self_test(const SelfTestOptions& options) {
     }
     if (vm.feature_available(Feature::Wait)) {
         t.check(controller.wait("idle", 2000).has_value(), "wait for idle");
+    }
+    if (vm.feature_available(Feature::Exceptions)) {
+        // WP-20: the real `exceptions` command; nothing is held, so the authoritative answer is empty.
+        t.check(controller.refresh_exceptions().has_value() && vm.pending_exceptions().empty(), "exceptions: the broker holds no thread");
+    }
+    if (vm.feature_available(Feature::Revert)) {
+        // WP-22: the real `revert` command with nothing to revert must answer (a result or a diagnostic), not hang or disappear.
+        Result<RevertSummary> reverted = controller.revert(0, "", "all");
+        t.check(reverted.has_value() || reverted.error().code != 5402, "revert: the broker answers (" +
+                    (reverted ? std::string("ok") : reverted.error().id()) + ")");
     }
     t.check(controller.refresh_status().has_value(), "status again after the commands");
 
@@ -242,7 +255,7 @@ int run_self_test(const SelfTestOptions& options) {
         const std::string settings_path = (work / "ui.json").string();
         t.check(save_settings(settings_path, settings).has_value(), "settings: save");
         Result<Settings> loaded = load_settings(settings_path);
-        t.check(loaded.has_value() && loaded->compile_on_save && loaded->jobs == 3, "settings: load");
+        t.check(loaded.has_value() && loaded->compile_on_save.value_or(false) && loaded->jobs == 3, "settings: load");
     }
 
     return finish();

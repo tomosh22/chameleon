@@ -266,3 +266,131 @@ TEST_CASE("log level names") {
     CHECK_FALSE(parse_log_level("loud", &l));
     CHECK(std::string(to_string(LogLevel::Error)) == "error");
 }
+
+// --- review fixes --------------------------------------------------------------------------------------------------
+
+TEST_CASE("a new diagnostic with the same id but another text is never dropped") {
+    ViewModel vm;
+    fixed_clock(vm);
+    cml::Diag a = cml::Diag::make(5401, "bad request: argument 'pid' must be an integer", "Fix pid.");
+    cml::Diag b = cml::Diag::make(5401, "bad request: argument 'module' must be a string", "Fix module.");
+    vm.apply_command_failure("reload", a);
+    vm.apply_command_failure("reload", b);
+    std::size_t headers = 0;
+    for (const OutputLine& l : vm.output()) {
+        headers += l.diag_id == "CML5401" ? 1 : 0;
+    }
+    CHECK(headers == 2);
+    // the same through events, with compile locations that differ
+    vm.apply_event(event(R"({"event":"diag","id":"CML2101","severity":"error","stage":"compile","message":"a.cpp(1,1): error C1: x"})"));
+    vm.apply_event(event(R"({"event":"diag","id":"CML2101","severity":"error","stage":"compile","message":"b.cpp(2,2): error C2: y"})"));
+    std::size_t located = 0;
+    for (const OutputLine& l : vm.output()) {
+        located += l.location.clickable() ? 1 : 0;
+    }
+    CHECK(located == 2);
+    // and a later event with the first command failure's id and text is still the same diagnostic: shown once
+    const auto ev = event(R"({"event":"diag","id":"CML5401","severity":"error","stage":"reload","message":"bad request: argument 'pid' must be an integer","action":"Fix pid."})");
+    const std::size_t before = vm.output().size();
+    vm.apply_event(ev);
+    CHECK(vm.output().size() == before);
+}
+
+TEST_CASE("every reload trigger passes one guard") {
+    ViewModel vm;
+    cml::ui::test::FakeBroker broker;
+    vm.apply_status(broker.status);
+    std::string why;
+    CHECK_FALSE(vm.try_begin_reload(&why));  // not connected yet
+    CHECK(why.find("Not connected") == 0);
+    vm.set_connection(ConnectionState::Connected, "ok");
+    CHECK(vm.try_begin_reload(&why));
+    CHECK(vm.reload_in_flight());
+    CHECK_FALSE(vm.try_begin_reload(&why));  // a second trigger before the first one ran
+    CHECK(why.find("already") != std::string::npos);
+    vm.set_reload_in_flight(false);
+    CHECK(vm.try_begin_reload());
+    vm.set_connection(ConnectionState::Failed, "lost");  // the queued task will never run
+    CHECK_FALSE(vm.reload_in_flight());
+    vm.set_connection(ConnectionState::Connected, "ok");
+    CHECK(vm.try_begin_reload());
+    vm.set_reload_in_flight(false);
+    // the broker is reloading for somebody else
+    cml::ipc::StatusReport busy = broker.status;
+    busy.reload_running = true;
+    vm.apply_status(busy);
+    CHECK_FALSE(vm.try_begin_reload());
+    // no reload capability
+    cml::ui::test::FakeBroker without({"status"});
+    vm.apply_status(without.status);
+    CHECK_FALSE(vm.try_begin_reload(&why));
+    CHECK(why.find("no 'reload'") != std::string::npos);
+}
+
+TEST_CASE("the exceptions answer is authoritative, and a lost connection clears the list") {
+    ViewModel vm;
+    fixed_clock(vm);
+    vm.apply_event(event(R"({"event":"exception","pid":10,"tid":1,"exception_id":1,"code":"0x1"})"));
+    vm.apply_event(event(R"({"event":"exception","pid":10,"tid":1,"exception_id":2,"code":"0x2"})"));
+    REQUIRE(vm.pending_exceptions().size() == 2);
+    ExceptionRow keep;
+    keep.pid = 10;
+    keep.exception_id = 2;
+    keep.code = "0x2";
+    vm.set_pending_exceptions({keep});
+    REQUIRE(vm.pending_exceptions().size() == 1);
+    CHECK(vm.current_exception()->exception_id == 2);
+    vm.set_pending_exceptions({});
+    CHECK(vm.current_exception() == nullptr);
+    vm.apply_event(event(R"({"event":"exception","pid":10,"tid":1,"exception_id":3,"code":"0x3"})"));
+    vm.set_connection(ConnectionState::Failed, "lost");
+    CHECK(vm.pending_exceptions().empty());
+}
+
+TEST_CASE("one CML5551 prompt per reload request") {
+    ViewModel vm;
+    fixed_clock(vm);
+    cml::ipc::StatusReport report;
+    report.capabilities = {"status", "reload"};
+    vm.apply_status(report);
+    vm.set_connection(ConnectionState::Connected, "ok");
+    const auto prompt_event = event(R"({"event":"diag","id":"CML5551","severity":"error","stage":"sweep","pid":10,"message":"the change affects 90 compilands","action":"confirm"})");
+    const cml::Diag failure = cml::Diag::make(5551, "the change affects 90 compilands", "confirm");
+
+    REQUIRE(vm.try_begin_reload());
+    const std::uint64_t serial = vm.begin_reload_request();
+    vm.apply_event(prompt_event);  // the event comes first
+    REQUIRE(vm.confirm_prompt());
+    vm.clear_confirm_prompt();      // the user answers at once
+    vm.apply_command_failure("reload", failure, 0, "", serial);  // the answer of the same request arrives afterwards
+    CHECK_FALSE(vm.confirm_prompt());
+    vm.apply_event(prompt_event);   // and a repeated event of the same request
+    CHECK_FALSE(vm.confirm_prompt());
+    vm.set_reload_in_flight(false);
+
+    // the next request gets its own prompt, from either path
+    REQUIRE(vm.try_begin_reload());
+    const std::uint64_t second = vm.begin_reload_request();
+    CHECK(second != serial);
+    vm.apply_command_failure("reload", failure, 0, "", second);
+    CHECK(vm.confirm_prompt());
+    // a stale answer of an older request does not arm anything
+    vm.clear_confirm_prompt();
+    vm.apply_command_failure("reload", failure, 0, "", serial);
+    CHECK_FALSE(vm.confirm_prompt());
+}
+
+TEST_CASE("error and warning counters follow push, trim and clear") {
+    ViewModel vm;
+    fixed_clock(vm);
+    for (std::size_t i = 0; i < ViewModel::kMaxOutput + 25; ++i) {
+        vm.add_output_text("a.cpp(1): error C1: e", OutputSeverity::Error, "t");
+    }
+    vm.add_output_text("a.cpp(1): warning C2: w", OutputSeverity::Warning, "t");
+    CHECK(vm.output().size() == ViewModel::kMaxOutput);
+    CHECK(vm.error_count() == ViewModel::kMaxOutput - 1);  // the warning took one slot
+    CHECK(vm.warning_count() == 1);
+    vm.clear_output();
+    CHECK(vm.error_count() == 0);
+    CHECK(vm.warning_count() == 0);
+}
