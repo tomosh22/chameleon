@@ -34,6 +34,11 @@ diagnostic is planned, not live.
 
 ## Documented behaviour (no diagnostic)
 
+- Several enabled modules and several processes (WP-16): every enabled module of every process is its own unit (own registry,
+  index, patches, hooks, source baseline). One `reload` compiles each distinct recorded command line once and then links and loads
+  a patch per process. A process that is started after an edit was made enables its modules against the edited sources: its
+  baseline is taken from the files on disk, while the process runs the binary it was built from, so that edit is not applied to
+  it until the next change of the file (rebuild and restart such a process).
 - Read-only data (`.rdata`, const tables, constants) is not bound to the old image: the patch uses a fresh copy, so edits to it take effect, but its ADDRESS changes across a patch (code of the old image that took and keeps the old address, or compares addresses, sees the old table).
 - Statics only match old records of exactly the same scope (same enclosing function, or file scope): a static that moved to another function is a new, fresh variable, and a lambda moved to another function is new code that is not hooked.
 - Functions currently executing on a thread's stack keep running old code until they return;

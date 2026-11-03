@@ -31,7 +31,13 @@ to the fixture directory).
 | `lambdas` | present | capturing lambda stored in `std::function` at startup; edit `lambda_times_10` (value (n%3)+5 → (n%3)+50) |
 | `new_function` | present | edit `add_helper` adds a new external function called by `compute_value` (value 1 → 42) |
 | `new_global` | present | edit `add_tracker` adds a global with dynamic initialiser and destructor (value 1 → 7) |
+| `exe_plus_dll` | present (WP-16) | exe + `fixture_exe_plus_dll_lib.dll`, both enabled; `TICK dll= cb= imp=`; edits `dll_scale_30` (DLL) and `exe_changes` (exe callback + code reading `__imp_lib_offset`) |
+| `two_processes` | present (WP-16) | `fixture_two_processes` (server) and `fixture_two_processes_client` share `fixture_two_processes_lib.dll`; edit `value_70` (7 → 70, per-process call counter) |
 
 Fixtures after `basic` share `common/fixture_runtime.h` (TICK loop, `--ticks`, `--agent`,
 `--agent-wait`), which only `main.cpp` includes; scenarios never patch `main.cpp`.
 
+
+Multi-module fixtures (WP-16) declare their DLLs with `cml_add_fixture_dll(<target> SOURCES ...)` and list them in
+`cml_fixture::extra_modules()` (file names beside the exe) before calling `cml_fixture::run()`, which enables them next to the
+exe. `--force-load-collisions N` makes the agent find the image range of the first N patch loads taken (relink test).
