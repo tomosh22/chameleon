@@ -621,10 +621,12 @@ private:
         if (step.has_result_value) {
             const ipc::json::Value* member = response->result.find(step.result_key);
             if (member == nullptr || !member->is_integer() || member->as_integer() != step.result_value) {
+                const ipc::json::Value* patches = response->result.find("patches");  // WP-25: per-module counts and the hooks that were kept
                 return StepOutcome::fail(cml::ids::kResultMismatch,
                                          "the reload result has " + step.result_key + " = " +
                                              (member == nullptr ? std::string("(absent)") : ipc::json::serialize(*member)) + ", expected " +
-                                             std::to_string(step.result_value));
+                                             std::to_string(step.result_value) +
+                                             (patches != nullptr ? "; patches: " + ipc::json::serialize(*patches) : std::string()));
             }
         }
         std::string summary = "patched=" + std::to_string(response->result.get_integer("patched")) +

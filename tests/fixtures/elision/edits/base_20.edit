@@ -1,0 +1,11 @@
+--- a/elision.cpp
++++ b/elision.cpp
+@@ -8,7 +8,7 @@
+
+ __declspec(noinline) int elision_base()
+ {
+-    return 10;
++    return 20;
+ }
+
+ __declspec(noinline) int elision_tmpl()
