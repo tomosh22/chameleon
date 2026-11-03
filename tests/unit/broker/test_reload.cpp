@@ -100,6 +100,7 @@ struct Rig {
 
     // knobs of the fake compiler / linker / agent
     bool fail_compile = false;
+    bool short_results = false;                 // compile_all returns one result too few
     bool compile_warning = false;               // the fake compiler reports a warning
     std::vector<std::string> compile_outputs;   // output_object of every compile request
     std::atomic<int> compile_calls{0};
@@ -129,11 +130,11 @@ struct Rig {
     Session session{1, "0.1.0"};
     std::shared_ptr<ModuleState> module;
 
-    explicit Rig(bool default_session_dir = false) {
+    explicit Rig(bool default_session_dir = false, const std::string& logic_flags = std::string()) {
         // basic_world() with the compiland's build environment recorded at the head of its module stream (before
         // the first proc), as the compilers do.
         SynthWorld w;
-        w.tu().symbols.envblock({{"cwd", dir.dir()}, {"cl", "C:\\VC\\bin\\cl.exe"}, {"cmd", "/c /Zi /Gy logic.cpp"}, {"src", "C:\\proj\\logic.cpp"}});
+        w.tu().symbols.envblock({{"cwd", dir.dir()}, {"cl", "C:\\VC\\bin\\cl.exe"}, {"cmd", "/c /Zi /Gy " + logic_flags + " logic.cpp"}, {"src", "C:\\proj\\logic.cpp"}});
         w.proc(w.tu(), "compute_value", 0x10);
         w.main_obj().symbols.envblock({{"cwd", dir.dir()}, {"cl", "C:\\VC\\bin\\cl.exe"}, {"cmd", "/c /Zi /Gy main.cpp"}, {"src", "C:\\proj\\main.cpp"}});
         w.proc(w.main_obj(), "fixture_note", 0x100);
@@ -151,7 +152,7 @@ struct Rig {
 
         PipelineEnv env;
         env.compile_all = [this](const std::vector<toolchain::CompileRequest>& requests_in, std::vector<toolchain::CompileOutcome>& outcomes, unsigned,
-                                 toolchain::CancelToken*) {
+                                 toolchain::CancelToken*, const std::function<void(std::size_t)>& on_done) {
             std::vector<Result<void>> results;
             for (std::size_t i = 0; i < requests_in.size(); ++i) {
                 ++compile_calls;
@@ -160,6 +161,12 @@ struct Rig {
                 }
                 outcomes[i].object_path = requests_in[i].output_object;
                 outcomes[i].compiler_used = "C:\\VC\\bin\\cl.exe";
+                if (on_done) {
+                    on_done(i);
+                }
+                if (short_results && i + 1 == requests_in.size() && requests_in.size() > 1) {
+                    break;  // the driver "loses" the last result
+                }
                 compile_outputs.push_back(requests_in[i].output_object);
                 if (compile_warning) {
                     outcomes[i].warnings.push_back(Diag::make(2201, "the compiler warned about logic.cpp", "Fix it."));
@@ -1057,6 +1064,132 @@ TEST_CASE("patches applied before a later compiland failed still count in the ge
     REQUIRE(accepted.size() == 1);
     CHECK(accepted[0].count("C:\\proj\\logic.cpp") == 1);
     CHECK(accepted[0].count("C:\\proj\\main.cpp") == 0);
+}
+
+// ---- WP-15: header dependency handling ----------------------------------------------------------------------------
+
+TEST_CASE("reload: a changed file of a precompiled header is refused with CML5550 before anything is compiled") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.module->index->set_sweep_override_for_testing([]() -> Result<ModuleIndex::Sweep> {
+        ModuleIndex::Sweep s;
+        const std::string pch = "C:\\proj\\pch.h";
+        s.changed = {pch};
+        s.compilands = {0, 1};
+        s.file_compilands[pch] = {0, 1};
+        s.pch_headers = {pch};
+        s.stamps[pch] = FileStamp{1, 2, 3};
+        return s;
+    });
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML5550");
+    CHECK(r.error().message.find("pch.h") != std::string::npos);
+    CHECK(rig.events->diag_ids() == std::vector<std::string>{"CML5550"});
+    CHECK(rig.compile_calls == 0);
+    CHECK(rig.requests.empty());
+    CHECK(rig.module->index->accepted_for_testing().empty());  // still "changed": reverting it makes the next reload a no-op
+}
+
+TEST_CASE("reload: more affected compilands than max_affected_compilands needs a confirmation (CML5551)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed_both();
+    rig.second_object = make_object({}, false, "no_such_function_anywhere");  // stops after the compile stage; the cap is what is tested
+    SUBCASE("above the limit and not confirmed: nothing is compiled and the count is named") {
+        rig.option("max_affected_compilands", Value::integer(1));
+        Result<Value> r = rig.reload();
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().id() == "CML5551");
+        CHECK(r.error().message.find("2 compilands") != std::string::npos);
+        CHECK(r.error().what_to_do.find("confirm") != std::string::npos);
+        CHECK(rig.compile_calls == 0);
+        CHECK(rig.requests.empty());
+    }
+    SUBCASE("confirmed: the reload proceeds") {
+        rig.option("max_affected_compilands", Value::integer(1));
+        Value args = Value::object();
+        args.set("confirm", Value::boolean(true));
+        Result<Value> r = rig.service->reload(args);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().id() == "CML3200");  // got as far as planning
+        CHECK(rig.compile_calls >= 1);
+    }
+    SUBCASE("at the limit no confirmation is needed") {
+        rig.option("max_affected_compilands", Value::integer(2));
+        Result<Value> r = rig.reload();
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().id() == "CML3200");
+    }
+    SUBCASE("with the limit off no confirmation is needed") {
+        rig.option("max_affected_compilands", Value::integer(0));
+        Result<Value> r = rig.reload();
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().id() == "CML3200");
+    }
+    SUBCASE("'confirm' must be a boolean") {
+        Value args = Value::object();
+        args.set("confirm", Value::string("yes"));
+        Result<Value> r = rig.service->reload(args);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().id() == "CML5311");
+    }
+}
+
+TEST_CASE("reload: one compile call for all units; progress is reported per finished unit") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed_both();
+    rig.second_object = make_object({}, false, "no_such_function_anywhere");
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(rig.events->count("progress") == 3);  // 0/2, 1/2, 2/2
+}
+
+TEST_CASE("reload: a compile driver that returns too few results fails the missing units (CML5318)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed_both();
+    rig.short_results = true;
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML5318");
+    CHECK(r.error().message.find("main.cpp") != std::string::npos);
+    CHECK(rig.requests.empty());
+}
+
+TEST_CASE("reload: a /Yu compiland whose precompiled header cannot be determined is refused (CML5552), whatever the scan finds") {
+    QuietLogs quiet;
+    SUBCASE("/Yu without a header name: no file to track, no .pch known to be current") {
+        Rig rig(false, "/Yu");
+        rig.enable();
+        rig.changed();
+        Result<Value> r = rig.reload();
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().id() == "CML5552");
+        CHECK(r.error().message.find("precompiled header") != std::string::npos);
+        CHECK(rig.compile_calls == 0);
+    }
+    SUBCASE("/Yu naming a header that is not on disk is refused as well") {
+        Rig rig(false, "/Yupch.h");
+        rig.enable();
+        rig.changed();
+        Result<Value> r = rig.reload();
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().id() == "CML5552");
+        CHECK(rig.compile_calls == 0);
+    }
+    SUBCASE("a TU without a precompiled header is not affected") {
+        Rig rig;
+        rig.enable();
+        rig.changed();
+        Result<Value> r = rig.reload();
+        CHECK(r.has_value());
+    }
 }
 
 // ---- WP-16: one compile per distinct command line, link and load per module ------------------------------------------------

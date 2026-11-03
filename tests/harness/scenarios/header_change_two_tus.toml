@@ -1,0 +1,39 @@
+# Scenario `header_change_two_tus` (WP-15, ADR-0013): a change to a header that holds no code must recompile every
+# translation unit that includes it. scale.h is `constexpr int kScale = 1;` - no function, no data - so clang-cl's
+# PDB does not list it for tu_a.cpp or tu_b.cpp; the broker finds both through its include scan. No .cpp file is edited.
+name = "header_change_two_tus"
+description = "fixture header_change_two_tus: a=10 b=100 -> edit scale.h -> reload -> a=20 b=200"
+fixture = "header_change_two_tus"
+timeout_s = 120
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ a=10 b=100"
+within_s = 10
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_header_change_two_tus.exe"
+within_s = 10
+
+[[step]]
+kind = "edit"
+patch = "edits/scale_2.edit"
+
+[[step]]
+kind = "reload"
+within_s = 60
+
+# Both translation units show the new behaviour.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ a=20 b=200"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ a=20 b=200"
+within_s = 10

@@ -148,8 +148,11 @@ Result<void> compile_tu(const CompileRequest& request, CompileOutcome& outcome);
 
 // Compiles all requests with min(requests, hardware_concurrency) workers. outcomes[i] and the
 // returned results[i] belong to requests[i]. On cancel, unstarted requests fail with CML2203.
+// `on_done(i)`, when set, is called once per request after it finished (also a failed one), on the worker thread that ran it:
+// calls MAY RUN CONCURRENTLY, so the callback must be thread-safe. It must not throw or block for long.
 std::vector<Result<void>> compile_all(const std::vector<CompileRequest>& requests, std::vector<CompileOutcome>& outcomes,
-                                      unsigned max_parallel = 0, CancelToken* cancel = nullptr);
+                                      unsigned max_parallel = 0, CancelToken* cancel = nullptr,
+                                      const std::function<void(std::size_t index)>& on_done = {});
 #endif
 
 }  // namespace cml::toolchain
