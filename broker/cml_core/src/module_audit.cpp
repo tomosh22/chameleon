@@ -12,6 +12,7 @@
 #include "cml/toolchain/command_line.h"
 #include "cml/toolchain/link_patch.h"
 #include "cml/toolchain/record.h"
+#include "cml/util/format.h"
 #include "cml/util/log.h"
 #include "cml/util/path.h"
 
@@ -53,11 +54,11 @@ const AuditFinding* ModuleAudit::find(const std::string& check) const noexcept {
 
 namespace {
 
-std::string upper(std::string_view s) {
+std::string detail_lower(std::string_view s) {
     std::string out(s);
     for (char& c : out) {
-        if (c >= 'a' && c <= 'z') {
-            c = static_cast<char>(c - 'a' + 'A');
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
         }
     }
     return out;
@@ -137,15 +138,14 @@ LinkOptionsFacts parse_link_options(const std::string& linker_command) {
         options_seen = true;
         const std::string body = upper(std::string_view(tok).substr(1));
         if (body == "DEBUG" || body.compare(0, 6, "DEBUG:") == 0) {
+            // link.exe: the last /DEBUG wins ("/DEBUG:FASTLINK ... /DEBUG:FULL" is a full PDB); /DEBUG:NONE turns debug info off.
             const std::string value = body.size() > 6 ? body.substr(6) : "";
-            if (value == "FASTLINK") {
+            if (value == "NONE") {
+                debug_seen = false;
+                out.debug_fastlink.reset();
+            } else {
                 debug_seen = true;
-                out.debug_fastlink = true;
-            } else if (value != "NONE") {
-                debug_seen = true;
-                if (!out.debug_fastlink) {
-                    out.debug_fastlink = false;
-                }
+                out.debug_fastlink = (value == "FASTLINK");
             }
         } else if (body.compare(0, 4, "OPT:") == 0) {
             std::size_t pos = 4;
@@ -190,9 +190,9 @@ bool command_allows_inlining(const std::string& compile_command) {
     return true;
 }
 
-std::optional<Diag> stale_inline_warning(const pdb::PdbIndex& index, std::uint32_t compiland, const std::string& display, std::uint32_t old_size,
+std::optional<Diag> stale_inline_warning(const pdb::PdbIndex& index, std::uint32_t compiland, const std::vector<std::string>& changed_small,
                                          const std::string& module_name) {
-    if (old_size == 0 || old_size > kSmallFunctionBytes || compiland >= index.compiland_count()) {
+    if (changed_small.empty() || compiland >= index.compiland_count()) {
         return std::nullopt;
     }
     Result<pdb::BuildEnv> env = index.build_env(compiland);
@@ -204,8 +204,9 @@ std::optional<Diag> stale_inline_warning(const pdb::PdbIndex& index, std::uint32
         return std::nullopt;
     }
     return Diag::make(ad::kStaleInlinedCopies,
-                      "'" + display + "' (" + std::to_string(old_size) + " bytes) changed but compiland " + base_of(index.compiland(compiland).object_name) + " of " +
-                          module_name + " is optimised; copies inlined into other translation units keep the old code.",
+                      "Compiland " + base_of(index.compiland(compiland).object_name) + " of " + module_name + " is optimised with inlining and " +
+                          std::to_string(changed_small.size()) + " small changed function(s) (" + list_names(changed_small) +
+                          ") may be inlined into their callers: a caller that is still executing, or whose own code did not change, keeps the old code.",
                       "Build iterated modules with /Ob0 or /Od, or hot-restart.");
 }
 
@@ -409,18 +410,25 @@ void audit_with_pdb(const std::string& module_path, const pdb::PdbIndex& index, 
     }
 
     // ---- /DEBUG:FULL ----------------------------------------------------------------------------------------------
+    // The PDB itself is the evidence, the linker's command line only the fallback: a command line can say FASTLINK and be
+    // overridden by a later /DEBUG:FULL, and lld-link writes a full PDB whatever it is given.
     const ProcSample procs = sample_function_symbols(index, options);
     {
+        const std::string exe_lower = detail_lower(linker.exe_path);
+        const std::string version_lower = detail_lower(linker.compile_version);
+        const bool lld = exe_lower.find("lld") != std::string::npos || version_lower.find("lld") != std::string::npos ||
+                         version_lower.find("llvm") != std::string::npos;
         std::string evidence = lo.known ? lo.detail : "the PDB records no linker command line";
+        evidence += std::string("; linker: ") + (lld ? "lld-link" : "link.exe or unknown");
         evidence += "; function symbols found for " + std::to_string(procs.found) + " of " + std::to_string(procs.sampled) + " sampled code contributions";
-        if (lo.debug_fastlink.value_or(false)) {
-            audit.findings.push_back(make("debug-info", Verdict::Fail, ad::kFastlinkPdb,
-                                          "Module " + module_name + " uses a /DEBUG:FASTLINK PDB; Chameleon needs /DEBUG:FULL.",
-                                          "Relink the module with /DEBUG:FULL.", evidence));
-        } else if (procs.sampled > 0 && procs.found == 0) {
+        if (procs.sampled > 0 && procs.found == 0) {
             audit.findings.push_back(make("debug-info", Verdict::Fail, ad::kFastlinkPdb,
                                           "The PDB of " + module_name + " holds no function symbols for its compilands (a /DEBUG:FASTLINK or stripped PDB); Chameleon needs /DEBUG:FULL.",
                                           "Relink the module with /DEBUG:FULL.", evidence));
+        } else if (procs.sampled == 0 && lo.debug_fastlink.value_or(false) && !lld) {
+            audit.findings.push_back(make("debug-info", Verdict::Fail, ad::kFastlinkPdb,
+                                          "Module " + module_name + " uses a /DEBUG:FASTLINK PDB; Chameleon needs /DEBUG:FULL.",
+                                          "Relink the module with /DEBUG:FULL.", evidence + " (no function symbols could be sampled: the command line decides)"));
         } else {
             audit.findings.push_back(make("debug-info", Verdict::Pass, ad::kFastlinkPdb, "The PDB of " + module_name + " is a full PDB.", "", evidence));
         }
@@ -464,16 +472,22 @@ void audit_with_pdb(const std::string& module_path, const pdb::PdbIndex& index, 
     }
 
     {
+        // The module is what matters for CFG: a CFG-enabled image refuses patched code as a call target. A compiland built with
+        // /guard:cf in a module that was linked without /GUARD:CF is a WARN at most (the image has no CFG table).
         const toolchain::FlagFact module_cf = toolchain::detect_module_guard_cf(image);
-        if (!s.guard_cf.empty() || module_cf.value == toolchain::Tri::Yes) {
+        const bool image_cfg = module_cf.value == toolchain::Tri::Yes || (module_cf.value == toolchain::Tri::Unknown && lo.guard_cf);
+        const std::string evidence = "image: " + module_cf.detail + "; linker /GUARD:CF " + (lo.guard_cf ? "given" : "not seen") + "; " +
+                                     std::to_string(s.guard_cf.size()) + " compilands compiled with /guard:cf";
+        if (image_cfg) {
             audit.findings.push_back(make("guard-cf", Verdict::Fail, ad::kGuardCf,
-                                          "Module " + module_name + " is built with /guard:cf" + (s.guard_cf.empty() ? "" : " (compiland " + s.guard_cf.front() + ")") +
-                                              "; patched code would not be a valid CFG call target.",
-                                          "Build with /guard:cf- for development configurations.",
-                                          "image: " + module_cf.detail + "; " + std::to_string(s.guard_cf.size()) + " compilands compiled with it"));
+                                          "Module " + module_name + " is built with /guard:cf; patched code would not be a valid CFG call target.",
+                                          "Build with /guard:cf- for development configurations.", evidence));
+        } else if (!s.guard_cf.empty()) {
+            audit.findings.push_back(make("guard-cf", Verdict::Warn, ad::kGuardCf,
+                                          "Compiland " + s.guard_cf.front() + " of " + module_name + " was compiled with /guard:cf, but the module is not CFG-enabled (not linked with /GUARD:CF).",
+                                          "Build with /guard:cf- for development configurations.", evidence));
         } else {
-            audit.findings.push_back(make("guard-cf", Verdict::Pass, ad::kGuardCf, "Module " + module_name + " is not built with /guard:cf.", "",
-                                          "image: " + module_cf.detail));
+            audit.findings.push_back(make("guard-cf", Verdict::Pass, ad::kGuardCf, "Module " + module_name + " is not built with /guard:cf.", "", evidence));
         }
     }
 

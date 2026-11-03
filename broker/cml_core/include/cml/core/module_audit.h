@@ -19,8 +19,8 @@
 //   CML1601 /FUNCTIONPADMIN + /hotpatch        WARN   CML1602 /OPT:NOREF /OPT:NOICF              WARN
 //   CML1603 /Ob0 or /Od on iterated modules    WARN
 //
-// CML3104 (a changed small function of an optimised compiland may have inlined copies elsewhere) is the same
-// condition as CML1603 seen per function at reload time: stale_inline_warning() raises it, the pipeline calls it.
+// CML3104 (a changed small function of an optimised compiland may be inlined into callers) is the same condition as CML1603
+// seen at reload time: stale_inline_warning() raises it, the pipeline calls it once per compiland.
 //
 // Portable; no threads.
 
@@ -120,9 +120,11 @@ bool command_allows_inlining(const std::string& compile_command);
 // Size in bytes up to which a changed function counts as "small" for CML3104.
 inline constexpr std::uint32_t kSmallFunctionBytes = 128;
 
-// CML3104 (warning) when `compiland` was compiled with inlining and the changed function `display` (`old_size` bytes in the
-// running module, 0 = unknown) is small: copies inlined into other translation units keep the old code.
-std::optional<Diag> stale_inline_warning(const pdb::PdbIndex& index, std::uint32_t compiland, const std::string& display,
-                                         std::uint32_t old_size, const std::string& module_name);
+// CML3104 (warning, at most one per compiland of a reload): `compiland` was compiled with inlining and `changed_small` names the changed
+// functions of at most kSmallFunctionBytes bytes that are being hooked. What the warning says is limited to what is true (see
+// docs/wp/WP-18.md): a caller that is still executing, or whose hook was narrowed away, keeps the code it was built with, and
+// a small changed function may have been inlined into it. nullopt when the list is empty or the compiland does not inline.
+std::optional<Diag> stale_inline_warning(const pdb::PdbIndex& index, std::uint32_t compiland, const std::vector<std::string>& changed_small,
+                                         const std::string& module_name);
 
 }  // namespace cml::core

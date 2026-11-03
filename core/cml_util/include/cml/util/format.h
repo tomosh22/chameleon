@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 namespace cml {
 
@@ -20,6 +21,17 @@ inline std::string hex(std::uint64_t value) {
     *--begin = 'x';
     *--begin = '0';
     return std::string(begin, static_cast<std::size_t>(end - begin));
+}
+
+// ASCII upper-case copy of `s`.
+inline std::string upper(std::string_view s) {
+    std::string out(s);
+    for (char& c : out) {
+        if (c >= 'a' && c <= 'z') {
+            c = static_cast<char>(c - 'a' + 'A');
+        }
+    }
+    return out;
 }
 
 }  // namespace cml

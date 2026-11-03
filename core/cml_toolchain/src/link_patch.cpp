@@ -517,9 +517,27 @@ bool has_linker_code(const std::string& line, const char* severity) {
     return false;
 }
 
+// "<stem>: <severity>:" at the start of the line, where <stem> begins "lld-link" or is the configured linker's stem.
+bool has_lld_prefix(const std::string& line, const char* severity, std::string_view linker_stem) {
+    const std::size_t colon = line.find(':');
+    if (colon == std::string::npos || colon == 0) {
+        return false;
+    }
+    const std::string stem = detail::lower(std::string_view(line).substr(0, colon));
+    if (stem.find_first_of(" \\/") != std::string::npos) {
+        return false;
+    }
+    const bool lld_name = stem.rfind("lld-link", 0) == 0 || (!linker_stem.empty() && stem == detail::lower(linker_stem));
+    if (!lld_name) {
+        return false;
+    }
+    const std::string key = std::string(": ") + severity + ":";
+    return line.compare(colon, key.size(), key) == 0;
+}
+
 }  // namespace
 
-LinkOutputSummary summarize_link_output(std::string_view output) {
+LinkOutputSummary summarize_link_output(std::string_view output, std::string_view linker_stem) {
     LinkOutputSummary s;
     std::size_t pos = 0;
     while (pos <= output.size()) {
@@ -537,8 +555,8 @@ LinkOutputSummary summarize_link_output(std::string_view output) {
         // line. A line that merely contains ": warning: " (the output of a tool the linker ran, a source path) is not a diagnostic.
         const bool msvc_error = has_linker_code(line, "error");
         const bool msvc_warning = has_linker_code(line, "warning");
-        const bool lld_error = line.rfind("lld-link: error:", 0) == 0;
-        const bool lld_warning = line.rfind("lld-link: warning:", 0) == 0;
+        const bool lld_error = has_lld_prefix(line, "error", linker_stem);
+        const bool lld_warning = has_lld_prefix(line, "warning", linker_stem);
         if (msvc_error || lld_error) {
             s.errors.push_back(line);
             static const char kMsvc[] = "unresolved external symbol ";

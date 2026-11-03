@@ -96,7 +96,8 @@ enum {
     CML_STATUS_AGENT_LOAD_FAILED = 5294,
     CML_STATUS_NOT_CONNECTED = 5295,   /* reserved */
     CML_STATUS_TIMEOUT = 5296,         /* the wait elapsed; the request is still open */
-    CML_STATUS_UNKNOWN_REQUEST = 5297, /* no such request id (never issued, or already consumed) */
+    CML_STATUS_UNKNOWN_REQUEST = 5297, /* no such request id: never issued, already consumed, or an answer nobody collected for
+                                        * 10 minutes (the agent drops those; FU-02) */
     /* The agent diagnostics an application can get back from a call, named so that "the agent is not
      * running any more" is told apart from "the wait timed out" (FU-01). */
     CML_STATUS_NOT_RUNNING = 5215,     /* the agent was stopped (cml_destroy_agent): nothing is queued, every open

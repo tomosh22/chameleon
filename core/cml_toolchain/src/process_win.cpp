@@ -140,11 +140,11 @@ std::vector<DWORD> job_process_ids(HANDLE job, std::vector<char>& buffer) {
 // ---- the fallback when there is no job (FU-07) --------------------------------------------------------------------------
 // If the process could not be put into a job object (it is in a job of the caller that forbids nesting, or the assignment
 // failed otherwise), cancelling used to kill the driver only and leave its compiler helpers running. The fallback finds the
-// helpers through the parent process id in a process snapshot, with two guards against the staleness the job avoids:
-//   * a candidate counts as a child only if it was CREATED between its parent's creation and the moment the driver was
-//     killed. A process that was started later by a different process which reused the dead driver's pid is created after
-//     the kill, and a process created before its claimed parent cannot be its child;
-//   * mspdbsrv.exe is never touched (it is shared with other compiles), whatever its parent pid says.
+// helpers through the parent process id in a process snapshot. The family is tracked with OPEN HANDLES: a process object whose
+// handle we hold cannot have its pid reused, so a snapshot entry whose parent pid is a member of the family really is a child of
+// that member (children of helpers that started while the kill was running are found by the next pass, whenever they started).
+// The one remaining defence is a lower bound: a process created before its claimed parent cannot be its child. mspdbsrv.exe is
+// never touched (it is shared with other compiles), whatever its parent pid says. One 200 ms budget is shared by all waits.
 std::uint64_t filetime_value(const FILETIME& ft) {
     return (static_cast<std::uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
 }
@@ -161,16 +161,21 @@ bool process_creation_time(HANDLE h, std::uint64_t* out) {
     return true;
 }
 
-// Terminates the descendants of `root_pid` (created at `root_created`, killed at `killed_at`; FILETIME values), at most
-// four passes because a helper can start another one while the first are being killed.
-void kill_descendants(DWORD root_pid, std::uint64_t root_created, std::uint64_t killed_at) {
-    std::map<DWORD, std::uint64_t> family;  // pid -> creation time of the processes known to belong to the tree
-    family[root_pid] = root_created;
-    std::vector<HANDLE> terminated;
+// Terminates the descendants of the process `root` (pid `root_pid`, created at `root_created`), at most four passes. `root`
+// stays owned by the caller.
+void kill_descendants(HANDLE root, DWORD root_pid, std::uint64_t root_created) {
+    struct Member {
+        HANDLE handle = nullptr;  // owned, except the root's
+        std::uint64_t created = 0;
+    };
+    std::map<DWORD, Member> family;
+    family[root_pid] = Member{root, root_created};
+    const ULONGLONG deadline = GetTickCount64() + 200;  // shared by every wait of every pass
+    std::vector<HANDLE> to_wait;
     for (int pass = 0; pass < 4; ++pass) {
         HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if (snapshot == INVALID_HANDLE_VALUE) {
-            return;
+            break;
         }
         std::vector<std::pair<DWORD, DWORD>> processes;  // pid, parent pid
         PROCESSENTRY32W entry{};
@@ -179,6 +184,7 @@ void kill_descendants(DWORD root_pid, std::uint64_t root_created, std::uint64_t 
             processes.emplace_back(entry.th32ProcessID, entry.th32ParentProcessID);
         }
         CloseHandle(snapshot);
+        bool added = false;
         bool grew = true;
         while (grew) {  // a descendant listed before its parent in the snapshot is found by the next round
             grew = false;
@@ -192,28 +198,32 @@ void kill_descendants(DWORD root_pid, std::uint64_t root_created, std::uint64_t 
                     continue;
                 }
                 std::uint64_t created = 0;
-                if (!process_creation_time(h, &created) || created < known_parent->second || created > killed_at || is_pdb_server(h)) {
+                if (!process_creation_time(h, &created) || created < known_parent->second.created || is_pdb_server(h)) {
                     CloseHandle(h);
                     continue;
                 }
-                family[pid] = created;
+                family[pid] = Member{h, created};  // the handle stays open until the end: the pid cannot be reused
                 grew = true;
+                added = true;
                 if (WaitForSingleObject(h, 0) != WAIT_OBJECT_0) {
                     TerminateProcess(h, 1);
-                    terminated.push_back(h);
-                } else {
-                    CloseHandle(h);
+                    to_wait.push_back(h);
                 }
             }
         }
-        if (terminated.empty()) {
-            return;
+        for (HANDLE h : to_wait) {
+            const ULONGLONG now = GetTickCount64();
+            WaitForSingleObject(h, now < deadline ? static_cast<DWORD>(deadline - now) : 0);
         }
-        for (HANDLE h : terminated) {
-            WaitForSingleObject(h, 200);
-            CloseHandle(h);
+        to_wait.clear();
+        if (!added) {
+            break;
         }
-        terminated.clear();
+    }
+    for (auto& [pid, member] : family) {
+        if (pid != root_pid && member.handle != nullptr) {
+            CloseHandle(member.handle);
+        }
     }
 }
 
@@ -251,14 +261,11 @@ struct Killable {
             return false;  // exited on its own just now: not a cancellation
         }
         killed = true;
-        FILETIME kill_time{};
-        GetSystemTimeAsFileTime(&kill_time);
-        const std::uint64_t killed_at = filetime_value(kill_time);
         if (process != nullptr) {
             TerminateProcess(process, 1);  // the driver first: it must not spawn another stage
         }
         if (job == nullptr && process_created != 0) {
-            kill_descendants(pid, process_created, killed_at);  // FU-07
+            kill_descendants(process, pid, process_created);  // FU-07
         }
         if (job != nullptr) {
             constexpr DWORD kMaxIds = 4096;

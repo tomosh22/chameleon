@@ -396,6 +396,23 @@ TEST_CASE("link output: only the linkers' own diagnostics count (FU-11)") {
     CHECK(real.unresolved[1] == "h");
 }
 
+TEST_CASE("link output: lld names its diagnostics after argv[0] (lld-link-18, a renamed binary)") {
+    const LinkOutputSummary versioned = summarize_link_output(
+        "lld-link-18: error: undefined symbol: foo\n>>> referenced by x.obj:(f)\nlld-link-18: warning: something\n");
+    CHECK(versioned.errors.size() == 1);
+    CHECK(versioned.warnings.size() == 1);
+    REQUIRE(versioned.unresolved.size() == 1);
+    CHECK(versioned.unresolved[0] == "foo");
+    // A binary with another name counts when it is the configured linker.
+    const std::string renamed = "mylink: error: undefined symbol: bar\n";
+    CHECK(summarize_link_output(renamed).errors.empty());
+    CHECK(summarize_link_output(renamed, "mylink").errors.size() == 1);
+    CHECK(summarize_link_output(renamed, "MyLink").unresolved.at(0) == "bar");
+    // Not the start of the line / not a plain word: no.
+    CHECK(summarize_link_output("see lld-link: error: quoted\n").errors.empty());
+    CHECK(summarize_link_output("C:\\lld-link: error: path\n").errors.empty());
+}
+
 TEST_CASE("link output: banner lines and empty output produce nothing") {
     CHECK(summarize_link_output("").errors.empty());
     const LinkOutputSummary s = summarize_link_output("   Creating library x.lib and object x.exp\r\n");

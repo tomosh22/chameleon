@@ -121,7 +121,7 @@ public:
 private:
     explicit ModuleIndex(ModuleIndexSpec spec);
     void run();
-    void set_status(IndexState state, std::uint32_t percent, std::string phase, std::optional<Diag> error = std::nullopt);
+    void set_status(IndexState state, std::uint32_t percent, std::string phase, std::optional<Diag> error = std::nullopt, bool drop_pdb = false);
     Result<std::shared_ptr<const pdb::PdbIndex>> open_pdb();
 
     ModuleIndexSpec spec_;

@@ -625,9 +625,15 @@ private:
                 }
             }
         }
-        // WP-18, CML3104: a changed small function of an optimised compiland may be inlined into other translation units.
-        for (const bind::HookEntry& h : hooks) {
-            if (std::optional<Diag> stale = stale_inline_warning(pdb, u.compiland, h.display, h.old_size, module_.name)) {
+        // WP-18, CML3104: a changed small function of an optimised compiland may be inlined into its callers (one warning per compiland).
+        {
+            std::vector<std::string> small_changed;  // one warning per compiland, naming the small functions
+            for (const bind::HookEntry& h : hooks) {
+                if (h.old_size != 0 && h.old_size <= kSmallFunctionBytes) {
+                    small_changed.push_back(h.display);
+                }
+            }
+            if (std::optional<Diag> stale = stale_inline_warning(pdb, u.compiland, small_changed, module_.name)) {
                 warn(report, "plan", std::move(*stale));
             }
         }

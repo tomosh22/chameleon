@@ -5,6 +5,8 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <mutex>
 
 #include "../pdb/pdb_builder.h"
 #include "../pdb/test_util.h"
@@ -43,6 +45,9 @@ struct ModOpts {
     bool write_pdb = true;
     std::array<std::uint8_t, 16> pdb_guid = kGuid;
     bool second_tu_without_command = false;
+    std::string link_exe = "C:\\vc\\bin\\link.exe";  // what the linker module records as its program
+    bool no_contributions = false;            // no section contributions: no function symbol can be sampled
+    bool cfg_image = false;                   // DllCharacteristics GUARD_CF set in the PE
 };
 
 // One synthetic module on disk: app.exe + app.pdb with one translation unit "a.cpp.obj" and a `* Linker *` compiland.
@@ -64,11 +69,13 @@ struct Module {
         tp::Module linker;
         linker.name = "* Linker *";
         if (!o.link.empty()) {
-            linker.symbols.envblock({{"cwd", "C:\\proj"}, {"exe", "C:\\vc\\bin\\link.exe"}, {"cmd", o.link}});
+            linker.symbols.envblock({{"cwd", "C:\\proj"}, {"exe", o.link_exe}, {"cmd", o.link}});
         }
         spec.modules.push_back(std::move(linker));
         const std::uint16_t last = static_cast<std::uint16_t>(spec.modules.size() - 1);
-        spec.contributions = {{1, 0x000, 0x100, 0}, {1, 0x100, 0x100, o.second_tu_without_command ? std::uint16_t(1) : last}};
+        if (!o.no_contributions) {
+            spec.contributions = {{1, 0x000, 0x100, 0}, {1, 0x100, 0x100, o.second_tu_without_command ? std::uint16_t(1) : last}};
+        }
         spec.symrec.pub32("a_func", 0x3, 1, 0x10);
         pdb = dir.file("app.pdb");
         exe = dir.file("app.exe");
@@ -80,6 +87,9 @@ struct Module {
         tp::Bytes pe = tp::build_pe(kGuid, 1, pdb);
         pe[0x84] = static_cast<std::uint8_t>(o.pe_machine & 0xFF);
         pe[0x85] = static_cast<std::uint8_t>(o.pe_machine >> 8);
+        if (o.cfg_image) {
+            pe[0xDF] = static_cast<std::uint8_t>(pe[0xDF] | 0x40);  // DllCharacteristics (optional header + 70) |= IMAGE_DLLCHARACTERISTICS_GUARD_CF
+        }
         tp::write_file(exe, pe);
     }
 
@@ -182,21 +192,37 @@ TEST_CASE("audit: /GL is CML1103 FAIL, from the command line and from the S_COMP
     CHECK(finding(b, "gl").id == 1103);
 }
 
-TEST_CASE("audit: /guard:cf is CML1104 FAIL") {
+TEST_CASE("audit: /guard:cf is CML1104 FAIL when the image is CFG-enabled, WARN when only a compiland was compiled with it") {
     QuietLogs quiet;
     ModOpts o;
     o.compile = "/c /Zi /Gy /guard:cf a.cpp";
+    o.cfg_image = true;
     Module m(o);
     const ModuleAudit a = audit_module_file(m.exe);
     CHECK(finding(a, "guard-cf").verdict == Verdict::Fail);
     CHECK(finding(a, "guard-cf").id == 1104);
     CHECK(a.has_failures());
+
+    // Compiled with /guard:cf but linked without /GUARD:CF: the image has no CFG table, so only a warning.
+    ModOpts compile_only;
+    compile_only.compile = "/c /Zi /Gy /guard:cf a.cpp";
+    Module m1(compile_only);
+    const ModuleAudit w = audit_module_file(m1.exe);
+    CHECK(finding(w, "guard-cf").verdict == Verdict::Warn);
+    CHECK(finding(w, "guard-cf").id == 1104);
+    CHECK_FALSE(w.has_failures());
+
     // clang's spelling in a cc1 command
     ModOpts c;
     c.compile = "-cc1 -triple x86_64-pc-windows-msvc19.40.0 -ffunction-sections -cfguard a.cpp";
     Module m2(c);
-    CHECK(finding(audit_module_file(m2.exe), "guard-cf").id == 1104);
-    CHECK(finding(audit_module_file(m2.exe), "guard-cf").verdict == Verdict::Fail);
+    CHECK(finding(audit_module_file(m2.exe), "guard-cf").verdict == Verdict::Warn);
+    c.cfg_image = true;
+    Module m3(c);
+    CHECK(finding(audit_module_file(m3.exe), "guard-cf").verdict == Verdict::Fail);
+
+    // Image flag unknown (a function table without the DllCharacteristics bit cannot be told apart): the link option decides.
+    CHECK(parse_link_options("/DEBUG:FULL /GUARD:CF").guard_cf);
 }
 
 TEST_CASE("audit: /Gy absent is CML1105 FAIL; /ZI and /O2 imply it") {
@@ -233,24 +259,46 @@ TEST_CASE("audit: a compiland without a recorded command line is CML1102 (FAIL w
     CHECK_FALSE(b.has_failures());
 }
 
-TEST_CASE("audit: /DEBUG:FASTLINK is CML1101 FAIL, from the linker command and from a PDB without function symbols") {
+TEST_CASE("audit: a PDB without function symbols is CML1101 FAIL; the command line only decides when the PDB cannot say") {
     QuietLogs quiet;
-    ModOpts o;
-    o.link = "/DEBUG:FASTLINK /INCREMENTAL:NO /OUT:app.exe";
-    Module m(o);
-    const ModuleAudit a = audit_module_file(m.exe);
-    CHECK(finding(a, "debug-info").verdict == Verdict::Fail);
-    CHECK(finding(a, "debug-info").id == 1101);
-    CHECK(finding(a, "debug-info").message.find("FASTLINK") != std::string::npos);
-
+    // The PDB is the evidence: compilands that contributed code but list no function are a FASTLINK / stripped PDB.
     ModOpts bare;
-    bare.link = "";  // the linker recorded nothing: only the symbols can tell
+    bare.link = "";
     bare.procs = false;
-    Module m2(bare);
-    const ModuleAudit b = audit_module_file(m2.exe);
+    Module m(bare);
+    const ModuleAudit b = audit_module_file(m.exe);
     CHECK(finding(b, "debug-info").verdict == Verdict::Fail);
     CHECK(finding(b, "debug-info").id == 1101);
     CHECK(b.has_failures());
+
+    // /DEBUG:FASTLINK on the command line, but the PDB has its function symbols: a full PDB, no FAIL.
+    ModOpts overridden;
+    overridden.link = "/DEBUG:FASTLINK /DEBUG:FULL /INCREMENTAL:NO /OUT:app.exe";
+    Module m2(overridden);
+    CHECK(finding(audit_module_file(m2.exe), "debug-info").verdict == Verdict::Pass);
+    ModOpts contradicting;
+    contradicting.link = "/DEBUG:FASTLINK /INCREMENTAL:NO /OUT:app.exe";
+    Module m3(contradicting);
+    CHECK(finding(audit_module_file(m3.exe), "debug-info").verdict == Verdict::Pass);  // the symbols are there
+
+    // Nothing to sample (no section contributions): the command line decides, for link.exe ...
+    ModOpts unsampled;
+    unsampled.no_contributions = true;
+    unsampled.link = "/DEBUG:FASTLINK /OUT:app.exe";
+    Module m4(unsampled);
+    const ModuleAudit f = audit_module_file(m4.exe);
+    CHECK(finding(f, "debug-info").verdict == Verdict::Fail);
+    CHECK(finding(f, "debug-info").id == 1101);
+    CHECK(finding(f, "debug-info").message.find("FASTLINK") != std::string::npos);
+    // ... a later /DEBUG:FULL wins ...
+    unsampled.link = "/DEBUG:FASTLINK /DEBUG:FULL /OUT:app.exe";
+    Module m5(unsampled);
+    CHECK(finding(audit_module_file(m5.exe), "debug-info").verdict == Verdict::Pass);
+    // ... and lld-link writes a full PDB whatever it is given.
+    unsampled.link = "/DEBUG:FASTLINK /OUT:app.exe";
+    unsampled.link_exe = "C:\\Program Files\\LLVM\\bin\\lld-link.exe";
+    Module m6(unsampled);
+    CHECK(finding(audit_module_file(m6.exe), "debug-info").verdict == Verdict::Pass);
 }
 
 TEST_CASE("audit: a missing PDB is CML1410 FAIL, a PDB of another build CML1411 FAIL") {
@@ -351,6 +399,11 @@ TEST_CASE("link options: defaults follow /DEBUG, explicit options win, the last 
     LinkOptionsFacts fast = parse_link_options("-debug:fastlink -GUARD:CF");
     CHECK(*fast.debug_fastlink);
     CHECK(fast.guard_cf);
+    // /DEBUG is last-wins (link.exe).
+    CHECK_FALSE(*parse_link_options("/DEBUG:FASTLINK /DEBUG:FULL").debug_fastlink);
+    CHECK(*parse_link_options("/DEBUG:FULL /DEBUG:FASTLINK").debug_fastlink);
+    CHECK_FALSE(*parse_link_options("/DEBUG:FASTLINK /DEBUG").debug_fastlink);
+    CHECK_FALSE(parse_link_options("/DEBUG:FASTLINK /DEBUG:NONE").debug_fastlink.has_value());
 }
 
 TEST_CASE("inlining: only optimised compilands without /Ob0 or -fno-inline allow it") {
@@ -375,20 +428,22 @@ TEST_CASE("CML3104: a changed small function of an optimised compiland warns; bi
     auto index = pdb::PdbIndex::open_for_pe(m.exe, po);
     REQUIRE_MESSAGE(index.has_value(), index.error().format());
     const std::uint32_t ci = (*index)->compilands_by_object_stem("a")[0];
-    const std::optional<Diag> small = stale_inline_warning(**index, ci, "a_func", 6, "app.exe");
+    const std::optional<Diag> small = stale_inline_warning(**index, ci, {"a_func", "b_func"}, "app.exe");
     REQUIRE(small.has_value());
     CHECK(small->code == 3104);
     CHECK(small->message.find("a_func") != std::string::npos);
+    CHECK(small->message.find("b_func") != std::string::npos);
     CHECK(small->message.find("a.cpp.obj") != std::string::npos);
+    CHECK(small->message.find("2 small changed function") != std::string::npos);  // one diagnostic for the whole compiland
+    CHECK(small->message.find("other translation unit") == std::string::npos);    // that is not what happens (docs/wp/WP-18.md)
     CHECK_FALSE(small->what_to_do.empty());
-    CHECK_FALSE(stale_inline_warning(**index, ci, "a_func", kSmallFunctionBytes + 1, "app.exe").has_value());
-    CHECK_FALSE(stale_inline_warning(**index, ci, "a_func", 0, "app.exe").has_value());  // size unknown
+    CHECK_FALSE(stale_inline_warning(**index, ci, {}, "app.exe").has_value());
 
     ModOpts od;
     Module m2(od);
     auto index2 = pdb::PdbIndex::open_for_pe(m2.exe, po);
     REQUIRE(index2.has_value());
-    CHECK_FALSE(stale_inline_warning(**index2, (*index2)->compilands_by_object_stem("a")[0], "a_func", 6, "app.exe").has_value());
+    CHECK_FALSE(stale_inline_warning(**index2, (*index2)->compilands_by_object_stem("a")[0], {"a_func"}, "app.exe").has_value());
 }
 
 TEST_CASE("check command: exit code 0 without FAIL, 1 with, 2 for a bad command line; text and JSON output") {
@@ -447,17 +502,29 @@ TEST_CASE("enable time: the index of a module that fails the audit fails with th
     QuietLogs quiet;
     ModOpts o;
     o.compile = "/c /Zi /Gy /guard:cf a.cpp";
+    o.cfg_image = true;
     Module bad(o);
     std::atomic<int> audits{0};
     std::string seen;
     ModuleIndexSpec spec;
     spec.module_path = bad.exe;
     spec.audit = true;
+    std::shared_ptr<ModuleIndex> index_for_hook;
+    std::mutex hook_mutex;
     spec.on_audit = [&](const ModuleAudit& a) {
         ++audits;
+        // Between the audit and the Failed state: the PDB is still available (and is handed out), but it must not stay mapped afterwards.
+        std::lock_guard<std::mutex> lock(hook_mutex);
+        if (index_for_hook) {
+            (void)index_for_hook->acquire_pdb();
+        }
         seen = a.first_failure() != nullptr ? a.first_failure()->diag().id() : "";
     };
     auto index = ModuleIndex::start(spec);
+    {
+        std::lock_guard<std::mutex> lock(hook_mutex);
+        index_for_hook = index;
+    }
     REQUIRE(index->wait(20000));
     CHECK(index->status().state == IndexState::Failed);
     REQUIRE(index->status().error.has_value());
@@ -465,7 +532,11 @@ TEST_CASE("enable time: the index of a module that fails the audit fails with th
     CHECK(audits.load() == 1);
     CHECK(seen == "CML1104");
     CHECK(index->audit().has_value());
-    CHECK(index->pdb() == nullptr);  // released: a module that cannot be enabled keeps no mapping (ADR-0017)
+    CHECK(index->pdb() == nullptr);
+    {
+        std::lock_guard<std::mutex> lock(hook_mutex);
+        index_for_hook.reset();  // (the hook holds the index: break the cycle before it is destroyed)
+    }  // released: a module that cannot be enabled keeps no mapping (ADR-0017)
     CHECK_FALSE(index->acquire_pdb().has_value());
 
     Module good;
