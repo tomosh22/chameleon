@@ -31,9 +31,20 @@
  *   CML_BROKER_ARGS    extra command-line arguments appended when auto-starting the broker
  *   CML_AGENT_LOG      path of a file the agent appends its log to
  *
- * Reserved for a later work package (WP-17), NOT defined yet: CML_PREPATCH_HOOK,
- * CML_POSTPATCH_HOOK, CML_COMPILE_START_HOOK, CML_COMPILE_SUCCESS_HOOK, CML_COMPILE_ERROR_HOOK,
- * CML_PRERESTART_HOOK.
+ * Hooks (file scope, any module the agent watches, also in code you add in a patch):
+ *   CML_PREPATCH_HOOK(fn)         void fn(void)  runs before the hooks of a patch are written
+ *   CML_POSTPATCH_HOOK(fn)        void fn(void)  runs after they were written (rebuild state by hand)
+ *   CML_COMPILE_START_HOOK(fn)    void fn(void)  the broker started compiling
+ *   CML_COMPILE_SUCCESS_HOOK(fn)  void fn(void)  the compile finished without errors
+ *   CML_COMPILE_ERROR_HOOK(fn)    void fn(const char* message)  the compile failed (UTF-8, one line)
+ *   CML_PRERESTART_HOOK(fn)       void fn(void)  reserved: restart is not implemented yet, never called
+ * Patch hooks run on the thread that applies the patch: inside SyncPoint() in synchronised mode,
+ * on the agent thread in immediate mode. Once the pre-patch hooks ran, the post-patch hooks run too, also when
+ * the installation failed (ask cml_last_patch_status()). Compile hooks run inside SyncPoint() in synchronised
+ * mode and on a separate worker thread in immediate mode (a slow one never stalls the agent). Several hooks of
+ * one kind run in the order the linker placed them. A hook must not call DestroyAgent (refused, CML5655), and a
+ * hook on the agent thread (immediate mode, patch hooks) must not block in WaitForRequest (refused, CML5656;
+ * polling with timeout 0 is fine).
  *
  * Compiles clean as C99, C++14 and C++20 at /W4 /WX (cl) and -Wall -Wextra -Werror (clang-cl),
  * with WIN32_LEAN_AND_MEAN / NOMINMAX defined or not. The header uses no exceptions and no RTTI.
@@ -119,6 +130,33 @@ typedef struct cml_reply {
 } cml_reply;
 
 /* ------------------------------------------------------------------------------------------ */
+/* Hook registration records (CML_*_HOOK macros). The agent finds them by scanning the section */
+/* ".cmlhk" of every enabled module and patch image, so this layout is part of the ABI.       */
+/* ------------------------------------------------------------------------------------------ */
+
+/* Generic function pointer; GetProcAddress results and hook functions are converted through it so
+ * that the casts stay warning-free under -Wcast-function-type. */
+typedef void (*cml_generic_fn)(void);
+
+#define CML_HOOK_MAGIC 0x4B484D43u /* 'C' 'M' 'H' 'K' */
+
+enum {
+    CML_HOOK_PREPATCH = 1,
+    CML_HOOK_POSTPATCH = 2,
+    CML_HOOK_COMPILE_START = 3,
+    CML_HOOK_COMPILE_SUCCESS = 4,
+    CML_HOOK_COMPILE_ERROR = 5,
+    CML_HOOK_PRERESTART = 6
+};
+
+typedef struct cml_hook_entry {
+    uint32_t magic; /* CML_HOOK_MAGIC */
+    uint32_t kind;  /* CML_HOOK_* */
+    cml_generic_fn fn;
+    const char* key; /* "<file>|<function expression>": names the hook across a patch of its file */
+} cml_hook_entry;
+
+/* ------------------------------------------------------------------------------------------ */
 /* Agent ABI: the functions cml_agent.dll exports. Applications use the cml_* wrappers further */
 /* down instead; this section is what the loader resolves and what the agent implements.      */
 /* ------------------------------------------------------------------------------------------ */
@@ -142,6 +180,7 @@ typedef cml_status (*cml_pfn_call)(void* agent);
 typedef cml_status (*cml_pfn_wait_for_reload)(void* agent, uint32_t timeout_ms);
 typedef cml_status (*cml_pfn_set_hotkeys)(void* agent, const cml_hotkeys* hotkeys);
 typedef int (*cml_pfn_is_connected)(void* agent);
+typedef int32_t (*cml_pfn_last_patch_status)(void);
 
 /* Export names, resolved with GetProcAddress. */
 #define CML_EXPORT_ABI_VERSION "cml_agent_abi_version"
@@ -156,6 +195,7 @@ typedef int (*cml_pfn_is_connected)(void* agent);
 #define CML_EXPORT_SCHEDULE_RESTART "cml_agent_schedule_restart"
 #define CML_EXPORT_SET_GLOBAL_HOTKEYS "cml_agent_set_global_hotkeys"
 #define CML_EXPORT_IS_CONNECTED "cml_agent_is_connected"
+#define CML_EXPORT_LAST_PATCH_STATUS "cml_agent_last_patch_status"
 
 #if !defined(CML_AGENT_BUILD) /* everything below is for applications, not for the agent itself */
 
@@ -213,10 +253,6 @@ CML_INLINE cml_status cml_get_current_module_path(wchar_t* buffer, uint32_t capa
     }
     return CML_STATUS_OK;
 }
-
-/* Generic function pointer; GetProcAddress results are converted through it so that the casts
- * stay warning-free under -Wcast-function-type. */
-typedef void (*cml_generic_fn)(void);
 
 CML_INLINE cml_generic_fn cml_resolve_export(HMODULE module, const char* name) {
     return (cml_generic_fn)GetProcAddress(module, name);
@@ -478,10 +514,51 @@ CML_INLINE cml_status cml_set_global_hotkeys(cml_agent agent, const cml_hotkeys*
     return agent->set_global_hotkeys(agent->impl, hotkeys);
 }
 
+/* How the most recent patch installation went: 0 = every hook was written, else a CMLnnnn number (for example
+ * 4305). Meant for CML_POSTPATCH_HOOK functions: they also run after an installation that FAILED (whenever the
+ * pre-patch hooks ran), so that state torn down in a pre-patch hook can always be rebuilt. Callable from any
+ * thread, needs no agent handle. CML_STATUS_AGENT_NOT_FOUND when no agent is loaded in this process. */
+CML_INLINE cml_status cml_last_patch_status(void) {
+    HMODULE module = GetModuleHandleW(L"cml_agent.dll");
+    cml_pfn_last_patch_status fn;
+    if (module == NULL) {
+        return CML_STATUS_AGENT_NOT_FOUND;
+    }
+    fn = (cml_pfn_last_patch_status)cml_resolve_export(module, CML_EXPORT_LAST_PATCH_STATUS);
+    return fn == NULL ? CML_STATUS_AGENT_NOT_FOUND : (cml_status)fn();
+}
+
 /* Nonzero while the agent has a live, handshaken connection to the broker. For diagnostics. */
 CML_INLINE int cml_is_connected(cml_agent agent) {
     return agent != NULL && agent->is_connected(agent->impl) != 0;
 }
+
+/* ------------------------------------------------------------------------------------------ */
+/* Hook macros. Use at file scope, with a semicolon:  CML_POSTPATCH_HOOK(OnAfterPatch);       */
+/* The function must be defined (or declared) before the macro. The record is NOT const on   */
+/* purpose: cl drops an unreferenced internal const, a plain static survives. Sections:       */
+/* ".cmlhk$a" (pre-patch), ".cmlhk$b" (post-patch), ".cmlhk$c" (the others).                  */
+/* ------------------------------------------------------------------------------------------ */
+
+#define CML_HOOK_CONCAT2_(a, b) a##b
+#define CML_HOOK_CONCAT_(a, b) CML_HOOK_CONCAT2_(a, b)
+#if defined(__clang__)
+#define CML_HOOK_USED_ __attribute__((used))
+#else
+#define CML_HOOK_USED_
+#endif
+#define CML_HOOK_REGISTER_(sec, kind_value, fn)                                                    \
+    __pragma(section(sec, read))                                                                   \
+    __declspec(allocate(sec)) CML_HOOK_USED_ static cml_hook_entry                                 \
+        CML_HOOK_CONCAT_(cml_hook_entry_, __COUNTER__) = {CML_HOOK_MAGIC, (kind_value),            \
+                                                          (cml_generic_fn)(fn), __FILE__ "|" #fn}
+
+#define CML_PREPATCH_HOOK(fn) CML_HOOK_REGISTER_(".cmlhk$a", CML_HOOK_PREPATCH, fn)
+#define CML_POSTPATCH_HOOK(fn) CML_HOOK_REGISTER_(".cmlhk$b", CML_HOOK_POSTPATCH, fn)
+#define CML_COMPILE_START_HOOK(fn) CML_HOOK_REGISTER_(".cmlhk$c", CML_HOOK_COMPILE_START, fn)
+#define CML_COMPILE_SUCCESS_HOOK(fn) CML_HOOK_REGISTER_(".cmlhk$c", CML_HOOK_COMPILE_SUCCESS, fn)
+#define CML_COMPILE_ERROR_HOOK(fn) CML_HOOK_REGISTER_(".cmlhk$c", CML_HOOK_COMPILE_ERROR, fn)
+#define CML_PRERESTART_HOOK(fn) CML_HOOK_REGISTER_(".cmlhk$c", CML_HOOK_PRERESTART, fn)
 
 #endif /* !CML_AGENT_BUILD */
 

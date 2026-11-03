@@ -19,6 +19,7 @@
 #include "cml/util/log.h"
 #include "cml/util/path.h"
 #include "hook/installer.h"
+#include "hook/user_hook_ids.h"
 #include "loader/patch_loader.h"
 #include "module_diff.h"
 
@@ -106,8 +107,25 @@ int& Agent::CallGuard::depth() noexcept {
     return depth;
 }
 
+Agent::HookThread& Agent::hook_thread() noexcept {
+    thread_local HookThread current = HookThread::None;
+    return current;
+}
+
 bool Agent::in_guarded_call() noexcept {
-    return CallGuard::depth() > 0;
+    return CallGuard::depth() > 0 || hook_thread() != HookThread::None;
+}
+
+namespace {
+std::atomic<std::int32_t> g_last_patch_status{0};
+}  // namespace
+
+std::int32_t Agent::last_patch_status() noexcept {
+    return g_last_patch_status.load(std::memory_order_acquire);
+}
+
+void Agent::set_last_patch_status(std::int32_t status) noexcept {
+    g_last_patch_status.store(status, std::memory_order_release);
 }
 
 Agent::Agent(std::uint32_t mode) : mode_(mode) {}
@@ -125,11 +143,42 @@ Agent::~Agent() {
     }
 }
 
+namespace {
+
+// Process-wide wake-up for destroyers (FU-06). It must not be a member of Agent: the thread that brings the
+// call count to zero wakes the destroyer *after* its decrement, by which time the destroyer is free to delete
+// the Agent. It lives in static storage.
+struct IdleSignal {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::atomic<int> destroyers{0};
+};
+
+// Static storage, no heap block: the agent's live-block accounting must return to its baseline.
+IdleSignal g_idle;
+
+}  // namespace
+
+void Agent::CallGuard::leave_call(std::atomic<int>& calls) noexcept {
+    if (calls.fetch_sub(1, std::memory_order_seq_cst) != 1) {
+        return;
+    }
+    // A destroyer increments `destroyers` before it tests the count (both seq_cst), so either it sees this
+    // decrement or this thread sees it here. Nothing of the Agent is touched from this point on.
+    if (g_idle.destroyers.load(std::memory_order_seq_cst) > 0) {
+        std::lock_guard<std::mutex> lock(g_idle.mutex);
+        g_idle.changed.notify_all();
+    }
+}
+
 void Agent::stop_and_wait_for_calls() {
     stop();  // wakes every waiter; later calls see stopping_ and return at once
-    while (active_calls_.load(std::memory_order_acquire) != 0) {
-        Sleep(1);
+    g_idle.destroyers.fetch_add(1, std::memory_order_seq_cst);
+    {
+        std::unique_lock<std::mutex> lock(g_idle.mutex);
+        g_idle.changed.wait(lock, [this] { return active_calls_.load(std::memory_order_seq_cst) == 0; });
     }
+    g_idle.destroyers.fetch_sub(1, std::memory_order_seq_cst);
 }
 
 Result<void> Agent::start() {
@@ -194,6 +243,7 @@ void Agent::stop() {
         CloseHandle(thread_);
         thread_ = nullptr;
     }
+    stop_compile_worker();
     if (logs_forwarded_) {
         set_log_forwarding(false);
         logs_forwarded_ = false;
@@ -287,6 +337,12 @@ void Agent::erase_done_locked(std::uint64_t id) {
 }
 
 cml_status Agent::wait_request(std::uint64_t request_id, std::uint32_t timeout_ms, cml_reply* reply) {
+    if (timeout_ms != 0 && hook_thread() == HookThread::AgentThread) {
+        // A hook running on the agent's own thread (immediate mode): the answer can only come from that thread.
+        CML_LOG(Warn, "CML%u: a blocking cml_wait_request from a hook on the agent thread would wait for itself; refused (poll with timeout 0)",
+                user_hooks::ids::kWaitInHook);
+        return static_cast<cml_status>(user_hooks::ids::kWaitInHook);
+    }
     std::unique_lock<std::mutex> lock(mutex_);
     auto lookup = [&]() -> std::map<std::uint64_t, Entry>::iterator {
         const auto it = entries_.find(request_id);
@@ -895,6 +951,10 @@ void Agent::handle_message(const ipc::Message& message) {
     }
     if (const auto* install = std::get_if<ipc::InstallHooks>(&message)) {
         handle_install_hooks(*install);
+        return;
+    }
+    if (const auto* compile = std::get_if<ipc::CompileEvent>(&message)) {
+        handle_compile_event(*compile);
         return;
     }
     CML_LOG(Warn, "ignoring unexpected %s from the broker", ipc::to_string(ipc::type_of(message)));

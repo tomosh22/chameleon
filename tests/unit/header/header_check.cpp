@@ -14,6 +14,7 @@
 #include "Chameleon_API.h"
 
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 namespace {
@@ -25,6 +26,55 @@ void expect(bool condition, const char* what) {
         std::fprintf(stderr, "FAIL: %s\n", what);
         ++g_failures;
     }
+}
+
+// --- hook macros (WP-17): every kind registers a record that survives the link and names its function ---
+int g_hook_probe = 0;
+void on_pre() { g_hook_probe |= 1; }
+void on_post() { g_hook_probe |= 2; }
+void on_compile_start() { g_hook_probe |= 4; }
+void on_compile_success() { g_hook_probe |= 8; }
+void on_compile_error(const char* message) { g_hook_probe |= (message != NULL) ? 16 : 0; }
+void on_pre_restart() { g_hook_probe |= 32; }
+
+CML_PREPATCH_HOOK(on_pre);
+CML_POSTPATCH_HOOK(on_post);
+CML_COMPILE_START_HOOK(on_compile_start);
+CML_COMPILE_SUCCESS_HOOK(on_compile_success);
+CML_COMPILE_ERROR_HOOK(on_compile_error);
+CML_PRERESTART_HOOK(on_pre_restart);
+
+// Scans this image's ".cmlhk" section the way the agent does and checks the six records.
+void check_hook_records() {
+    const unsigned char* base = reinterpret_cast<const unsigned char*>(GetModuleHandleW(NULL));
+    const IMAGE_DOS_HEADER* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const IMAGE_NT_HEADERS* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
+    unsigned seen = 0;
+    unsigned count = 0;
+    expect(sizeof(cml_hook_entry) == 24, "a hook record is 24 bytes");
+    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        if (std::memcmp(section[i].Name, ".cmlhk\0\0", 8) == 0) {
+            const cml_hook_entry* records = reinterpret_cast<const cml_hook_entry*>(base + section[i].VirtualAddress);
+            const size_t n = section[i].Misc.VirtualSize / sizeof(cml_hook_entry);
+            for (size_t k = 0; k < n; ++k) {
+                if (records[k].magic == CML_HOOK_MAGIC && records[k].kind >= 1 && records[k].kind <= 6 &&
+                    records[k].fn != NULL && records[k].key != NULL && std::strchr(records[k].key, '|') != NULL) {
+                    seen |= 1u << records[k].kind;
+                    ++count;
+                }
+            }
+        }
+    }
+    expect(count == 6, "six hook records in the .cmlhk section");
+    expect(seen == 0x7Eu, "one record of each kind");
+    on_pre();
+    on_post();
+    on_compile_start();
+    on_compile_success();
+    on_compile_error("x");
+    on_pre_restart();
+    expect(g_hook_probe == 63, "the hook functions are callable");
 }
 
 }  // namespace
@@ -106,10 +156,13 @@ int main() {
     expect(!agent.IsConnected(), "Agent::IsConnected");
     expect(agent.NativeHandle() == NULL, "Agent::NativeHandle");
     cml::DestroyAgent(agent);
+    expect(cml_last_patch_status() == CML_STATUS_AGENT_NOT_FOUND, "no agent loaded: cml_last_patch_status says so");
     expect(!agent.IsValid(), "DestroyAgent leaves the handle invalid");
 
     const std::wstring self = cml::GetCurrentModulePath();
     expect(!self.empty() && self.find(L".exe") != std::wstring::npos, "GetCurrentModulePath names this exe");
+
+    check_hook_records();
 
     return g_failures == 0 ? 0 : 1;
 }

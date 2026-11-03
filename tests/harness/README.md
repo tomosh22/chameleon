@@ -93,6 +93,19 @@ key = "compiled"               # modules_patched, processes_patched, patched, ho
 value = 1
 ```
 
+Keys added by WP-17 (synchronised mode and hooks):
+
+```toml
+fixture_args = "--hold-sync"   # header key: extra fixture arguments after `--agent` (letters, digits, space, - _ = .)
+
+[[step]]
+kind = "reload"
+expect_error = "CML5309"     # the reload must FAIL with this diagnostic id (the step passes then)
+
+[[step]]
+kind = "signal_fixture"        # create the file named by the fixture's CML_FIXTURE_SIGNAL_FILE environment variable
+```
+
 Unknown keys, unknown kinds, missing fields, bad values and steps that need a running process before `launch`
 are rejected with `CML5411` before anything runs; a pattern that does not compile is `CML5420`.
 

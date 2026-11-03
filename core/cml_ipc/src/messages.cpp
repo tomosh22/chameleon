@@ -272,6 +272,12 @@ void encode(Writer& w, const Reply& m) {
     w.u32(m.status);
     w.str(m.message);
 }
+void encode(Writer& w, const CompileEvent& m) {
+    w.u32(static_cast<std::uint32_t>(m.phase));
+    w.u32(m.diag);
+    w.str(m.module);
+    w.str(m.text);
+}
 void encode(Writer& w, const InstallHooks& m) {
     w.u64(m.request_id);
     w.u32(m.flags);
@@ -454,6 +460,18 @@ Message decode_reply(Reader& r) {
     m.request_id = r.u64();
     m.status = r.u32();
     m.message = r.str();
+    return m;
+}
+Message decode_compile_event(Reader& r) {
+    CompileEvent m;
+    const std::uint32_t phase = r.u32();
+    if (r.ok() && (phase < 1 || phase > 3)) {
+        r.fail("unknown compile phase");
+    }
+    m.phase = static_cast<CompilePhase>(phase);
+    m.diag = r.u32();
+    m.module = r.str();
+    m.text = r.str();
     return m;
 }
 Message decode_install_hooks(Reader& r) {
@@ -670,6 +688,7 @@ const char* to_string(MessageType type) noexcept {
         case MessageType::ExceptionAction: return "ExceptionAction";
         case MessageType::Log: return "Log";
         case MessageType::Restart: return "Restart";
+        case MessageType::CompileEvent: return "CompileEvent";
     }
     return "Unknown";
 }
@@ -687,6 +706,7 @@ bool is_implemented(MessageType type) noexcept {
         case MessageType::InstallHooks:
         case MessageType::HooksInstalled:
         case MessageType::Log:
+        case MessageType::CompileEvent:
         case MessageType::ReserveRange:
         case MessageType::ReserveRangeResult:
         case MessageType::ReleaseRange:
@@ -710,6 +730,7 @@ MessageType type_of(const Message& message) noexcept {
         MessageType operator()(const ModuleLoaded&) const noexcept { return MessageType::ModuleLoaded; }
         MessageType operator()(const ModuleUnloaded&) const noexcept { return MessageType::ModuleUnloaded; }
         MessageType operator()(const Log&) const noexcept { return MessageType::Log; }
+        MessageType operator()(const CompileEvent&) const noexcept { return MessageType::CompileEvent; }
         MessageType operator()(const Reply&) const noexcept { return MessageType::Reply; }
         MessageType operator()(const InstallHooks&) const noexcept { return MessageType::InstallHooks; }
         MessageType operator()(const HooksInstalled&) const noexcept { return MessageType::HooksInstalled; }
@@ -890,6 +911,7 @@ Result<Message> decode_message(std::uint16_t type, std::uint16_t version, const 
         case MessageType::ModuleLoaded: message = decode_loaded(reader); break;
         case MessageType::ModuleUnloaded: message = decode_unloaded(reader); break;
         case MessageType::Log: message = decode_log(reader); break;
+        case MessageType::CompileEvent: message = decode_compile_event(reader); break;
         case MessageType::InstallHooks: message = decode_install_hooks(reader); break;
         case MessageType::HooksInstalled: message = decode_hooks_installed(reader); break;
         case MessageType::ReserveRange: message = decode_reserve_range(reader); break;
@@ -1011,6 +1033,12 @@ std::string describe(const Message& message) {
         }
         std::string operator()(const Log& m) const {
             return "Log level=" + std::to_string(m.level) + " text=" + quoted(m.text);
+        }
+        std::string operator()(const CompileEvent& m) const {
+            return std::string("CompileEvent phase=") +
+                   (m.phase == CompilePhase::Start ? "start" : m.phase == CompilePhase::Success ? "success" : "error") +
+                   " diag=" + std::to_string(m.diag) + " module=" + quoted(m.module) +
+                   (m.text.empty() ? std::string() : " text=" + quoted(m.text));
         }
         std::string operator()(const Reply& m) const {
             return "Reply request=" + std::to_string(m.request_id) +

@@ -5,11 +5,14 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "cml/proc/address_space.h"
@@ -607,4 +610,95 @@ TEST_CASE("the broker-facing dispatcher answers every request type") {
         REQUIRE(frame.has_value());
         CHECK(ipc::decode_frame(frame->data(), frame->size()).has_value());
     }
+}
+
+
+// --- application hooks (WP-17) --------------------------------------------------------------------------------
+
+TEST_CASE("hook leases: a patch is invisible until committed; unload hides it, waits for the running hooks, then frees it") {
+    LoaderSession session(1);
+    const std::uint64_t first = session.blocks[0].base;
+    const ipc::PatchLoaded a = session.load(make_request(first, "hook_lease_a", false, false));
+    REQUIRE_MESSAGE(a.status == 0, a.message);
+
+    PatchLoader::HookLease lease = session.loader.acquire_hook_lease();
+    REQUIRE(lease.images().size() == 1);
+    CHECK(lease.images()[0].range.base == first);
+    CHECK(lease.images()[0].range.size == proto().image_size);
+    CHECK_FALSE(lease.images()[0].committed);  // after LoadPatch, before InstallHooks succeeded
+    CHECK(lease.images()[0].target_base == 0);
+
+    // InstallHooks succeeded for a function of the host module whose new code is in the patch.
+    const proc::ModuleInfo host{host_base(), host_size(), "host.exe"};
+    session.loader.commit_hooked({{host_base() + 0x10, first + proto().rva_answer}}, {host});
+    CHECK_FALSE(lease.images()[0].committed);  // the lease's copy is a snapshot ...
+    lease.refresh();
+    CHECK(lease.images()[0].committed);  // ... until it is refreshed
+    CHECK(lease.images()[0].target_base == host_base());
+    // A hook pair whose new entry is in no patch commits nothing.
+    session.loader.commit_hooked({{host_base() + 0x10, host_base() + 0x20}}, {host});
+
+    // Unload on another thread: it must wait for the lease (a hook may be running from the image).
+    std::atomic<bool> finished{false};
+    cml::Result<void> unloaded;
+    std::thread unloader([&] {
+        unloaded = session.loader.unload_patch(first);
+        finished = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    CHECK_FALSE(finished.load());
+    CHECK(is_module_loaded_at(first));  // still mapped: nothing was freed under the lease
+    // From the moment the unload started the patch is no longer offered to anybody.
+    {
+        PatchLoader::HookLease late = session.loader.acquire_hook_lease();
+        CHECK(late.images().empty());
+    }
+    lease.release();
+    unloader.join();
+    REQUIRE_MESSAGE(unloaded.has_value(), unloaded.error().format());
+    CHECK_FALSE(is_module_loaded_at(first));
+    CHECK(session.loader.patch_count() == 0);
+}
+
+TEST_CASE("hook leases: an unload that cannot get the leases back says so, keeps the patch and hides its hooks") {
+    LoaderSession session(1);
+    const std::uint64_t first = session.blocks[0].base;
+    const ipc::PatchLoaded a = session.load(make_request(first, "hook_lease_b", false, false));
+    REQUIRE_MESSAGE(a.status == 0, a.message);
+    session.loader.set_hook_wait_ms_for_testing(200);
+
+    PatchLoader::HookLease lease = session.loader.acquire_hook_lease();
+    REQUIRE(lease.images().size() == 1);
+    const proc::ModuleInfo host{host_base(), host_size(), "host.exe"};
+    session.loader.commit_hooked({{host_base() + 0x10, first + proto().rva_answer}}, {host});
+    cml::Result<void> refused = session.loader.unload_patch(first);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().code == ids::kLoaderPatchBusy);
+    CHECK(is_module_loaded_at(first));
+    lease.refresh();
+    CHECK_FALSE(lease.images()[0].committed);  // the failed unload left it hidden
+    lease.release();
+    REQUIRE(session.loader.unload_patch(first).has_value());  // the lease is gone: it works now
+    CHECK_FALSE(is_module_loaded_at(first));
+}
+
+TEST_CASE("hook leases: a patch that is being loaded is not leased; a lease keeps working after the loader moved on") {
+    LoaderSession session(1);
+    const std::uint64_t first = session.blocks[0].base;
+    {
+        PatchLoader::HookLease empty = session.loader.acquire_hook_lease();
+        CHECK(empty.images().empty());
+    }
+    const ipc::PatchLoaded a = session.load(make_request(first, "hook_lease_c", false, false));
+    REQUIRE_MESSAGE(a.status == 0, a.message);
+    PatchLoader::HookLease moved;
+    {
+        PatchLoader::HookLease original = session.loader.acquire_hook_lease();
+        moved = std::move(original);  // movable; releases exactly once
+        CHECK(original.images().empty());
+    }
+    CHECK(moved.images().size() == 1);
+    moved.release();
+    moved.release();  // idempotent
+    REQUIRE(session.loader.unload_patch(first).has_value());
 }

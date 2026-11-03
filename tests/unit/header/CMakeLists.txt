@@ -12,7 +12,7 @@
 set(_cml_api_include "${PROJECT_SOURCE_DIR}/agent/include")
 
 function(cml_add_header_check name source standard)
-    cmake_parse_arguments(H "BARE" "" "" ${ARGN})
+    cmake_parse_arguments(H "BARE;GC" "" "" ${ARGN})
     add_executable(${name} ${source})
     target_include_directories(${name} PRIVATE "${_cml_api_include}")
     set_target_properties(${name} PROPERTIES FOLDER "tests/header")
@@ -39,6 +39,14 @@ function(cml_add_header_check name source standard)
         endif()
     endif()
 
+    if(H_GC)
+        # WP-17: the hook records must survive the optimisations that drop unreferenced data and functions
+        # (/Gw puts global data in COMDATs, /OPT:REF removes the unreferenced ones, /OPT:ICF folds identical code).
+        # header_check.c/.cpp scans its own .cmlhk section and fails when a record is missing.
+        target_compile_options(${name} PRIVATE /Gw /Gy /GF)
+        target_link_options(${name} PRIVATE /OPT:REF /OPT:ICF /INCREMENTAL:NO)
+    endif()
+
     add_test(NAME header.${name} COMMAND ${name})
     set_tests_properties(header.${name} PROPERTIES TIMEOUT 60)
 endfunction()
@@ -49,3 +57,6 @@ cml_add_header_check(cml_header_check_cxx14      header_check.cpp 14)
 cml_add_header_check(cml_header_check_cxx14_bare header_check.cpp 14 BARE)
 cml_add_header_check(cml_header_check_cxx20      header_check.cpp 20)
 cml_add_header_check(cml_header_check_cxx20_bare header_check.cpp 20 BARE)
+# WP-17: the same sources linked with whole-program data/function GC on.
+cml_add_header_check(cml_header_check_c99_gc     header_check.c   c99 GC)
+cml_add_header_check(cml_header_check_cxx20_gc   header_check.cpp 20 GC)

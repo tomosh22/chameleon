@@ -22,6 +22,7 @@ enum class StepKind {
     SetOption,            // control command `set-option` (WP-14: e.g. compile_on_save = true)
     Wait,                 // control command `wait` for "index" or "idle"
     ExpectEvent,          // an event of this name (patch_applied, ...) must arrive (needs capability "subscribe")
+    SignalFixture,        // create the file named by CML_FIXTURE_SIGNAL_FILE, which the fixture waits for (WP-17)
     ExpectReloadResult,   // an integer member of the most recent reload's result has this value (WP-16)
 };
 
@@ -69,6 +70,7 @@ struct Scenario {
     std::string name;
     std::string description;
     std::string fixture;  // tests/fixtures/<fixture>
+    std::string fixture_args;  // extra command-line arguments for the fixture after `--agent` (WP-17); may be empty
     int timeout_s = 120;
     std::vector<Step> steps;
     std::filesystem::path path;  // where it was loaded from (empty for parse_scenario)

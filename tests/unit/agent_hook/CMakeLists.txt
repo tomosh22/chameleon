@@ -13,7 +13,7 @@
 # which the CI workflow prints.
 
 cml_add_unit_test(agent_hook
-    SOURCES test_length_decoder.cpp test_plan.cpp
+    SOURCES test_length_decoder.cpp test_plan.cpp test_user_hooks.cpp
     LIBS cml_agent_core)
 
 if(WIN32)
@@ -21,7 +21,7 @@ if(WIN32)
     # `new` goes through the agent's heap, so heap::set_alloc_forbidden() is really exercised (see
     # alloc_guard.h).
     set(CML_AGENT_OPERATOR_NEW "${PROJECT_SOURCE_DIR}/agent/src/operator_new.cpp")
-    target_sources(cml_test_agent_hook PRIVATE test_installer.cpp test_hardening.cpp test_hang_watch.cpp test_dispatch.cpp
+    target_sources(cml_test_agent_hook PRIVATE test_installer.cpp test_hardening.cpp test_hang_watch.cpp test_dispatch.cpp user_hooks_probe.cpp
                                                ${CML_AGENT_OPERATOR_NEW})
     target_include_directories(cml_test_agent_hook PRIVATE "${PROJECT_SOURCE_DIR}/agent/include")
     # Test functions are located by address: no incremental-link thunks, no identical-code folding.
