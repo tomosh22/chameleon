@@ -94,6 +94,8 @@ ControlResponse make_error_response(std::optional<std::int64_t> id, const Diag& 
 // baseline, "ready" once reload can run, "failed" with `index_message` otherwise. Empty = the broker does
 // not report it (WP-13 brokers); clients must treat that as ready.
 struct StatusModule {
+    StatusModule() = default;
+    StatusModule(std::string p, bool e) : path(std::move(p)), enabled(e) {}
     std::string path;
     bool enabled = false;
     std::string index_state;

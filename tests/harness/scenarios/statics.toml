@@ -1,0 +1,57 @@
+# Scenario `statics`: file-static data, a function-local static with a thread-safe guard (a SECREL fix-up on
+# `_Init_thread_epoch`), a static member and a const table in .rdata. The edit changes the returned value 3 -> 30;
+# the `calls=` counter lives in the OLD image's storage and must keep counting through the reload (a patch with
+# its own copy of `s_calls` would restart at 0).
+name = "statics"
+description = "fixture statics: value=3 -> edit -> reload -> value=30, calls= keeps counting"
+fixture = "statics"
+timeout_s = 180
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=3 calls=\\d+ total=\\d+"
+within_s = 15
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_statics.exe"
+within_s = 15
+
+# Let the counter reach at least 20 before the patch: a reset afterwards cannot hide.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=3 calls=([2-9][0-9]|[1-9][0-9]{2,}) "
+within_s = 15
+
+[[step]]
+kind = "edit"
+patch = "edits/value_30.edit"
+
+[[step]]
+kind = "reload"
+within_s = 90
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=30 calls=\\d+"
+within_s = 10
+
+# The patched code keeps running and keeps counting.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=30 calls=\\d+"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=30 calls=\\d+"
+within_s = 10
+
+# calls= never went down, over the whole run (before and after the reload).
+[[step]]
+kind = "expect_monotonic"
+key = "calls"
+min_samples = 25

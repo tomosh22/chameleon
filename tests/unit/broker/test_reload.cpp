@@ -17,6 +17,8 @@
 #include "../bind/worlds.h"
 #include "../pdb/test_util.h"
 #include "../pe/pe_builder.h"
+#include "cml/core/control_server.h"
+#include "cml/core/process_registry.h"
 #include "cml/core/reload_service.h"
 #include "cml/proc/diag_ids.h"
 #include "cml/util/log.h"
@@ -815,4 +817,66 @@ TEST_CASE("the PDB index can be released and mapped again (ADR-0017)") {
     rig.option("release_pdb_after_reload", Value::boolean(true));
     CHECK(rig.reload().has_value());
     CHECK(rig.module->index->pdb() == nullptr);
+}
+
+// ---- the control pipe's view (handle_control_line with a service) -----------------------------------------
+
+TEST_CASE("control: with a service the broker advertises reload, wait, set-option, subscribe and diag-events") {
+    QuietLogs quiet;
+    Rig rig;
+    ControlContext context;
+    context.version = "0.1.0";
+    context.service = rig.service.get();
+    const std::vector<std::string> caps = broker_capabilities(context);
+    for (const char* c : {"status", "reload", "wait", "set-option", "subscribe", "diag-events"}) {
+        CHECK_MESSAGE(std::find(caps.begin(), caps.end(), c) != caps.end(), c);
+    }
+    CHECK(broker_capabilities().size() == 1);  // without a service: status only (WP-13)
+    ControlContext bare;
+    CHECK(broker_capabilities(bare).size() == 1);
+}
+
+TEST_CASE("control: status reports the module's index state; reload / wait / set-option / subscribe answer over the line protocol") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    ProcessRegistry registry;
+    registry.update(rig.session);
+    std::set<std::string> subscribed;
+    ControlContext context;
+    context.version = "0.1.0";
+    context.registry = &registry;
+    context.service = rig.service.get();
+    context.subscribe = [&](const std::set<std::string>& names) { subscribed = names; };
+
+    const auto call = [&](const std::string& line) {
+        Result<Value> parsed = ipc::json::parse(handle_control_line(line, context));
+        REQUIRE(parsed.has_value());
+        return *parsed;
+    };
+    const Value status = call(R"({"id":1,"cmd":"status"})");
+    REQUIRE(status.get_bool("ok"));
+    const Value* index = status.find("result")->find("processes")->items()[0].find("modules")->items()[0].find("index");
+    REQUIRE(index != nullptr);
+    CHECK(index->get_string("state") == "ready");
+
+    rig.changed();
+    const Value reloaded = call(R"({"id":2,"cmd":"reload","args":{"timeout_ms":30000}})");
+    REQUIRE_MESSAGE(reloaded.get_bool("ok"), ipc::json::serialize(reloaded));
+    CHECK(reloaded.find("result")->get_integer("patched") == 1);
+    CHECK(reloaded.find("result")->get_string("timing").rfind("RELOAD-TIMING", 0) == 0);
+    CHECK(call(R"({"id":3,"cmd":"status"})").find("result")->get_integer("generation") == 1);
+
+    CHECK(call(R"({"id":4,"cmd":"wait","args":{"for":"idle","timeout_ms":2000}})").get_bool("ok"));
+    CHECK(call(R"({"id":5,"cmd":"set-option","args":{"name":"narrow_hooks","value":false}})").get_bool("ok"));
+    const Value bad_option = call(R"({"id":6,"cmd":"set-option","args":{"name":"nope","value":1}})");
+    CHECK_FALSE(bad_option.get_bool("ok"));
+    CHECK(bad_option.find("diag")->get_string("id") == "CML5311");
+
+    CHECK(call(R"({"id":7,"cmd":"subscribe","args":{"events":["diag","log"]}})").get_bool("ok"));
+    CHECK(subscribed == std::set<std::string>{"diag", "log"});
+    CHECK(call(R"({"id":8,"cmd":"subscribe"})").get_bool("ok"));
+    CHECK(subscribed.size() == 3);
+    CHECK_FALSE(call(R"({"id":9,"cmd":"subscribe","args":{"events":["nothing"]}})").get_bool("ok"));
+    CHECK(call(R"({"id":10,"cmd":"frobnicate"})").find("diag")->get_string("id") == "CML5402");
 }

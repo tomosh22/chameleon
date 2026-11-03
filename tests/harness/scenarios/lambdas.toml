@@ -1,0 +1,42 @@
+# Scenario `lambdas`: a capturing lambda stored in a std::function at startup. Its operator() is hooked, the
+# captured `base` lives in the std::function object that already exists.
+name = "lambdas"
+description = "fixture lambdas: value=(n%3)+5 -> edit -> reload -> value=(n%3)+50"
+fixture = "lambdas"
+timeout_s = 180
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=[5-7]\\b"
+within_s = 15
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_lambdas.exe"
+within_s = 15
+
+[[step]]
+kind = "edit"
+patch = "edits/lambda_times_10.edit"
+
+[[step]]
+kind = "reload"
+within_s = 90
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=5[0-2]\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=5[0-2]\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=5[0-2]\\b"
+within_s = 10

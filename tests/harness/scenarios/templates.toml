@@ -1,0 +1,42 @@
+# Scenario `templates`: template instantiations in two translation units (COMDAT); the TU-local template
+# `offset<T>` changes from +1 to +100, `twice<int>` (shared by both TUs) is unchanged and must not be hooked.
+name = "templates"
+description = "fixture templates: value=13 -> edit -> reload -> value=211, other=20 unchanged"
+fixture = "templates"
+timeout_s = 180
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=13 other=20"
+within_s = 15
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_templates.exe"
+within_s = 15
+
+[[step]]
+kind = "edit"
+patch = "edits/offset_100.edit"
+
+[[step]]
+kind = "reload"
+within_s = 90
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=211 other=20"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=211 other=20"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=211 other=20"
+within_s = 10
