@@ -565,6 +565,7 @@ TEST_CASE("link patch: fixture templates links under the mirrored linker and the
 TEST_CASE("link patch: fixture lambdas links under the mirrored linker and the other one") { run_fixture("lambdas"); }
 TEST_CASE("link patch: fixture new_function links under the mirrored linker and the other one") { run_fixture("new_function"); }
 TEST_CASE("link patch: fixture new_global links under the mirrored linker and the other one") { run_fixture("new_global"); }
+TEST_CASE("link patch: fixture tls links under the mirrored linker and the other one") { run_fixture("tls"); }
 
 TEST_CASE("link patch: the user can override the detected linker family") {
     const FixturePaths& paths = FixturePaths::get();

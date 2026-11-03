@@ -1,6 +1,6 @@
 --- a/logic.cpp
 +++ b/logic.cpp
-@@ -7,6 +7,7 @@
+@@ -6,6 +6,7 @@
  } // namespace
 
  thread_local int t_counter = 0;  // namespace scope, external linkage
@@ -8,7 +8,7 @@
 
  TlsValues tls_step()
  {
-@@ -16,5 +17,5 @@
+@@ -15,6 +16,6 @@
      TlsValues v;
      v.step = kStep;
      v.ns = t_counter;
