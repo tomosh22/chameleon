@@ -550,3 +550,57 @@ include ntdll and ucrtbase.
 **Hook narrowing.** The planner hooks every defined function present in the old image: up to 83
 for STL-heavy TUs. WP-12 narrows the hook list to changed functions by comparing function bytes,
 or the COMDAT checksum, against the old image.
+
+## ADR-0030 Broker patch pipeline decisions from WP-12
+
+**Date:** 2026-11-03 · **Status:** Accepted · **Source:** WP-12 (PR #23), `docs/wp/WP-12.md`
+
+**SECREL is pre-applied (answers the ADR-0029 open point).** The broker writes each SecRel32
+value into the patch DLL file between link and `LoadPatch` (`preapply_write32`). Every site is
+range-checked against its section's raw data before anything is written. The value depends only
+on the old image's section layout, never on the load address, so no `Write32` wire kind was
+added and the agent and wire format are unchanged.
+
+**Hook narrowing (ADR-0029 hand-off).** A planned hook is dropped only when all three hold:
+- the old bytes are known;
+- the new code has the same length and equal bytes with relocation sites masked;
+- every relocation resolves to the same target as in the old code.
+
+Read-only constants that carry pointers (vtables) never count as equal. Masking alone would miss
+`call a` → `call b` and edited string literals. `set-option narrow_hooks false` restores the
+planner's full list.
+
+**One patch DLL per recompiled compiland.** This avoids duplicate thunks and definitions between
+objects in one link. The registry is updated between patches, so a later compiland binds to an
+earlier one's new symbols. A reload that fails partway keeps the patches already applied, and
+`generation` counts them.
+
+**Staged agent requests.** The broker sends LoadPatch, ApplyFixups, RunInitializers and
+InstallHooks as separate requests, each with its own timing (`RELOAD-TIMING`). Failure handling:
+- Only a real timeout after InstallHooks (CML5320, synchronised mode) leaves the patch loaded,
+  and records the hooks as installed.
+- A send failure or a lost agent unloads the patch.
+- A LoadPatch timeout queues an unload behind the late load.
+
+**Control events are asynchronous.** Each subscribed connection has a bounded queue and a writer
+thread that shares the response write lock. A stalled subscriber never blocks the pipeline. An
+event such as `patch_applied` may arrive after the `reload` response it belongs to.
+
+**`status` readiness.** A module appears enabled only once its PDB index exists; until then the
+index is reported as `pending`. cmltest's `expect_module_enabled` waits for `ready`, so an edit
+can never be baked into the source baseline.
+
+## ADR-0031 Diagnostic sub-ranges for wave 5 (extends ADR-0008)
+
+**Date:** 2026-11-03 · **Status:** Accepted
+
+CML5400–5499 is already used by the control pipe and cmltest (WP-12/WP-13). Wave 5 runs in
+parallel, so each work package gets its own range:
+
+| Range | Owner |
+|---|---|
+| CML5500–5549 | WP-14 file watcher and change detection |
+| CML5550–5599 | WP-15 header dependency handling |
+| CML5600–5649 | WP-16 multiple modules and processes |
+| CML5650–5699 | WP-17 patch/compile hooks and synchronised mode |
+| CML1600–1699, CML2300–2399 | WP-18 build-requirement checks (`cml_broker check`) |
