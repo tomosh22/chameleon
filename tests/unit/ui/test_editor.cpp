@@ -45,7 +45,8 @@ TEST_CASE("custom template with placeholders and quoting") {
     const auto tricky = make_editor_launch(config, loc("a & b \" c.cpp", 1, 1));
     REQUIRE(tricky);
     CHECK(tricky->argv[2] == "a & b \" c.cpp");
-    CHECK(join_command_line({tricky->argv[2]}) == R"("a & b \" c.cpp")");
+    const std::string expected_quoted = "\"a & b \\\" c.cpp\"";
+    CHECK(join_command_line({tricky->argv[2]}) == expected_quoted);
 }
 
 TEST_CASE("missing line and column default to 1") {
@@ -83,7 +84,9 @@ TEST_CASE("quote_argument follows the CommandLineToArgvW rules") {
     CHECK(quote_argument("") == "\"\"");
     CHECK(quote_argument("a b") == "\"a b\"");
     CHECK(quote_argument(R"(C:\dir with space\)") == R"("C:\dir with space\\")");
-    CHECK(quote_argument(R"(say "hi")") == R"("say \"hi\"")");
+    const std::string said = "say \"hi\"";
+    const std::string said_quoted = "\"say \\\"hi\\\"\"";
+    CHECK(quote_argument(said) == said_quoted);
 }
 
 TEST_CASE("editor kind names round trip") {
