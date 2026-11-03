@@ -107,11 +107,20 @@ const AuditFinding& finding(const ModuleAudit& a, const char* check) {
     return *f;
 }
 
+std::FILE* open_scratch(const std::string& path) {
+#if defined(_WIN32)
+    std::FILE* f = nullptr;
+    return fopen_s(&f, path.c_str(), "w+b") == 0 ? f : nullptr;
+#else
+    return std::fopen(path.c_str(), "w+b");
+#endif
+}
+
 std::string capture(int* code, const std::vector<std::string>& args, std::string* err_text = nullptr) {
     // (not std::tmpfile(): on Windows it writes to the root of the drive, which needs administrator rights)
     tp::TempDir scratch;
-    std::FILE* out = std::fopen(scratch.file("out.txt").c_str(), "w+b");
-    std::FILE* err = std::fopen(scratch.file("err.txt").c_str(), "w+b");
+    std::FILE* out = open_scratch(scratch.file("out.txt"));
+    std::FILE* err = open_scratch(scratch.file("err.txt"));
     REQUIRE(out != nullptr);
     REQUIRE(err != nullptr);
     *code = run_check_command(args, out, err);
