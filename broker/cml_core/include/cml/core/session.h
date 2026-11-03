@@ -9,6 +9,7 @@
 // Portable (no Win32) so it can be unit-tested without pipes.
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -22,9 +23,20 @@ struct SessionOutcome {
     bool close = false;                 // protocol violation: drop the connection after sending
 };
 
+// The broker's own requests (ReserveRange, LoadPatch, ApplyFixups, RunInitializers, InstallHooks, ReleaseRange) are
+// answered by the agent with Reply, ReserveRangeResult, PatchLoaded or HooksInstalled. A Session does not interpret
+// those answers; it hands them to the sink (see AgentLink::deliver) and, like WP-10 asked, ignores answers whose
+// request id nobody waits for any more (a reply that arrives after its request timed out).
+using AnswerSink = std::function<bool(const ipc::Message& answer)>;  // true: somebody was waiting for it
+
 class Session {
 public:
     Session(std::uint64_t agent_id, std::string broker_version);
+
+    void set_answer_sink(AnswerSink sink) { answer_sink_ = std::move(sink); }
+    // Answers that no sink consumed (unknown request id, or no sink): counted for tests and diagnostics.
+    std::uint64_t ignored_answers() const noexcept { return ignored_answers_; }
+    ipc::AgentMode mode() const noexcept { return mode_; }
 
     // Handles one message from the agent. Every incoming message is logged at info level; a
     // request gets exactly one reply (Welcome for Hello, Reply for the others).
@@ -59,6 +71,9 @@ private:
     std::uint64_t revision_ = 0;
     bool handshaken_ = false;
     std::uint32_t pid_ = 0;
+    ipc::AgentMode mode_ = ipc::AgentMode::Immediate;
+    AnswerSink answer_sink_;
+    std::uint64_t ignored_answers_ = 0;
     std::string agent_path_;
     std::string command_line_;
     std::vector<ipc::ModuleEntry> modules_;

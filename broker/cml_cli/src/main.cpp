@@ -4,9 +4,10 @@
 //   cml_broker --headless [--pipe NAME] [--control-pipe NAME] [--exit-when-idle MS] [--startup-timeout MS]
 //                         [--log FILE] [--verbose]
 //
-// WP-11 provides only the minimal headless broker (agents register, module lists are recorded,
-// EnableModule is answered). WP-13 adds the control pipe (`status` only); the real broker
-// (reload pipeline, the other control commands) and the GUI arrive with WP-12.
+// WP-11 provided the minimal headless broker (agents register, module lists are recorded, EnableModule is
+// answered), WP-13 the control pipe, WP-12 the real thing behind it: the PDB index of enabled modules, the
+// patch pipeline (`reload`), `wait`, `set-option`, `subscribe` and the diag / patch_applied / log events. The
+// control pipe is now served under its default name unless --control-pipe / CML_CONTROL_PIPE name another one.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -26,6 +27,7 @@
 #include <chrono>
 
 #include "cml/core/connection_server.h"
+#include "cml/core/log_hub.h"
 #include <optional>
 
 #include "cml/ipc/control.h"
@@ -40,19 +42,22 @@ void print_usage(std::FILE* out) {
         "usage: cml_broker --version | --help\n"
         "       cml_broker --headless [--pipe NAME] [--control-pipe NAME] [--exit-when-idle MS]\n"
         "                             [--startup-timeout MS]\n"
-        "                             [--log FILE] [--verbose]\n"
+        "                             [--log FILE] [--log-format text|json] [--verbose] [--session-dir DIR]\n"
         "\n"
         "  --headless            run without a GUI and serve agents on the broker pipe\n"
         "  --pipe NAME           full pipe name (default: CML_PIPE_NAME, else\n"
         "                        \\\\.\\pipe\\cml_broker_<logon session SID>)\n"
-        "  --control-pipe NAME   also serve the control protocol (docs/wp/WP-13.md) on this full pipe\n"
-        "                        name; CML_CONTROL_PIPE does the same. Without either, no control pipe\n"
-        "                        is served (the default name is\n"
-        "                        \\\\.\\pipe\\cml_control_<logon session SID>)\n"
+        "  --control-pipe NAME   serve the control protocol (docs/wp/WP-13.md, WP-12.md) on this full pipe\n"
+        "                        name; CML_CONTROL_PIPE does the same. Without either the default name\n"
+        "                        \\\\.\\pipe\\cml_control_<logon session SID> is served (if another broker\n"
+        "                        already serves it, this one runs without a control pipe)\n"
         "  --exit-when-idle MS   exit MS milliseconds after the last agent disconnected\n"
         "  --startup-timeout MS  exit if no agent has connected after MS milliseconds\n"
         "  --log FILE            append the log to FILE instead of writing it to stdout\n"
-        "  --verbose             also log debug messages\n",
+        "  --log-format F        text (default) or json: one JSON object per log record\n"
+        "  --verbose             also log debug messages\n"
+        "  --session-dir DIR     keep objects, patch DLLs and PDBs of reloads in DIR (default:\n"
+        "                        $CML_SESSION_DIR, else a temporary directory removed at exit)\n",
         out);
 }
 
@@ -64,6 +69,8 @@ struct Options {
     std::string pipe;
     std::string control_pipe;
     std::string log_file;
+    std::string log_format = "text";
+    std::string session_dir;
     std::uint32_t exit_when_idle_ms = 0;
     std::uint32_t startup_timeout_ms = 0;
 };
@@ -107,6 +114,14 @@ bool parse_args(const std::vector<std::string>& args, Options* options) {
             if (!value_of("--control-pipe", &options->control_pipe)) return false;
         } else if (arg == "--log") {
             if (!value_of("--log", &options->log_file)) return false;
+        } else if (arg == "--log-format") {
+            if (!value_of("--log-format", &options->log_format)) return false;
+            if (options->log_format != "text" && options->log_format != "json") {
+                std::fprintf(stderr, "cml_broker: --log-format takes text or json\n");
+                return false;
+            }
+        } else if (arg == "--session-dir") {
+            if (!value_of("--session-dir", &options->session_dir)) return false;
         } else if (arg == "--exit-when-idle") {
             if (!value_of("--exit-when-idle", &text) ||
                 !parse_milliseconds(text, &options->exit_when_idle_ms)) {
@@ -149,50 +164,43 @@ std::vector<std::string> collect_args(int argc, char** argv) {
 
 #if defined(_WIN32)
 
-// Log sink: one line per message, flushed immediately so that tests and users can tail the file.
-struct LogOutput {
-    std::FILE* file = nullptr;
-    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-};
-LogOutput g_log_output;
-
-void write_log_line(void* user, cml::LogLevel level, const char* file, int line, const char* message) {
-    auto* out = static_cast<LogOutput*>(user);
-    const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now() - out->start)
-                             .count();
-    std::fprintf(out->file, "[%7lld ms] [%s] %s:%d: %s\n", ms, cml::to_string(level), std::string(cml::path::base_name(std::string_view(file))).c_str(),
-                 line, message);
-    std::fflush(out->file);
-}
-
 // Ctrl+C / console close: the handler runs on its own thread, possibly while the server is being
-// torn down, so it touches nothing but an event that lives as long as the process (never closed).
+// torn down, so it touches nothing but two events that live as long as the process (never closed).
 HANDLE g_stop_event = nullptr;
+HANDLE g_done_event = nullptr;  // set when run() returned and the broker has shut down
 
-BOOL WINAPI on_console_event(DWORD) {
+// CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT and CTRL_SHUTDOWN_EVENT end the process as soon as the handler returns (or
+// after about 5 s): for these the handler waits until the server has stopped (FU-03), so that patch files, pipes
+// and the log are not cut off in the middle of a reload. Ctrl+C and Ctrl+Break only ask for the stop.
+BOOL WINAPI on_console_event(DWORD type) {
     if (g_stop_event != nullptr) {
         SetEvent(g_stop_event);
+    }
+    if ((type == CTRL_CLOSE_EVENT || type == CTRL_LOGOFF_EVENT || type == CTRL_SHUTDOWN_EVENT) && g_done_event != nullptr) {
+        WaitForSingleObject(g_done_event, 4500);
     }
     return TRUE;
 }
 
 int run_headless(const Options& options) {
-    g_log_output.file = stdout;
+    std::FILE* out = stdout;
     if (!options.log_file.empty()) {
         const std::wstring wide = cml::proc::wide_from_utf8(options.log_file);
         // _wfsopen, not _wfopen_s: the latter opens the file exclusively, and tests (and users) read
         // the log while the broker is still running.
-        std::FILE* file = _wfsopen(wide.c_str(), L"ab", _SH_DENYWR);
-        if (file == nullptr) {
+        out = _wfsopen(wide.c_str(), L"ab", _SH_DENYWR);
+        if (out == nullptr) {
             std::fprintf(stderr, "cml_broker: cannot open log file '%s'\n", options.log_file.c_str());
             return 1;
         }
-        g_log_output.file = file;
     } else {
         std::setvbuf(stdout, nullptr, _IONBF, 0);
     }
-    cml::set_log_sink(write_log_line, &g_log_output);
+    cml::core::LogHub::Options hub_options;
+    hub_options.file = out;
+    hub_options.format = options.log_format == "json" ? cml::core::LogFormat::Json : cml::core::LogFormat::Text;
+    cml::core::LogHub hub(hub_options);
+    cml::set_log_sink(cml::core::LogHub::sink, &hub);
     cml::set_log_level(options.verbose ? cml::LogLevel::Debug : cml::LogLevel::Info);
 
     cml::Result<std::string> pipe_name = cml::ipc::resolve_pipe_name(options.pipe);
@@ -205,23 +213,32 @@ int run_headless(const Options& options) {
 
     cml::core::ServerOptions server_options;
     server_options.pipe_name = *pipe_name;
-    // The control pipe is opt-in for now (--control-pipe or CML_CONTROL_PIPE): several headless
-    // brokers run side by side in tests, and a shared default name would make them collide.
+    // The control pipe is always served. A name given on the command line or in CML_CONTROL_PIPE is required
+    // (the broker does not start without it); the default name is best effort, because several headless brokers
+    // can run side by side (tests) and only the first can have the default.
     const std::optional<std::string> control_from_env = cml::proc::get_env("CML_CONTROL_PIPE");
-    if (!options.control_pipe.empty() || (control_from_env && !control_from_env->empty())) {
-        cml::Result<std::string> control_name = cml::ipc::resolve_control_pipe_name(options.control_pipe);
-        if (!control_name) {
-            CML_LOG(Error, "%s", control_name.error().format().c_str());
-            return 1;
-        }
-        server_options.control_pipe_name = *control_name;
-        CML_LOG(Info, "control pipe=%s", control_name->c_str());
+    const bool control_requested = !options.control_pipe.empty() || (control_from_env && !control_from_env->empty());
+    cml::Result<std::string> control_name = cml::ipc::resolve_control_pipe_name(options.control_pipe);
+    if (!control_name && control_requested) {
+        CML_LOG(Error, "%s", control_name.error().format().c_str());
+        return 1;
     }
+    if (!control_name) {
+        // Best effort for the default name (e.g. the logon-session SID cannot be queried): run without a control pipe.
+        CML_LOG(Warn, "no control pipe: %s", control_name.error().format().c_str());
+    } else {
+        server_options.control_pipe_name = *control_name;
+        server_options.control_pipe_optional = !control_requested;
+        CML_LOG(Info, "control pipe=%s%s", control_name->c_str(), control_requested ? "" : " (default name)");
+    }
+    server_options.session_dir = options.session_dir;
     server_options.exit_when_idle_ms = options.exit_when_idle_ms;
     server_options.startup_timeout_ms = options.startup_timeout_ms;
     g_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_done_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     server_options.stop_event = g_stop_event;
     cml::core::ConnectionServer server(server_options);
+    hub.attach_events(&server.event_bus(), cml::LogLevel::Info);  // `log` events for subscribed control clients
     SetConsoleCtrlHandler(on_console_event, TRUE);
 
     const cml::Result<cml::core::ServerExit> result = server.run();
@@ -233,6 +250,9 @@ int run_headless(const Options& options) {
         exit_code = 3;
     }
     CML_LOG(Info, "cml_broker exiting with code %d", exit_code);
+    hub.attach_events(nullptr);
+    cml::set_log_sink(nullptr, nullptr);  // the hub is a local of this function
+    SetEvent(g_done_event);  // releases a console-close handler that is waiting for the shutdown
     return exit_code;
 }
 

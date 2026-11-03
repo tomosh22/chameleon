@@ -227,17 +227,27 @@ jobs:
       # stdout and `status`. Until WP-12 provides the reload pipeline the `reload` step and the
       # steps after it are SKIPPED (reported as such, never as passes) and the run is PARTIAL;
       # WP-12 adds --require-all-capabilities here.
-      - name: cmltest basic scenario (Ninja)
+      # WP-12: all seven M1 scenarios, every one with --require-all-capabilities (ADR-0022: a skipped step is a
+      # failure). Each prints CMLTEST_RESULT and the RELOAD-TIMING line of its reload. A failing scenario does not
+      # stop the others; the step fails at the end.
+      - name: cmltest M1 scenarios (Ninja)
         run: |
           New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
-          & "$env:BUILD_DIR/bin/cmltest.exe" --scenario tests/harness/scenarios/basic.toml `
-            --build-dir $env:BUILD_DIR --generator ninja --config ${{ matrix.config }} --cxx $env:CML_CXX `
-            --artifacts "$PWD/$env:LOG_DIR/cmltest-ninja" --junit "$PWD/$env:LOG_DIR/cmltest-ninja-junit.xml" `
-            *>&1 | Tee-Object -FilePath "$env:LOG_DIR/cmltest-ninja.log"
-          $rc = $LASTEXITCODE
-          Get-Content "$env:LOG_DIR/cmltest-ninja.log" | Where-Object { $_ -match '^(CMLTEST_RESULT|PARTIAL|FAILED)' } |
-            Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
-          if ($rc -ne 0) { exit $rc }
+          $failed = @()
+          foreach ($s in 'basic', 'statics', 'virtuals', 'templates', 'lambdas', 'new_function', 'new_global') {
+            Write-Host "::group::cmltest $s"
+            & "$env:BUILD_DIR/bin/cmltest.exe" --scenario "tests/harness/scenarios/$s.toml" `
+              --build-dir $env:BUILD_DIR --generator ninja --config ${{ matrix.config }} --cxx $env:CML_CXX `
+              --require-all-capabilities `
+              --artifacts "$PWD/$env:LOG_DIR/cmltest-ninja-$s" --junit "$PWD/$env:LOG_DIR/cmltest-ninja-$s-junit.xml" `
+              *>&1 | Tee-Object -FilePath "$env:LOG_DIR/cmltest-ninja-$s.log"
+            if ($LASTEXITCODE -ne 0) { $failed += $s }
+            Write-Host "::endgroup::"
+          }
+          Get-Content "$env:LOG_DIR/cmltest-ninja-*.log" | Where-Object { $_ -match '^(CMLTEST_RESULT|PARTIAL|FAILED|RELOAD-TIMING)' } |
+            Tee-Object -FilePath "$env:LOG_DIR/cmltest-ninja-summary.txt" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          Get-Content "$env:LOG_DIR/cmltest-ninja-summary.txt"
+          if ($failed.Count -gt 0) { Write-Host "FAILED scenarios: $($failed -join ', ')"; exit 1 }
 
       # Once per OS, with MSVC in Debug: the same scenario with the fixture built by the Visual
       # Studio generator (MSBuild), proving that path of the fixture builder.
@@ -246,6 +256,7 @@ jobs:
         run: |
           & "$env:BUILD_DIR/bin/cmltest.exe" --scenario tests/harness/scenarios/basic.toml `
             --build-dir $env:BUILD_DIR --generator msbuild --config ${{ matrix.config }} --cxx $env:CML_CXX `
+            --require-all-capabilities `
             --artifacts "$PWD/$env:LOG_DIR/cmltest-msbuild" --junit "$PWD/$env:LOG_DIR/cmltest-msbuild-junit.xml" `
             *>&1 | Tee-Object -FilePath "$env:LOG_DIR/cmltest-msbuild.log"
           $rc = $LASTEXITCODE

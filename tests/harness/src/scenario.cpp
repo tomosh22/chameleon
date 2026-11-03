@@ -19,6 +19,7 @@ const char* to_string(StepKind kind) {
         case StepKind::Edit: return "edit";
         case StepKind::Reload: return "reload";
         case StepKind::ExpectDiag: return "expect_diag";
+        case StepKind::ExpectMonotonic: return "expect_monotonic";
     }
     return "?";
 }
@@ -39,6 +40,12 @@ std::string Step::describe() const {
             break;
         case StepKind::Reload:
             out += " within " + std::to_string(within_s) + " s";
+            if (has_result_value) {
+                out += " expecting " + result_key + "=" + std::to_string(result_value);
+            }
+            break;
+        case StepKind::ExpectMonotonic:
+            out += " " + key + " (at least " + std::to_string(min_samples) + " samples)";
             break;
         case StepKind::ExpectDiag:
             out += " " + id + " within " + std::to_string(within_s) + " s";
@@ -163,11 +170,27 @@ cml::Result<Step> parse_step(const toml::Table& table) {
     }
     if (*kind == "reload") {
         step.kind = StepKind::Reload;
-        cml::Result<void> keys = only_keys(table, {"kind", "within_s"}, "a reload step");
+        cml::Result<void> keys = only_keys(table, {"kind", "within_s", "expect_result_key", "expect_result_value"}, "a reload step");
         if (!keys) return keys.error();
         cml::Result<int> within = int_in_range(table, "within_s", 60, 1, 3600);
         if (!within) return within.error();
         step.within_s = *within;
+        const toml::Value* rk = table.find("expect_result_key");
+        const toml::Value* rv = table.find("expect_result_value");
+        if ((rk == nullptr) != (rv == nullptr)) {
+            return invalid(table.line, "'expect_result_key' and 'expect_result_value' go together");
+        }
+        if (rk != nullptr) {
+            if (rk->kind != toml::Value::Kind::String || !name_chars_ok(rk->text, false)) {
+                return invalid(rk->line, "'expect_result_key' must be a member name (letters, digits, '_', '-')");
+            }
+            if (rv->kind != toml::Value::Kind::Integer) {
+                return invalid(rv->line, "'expect_result_value' must be an integer");
+            }
+            step.result_key = rk->text;
+            step.result_value = rv->integer;
+            step.has_result_value = true;
+        }
         return step;
     }
     if (*kind == "expect_diag") {
@@ -185,9 +208,22 @@ cml::Result<Step> parse_step(const toml::Table& table) {
         step.within_s = *within;
         return step;
     }
+    if (*kind == "expect_monotonic") {
+        step.kind = StepKind::ExpectMonotonic;
+        cml::Result<void> keys = only_keys(table, {"kind", "key", "min_samples"}, "an expect_monotonic step");
+        if (!keys) return keys.error();
+        cml::Result<std::string> key = require_string(table, "key", "an expect_monotonic step");
+        if (!key) return key.error();
+        if (!name_chars_ok(*key, false)) return invalid(table.line, "'key' must be a TICK key (letters, digits, '_', '-')");
+        step.key = *key;
+        cml::Result<int> samples = int_in_range(table, "min_samples", 10, 2, 100000);
+        if (!samples) return samples.error();
+        step.min_samples = *samples;
+        return step;
+    }
     (void)context;
     return invalid(table.line, "unknown step kind '" + *kind +
-                                   "' (launch, expect_stdout, expect_module_enabled, edit, reload, expect_diag)");
+                                   "' (launch, expect_stdout, expect_module_enabled, edit, reload, expect_diag, expect_monotonic)");
 }
 
 }  // namespace

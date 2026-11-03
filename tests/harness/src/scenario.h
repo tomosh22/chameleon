@@ -18,6 +18,7 @@ enum class StepKind {
     Edit,                 // apply a unified diff to the scratch copy of the fixture sources
     Reload,               // control command `reload` (needs capability "reload")
     ExpectDiag,           // a `diag` event with this id must arrive (needs capability "diag-events")
+    ExpectMonotonic,      // a `key=<int>` of the fixture's TICK lines never decreases (state kept in the old storage)
 };
 
 const char* to_string(StepKind kind);
@@ -30,6 +31,12 @@ struct Step {
     std::string patch;     // Edit: path relative to the fixture directory
     std::string id;        // ExpectDiag: "CML3101"
     int within_s = 10;     // ExpectStdout / ExpectModuleEnabled / Reload / ExpectDiag
+    std::string key;       // ExpectMonotonic: the TICK key ("calls")
+    int min_samples = 10;  // ExpectMonotonic: at least this many samples of the key in the whole output
+    // Reload: the result object of the reload command must hold this integer member (e.g. "initializers_run" = 1).
+    std::string result_key;
+    long long result_value = 0;
+    bool has_result_value = false;
 
     // "expect_stdout /value=2/ within 10 s"
     std::string describe() const;

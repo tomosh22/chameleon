@@ -16,11 +16,28 @@ add_library(cml_core STATIC
     src/bind_plan.cpp
     src/bind_fixups.cpp
     src/bind_json.cpp
-    src/symbol_registry.cpp)
+    src/symbol_registry.cpp
+    # WP-12: the reload pipeline (portable; the compiler and linker are behind PipelineEnv)
+    src/hook_narrowing.cpp
+    src/module_symbols.cpp
+    src/patch_image.cpp
+    src/source_baseline.cpp
+    src/module_index.cpp
+    src/module_state.cpp
+    src/agent_link.cpp
+    src/event_bus.cpp
+    src/log_hub.cpp
+    src/pipeline.cpp
+    src/pipeline_native.cpp
+    src/reload_service.cpp)
 target_include_directories(cml_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_BINARY_DIR}/generated")
-target_link_libraries(cml_core PUBLIC cml_util cml_ipc cml_coff cml_pdb)
+target_link_libraries(cml_core PUBLIC cml_util cml_ipc cml_coff cml_pdb cml_pe cml_toolchain)
+if(NOT MSVC)
+    find_package(Threads REQUIRED)
+    target_link_libraries(cml_core PUBLIC Threads::Threads)
+endif()
 cml_apply_warnings(cml_core)
 cml_target_core_style(cml_core)
 set_target_properties(cml_core PROPERTIES FOLDER "broker")

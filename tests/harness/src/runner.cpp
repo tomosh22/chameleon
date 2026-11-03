@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdio>
 #include <fstream>
 #include <memory>
 #include <optional>
@@ -20,6 +21,7 @@
 #include "fixture_builder.h"
 #include "rx.h"
 #include "supervisor.h"
+#include "ticks.h"
 #include "unified_diff.h"
 
 namespace cmltest {
@@ -232,6 +234,7 @@ private:
             case StepKind::Edit: return edit(step);
             case StepKind::Reload: return reload(step);
             case StepKind::ExpectDiag: return expect_diag(step);
+            case StepKind::ExpectMonotonic: return expect_monotonic(step);
         }
         return StepOutcome::fail(cml::ids::kScenarioFailed, "unknown step kind");
     }
@@ -285,6 +288,8 @@ private:
                            L" --startup-timeout 300000 --verbose";
         broker.working_directory = options_.artifacts_dir;
         broker.output_file = options_.artifacts_dir / "broker.stdout.txt";
+        // Objects, patch DLLs and PDBs of the reloads go below the artifacts, so a failed run uploads its evidence.
+        broker.environment[L"CML_SESSION_DIR"] = (options_.artifacts_dir / "broker-session").wstring();
         cml::Result<std::size_t> broker_id = supervisor_.start(broker);
         if (!broker_id) {
             return StepOutcome::fail(broker_id.error());
@@ -410,15 +415,31 @@ private:
                 return StepOutcome::fail(status.error());
             }
             const ipc::StatusProcess* process = status->find_process(pid);
+            bool matched_enabled = false;  // a matching module is enabled but its index is not ready: keep that message
             if (process != nullptr) {
                 for (const ipc::StatusModule& module : process->modules) {
                     if (module.enabled && module_matches(step.module, module.path)) {
-                        write_status_artifact(*status);
-                        return StepOutcome::pass("pid " + std::to_string(pid) + " lists " + module.path + " enabled");
+                        // WP-12: "enabled" also means the PDB index and the source baseline exist; an edit made
+                        // before that would be baked into the baseline and never reloaded.
+                        if (module.index_state == "failed") {
+                            write_status_artifact(*status);
+                            return StepOutcome::fail(cml::ids::kExpectModuleTimeout, "the PDB index of " + module.path + " failed: " + module.index_message);
+                        }
+                        // The WP-12 broker always reports the index state; a missing one is "not ready".
+                        if (module.index_state == "ready") {
+                            write_status_artifact(*status);
+                            return StepOutcome::pass("pid " + std::to_string(pid) + " lists " + module.path + " enabled, index ready");
+                        }
+                        matched_enabled = true;
+                        last = module.path + " is enabled but its index is " + (module.index_state.empty() ? std::string("not reported") : module.index_state) +
+                               " (" + std::to_string(module.index_percent) + "% " + module.index_message + ")";
+                        continue;
                     }
                 }
-                last = "pid " + std::to_string(pid) + " is registered with " + std::to_string(process->modules.size()) + " modules, none matching '" +
-                       step.module + "' is enabled";
+                if (!matched_enabled) {
+                    last = "pid " + std::to_string(pid) + " is registered with " + std::to_string(process->modules.size()) + " modules, none matching '" +
+                           step.module + "' is enabled";
+                }
             } else {
                 last = "the broker does not list pid " + std::to_string(pid) + " (it knows " + std::to_string(status->processes.size()) + " processes)";
             }
@@ -482,11 +503,40 @@ private:
             const ipc::ControlDiag& d = *response->diag;
             return StepOutcome::fail(cml::ids::kReloadFailed, "reload failed: " + d.id + ": " + d.message + " What to do: " + d.action);
         }
-        std::string summary = ipc::json::serialize(response->result);
-        if (summary.size() > 200) {
-            summary.resize(200);
+        // The per-stage timing line is part of the evidence (the broker logs the same line): print it.
+        const std::string timing = response->result.get_string("timing");
+        if (!timing.empty()) {
+            std::printf("%s\n", timing.c_str());
+            std::fflush(stdout);
         }
-        return StepOutcome::pass("reload ok " + summary);
+        {
+            std::ofstream out(options_.artifacts_dir / "reload-result.json", std::ios::binary | std::ios::app);
+            out << ipc::json::serialize(response->result) << "\n";
+        }
+        if (step.has_result_value) {
+            const ipc::json::Value* member = response->result.find(step.result_key);
+            if (member == nullptr || !member->is_integer() || member->as_integer() != step.result_value) {
+                return StepOutcome::fail(cml::ids::kResultMismatch,
+                                         "the reload result has " + step.result_key + " = " +
+                                             (member == nullptr ? std::string("(absent)") : ipc::json::serialize(*member)) + ", expected " +
+                                             std::to_string(step.result_value));
+            }
+        }
+        std::string summary = "patched=" + std::to_string(response->result.get_integer("patched")) +
+                              " hooks_installed=" + std::to_string(response->result.get_integer("hooks_installed")) +
+                              " initializers_run=" + std::to_string(response->result.get_integer("initializers_run"));
+        return StepOutcome::pass("reload ok " + summary + (timing.empty() ? std::string() : "; " + timing));
+    }
+
+    // The values of `key=` in the fixture's whole output never decrease and do change: state that lives in the old
+    // image's storage survives the reload.
+    StepOutcome expect_monotonic(const Step& step) {
+        const std::string output = read_whole_file(fixture_stdout_);
+        cml::Result<std::string> checked = check_monotonic(output, step.key, static_cast<std::size_t>(step.min_samples));
+        if (!checked) {
+            return StepOutcome::fail(checked.error());
+        }
+        return StepOutcome::pass(*checked);
     }
 
     StepOutcome expect_diag(const Step& step) {

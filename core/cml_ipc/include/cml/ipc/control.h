@@ -90,9 +90,17 @@ ControlResponse make_error_response(std::optional<std::int64_t> id, const Diag& 
 
 // --- status ---------------------------------------------------------------------------------
 
+// State of a module's PDB index (WP-12): "loading" while the broker opens the PDB and takes the source-hash
+// baseline, "ready" once reload can run, "failed" with `index_message` otherwise. Empty = the broker does
+// not report it (WP-13 brokers); clients must treat that as ready.
 struct StatusModule {
+    StatusModule() = default;
+    StatusModule(std::string p, bool e) : path(std::move(p)), enabled(e) {}
     std::string path;
     bool enabled = false;
+    std::string index_state;
+    std::uint32_t index_percent = 0;  // 0..100 while loading
+    std::string index_message;        // phase while loading, error text when failed
 };
 
 struct StatusProcess {
@@ -107,6 +115,8 @@ struct StatusReport {
     std::vector<StatusProcess> processes;
     bool truncated = false;              // some processes or modules were left out (size bound)
     bool control_pipe_healthy = true;    // false while the broker's control accept loop is recovering
+    bool reload_running = false;         // a reload is in progress (WP-12)
+    std::uint64_t generation = 0;        // patches applied so far by this broker (WP-12)
 
     bool has_capability(std::string_view name) const;
     // The process with this pid, or nullptr.

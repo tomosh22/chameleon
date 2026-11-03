@@ -10,8 +10,11 @@
 #include <thread>
 #include <vector>
 
+#include "cml/core/agent_link.h"
 #include "cml/core/control_server.h"
+#include "cml/core/pipeline.h"
 #include "cml/core/process_registry.h"
+#include "cml/core/reload_service.h"
 #include "cml/core/session.h"
 #include "cml/core/version.h"
 #include "cml/proc/diag_ids.h"
@@ -36,6 +39,7 @@ struct Connection {
 // State shared between run() and the connection threads.
 struct Shared {
     ProcessRegistry registry;  // what the control pipe's `status` reports
+    ReloadService* service = nullptr;  // the reload pipeline (WP-12)
     std::atomic<int> active{0};
     std::atomic<unsigned long long> last_idle_tick{0};  // GetTickCount64 when active last hit 0
 };
@@ -43,6 +47,24 @@ struct Shared {
 void serve_connection(Connection& connection, std::uint64_t agent_id, Shared& shared,
                       const std::atomic<bool>& stop_requested) {
     Session session(agent_id, version_string());
+    // Everything written to the agent goes through the link, which serialises the connection thread's own
+    // replies with the requests the reload pipeline sends from other threads.
+    auto link = std::make_shared<AgentLink>(agent_id, [&connection](const ipc::Message& message) -> Result<void> {
+        Result<ipc::IoStatus> sent = connection.pipe.send(message, kSendTimeoutMs);
+        if (!sent) {
+            return sent.error();
+        }
+        if (*sent != ipc::IoStatus::Ok) {
+            return Diag::make(ids::kConnectionLost, "the connection to the agent was closed while sending",
+                              "The application may have exited; wait for its agent to reconnect.");
+        }
+        return Result<void>();
+    });
+    session.set_answer_sink([link](const ipc::Message& answer) { return link->deliver(answer); });
+    if (shared.service != nullptr) {
+        shared.service->attach(link);
+    }
+    std::uint64_t seen_revision = 0;
     bool running = true;
     while (running && !stop_requested.load(std::memory_order_acquire)) {
         Result<ipc::PipeConnection::Received> received = connection.pipe.receive(ipc::kInfiniteTimeout);
@@ -54,16 +76,21 @@ void serve_connection(Connection& connection, std::uint64_t agent_id, Shared& sh
         switch (received->status) {
             case ipc::IoStatus::Ok: {
                 SessionOutcome outcome = session.on_message(received->message);
+                // Order matters: the index (state "loading") must exist before `status` can show the module as
+                // enabled, so the service sees the change first.
+                link->publish(session);
+                if (shared.service != nullptr && session.revision() != seen_revision) {
+                    seen_revision = session.revision();
+                    shared.service->on_session_changed(agent_id);  // starts / drops the PDB index of enabled modules
+                }
                 shared.registry.update_if_changed(session);  // rebuilds only when modules / enabled set changed
                 for (const ipc::Message& reply : outcome.replies) {
                     CML_LOG(Debug, "agent#%llu -> %s", static_cast<unsigned long long>(agent_id),
                             ipc::describe(reply).c_str());
-                    Result<ipc::IoStatus> sent = connection.pipe.send(reply, kSendTimeoutMs);
-                    if (!sent || *sent != ipc::IoStatus::Ok) {
-                        if (!sent) {
-                            CML_LOG(Warn, "agent#%llu: %s", static_cast<unsigned long long>(agent_id),
-                                    sent.error().format().c_str());
-                        }
+                    Result<void> sent = link->send(reply);
+                    if (!sent) {
+                        CML_LOG(Warn, "agent#%llu: %s", static_cast<unsigned long long>(agent_id),
+                                sent.error().format().c_str());
                         running = false;
                         break;
                     }
@@ -91,8 +118,7 @@ void serve_connection(Connection& connection, std::uint64_t agent_id, Shared& sh
                     error_reply.request_id = *bad.request_id;
                     error_reply.status = bad.error.code;
                     error_reply.message = ipc::sanitize_utf8(bad.error.message + " " + bad.error.what_to_do, 1000);
-                    Result<ipc::IoStatus> sent = connection.pipe.send(error_reply, kSendTimeoutMs);
-                    if (!sent || *sent != ipc::IoStatus::Ok) {
+                    if (!link->send(error_reply)) {
                         running = false;
                     }
                 }
@@ -106,6 +132,10 @@ void serve_connection(Connection& connection, std::uint64_t agent_id, Shared& sh
                 running = false;
                 break;
         }
+    }
+    link->close();  // ends the reload pipeline's pending requests; nobody uses the pipe after this
+    if (shared.service != nullptr) {
+        shared.service->detach(agent_id);
     }
     shared.registry.remove(agent_id);
     CML_LOG(Info, "agent#%llu disconnected (pid %u, %llu modules enabled)",
@@ -168,15 +198,26 @@ Result<ServerExit> ConnectionServer::run() {
     CML_LOG(Info, "listening on %s", options_.pipe_name.c_str());
 
     Shared shared;
+    PipelineEnv native;
+    if (options_.pipeline_env == nullptr) {
+        native = native_pipeline_env();
+    }
+    ReloadService service(options_.pipeline_env != nullptr ? *options_.pipeline_env : native, &events_, options_.session_dir);
+    shared.service = &service;
     std::unique_ptr<ControlServer> control;
     if (!options_.control_pipe_name.empty()) {
         ControlContext context;
         context.version = version_string();
         context.registry = &shared.registry;
+        context.service = &service;
         control = std::make_unique<ControlServer>(options_.control_pipe_name, std::move(context));
         Result<void> started = control->start();
         if (!started) {
-            return started.error();
+            if (!options_.control_pipe_optional) {
+                return started.error();
+            }
+            CML_LOG(Warn, "no control pipe: %s", started.error().format().c_str());
+            control.reset();
         }
     }
     std::vector<std::unique_ptr<Connection>> connections;
@@ -240,6 +281,7 @@ Result<ServerExit> ConnectionServer::run() {
     }
 
     stop_requested_.store(true, std::memory_order_release);  // the connection threads look at this too
+    service.cancel();  // a running reload ends its compile / link at once
     server.cancel();
     for (auto& connection : connections) {
         connection->pipe.cancel();

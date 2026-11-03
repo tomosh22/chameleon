@@ -1,0 +1,45 @@
+# Scenario `new_global`: the edit adds a global `Tracker` with a dynamic initialiser (a std::string) and a
+# destructor. value = g_tracker.name.size() = 7 proves the constructor ran; the reload result must report
+# exactly one initialiser run (the constructor runs once, not once per reload step or per hook).
+name = "new_global"
+description = "fixture new_global: value=1 -> edit (adds Tracker) -> reload -> value=7, constructor ran once"
+fixture = "new_global"
+timeout_s = 180
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1\\b"
+within_s = 15
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_new_global.exe"
+within_s = 15
+
+[[step]]
+kind = "edit"
+patch = "edits/add_tracker.edit"
+
+[[step]]
+kind = "reload"
+within_s = 90
+expect_result_key = "initializers_run"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=7\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=7\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=7\\b"
+within_s = 10
