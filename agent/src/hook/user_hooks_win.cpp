@@ -231,6 +231,15 @@ void Session::commit(const std::vector<std::pair<std::uint64_t, std::uint64_t>>&
 }
 
 std::size_t Session::run(Kind kind, const char* text) {
+    // A stack overflow in a hook is survivable only if the thread keeps enough stack to dispatch the exception
+    // after the guard page was hit; the default guarantee is not enough on every Windows build (one CI machine
+    // died with an unhandled STATUS_STACK_OVERFLOW instead of reaching the handler). Once per thread.
+    static thread_local bool guarantee_set = false;
+    if (!guarantee_set) {
+        guarantee_set = true;
+        ULONG guarantee = 64 * 1024;
+        SetThreadStackGuarantee(&guarantee);
+    }
     if (t_refuse_hooks) {
         CML_LOG(Error, "%s",
                 Diag::make(ids::kStackNotRestored, "no application hook runs on this thread any more",
