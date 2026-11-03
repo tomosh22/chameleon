@@ -172,6 +172,14 @@ TEST_CASE("audit: /GL is CML1103 FAIL, from the command line and from the S_COMP
     CHECK(finding(a, "gl").message.find("a.cpp.obj") != std::string::npos);
     CHECK(finding(a, "gl").message.find("/GL") != std::string::npos);
     CHECK_FALSE(finding(a, "gl").what_to_do.empty());
+
+    // The compiler's own record (S_COMPILE3 LTCG bit) is enough, whatever the recorded command says.
+    ModOpts bit;
+    bit.compile3_flags = kFlagLtcg;
+    Module m2(bit);
+    const ModuleAudit b = audit_module_file(m2.exe);
+    CHECK(finding(b, "gl").verdict == Verdict::Fail);
+    CHECK(finding(b, "gl").id == 1103);
 }
 
 TEST_CASE("audit: /guard:cf is CML1104 FAIL") {
