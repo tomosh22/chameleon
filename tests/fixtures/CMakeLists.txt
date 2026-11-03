@@ -32,3 +32,10 @@ foreach(_cml_m2 header_change_two_tus exe_plus_dll two_processes sync_point opti
         add_subdirectory(${_cml_m2})
     endif()
 endforeach()
+
+# Wave 6 fixture directories (ADR-0032), built only once a work package adds them.
+foreach(_cml_m6 crash hot_restart revert tls elision)
+    if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/${_cml_m6}/CMakeLists.txt")
+        add_subdirectory(${_cml_m6})
+    endif()
+endforeach()
