@@ -431,6 +431,10 @@ TEST_CASE("application hooks, immediate mode: pre-patch, then the install, then 
             CHECK(thread != GetCurrentThreadId());
         }
     }
+    // The installer's registry is process-wide and the next Rig may reuse these addresses: take the hook off
+    // again (a revert of a function without a hook is answered with CML4311 and harmless).
+    REQUIRE(broker.send(request(99, ipc::kInstallHooksRevert, {{rig.old_fn.entry, nullptr}})));
+    REQUIRE(broker.wait_for_answer(15000).has_value());
     agent.stop_and_wait_for_calls();
     set_window_probe(false);
     hooktest_user::reset(nullptr);
@@ -481,6 +485,13 @@ TEST_CASE("application hooks, synchronised mode: nothing runs before SyncPoint, 
     for (const unsigned long thread : hooktest_user::threads()) {
         CHECK(thread == GetCurrentThreadId());  // hooks and the install ran on the thread that called SyncPoint
     }
+    REQUIRE(broker.send(request(98, ipc::kInstallHooksRevert, {{rig.old_fn.entry, nullptr}})));
+    answer.reset();
+    while (!answer && std::chrono::steady_clock::now() < deadline) {
+        agent.sync_point();
+        answer = broker.wait_for_answer(100);
+    }
+    REQUIRE(answer.has_value());
     agent.stop_and_wait_for_calls();
     set_window_probe(false);
     hooktest_user::reset(nullptr);
