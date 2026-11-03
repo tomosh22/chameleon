@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <future>
 #include <map>
 #include <memory>
@@ -76,6 +77,10 @@ public:
     SaveWatcherHooks::ReloadResult reload_for_save();
     // Test seam: the directory watcher factory used by the next compile_on_save activation.
     void set_watcher_factory_for_testing(WatcherFactory factory);
+    // WP-20: called (on the control connection's thread, without a lock held) after set-option changed an option; the name is
+    // the option's. The exception service re-evaluates whether the agents should hold faulting threads.
+    using OptionObserver = std::function<void(const std::string& name)>;
+    void set_option_observer(OptionObserver observer);
     // Aborts running compiles and links (shutdown); sticky.
     void cancel() { cancel_.cancel(); }
 
@@ -118,6 +123,9 @@ private:
     std::shared_ptr<SaveWatcher> save_watcher_;
     std::vector<std::future<void>> retiring_;  // stopped save watchers finishing a reload
     WatcherFactory watcher_factory_;
+
+    std::mutex observer_mutex_;
+    OptionObserver option_observer_;
 
     std::mutex reload_mutex_;  // one reload at a time
     std::atomic<bool> running_{false};

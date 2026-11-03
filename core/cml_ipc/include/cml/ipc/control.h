@@ -41,6 +41,7 @@ inline constexpr const char* kSetOption = "set-option";
 inline constexpr const char* kSubscribe = "subscribe";
 inline constexpr const char* kRevert = "revert";  // WP-22: control command `revert` and the `patch_reverted` event
 inline constexpr const char* kDiagEvents = "diag-events";  // `diag` events are delivered to subscribers
+inline constexpr const char* kExceptions = "exceptions";    // WP-20: `exception` events, `exception-action` and `exceptions` commands
 }  // namespace capability
 
 struct ControlDiag {

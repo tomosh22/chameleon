@@ -1,0 +1,69 @@
+# Scenario `crash_leave_function` (WP-20, plan section 4.11): "Leave function".
+#
+# The fixture (--leave) faults in cell_store() once armed. The agent holds the thread; the answer is Leave function: the agent
+# unwinds the faulting frame (RtlVirtualUnwind, or the return address at RSP for a leaf function), sets RAX to 0 and resumes the
+# thread at the return address. The caller sees 0 from cell_store() (`cell=0`), recovers, and the loop carries on without a patch.
+name = "crash_leave_function"
+description = "fixture crash --leave: a held fault is answered with Leave function; the caller sees 0 and carries on"
+fixture = "crash"
+fixture_args = "--leave"
+timeout_s = 240
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ cell=\\d+ armed=0"
+within_s = 20
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_crash.exe"
+within_s = 30
+
+[[step]]
+kind = "watch_exceptions"
+
+[[step]]
+kind = "signal_fixture"
+
+[[step]]
+kind = "expect_stdout"
+regex = "ARMED"
+within_s = 10
+
+[[step]]
+kind = "expect_exception"
+code = "0xC0000005"
+function = "cell_store"
+within_s = 30
+
+[[step]]
+kind = "expect_pending_exceptions"
+count = 1
+
+[[step]]
+kind = "exception_action"
+action = "leave"
+
+[[step]]
+kind = "expect_pending_exceptions"
+count = 0
+
+# The frame's caller saw 0 ...
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ cell=0 armed=1"
+within_s = 10
+
+# ... recovered, and the loop goes on with real values again.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ cell=[1-9]\\d+ armed=1"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ cell=[1-9]\\d+ armed=1"
+within_s = 10

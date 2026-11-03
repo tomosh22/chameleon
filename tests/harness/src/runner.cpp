@@ -18,6 +18,7 @@
 #include "cml/ipc/control.h"
 #include "cml/ipc/pipe.h"
 #include "cml/proc/proc.h"
+#include "exception_steps.h"
 #include "fixture_builder.h"
 #include "revert_step.h"
 #include "subscription.h"
@@ -251,8 +252,19 @@ private:
             case StepKind::SignalFixture: return signal_fixture();
             case StepKind::ExpectReloadResult: return expect_reload_result(step);
             case StepKind::Revert: return revert(step);
+            case StepKind::WatchExceptions: return from_exception(exception_steps_.watch(*control_, kControlTimeoutMs));
+            case StepKind::ExpectException: {
+                const std::uint32_t limit_ms = std::min<std::uint32_t>(static_cast<std::uint32_t>(step.within_s) * 1000u, remaining_ms());
+                return from_exception(exception_steps_.expect(*control_, step, limit_ms, limit_ms < static_cast<std::uint32_t>(step.within_s) * 1000u));
+            }
+            case StepKind::ExceptionAction: return from_exception(exception_steps_.act(*control_, step, kControlTimeoutMs));
+            case StepKind::ExpectPendingExceptions: return from_exception(exception_steps_.pending(*control_, step, kControlTimeoutMs));
         }
         return StepOutcome::fail(cml::ids::kScenarioFailed, "unknown step kind");
+    }
+
+    static StepOutcome from_exception(const ExceptionStepResult& result) {
+        return result.ok ? StepOutcome::pass(result.detail) : StepOutcome::fail(result.diag_code, result.detail);
     }
 
     StepOutcome build() {
@@ -810,6 +822,7 @@ private:
     bool has_reload_result_ = false;
     bool launched_ = false;
     fs::path signal_file_;
+    ExceptionSteps exception_steps_;  // WP-20
     bool failed_ = false;
     std::optional<std::string> skip_reason_;
     Clock::time_point run_deadline_ = Clock::now();

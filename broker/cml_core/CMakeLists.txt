@@ -36,6 +36,8 @@ add_library(cml_core STATIC
     src/revert.cpp
     # WP-14: compile on save
     src/save_watcher.cpp
+    # WP-20: crash -> patch -> continue
+    src/exception_service.cpp
     src/reload_service.cpp)
 target_include_directories(cml_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"

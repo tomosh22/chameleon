@@ -16,6 +16,7 @@
 #include <string_view>
 #include <vector>
 
+#include "cml/core/exception_service.h"
 #include "cml/core/process_registry.h"
 #include "cml/core/reload_service.h"
 #include "cml/ipc/control.h"
@@ -29,6 +30,8 @@ struct ControlContext {
     const std::atomic<bool>* pipe_healthy = nullptr;
     // WP-12: the reload pipeline behind reload / wait / set-option / subscribe (null: status only).
     ReloadService* service = nullptr;
+    // WP-20: crash -> patch -> continue (`exception-action`, `exceptions`; capability "exceptions"). Null: not provided.
+    ExceptionService* exceptions = nullptr;
     // Set per connection by the server: subscribes the connection to the given events (empty = all). Null
     // (handle_control_line used without a connection): `subscribe` is answered with an empty subscription.
     std::function<void(const std::set<std::string>& events)> subscribe;

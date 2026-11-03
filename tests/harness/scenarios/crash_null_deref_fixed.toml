@@ -1,0 +1,88 @@
+# Scenario `crash_null_deref_fixed` (WP-20, plan section 4.11): crash -> patch -> continue.
+#
+# The fixture's main thread faults (an access violation in cell_store(), in the enabled exe) every frame once the harness arms it.
+# Because a control client listens for `exception` events, the agent HOLDS the faulting thread instead of letting the process
+# die, and the broker reports it. While the thread is held the application is still alive: the patch (edits/fix_cell.edit,
+# maintain() makes the page accessible) is compiled, loaded and hooked, and the helper thread runs the new code. Then Continue
+# resumes the held thread at the faulting instruction, which now succeeds, and the TICK lines carry on.
+#
+# The rule that makes Continue safe is in docs/wp/WP-20.md: it re-executes the instruction with the registers it had, so the fix
+# must change the memory the instruction touches (a register that holds null stays null).
+name = "crash_null_deref_fixed"
+description = "fixture crash: a fault in an enabled module is held, a patch fixes the state, Continue resumes and the loop goes on"
+fixture = "crash"
+timeout_s = 300
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ cell=\\d+ armed=0"
+within_s = 20
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_crash.exe"
+within_s = 30
+
+# From here on the agents hold faulting threads.
+[[step]]
+kind = "watch_exceptions"
+
+[[step]]
+kind = "signal_fixture"
+
+[[step]]
+kind = "expect_stdout"
+regex = "ARMED"
+within_s = 10
+
+[[step]]
+kind = "expect_exception"
+code = "0xC0000005"
+function = "cell_store"
+within_s = 30
+
+# The thread is held: the broker lists it and the fixture prints nothing more.
+[[step]]
+kind = "expect_pending_exceptions"
+count = 1
+
+[[step]]
+kind = "edit"
+patch = "edits/fix_cell.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+
+# The patched maintain() ran on the helper thread.
+[[step]]
+kind = "expect_stdout"
+regex = "REPAIRED"
+within_s = 20
+
+[[step]]
+kind = "exception_action"
+action = "continue"
+
+[[step]]
+kind = "expect_pending_exceptions"
+count = 0
+
+# The held frame completes and the loop carries on, frame after frame.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ cell=\\d+ armed=1"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ cell=\\d+ armed=1"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ cell=\\d+ armed=1"
+within_s = 10

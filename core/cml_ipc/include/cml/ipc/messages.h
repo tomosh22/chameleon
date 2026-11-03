@@ -69,9 +69,10 @@ enum class MessageType : std::uint16_t {
     HooksInstalled = 0x0041,  // implemented  agent -> broker (the answer; repeats the request id)
     SyncPointReady = 0x0042,
 
-    // Exceptions (later work packages).
-    Exception = 0x0050,
-    ExceptionAction = 0x0051,
+    // Crash -> patch -> continue (WP-20, ADR-0032: 0x0050..0x005F).
+    Exception = 0x0050,        // implemented  agent -> broker (event, no answer)
+    ExceptionAction = 0x0051,  // implemented  broker -> agent (request, answered by Reply)
+    ExceptionConfig = 0x0052,  // implemented  broker -> agent (request, answered by Reply)
 
     // Diagnostics and lifecycle.
     Log = 0x0060,      // implemented  agent -> broker (event)
@@ -203,6 +204,58 @@ struct HooksInstalled {
     std::uint32_t threads = 0;     // threads stopped in the largest window
     std::uint32_t window_ms = 0;   // longest time they were stopped
     std::vector<HookResult> results;  // one per hook, in request order
+};
+
+// --- crash -> patch -> continue (WP-20, plan section 4.11) ------------------------------------------
+
+// The agent's first-chance exception handler found an access violation, integer division by zero or illegal instruction
+// in an enabled module (or a patch) and holds the faulting thread. It reports the fault and waits for ExceptionAction;
+// nothing is answered to the Exception itself. `exception_id` identifies the held thread (unique per agent run).
+inline constexpr std::uint32_t kExceptionFlagInPatch = 1u;  // the faulting address lies in a patch image, not in an enabled module
+inline constexpr std::uint32_t kExceptionAccessNone = 0xFFFFFFFFu;  // not an access violation
+
+struct Exception {
+    std::uint32_t exception_id = 0;
+    std::uint32_t thread_id = 0;
+    std::uint32_t code = 0;          // NTSTATUS: 0xC0000005 access violation, 0xC0000094 divide by zero, 0xC000001D illegal instruction
+    std::uint32_t flags = 0;         // kExceptionFlag*
+    std::uint32_t access = kExceptionAccessNone;  // access violation: 0 read, 1 write, 8 execute (DEP); else kExceptionAccessNone
+    std::uint64_t address = 0;       // the faulting instruction (RIP)
+    std::uint64_t data_address = 0;  // access violation: the address that was accessed
+    std::uint64_t stack_pointer = 0; // RSP at the fault
+    std::uint64_t module_base = 0;   // base of the module or patch image holding `address`
+    std::string module_path;         // its file, UTF-8
+};
+
+// The agent's answer (Reply status) when ExceptionAction names a thread that is not held. Shared so the broker can tell "gone"
+// from "refused" (agent/src/crash/diag_ids.h: kUnknownException).
+inline constexpr std::uint32_t kStatusUnknownException = 4400;
+
+// What to do with a held thread. Values are on the wire; never renumber.
+enum class ExceptionActionKind : std::uint32_t {
+    Continue = 1,  // resume at the faulting instruction (after a fix that makes it safe)
+    Leave = 2,     // unwind the faulting function, return 0 from it
+    Ignore = 3,    // hand the exception to the next handler
+};
+
+// Broker -> agent request, answered by Reply: status 0 once the thread was released, else a CML44xx id (the thread stays held).
+struct ExceptionAction {
+    std::uint64_t request_id = 0;
+    std::uint32_t exception_id = 0;
+    ExceptionActionKind action = ExceptionActionKind::Ignore;
+};
+
+// Bit flags of ExceptionConfig::flags.
+inline constexpr std::uint32_t kExceptionConfigEnabled = 1u;            // hold faulting threads and report them
+inline constexpr std::uint32_t kExceptionConfigBreakWithDebugger = 2u;  // also when a debugger is attached
+inline constexpr std::uint32_t kExceptionConfigKnownFlags = kExceptionConfigEnabled | kExceptionConfigBreakWithDebugger;
+
+// Broker -> agent request, answered by Reply: the broker sends it when a control client subscribes to (or leaves) the
+// `exception` event and when the `crash_handler` / `break_with_debugger` options change. Not enabled: the agent answers every
+// fault with "ignore" at once and releases the threads it holds.
+struct ExceptionConfig {
+    std::uint64_t request_id = 0;
+    std::uint32_t flags = 0;
 };
 
 // --- compile notifications (WP-17, plan section 4.9) ---------------------------------------------
@@ -338,7 +391,7 @@ struct ReleaseRange {
 using Message = std::variant<Hello, Welcome, ModuleList, EnableModule, DisableModule, ModuleLoaded,
                              ModuleUnloaded, Log, Reply, ReserveRange, ReleaseRange, LoadPatch,
                              PatchLoaded, ApplyFixups, RunInitializers, ReserveRangeResult, InstallHooks,
-                             HooksInstalled, CompileEvent>;
+                             HooksInstalled, CompileEvent, Exception, ExceptionAction, ExceptionConfig>;
 
 MessageType type_of(const Message& message) noexcept;
 
