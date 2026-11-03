@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cwchar>
 #include <memory>
+#include <string>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -92,19 +93,33 @@ std::wstring build_environment_block(const std::vector<std::pair<std::string, st
     return block;
 }
 
-// True for the shared PDB server (matched by image name, case-insensitive).
-bool is_pdb_server(HANDLE process) {
-    wchar_t buf[MAX_PATH * 2];
-    DWORD len = static_cast<DWORD>(sizeof(buf) / sizeof(buf[0]));
-    if (!QueryFullProcessImageNameW(process, 0, buf, &len)) {
-        return true;  // cannot tell what it is: do not kill it
-    }
-    const wchar_t* base = buf;
-    for (const wchar_t* c = buf; *c != L'\0'; ++c) {
-        if (*c == L'\\' || *c == L'/') {
-            base = c + 1;
+// The image path of `process`, or an empty string when it cannot be queried. The buffer grows (FU-08): a path longer than
+// the first guess (MAX_PATH * 2) used to fail the query, and a failed query was taken for "this is mspdbsrv, keep it".
+std::wstring image_path_of(HANDLE process) {
+    std::wstring buf(MAX_PATH * 2, L'\0');
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        DWORD len = static_cast<DWORD>(buf.size());
+        if (QueryFullProcessImageNameW(process, 0, buf.data(), &len)) {
+            buf.resize(len);
+            return buf;
         }
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || buf.size() >= 32768) {
+            break;
+        }
+        buf.assign(buf.size() * 4 > 32768 ? 32768 : buf.size() * 4, L'\0');
     }
+    return std::wstring();
+}
+
+// True for the shared PDB server (matched by image name, case-insensitive). When the image name cannot be queried at all
+// (access denied, a process that just exited) the answer is still "true": what cannot be identified is not killed.
+bool is_pdb_server(HANDLE process) {
+    const std::wstring path = image_path_of(process);
+    if (path.empty()) {
+        return true;
+    }
+    const std::size_t slash = path.find_last_of(L"\\/");
+    const wchar_t* base = path.c_str() + (slash == std::wstring::npos ? 0 : slash + 1);
     return _wcsicmp(base, L"mspdbsrv.exe") == 0;
 }
 
