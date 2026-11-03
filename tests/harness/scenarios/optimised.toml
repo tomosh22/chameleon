@@ -1,0 +1,43 @@
+# Scenario `optimised` (WP-18): fixture `optimised` is built with /O2 /Ob2. The edit changes the small function
+# small_value(); the reload succeeds and the broker warns CML3104 (a copy of the function inlined into another
+# translation unit would keep the old code).
+name = "optimised"
+description = "fixture optimised: small_value() 1 -> 2 -> reload -> warning CML3104"
+fixture = "optimised"
+timeout_s = 180
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=11 small=1\\b"
+within_s = 15
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_optimised.exe"
+within_s = 15
+
+[[step]]
+kind = "edit"
+patch = "edits/small_value_2.edit"
+
+[[step]]
+kind = "reload"
+within_s = 90
+
+[[step]]
+kind = "expect_diag"
+id = "CML3104"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=12 small=2\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=12 small=2\\b"
+within_s = 10

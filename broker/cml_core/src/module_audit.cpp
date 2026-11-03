@@ -227,7 +227,11 @@ void examine_compilands(const pdb::PdbIndex& index, const AuditOptions& options,
             continue;
         }
         const pdb::Compiland& c = index.compiland(ci);
-        if (!c.has_compile3 || !is_codeview_language_with_code(c.compile.language)) {
+        // An object without S_COMPILE3 still counts (an IL object of a /GL build may have none); other record kinds
+        // (MASM, resources, ...) do not.
+        const std::string_view object_name = c.object_name;
+        const bool object_file = object_name.size() > 4 && (object_name.substr(object_name.size() - 4) == ".obj" || object_name.substr(object_name.size() - 2) == ".o");
+        if (c.has_compile3 ? !is_codeview_language_with_code(c.compile.language) : !object_file) {
             continue;
         }
         if (audit.compilands_examined >= options.max_compilands) {
@@ -287,7 +291,7 @@ void examine_compilands(const pdb::PdbIndex& index, const AuditOptions& options,
         in.args = args;
         in.dialect = dialect;
         in.have_command_line = have_command;
-        in.compile3 = &c.compile;
+        in.compile3 = c.has_compile3 ? &c.compile : nullptr;
         in.object_bytes = object;
         const toolchain::CompilandFlagFacts facts = toolchain::detect_compiland_flags(in);
         if (facts.whole_program_optimization.value == toolchain::Tri::Yes) {
