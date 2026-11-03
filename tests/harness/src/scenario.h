@@ -22,6 +22,7 @@ enum class StepKind {
     SetOption,            // control command `set-option` (WP-14: e.g. compile_on_save = true)
     Wait,                 // control command `wait` for "index" or "idle"
     ExpectEvent,          // an event of this name (patch_applied, ...) must arrive (needs capability "subscribe")
+    ExpectReloadResult,   // an integer member of the most recent reload's result has this value (WP-16)
 };
 
 const char* to_string(StepKind kind);
@@ -47,6 +48,14 @@ struct Step {
     std::string result_key;
     long long result_value = 0;
     bool has_result_value = false;
+    // WP-16, several processes. Launch: `exe` is a fixture executable of the same build (file name, ".exe" optional; empty =
+    // the fixture's primary exe) and `label` names the process (default "fixture" for the primary exe, else the exe's name
+    // without extension). `process` selects the process of ExpectStdout / ExpectModuleEnabled / ExpectMonotonic (empty =
+    // the first launched). ExpectReloadResult uses `key` and `result_value`.
+    std::string exe;
+    std::string label;
+    std::string args;   // Launch: extra command-line arguments of the fixture process (after --agent)
+    std::string process;
 
     // "expect_stdout /value=2/ within 10 s"
     std::string describe() const;

@@ -1,6 +1,7 @@
 #include "scenario.h"
 
 #include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <sstream>
 #include <system_error>
@@ -23,6 +24,7 @@ const char* to_string(StepKind kind) {
         case StepKind::SetOption: return "set_option";
         case StepKind::Wait: return "wait";
         case StepKind::ExpectEvent: return "expect_event";
+        case StepKind::ExpectReloadResult: return "expect_reload_result";
     }
     return "?";
 }
@@ -31,12 +33,27 @@ std::string Step::describe() const {
     std::string out = to_string(kind);
     switch (kind) {
         case StepKind::Launch:
+            if (!exe.empty()) {
+                out += " " + exe + (label.empty() ? std::string() : " as " + label);
+            }
+            if (!args.empty()) {
+                out += " [" + args + "]";
+            }
             break;
         case StepKind::ExpectStdout:
             out += " /" + regex + "/ within " + std::to_string(within_s) + " s";
+            if (!process.empty()) {
+                out += " (" + process + ")";
+            }
             break;
         case StepKind::ExpectModuleEnabled:
             out += " " + module + " within " + std::to_string(within_s) + " s";
+            if (!process.empty()) {
+                out += " (" + process + ")";
+            }
+            break;
+        case StepKind::ExpectReloadResult:
+            out += " " + key + "=" + std::to_string(result_value);
             break;
         case StepKind::Edit:
             out += " " + patch;
@@ -129,7 +146,35 @@ cml::Result<void> only_keys(const toml::Table& table, std::initializer_list<cons
     return cml::Result<void>();
 }
 
+// A launched exe's default label: its file name without a (case-insensitive) ".exe" suffix, like the runner's lookup.
+std::string default_label(const std::string& exe) {
+    if (exe.size() > 4) {
+        std::string tail = exe.substr(exe.size() - 4);
+        std::transform(tail.begin(), tail.end(), tail.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (tail == ".exe") {
+            return exe.substr(0, exe.size() - 4);
+        }
+    }
+    return exe;
+}
+
+cml::Result<Step> parse_step_kind(const toml::Table& table);
+
 cml::Result<Step> parse_step(const toml::Table& table) {
+    cml::Result<Step> step = parse_step_kind(table);
+    if (!step) {
+        return step;
+    }
+    if (const toml::Value* p = table.find("process")) {
+        if (p->kind != toml::Value::Kind::String || !name_chars_ok(p->text, false)) {
+            return invalid(p->line, "'process' must be a process label (letters, digits, '_', '-')");
+        }
+        step->process = p->text;
+    }
+    return step;
+}
+
+cml::Result<Step> parse_step_kind(const toml::Table& table) {
     Step step;
     step.line = table.line;
     cml::Result<std::string> kind = require_string(table, "kind", "[[step]]");
@@ -139,13 +184,31 @@ cml::Result<Step> parse_step(const toml::Table& table) {
     const char* context = "this step";
     if (*kind == "launch") {
         step.kind = StepKind::Launch;
-        cml::Result<void> keys = only_keys(table, {"kind"}, "a launch step");
+        cml::Result<void> keys = only_keys(table, {"kind", "exe", "label", "args"}, "a launch step");
         if (!keys) return keys.error();
+        if (table.find("exe") != nullptr) {
+            cml::Result<std::string> exe = require_string(table, "exe", "a launch step");
+            if (!exe) return exe.error();
+            if (!name_chars_ok(*exe, true)) return invalid(table.line, "'exe' must be an executable file name of the fixture build");
+            step.exe = *exe;
+        }
+        if (table.find("args") != nullptr) {
+            cml::Result<std::string> args = require_string(table, "args", "a launch step");
+            if (!args) return args.error();
+            if (args->size() > 512 || args->find('"') != std::string::npos) return invalid(table.line, "'args' must be at most 512 characters and hold no double quote");
+            step.args = *args;
+        }
+        if (table.find("label") != nullptr) {
+            cml::Result<std::string> label = require_string(table, "label", "a launch step");
+            if (!label) return label.error();
+            if (!name_chars_ok(*label, false)) return invalid(table.line, "'label' must be 1-64 characters of a-z, A-Z, 0-9, '_', '-'");
+            step.label = *label;
+        }
         return step;
     }
     if (*kind == "expect_stdout") {
         step.kind = StepKind::ExpectStdout;
-        cml::Result<void> keys = only_keys(table, {"kind", "regex", "within_s"}, "an expect_stdout step");
+        cml::Result<void> keys = only_keys(table, {"kind", "regex", "within_s", "process"}, "an expect_stdout step");
         if (!keys) return keys.error();
         cml::Result<std::string> regex = require_string(table, "regex", "an expect_stdout step");
         if (!regex) return regex.error();
@@ -161,7 +224,7 @@ cml::Result<Step> parse_step(const toml::Table& table) {
     }
     if (*kind == "expect_module_enabled") {
         step.kind = StepKind::ExpectModuleEnabled;
-        cml::Result<void> keys = only_keys(table, {"kind", "module", "within_s"}, "an expect_module_enabled step");
+        cml::Result<void> keys = only_keys(table, {"kind", "module", "within_s", "process"}, "an expect_module_enabled step");
         if (!keys) return keys.error();
         cml::Result<std::string> module = require_string(table, "module", "an expect_module_enabled step");
         if (!module) return module.error();
@@ -228,7 +291,7 @@ cml::Result<Step> parse_step(const toml::Table& table) {
     }
     if (*kind == "expect_monotonic") {
         step.kind = StepKind::ExpectMonotonic;
-        cml::Result<void> keys = only_keys(table, {"kind", "key", "min_samples"}, "an expect_monotonic step");
+        cml::Result<void> keys = only_keys(table, {"kind", "key", "min_samples", "process"}, "an expect_monotonic step");
         if (!keys) return keys.error();
         cml::Result<std::string> key = require_string(table, "key", "an expect_monotonic step");
         if (!key) return key.error();
@@ -291,10 +354,26 @@ cml::Result<Step> parse_step(const toml::Table& table) {
         step.within_s = *within;
         return step;
     }
+    if (*kind == "expect_reload_result") {
+        step.kind = StepKind::ExpectReloadResult;
+        cml::Result<void> keys = only_keys(table, {"kind", "key", "value"}, "an expect_reload_result step");
+        if (!keys) return keys.error();
+        cml::Result<std::string> key = require_string(table, "key", "an expect_reload_result step");
+        if (!key) return key.error();
+        if (!name_chars_ok(*key, false)) return invalid(table.line, "'key' must be a member name (letters, digits, '_', '-')");
+        const toml::Value* value = table.find("value");
+        if (value == nullptr || value->kind != toml::Value::Kind::Integer) {
+            return invalid(table.line, "an expect_reload_result step needs an integer 'value'");
+        }
+        step.key = *key;
+        step.result_value = value->integer;
+        step.has_result_value = true;
+        return step;
+    }
     (void)context;
     return invalid(table.line, "unknown step kind '" + *kind +
                                    "' (launch, expect_stdout, expect_module_enabled, edit, reload, expect_diag, expect_monotonic, set_option, wait, "
-                                   "expect_event)");
+                                   "expect_event, expect_reload_result)");
 }
 
 }  // namespace
@@ -332,14 +411,25 @@ cml::Result<Scenario> parse_scenario(std::string_view text) {
     scenario.timeout_s = *timeout;
 
     bool launched = false;
+    std::vector<std::string> labels;  // processes launched so far (WP-16)
     for (const toml::Table& t : doc->array_tables) {
         cml::Result<Step> step = parse_step(t);
         if (!step) {
             return step.error();
         }
         if (step->kind == StepKind::Launch) {
-            if (launched) return invalid(t.line, "a scenario can launch only once");
+            if (launched && step->exe.empty()) {
+                return invalid(t.line, "a scenario can launch the primary fixture only once; further launches need 'exe' (another executable of the fixture)");
+            }
+            const std::string label = !step->label.empty() ? step->label : step->exe.empty() ? std::string("fixture") : default_label(step->exe);
+            if (std::find(labels.begin(), labels.end(), label) != labels.end()) {
+                return invalid(t.line, "the process label '" + label + "' is used twice (give the launch a 'label')");
+            }
+            step->label = label;
+            labels.push_back(label);
             launched = true;
+        } else if (!step->process.empty() && std::find(labels.begin(), labels.end(), step->process) == labels.end()) {
+            return invalid(t.line, "the process '" + step->process + "' is not launched before this step");
         } else if (step->kind != StepKind::Edit && !launched) {
             return invalid(t.line, std::string(to_string(step->kind)) + " needs a launch step before it");
         }

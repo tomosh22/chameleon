@@ -111,6 +111,14 @@ struct StepOutcome {
     }
 };
 
+// One fixture process of the scenario (WP-16: a scenario may start several).
+struct Proc {
+    std::string label;
+    std::size_t id = 0;  // Supervisor id
+    fs::path stdout_file;
+    std::size_t cursor = 0;  // expect_stdout reads from here
+};
+
 class ScenarioRun {
 public:
     ScenarioRun(const Scenario& scenario, const RunnerOptions& options) : scenario_(scenario), options_(options) {}
@@ -228,7 +236,7 @@ private:
 
     StepOutcome execute(const Step& step) {
         switch (step.kind) {
-            case StepKind::Launch: return launch();
+            case StepKind::Launch: return launch(step);
             case StepKind::ExpectStdout: return expect_stdout(step);
             case StepKind::ExpectModuleEnabled: return expect_module_enabled(step);
             case StepKind::Edit: return edit(step);
@@ -238,6 +246,7 @@ private:
             case StepKind::SetOption: return set_option(step);
             case StepKind::Wait: return wait_step(step);
             case StepKind::ExpectEvent: return expect_event(step);
+            case StepKind::ExpectReloadResult: return expect_reload_result(step);
         }
         return StepOutcome::fail(cml::ids::kScenarioFailed, "unknown step kind");
     }
@@ -274,14 +283,22 @@ private:
         return StepOutcome::pass(options_.generator + " build of fixture_" + scenario_.fixture + " ok: " + built_.exe.string());
     }
 
-    StepOutcome launch() {
+    StepOutcome launch(const Step& step) {
         launched_ = true;
+        if (!control_) {
+            StepOutcome broker = start_broker();
+            if (!broker.ok) {
+                return broker;
+            }
+        }
+        return start_process(step);
+    }
+
+    StepOutcome start_broker() {
         const std::string unique = std::to_string(GetCurrentProcessId()) + "_" + std::to_string(GetTickCount64());
         agent_pipe_ = "\\\\.\\pipe\\cml_t_" + unique;
         control_pipe_ = "\\\\.\\pipe\\cml_tc_" + unique;
         const fs::path broker_log = options_.artifacts_dir / "broker.log";
-        const fs::path agent_log = options_.artifacts_dir / "agent.log";
-        fixture_stdout_ = options_.artifacts_dir / "fixture.stdout.txt";
 
         ChildSpec broker;
         broker.label = "broker";
@@ -343,13 +360,38 @@ private:
                 return StepOutcome::fail(ipc::to_diag(*subscribed->diag));
             }
         }
+        return StepOutcome::pass();
+    }
 
+    // Starts one fixture process (the primary exe, or another executable of the same build) with the agent.
+    StepOutcome start_process(const Step& step) {
+        Proc proc;
+        proc.label = step.label.empty() ? std::string("fixture") : step.label;
+        const bool first = procs_.empty();
+        proc.stdout_file = options_.artifacts_dir / (first ? std::string("fixture.stdout.txt") : "fixture-" + proc.label + ".stdout.txt");
+        const fs::path agent_log = options_.artifacts_dir / (first ? std::string("agent.log") : "agent-" + proc.label + ".log");
+
+        fs::path exe = built_.exe;
+        if (!step.exe.empty()) {
+            std::string file = step.exe;
+            if (file.size() < 4 || lower(file.substr(file.size() - 4)) != ".exe") {
+                file += ".exe";
+            }
+            exe = built_.exe.parent_path() / file;
+            std::error_code ec;
+            if (!fs::exists(exe, ec)) {
+                return StepOutcome::fail(cml::ids::kLaunchFailed, "the fixture build has no executable '" + exe.string() + "'");
+            }
+        }
         ChildSpec fixture;
-        fixture.label = "fixture";
-        fixture.exe = built_.exe;
+        fixture.label = proc.label;
+        fixture.exe = exe;
         fixture.arguments = L"--agent";
-        fixture.working_directory = built_.exe.parent_path();
-        fixture.output_file = fixture_stdout_;
+        if (!step.args.empty()) {
+            fixture.arguments += L" " + cml::proc::wide_from_utf8(step.args);
+        }
+        fixture.working_directory = exe.parent_path();
+        fixture.output_file = proc.stdout_file;
         fixture.environment[L"CML_PIPE_NAME"] = cml::proc::wide_from_utf8(agent_pipe_);
         fixture.environment[L"CML_CONTROL_PIPE"] = cml::proc::wide_from_utf8(control_pipe_);
         fixture.environment[L"CML_AGENT_LOG"] = agent_log.wstring();
@@ -359,9 +401,22 @@ private:
         if (!fixture_id) {
             return StepOutcome::fail(fixture_id.error());
         }
-        fixture_id_ = *fixture_id;
-        return StepOutcome::pass("broker pid " + std::to_string(supervisor_.pid(broker_id_)) + " (v" + broker_version_ + ", capabilities: " +
-                                 join(capabilities_) + "), fixture pid " + std::to_string(supervisor_.pid(fixture_id_)));
+        proc.id = *fixture_id;
+        procs_.push_back(proc);
+        return StepOutcome::pass((first ? "broker pid " + std::to_string(supervisor_.pid(broker_id_)) + " (v" + broker_version_ +
+                                              ", capabilities: " + join(capabilities_) + "), "
+                                        : std::string()) +
+                                 "process '" + proc.label + "' pid " + std::to_string(supervisor_.pid(proc.id)));
+    }
+
+    // The process a step refers to (empty label = the first launched); nullptr when there is none.
+    Proc* find_proc(const std::string& label) {
+        for (Proc& p : procs_) {
+            if (label.empty() || p.label == label) {
+                return &p;
+            }
+        }
+        return nullptr;
     }
 
     static std::string join(const std::vector<std::string>& items) {
@@ -377,14 +432,18 @@ private:
         if (!regex) {
             return StepOutcome::fail(regex.error());
         }
+        Proc* proc = find_proc(step.process);
+        if (proc == nullptr) {
+            return StepOutcome::fail(cml::ids::kScenarioFailed, "no process '" + step.process + "' was launched");
+        }
         const std::uint32_t limit_ms = std::min<std::uint32_t>(static_cast<std::uint32_t>(step.within_s) * 1000u, remaining_ms());
         const Clock::time_point until = Clock::now() + std::chrono::milliseconds(limit_ms);
         for (;;) {
-            const bool exited = supervisor_.exit_code(fixture_id_).has_value();  // look BEFORE reading the output
-            const std::string output = read_whole_file(fixture_stdout_);
+            const bool exited = supervisor_.exit_code(proc->id).has_value();  // look BEFORE reading the output
+            const std::string output = read_whole_file(proc->stdout_file);
             Regex::Match match;
-            if (cursor_ <= output.size() && regex->search(output, cursor_, &match)) {
-                cursor_ = match.end;
+            if (proc->cursor <= output.size() && regex->search(output, proc->cursor, &match)) {
+                proc->cursor = match.end;
                 return StepOutcome::pass("matched: " + line_around(output, match.begin));
             }
             if (regex->budget_exceeded()) {
@@ -392,7 +451,7 @@ private:
             }
             if (exited) {
                 return StepOutcome::fail(cml::ids::kExpectStdoutTimeout,
-                                         "the fixture exited with code " + std::to_string(*supervisor_.exit_code(fixture_id_)) +
+                                         "the fixture exited with code " + std::to_string(*supervisor_.exit_code(proc->id)) +
                                              " before /" + step.regex + "/ appeared; last output:\n" + tail_lines(output, 15));
             }
             if (Clock::now() >= until) {
@@ -410,7 +469,11 @@ private:
     StepOutcome expect_module_enabled(const Step& step) {
         const std::uint32_t limit_ms = std::min<std::uint32_t>(static_cast<std::uint32_t>(step.within_s) * 1000u, remaining_ms());
         const Clock::time_point until = Clock::now() + std::chrono::milliseconds(limit_ms);
-        const std::uint32_t pid = supervisor_.pid(fixture_id_);
+        Proc* proc = find_proc(step.process);
+        if (proc == nullptr) {
+            return StepOutcome::fail(cml::ids::kScenarioFailed, "no process '" + step.process + "' was launched");
+        }
+        const std::uint32_t pid = supervisor_.pid(proc->id);
         std::string last;
         for (;;) {
             cml::Result<ipc::StatusReport> status = control_->status(kControlTimeoutMs);
@@ -446,9 +509,9 @@ private:
             } else {
                 last = "the broker does not list pid " + std::to_string(pid) + " (it knows " + std::to_string(status->processes.size()) + " processes)";
             }
-            if (supervisor_.exit_code(fixture_id_)) {
+            if (supervisor_.exit_code(proc->id)) {
                 return StepOutcome::fail(cml::ids::kExpectModuleTimeout,
-                                         "the fixture exited with code " + std::to_string(*supervisor_.exit_code(fixture_id_)) + "; " + last);
+                                         "the fixture exited with code " + std::to_string(*supervisor_.exit_code(proc->id)) + "; " + last);
             }
             if (Clock::now() >= until) {
                 if (limit_ms < static_cast<std::uint32_t>(step.within_s) * 1000u) {
@@ -495,7 +558,9 @@ private:
             return scenario_timeout();
         }
         // Output printed from now on belongs to the reloaded program.
-        cursor_ = read_whole_file(fixture_stdout_).size();
+        for (Proc& p : procs_) {
+            p.cursor = read_whole_file(p.stdout_file).size();
+        }
         ipc::json::Value args = ipc::json::Value::object();
         args.set("timeout_ms", ipc::json::Value::integer(limit_ms));
         cml::Result<ipc::ControlResponse> response = control_->call("reload", std::move(args), limit_ms + 5000);
@@ -516,6 +581,8 @@ private:
             std::ofstream out(options_.artifacts_dir / "reload-result.json", std::ios::binary | std::ios::app);
             out << ipc::json::serialize(response->result) << "\n";
         }
+        last_reload_result_ = response->result;
+        has_reload_result_ = true;
         if (step.has_result_value) {
             const ipc::json::Value* member = response->result.find(step.result_key);
             if (member == nullptr || !member->is_integer() || member->as_integer() != step.result_value) {
@@ -534,7 +601,11 @@ private:
     // The values of `key=` in the fixture's whole output never decrease and do change: state that lives in the old
     // image's storage survives the reload.
     StepOutcome expect_monotonic(const Step& step) {
-        const std::string output = read_whole_file(fixture_stdout_);
+        Proc* proc = find_proc(step.process);
+        if (proc == nullptr) {
+            return StepOutcome::fail(cml::ids::kScenarioFailed, "no process '" + step.process + "' was launched");
+        }
+        const std::string output = read_whole_file(proc->stdout_file);
         cml::Result<std::string> checked = check_monotonic(output, step.key, static_cast<std::size_t>(step.min_samples));
         if (!checked) {
             return StepOutcome::fail(checked.error());
@@ -611,6 +682,19 @@ private:
                                              (seen.empty() ? "none" : seen) + ")");
             }
         }
+    // An integer member of the most recent reload's result (WP-16: "compiled", "compile_reused", "processes", ...).
+    StepOutcome expect_reload_result(const Step& step) {
+        if (!has_reload_result_) {
+            return StepOutcome::fail(cml::ids::kResultMismatch, "no reload ran before this step");
+        }
+        const ipc::json::Value* member = last_reload_result_.find(step.key);
+        if (member == nullptr || !member->is_integer() || member->as_integer() != step.result_value) {
+            return StepOutcome::fail(cml::ids::kResultMismatch,
+                                     "the reload result has " + step.key + " = " +
+                                         (member == nullptr ? std::string("(absent)") : ipc::json::serialize(*member)) + ", expected " +
+                                         std::to_string(step.result_value));
+        }
+        return StepOutcome::pass(step.key + " = " + std::to_string(step.result_value));
     }
 
     StepOutcome expect_diag(const Step& step) {
@@ -669,10 +753,10 @@ private:
     std::string broker_version_;
     std::string agent_pipe_;
     std::string control_pipe_;
-    fs::path fixture_stdout_;
+    std::vector<Proc> procs_;
     std::size_t broker_id_ = 0;
-    std::size_t fixture_id_ = 0;
-    std::size_t cursor_ = 0;
+    ipc::json::Value last_reload_result_;
+    bool has_reload_result_ = false;
     bool launched_ = false;
     bool failed_ = false;
     std::optional<std::string> skip_reason_;

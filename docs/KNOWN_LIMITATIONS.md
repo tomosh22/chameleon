@@ -34,6 +34,12 @@ diagnostic is planned, not live.
 
 ## Documented behaviour (no diagnostic)
 
+- Several enabled modules and several processes (WP-16): every enabled module of every process is its own unit (own registry,
+  index, patches, hooks, source baseline). One `reload` compiles each distinct recorded command line once and then links and loads
+  a patch per process. A process that is started after an edit was made enables its modules against the edited sources: its
+  baseline is taken from the files on disk, while the process runs the binary it was built from, so that edit is not applied to
+  it until the next change of the file (rebuild and restart such a process).
+- `CML_TEST_FORCE_LOAD_COLLISIONS=<n>` (WP-16) is a test-only environment variable of the agent: it makes the first n patch loads of the process fail (CML4203) so the broker's relink can be tested. Never set it in a real application; the agent logs a warning at start when it is set.
 - A reload that changes several source files makes one patch per file. If a later one fails,
   the earlier patches stay applied (and are counted in `generation`); fix the error and reload
   again (WP-12).

@@ -1,0 +1,47 @@
+# Scenario `relink_other_base` (WP-16, FU-15): the first patch load finds its image range taken (the agent takes the range
+# itself right after releasing it, CML_TEST_FORCE_LOAD_COLLISIONS, set by the fixture's --force-load-collisions), so the real
+# LoadLibraryExW fails (CML4203) and the broker relinks the patch at another base inside its reservation and loads it again.
+# load_attempts counts the LoadPatch requests of the reload: 2 for one patch that needed one relink.
+name = "relink_other_base"
+description = "fixture exe_plus_dll: first load refused (range taken), relinked at another base, patch live"
+fixture = "exe_plus_dll"
+timeout_s = 240
+
+[[step]]
+kind = "launch"
+args = "--force-load-collisions 1"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ dll=6 cb=6 imp=10"
+within_s = 15
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_exe_plus_dll_lib.dll"
+within_s = 30
+
+[[step]]
+kind = "edit"
+patch = "edits/dll_scale_30.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_reload_result"
+key = "load_attempts"
+value = 2
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ dll=60 cb=6 imp=10"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ dll=60 cb=6 imp=10"
+within_s = 10
