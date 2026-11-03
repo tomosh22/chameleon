@@ -76,7 +76,10 @@ enum class MessageType : std::uint16_t {
 
     // Diagnostics and lifecycle.
     Log = 0x0060,      // implemented  agent -> broker (event)
-    Restart = 0x0061,  // later work package
+    Restart = 0x0061,        // implemented (WP-21)  broker -> agent (request, answered by RestartInfo)
+    RestartInfo = 0x0062,    // implemented (WP-21)  agent -> broker (answer to Restart)
+    ReenableModules = 0x0063,  // implemented (WP-21)  broker -> agent (request, answered by Reply)
+    RestartCancel = 0x0064,    // implemented (WP-21)  broker -> agent (event, no answer)
 
     // Compile notifications (WP-17).
     CompileEvent = 0x0070,  // implemented  broker -> agent (event, no answer)
@@ -99,6 +102,9 @@ struct Hello {
     AgentMode mode = AgentMode::Immediate;
     std::string agent_path;    // full path of cml_agent.dll, UTF-8
     std::string command_line;  // command line of the host process, UTF-8
+    // WP-21: the value of CML_RESTART_TOKEN in the process's environment ("" for a process nobody restarted). Written
+    // after command_line and only when not empty; a Hello without it is a Hello with an empty token.
+    std::string restart_token;
 };
 
 struct Welcome {
@@ -388,10 +394,69 @@ struct ReleaseRange {
     ReleaseMode mode = ReleaseMode::Free;
 };
 
+// --- hot-restart (WP-21, plan section 4.12) -------------------------------------------------------
+
+// Wide (UTF-16) text travels as `uint32 unit_count` followed by that many little-endian uint16 units, unchecked for
+// surrogate pairing: Windows allows lone surrogates in command lines and environment blocks and a restart must hand
+// the new process exactly what the old one had.
+inline constexpr std::uint32_t kMaxWideUnits = 1u << 18;      // units per wide field
+inline constexpr std::uint32_t kMaxRestartModules = 4096;
+// The agent refuses to restart a process whose launch parameters do not fit one frame comfortably.
+inline constexpr std::size_t kMaxLaunchParameterUnits = 400u * 1024u;  // all wide fields of a RestartInfo together
+
+// Broker -> agent. The agent runs the application's CML_PRERESTART_HOOK functions (on the SyncPoint thread in
+// synchronised mode, as for InstallHooks) and answers with RestartInfo. The process is still running afterwards: the
+// broker terminates it only after a usable answer arrived.
+struct Restart {
+    std::uint64_t request_id = 0;
+    std::uint32_t flags = 0;  // reserved, must be 0
+};
+
+// Broker -> agent, an event: the broker gave up waiting for the answer to Restart `request_id`. If its job has not run yet the
+// agent drops it (the pre-restart hooks never run for a restart nobody is going to carry out). A job that already runs finishes.
+struct RestartCancel {
+    std::uint64_t request_id = 0;
+};
+
+// Bit flags of RestartInfo::flags.
+inline constexpr std::uint32_t kRestartInfoHadConsole = 1u;  // the process had a console when the agent started
+
+struct RestartModule {
+    std::uint32_t options = 0;  // kModuleOption* bits
+    std::string path;           // as the application spelled it
+};
+
+// Agent -> broker. status 0, or a CML44xx id (message says why); on failure the other fields are empty and the broker
+// leaves the process alone.
+struct RestartInfo {
+    std::uint64_t request_id = 0;
+    std::uint32_t status = 0;
+    std::string message;
+    std::uint32_t hooks_run = 0;           // CML_PRERESTART_HOOK functions that ran
+    std::uint32_t flags = 0;               // kRestartInfo*
+    std::u16string image_path;             // GetModuleFileNameW(NULL)
+    std::u16string command_line;           // GetCommandLineW() when the agent started
+    std::u16string working_directory;      // GetCurrentDirectoryW() when the agent started
+    std::u16string environment;            // the environment block when the agent started: "A=b\0C=d\0\0"
+    std::uint64_t std_input = 0;           // GetStdHandle values in the old process (the broker duplicates them from there)
+    std::uint64_t std_output = 0;
+    std::uint64_t std_error = 0;
+    std::vector<RestartModule> modules;    // the modules the application enabled and the broker accepted
+};
+
+// Broker -> agent. After a restart the broker asks the new process to enable the modules the old one had enabled and
+// that the application did not enable by itself. Each becomes an EnableModule request as if the application had called
+// EnableModule; the agent answers Reply (status 0 once they are queued).
+struct ReenableModules {
+    std::uint64_t request_id = 0;
+    std::vector<RestartModule> modules;
+};
+
 using Message = std::variant<Hello, Welcome, ModuleList, EnableModule, DisableModule, ModuleLoaded,
                              ModuleUnloaded, Log, Reply, ReserveRange, ReleaseRange, LoadPatch,
                              PatchLoaded, ApplyFixups, RunInitializers, ReserveRangeResult, InstallHooks,
-                             HooksInstalled, CompileEvent, Exception, ExceptionAction, ExceptionConfig>;
+                             HooksInstalled, CompileEvent, Exception, ExceptionAction, ExceptionConfig, Restart, RestartInfo,
+                             ReenableModules, RestartCancel>;
 
 MessageType type_of(const Message& message) noexcept;
 

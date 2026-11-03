@@ -23,6 +23,9 @@ std::vector<std::string> broker_capabilities(const ControlContext& context) {
                               ipc::capability::kDiagEvents}) {
             caps.emplace_back(c);
         }
+        if (context.service->restart_available()) {
+            caps.emplace_back(ipc::capability::kRestart);  // WP-21
+        }
         caps.emplace_back(ipc::capability::kRevert);  // WP-22
     }
     if (context.exceptions != nullptr) {
@@ -111,7 +114,7 @@ ipc::ControlResponse answer(const ipc::ControlRequest& request, Result<ipc::json
 }
 
 ipc::ControlResponse subscribe_response(const ipc::ControlRequest& request, const ControlContext& context) {
-    static const char* const kEvents[] = {"diag", "patch_applied", "patch_reverted", "progress", "log", "exception"};
+    static const char* const kEvents[] = {"diag", "patch_applied", "patch_reverted", "progress", "log", "exception", "restarted"};
     std::set<std::string> names;
     const ipc::json::Value* events = request.args.find("events");
     // An empty array is the same as no argument: the default set. (The bus reads an empty set as "every event", which would switch
@@ -120,10 +123,10 @@ ipc::ControlResponse subscribe_response(const ipc::ControlRequest& request, cons
         // `progress` (WP-15) is opt-in: it can be chatty on a big reload. `exception` (WP-20) is opt-in because listening for it
         // makes the agents hold faulting threads until somebody decides.
         for (const char* k : kEvents) {
-            if (std::string(k) != "progress" && std::string(k) != "exception") names.insert(k);
+            if (std::string(k) != "progress" && std::string(k) != "exception" && std::string(k) != "restarted") names.insert(k);
         }
     } else if (!events->is_array()) {
-        return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "argument 'events' must be an array of event names", "Use [\"diag\", \"patch_applied\", \"patch_reverted\", \"progress\", \"log\", \"exception\"] or a subset."));
+        return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "argument 'events' must be an array of event names", "Use [\"diag\", \"patch_applied\", \"patch_reverted\", \"progress\", \"log\", \"exception\", \"restarted\"] or a subset."));
     } else {
         for (const ipc::json::Value& e : events->items()) {
             bool known = false;
@@ -131,7 +134,7 @@ ipc::ControlResponse subscribe_response(const ipc::ControlRequest& request, cons
                 known = known || (e.is_string() && e.as_string() == k);
             }
             if (!known) {
-                return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "unknown event name in 'events'", "Known events: diag, patch_applied, patch_reverted, progress, log, exception."));
+                return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "unknown event name in 'events'", "Known events: diag, patch_applied, patch_reverted, progress, log, exception, restarted."));
             }
             names.insert(e.as_string());
         }
@@ -169,6 +172,9 @@ ipc::ControlResponse handle_control_request(const ipc::ControlRequest& request, 
         }
         if (request.cmd == "subscribe") {
             return subscribe_response(request, context);
+        }
+        if (request.cmd == "restart" && context.service->restart_available()) {
+            return answer(request, context.service->restart(request.args));  // WP-21
         }
     }
     if (context.exceptions != nullptr) {
