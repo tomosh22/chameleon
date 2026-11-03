@@ -74,6 +74,7 @@ SessionOutcome Session::handle_hello(const ipc::Hello& hello) {
     handshaken_ = true;
     ++revision_;
     pid_ = hello.pid;
+    mode_ = hello.mode;
     agent_path_ = hello.agent_path;
     command_line_ = hello.command_line;
 
@@ -178,10 +179,15 @@ SessionOutcome Session::on_message(const ipc::Message& message) {
     } else if (const auto* log = std::get_if<ipc::Log>(&message)) {
         CML_LOG(Info, "agent#%llu log[%u]: %s", static_cast<unsigned long long>(agent_id_),
                 log->level, log->text.c_str());
-    } else if (std::get_if<ipc::Reply>(&message) != nullptr) {
-        // The broker sends no requests yet, so there is nothing a Reply could answer.
-        CML_LOG(Warn, "agent#%llu sent an unexpected Reply; ignored",
-                static_cast<unsigned long long>(agent_id_));
+    } else if (std::get_if<ipc::Reply>(&message) != nullptr || std::get_if<ipc::ReserveRangeResult>(&message) != nullptr ||
+               std::get_if<ipc::PatchLoaded>(&message) != nullptr || std::get_if<ipc::HooksInstalled>(&message) != nullptr) {
+        // Answers to the broker's own requests (WP-12). One whose request id nobody waits for (the request timed
+        // out, or the id is made up) is ignored, never a protocol violation.
+        if (!answer_sink_ || !answer_sink_(message)) {
+            ++ignored_answers_;
+            CML_LOG(Debug, "agent#%llu: %s with an unknown request id; ignored", static_cast<unsigned long long>(agent_id_),
+                    ipc::to_string(ipc::type_of(message)));
+        }
     } else {
         return violation(0, std::string(ipc::to_string(ipc::type_of(message))) +
                                 " is not accepted from an agent");

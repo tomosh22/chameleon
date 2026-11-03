@@ -1,0 +1,101 @@
+#pragma once
+
+// The broker's reload service (WP-12): the process/module registry behind the control pipe's `reload`, `wait`
+// and `set-option` commands.
+//
+//   * attach()/on_session_changed()/detach() follow the agent connections. When a session enables a module the
+//     service creates a ModuleState for it and starts its asynchronous PDB index (ModuleIndex); when the module
+//     is disabled or the agent goes away the state is dropped (its index thread is joined, the PDB mapping is
+//     released: ADR-0017).
+//   * reload() runs the PatchPipeline for the enabled modules (all, or those of `pid` / `module`), one reload at
+//     a time (a second one is refused with CML5304), and answers with the per-stage timing (also logged as one
+//     `RELOAD-TIMING` line per patched module).
+//   * wait() blocks until the indexes are loaded and no reload runs.
+//   * set_option() changes ReloadOptions at run time and returns the previous value.
+//
+// Portable: the agent transport, compiler and linker are behind AgentLink and PipelineEnv.
+
+#include <atomic>
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "cml/core/agent_link.h"
+#include "cml/core/event_bus.h"
+#include "cml/core/module_state.h"
+#include "cml/core/pipeline.h"
+#include "cml/ipc/json.h"
+#include "cml/util/result.h"
+
+namespace cml::core {
+
+class ReloadService {
+public:
+    // `session_dir`: base directory for objects, patch DLLs and PDBs ("" = a new directory under the system
+    // temporary directory, or $CML_SESSION_DIR). `events` may be null.
+    ReloadService(PipelineEnv env, EventBus* events, std::string session_dir = {});
+    ~ReloadService();
+    ReloadService(const ReloadService&) = delete;
+    ReloadService& operator=(const ReloadService&) = delete;
+
+    // ---- connections ----
+    void attach(std::shared_ptr<AgentLink> link);
+    void on_session_changed(std::uint64_t agent_id);
+    void detach(std::uint64_t agent_id);
+
+    // ---- control commands (args are the request's "args" object) ----
+    // {"pid"?:N, "module"?:"name or path", "timeout_ms"?:N}
+    Result<ipc::json::Value> reload(const ipc::json::Value& args);
+    // {"for"?:"idle"|"index", "timeout_ms"?:N}
+    Result<ipc::json::Value> wait(const ipc::json::Value& args);
+    // {"name":s, "value":s|n|b}
+    Result<ipc::json::Value> set_option(const ipc::json::Value& args);
+
+    // ---- status ----
+    std::optional<IndexStatus> index_status(std::uint64_t agent_id, const std::string& module_path) const;
+    bool reload_running() const noexcept { return running_.load(); }
+    std::uint64_t generation() const noexcept { return generation_.load(); }
+    ReloadOptions options() const;
+    const std::string& session_dir() const noexcept { return session_dir_; }
+    EventBus* events() const noexcept { return events_; }
+    // Aborts running compiles and links (shutdown); sticky.
+    void cancel() { cancel_.cancel(); }
+
+    // The state of a module (tests, diagnostics); null when it is not enabled.
+    std::shared_ptr<ModuleState> module_state(std::uint64_t agent_id, const std::string& module_path) const;
+
+private:
+    struct AgentEntry {
+        std::shared_ptr<AgentLink> link;
+        std::map<std::string, std::shared_ptr<ModuleState>> modules;  // normalised path -> state
+    };
+    struct Target {
+        std::shared_ptr<AgentLink> link;
+        std::shared_ptr<ModuleState> module;
+    };
+
+    Result<std::string> ensure_session_dir();
+    std::vector<Target> targets(std::uint32_t pid, const std::string& module) const;
+
+    PatchPipeline pipeline_;
+    EventBus* events_;
+    std::string session_dir_;
+    bool session_dir_made_ = false;
+    bool keep_session_dir_ = false;
+    std::shared_ptr<ExportCache> exports_ = std::make_shared<ExportCache>();
+    toolchain::CancelToken cancel_;
+
+    mutable std::mutex mutex_;  // agents_, options_
+    std::map<std::uint64_t, AgentEntry> agents_;
+    ReloadOptions options_;
+
+    std::mutex reload_mutex_;  // one reload at a time
+    std::atomic<bool> running_{false};
+    std::atomic<std::uint64_t> generation_{0};
+};
+
+}  // namespace cml::core
