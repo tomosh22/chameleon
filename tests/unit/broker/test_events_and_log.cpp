@@ -20,6 +20,15 @@ public:
     std::vector<Event> events;
 };
 
+std::FILE* open_scratch(const std::string& path) {
+#if defined(_WIN32)
+    std::FILE* f = nullptr;
+    return fopen_s(&f, path.c_str(), "w+b") == 0 ? f : nullptr;
+#else
+    return std::fopen(path.c_str(), "w+b");
+#endif
+}
+
 // Restores the process-wide log sink and level.
 struct SinkGuard {
     LogLevel level = log_level();
@@ -112,7 +121,7 @@ TEST_CASE("a listener may unsubscribe itself while it is being called") {
 TEST_CASE("log hub: text and JSON lines, sequence numbers, ring buffer") {
     SinkGuard guard;
     testpdb::TempDir dir;
-    std::FILE* file = std::fopen(dir.file("log.txt").c_str(), "w+b");
+    std::FILE* file = open_scratch(dir.file("log.txt"));
     REQUIRE(file != nullptr);
     LogHub::Options options;
     options.file = file;
@@ -158,7 +167,7 @@ TEST_CASE("log hub: text and JSON lines, sequence numbers, ring buffer") {
 TEST_CASE("log hub: JSON mode writes one JSON object per record, and a message with a newline stays on one line") {
     SinkGuard guard;
     testpdb::TempDir dir;
-    std::FILE* file = std::fopen(dir.file("log.json").c_str(), "w+b");
+    std::FILE* file = open_scratch(dir.file("log.json"));
     REQUIRE(file != nullptr);
     LogHub::Options options;
     options.file = file;
