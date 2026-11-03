@@ -12,6 +12,7 @@
 
 #include "cml/core/agent_link.h"
 #include "cml/core/control_server.h"
+#include "cml/core/exception_service.h"
 #include "cml/core/pipeline.h"
 #include "cml/core/process_registry.h"
 #include "cml/core/reload_service.h"
@@ -40,6 +41,7 @@ struct Connection {
 struct Shared {
     ProcessRegistry registry;  // what the control pipe's `status` reports
     ReloadService* service = nullptr;  // the reload pipeline (WP-12)
+    ExceptionService* exceptions = nullptr;  // crash -> patch -> continue (WP-20)
     std::atomic<int> active{0};
     std::atomic<unsigned long long> last_idle_tick{0};  // GetTickCount64 when active last hit 0
 };
@@ -64,6 +66,12 @@ void serve_connection(Connection& connection, std::uint64_t agent_id, Shared& sh
     if (shared.service != nullptr) {
         shared.service->attach(link);
     }
+    if (shared.exceptions != nullptr) {
+        session.set_exception_sink([&session, &link, &shared](const ipc::Exception& exception) {
+            shared.exceptions->on_exception(link, session.pid(), exception);
+        });
+    }
+    bool exceptions_announced = false;
     std::uint64_t seen_revision = 0;
     bool running = true;
     while (running && !stop_requested.load(std::memory_order_acquire)) {
@@ -94,6 +102,11 @@ void serve_connection(Connection& connection, std::uint64_t agent_id, Shared& sh
                         running = false;
                         break;
                     }
+                }
+                // Only now, with the Welcome on the wire: the agent expects nothing before it, so ExceptionConfig must not overtake it.
+                if (running && !exceptions_announced && shared.exceptions != nullptr && session.handshaken()) {
+                    exceptions_announced = true;
+                    shared.exceptions->agent_ready(link);  // tells the agent whether to hold faulting threads
                 }
                 if (outcome.close) {
                     running = false;
@@ -132,6 +145,9 @@ void serve_connection(Connection& connection, std::uint64_t agent_id, Shared& sh
                 running = false;
                 break;
         }
+    }
+    if (shared.exceptions != nullptr) {
+        shared.exceptions->agent_gone(agent_id);
     }
     link->close();  // ends the reload pipeline's pending requests; nobody uses the pipe after this
     if (shared.service != nullptr) {
@@ -204,6 +220,13 @@ Result<ServerExit> ConnectionServer::run() {
     }
     ReloadService service(options_.pipeline_env != nullptr ? *options_.pipeline_env : native, &events_, options_.session_dir);
     shared.service = &service;
+    ExceptionService exceptions(&service, &events_);
+    shared.exceptions = &exceptions;
+    service.set_option_observer([&exceptions](const std::string& name) {
+        if (name == "crash_handler" || name == "break_with_debugger") {
+            exceptions.refresh(true);
+        }
+    });
     if (options_.compile_on_save) {
         ipc::json::Value args = ipc::json::Value::object();
         args.set("name", ipc::json::Value::string("compile_on_save"));
@@ -216,6 +239,7 @@ Result<ServerExit> ConnectionServer::run() {
         context.version = version_string();
         context.registry = &shared.registry;
         context.service = &service;
+        context.exceptions = &exceptions;
         control = std::make_unique<ControlServer>(options_.control_pipe_name, std::move(context));
         Result<void> started = control->start();
         if (!started) {
@@ -298,6 +322,7 @@ Result<ServerExit> ConnectionServer::run() {
     if (control) {
         control->stop();
     }
+    service.set_option_observer(nullptr);
     if (failure) {
         return *failure;
     }
