@@ -50,7 +50,8 @@ void set_violation_hook_for_test(ViolationHook hook) noexcept;
 // holds (the process heap, which the C runtime uses, is taken by every thread that starts).
 void probe_forbidden_for_test() noexcept;
 // Tests only. The Win32 handle of the agent's private heap (created if need be), so that a test can
-// HeapLock it from a thread that is then stopped. nullptr off Windows.
+// HeapLock it from a thread that is then stopped. Like everything else in heap.cpp, both test functions
+// are defined on Windows only (the file is empty elsewhere); nothing portable calls them.
 void* native_heap_for_test() noexcept;
 
 // Number of blocks currently allocated and not yet released (for tests and leak checks).

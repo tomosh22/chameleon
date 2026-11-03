@@ -90,8 +90,10 @@ jobs:
       # Hang diagnosis (ADR-0011 approves cdb.exe in CI): when the out-of-process hang watcher
       # (tests/unit/hang_watch) kills a hung hook test it runs `cdb -z <dump> -c "~*kn;q"` and prints a
       # symbolised stack of every thread. The test executable's PDB is found next to it; the Windows system
-      # DLLs are symbolised from this cache, which is filled here once so that the run at hang time
-      # (a budget of seconds) does not have to download. Best effort: a failure here only costs the ntdll names.
+      # DLLs are symbolised from a LOCAL symbol store that is filled here once (the only step that talks to the
+      # symbol server), so that no test ever depends on the network and the run at hang time (a budget of
+      # seconds) does not download. The Test and repeat steps use `srv*<dir>` with no URL. Best effort: a
+      # failure here only costs the ntdll names.
       - name: Warm the symbol cache for hang diagnosis
         continue-on-error: true
         timeout-minutes: 5
@@ -106,7 +108,7 @@ jobs:
 
       - name: Test
         env:
-          _NT_SYMBOL_PATH: srv*${{ runner.temp }}\symcache*https://msdl.microsoft.com/download/symbols
+          _NT_SYMBOL_PATH: srv*${{ runner.temp }}\symcache
         run: |
           ctest --test-dir $env:BUILD_DIR -C ${{ matrix.config }} --output-on-failure `
             --output-junit "$PWD/$env:LOG_DIR/ctest-junit.xml" *>&1 | Tee-Object -FilePath "$env:LOG_DIR/ctest.log"
@@ -117,16 +119,16 @@ jobs:
       # first failure and prints its output; the last line is
       # WP10-REPEAT <cell> unit.agent_hook runs=N passed=P failed=F.
       - name: WP-10 hook repeat evidence (unit.agent_hook x25)
-        if: always()
+        if: ${{ !cancelled() }}
         timeout-minutes: 45
         env:
-          _NT_SYMBOL_PATH: srv*${{ runner.temp }}\symcache*https://msdl.microsoft.com/download/symbols
+          _NT_SYMBOL_PATH: srv*${{ runner.temp }}\symcache
         run: |
           New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
           $total = 25; $passed = 0; $failed = 0
           for ($i = 1; $i -le $total; $i++) {
             $log = "$env:LOG_DIR/hook-repeat-$i.txt"
-            ctest --test-dir $env:BUILD_DIR -C ${{ matrix.config }} -R '^unit\.agent_hook$' --output-on-failure *>&1 | Out-File -Encoding utf8 $log
+            ctest --test-dir $env:BUILD_DIR -C ${{ matrix.config }} -R '^unit\.agent_hook$' --no-tests=error --output-on-failure *>&1 | Out-File -Encoding utf8 $log
             if ($LASTEXITCODE -eq 0) { $passed++ } else { $failed++; Get-Content $log; break }
             Get-Content $log | Select-String -Pattern 'unit\.agent_hook ' | ForEach-Object { $_.Line }
           }

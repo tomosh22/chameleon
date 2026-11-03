@@ -234,10 +234,17 @@ namespace {
 using LdrLockLoaderLockFn = LONG(NTAPI*)(ULONG flags, ULONG* disposition, ULONG_PTR* cookie);
 using LdrUnlockLoaderLockFn = LONG(NTAPI*)(ULONG flags, ULONG_PTR cookie);
 
-// A thread that, on command, takes the locks a thread stopped at a bad moment would be holding: the
-// process heap (what malloc and the loader use), the agent's private heap (what `new` uses) and the
-// loader lock. It spins while it holds them, so the installer stops it inside that state. The calls the
-// installer thread makes (acquire / holding / release) only use atomics and SwitchToThread: they run
+// A thread that, on command, takes the locks a thread stopped at a bad moment would be holding, and
+// spins while it holds them, so the installer stops it inside that state. Exactly these three:
+//   * the process heap (HeapLock(GetProcessHeap())): what the loader allocates from and what the C
+//     runtime's malloc draws on (the CRT heap IS the process heap),
+//   * the agent's private heap (what `new` uses in this executable),
+//   * the loader lock (LdrLockLoaderLock).
+// NOT held: the C runtime's own locks (the Debug CRT's _HEAP_LOCK mutex and the debug-heap list lock),
+// which are private to the CRT and cannot be taken from here. A thread stopped inside _malloc_dbg would
+// hold those too; the window code calls no CRT function at all, which the allocation guard checks (Debug
+// cells hook every malloc / free), so that lock is covered by that check and not by this test. The calls
+// the installer thread makes (acquire / holding / release) only use atomics and SwitchToThread: they run
 // with the locks held and, for holding(), with the world stopped, so they must not allocate.
 class LockHolder {
 public:

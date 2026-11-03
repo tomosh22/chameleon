@@ -128,13 +128,17 @@ TEST_CASE("the out-of-process hang watchdog reports every thread of a process wh
     CHECK(output.find("minidump written to") != std::string::npos);
 
     // With cdb.exe installed the watcher prints a symbolised stack of every thread, from the dump and the
-    // helper's PDB: the victim's sleeper threads are named. Without cdb it says so (no failure: a runner
-    // need not have the debugger tools).
+    // helper's PDB: the victim's sleeper threads are named. Only "cdb.exe not found" and a spent budget
+    // may degrade to a message (a runner need not have the debugger tools, and a slow one may need more
+    // than the budget); cdb found but not started, or not ending at all, fails the test.
     if (output.find("cdb stacks begin") != std::string::npos) {
+        CHECK(output.find("cannot start cdb") == std::string::npos);
         if (output.find("cdb stacks end: cdb exit code") != std::string::npos) {
             CHECK_MESSAGE(output.find("sleeper") != std::string::npos, "cdb ran but no stack names the sleeper threads");
-        } else {
+        } else if (output.find("cdb did not finish within") != std::string::npos) {
             MESSAGE("cdb did not finish within its budget on this machine; symbolised stacks not checked");
+        } else {
+            CHECK_MESSAGE(false, "cdb stacks began but the watcher printed no end line");
         }
     } else {
         CHECK(output.find("cdb.exe not found") != std::string::npos);
