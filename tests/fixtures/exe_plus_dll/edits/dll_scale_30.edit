@@ -1,0 +1,11 @@
+--- a/lib.cpp
++++ b/lib.cpp
+@@ -6,7 +6,7 @@
+
+ CML_NOINLINE int lib_scale(int x)
+ {
+-    return x * 3;
++    return x * 30;
+ }
+
+ CML_NOINLINE int lib_offset(int x)

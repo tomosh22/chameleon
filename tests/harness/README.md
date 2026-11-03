@@ -59,6 +59,23 @@ within_s = 60                  # default 60
 kind = "expect_diag"           # a `diag` event with this id; needs capability "diag-events"
 id = "CML3101"
 within_s = 10
+
+# WP-16: several processes under one broker, and the reload's result counters
+[[step]]
+kind = "launch"                # a first launch starts the broker; a further launch needs `exe` (another executable of the
+exe = "fixture_two_processes_client"   # fixture build, ".exe" optional) and adds a process to the same broker
+label = "client"               # process name for `process =` (default "fixture", or the exe's name); labels are unique
+args = "--force-load-collisions 1"     # optional extra fixture arguments (after --agent)
+
+[[step]]
+kind = "expect_stdout"         # expect_stdout / expect_module_enabled / expect_monotonic take `process = "<label>"`
+process = "client"             # (default: the first launched process); `reload` resets every process's output cursor
+regex = "TICK"
+
+[[step]]
+kind = "expect_reload_result"  # an integer member of the last reload's result (compiled, compile_reused, load_attempts,
+key = "compiled"               # modules_patched, processes_patched, patched, hooks_installed, ...)
+value = 1
 ```
 
 Keys added by WP-17 (synchronised mode and hooks):

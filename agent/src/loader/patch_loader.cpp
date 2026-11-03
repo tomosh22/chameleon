@@ -41,6 +41,31 @@ unsigned long long ull(std::uint64_t v) {
     return static_cast<unsigned long long>(v);
 }
 
+// Test-only (WP-16, FU-15): CML_TEST_FORCE_LOAD_COLLISIONS=<n> makes the first n load attempts of the process find their image
+// range taken. try_load_candidate() takes the range itself right after releasing it, which is what another thread of the
+// process allocating there would do, so the real LoadLibraryExW failure (CML4203) and the broker's relink at another base
+// are exercised in a real process. Unset (the normal case) it costs one environment lookup for the whole run.
+std::atomic<int> g_forced_collisions{-1};  // -1: environment not read yet
+
+// Reads the variable once; the number of collisions still to force.
+int forced_collisions_left() noexcept {
+    int n = g_forced_collisions.load();
+    if (n < 0) {
+        int wanted = 0;
+        wchar_t text[16];
+        const DWORD length = GetEnvironmentVariableW(L"CML_TEST_FORCE_LOAD_COLLISIONS", text, 16);
+        if (length > 0 && length < 16) {
+            for (DWORD i = 0; i < length && text[i] >= L'0' && text[i] <= L'9'; ++i) {
+                wanted = wanted * 10 + (text[i] - L'0');
+            }
+        }
+        int expected = -1;
+        g_forced_collisions.compare_exchange_strong(expected, wanted);
+        n = g_forced_collisions.load();
+    }
+    return n;
+}
+
 std::string failure_text(const Diag& diag) {
     return diag.message + " What to do: " + diag.what_to_do;
 }
@@ -339,6 +364,10 @@ PatchLoader& PatchLoader::shared() {
         delete created;  // another thread won; ours owns nothing yet
         return *expected;
     }
+    if (forced_collisions_left() > 0) {
+        CML_LOG(Warn, "test option CML_TEST_FORCE_LOAD_COLLISIONS is set: the first %d patch load(s) of this process will find their range taken (never use this outside tests)",
+                forced_collisions_left());
+    }
     return *created;
 }
 
@@ -528,11 +557,25 @@ Result<void> PatchLoader::try_load_candidate(const ipc::PatchCandidate& candidat
     if (hooks_.after_release != nullptr) {
         hooks_.after_release(hooks_.context, range.base, range.size, attempt);
     }
+    LPVOID squatter = nullptr;
+    if (forced_collisions_left() > 0) {
+        squatter = VirtualAlloc(reinterpret_cast<LPVOID>(range.base), static_cast<SIZE_T>(range.size), MEM_RESERVE, PAGE_NOACCESS);
+        if (squatter != nullptr) {
+            // Only a range that was really taken uses up a collision; a failed reservation leaves the count alone.
+            g_forced_collisions.fetch_sub(1);
+            CML_LOG(Warn, "test option CML_TEST_FORCE_LOAD_COLLISIONS: took %s+%s before loading %s", hex(range.base).c_str(), hex(range.size).c_str(),
+                    candidate.path.c_str());
+        }
+    }
     // 2. Load.
     HMODULE module = LoadLibraryExW(wide_path.c_str(), nullptr, 0);
     if (module == nullptr) {
         const DWORD error = GetLastError();
         const bool taken = !range_is_free(range);  // probe before restore_reservation changes the picture
+        if (squatter != nullptr) {
+            VirtualFree(squatter, 0, MEM_RELEASE);
+            squatter = nullptr;
+        }
         owned_remove(range);
         restore_reservation(range);
         if (taken || error == ERROR_INVALID_ADDRESS || error == ERROR_ILLEGAL_DLL_RELOCATION ||
@@ -546,6 +589,9 @@ Result<void> PatchLoader::try_load_candidate(const ipc::PatchCandidate& candidat
         return make(ids::kLoaderLoadFailed,
                     "LoadLibraryExW(" + candidate.path + ") failed with OS error " + std::to_string(error),
                     "Check that the patch DLL exists, is a valid x64 DLL and that its dependencies can be found.");
+    }
+    if (squatter != nullptr) {
+        VirtualFree(squatter, 0, MEM_RELEASE);  // the range was not taken after all (the allocation failed or the image went elsewhere)
     }
     // 3. It must sit where it was linked to sit.
     const auto loaded_at = reinterpret_cast<std::uint64_t>(module);

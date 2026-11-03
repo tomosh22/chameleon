@@ -21,6 +21,7 @@ enum class StepKind {
     ExpectMonotonic,      // a `key=<int>` of the fixture's TICK lines never decreases (state kept in the old storage)
     SetOption,            // control command `set-option` with an integer value (WP-17: hooks_timeout_ms)
     SignalFixture,        // create the file named by CML_FIXTURE_SIGNAL_FILE, which the fixture waits for (WP-17)
+    ExpectReloadResult,   // an integer member of the most recent reload's result has this value (WP-16)
 };
 
 const char* to_string(StepKind kind);
@@ -45,6 +46,14 @@ struct Step {
     // SetOption
     std::string option_name;
     long long option_value = 0;
+    // WP-16, several processes. Launch: `exe` is a fixture executable of the same build (file name, ".exe" optional; empty =
+    // the fixture's primary exe) and `label` names the process (default "fixture" for the primary exe, else the exe's name
+    // without extension). `process` selects the process of ExpectStdout / ExpectModuleEnabled / ExpectMonotonic (empty =
+    // the first launched). ExpectReloadResult uses `key` and `result_value`.
+    std::string exe;
+    std::string label;
+    std::string args;   // Launch: extra command-line arguments of the fixture process (after --agent)
+    std::string process;
 
     // "expect_stdout /value=2/ within 10 s"
     std::string describe() const;
