@@ -10,7 +10,11 @@ if(MSVC)
 endif()
 cml_add_fixture(optimised SOURCES main.cpp logic.cpp)
 if(MSVC)
-    # After cml_add_fixture(): the fixture style's /Ob0 (RelWithDebInfo) comes first, the later /Ob2 wins.
+    # cml_target_fixture_style() adds /Ob0 in RelWithDebInfo. cl lets the later /Ob2 win, but clang-cl records -fno-inline in
+    # its cc1 command whenever a /Ob0 is anywhere on the command line (CI evidence, docs/wp/WP-18.md), so the /Ob0 is removed.
+    get_target_property(_cml_opt_flags fixture_optimised_objs COMPILE_OPTIONS)
+    list(FILTER _cml_opt_flags EXCLUDE REGEX "Ob0")
+    set_target_properties(fixture_optimised_objs PROPERTIES COMPILE_OPTIONS "${_cml_opt_flags}")
     target_compile_options(fixture_optimised_objs PRIVATE /O2 /Ob2)
 endif()
 
