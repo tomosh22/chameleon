@@ -3,12 +3,12 @@
 #if defined(_WIN32)
 
 #include <algorithm>
-#include <cctype>
 #include <chrono>
 #include <optional>
 #include <string>
 
 #include "cml/ipc/control_ids.h"
+#include "cml/util/format.h"
 
 namespace cmltest {
 
@@ -33,11 +33,6 @@ ExceptionStepResult fail(std::uint32_t code, std::string detail) {
 
 ExceptionStepResult fail(const cml::Diag& diag) {
     return fail(diag.code, diag.format());
-}
-
-std::string upper(std::string text) {
-    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-    return text;
 }
 
 }  // namespace
@@ -80,7 +75,7 @@ ExceptionStepResult ExceptionSteps::expect(ipc::ControlClient& control, const St
             }
             const std::string code = e.body.get_string("code");
             const std::string function = e.body.get_string("function");
-            if (!step.exception_code.empty() && upper(code) != upper(step.exception_code)) {
+            if (!step.exception_code.empty() && cml::upper(code) != cml::upper(step.exception_code)) {
                 return fail(cml::ids::kExpectEventTimeout,
                             "an exception event arrived with code " + code + ", expected " + step.exception_code + ": " + ipc::json::serialize(e.body));
             }

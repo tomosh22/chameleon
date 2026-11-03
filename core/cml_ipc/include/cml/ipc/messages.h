@@ -224,6 +224,10 @@ struct Exception {
     std::string module_path;         // its file, UTF-8
 };
 
+// The agent's answer (Reply status) when ExceptionAction names a thread that is not held. Shared so the broker can tell "gone"
+// from "refused" (agent/src/crash/diag_ids.h: kUnknownException).
+inline constexpr std::uint32_t kStatusUnknownException = 4400;
+
 // What to do with a held thread. Values are on the wire; never renumber.
 enum class ExceptionActionKind : std::uint32_t {
     Continue = 1,  // resume at the faulting instruction (after a fix that makes it safe)

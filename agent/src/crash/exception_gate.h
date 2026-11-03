@@ -82,8 +82,18 @@ public:
     bool enabled() const noexcept { return enabled_.load(std::memory_order_acquire); }
 
     // Replaces the ranges in which faults are acted on (agent thread; extra ranges beyond kMaxRanges are dropped).
+    // Protocol (the handler must stay lock-free): two tables, one active. The handler counts itself in as a reader of the table it
+    // read from `active_table_` and re-checks that it is still the active one before scanning (else it counts out and retries); the
+    // writer fills the INACTIVE table only after its reader count is zero, then flips. So a handler never scans a table while it is
+    // being rewritten, however long it was preempted.
     void set_ranges(const Range* ranges, std::size_t count);
     std::size_t range_count() const noexcept;
+    // The handler's lookup, public so a test can hammer it against set_ranges() without faulting.
+    bool in_ranges_for_testing(std::uint64_t pc) const noexcept {
+        std::uint64_t base = 0;
+        bool patch = false;
+        return classify(pc, &base, &patch);
+    }
 
     // Threads that never get held (the agent's own). Agent thread / worker threads at their start and end.
     void add_ignored_thread(std::uint32_t thread_id) noexcept;
@@ -142,6 +152,7 @@ private:
         std::atomic<bool> patch{false};
     };
     struct RangeTable {
+        std::atomic<std::uint32_t> readers{0};  // handlers currently inside classify() on this table
         std::atomic<std::uint32_t> count{0};
         RangeEntry entries[kMaxRanges];
     };
@@ -159,7 +170,7 @@ private:
     std::atomic<std::uint32_t> next_id_{1};
     std::atomic<std::uint32_t> overflow_{0};
     std::atomic<int> active_table_{0};
-    RangeTable tables_[2];
+    mutable RangeTable tables_[2];  // readers is bumped by const lookups
     std::atomic<DWORD> ignored_threads_[kMaxIgnoredThreads] = {};
     Slot slots_[kMaxSlots];
     void* handler_cookie_ = nullptr;

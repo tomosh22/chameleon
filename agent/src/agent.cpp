@@ -663,6 +663,7 @@ bool Agent::send_module_list(ipc::PipeConnection& connection) {
         return false;
     }
     known_modules_ = list.modules;
+    ranges_dirty_.store(true, std::memory_order_release);
     last_module_poll_ = GetTickCount64();
     if (modules) {
         polled_seq_ = seq_mark;
@@ -763,6 +764,9 @@ bool Agent::poll_modules(ipc::PipeConnection& connection) {
         }
     }
     known_modules_ = std::move(current);
+    if (!delta.loaded.empty() || !delta.unloaded.empty()) {
+        ranges_dirty_.store(true, std::memory_order_release);
+    }
     polled_seq_ = seq_mark;
     return true;
 }
@@ -777,6 +781,7 @@ void Agent::note_sent_locked(Entry& entry) {
 }
 
 void Agent::track_enabled_locked(const Entry& entry, std::uint32_t status) {
+    ranges_dirty_.store(true, std::memory_order_release);  // WP-20: the enabled set may change
     if (const auto* enable = std::get_if<ipc::EnableModule>(&entry.message)) {
         const auto same = [enable](const EnabledModule& m) { return same_module(m.path, enable->path); };
         if (status == 0) {

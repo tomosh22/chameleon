@@ -2,12 +2,12 @@
 
 #if defined(_WIN32)
 
-#include <cstdio>
 #include <cstring>
 #include <string>
 #include <new>
 
 #include "crash/diag_ids.h"
+#include "cml/util/format.h"
 #include "heap.h"
 
 namespace cml::agent::crash {
@@ -21,12 +21,6 @@ constexpr DWORD kWaitSliceMs = 500;  // how often a held thread looks at the gat
 
 bool is_handled_code(DWORD code) noexcept {
     return code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_INT_DIVIDE_BY_ZERO || code == EXCEPTION_ILLEGAL_INSTRUCTION;
-}
-
-std::string hex_address(std::uint64_t value) {
-    char text[24];
-    std::snprintf(text, sizeof text, "0x%llx", static_cast<unsigned long long>(value));
-    return text;
 }
 
 bool executable_code(std::uint64_t address) noexcept {
@@ -85,6 +79,11 @@ void ExceptionGate::set_ranges(const Range* ranges, std::size_t count) {
     // Write the table that is not in use, then flip: the handler reads one table from start to end without a lock.
     const int next = 1 - active_table_.load(std::memory_order_acquire);
     RangeTable& table = tables_[next];
+    // A handler that read the old value of active_table_ may still be counted in on this table: wait for it to leave (this is the
+    // agent thread, which may sleep; the handler never waits for anything).
+    while (table.readers.load() != 0) {
+        Sleep(0);
+    }
     std::uint32_t n = 0;
     for (std::size_t i = 0; i < count && n < kMaxRanges; ++i) {
         if (ranges[i].size == 0) {
@@ -129,18 +128,31 @@ bool ExceptionGate::is_ignored_thread(DWORD thread_id) const noexcept {
 }
 
 bool ExceptionGate::classify(std::uint64_t pc, std::uint64_t* base, bool* patch) const noexcept {
-    const RangeTable& table = tables_[active_table_.load(std::memory_order_acquire)];
-    const std::uint32_t count = table.count.load(std::memory_order_acquire);
+    // Count in as a reader of the table that is active NOW; if the writer flipped meanwhile, count out and look again.
+    RangeTable* table = nullptr;
+    for (;;) {
+        const int index = active_table_.load();
+        table = &tables_[index];
+        table->readers.fetch_add(1);
+        if (active_table_.load() == index) {
+            break;
+        }
+        table->readers.fetch_sub(1);
+    }
+    bool found = false;
+    const std::uint32_t count = table->count.load(std::memory_order_acquire);
     for (std::uint32_t i = 0; i < count; ++i) {
-        const std::uint64_t b = table.entries[i].base.load(std::memory_order_relaxed);
-        const std::uint64_t e = table.entries[i].end.load(std::memory_order_relaxed);
+        const std::uint64_t b = table->entries[i].base.load(std::memory_order_relaxed);
+        const std::uint64_t e = table->entries[i].end.load(std::memory_order_relaxed);
         if (pc >= b && pc < e) {
             *base = b;
-            *patch = table.entries[i].patch.load(std::memory_order_relaxed);
-            return true;
+            *patch = table->entries[i].patch.load(std::memory_order_relaxed);
+            found = true;
+            break;
         }
     }
-    return false;
+    table->readers.fetch_sub(1);
+    return found;
 }
 
 ExceptionGate::Slot* ExceptionGate::claim_slot() noexcept {
@@ -327,7 +339,7 @@ Result<void> ExceptionGate::compute_leave(const CONTEXT& in, CONTEXT* out) {
         if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(in.Rsp), &return_address, sizeof return_address, &read) == 0 ||
             read != sizeof return_address) {
             return Diag::make(ids::kLeaveUnwindFailed,
-                              "cannot leave the function at " + hex_address(in.Rip) + ": it has no unwind information and the stack top is unreadable",
+                              "cannot leave the function at " + cml::hex(in.Rip) + ": it has no unwind information and the stack top is unreadable",
                               "Use Ignore, or Continue after a patch fixed the cause.");
         }
         ctx.Rip = return_address;
@@ -335,7 +347,7 @@ Result<void> ExceptionGate::compute_leave(const CONTEXT& in, CONTEXT* out) {
     }
     if (ctx.Rip == 0 || ctx.Rsp <= in.Rsp || !executable_code(ctx.Rip)) {
         return Diag::make(ids::kLeaveBadFrame,
-                          "unwinding the faulting function did not lead to a caller (return address " + hex_address(ctx.Rip) + ")",
+                          "unwinding the faulting function did not lead to a caller (return address " + cml::hex(ctx.Rip) + ")",
                           "The stack looks damaged or the frame is not described by unwind data; use Ignore, or Continue after a patch.");
     }
     ctx.Rax = 0;

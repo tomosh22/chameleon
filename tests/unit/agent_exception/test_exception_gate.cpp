@@ -523,3 +523,53 @@ TEST_CASE("crash handler: each scenario behaves, in a child process") {
         }
     }
 }
+
+// The range table protocol: lookups (what the handler does) run against a writer that keeps swapping tables. The two contents differ in
+// order and length, so a lookup that read a table while it was being rewritten would miss the one range that is in both.
+TEST_CASE("range table: lookups never see a table that is being rewritten") {
+    ExceptionGate& gate = ExceptionGate::shared();
+    constexpr std::uint64_t kKnown = 0x70000000ull;
+    constexpr std::uint64_t kUnknown = 0x90000000ull;
+    std::vector<Range> first;
+    for (std::uint64_t i = 0; i < 200; ++i) {
+        first.push_back(Range{0x10000000ull + i * 0x2000, 0x1000, false});
+    }
+    first.push_back(Range{kKnown, 0x1000, false});  // last
+    std::vector<Range> second;
+    second.push_back(Range{kKnown, 0x1000, false});  // first
+    second.push_back(Range{0x50000000ull, 0x1000, true});
+    gate.set_ranges(first.data(), first.size());
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> misses{0};
+    std::atomic<int> false_hits{0};
+    std::atomic<std::uint64_t> lookups{0};
+    std::vector<std::thread> readers;
+    for (int i = 0; i < 4; ++i) {
+        readers.emplace_back([&] {
+            while (!stop.load()) {
+                if (!gate.in_ranges_for_testing(kKnown + 8)) {
+                    misses.fetch_add(1);
+                }
+                if (gate.in_ranges_for_testing(kUnknown)) {
+                    false_hits.fetch_add(1);
+                }
+                lookups.fetch_add(2);
+            }
+        });
+    }
+    const ULONGLONG until = GetTickCount64() + 2000;
+    std::uint64_t swaps = 0;
+    while (GetTickCount64() < until) {
+        const std::vector<Range>& next = (swaps++ % 2 == 0) ? second : first;
+        gate.set_ranges(next.data(), next.size());
+    }
+    stop.store(true);
+    for (std::thread& t : readers) {
+        t.join();
+    }
+    CHECK(misses.load() == 0);
+    CHECK(false_hits.load() == 0);
+    CHECK(swaps > 100);
+    CHECK(lookups.load() > 1000);
+}

@@ -87,10 +87,6 @@ void serve_connection(Connection& connection, std::uint64_t agent_id, Shared& sh
                 // Order matters: the index (state "loading") must exist before `status` can show the module as
                 // enabled, so the service sees the change first.
                 link->publish(session);
-                if (!exceptions_announced && shared.exceptions != nullptr && session.handshaken()) {
-                    exceptions_announced = true;
-                    shared.exceptions->agent_ready(link);  // tells the agent whether to hold faulting threads
-                }
                 if (shared.service != nullptr && session.revision() != seen_revision) {
                     seen_revision = session.revision();
                     shared.service->on_session_changed(agent_id);  // starts / drops the PDB index of enabled modules
@@ -106,6 +102,11 @@ void serve_connection(Connection& connection, std::uint64_t agent_id, Shared& sh
                         running = false;
                         break;
                     }
+                }
+                // Only now, with the Welcome on the wire: the agent expects nothing before it, so ExceptionConfig must not overtake it.
+                if (running && !exceptions_announced && shared.exceptions != nullptr && session.handshaken()) {
+                    exceptions_announced = true;
+                    shared.exceptions->agent_ready(link);  // tells the agent whether to hold faulting threads
                 }
                 if (outcome.close) {
                     running = false;

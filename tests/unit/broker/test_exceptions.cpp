@@ -392,3 +392,92 @@ TEST_CASE("control: the exceptions capability, the two commands and the opt-in e
     REQUIRE(unknown.has_value());
     CHECK(unknown->find("diag")->get_string("id") == "CML5402");
 }
+
+TEST_CASE("exceptions: a second subscriber, or an unchanged state, sends the agents nothing new") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.listen(std::make_shared<Collect>());
+    REQUIRE(rig.configs().size() == 1);
+    rig.listen(std::make_shared<Collect>());  // another client names `exception`: still on
+    rig.exceptions.refresh(true);
+    CHECK(rig.configs().size() == 1);
+}
+
+TEST_CASE("exceptions: a fault that arrives after the switch-off is released, never left pending") {
+    QuietLogs quiet;
+    Rig rig;
+    const EventBus::Id subscription = rig.listen(std::make_shared<Collect>());
+    rig.stop_listening(subscription);
+    rig.exceptions.on_exception(rig.link, 4242, Rig::fault(4));
+    CHECK(rig.exceptions.pending_count() == 0);
+    const auto actions = rig.actions();
+    REQUIRE(actions.size() == 1);
+    CHECK(actions[0].action == ipc::ExceptionActionKind::Ignore);
+}
+
+TEST_CASE("exceptions: concurrent refreshes leave the agent with the configuration of the final state") {
+    QuietLogs quiet;
+    Rig rig;
+    auto collector = std::make_shared<Collect>();
+    std::thread toggler([&] {
+        for (int i = 0; i < 100; ++i) {
+            const EventBus::Id id = rig.bus.subscribe(collector, {"exception"});
+            rig.exceptions.refresh(true);
+            rig.bus.unsubscribe(id);
+            rig.exceptions.refresh(true);
+        }
+    });
+    std::thread bystander([&] {
+        for (int i = 0; i < 300; ++i) {
+            rig.exceptions.refresh(true);
+        }
+    });
+    toggler.join();
+    bystander.join();
+    rig.exceptions.refresh(true);
+    const auto configs = rig.configs();
+    REQUIRE_FALSE(configs.empty());
+    // The last thing the agent was told is the final state: off. And it was never told the same thing twice in a row.
+    CHECK((configs.back().flags & ipc::kExceptionConfigEnabled) == 0);
+    for (std::size_t i = 1; i < configs.size(); ++i) {
+        CHECK(configs[i].flags != configs[i - 1].flags);
+    }
+    CHECK_FALSE(rig.exceptions.active());
+    CHECK(rig.exceptions.pending_count() == 0);
+}
+
+TEST_CASE("exceptions: the same exception_id in two processes needs a pid") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.listen(std::make_shared<Collect>());
+    auto other = std::make_shared<AgentLink>(6, [&](const ipc::Message&) -> Result<void> { return Result<void>(); });
+    rig.exceptions.agent_ready(other);
+    rig.exceptions.on_exception(rig.link, 4242, Rig::fault(1));
+    rig.exceptions.on_exception(other, 5555, Rig::fault(1));
+    Value args = Value::object();
+    args.set("exception_id", Value::integer(1));
+    args.set("action", Value::string("continue"));
+    Result<Value> ambiguous = rig.exceptions.action(args);
+    REQUIRE_FALSE(ambiguous.has_value());
+    CHECK(ambiguous.error().id() == "CML5755");
+    CHECK(rig.exceptions.pending_count() == 2);
+    args.set("pid", Value::integer(4242));
+    CHECK(rig.exceptions.action(args).has_value());
+}
+
+TEST_CASE("control: an empty events array is the default set, not every event (exception stays opt-in)") {
+    QuietLogs quiet;
+    Rig rig;
+    ControlContext context;
+    context.service = &rig.service;
+    context.exceptions = &rig.exceptions;
+    std::set<std::string> subscribed{"sentinel"};
+    context.subscribe = [&](const std::set<std::string>& names) { subscribed = names; };
+    Result<Value> parsed = ipc::json::parse(handle_control_line(R"({"id":1,"cmd":"subscribe","args":{"events":[]}})", context));
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed->get_bool("ok"));
+    CHECK_FALSE(subscribed.empty());
+    CHECK(subscribed.count("exception") == 0);
+    CHECK(subscribed.count("progress") == 0);
+    CHECK(subscribed.count("diag") == 1);
+}

@@ -54,9 +54,13 @@ public:
     // {"pid"?:N}  ->  {"pending":[<exception event bodies>]}
     Result<ipc::json::Value> pending(const ipc::json::Value& args) const;
 
-    // Re-evaluates "should the agents hold faulting threads" (a client subscribed / left, an option changed) and tells every
-    // agent. `wait`: wait for each agent's acknowledgement (so the caller knows the setting is in effect); otherwise fire and
-    // forget (teardown paths).
+    // Re-evaluates "should the agents hold faulting threads" (a client subscribed / left, an option changed) and, only when the
+    // answer differs from what the agents were last told, tells every agent (in parallel). `wait`: wait for the agents'
+    // acknowledgements (so the caller knows the setting is in effect); otherwise fire and forget (teardown paths).
+    //
+    // Ordering: refresh() and agent_ready() hold `config_mutex_` from computing the configuration to sending it, so two
+    // configurations can never cross on the wire and the last one sent is the one computed last, i.e. from the newest state of the
+    // event bus and the options. An agent is registered (and told) only under that mutex, after its Welcome went out.
     void refresh(bool wait);
 
     // Is holding on right now (option on and somebody listens)?
@@ -84,7 +88,10 @@ private:
 
     ReloadService* service_;
     EventBus* events_;
-    mutable std::mutex mutex_;  // links_, pending_
+    std::mutex config_mutex_;  // serialises "compute the configuration + send it" (refresh, agent_ready); taken before mutex_
+    std::uint32_t applied_flags_ = 0;  // config_mutex_: what the agents were last told
+    mutable std::mutex mutex_;  // links_, pending_, holding_
+    bool holding_ = false;      // the agents may hold threads; set together with clearing pending_ (under mutex_)
     std::map<std::uint64_t, std::shared_ptr<AgentLink>> links_;
     std::map<Key, Pending> pending_;
 };

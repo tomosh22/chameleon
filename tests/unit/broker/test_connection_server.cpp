@@ -13,6 +13,7 @@
 #include <variant>
 #include <vector>
 
+#include "cml/ipc/control.h"
 #include "cml/ipc/pipe.h"
 #include "cml/proc/diag_ids.h"
 #include "cml/util/log.h"
@@ -472,6 +473,46 @@ TEST_CASE("a client waiting for its replacement pipe instance keeps the server f
     second.close();
     REQUIRE(server.join());  // now it is really idle
     CHECK(server.reason() == ServerExit::Idle);
+}
+
+
+// WP-20 review: with a control client already listening for `exception`, a new agent must still get its Welcome FIRST (the agent's
+// handshake expects nothing else), and then holding enabled.
+TEST_CASE("an agent that connects while a client listens for exceptions gets Welcome first, then the configuration") {
+    QuietLogs quiet;
+    ServerOptions options;
+    options.pipe_name = unique_pipe_name("excwelcome");
+    options.control_pipe_name = unique_pipe_name("excwelcome_ctl");
+    RunningServer server(options);
+    REQUIRE_MESSAGE(ipc::pipe_exists(options.pipe_name), server.error());
+
+    Result<ipc::ControlClient> control = ipc::ControlClient::connect(options.control_pipe_name, kWaitMs);
+    REQUIRE_MESSAGE(control.has_value(), (control.has_value() ? "" : control.error().format()));
+    ipc::json::Value args = ipc::json::Value::object();
+    ipc::json::Value events = ipc::json::Value::array();
+    events.push(ipc::json::Value::string("exception"));
+    args.set("events", std::move(events));
+    Result<ipc::ControlResponse> subscribed = control->call("subscribe", std::move(args), kWaitMs);
+    REQUIRE(subscribed.has_value());
+    REQUIRE(subscribed->ok);
+
+    for (int round = 0; round < 2; ++round) {  // a second connection is the reconnect case
+        PipeConnection agent = connect(options.pipe_name);
+        Result<IoStatus> sent = agent.send(hello(10 + static_cast<std::uint64_t>(round)), kWaitMs);
+        REQUIRE(sent.has_value());
+        Result<PipeConnection::Received> first = agent.receive(kWaitMs);
+        REQUIRE_MESSAGE(first.has_value(), (first.has_value() ? "" : first.error().format()));
+        REQUIRE(first->status == IoStatus::Ok);
+        REQUIRE_MESSAGE(std::holds_alternative<ipc::Welcome>(first->message), ipc::describe(first->message));
+        Result<PipeConnection::Received> second = agent.receive(kWaitMs);
+        REQUIRE_MESSAGE(second.has_value(), (second.has_value() ? "" : second.error().format()));
+        REQUIRE(second->status == IoStatus::Ok);
+        const auto* config = std::get_if<ipc::ExceptionConfig>(&second->message);
+        REQUIRE_MESSAGE(config != nullptr, ipc::describe(second->message));
+        CHECK((config->flags & ipc::kExceptionConfigEnabled) != 0);
+    }
+    server.stop();
+    CHECK(server.join());
 }
 
 #endif  // _WIN32

@@ -14,9 +14,9 @@
 
 namespace cml::agent {
 
-namespace {
+static_assert(crash::ids::kUnknownException == ipc::kStatusUnknownException, "the broker's copy of the id differs");
 
-constexpr ULONGLONG kRangeRefreshMs = 100;  // how stale the "is this fault in the application's code" table may get
+namespace {
 
 const char* action_name(ipc::ExceptionActionKind action) {
     switch (action) {
@@ -54,7 +54,7 @@ void Agent::end_crash_session() {
 }
 
 void Agent::refresh_exception_ranges() {
-    last_range_refresh_ = GetTickCount64();
+    ranges_dirty_.store(false, std::memory_order_release);
     const std::vector<std::string> enabled = enabled_module_paths();
     std::vector<crash::Range> ranges;
     ranges.reserve(known_modules_.size() + 8);
@@ -76,7 +76,7 @@ void Agent::refresh_exception_ranges() {
 }
 
 void Agent::refresh_exception_ranges_if_due() {
-    if (crash::ExceptionGate::shared().enabled() && GetTickCount64() - last_range_refresh_ >= kRangeRefreshMs) {
+    if (ranges_dirty_.load(std::memory_order_acquire) && crash::ExceptionGate::shared().enabled()) {
         refresh_exception_ranges();
     }
 }

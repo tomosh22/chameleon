@@ -303,7 +303,9 @@ private:
     ULONGLONG full_list_not_before_ = 0;    // earliest tick for the next full-list resend
     DWORD list_backoff_ms_ = 1000;          // 1 s, 2 s ... 30 s; reset when a list is accepted
     bool full_list_pending_ = false;         // the broker refused a ModuleList: send a full one on the next poll
-    ULONGLONG last_range_refresh_ = 0;       // WP-20: when the crash handler's table of application ranges was rebuilt
+    // WP-20: set when something the crash handler's table of application ranges is built from changed (module list, enabled set,
+    // patch set); the agent thread rebuilds the table then, and only then.
+    std::atomic<bool> ranges_dirty_{false};
 };
 
 }  // namespace cml::agent

@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <iterator>
+#include <thread>
 #include <utility>
 
 #include "cml/core/bind_names.h"
@@ -65,14 +66,17 @@ std::size_t ExceptionService::pending_count() const {
 }
 
 ipc::ExceptionConfig ExceptionService::make_config() const {
-    const ReloadOptions options = service_->options();
     ipc::ExceptionConfig config;
-    const bool on = options.crash_handler && events_ != nullptr && events_->wanted("exception");
-    config.flags = (on ? ipc::kExceptionConfigEnabled : 0u) | (on && options.break_with_debugger ? ipc::kExceptionConfigBreakWithDebugger : 0u);
+    const bool on = active();
+    config.flags = (on ? ipc::kExceptionConfigEnabled : 0u) |
+                   (on && service_->options().break_with_debugger ? ipc::kExceptionConfigBreakWithDebugger : 0u);
     return config;
 }
 
 void ExceptionService::agent_ready(const std::shared_ptr<AgentLink>& link) {
+    // Called after the agent's Welcome was sent (the agent expects nothing else before it). Registered and told under the same
+    // mutex refresh() uses, so a concurrent refresh either includes this agent (and told it first) or runs entirely before.
+    std::lock_guard<std::mutex> config_lock(config_mutex_);
     {
         std::lock_guard<std::mutex> lock(mutex_);
         links_[link->agent_id()] = link;
@@ -147,23 +151,30 @@ Value ExceptionService::describe(const std::shared_ptr<AgentLink>& link, std::ui
 }
 
 void ExceptionService::on_exception(const std::shared_ptr<AgentLink>& link, std::uint32_t pid, const ipc::Exception& exception) {
-    if (!active()) {
+    Event event;
+    event.name = "exception";
+    event.body = describe(link, pid, exception);
+    bool release = false;
+    {
+        // Check and insert under the mutex refresh() clears the list under: an entry can never survive a switch-off.
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (holding_) {
+            Pending pending;
+            pending.pid = pid;
+            pending.link = link;
+            pending.body = event.body;
+            pending_[Key{link->agent_id(), exception.exception_id}] = std::move(pending);
+        } else {
+            release = true;
+        }
+    }
+    if (release) {
         // The listener left between the agent's decision and now: nobody can answer, so do not keep the thread waiting.
+        // (Sent after the lock is dropped: a write to the agent can block.)
         CML_LOG(Info, "CML%u: exception %u of process %u released as Ignore: no client listens for exception events", ed::kIgnoredNoClient,
                 exception.exception_id, pid);
         send_ignore(link, exception.exception_id);
         return;
-    }
-    Event event;
-    event.name = "exception";
-    event.body = describe(link, pid, exception);
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        Pending pending;
-        pending.pid = pid;
-        pending.link = link;
-        pending.body = event.body;
-        pending_[Key{link->agent_id(), exception.exception_id}] = std::move(pending);
     }
     CML_LOG(Info, "process %u: thread %u faulted with %s at %s (%s); waiting for a decision", pid, exception.thread_id,
             event.body.get_string("code").c_str(), event.body.get_string("address").c_str(), event.body.get_string("function").c_str());
@@ -199,21 +210,25 @@ Result<Value> ExceptionService::action(const Value& args) {
 
     std::shared_ptr<AgentLink> link;
     std::uint32_t pid = 0;
+    bool ambiguous = false;
     Key key;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        std::size_t matches = 0;
         for (const auto& [k, p] : pending_) {
             if (k.exception_id == exception_id && (!has_pid || p.pid == static_cast<std::uint32_t>(pid_value->as_integer()))) {
-                ++matches;
+                if (link != nullptr) {
+                    ambiguous = true;
+                }
                 key = k;
                 link = p.link;
                 pid = p.pid;
             }
         }
-        if (matches != 1) {
-            link.reset();
-        }
+    }
+    if (ambiguous) {
+        return Diag::make(ed::kAmbiguousException,
+                          "exception_id " + std::to_string(exception_id) + " is held in more than one process",
+                          "Add \"pid\" to the request; `exceptions` lists the processes.");
     }
     if (link == nullptr) {
         return Diag::make(ed::kNoSuchException,
@@ -238,7 +253,7 @@ Result<Value> ExceptionService::action(const Value& args) {
     if (reply->status != 0) {
         // A refusal ("cannot unwind this frame") leaves the thread held so that the client can choose another action;
         // "unknown exception" means it is gone.
-        if (reply->status == 4400) {
+        if (reply->status == ipc::kStatusUnknownException) {
             std::lock_guard<std::mutex> lock(mutex_);
             pending_.erase(key);
         }
@@ -276,32 +291,54 @@ Result<Value> ExceptionService::pending(const Value& args) const {
 }
 
 void ExceptionService::refresh(bool wait) {
+    std::lock_guard<std::mutex> config_lock(config_mutex_);
     ipc::ExceptionConfig config = make_config();
     const bool enabled = (config.flags & ipc::kExceptionConfigEnabled) != 0;
+    if (config.flags == applied_flags_) {
+        return;  // nothing the agents do not know already
+    }
+    applied_flags_ = config.flags;
     std::vector<std::shared_ptr<AgentLink>> links;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         for (const auto& [id, link] : links_) {
             links.push_back(link);
         }
+        holding_ = enabled;
         if (!enabled) {
             pending_.clear();  // the agents release every held thread as Ignore
         }
     }
     CML_LOG(Info, "crash handling %s for %llu agents", enabled ? "on" : "off", static_cast<unsigned long long>(links.size()));
-    for (const std::shared_ptr<AgentLink>& link : links) {
-        config.request_id = link->next_request_id();
-        if (!wait) {
-            (void)link->send(config);
-            continue;
+    const auto tell = [&config](const std::shared_ptr<AgentLink>& link, bool wait_for_answer) {
+        ipc::ExceptionConfig mine = config;
+        mine.request_id = link->next_request_id();
+        if (!wait_for_answer) {
+            (void)link->send(mine);
+            return;
         }
-        Result<ipc::Message> answer = link->request(config, kConfigTimeoutMs);
+        Result<ipc::Message> answer = link->request(mine, kConfigTimeoutMs);
         const auto* reply = answer ? std::get_if<ipc::Reply>(&*answer) : nullptr;
         if (!answer || reply == nullptr || reply->status != 0) {
             CML_LOG(Warn, "CML%u: agent#%llu did not accept the crash-handler configuration: %s", ed::kConfigRefused,
                     static_cast<unsigned long long>(link->agent_id()),
                     !answer ? answer.error().format().c_str() : (reply != nullptr ? reply->message.c_str() : "unexpected answer"));
         }
+    };
+    if (!wait || links.size() < 2) {
+        for (const std::shared_ptr<AgentLink>& link : links) {
+            tell(link, wait);
+        }
+        return;
+    }
+    // Several agents: ask them all at once, so one that does not answer costs one timeout, not one per agent.
+    std::vector<std::thread> askers;
+    askers.reserve(links.size());
+    for (const std::shared_ptr<AgentLink>& link : links) {
+        askers.emplace_back([&tell, link] { tell(link, true); });
+    }
+    for (std::thread& t : askers) {
+        t.join();
     }
 }
 

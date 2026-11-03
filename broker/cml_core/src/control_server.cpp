@@ -113,7 +113,9 @@ ipc::ControlResponse subscribe_response(const ipc::ControlRequest& request, cons
     static const char* const kEvents[] = {"diag", "patch_applied", "progress", "log", "exception"};
     std::set<std::string> names;
     const ipc::json::Value* events = request.args.find("events");
-    if (events == nullptr || events->is_null()) {
+    // An empty array is the same as no argument: the default set. (The bus reads an empty set as "every event", which would switch
+    // on `exception` without the client naming it.)
+    if (events == nullptr || events->is_null() || (events->is_array() && events->items().empty())) {
         // `progress` (WP-15) is opt-in: it can be chatty on a big reload. `exception` (WP-20) is opt-in because listening for it
         // makes the agents hold faulting threads until somebody decides.
         for (const char* k : kEvents) {
