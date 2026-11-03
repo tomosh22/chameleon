@@ -38,6 +38,17 @@ Event make_patch_applied_event(std::uint32_t pid, const std::string& module, std
     return e;
 }
 
+Event make_patch_reverted_event(std::uint32_t pid, const std::string& module, std::uint64_t generation) {
+    Event e;
+    e.name = "patch_reverted";
+    e.body = ipc::json::Value::object();
+    e.body.set("event", ipc::json::Value::string("patch_reverted"));
+    e.body.set("pid", ipc::json::Value::integer(static_cast<std::int64_t>(pid)));
+    e.body.set("module", ipc::json::Value::string(module));
+    e.body.set("generation", ipc::json::Value::integer(static_cast<std::int64_t>(generation)));
+    return e;
+}
+
 Event make_progress_event(const std::string& stage, std::uint32_t pid, const std::string& module, std::size_t done, std::size_t total) {
     Event e;
     e.name = "progress";

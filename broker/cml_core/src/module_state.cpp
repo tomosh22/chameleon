@@ -14,11 +14,6 @@ std::optional<SymbolAddress> SharedRegistry::find(std::string_view decorated_nam
     return registry_.find(decorated_name);
 }
 
-void SharedRegistry::add(std::string name, SymbolAddress address) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    registry_.add(std::move(name), std::move(address));
-}
-
 std::optional<SymbolAddress> SharedRegistry::replace(std::string name, SymbolAddress address) {
     std::lock_guard<std::mutex> lock(mutex_);
     std::optional<SymbolAddress> previous = registry_.find(name);

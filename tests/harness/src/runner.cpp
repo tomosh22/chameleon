@@ -20,6 +20,7 @@
 #include "cml/proc/proc.h"
 #include "fixture_builder.h"
 #include "revert_step.h"
+#include "subscription.h"
 #include "rx.h"
 #include "supervisor.h"
 #include "ticks.h"
@@ -351,7 +352,7 @@ private:
         if (status->has_capability(ipc::capability::kSubscribe)) {
             ipc::json::Value args = ipc::json::Value::object();
             ipc::json::Value events = ipc::json::Value::array();
-            for (const char* e : {"diag", "patch_applied", "patch_reverted", "log"}) {
+            for (const std::string& e : subscription_events(capabilities_)) {
                 events.push(ipc::json::Value::string(e));
             }
             args.set("events", std::move(events));

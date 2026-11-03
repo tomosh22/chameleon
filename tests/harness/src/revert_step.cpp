@@ -11,6 +11,7 @@ RevertStepResult run_revert_step(ipc::ControlClient& control, const Step& step, 
     RevertStepResult out;
     ipc::json::Value args = ipc::json::Value::object();
     args.set("scope", ipc::json::Value::string(step.revert_scope));
+    args.set("timeout_ms", ipc::json::Value::integer(limit_ms));  // the broker's one deadline for the whole revert
     cml::Result<ipc::ControlResponse> response = control.call("revert", std::move(args), limit_ms + 5000);
     if (!response) {
         out.diag = response.error();
@@ -40,6 +41,10 @@ RevertStepResult run_revert_step(ipc::ControlClient& control, const Step& step, 
     if (reverted == nullptr || !reverted->is_array() || reverted->items().empty()) {
         out.diag = cml::Diag::make(cml::ids::kResultMismatch, "the revert answered ok but lists no reverted module: " + ipc::json::serialize(response->result),
                                    "Check the broker.");
+        return out;
+    }
+    if (const ipc::json::Value* failed = response->result.find("failed"); failed != nullptr && failed->is_array() && !failed->items().empty()) {
+        out.diag = cml::Diag::make(cml::ids::kScenarioFailed, "the revert was partial: " + ipc::json::serialize(response->result), "See the broker log.");
         return out;
     }
     out.detail = "revert " + step.revert_scope + " ok: " + ipc::json::serialize(response->result);

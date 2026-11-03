@@ -552,6 +552,7 @@ private:
             batch.baseline_before = module_.index->baseline_stamps(accepted_files);
             batch.patches = std::move(applied_);
             batch.generation_before = generation_before;
+            batch.reload_id = ctx_.reload_id;
         }
         module_.index->accept(accepted);
         if (!batch.patches.empty()) {
@@ -912,12 +913,10 @@ private:
         report.times.init += lap.lap();
 
         // ---- hooks -------------------------------------------------------------------------------------------------
-        std::vector<std::pair<std::uint64_t, std::uint64_t>> installed;
-        AppliedPatch applied;  // WP-22
+        AppliedPatch applied;  // WP-22: what a revert needs; applied.hooks is also the list of the hook table entries below
         applied.number = patch_no;
         applied.base = base;
         applied.dll_path = linked.dll_path;
-        std::vector<AppliedHook> applied_hooks;
         if (!hooks.empty()) {
             ipc::InstallHooks req;
             req.request_id = link_.next_request_id();
@@ -929,8 +928,7 @@ private:
                                                     "Report this with the bind plan."));
                 }
                 req.hooks.push_back(ipc::HookSpec{h.old_va, *target, h.display});
-                installed.emplace_back(h.old_va, *target);
-                applied_hooks.push_back(AppliedHook{h.old_va, *target, h.display});
+                applied.hooks.push_back(AppliedHook{h.old_va, *target, h.display});
             }
             Result<ipc::Message> answer = link_.request(ipc::Message(std::move(req)), clamp_timeout(options_.hooks_timeout_ms));
             if (!answer) {
@@ -939,11 +937,10 @@ private:
                 const bool timed_out = answer.error().code == pd::kAgentRequestTimeout;  // a send failure or a lost agent is a plain failure
                 if (timed_out) {
                     std::lock_guard<std::mutex> lock(module_.mutex);
-                    for (const auto& h : installed) {
-                        module_.hooked[h.first] = h.second;
+                    for (const AppliedHook& h : applied.hooks) {
+                        module_.hooked[h.old_entry] = h.new_entry;
                     }
-                    applied.hooks = applied_hooks;  // WP-22: still live (or about to be), so a revert has to know it
-                    applied_.push_back(std::move(applied));
+                    applied_.push_back(std::move(applied));  // WP-22: still live (or about to be), so a revert has to know it
                     return fail("hooks", Diag::make(pd::kHooksTimeout, "the agent did not confirm the hooks in time: " + answer.error().message,
                                                     "In synchronised mode the application must call SyncPoint(); the patch stays loaded and the hooks may still apply."));
                 }
@@ -970,8 +967,8 @@ private:
         // ---- commit: the process symbol registry and the hook table (plan step 9) -----------------------------------
         {
             std::lock_guard<std::mutex> lock(module_.mutex);
-            for (const auto& h : installed) {
-                module_.hooked[h.first] = h.second;
+            for (const AppliedHook& h : applied.hooks) {
+                module_.hooked[h.old_entry] = h.new_entry;
             }
             ++module_.generation;
             report.generation = module_.generation;
@@ -1001,7 +998,6 @@ private:
                                                  "Report this with the bind plan."));
             }
         }
-        applied.hooks = std::move(applied_hooks);
         applied_.push_back(std::move(applied));
         report.dll_path = linked.dll_path;
         report.patched = true;

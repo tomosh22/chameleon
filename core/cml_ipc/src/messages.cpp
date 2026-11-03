@@ -576,7 +576,7 @@ Message decode_release_range(Reader& r) {
     m.base = r.u64();
     m.size = r.u64();
     const std::uint32_t mode = r.u32();
-    if (r.ok() && mode > static_cast<std::uint32_t>(ReleaseMode::UnloadPatch)) {
+    if (r.ok() && mode > static_cast<std::uint32_t>(ReleaseMode::Uncommit)) {
         r.fail("unknown release mode");
     }
     m.mode = static_cast<ReleaseMode>(mode);
@@ -1068,7 +1068,7 @@ std::string describe(const Message& message) {
         }
         std::string operator()(const ReleaseRange& m) const {
             return "ReleaseRange request=" + std::to_string(m.request_id) + " base=0x" + hex(m.base) +
-                   " size=0x" + hex(m.size) + (m.mode == ReleaseMode::Free ? " mode=free" : " mode=unload-patch");
+                   " size=0x" + hex(m.size) + (m.mode == ReleaseMode::Free ? " mode=free" : m.mode == ReleaseMode::Uncommit ? " mode=uncommit" : " mode=unload-patch");
         }
         std::string operator()(const LoadPatch& m) const {
             std::string s = "LoadPatch request=" + std::to_string(m.request_id) +

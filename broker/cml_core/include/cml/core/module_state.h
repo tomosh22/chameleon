@@ -28,9 +28,7 @@ namespace cml::core {
 class SharedRegistry final : public SymbolRegistry {
 public:
     std::optional<SymbolAddress> find(std::string_view decorated_name) const override;
-    void add(std::string name, SymbolAddress address);
-    // WP-22: add() that also returns what the name resolved to before (nullopt: it was not registered), and the
-    // undo of such a call (restores the previous address, or removes the name).
+    // Registers `name`; returns what it resolved to before (nullopt: it was not registered). WP-22: restore() is the undo.
     std::optional<SymbolAddress> replace(std::string name, SymbolAddress address);
     void restore(const std::string& name, const std::optional<SymbolAddress>& previous);
     std::size_t size() const;
@@ -85,6 +83,7 @@ struct AppliedPatch {
 struct PatchBatch {
     std::vector<AppliedPatch> patches;
     std::uint64_t generation_before = 0;                 // the module's generation before the batch
+    std::uint64_t reload_id = 0;                         // the reload command that made it (ReloadService numbers them 1, 2, ...)
     std::map<std::string, FileStamp> baseline_before;    // the source baseline the batch replaced
 };
 

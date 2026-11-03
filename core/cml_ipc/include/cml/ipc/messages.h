@@ -323,12 +323,15 @@ struct ReserveRangeResult {
 enum class ReleaseMode : std::uint32_t {
     Free = 0,         // give [base, base+size) of reserved address space back to the OS
     UnloadPatch = 1,  // FreeLibrary the patch loaded at `base` and return its range to the reserved state
+    // WP-22: the patch loaded at `base` was reverted: its application-hook records (CML_PREPATCH_HOOK, ...) stop being
+    // collected again. The image stays loaded. An agent without this mode refuses the request ("unknown release mode").
+    Uncommit = 2,
 };
 
 struct ReleaseRange {
     std::uint64_t request_id = 0;
     std::uint64_t base = 0;
-    std::uint64_t size = 0;  // Free: the extent; UnloadPatch: ignored (0)
+    std::uint64_t size = 0;  // Free: the extent; UnloadPatch / Uncommit: ignored (0)
     ReleaseMode mode = ReleaseMode::Free;
 };
 

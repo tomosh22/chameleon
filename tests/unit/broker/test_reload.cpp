@@ -20,6 +20,7 @@
 #include "cml/core/control_server.h"
 #include "cml/core/process_registry.h"
 #include "cml/core/reload_service.h"
+#include "cml/core/revert.h"
 #include "cml/proc/diag_ids.h"
 #include "cml/util/log.h"
 #include "doctest.h"
@@ -115,6 +116,8 @@ struct Rig {
     std::uint32_t fixups_status = 0;
     std::uint32_t init_status = 0;
     std::uint32_t hooks_status = 0;
+    std::uint32_t hooks_status2 = 0;            // WP-22: the second process' answer to InstallHooks
+    std::uint32_t uncommit_status = 0;          // WP-22: status of the answer to ReleaseRange mode Uncommit (an older agent refuses it)
     bool answer_hooks = true;
     bool close_on_load = false;
 
@@ -130,6 +133,9 @@ struct Rig {
     std::unique_ptr<ReloadService> service;
     Session session{1, "0.1.0"};
     std::shared_ptr<ModuleState> module;
+    std::shared_ptr<AgentLink> link2;           // WP-22: a second process running the same exe (enable2)
+    Session session2{2, "0.1.0"};
+    std::shared_ptr<ModuleState> module2;
 
     explicit Rig(bool default_session_dir = false, const std::string& logic_flags = std::string()) {
         // basic_world() with the compiland's build environment recorded at the head of its module stream (before
@@ -240,8 +246,9 @@ struct Rig {
         service->attach(link);
     }
 
-    // The scripted agent.
-    Result<void> agent(const ipc::Message& m) {
+    // The scripted agent of the first process; agent_on() serves any link (WP-22: a second process).
+    Result<void> agent(const ipc::Message& m) { return agent_on(*link, m); }
+    Result<void> agent_on(AgentLink& l, const ipc::Message& m) {
         if (fail_send && std::holds_alternative<ipc::InstallHooks>(m)) {
             return Diag::make(ids::kPipeIoFailed, "pipe broke", "restart");
         }
@@ -263,16 +270,16 @@ struct Rig {
             r.request_id = id;
             r.status = status;
             r.message = text;
-            link->deliver(r);
+            l.deliver(r);
         };
         if (std::holds_alternative<ipc::ReserveRange>(m)) {
             ipc::ReserveRangeResult r;
             r.request_id = id;
             r.blocks.push_back({0x13F000000ull, 64ull << 20});
-            link->deliver(r);
+            l.deliver(r);
         } else if (const auto* load = std::get_if<ipc::LoadPatch>(&m)) {
             if (close_on_load) {
-                std::thread([this] { link->close(); }).detach();
+                std::thread([&l] { l.close(); }).detach();
                 return Result<void>();
             }
             ipc::PatchLoaded r;
@@ -293,7 +300,7 @@ struct Rig {
                 r.image_base = load->candidates[0].image_base;
                 r.image_size = load->candidates[0].image_size;
             }
-            link->deliver(r);
+            l.deliver(r);
         } else if (std::holds_alternative<ipc::ApplyFixups>(m)) {
             reply(fixups_status, fixups_status != 0 ? "fix-up refused" : "");
         } else if (std::holds_alternative<ipc::RunInitializers>(m)) {
@@ -302,13 +309,18 @@ struct Rig {
             if (answer_hooks) {
                 ipc::HooksInstalled r;
                 r.request_id = id;
-                r.status = hooks_status;
-                r.message = hooks_status != 0 ? "too short" : "";
+                const std::uint32_t hooks_result = (link2 && &l == link2.get()) ? hooks_status2 : hooks_status;
+                r.status = hooks_result;
+                r.message = hooks_result != 0 ? "too short" : "";
                 r.threads = 3;
-                link->deliver(r);
+                l.deliver(r);
             }
-        } else if (std::holds_alternative<ipc::ReleaseRange>(m)) {
-            reply(0);
+        } else if (const auto* release = std::get_if<ipc::ReleaseRange>(&m)) {
+            if (release->mode == ipc::ReleaseMode::Uncommit && uncommit_status != 0) {
+                reply(uncommit_status, "unknown release mode");  // an older agent
+            } else {
+                reply(0);
+            }
         }
         return Result<void>();
     }
@@ -338,6 +350,48 @@ struct Rig {
         module = service->module_state(1, exe);
         REQUIRE(module != nullptr);
         REQUIRE(module->index->status().state == IndexState::Ready);
+    }
+
+    // WP-22: a second process (pid kPid + 1, agent 2) that runs the same exe; its answers come from agent_on().
+    void enable2() {
+        link2 = std::make_shared<AgentLink>(2, [this](const ipc::Message& m) { return agent_on(*link2, m); });
+        session2.set_answer_sink([this](const ipc::Message& m) { return link2->deliver(m); });
+        service->attach(link2);
+        ipc::Hello hello;
+        hello.request_id = 1;
+        hello.pid = kPid + 1;
+        session2.on_message(hello);
+        ipc::ModuleList list;
+        list.request_id = 2;
+        list.modules.push_back({kModuleBase, 0x4000, exe});
+        list.modules.push_back({0x7FF800000000ull, 0x90000, "C:\\Windows\\System32\\ntdll.dll"});
+        session2.on_message(list);
+        ipc::EnableModule enable_module;
+        enable_module.request_id = 3;
+        enable_module.path = exe;
+        session2.on_message(enable_module);
+        link2->publish(session2);
+        service->on_session_changed(2);
+        Value args = Value::object();
+        args.set("for", Value::string("index"));
+        args.set("timeout_ms", Value::integer(20000));
+        Result<Value> waited = service->wait(args);
+        REQUIRE_MESSAGE(waited.has_value(), waited.error().format());
+        module2 = service->module_state(2, exe);
+        REQUIRE(module2 != nullptr);
+        REQUIRE(module2->index->status().state == IndexState::Ready);
+    }
+    void changed_on(ModuleState& m, const std::string& file = "C:\\proj\\logic.cpp") {
+        m.index->set_sweep_override_for_testing([file]() -> Result<ModuleIndex::Sweep> {
+            ModuleIndex::Sweep s;
+            s.changed = {file};
+            s.compilands = {0};
+            s.file_compilands[file] = {0};
+            s.stamps[file] = FileStamp{1, 2, 3};
+            s.checked = 1;
+            s.hashed = 1;
+            return s;
+        });
     }
 
     // Makes the next sweep report `file` as changed in compiland 0.
@@ -611,8 +665,11 @@ TEST_CASE("revert last: the function jumps back to the previous patch; its symbo
     CHECK(rig.events->count("patch_reverted") == 1);
     // Patch 1's helper is still canonical: a later reload may bind to it.
     CHECK(rig.module->registry.find("?new_helper@@YAHXZ").has_value());
-    // The loaded patches stay where they are (no ReleaseRange for a revert).
-    CHECK(rig.seen<ipc::ReleaseRange>().size() == 0);
+    // The loaded patches stay where they are: nothing is unloaded; the reverted patch is only un-committed (WP-22).
+    const auto releases = rig.seen<ipc::ReleaseRange>();
+    REQUIRE(releases.size() == 1);
+    CHECK(releases[0].mode == ipc::ReleaseMode::Uncommit);
+    CHECK(releases[0].base == base2);
 }
 
 TEST_CASE("revert all: the original bytes come back, the registry forgets the patches' symbols and the next reload cannot bind to them") {
@@ -751,6 +808,211 @@ TEST_CASE("revert: arguments are validated; a module or process that does not ma
     named.set("scope", Value::string("last"));
     CHECK(rig.service->revert(named).has_value());
     CHECK(rig.module->generation == 1);
+}
+
+TEST_CASE("revert last means the newest reload: a module that reload did not touch keeps its older one") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.enable2();
+    // Reload 1 patches both processes ...
+    rig.changed_on(*rig.module);
+    rig.changed_on(*rig.module2);
+    REQUIRE(rig.reload().has_value());
+    REQUIRE(rig.module->batches.size() == 1);
+    REQUIRE(rig.module2->batches.size() == 1);
+    // ... reload 2 only the first.
+    rig.changed();
+    Value only_first = Value::object();
+    only_first.set("pid", Value::integer(kPid));
+    REQUIRE(rig.service->reload(only_first).has_value());
+    REQUIRE(rig.module->batches.size() == 2);
+    CHECK(rig.module->batches[1].reload_id > rig.module->batches[0].reload_id);
+    CHECK(rig.module->batches[0].reload_id == rig.module2->batches[0].reload_id);
+
+    Result<Value> r = revert_with(rig, "last");  // no pid, no module
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    REQUIRE(r->find("reverted")->items().size() == 1);  // the second process was not part of reload 2
+    CHECK(r->find("reverted")->items()[0].get_integer("pid") == kPid);
+    CHECK(rig.module->batches.size() == 1);
+    CHECK(rig.module2->batches.size() == 1);  // intact
+    CHECK(rig.module2->generation == 1);
+    CHECK_FALSE(rig.module2->hooked.empty());
+
+    // The next `last` is reload 1, in both processes.
+    Result<Value> again = revert_with(rig, "last");
+    REQUIRE_MESSAGE(again.has_value(), again.error().format());
+    CHECK(again->find("reverted")->items().size() == 2);
+    CHECK(rig.module->batches.empty());
+    CHECK(rig.module2->batches.empty());
+    CHECK(rig.service->generation() == 0);
+}
+
+TEST_CASE("revert across processes: a refusal in one process still reports the other as reverted, and a retry does not undo it again (CML5854)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.enable2();
+    rig.changed_on(*rig.module);
+    rig.changed_on(*rig.module2);
+    REQUIRE(rig.reload().has_value());
+    const std::size_t hook_requests = rig.seen<ipc::InstallHooks>().size();
+
+    rig.hooks_status2 = 4305;  // a thread of the second process would not leave the function
+    Result<Value> r = revert_with(rig, "all");
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    REQUIRE(r->find("reverted")->items().size() == 1);
+    CHECK(r->find("reverted")->items()[0].get_integer("pid") == kPid);
+    CHECK(r->get_bool("partial"));
+    REQUIRE(r->find("failed") != nullptr);
+    REQUIRE(r->find("failed")->items().size() == 1);
+    CHECK(r->find("failed")->items()[0].get_integer("pid") == kPid + 1);
+    CHECK(r->find("failed")->items()[0].get_string("id") == "CML5851");
+    CHECK(r->get_string("diag") == "CML5854");
+    CHECK(rig.events->diag_ids().back() == "CML5854");
+    CHECK(rig.module->batches.empty());
+    CHECK(rig.module2->batches.size() == 1);
+    CHECK(rig.module2->generation == 1);
+    CHECK(rig.service->generation() == 1);
+
+    // The retry only touches what is still applied: the first process is not asked again.
+    rig.hooks_status2 = 0;
+    const std::size_t before_retry = rig.seen<ipc::InstallHooks>().size();
+    Result<Value> retry = revert_with(rig, "all");
+    REQUIRE_MESSAGE(retry.has_value(), retry.error().format());
+    REQUIRE(retry->find("reverted")->items().size() == 1);
+    CHECK(retry->find("reverted")->items()[0].get_integer("pid") == kPid + 1);
+    CHECK(retry->find("failed") == nullptr);
+    CHECK(rig.seen<ipc::InstallHooks>().size() == before_retry + 1);
+    CHECK(before_retry == hook_requests + 2);
+    CHECK(rig.service->generation() == 0);
+    CHECK(rig.module2->batches.empty());
+}
+
+TEST_CASE("revert across processes: when every module fails the error is the first one, with the count") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.enable2();
+    rig.changed_on(*rig.module);
+    rig.changed_on(*rig.module2);
+    REQUIRE(rig.reload().has_value());
+    rig.hooks_status = 4305;
+    rig.hooks_status2 = 4305;
+    Result<Value> r = revert_with(rig, "all");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML5851");
+    CHECK(r.error().message.find("2 of 2 modules failed") != std::string::npos);
+    CHECK(rig.module->batches.size() == 1);
+    CHECK(rig.module2->batches.size() == 1);
+}
+
+TEST_CASE("revert: the reverted patches are un-committed in the agent, newest first; an agent that refuses that costs a warning, not the revert (CML5855)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    apply_two_patches(rig);
+    const auto loads = rig.seen<ipc::LoadPatch>();
+    REQUIRE(loads.size() == 2);
+    const std::uint64_t base1 = loads[0].candidates[0].image_base;
+    const std::uint64_t base2 = loads[1].candidates[0].image_base;
+
+    // last: only patch 2's image
+    REQUIRE(revert_with(rig, "last").has_value());
+    auto releases = rig.seen<ipc::ReleaseRange>();
+    REQUIRE(releases.size() == 1);
+    CHECK(releases[0].mode == ipc::ReleaseMode::Uncommit);
+    CHECK(releases[0].base == base2);
+
+    // all: the rest (patch 1)
+    rig.uncommit_status = 5201;  // an agent that does not know the mode
+    Result<Value> r = revert_with(rig, "all");
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    releases = rig.seen<ipc::ReleaseRange>();
+    REQUIRE(releases.size() == 2);
+    CHECK(releases[1].mode == ipc::ReleaseMode::Uncommit);
+    CHECK(releases[1].base == base1);
+    CHECK(rig.module->batches.empty());  // the revert itself went through
+    bool warned = false;
+    for (const Event& e : rig.events->events) {
+        warned = warned || (e.name == "diag" && e.body.get_string("id") == "CML5855" && e.body.get_string("severity") == "warning");
+    }
+    CHECK(warned);
+}
+
+TEST_CASE("revert: a module that is no longer loaded is refused (CML5856) and its stale patch list is dropped") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    apply_two_patches(rig);
+    const std::size_t hook_requests = rig.seen<ipc::InstallHooks>().size();
+    ipc::ModuleUnloaded unloaded;
+    unloaded.module = {kModuleBase, 0x4000, rig.exe};
+    rig.session.on_message(unloaded);
+    rig.link->publish(rig.session);
+
+    Result<Value> r = revert_with(rig, "all");
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML5856");
+    CHECK(rig.seen<ipc::InstallHooks>().size() == hook_requests);  // nothing was written into whatever is there now
+    CHECK(rig.module->batches.empty());
+    CHECK(rig.module->hooked.empty());
+    // Nothing is left to revert afterwards.
+    Result<Value> again = revert_with(rig, "all");
+    REQUIRE_FALSE(again.has_value());
+    CHECK(again.error().id() == "CML5850");
+}
+
+TEST_CASE("revert: one deadline for the whole command; a spent deadline stops before a step and changes nothing (CML5858)") {
+    QuietLogs quiet;
+    {
+        Rig rig;
+        rig.enable();
+        apply_two_patches(rig);
+        // revert_module directly with a deadline that has passed: the re-point of the last revert is not even sent.
+        RevertOptions options;
+        options.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+        const std::size_t hook_requests = rig.seen<ipc::InstallHooks>().size();
+        Result<RevertReport> r = revert_module(*rig.link, *rig.module, RevertScope::Last, options);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().id() == "CML5858");
+        CHECK(rig.seen<ipc::InstallHooks>().size() == hook_requests);
+        CHECK(rig.module->batches.size() == 2);
+        CHECK(rig.module->generation == 2);
+    }
+    {
+        // The command's timeout_ms caps the wait for an agent that never answers (hooks_timeout_ms alone would be 30 s).
+        Rig rig;
+        rig.enable();
+        rig.changed();
+        REQUIRE(rig.reload().has_value());
+        rig.answer_hooks = false;
+        Value args = Value::object();
+        args.set("scope", Value::string("all"));
+        args.set("timeout_ms", Value::integer(300));
+        const auto start = std::chrono::steady_clock::now();
+        Result<Value> r = rig.service->revert(args);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+        REQUIRE_MESSAGE(r.has_value(), r.error().format());
+        CHECK(elapsed < 5000);
+        bool unconfirmed = false;
+        bool uncommit_out_of_time = false;
+        for (const Event& e : rig.events->events) {
+            unconfirmed = unconfirmed || (e.name == "diag" && e.body.get_string("id") == "CML5852");
+            uncommit_out_of_time = uncommit_out_of_time || (e.name == "diag" && e.body.get_string("id") == "CML5855");
+        }
+        CHECK(unconfirmed);
+        CHECK(uncommit_out_of_time);  // the spent deadline reaches the later steps too
+    }
+}
+
+TEST_CASE("events: patch_reverted carries pid, module and the generation after the revert") {
+    const Event e = make_patch_reverted_event(4711, "app.exe", 3);
+    CHECK(e.name == "patch_reverted");
+    CHECK(e.body.get_string("event") == "patch_reverted");
+    CHECK(e.body.get_integer("pid") == 4711);
+    CHECK(e.body.get_string("module") == "app.exe");
+    CHECK(e.body.get_integer("generation") == 3);
 }
 
 TEST_CASE("revert: in synchronised mode an unconfirmed request is a warning, and the broker's state still goes back") {
