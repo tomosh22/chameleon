@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <utility>
@@ -395,6 +396,11 @@ Result<std::vector<proc::ModuleInfo>> PatchLoader::enumerate_modules_without_pat
     return modules;
 }
 
+void PatchLoader::set_hook_wait_ms_for_testing(unsigned ms) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    hook_wait_ms_ = ms;
+}
+
 void PatchLoader::set_test_hooks(const TestHooks& hooks) {
     std::lock_guard<std::mutex> lock(mutex_);
     hooks_ = hooks;
@@ -405,16 +411,86 @@ std::size_t PatchLoader::patch_count() const {
     return patches_.size();
 }
 
-std::vector<AddressRange> PatchLoader::live_patch_images() const {
+PatchLoader::HookLease PatchLoader::acquire_hook_lease() {
+    HookLease lease;
+    lease.loader_ = this;
     std::lock_guard<std::mutex> lock(mutex_);
-    std::vector<AddressRange> images;
-    images.reserve(patches_.size());
-    for (const Patch& patch : patches_) {
-        if (patch.live && !patch.busy) {
-            images.push_back(AddressRange{patch.range.base, patch.image_size});
+    lease.images_.reserve(patches_.size());
+    for (Patch& patch : patches_) {
+        if (patch.live && !patch.busy && !patch.unloading) {
+            ++patch.leases;
+            lease.images_.push_back(HookImage{AddressRange{patch.range.base, patch.image_size}, patch.committed, patch.target_base});
         }
     }
-    return images;
+    return lease;
+}
+
+void PatchLoader::HookLease::refresh() {
+    if (loader_ == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(loader_->mutex_);
+    for (HookImage& image : images_) {
+        if (const Patch* patch = loader_->find_patch(image.range.base)) {
+            image.committed = patch->committed && !patch->unloading;
+            image.target_base = patch->target_base;
+        }
+    }
+}
+
+void PatchLoader::HookLease::release() {
+    if (loader_ == nullptr) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(loader_->mutex_);
+        for (const HookImage& image : images_) {
+            if (Patch* patch = loader_->find_patch(image.range.base)) {
+                if (patch->leases > 0) {
+                    --patch->leases;
+                }
+            }
+        }
+    }
+    loader_->leases_changed_.notify_all();
+    loader_ = nullptr;
+    images_.clear();
+}
+
+void PatchLoader::commit_hooked(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& hooks, const std::vector<proc::ModuleInfo>& modules) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto holds = [](std::uint64_t base, std::uint64_t size, std::uint64_t address) { return address >= base && address - base < size; };
+    for (const auto& [old_entry, new_entry] : hooks) {
+        Patch* owner = nullptr;
+        for (Patch& patch : patches_) {
+            if (patch.live && !patch.unloading && holds(patch.range.base, patch.image_size, new_entry)) {
+                owner = &patch;
+                break;
+            }
+        }
+        if (owner == nullptr) {
+            continue;
+        }
+        std::uint64_t target = 0;
+        for (const proc::ModuleInfo& module : modules) {
+            if (holds(module.base, module.size, old_entry)) {
+                target = module.base;
+                break;
+            }
+        }
+        if (target == 0) {
+            for (const Patch& patch : patches_) {
+                if (patch.committed && holds(patch.range.base, patch.image_size, old_entry)) {
+                    target = patch.target_base;  // re-pointing a function an earlier patch added
+                    break;
+                }
+            }
+        }
+        if (target != 0) {
+            owner->committed = true;
+            owner->target_base = target;
+        }
+    }
 }
 
 std::vector<AddressRange> PatchLoader::owned_ranges() const {
@@ -860,14 +936,40 @@ Result<std::uint32_t> PatchLoader::run_initializers(std::uint64_t image_base, st
 }
 
 Result<void> PatchLoader::unload_patch(std::uint64_t image_base) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     for (std::size_t i = 0; i < patches_.size(); ++i) {
         if (patches_[i].range.base == image_base) {
             if (patches_[i].busy) {
                 return make(ids::kLoaderPatchBusy, "the patch at " + hex(image_base) + " is being used by another request",
                             "Wait for the previous request on this patch to be answered.");
             }
-            return unload_locked(i);
+            // WP-17: first make the patch invisible to hook collection, then wait for the hooks that are running
+            // from it (they hold a lease), and only then free the image.
+            patches_[i].committed = false;
+            patches_[i].unloading = true;
+            const bool drained = leases_changed_.wait_for(lock, std::chrono::milliseconds(hook_wait_ms_), [&] {
+                const Patch* p = find_patch(image_base);
+                return p == nullptr || p->leases == 0;
+            });
+            if (!drained) {
+                if (Patch* p = find_patch(image_base)) {
+                    p->unloading = false;  // still loaded, but its hooks stay invisible
+                }
+                return make(ids::kLoaderPatchBusy, "an application hook is still running from the patch at " + hex(image_base),
+                            "The patch stays loaded; unload it again after the hook returned.");
+            }
+            for (std::size_t j = 0; j < patches_.size(); ++j) {
+                if (patches_[j].range.base == image_base) {
+                    Result<void> unloaded = unload_locked(j);
+                    if (!unloaded) {
+                        if (Patch* p = find_patch(image_base)) {
+                            p->unloading = false;
+                        }
+                    }
+                    return unloaded;
+                }
+            }
+            return {};
         }
     }
     return make(ids::kLoaderUnknownPatch, "no patch is loaded at " + hex(image_base),

@@ -16,8 +16,13 @@ void reset(int (*probe)(int));
 std::vector<std::string> log();
 // Thread id of every logged entry, same order.
 std::vector<unsigned long> threads();
-// Makes the middle post-patch hook raise a processor exception.
-void set_fault(bool on);
+// Makes the middle post-patch hook fail: 0 = no, 1 = raise a processor exception, 2 = overflow the stack.
+void set_fault(int mode);
+// Called by the pre-patch hook and by the compile-start hook, after they logged ("pre" / "compile-start").
+using Action = void (*)(void* context, const char* where);
+void set_action(Action action, void* context);
+// The compile-start hook sleeps this long (a slow hook).
+void set_compile_start_delay_ms(unsigned ms);
 // Full path of this executable, UTF-8.
 std::string module_path_utf8();
 

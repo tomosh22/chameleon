@@ -156,6 +156,7 @@ int main() {
     expect(!agent.IsConnected(), "Agent::IsConnected");
     expect(agent.NativeHandle() == NULL, "Agent::NativeHandle");
     cml::DestroyAgent(agent);
+    expect(cml_last_patch_status() == CML_STATUS_AGENT_NOT_FOUND, "no agent loaded: cml_last_patch_status says so");
     expect(!agent.IsValid(), "DestroyAgent leaves the handle invalid");
 
     const std::wstring self = cml::GetCurrentModulePath();

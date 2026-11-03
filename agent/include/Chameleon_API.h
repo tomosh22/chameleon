@@ -39,8 +39,12 @@
  *   CML_COMPILE_ERROR_HOOK(fn)    void fn(const char* message)  the compile failed (UTF-8, one line)
  *   CML_PRERESTART_HOOK(fn)       void fn(void)  reserved: restart is not implemented yet, never called
  * Patch hooks run on the thread that applies the patch: inside SyncPoint() in synchronised mode,
- * on the agent thread in immediate mode. Compile hooks run the same way. Several hooks of one
- * kind run in the order the linker placed them. A hook must not call DestroyAgent.
+ * on the agent thread in immediate mode. Once the pre-patch hooks ran, the post-patch hooks run too, also when
+ * the installation failed (ask cml_last_patch_status()). Compile hooks run inside SyncPoint() in synchronised
+ * mode and on a separate worker thread in immediate mode (a slow one never stalls the agent). Several hooks of
+ * one kind run in the order the linker placed them. A hook must not call DestroyAgent (refused, CML5655), and a
+ * hook on the agent thread (immediate mode, patch hooks) must not block in WaitForRequest (refused, CML5656;
+ * polling with timeout 0 is fine).
  *
  * Compiles clean as C99, C++14 and C++20 at /W4 /WX (cl) and -Wall -Wextra -Werror (clang-cl),
  * with WIN32_LEAN_AND_MEAN / NOMINMAX defined or not. The header uses no exceptions and no RTTI.
@@ -176,6 +180,7 @@ typedef cml_status (*cml_pfn_call)(void* agent);
 typedef cml_status (*cml_pfn_wait_for_reload)(void* agent, uint32_t timeout_ms);
 typedef cml_status (*cml_pfn_set_hotkeys)(void* agent, const cml_hotkeys* hotkeys);
 typedef int (*cml_pfn_is_connected)(void* agent);
+typedef int32_t (*cml_pfn_last_patch_status)(void);
 
 /* Export names, resolved with GetProcAddress. */
 #define CML_EXPORT_ABI_VERSION "cml_agent_abi_version"
@@ -190,6 +195,7 @@ typedef int (*cml_pfn_is_connected)(void* agent);
 #define CML_EXPORT_SCHEDULE_RESTART "cml_agent_schedule_restart"
 #define CML_EXPORT_SET_GLOBAL_HOTKEYS "cml_agent_set_global_hotkeys"
 #define CML_EXPORT_IS_CONNECTED "cml_agent_is_connected"
+#define CML_EXPORT_LAST_PATCH_STATUS "cml_agent_last_patch_status"
 
 #if !defined(CML_AGENT_BUILD) /* everything below is for applications, not for the agent itself */
 
@@ -506,6 +512,20 @@ CML_INLINE cml_status cml_set_global_hotkeys(cml_agent agent, const cml_hotkeys*
         return CML_STATUS_INVALID_ARGUMENT;
     }
     return agent->set_global_hotkeys(agent->impl, hotkeys);
+}
+
+/* How the most recent patch installation went: 0 = every hook was written, else a CMLnnnn number (for example
+ * 4305). Meant for CML_POSTPATCH_HOOK functions: they also run after an installation that FAILED (whenever the
+ * pre-patch hooks ran), so that state torn down in a pre-patch hook can always be rebuilt. Callable from any
+ * thread, needs no agent handle. CML_STATUS_AGENT_NOT_FOUND when no agent is loaded in this process. */
+CML_INLINE cml_status cml_last_patch_status(void) {
+    HMODULE module = GetModuleHandleW(L"cml_agent.dll");
+    cml_pfn_last_patch_status fn;
+    if (module == NULL) {
+        return CML_STATUS_AGENT_NOT_FOUND;
+    }
+    fn = (cml_pfn_last_patch_status)cml_resolve_export(module, CML_EXPORT_LAST_PATCH_STATUS);
+    return fn == NULL ? CML_STATUS_AGENT_NOT_FOUND : (cml_status)fn();
 }
 
 /* Nonzero while the agent has a live, handshaken connection to the broker. For diagnostics. */

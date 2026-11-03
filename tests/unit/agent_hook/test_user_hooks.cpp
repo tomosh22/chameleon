@@ -58,10 +58,24 @@ Record rec(Kind kind, std::uint64_t fn, const char* key) {
     return r;
 }
 
-Source source(bool patch, const char* name, std::vector<Record> records) {
+// An enabled module (base 0x140000000 by default) or a committed patch of `target`.
+Source module(const char* name, std::vector<Record> records, std::uint64_t base = 0x140000000ull) {
     Source s;
-    s.patch = patch;
+    s.patch = false;
     s.name = name;
+    s.base = base;
+    s.records = std::move(records);
+    return s;
+}
+
+Source patch(const char* name, std::vector<Record> records, std::uint64_t base, std::uint64_t target = 0x140000000ull,
+             bool committed = true) {
+    Source s;
+    s.patch = true;
+    s.name = name;
+    s.base = base;
+    s.target_base = target;
+    s.committed = committed;
     s.records = std::move(records);
     return s;
 }
@@ -232,10 +246,10 @@ TEST_CASE("hooks: the .cmlhk sections of a PE image are found by their exact nam
 
 TEST_CASE("hooks: records of an enabled module all run, in order; the kinds do not mix") {
     const std::vector<Source> sources = {
-        source(false, "game.exe",
+        module("game.exe",
                {rec(Kind::PrePatch, 1, "a.cpp|P1"), rec(Kind::PostPatch, 2, "a.cpp|Q1"), rec(Kind::PrePatch, 3, "b.cpp|P2"),
                 rec(Kind::CompileError, 4, "b.cpp|E")}),
-        source(false, "game_ext.dll", {rec(Kind::PrePatch, 5, "c.cpp|P3")}),
+        module("game_ext.dll", {rec(Kind::PrePatch, 5, "c.cpp|P3")}, 0x150000000ull),
     };
     CHECK(fns(select_hooks(Kind::PrePatch, sources)) == std::vector<std::uint64_t>{1, 3, 5});
     CHECK(fns(select_hooks(Kind::PostPatch, sources)) == std::vector<std::uint64_t>{2});
@@ -247,26 +261,76 @@ TEST_CASE("hooks: records of an enabled module all run, in order; the kinds do n
 
 TEST_CASE("hooks: a patch holds a copy of every hook of the unit it recompiled - it must not run a second time") {
     // The module has OnPost and OnOther; a patch of that unit holds copies of both (different addresses).
-    const Source module = source(false, "game.exe", {rec(Kind::PostPatch, 0x1000, "a.cpp|OnPost"), rec(Kind::PostPatch, 0x1100, "a.cpp|OnOther")});
-    const Source patch = source(true, "patch #1", {rec(Kind::PostPatch, 0x9000, "a.cpp|OnPost"), rec(Kind::PostPatch, 0x9100, "a.cpp|OnOther")});
-    CHECK(fns(select_hooks(Kind::PostPatch, {module, patch})) == std::vector<std::uint64_t>{0x1000, 0x1100});
+    const Source m = module("game.exe", {rec(Kind::PostPatch, 0x1000, "a.cpp|OnPost"), rec(Kind::PostPatch, 0x1100, "a.cpp|OnOther")});
+    const Source p = patch("patch #1", {rec(Kind::PostPatch, 0x9000, "a.cpp|OnPost"), rec(Kind::PostPatch, 0x9100, "a.cpp|OnOther")}, 0x7000);
+    CHECK(fns(select_hooks(Kind::PostPatch, {m, p})) == std::vector<std::uint64_t>{0x1000, 0x1100});
+}
+
+TEST_CASE("hooks: the copies differ only in how __FILE__ is spelled - still one hook") {
+    // The original build says "..\\src\\A.cpp", the broker's recompile says "C:/proj/src/a.cpp".
+    const Source m = module("game.exe", {rec(Kind::PostPatch, 0x1000, "..\\src\\A.cpp|OnPost"), rec(Kind::PrePatch, 0x1100, "src/a.cpp|OnPre")});
+    const Source p = patch("patch #1", {rec(Kind::PostPatch, 0x9000, "C:/proj/src/a.cpp|OnPost"), rec(Kind::PrePatch, 0x9100, "C:\\proj\\SRC\\a.cpp|OnPre")}, 0x7000);
+    CHECK(fns(select_hooks(Kind::PostPatch, {m, p})) == std::vector<std::uint64_t>{0x1000});
+    CHECK(fns(select_hooks(Kind::PrePatch, {m, p})) == std::vector<std::uint64_t>{0x1100});
+    // A different file name or function name is a different hook.
+    const Source other = patch("patch #2", {rec(Kind::PostPatch, 0x9200, "C:/proj/src/b.cpp|OnPost"), rec(Kind::PostPatch, 0x9300, "C:/proj/src/a.cpp|OnOther")}, 0x8000);
+    CHECK(fns(select_hooks(Kind::PostPatch, {m, other})) == std::vector<std::uint64_t>{0x1000, 0x9200, 0x9300});
+    CHECK(normalize_key("C:\\Proj\\Src\\A.CPP|ns::Fn") == "a.cpp|ns::Fn");
+    CHECK(normalize_key("a.cpp|Fn") == "a.cpp|Fn");
+    CHECK(normalize_key("nobar") == "|nobar");
 }
 
 TEST_CASE("hooks: a hook added by a patch runs once; of several patches the newest copy runs") {
-    const Source module = source(false, "game.exe", {rec(Kind::PostPatch, 0x1000, "a.cpp|OnPost")});
-    const Source patch1 = source(true, "patch #1", {rec(Kind::PostPatch, 0x9000, "a.cpp|OnPost"), rec(Kind::PostPatch, 0x9100, "a.cpp|Added")});
-    const Source patch2 = source(true, "patch #2", {rec(Kind::PostPatch, 0xA000, "a.cpp|OnPost"), rec(Kind::PostPatch, 0xA100, "a.cpp|Added"),
-                                                    rec(Kind::PostPatch, 0xA200, "b.cpp|AddedLater")});
-    CHECK(fns(select_hooks(Kind::PostPatch, {module, patch1})) == std::vector<std::uint64_t>{0x1000, 0x9100});
+    const Source m = module("game.exe", {rec(Kind::PostPatch, 0x1000, "a.cpp|OnPost")});
+    const Source p1 = patch("patch #1", {rec(Kind::PostPatch, 0x9000, "a.cpp|OnPost"), rec(Kind::PostPatch, 0x9100, "a.cpp|Added")}, 0x7000);
+    const Source p2 = patch("patch #2", {rec(Kind::PostPatch, 0xA000, "a.cpp|OnPost"), rec(Kind::PostPatch, 0xA100, "a.cpp|Added"),
+                                         rec(Kind::PostPatch, 0xA200, "b.cpp|AddedLater")}, 0x8000);
+    CHECK(fns(select_hooks(Kind::PostPatch, {m, p1})) == std::vector<std::uint64_t>{0x1000, 0x9100});
     // The newer copy replaces the older one and keeps its place.
-    CHECK(fns(select_hooks(Kind::PostPatch, {module, patch1, patch2})) == std::vector<std::uint64_t>{0x1000, 0xA100, 0xA200});
+    CHECK(fns(select_hooks(Kind::PostPatch, {m, p1, p2})) == std::vector<std::uint64_t>{0x1000, 0xA100, 0xA200});
 }
 
-TEST_CASE("hooks: the same key under another kind is another hook") {
-    const Source module = source(false, "game.exe", {rec(Kind::PrePatch, 0x1000, "a.cpp|Fn")});
-    const Source patch = source(true, "patch #1", {rec(Kind::PostPatch, 0x9000, "a.cpp|Fn")});
-    CHECK(fns(select_hooks(Kind::PostPatch, {module, patch})) == std::vector<std::uint64_t>{0x9000});
-    CHECK(fns(select_hooks(Kind::PrePatch, {module, patch})) == std::vector<std::uint64_t>{0x1000});
+TEST_CASE("hooks: the same identity under another kind is another hook") {
+    const Source m = module("game.exe", {rec(Kind::PrePatch, 0x1000, "a.cpp|Fn")});
+    const Source p = patch("patch #1", {rec(Kind::PostPatch, 0x9000, "a.cpp|Fn")}, 0x7000);
+    CHECK(fns(select_hooks(Kind::PostPatch, {m, p})) == std::vector<std::uint64_t>{0x9000});
+    CHECK(fns(select_hooks(Kind::PrePatch, {m, p})) == std::vector<std::uint64_t>{0x1000});
+}
+
+TEST_CASE("hooks: a patch that is not committed contributes nothing") {
+    const Source m = module("game.exe", {rec(Kind::PostPatch, 0x1000, "a.cpp|OnPost")});
+    // Loaded, but its InstallHooks has not succeeded yet (sync mode still waiting, CML5309, fix-ups running).
+    const Source loading = patch("patch #1", {rec(Kind::PostPatch, 0x9100, "a.cpp|Added")}, 0x7000, 0x140000000ull, /*committed=*/false);
+    CHECK(fns(select_hooks(Kind::PostPatch, {m, loading})) == std::vector<std::uint64_t>{0x1000});
+    // The same patch once committed.
+    Source committed = loading;
+    committed.committed = true;
+    CHECK(fns(select_hooks(Kind::PostPatch, {m, committed})) == std::vector<std::uint64_t>{0x1000, 0x9100});
+}
+
+TEST_CASE("hooks: the patches of a module that is not enabled (any more) contribute nothing") {
+    const Source game = module("game.exe", {rec(Kind::PostPatch, 0x1000, "a.cpp|OnPost")});
+    const Source ext_patch = patch("patch of ext.dll", {rec(Kind::PostPatch, 0x9100, "e.cpp|Added")}, 0x7000, /*target=*/0x150000000ull);
+    // ext.dll is not among the enabled modules: no module source has its base.
+    CHECK(fns(select_hooks(Kind::PostPatch, {game, ext_patch})) == std::vector<std::uint64_t>{0x1000});
+    // Enabled again (a source for it, even an empty one) and its patch counts.
+    const Source ext = module("ext.dll", {}, 0x150000000ull);
+    CHECK(fns(select_hooks(Kind::PostPatch, {game, ext, ext_patch})) == std::vector<std::uint64_t>{0x1000, 0x9100});
+    // A patch with an unknown target (0) never counts.
+    const Source orphan = patch("orphan", {rec(Kind::PostPatch, 0x9200, "o.cpp|X")}, 0x8000, /*target=*/0);
+    CHECK(fns(select_hooks(Kind::PostPatch, {game, ext, orphan})) == std::vector<std::uint64_t>{0x1000});
+}
+
+TEST_CASE("hooks: the identity is scoped to the module a patch belongs to") {
+    // game.exe has a.cpp|OnPost; ext.dll has none. A patch of ext.dll with a.cpp|OnPost is a NEW hook of ext.dll.
+    const Source game = module("game.exe", {rec(Kind::PostPatch, 0x1000, "a.cpp|OnPost")});
+    const Source ext = module("ext.dll", {}, 0x150000000ull);
+    const Source ext_patch = patch("patch of ext.dll", {rec(Kind::PostPatch, 0x9100, "a.cpp|OnPost")}, 0x7000, 0x150000000ull);
+    CHECK(fns(select_hooks(Kind::PostPatch, {game, ext, ext_patch})) == std::vector<std::uint64_t>{0x1000, 0x9100});
+    // Two patches of different modules with the same identity do not replace each other.
+    const Source game_patch = patch("patch of game.exe", {rec(Kind::PostPatch, 0xA100, "z.cpp|New")}, 0x8000, 0x140000000ull);
+    const Source ext_patch2 = patch("patch 2 of ext.dll", {rec(Kind::PostPatch, 0xB100, "z.cpp|New")}, 0x9000, 0x150000000ull);
+    CHECK(fns(select_hooks(Kind::PostPatch, {game, ext, game_patch, ext_patch2})) == std::vector<std::uint64_t>{0x1000, 0xA100, 0xB100});
 }
 
 TEST_CASE("hooks: kind names") {

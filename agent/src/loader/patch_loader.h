@@ -32,9 +32,11 @@
 
 #include <windows.h>
 
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <span>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -129,13 +131,57 @@ public:
 
     // --- introspection (tests, logs) ---------------------------------------------------------
     std::size_t patch_count() const;
-    // Image ranges (base, image size) of the live patches, in the order they were loaded. A patch that is
-    // still being loaded is not listed. WP-17 scans them for hook records.
-    std::vector<proc::AddressRange> live_patch_images() const;
+    // --- application hooks (WP-17) ---------------------------------------------------------
+    // A patch's hook records become visible to the application's hook collection only once the patch is
+    // COMMITTED: its InstallHooks succeeded (commit_hooked). Until then (after LoadPatch, during fix-ups and
+    // initialisers, while a synchronised-mode InstallHooks is still waiting for SyncPoint(), after a CML5309
+    // timeout) it is listed with committed == false and must be ignored.
+    struct HookImage {
+        proc::AddressRange range;        // base and image size
+        bool committed = false;
+        std::uint64_t target_base = 0;   // base of the enabled module the patch patches (0 until committed)
+    };
+    // While a lease exists no patch it lists is unloaded: unload_patch() makes the patch invisible (committed =
+    // false, no new lease lists it) and then waits (bounded, 10 s) for the leases to end before FreeLibrary.
+    // So a hook never runs from an image that is being freed. Collect, run, release.
+    class HookLease {
+    public:
+        HookLease() = default;
+        ~HookLease() { release(); }
+        HookLease(const HookLease&) = delete;
+        HookLease& operator=(const HookLease&) = delete;
+        HookLease(HookLease&& other) noexcept : loader_(other.loader_), images_(std::move(other.images_)) { other.loader_ = nullptr; }
+        HookLease& operator=(HookLease&& other) noexcept {
+            if (this != &other) {
+                release();
+                loader_ = other.loader_;
+                images_ = std::move(other.images_);
+                other.loader_ = nullptr;
+            }
+            return *this;
+        }
+        const std::vector<HookImage>& images() const { return images_; }
+        // Re-reads committed / target_base of the leased images (after commit_hooked).
+        void refresh();
+        void release();
+
+    private:
+        friend class PatchLoader;
+        PatchLoader* loader_ = nullptr;
+        std::vector<HookImage> images_;
+    };
+    // Every live patch (loading ones excluded), in load order, pinned until the lease is released.
+    HookLease acquire_hook_lease();
+    // InstallHooks succeeded for these (old entry, new entry) pairs: the patch holding each new entry is
+    // committed, its target is the module (from `modules`) holding the old entry, or the target of the patch
+    // that does.
+    void commit_hooked(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& hooks, const std::vector<proc::ModuleInfo>& modules);
     std::vector<proc::AddressRange> owned_ranges() const;
     bool is_loaded(std::uint64_t image_base) const;
 
     void set_test_hooks(const TestHooks& hooks);
+    // How long unload_patch waits for hook leases before it gives up (default 10 s); tests shorten it.
+    void set_hook_wait_ms_for_testing(unsigned ms);
 
 private:
     struct Patch {
@@ -146,6 +192,10 @@ private:
         bool busy = false;      // LoadPatch (or a staged request) is working on it
         bool live = false;      // load_patch returned success for it
         bool released = false;  // our LoadLibrary reference was already given back (unload retry)
+        bool committed = false;       // WP-17: its hooks were installed; its hook records are visible
+        bool unloading = false;       // WP-17: being unloaded; invisible to hook collection
+        std::uint64_t target_base = 0;  // WP-17: module patched (valid when committed)
+        int leases = 0;               // WP-17: hook leases pinning the image
     };
 
     // All of these require mutex_ to be held.
@@ -163,9 +213,11 @@ private:
     void unload_after_failure(std::uint64_t image_base);  // only for a load that is still in progress
 
     mutable std::mutex mutex_;
+    std::condition_variable leases_changed_;  // WP-17: a lease was released
     std::vector<proc::AddressRange> owned_;  // sorted by base, merged, never overlapping
     std::vector<Patch> patches_;
     TestHooks hooks_;
+    unsigned hook_wait_ms_ = 10000;
 };
 
 }  // namespace cml::agent::loader

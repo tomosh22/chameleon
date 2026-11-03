@@ -7,6 +7,7 @@
 #define CML_AGENT_BUILD
 #endif
 #include <atomic>
+#include <cstring>
 #include <chrono>
 #include <memory>
 #include <optional>
@@ -21,6 +22,7 @@
 #include "doctest.h"
 #include "hook/diag_ids.h"
 #include "hook/installer.h"
+#include "hook/user_hook_ids.h"
 #include "hook_test_support.h"
 #include "user_hooks_probe.h"
 
@@ -350,6 +352,38 @@ bool wait_for_log(std::size_t count, Agent* sync_agent = nullptr) {
 
 }  // namespace
 
+namespace {
+
+// What the test hooks learned about their surroundings (set from user_hooks_probe's action callback).
+struct HookProbe {
+    Agent* agent = nullptr;
+    std::atomic<int> guarded_in_pre{-1};
+    std::atomic<int> guarded_in_compile{-1};
+    std::atomic<int> wait_status{0};
+    std::atomic<long long> wait_ms{-1};
+    std::atomic<int> poll_status{0};
+    std::atomic<std::int32_t> status_in_post{-1};
+};
+
+void hook_action(void* context, const char* where) {
+    auto* probe = static_cast<HookProbe*>(context);
+    if (std::strcmp(where, "pre") == 0) {
+        probe->guarded_in_pre = Agent::in_guarded_call() ? 1 : 0;
+        cml_reply reply;
+        std::memset(&reply, 0, sizeof(reply));
+        const auto t0 = std::chrono::steady_clock::now();
+        probe->wait_status = probe->agent->wait_request(987654, 2000, &reply);  // blocking: refused on the agent thread
+        probe->wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        probe->poll_status = probe->agent->wait_request(987654, 0, &reply);  // polling is fine
+    } else if (std::strcmp(where, "post") == 0) {
+        probe->status_in_post = Agent::last_patch_status();
+    } else if (std::strcmp(where, "compile-start") == 0) {
+        probe->guarded_in_compile = Agent::in_guarded_call() ? 1 : 0;
+    }
+}
+
+}  // namespace
+
 TEST_CASE("application hooks, immediate mode: pre-patch, then the install, then post-patch - all on the agent thread") {
     Rig rig;
     const std::string pipe = unique_pipe_name();
@@ -388,14 +422,96 @@ TEST_CASE("application hooks, immediate mode: pre-patch, then the install, then 
         REQUIRE(reverted.has_value());
         CHECK(hooktest_user::log().size() == 3);
     }
-    SUBCASE("a failed install runs the pre-patch hooks and not the post-patch hooks") {
+    SUBCASE("once the pre-patch hooks ran the post-patch hooks run too, also after a failed install") {
+        HookProbe probe;
+        probe.agent = &agent;
+        hooktest_user::set_action(&hook_action, &probe);
         REQUIRE(broker.send(request(33, 0, {{rig.old_fn.entry, rig.new_1.entry}, {rig.tiny.entry, rig.new_1.entry}})));
         const std::optional<ipc::HooksInstalled> answer = broker.wait_for_answer(15000);
         REQUIRE(answer.has_value());
         CHECK(answer->status == hook::ids::kFunctionTooShort);
         const std::vector<std::string> log = hooktest_user::log();
-        REQUIRE(log.size() == 1);
+        // Nothing was installed: the post-patch hooks still see the original function (1) ...
+        REQUIRE(log.size() == 3);
         CHECK(log[0] == "pre:1");
+        CHECK(index_of(log, "post-a:1") > 0);
+        CHECK(index_of(log, "post-b:1") > 0);
+        // ... and can ask what happened.
+        CHECK(probe.status_in_post.load() == static_cast<std::int32_t>(hook::ids::kFunctionTooShort));
+        CHECK(Agent::last_patch_status() == static_cast<std::int32_t>(hook::ids::kFunctionTooShort));
+        CHECK(rig.old_fn.as_int()(1) == 1);
+    }
+    SUBCASE("a successful install reports status 0 to the post-patch hooks") {
+        HookProbe probe;
+        probe.agent = &agent;
+        hooktest_user::set_action(&hook_action, &probe);
+        REQUIRE(broker.send(request(36, 0, {{rig.old_fn.entry, rig.new_1.entry}})));
+        const std::optional<ipc::HooksInstalled> answer = broker.wait_for_answer(15000);
+        REQUIRE(answer.has_value());
+        CHECK(answer->status == 0);
+        CHECK(probe.status_in_post.load() == 0);
+        CHECK(Agent::last_patch_status() == 0);
+    }
+    SUBCASE("a hook on the agent thread cannot destroy the agent or block waiting for it") {
+        HookProbe probe;
+        probe.agent = &agent;
+        hooktest_user::set_action(&hook_action, &probe);
+        REQUIRE(broker.send(request(37, 0, {{rig.old_fn.entry, rig.new_1.entry}})));
+        const std::optional<ipc::HooksInstalled> answer = broker.wait_for_answer(15000);
+        REQUIRE(answer.has_value());
+        CHECK(answer->status == 0);
+        CHECK(probe.guarded_in_pre.load() == 1);  // DestroyAgent would be refused (CML5655)
+        CHECK(probe.wait_status.load() == static_cast<int>(cml::agent::user_hooks::ids::kWaitInHook));  // CML5656, at once
+        CHECK(probe.wait_ms.load() < 1000);  // it asked for 2 s and did not wait
+        // Polling is still allowed.
+        CHECK(probe.poll_status.load() == CML_STATUS_UNKNOWN_REQUEST);
+    }
+    SUBCASE("a hook that overflows the stack is contained and the guard page is restored, every time") {
+        hooktest_user::set_fault(2);
+        for (std::uint64_t round = 0; round < 2; ++round) {
+            REQUIRE(broker.send(request(50 + round * 2, 0, {{rig.old_fn.entry, rig.new_1.entry}})));
+            const std::optional<ipc::HooksInstalled> answer = broker.wait_for_answer(30000);
+            REQUIRE(answer.has_value());
+            CHECK(answer->status == 0);
+            REQUIRE(broker.send(request(51 + round * 2, ipc::kInstallHooksRevert, {{rig.old_fn.entry, nullptr}})));
+            REQUIRE(broker.wait_for_answer(15000).has_value());
+        }
+        const std::vector<std::string> log = hooktest_user::log();
+        int overflows = 0;
+        int posts = 0;
+        for (const std::string& entry : log) {
+            overflows += entry == "post-overflow" ? 1 : 0;
+            posts += entry.rfind("post-b:", 0) == 0 ? 1 : 0;
+        }
+        CHECK(overflows == 2);
+        CHECK(posts == 2);  // the hook after the overflowing one ran both times
+    }
+    SUBCASE("a slow compile hook does not stall the agent: an InstallHooks behind it is answered at once") {
+        hooktest_user::set_compile_start_delay_ms(2500);
+        REQUIRE(broker.send(compile_event(ipc::CompilePhase::Start)));
+        REQUIRE(wait_for_log(1));  // the hook started (and is asleep on its worker thread)
+        const auto t0 = std::chrono::steady_clock::now();
+        REQUIRE(broker.send(request(38, 0, {{rig.old_fn.entry, rig.new_1.entry}})));
+        const std::optional<ipc::HooksInstalled> answer = broker.wait_for_answer(15000);
+        REQUIRE(answer.has_value());
+        const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        CHECK(answer->status == 0);
+        CHECK(took < 2000);  // not behind the 2.5 s hook
+        CHECK(index_of(hooktest_user::log(), "compile-start-done") < 0);  // it is still sleeping
+        REQUIRE(wait_for_log(5));
+        CHECK(index_of(hooktest_user::log(), "compile-start-done") >= 0);
+    }
+    SUBCASE("a compile hook cannot destroy the agent either") {
+        HookProbe probe;
+        probe.agent = &agent;
+        hooktest_user::set_action(&hook_action, &probe);
+        REQUIRE(broker.send(compile_event(ipc::CompilePhase::Start)));
+        REQUIRE(wait_for_log(1));
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (probe.guarded_in_compile.load() < 0 && std::chrono::steady_clock::now() < deadline) {
+            Sleep(10);
+        }
+        CHECK(probe.guarded_in_compile.load() == 1);
     }
     SUBCASE("an empty request runs no hooks") {
         REQUIRE(broker.send(request(34, 0, {})));
@@ -404,7 +520,7 @@ TEST_CASE("application hooks, immediate mode: pre-patch, then the install, then 
         CHECK(hooktest_user::log().empty());
     }
     SUBCASE("a hook that raises an exception is reported and the next hook still runs") {
-        hooktest_user::set_fault(true);
+        hooktest_user::set_fault(1);
         REQUIRE(broker.send(request(35, 0, {{rig.old_fn.entry, rig.new_1.entry}})));
         const std::optional<ipc::HooksInstalled> answer = broker.wait_for_answer(15000);
         REQUIRE(answer.has_value());

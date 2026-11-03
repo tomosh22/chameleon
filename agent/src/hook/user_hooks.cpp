@@ -109,12 +109,27 @@ bool find_hook_sections(const std::uint8_t* headers, std::size_t size, std::vect
     return true;
 }
 
+std::string normalize_key(const std::string& key) {
+    const std::size_t bar = key.find('|');
+    const std::string file = bar == std::string::npos ? std::string() : key.substr(0, bar);
+    const std::string name = bar == std::string::npos ? key : key.substr(bar + 1);
+    std::size_t slash = file.find_last_of("/\\");
+    std::string base = slash == std::string::npos ? file : file.substr(slash + 1);
+    for (char& c : base) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    return base + "|" + name;
+}
+
 std::vector<Record> select_hooks(Kind kind, const std::vector<Source>& sources) {
     struct Chosen {
+        const Source* source;
         const Record* record;
+        std::string identity;
     };
     std::vector<const Record*> from_modules;
-    std::vector<Chosen> from_patches;  // newest wins per key, first-seen position
     for (const Source& source : sources) {
         if (source.patch) {
             continue;
@@ -125,25 +140,40 @@ std::vector<Record> select_hooks(Kind kind, const std::vector<Source>& sources) 
             }
         }
     }
+    std::vector<Chosen> from_patches;  // newest wins per (target module, identity); first-seen position
     for (const Source& source : sources) {
-        if (!source.patch) {
+        if (!source.patch || !source.committed) {
             continue;
+        }
+        const Source* target = nullptr;  // the enabled module this patch patches
+        for (const Source& candidate : sources) {
+            if (!candidate.patch && candidate.base == source.target_base) {
+                target = &candidate;
+                break;
+            }
+        }
+        if (target == nullptr) {
+            continue;  // the module is not enabled (any more): its patches contribute nothing
         }
         for (const Record& r : source.records) {
             if (r.kind != kind) {
                 continue;
             }
-            const auto in_module = std::find_if(from_modules.begin(), from_modules.end(),
-                                                [&r](const Record* m) { return m->key == r.key; });
-            if (in_module != from_modules.end()) {
+            const std::string identity = normalize_key(r.key);
+            const bool in_module = std::any_of(target->records.begin(), target->records.end(), [&](const Record& m) {
+                return m.kind == kind && normalize_key(m.key) == identity;
+            });
+            if (in_module) {
                 continue;
             }
-            const auto earlier = std::find_if(from_patches.begin(), from_patches.end(),
-                                              [&r](const Chosen& c) { return c.record->key == r.key; });
+            const auto earlier = std::find_if(from_patches.begin(), from_patches.end(), [&](const Chosen& c) {
+                return c.source->target_base == source.target_base && c.identity == identity;
+            });
             if (earlier != from_patches.end()) {
-                earlier->record = &r;  // a newer image: its copy replaces the older one
+                earlier->source = &source;  // a newer image: its copy replaces the older one
+                earlier->record = &r;
             } else {
-                from_patches.push_back(Chosen{&r});
+                from_patches.push_back(Chosen{&source, &r, identity});
             }
         }
     }

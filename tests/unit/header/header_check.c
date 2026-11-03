@@ -114,6 +114,7 @@ int main(void) {
     expect(cml_set_global_hotkeys(NULL, &hotkeys) == CML_STATUS_INVALID_ARGUMENT, "hotkeys on a null agent");
     expect(cml_is_connected(NULL) == 0, "null agent is not connected");
     cml_destroy_agent(NULL);
+    expect(cml_last_patch_status() == CML_STATUS_AGENT_NOT_FOUND, "no agent loaded: cml_last_patch_status says so");
 
     expect(cml_get_current_module_path(path, 32768, &length) == CML_STATUS_OK && length > 0,
            "current module path");

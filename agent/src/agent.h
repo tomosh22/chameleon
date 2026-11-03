@@ -94,9 +94,36 @@ public:
         Agent& agent_;
     };
 
-    // True on a thread that is inside a guarded call (e.g. work run by SyncPoint): destroying the
-    // agent from there is refused.
+    // True on a thread that is inside a guarded call (e.g. work run by SyncPoint) or inside an application
+    // hook: destroying the agent from there is refused.
     static bool in_guarded_call() noexcept;
+
+    // The thread an application hook is running on, for the calls that must not be made from a hook (WP-17).
+    //   AgentThread: immediate mode, the hook runs on the agent's own thread - anything that waits for the
+    //                agent thread (a blocking wait_request) would wait for itself.
+    //   Worker:      the thread that runs compile hooks in immediate mode - destroying the agent from there
+    //                would join the thread it runs on.
+    //   None:        not inside a hook, or a hook running on the application's thread in SyncPoint().
+    enum class HookThread { None, AgentThread, Worker };
+    static HookThread& hook_thread() noexcept;
+    class ScopedHookThread {
+    public:
+        explicit ScopedHookThread(HookThread now) noexcept : previous_(hook_thread()) { hook_thread() = now; }
+        ~ScopedHookThread() { hook_thread() = previous_; }
+        ScopedHookThread(const ScopedHookThread&) = delete;
+        ScopedHookThread& operator=(const ScopedHookThread&) = delete;
+
+    private:
+        HookThread previous_;
+    };
+
+    // Does path `a` name the module at `b` (or the other way round)? Used for the enabled-module set.
+    static bool same_module(const std::string& a, const std::string& b);
+
+    // Status of the most recent InstallHooks of this process (0 = installed, else the CMLnnnn id), set before the
+    // post-patch hooks run: they run after a failed install too, and ask with cml_last_patch_status().
+    static std::int32_t last_patch_status() noexcept;
+    static void set_last_patch_status(std::int32_t status) noexcept;
 
     // stop(), then wait until every thread has left every public call. Call this (not just the
     // destructor) before freeing an Agent that other threads may still be using.
@@ -174,6 +201,13 @@ private:
     void handle_compile_event(const ipc::CompileEvent& event);
     static void run_compile_job(void* context);
     void apply_compile_event(const ipc::CompileEvent& event);
+    // Immediate mode: compile hooks must not run on the agent thread (a slow one would stall ReserveRange,
+    // LoadPatch ... for every request behind it), so a worker thread runs them, in order. Created on first use,
+    // joined by stop().
+    bool queue_compile_event(const ipc::CompileEvent& event);
+    static unsigned __stdcall compile_worker_entry(void* self);
+    void compile_worker_run();
+    void stop_compile_worker();
     std::vector<std::string> enabled_module_paths();  // the modules the application enabled (any thread)
     bool flush_replies(ipc::PipeConnection& connection);
 
@@ -186,7 +220,6 @@ private:
         std::uint32_t options;
         bool needs_reenable = false;  // a re-enable was refused: send it again after the next accepted ModuleList
     };
-    static bool same_module(const std::string& a, const std::string& b);
     void track_enabled_locked(const Entry& entry, std::uint32_t status);
     void note_sent_locked(Entry& entry);
     void finish_locked(std::map<std::uint64_t, Entry>::iterator it, std::uint32_t status, const char* text,
@@ -226,6 +259,12 @@ private:
     std::size_t open_app_ = 0;              // application entries not yet Done (the 1024 limit)
     std::vector<EnabledModule> enabled_;    // modules the broker accepted and that were not disabled
     std::deque<ipc::Message> replies_;      // answers to broker requests (HooksInstalled), oldest first
+
+    std::mutex compile_mutex_;                 // guards compile_queue_, compile_thread_, compile_stop_
+    std::condition_variable compile_wake_;
+    std::deque<ipc::CompileEvent> compile_queue_;
+    HANDLE compile_thread_ = nullptr;
+    bool compile_stop_ = false;
 
     std::mutex connection_mutex_;  // guards active_connection_
     ipc::PipeConnection* active_connection_ = nullptr;

@@ -13,11 +13,15 @@
 //
 // Which records run (select_hooks). A reload recompiles whole translation units, so the patch image holds a
 // copy of every record of such a unit, whether or not its function changed. Calling both the original and
-// the copy would run a hook twice. The rule is by key ("<file>|<function expression>", written by the macro):
+// the copy would run a hook twice. A record's identity is (module, kind, file name, function expression): the
+// macro writes the key "<__FILE__>|<function expression>", and only the NAME of the file (case-insensitive) is
+// compared, because __FILE__ is spelled differently by the original build and by the broker's recompile
+// (relative or absolute, / or \). A patch image belongs to the module it patches (Source::target_base).
 //   1. every record of an enabled module runs. The original function is reached through the installed hook
 //      when a patch replaced it, so it runs the newest code;
-//   2. a record of a patch image runs only when no enabled module has a record of the same kind and key (the
-//      hook was added by a patch); of several patch images with the same kind and key the newest wins.
+//   2. a record of a patch image runs only when its patch is committed (its hooks are installed), its target
+//      module is enabled, and the target module has no record of the same kind and identity (the hook was added
+//      by a patch); of several patch images of one module with the same identity the newest wins.
 // A hook that a patch removes from the source keeps running (its original record is still there).
 //
 // Nothing here may be called while host threads are suspended (it allocates and calls application code).
@@ -25,7 +29,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
+
+#if defined(_WIN32)
+#include "loader/patch_loader.h"
+#endif
 
 namespace cml::agent::user_hooks {
 
@@ -51,11 +60,20 @@ struct Record {
 };
 
 // The records of one image. `patch` is true for a patch image. `name` is for log lines.
+//   module source: `base` is the module's base; it exists for every enabled module, with or without records.
+//   patch source:  `base` is the image base, `target_base` the module it patches; it only counts once
+//                  `committed` (its InstallHooks succeeded).
 struct Source {
     bool patch = false;
     std::string name;
+    std::uint64_t base = 0;
+    std::uint64_t target_base = 0;
+    bool committed = false;
     std::vector<Record> records;
 };
+
+// "C:\\proj\\src\\A.cpp|OnPost" and "..\\src\\a.cpp|OnPost" both give "a.cpp|OnPost".
+std::string normalize_key(const std::string& key);
 
 // Reads the key string at `address` (up to kMaxKeyBytes, without the terminator); false if unreadable.
 using KeyReader = bool (*)(void* context, std::uint64_t address, std::string* out);
@@ -87,17 +105,32 @@ const char* to_string(Kind kind) noexcept;
 
 #if defined(_WIN32)
 
-// Reads the hook records of the enabled modules (paths as the application spelled them) and of the live patch
-// images of this process. Problems (unreadable section, rejected record) are logged and skipped.
-std::vector<Source> collect_hooks(const std::vector<std::string>& enabled_modules);
+// One collection of the hook records, for one event (one InstallHooks, one compile notification). It reads the
+// enabled modules (paths as the application spelled them) and leases the live patch images of this process, so
+// that none of them is unloaded while the session lives (PatchLoader::HookLease). Problems (unreadable section,
+// rejected record) are logged and skipped. Not copyable. Allocates and calls application code: never use it while
+// threads are suspended.
+class Session {
+public:
+    explicit Session(const std::vector<std::string>& enabled_modules);
 
-// Calls the selected hooks of `kind` on the calling thread, in order. `text` is passed to CompileError hooks
-// (UTF-8; may be null for the others). A hook that raises a processor exception is reported (CML5652) and the
-// next one runs. Returns how many were called.
-std::size_t run_hooks(Kind kind, const std::vector<Source>& sources, const char* text);
+    // Calls the selected hooks of `kind` on the calling thread, in order. `text` is passed to CompileError hooks
+    // (UTF-8; may be null for the others). A hook that raises a processor exception is reported (CML5652) and
+    // the next one runs. Returns how many were called.
+    std::size_t run(Kind kind, const char* text);
 
-// The same, collecting first.
-std::size_t run_hooks(Kind kind, const std::vector<std::string>& enabled_modules, const char* text);
+    // The hooks (old entry, new entry) were installed: the patches that hold the new entries are committed and
+    // their records count from now on.
+    void commit(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& hooks);
+
+    const std::vector<Source>& sources() const { return sources_; }
+
+private:
+    void refresh_patch_flags();
+    std::vector<Source> sources_;  // enabled modules first, then every leased patch image in load order
+    std::vector<proc::ModuleInfo> modules_;
+    loader::PatchLoader::HookLease lease_;
+};
 
 #endif
 

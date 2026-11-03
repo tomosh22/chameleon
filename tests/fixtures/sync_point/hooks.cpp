@@ -21,7 +21,9 @@ void OnBeforePatch()
 
 void OnAfterPatch()
 {
-    std::printf("HOOK post thread=%s in_sync=%d value=%d\n", thread_name(), g_in_sync.load(), compute_value());
+    // cml_last_patch_status(): 0 = the hooks were written; a failed install runs this hook as well.
+    std::printf("HOOK post thread=%s in_sync=%d value=%d status=%d\n", thread_name(), g_in_sync.load(), compute_value(),
+                static_cast<int>(cml_last_patch_status()));
 }
 
 void OnCompileStart()

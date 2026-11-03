@@ -3,6 +3,8 @@
 // three dispatch lines. Member functions of Agent, declared in agent.h.
 #if defined(_WIN32)
 
+#include <process.h>
+
 #include <memory>
 #include <new>
 #include <string>
@@ -90,9 +92,25 @@ void Agent::apply_install_hooks(const ipc::InstallHooks& request) {
     // WP-17: pre-patch hooks of the application run before the first byte is changed, post-patch hooks after
     // the installation succeeded, both on this thread (the SyncPoint thread in synchronised mode). Nothing of
     // this runs while threads are suspended: the installer opens and closes its window inside install().
+    //
+    // One collection serves both runs and pins the patch images until the post-patch hooks returned. Once the
+    // pre-patch hooks ran the post-patch hooks ALWAYS run, also when the install failed: an application that tears
+    // state down in the first rebuilds it in the second and asks cml_last_patch_status() how it went.
+    // In immediate mode this is the agent thread: calls that would wait for the agent thread are refused for
+    // the duration (Agent::HookThread).
     const bool run_user_hooks = !revert && count != 0;
+    std::unique_ptr<user_hooks::Session> session;
     if (run_user_hooks) {
-        const std::size_t ran = user_hooks::run_hooks(user_hooks::Kind::PrePatch, enabled_module_paths(), nullptr);
+        session.reset(new (std::nothrow) user_hooks::Session(enabled_module_paths()));
+        if (session == nullptr) {
+            CML_LOG(Error, "CML%u: no memory for the hook collection; the application hooks of this request are skipped",
+                    user_hooks::ids::kOutOfMemory);
+        }
+    }
+    const HookThread hook_thread_here = synchronized() ? HookThread::None : HookThread::AgentThread;
+    if (session != nullptr) {
+        ScopedHookThread scope(hook_thread_here);
+        const std::size_t ran = session->run(user_hooks::Kind::PrePatch, nullptr);
         CML_LOG(Info, "hooks: request %llu: %llu pre-patch hook(s) ran", static_cast<unsigned long long>(request.request_id),
                 static_cast<unsigned long long>(ran));
     }
@@ -108,10 +126,25 @@ void Agent::apply_install_hooks(const ipc::InstallHooks& request) {
     const hook::BatchResult batch =
         revert ? installer.revert(specs.data(), count, outcomes) : installer.install(specs.data(), count, outcomes);
 
-    if (run_user_hooks && batch.ok()) {
-        const std::size_t ran = user_hooks::run_hooks(user_hooks::Kind::PostPatch, enabled_module_paths(), nullptr);
-        CML_LOG(Info, "hooks: request %llu: %llu post-patch hook(s) ran", static_cast<unsigned long long>(request.request_id),
-                static_cast<unsigned long long>(ran));
+    if (!revert) {
+        set_last_patch_status(static_cast<std::int32_t>(batch.diag.code));
+    }
+    if (session != nullptr) {
+        if (batch.ok()) {
+            // The hooks are written: the patches that hold the new functions count from now on (their own
+            // post-patch hooks included).
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> pairs;
+            pairs.reserve(count);
+            for (const ipc::HookSpec& h : request.hooks) {
+                pairs.emplace_back(h.old_entry, h.new_entry);
+            }
+            session->commit(pairs);
+        }
+        ScopedHookThread scope(hook_thread_here);
+        const std::size_t ran = session->run(user_hooks::Kind::PostPatch, nullptr);
+        CML_LOG(Info, "hooks: request %llu: %llu post-patch hook(s) ran (install %s)", static_cast<unsigned long long>(request.request_id),
+                static_cast<unsigned long long>(ran), batch.ok() ? "succeeded" : "failed");
+        session.reset();  // releases the patch images
     }
 
     ipc::HooksInstalled reply;
@@ -152,6 +185,15 @@ struct CompileJob {
 }  // namespace
 
 void Agent::handle_compile_event(const ipc::CompileEvent& event) {
+    if (!synchronized()) {
+        // Immediate mode: not on this (the agent) thread, a slow hook would stall every request behind it.
+        if (!queue_compile_event(event)) {
+            CML_LOG(Error, "CML%u: no memory or thread for a compile notification; the hooks of this event are skipped",
+                    user_hooks::ids::kOutOfMemory);
+        }
+        return;
+    }
+    // Synchronised mode: the next SyncPoint() runs it on the application's thread, in order with the patches.
     auto* job = new (std::nothrow) CompileJob{this, event};
     if (job == nullptr) {
         CML_LOG(Error, "CML%u: no memory for a compile notification; the hooks of this event are skipped",
@@ -179,9 +221,70 @@ void Agent::apply_compile_event(const ipc::CompileEvent& event) {
             text = event.text.c_str();
             break;
     }
-    const std::size_t ran = user_hooks::run_hooks(kind, enabled_module_paths(), text);
+    user_hooks::Session session(enabled_module_paths());
+    const std::size_t ran = session.run(kind, text);
     CML_LOG(Info, "hooks: %s of %s: %llu hook(s) ran", user_hooks::to_string(kind), event.module.c_str(),
             static_cast<unsigned long long>(ran));
+}
+
+bool Agent::queue_compile_event(const ipc::CompileEvent& event) {
+    std::lock_guard<std::mutex> lock(compile_mutex_);
+    if (compile_stop_) {
+        return true;  // the agent is going away: nobody wants the notification
+    }
+    if (compile_thread_ == nullptr) {
+        const std::uintptr_t handle = _beginthreadex(nullptr, 0, &Agent::compile_worker_entry, this, 0, nullptr);
+        if (handle == 0) {
+            return false;
+        }
+        compile_thread_ = reinterpret_cast<HANDLE>(handle);
+    }
+    // A bounded queue: a hook that never returns must not make the agent run out of memory.
+    constexpr std::size_t kMaxQueuedCompileEvents = 256;
+    if (compile_queue_.size() >= kMaxQueuedCompileEvents) {
+        compile_queue_.pop_front();
+    }
+    compile_queue_.push_back(event);
+    compile_wake_.notify_one();
+    return true;
+}
+
+unsigned __stdcall Agent::compile_worker_entry(void* self) {
+    static_cast<Agent*>(self)->compile_worker_run();
+    return 0;
+}
+
+void Agent::compile_worker_run() {
+    ScopedHookThread scope(HookThread::Worker);
+    for (;;) {
+        ipc::CompileEvent event;
+        {
+            std::unique_lock<std::mutex> lock(compile_mutex_);
+            compile_wake_.wait(lock, [this] { return compile_stop_ || !compile_queue_.empty(); });
+            if (compile_queue_.empty()) {
+                return;  // stopping, nothing left to deliver
+            }
+            event = std::move(compile_queue_.front());
+            compile_queue_.pop_front();
+        }
+        apply_compile_event(event);
+    }
+}
+
+void Agent::stop_compile_worker() {
+    HANDLE thread = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(compile_mutex_);
+        compile_stop_ = true;
+        compile_queue_.clear();  // notifications that were not delivered yet are dropped with the agent
+        thread = compile_thread_;
+        compile_thread_ = nullptr;
+    }
+    compile_wake_.notify_all();
+    if (thread != nullptr) {
+        WaitForSingleObject(thread, INFINITE);  // a hook that is running finishes first
+        CloseHandle(thread);
+    }
 }
 
 std::vector<std::string> Agent::enabled_module_paths() {

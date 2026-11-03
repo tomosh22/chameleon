@@ -53,7 +53,7 @@ within_s = 10
 
 [[step]]
 kind = "expect_stdout"
-regex = "HOOK post thread=main in_sync=1 value=42\\b"
+regex = "HOOK post thread=main in_sync=1 value=42 status=0"
 within_s = 10
 
 [[step]]

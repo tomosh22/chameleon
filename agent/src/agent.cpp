@@ -19,6 +19,7 @@
 #include "cml/util/log.h"
 #include "cml/util/path.h"
 #include "hook/installer.h"
+#include "hook/user_hook_ids.h"
 #include "loader/patch_loader.h"
 #include "module_diff.h"
 
@@ -106,8 +107,25 @@ int& Agent::CallGuard::depth() noexcept {
     return depth;
 }
 
+Agent::HookThread& Agent::hook_thread() noexcept {
+    thread_local HookThread current = HookThread::None;
+    return current;
+}
+
 bool Agent::in_guarded_call() noexcept {
-    return CallGuard::depth() > 0;
+    return CallGuard::depth() > 0 || hook_thread() != HookThread::None;
+}
+
+namespace {
+std::atomic<std::int32_t> g_last_patch_status{0};
+}  // namespace
+
+std::int32_t Agent::last_patch_status() noexcept {
+    return g_last_patch_status.load(std::memory_order_acquire);
+}
+
+void Agent::set_last_patch_status(std::int32_t status) noexcept {
+    g_last_patch_status.store(status, std::memory_order_release);
 }
 
 Agent::Agent(std::uint32_t mode) : mode_(mode) {}
@@ -225,6 +243,7 @@ void Agent::stop() {
         CloseHandle(thread_);
         thread_ = nullptr;
     }
+    stop_compile_worker();
     if (logs_forwarded_) {
         set_log_forwarding(false);
         logs_forwarded_ = false;
@@ -318,6 +337,12 @@ void Agent::erase_done_locked(std::uint64_t id) {
 }
 
 cml_status Agent::wait_request(std::uint64_t request_id, std::uint32_t timeout_ms, cml_reply* reply) {
+    if (timeout_ms != 0 && hook_thread() == HookThread::AgentThread) {
+        // A hook running on the agent's own thread (immediate mode): the answer can only come from that thread.
+        CML_LOG(Warn, "CML%u: a blocking cml_wait_request from a hook on the agent thread would wait for itself; refused (poll with timeout 0)",
+                user_hooks::ids::kWaitInHook);
+        return static_cast<cml_status>(user_hooks::ids::kWaitInHook);
+    }
     std::unique_lock<std::mutex> lock(mutex_);
     auto lookup = [&]() -> std::map<std::uint64_t, Entry>::iterator {
         const auto it = entries_.find(request_id);
