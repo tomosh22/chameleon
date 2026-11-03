@@ -215,6 +215,79 @@ TEST_CASE("run_process: cancellation after the process exited is not a cancellat
     CHECK(r->exit_code == 0);
 }
 
+namespace {
+
+// Number of running processes whose image is called `name` (FU-07 test).
+int count_processes_named(const wchar_t* name) {
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return -1;
+    }
+    int count = 0;
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    for (BOOL ok = Process32FirstW(snapshot, &entry); ok; ok = Process32NextW(snapshot, &entry)) {
+        if (_wcsicmp(entry.szExeFile, name) == 0) {
+            ++count;
+        }
+    }
+    CloseHandle(snapshot);
+    return count;
+}
+
+}  // namespace
+
+// FU-07: without a job object (the assignment can fail when the caller sits in a job that forbids nesting) a timeout or a
+// cancel used to kill only the driver. The helpers are now found through a process snapshot (parent pid, creation times).
+TEST_CASE("run_process without a job object: timeout and cancel kill the helpers of the driver too (FU-07)") {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::path(CML_TEST_WORK_DIR) / "toolchain" / "no_job";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    // A copy of cmd.exe under a name nothing else uses, started by the driver: the "helper" whose death is observed.
+    const fs::path helper = dir / "cml_fu07_helper.exe";
+    fs::copy_file(cmd_exe(), helper, fs::copy_options::overwrite_existing, ec);
+    REQUIRE_FALSE(ec);
+    REQUIRE(count_processes_named(L"cml_fu07_helper.exe") == 0);
+
+    // (run from `dir` so the name needs no path and no quotes: cmd's own quote rules would mangle them)
+    const std::string inner = "cml_fu07_helper.exe /c ping -n 60 127.0.0.1 >nul";
+    const auto wait_gone = [] {
+        for (int i = 0; i < 100 && count_processes_named(L"cml_fu07_helper.exe") != 0; ++i) {
+            Sleep(100);
+        }
+        return count_processes_named(L"cml_fu07_helper.exe") == 0;
+    };
+
+    SUBCASE("timeout") {
+        ProcessSpec spec = cmd(inner);
+        spec.timeout_ms = 1500;
+        spec.cwd = dir.string();
+        spec.no_job_for_testing = true;
+        auto r = run_process(spec);
+        REQUIRE(r);
+        CHECK(r->timed_out);
+        CHECK(wait_gone());
+    }
+    SUBCASE("cancel") {
+        CancelToken token;
+        std::thread canceller([&] {
+            Sleep(1500);
+            token.cancel();
+        });
+        ProcessSpec spec = cmd(inner);
+        spec.cwd = dir.string();
+        spec.no_job_for_testing = true;
+        auto r = run_process(spec, &token);
+        canceller.join();
+        REQUIRE(r);
+        CHECK(r->cancelled);
+        CHECK(wait_gone());
+    }
+    // Tidy up whatever a failing run left behind.
+    (void)run_process(cmd("taskkill /F /IM cml_fu07_helper.exe >nul 2>&1 & taskkill /F /IM ping.exe >nul 2>&1"));
+}
+
 #ifdef CML_TEST_COMPILER_IS_CL
 // The shared mspdbsrv.exe must survive a cancelled compile: a concurrent /Zi compile uses it.
 TEST_CASE("cancelling a /Zi compile does not break a concurrent /Zi compile (mspdbsrv is not killed)") {

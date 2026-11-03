@@ -1,9 +1,11 @@
 // CreateProcess with captured output, job-object cancellation, timeouts and @response files.
 #include <windows.h>
+#include <tlhelp32.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cwchar>
+#include <map>
 #include <memory>
 #include <string>
 #include <mutex>
@@ -135,6 +137,86 @@ std::vector<DWORD> job_process_ids(HANDLE job, std::vector<char>& buffer) {
     return ids;
 }
 
+// ---- the fallback when there is no job (FU-07) --------------------------------------------------------------------------
+// If the process could not be put into a job object (it is in a job of the caller that forbids nesting, or the assignment
+// failed otherwise), cancelling used to kill the driver only and leave its compiler helpers running. The fallback finds the
+// helpers through the parent process id in a process snapshot, with two guards against the staleness the job avoids:
+//   * a candidate counts as a child only if it was CREATED between its parent's creation and the moment the driver was
+//     killed. A process that was started later by a different process which reused the dead driver's pid is created after
+//     the kill, and a process created before its claimed parent cannot be its child;
+//   * mspdbsrv.exe is never touched (it is shared with other compiles), whatever its parent pid says.
+std::uint64_t filetime_value(const FILETIME& ft) {
+    return (static_cast<std::uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+}
+
+bool process_creation_time(HANDLE h, std::uint64_t* out) {
+    FILETIME created{};
+    FILETIME exited{};
+    FILETIME kernel{};
+    FILETIME user{};
+    if (!GetProcessTimes(h, &created, &exited, &kernel, &user)) {
+        return false;
+    }
+    *out = filetime_value(created);
+    return true;
+}
+
+// Terminates the descendants of `root_pid` (created at `root_created`, killed at `killed_at`; FILETIME values), at most
+// four passes because a helper can start another one while the first are being killed.
+void kill_descendants(DWORD root_pid, std::uint64_t root_created, std::uint64_t killed_at) {
+    std::map<DWORD, std::uint64_t> family;  // pid -> creation time of the processes known to belong to the tree
+    family[root_pid] = root_created;
+    std::vector<HANDLE> terminated;
+    for (int pass = 0; pass < 4; ++pass) {
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snapshot == INVALID_HANDLE_VALUE) {
+            return;
+        }
+        std::vector<std::pair<DWORD, DWORD>> processes;  // pid, parent pid
+        PROCESSENTRY32W entry{};
+        entry.dwSize = sizeof(entry);
+        for (BOOL ok = Process32FirstW(snapshot, &entry); ok; ok = Process32NextW(snapshot, &entry)) {
+            processes.emplace_back(entry.th32ProcessID, entry.th32ParentProcessID);
+        }
+        CloseHandle(snapshot);
+        bool grew = true;
+        while (grew) {  // a descendant listed before its parent in the snapshot is found by the next round
+            grew = false;
+            for (const auto& [pid, parent] : processes) {
+                const auto known_parent = family.find(parent);
+                if (known_parent == family.end() || family.count(pid) != 0 || pid == 0) {
+                    continue;
+                }
+                HANDLE h = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+                if (h == nullptr) {
+                    continue;
+                }
+                std::uint64_t created = 0;
+                if (!process_creation_time(h, &created) || created < known_parent->second || created > killed_at || is_pdb_server(h)) {
+                    CloseHandle(h);
+                    continue;
+                }
+                family[pid] = created;
+                grew = true;
+                if (WaitForSingleObject(h, 0) != WAIT_OBJECT_0) {
+                    TerminateProcess(h, 1);
+                    terminated.push_back(h);
+                } else {
+                    CloseHandle(h);
+                }
+            }
+        }
+        if (terminated.empty()) {
+            return;
+        }
+        for (HANDLE h : terminated) {
+            WaitForSingleObject(h, 200);
+            CloseHandle(h);
+        }
+        terminated.clear();
+    }
+}
+
 // State shared between the running process and the cancellation / timeout killers.
 //
 // Rule: cancellation kills ONLY processes that are inside OUR job object, and NEVER mspdbsrv.exe. The tree is never
@@ -149,7 +231,7 @@ std::vector<DWORD> job_process_ids(HANDLE job, std::vector<char>& buffer) {
 // passes it waits up to 200 ms in total for the processes terminated in the previous pass, then queries again; it
 // stops when a pass terminates nothing. TerminateJobObject is never used: it would also kill the shared PDB server,
 // which other concurrent /Zi compiles use. Closing the job handle leaves mspdbsrv.exe running. Without a job
-// (assignment failed) only the driver is killed.
+// (assignment failed) the descendants are found through a process snapshot instead (kill_descendants, FU-07).
 struct Killable {
     std::mutex mutex;
     HANDLE job = nullptr;
@@ -157,6 +239,7 @@ struct Killable {
     DWORD pid = 0;
     bool finished = false;
     bool killed = false;
+    std::uint64_t process_created = 0;  // FILETIME; set when there is no job (the fallback needs it)
 
     // True when this call killed the process tree; false when the process had already exited or finish() ran.
     bool kill() {
@@ -168,8 +251,14 @@ struct Killable {
             return false;  // exited on its own just now: not a cancellation
         }
         killed = true;
+        FILETIME kill_time{};
+        GetSystemTimeAsFileTime(&kill_time);
+        const std::uint64_t killed_at = filetime_value(kill_time);
         if (process != nullptr) {
             TerminateProcess(process, 1);  // the driver first: it must not spawn another stage
+        }
+        if (job == nullptr && process_created != 0) {
+            kill_descendants(pid, process_created, killed_at);  // FU-07
         }
         if (job != nullptr) {
             constexpr DWORD kMaxIds = 4096;
@@ -374,12 +463,15 @@ Result<ProcessResult> run_process(const ProcessSpec& spec, CancelToken* cancel) 
         // See Killable: no silent breakaway, no KILL_ON_JOB_CLOSE; the job is only used to enumerate our processes.
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
         SetInformationJobObject(job.h, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
-        if (!AssignProcessToJobObject(job.h, pi.hProcess)) {
-            CML_LOG(Debug, "toolchain: AssignProcessToJobObject failed (%lu); cancelling will kill the main process only",
+        if (spec.no_job_for_testing || !AssignProcessToJobObject(job.h, pi.hProcess)) {
+            CML_LOG(Debug, "toolchain: no job object for the process (%lu); cancelling finds its helpers through a process snapshot",
                     static_cast<unsigned long>(GetLastError()));
             CloseHandle(job.h);
             job.h = nullptr;
         }
+    }
+    if (job.h == nullptr) {
+        process_creation_time(pi.hProcess, &killable->process_created);
     }
     killable->job = job.h;
     killable->process = pi.hProcess;
