@@ -525,7 +525,22 @@ private:
         if (!write_file(anchored_path, *anchored)) {
             return fail("anchor", Diag::make(pd::kWorkDir, "cannot write '" + anchored_path + "'", "Check free disk space and the TEMP directory."));
         }
-        const std::vector<coff::BindSymbol> binds = plan.binding_symbols();
+        std::vector<coff::BindSymbol> binds = plan.binding_symbols();
+        // `/INCLUDE:sym` linker directives (cl writes `/INCLUDE:_fltused` into every object that uses floating
+        // point) are no relocations, so the planner never sees them; with /NODEFAULTLIB nothing defines the symbol.
+        // The patch gets an unused placeholder so the link resolves it.
+        for (const coff::Directive& dir : object->object.directives()) {
+            if (dir.kind != coff::DirectiveKind::Include || dir.value.empty()) {
+                continue;
+            }
+            const coff::Symbol* defined = object->object.find_symbol(dir.value);
+            const bool in_object = defined != nullptr && !defined->is_undefined();
+            const bool bound = std::any_of(binds.begin(), binds.end(), [&](const coff::BindSymbol& b) { return b.name == dir.value; });
+            if (!in_object && !bound) {
+                CML_LOG(Debug, "reload: /INCLUDE:%s has no definition in the patch: placeholder", dir.value.c_str());
+                binds.push_back(coff::BindSymbol{dir.value, coff::BindKind::Data});
+            }
+        }
         std::string binding_path;
         if (!binds.empty()) {
             Result<coff::ByteVector> binding = coff::make_binding_object(binds);

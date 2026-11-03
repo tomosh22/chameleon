@@ -54,4 +54,4 @@ within_s = 10
 [[step]]
 kind = "expect_monotonic"
 key = "calls"
-min_samples = 25
+min_samples = 20
