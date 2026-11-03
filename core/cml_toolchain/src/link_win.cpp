@@ -204,7 +204,7 @@ Result<LinkedPatch> link_patch(const LinkPatchRequest& request, LinkTrace* trace
                           "linking '" + request.name + "' did not finish within " + std::to_string(request.timeout_ms) + " ms",
                           "Check the linker output and for a hung mspdbsrv.exe.");
     }
-    const LinkOutputSummary summary = summarize_link_output(run->output);
+    const LinkOutputSummary summary = summarize_link_output(run->output, detail::linker_stem(request.linker.path));
     if (run->exit_code != 0) {
         if (!summary.unresolved.empty()) {
             return Diag::make(diag::kUnresolvedSymbol,

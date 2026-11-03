@@ -166,6 +166,26 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
+      # WP-18: what `cml_broker check --verbose` says about the good fixtures and the deliberately bad builds of this cell
+      # (the evidence docs/wp/WP-18.md quotes; the ctest tests check.* assert the ids). Never fails the job by itself.
+      - name: WP-18 cml_broker check evidence (fixtures and bad builds)
+        if: always()
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          $out = "$env:LOG_DIR/check-evidence.txt"
+          "" | Out-File -FilePath $out
+          foreach ($m in 'fixture_basic', 'fixture_optimised', 'bad_build_guard_cf', 'bad_build_fastlink', 'bad_build_gl', 'bad_build_no_pdb', 'bad_build_no_command') {
+            $exe = "$env:BUILD_DIR/bin/$m.exe"
+            if (Test-Path $exe) {
+              "== $m ==" | Tee-Object -FilePath $out -Append
+              & "$env:BUILD_DIR/bin/cml_broker.exe" check --verbose $exe *>&1 | Tee-Object -FilePath $out -Append
+              "exit code $LASTEXITCODE" | Tee-Object -FilePath $out -Append
+            } else {
+              "== ${m}: not built in this cell ==" | Tee-Object -FilePath $out -Append
+            }
+          }
+          exit 0
+
       # WP-10: the hook installer's instruction-length decoder against the first 16 bytes of EVERY
       # function of fixture_basic (functions enumerated from its PDB): `LDE <fn> lens=... unknown=0|1`,
       # then LDE-SUMMARY / LDE-PLAN / LDE-UNKNOWN lines. docs/wp/WP-10.md quotes the summary.

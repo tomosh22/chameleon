@@ -12,6 +12,7 @@
 
 #include "cml/proc/address_space.h"
 #include "cml/proc/loader_diag_ids.h"
+#include "cml/util/format.h"
 #include "cml/util/log.h"
 
 namespace cml::agent::loader {
@@ -20,16 +21,6 @@ namespace {
 
 constexpr DWORD kWritableMask = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
 constexpr DWORD kExecutableMask = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-
-std::string hex(std::uint64_t value) {
-    static const char kDigits[] = "0123456789abcdef";
-    std::string s;
-    do {
-        s.insert(s.begin(), kDigits[value & 0xF]);
-        value >>= 4;
-    } while (value != 0);
-    return "0x" + s;
-}
 
 Diag invalid(std::uint32_t id, std::string message) {
     return Diag::make(id, std::move(message),

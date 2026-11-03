@@ -10,7 +10,7 @@ cml_add_core_library(cml_pdb
         src/detail/mapped_file.cpp
         src/detail/msf.cpp
         src/detail/pe_codeview.cpp
-    LIBS cml_util cml_third_party_raw_pdb)
+    LIBS cml_util cml_pe cml_third_party_raw_pdb)
 # Private headers (src/detail/*.h, src/index_impl.h) are included relative to src/.
 target_include_directories(cml_pdb PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 if(NOT MSVC)

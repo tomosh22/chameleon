@@ -29,7 +29,7 @@ function(cml_add_unit_test name)
 endfunction()
 
 cml_add_unit_test(util
-    SOURCES util/test_diag.cpp util/test_result.cpp util/test_log.cpp util/test_hash.cpp util/test_path.cpp
+    SOURCES util/test_diag.cpp util/test_result.cpp util/test_log.cpp util/test_hash.cpp util/test_path.cpp util/test_format.cpp
     LIBS cml_util)
 if(NOT MSVC)
     find_package(Threads REQUIRED)
@@ -101,6 +101,8 @@ cml_add_unit_test(broker_core
         broker/test_agent_link.cpp
         broker/test_events_and_log.cpp
         broker/test_reload.cpp
+        # WP-18: the module audit (cml_broker check, enable-time build requirements)
+        broker/test_audit.cpp
         # WP-14: compile on save
         broker/test_save_watcher.cpp
     LIBS cml_core)

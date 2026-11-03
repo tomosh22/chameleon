@@ -1,0 +1,11 @@
+--- a/logic.cpp
++++ b/logic.cpp
+@@ -4,7 +4,7 @@
+ // because main.cpp calls it through a function pointer.
+ int small_value()
+ {
+-    return 1;
++    return 2;
+ }
+ 
+ int compute_value()

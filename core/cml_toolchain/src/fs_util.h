@@ -8,6 +8,8 @@
 #include <string_view>
 #include <system_error>
 
+#include "cml/util/format.h"
+
 namespace cml::toolchain::detail {
 
 inline std::filesystem::path to_path(std::string_view utf8) {
@@ -44,6 +46,38 @@ inline std::string lower(std::string_view s) {
         c = ascii_lower(c);
     }
     return out;
+}
+
+// "C:\\x\\lld-link.exe" -> "lld-link": the file name without directory and extension.
+inline std::string linker_stem(std::string_view path) {
+    const std::size_t slash = path.find_last_of("\\/");
+    if (slash != std::string_view::npos) {
+        path.remove_prefix(slash + 1);
+    }
+    const std::size_t dot = path.rfind('.');
+    if (dot != std::string_view::npos && dot > 0) {
+        path = path.substr(0, dot);
+    }
+    return std::string(path);
+}
+
+inline char ascii_upper(char c) noexcept {
+    return (c >= 'a' && c <= 'z') ? static_cast<char>(c - 'a' + 'A') : c;
+}
+
+inline std::string upper(std::string_view s) {
+    return cml::upper(s);
+}
+
+// Spaces, tabs, CR and LF removed from both ends (FU-11: the one copy; invoke_common.cpp and link_patch.cpp each had one).
+inline std::string_view trim(std::string_view s) noexcept {
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' || s.front() == '\n')) {
+        s.remove_prefix(1);
+    }
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n')) {
+        s.remove_suffix(1);
+    }
+    return s;
 }
 
 inline bool starts_with(std::string_view s, std::string_view prefix) noexcept {

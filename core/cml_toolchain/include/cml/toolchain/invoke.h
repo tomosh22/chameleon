@@ -91,6 +91,7 @@ struct ProcessSpec {
     bool force_response_file = false;     // always pass the arguments in an @file
     std::string response_file_dir;        // where @files are written ("" = the temp directory)
     std::size_t max_command_line = 30000; // longer command lines go into an @file (CreateProcess limit is 32767)
+    bool no_job_for_testing = false;      // test seam: behave as if AssignProcessToJobObject had failed (FU-07 fallback)
 };
 
 struct ProcessResult {

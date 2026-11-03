@@ -20,38 +20,17 @@ namespace {
 
 using detail::ascii_lower;
 
-std::string upper(std::string_view s) {
-    std::string out(s);
-    for (char& c : out) {
-        if (c >= 'a' && c <= 'z') {
-            c = static_cast<char>(c - 'a' + 'A');
-        }
-    }
-    return out;
-}
+using detail::upper;
 
 bool contains_ci(std::string_view haystack, std::string_view needle) {
     return detail::lower(haystack).find(detail::lower(needle)) != std::string::npos;
 }
 
 std::string trim(std::string_view s) {
-    std::size_t b = 0;
-    std::size_t e = s.size();
-    while (b < e && (s[b] == ' ' || s[b] == '\t' || s[b] == '\r' || s[b] == '\n')) {
-        ++b;
-    }
-    while (e > b && (s[e - 1] == ' ' || s[e - 1] == '\t' || s[e - 1] == '\r' || s[e - 1] == '\n')) {
-        --e;
-    }
-    return std::string(s.substr(b, e - b));
+    return std::string(detail::trim(s));
 }
 
-std::uint32_t read_u32(std::span<const std::byte> b, std::size_t off) noexcept {
-    return static_cast<std::uint32_t>(std::to_integer<unsigned>(b[off])) |
-           (static_cast<std::uint32_t>(std::to_integer<unsigned>(b[off + 1])) << 8) |
-           (static_cast<std::uint32_t>(std::to_integer<unsigned>(b[off + 2])) << 16) |
-           (static_cast<std::uint32_t>(std::to_integer<unsigned>(b[off + 3])) << 24);
-}
+using pe::read_u32_le;
 
 bool is_linker(ToolFamily f) noexcept {
     return f == ToolFamily::Link || f == ToolFamily::LldLink;
@@ -66,11 +45,11 @@ PeLinkerFacts read_pe_linker_facts(std::span<const std::byte> bytes) noexcept {
     if (bytes.size() < 0x40 || bytes[0] != std::byte{'M'} || bytes[1] != std::byte{'Z'}) {
         return facts;
     }
-    const std::uint32_t lfanew = read_u32(bytes, 0x3C);
+    const std::uint32_t lfanew = read_u32_le(bytes, 0x3C);
     if (lfanew < 0x40 || static_cast<std::uint64_t>(lfanew) + 24 + 4 > bytes.size()) {
         return facts;
     }
-    if (read_u32(bytes, lfanew) != 0x00004550u) {  // "PE\0\0"
+    if (read_u32_le(bytes, lfanew) != 0x00004550u) {  // "PE\0\0"
         return facts;
     }
     const std::size_t opt = static_cast<std::size_t>(lfanew) + 24;
@@ -520,9 +499,45 @@ std::string extract_symbol_name(const std::string& rest) {
     return trim(ref == std::string::npos ? std::string_view(rest) : std::string_view(rest).substr(0, ref));
 }
 
+// True when `line` holds "<severity> LNK" + at least four digits + ':' (link.exe's "error LNK2019:", "fatal error LNK1120:",
+// "warning LNK4281:"). "error LNK" without a code is prose, not a diagnostic.
+bool has_linker_code(const std::string& line, const char* severity) {
+    const std::string key = std::string(severity) + " LNK";
+    for (std::size_t pos = line.find(key); pos != std::string::npos; pos = line.find(key, pos + key.size())) {
+        std::size_t i = pos + key.size();
+        std::size_t digits = 0;
+        while (i < line.size() && line[i] >= '0' && line[i] <= '9') {
+            ++i;
+            ++digits;
+        }
+        if (digits >= 4 && i < line.size() && line[i] == ':') {
+            return true;
+        }
+    }
+    return false;
+}
+
+// "<stem>: <severity>:" at the start of the line, where <stem> begins "lld-link" or is the configured linker's stem.
+bool has_lld_prefix(const std::string& line, const char* severity, std::string_view linker_stem) {
+    const std::size_t colon = line.find(':');
+    if (colon == std::string::npos || colon == 0) {
+        return false;
+    }
+    const std::string stem = detail::lower(std::string_view(line).substr(0, colon));
+    if (stem.find_first_of(" \\/") != std::string::npos) {
+        return false;
+    }
+    const bool lld_name = stem.rfind("lld-link", 0) == 0 || (!linker_stem.empty() && stem == detail::lower(linker_stem));
+    if (!lld_name) {
+        return false;
+    }
+    const std::string key = std::string(": ") + severity + ":";
+    return line.compare(colon, key.size(), key) == 0;
+}
+
 }  // namespace
 
-LinkOutputSummary summarize_link_output(std::string_view output) {
+LinkOutputSummary summarize_link_output(std::string_view output, std::string_view linker_stem) {
     LinkOutputSummary s;
     std::size_t pos = 0;
     while (pos <= output.size()) {
@@ -535,10 +550,13 @@ LinkOutputSummary summarize_link_output(std::string_view output) {
         if (line.empty() || line.rfind(">>>", 0) == 0) {
             continue;
         }
-        const bool msvc_error = line.find("error LNK") != std::string::npos;
-        const bool msvc_warning = line.find("warning LNK") != std::string::npos;
-        const bool lld_error = line.find("lld-link: error:") != std::string::npos || line.find(": error: ") != std::string::npos;
-        const bool lld_warning = line.find("lld-link: warning:") != std::string::npos || line.find(": warning: ") != std::string::npos;
+        // Only the linkers' own diagnostics (FU-11): link.exe prints "<where> : [fatal ]error LNKnnnn: text" and
+        // "<where> : warning LNKnnnn: text"; lld-link prints "lld-link: error: text" / "lld-link: warning: text" at the start of the
+        // line. A line that merely contains ": warning: " (the output of a tool the linker ran, a source path) is not a diagnostic.
+        const bool msvc_error = has_linker_code(line, "error");
+        const bool msvc_warning = has_linker_code(line, "warning");
+        const bool lld_error = has_lld_prefix(line, "error", linker_stem);
+        const bool lld_warning = has_lld_prefix(line, "warning", linker_stem);
         if (msvc_error || lld_error) {
             s.errors.push_back(line);
             static const char kMsvc[] = "unresolved external symbol ";

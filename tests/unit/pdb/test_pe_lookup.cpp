@@ -64,7 +64,9 @@ TEST_CASE("RSDS extraction from a PE image") {
         REQUIRE_FALSE(r);
         CHECK(r.error().code == dg::kNoCodeViewRecord);
     }
-    SUBCASE("unterminated path is bounded by the record") {
+    SUBCASE("a path that is not NUL-terminated inside its record is corruption (FU-05)") {
+        // Before FU-05 the private reader returned the bytes up to the end of the record. cml_pe, now the only PE reader,
+        // calls such a record corrupt (CML1312), which is CML1409 here: a linker always writes the terminator.
         Bytes unterminated = pe;
         // Overwrite the path terminator and what follows with non-zero bytes up to the record end.
         const std::size_t record_end = 0x240 + 24 + std::string("C:\\build\\app.pdb").size() + 1;
@@ -72,8 +74,9 @@ TEST_CASE("RSDS extraction from a PE image") {
             unterminated[i] = 'A';
         }
         auto r = cml::pdb::read_codeview_ref_from_image(unterminated.data(), unterminated.size());
-        REQUIRE(r);
-        CHECK(r->pdb_path.size() == record_end - (0x240 + 24));
+        REQUIRE_FALSE(r);
+        CHECK(r.error().code == dg::kBadPeImage);
+        CHECK(r.error().message.find("not NUL-terminated") != std::string::npos);
     }
 }
 
@@ -83,7 +86,9 @@ TEST_CASE("RSDS extraction: a debug directory in a section's virtual-only tail i
     auto r = cml::pdb::read_codeview_ref_from_image(pe.data(), pe.size());
     REQUIRE_FALSE(r);
     CHECK(r.error().code == dg::kBadPeImage);
-    CHECK(r.error().message.find("not in the file") != std::string::npos);
+    // FU-05: the message is cml_pe's (the PE reader of record), wrapped in CML1409.
+    CHECK(r.error().message.find("beyond its file-backed bytes") != std::string::npos);
+    CHECK(r.error().message.find("CML1312") != std::string::npos);
     // The same image with the directory inside the raw data is fine.
     const Bytes ok = build_pe(kGuid, 5, "C:\\build\\app.pdb", true, 0x200);
     REQUIRE(cml::pdb::read_codeview_ref_from_image(ok.data(), ok.size()));

@@ -1,4 +1,5 @@
 #include "cml/core/module_symbols.h"
+#include "cml/core/source_baseline.h"
 
 #include <filesystem>
 #include <optional>
@@ -15,21 +16,6 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr std::uint32_t kScnMemExecute = 0x20000000u;
-
-bool file_stamp(const std::string& path, std::uint64_t* size, long long* mtime) {
-    std::error_code ec;
-    const std::uintmax_t s = fs::file_size(fs::path(path), ec);
-    if (ec) {
-        return false;
-    }
-    const fs::file_time_type t = fs::last_write_time(fs::path(path), ec);
-    if (ec) {
-        return false;
-    }
-    *size = s;
-    *mtime = static_cast<long long>(t.time_since_epoch().count());
-    return true;
-}
 
 std::shared_ptr<const ExportIndex> parse_exports(const std::string& path) {
     auto index = std::make_shared<ExportIndex>();
@@ -63,7 +49,7 @@ std::shared_ptr<const ExportIndex> parse_exports(const std::string& path) {
 std::shared_ptr<const ExportIndex> ExportCache::get(const std::string& path) {
     std::uint64_t size = 0;
     long long mtime = 0;
-    const bool have_stamp = file_stamp(path, &size, &mtime);
+    const bool have_stamp = stat_file(path, &size, &mtime);
     {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto it = entries_.find(path);
