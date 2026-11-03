@@ -46,6 +46,29 @@ inline std::string lower(std::string_view s) {
     return out;
 }
 
+inline char ascii_upper(char c) noexcept {
+    return (c >= 'a' && c <= 'z') ? static_cast<char>(c - 'a' + 'A') : c;
+}
+
+inline std::string upper(std::string_view s) {
+    std::string out(s);
+    for (char& c : out) {
+        c = ascii_upper(c);
+    }
+    return out;
+}
+
+// Spaces, tabs, CR and LF removed from both ends (FU-11: the one copy; invoke_common.cpp and link_patch.cpp each had one).
+inline std::string_view trim(std::string_view s) noexcept {
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' || s.front() == '\n')) {
+        s.remove_prefix(1);
+    }
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n')) {
+        s.remove_suffix(1);
+    }
+    return s;
+}
+
 inline bool starts_with(std::string_view s, std::string_view prefix) noexcept {
     return s.size() >= prefix.size() && s.substr(0, prefix.size()) == prefix;
 }

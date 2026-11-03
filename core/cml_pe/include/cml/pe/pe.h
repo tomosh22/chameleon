@@ -28,6 +28,15 @@ namespace cml::pe {
 
 using ByteSpan = std::span<const std::byte>;
 
+// Little-endian 32-bit read at `offset`. NOT bounds-checked: the caller guarantees offset + 4 <= b.size(). (FU-11: the
+// readers of other libraries use this instead of keeping a copy.)
+inline std::uint32_t read_u32_le(ByteSpan b, std::size_t offset) noexcept {
+    return static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(b[offset])) |
+           (static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(b[offset + 1])) << 8) |
+           (static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(b[offset + 2])) << 16) |
+           (static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(b[offset + 3])) << 24);
+}
+
 enum class ImageKind { OnDisk, InMemory };
 
 // Data directory indices (IMAGE_DIRECTORY_ENTRY_*).

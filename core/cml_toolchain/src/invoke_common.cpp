@@ -4,6 +4,7 @@
 #include <thread>
 
 #include "cml/toolchain/invoke.h"
+#include "fs_util.h"
 
 namespace cml::toolchain {
 
@@ -132,15 +133,7 @@ std::string ToolDiagnostic::format() const {
 
 namespace {
 
-std::string_view trim(std::string_view s) {
-    while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) {
-        s.remove_prefix(1);
-    }
-    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r')) {
-        s.remove_suffix(1);
-    }
-    return s;
-}
+using detail::trim;
 
 bool is_digit(char c) {
     return c >= '0' && c <= '9';
