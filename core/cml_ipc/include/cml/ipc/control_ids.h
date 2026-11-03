@@ -43,4 +43,8 @@ inline constexpr std::uint32_t kExpectEventTimeout = 5510;      // expect_event:
 inline constexpr std::uint32_t kSetOptionFailed = 5511;         // set_option: the broker refused the option
 inline constexpr std::uint32_t kWaitFailed = 5512;              // wait: the broker's `wait` failed or timed out
 
+// --- cmltest harness step added by WP-21 (hot-restart; ADR-0032 range CML5800-5849 of the broker, harness ids 5840-5849) ---
+inline constexpr std::uint32_t kRestartStepFailed = 5840;       // restart: the broker refused or the step could not complete
+inline constexpr std::uint32_t kRestartStepMismatch = 5841;     // restart: the result or event differs from what the scenario expects
+
 }  // namespace cml::ids

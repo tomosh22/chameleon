@@ -73,6 +73,7 @@ public:
                 continue;
             }
             if (const auto* hello = std::get_if<ipc::Hello>(&*message)) {
+                hello_ = *hello;
                 ipc::Welcome welcome;
                 welcome.request_id = hello->request_id;
                 welcome.agent_id = 1;
@@ -89,6 +90,34 @@ public:
             }
         }
         return false;
+    }
+
+    // The Hello the agent sent (WP-21: the restart token).
+    const ipc::Hello& hello() const { return hello_; }
+
+    // The next message of type T within the time (WP-21); module lists and EnableModule requests are answered on the way.
+    template <class T>
+    std::optional<T> wait_for(std::uint32_t timeout_ms) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (std::chrono::steady_clock::now() < deadline) {
+            std::optional<ipc::Message> message = receive(100);
+            if (!message) {
+                continue;
+            }
+            if (const auto* wanted = std::get_if<T>(&*message)) {
+                return *wanted;
+            }
+            if (const auto* list = std::get_if<ipc::ModuleList>(&*message)) {
+                ipc::Reply reply;
+                reply.request_id = list->request_id;
+                send(reply);
+            } else if (const auto* enable = std::get_if<ipc::EnableModule>(&*message)) {
+                ipc::Reply reply;
+                reply.request_id = enable->request_id;
+                send(reply);
+            }
+        }
+        return std::nullopt;
     }
 
     bool send(const ipc::Message& message) {
@@ -131,6 +160,7 @@ public:
 private:
     std::unique_ptr<ipc::PipeServer> server_;
     ipc::PipeConnection connection_;
+    ipc::Hello hello_;
 };
 
 // Remembers which thread applied the hooks.
@@ -630,6 +660,204 @@ TEST_CASE("application hooks: a module the application did not enable contribute
     CHECK(hooktest_user::log().empty());
     agent.stop_and_wait_for_calls();
     hooktest_user::reset(nullptr);
+}
+
+
+// --- hot-restart (WP-21) -----------------------------------------------------------------------------------
+
+namespace {
+
+// Sets an environment variable of the test process for the lifetime of the object.
+class ScopedVar {
+public:
+    ScopedVar(const wchar_t* name, const wchar_t* value) : name_(name) { SetEnvironmentVariableW(name, value); }
+    ~ScopedVar() { SetEnvironmentVariableW(name_, nullptr); }
+    ScopedVar(const ScopedVar&) = delete;
+    ScopedVar& operator=(const ScopedVar&) = delete;
+    void set(const wchar_t* value) { SetEnvironmentVariableW(name_, value); }
+
+private:
+    const wchar_t* name_;
+};
+
+std::u16string u16_of(const std::wstring& text) {
+    return std::u16string(reinterpret_cast<const char16_t*>(text.data()), text.size());
+}
+
+bool contains_entry(const std::u16string& block, const std::u16string& entry) {
+    const std::u16string needle = entry + std::u16string(1, u'\0');
+    const std::size_t at = block.find(needle);
+    return at != std::u16string::npos && (at == 0 || block[at - 1] == u'\0');
+}
+
+std::uint64_t handle_value(DWORD which) {
+    return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(GetStdHandle(which)));
+}
+
+}  // namespace
+
+TEST_CASE("hot-restart, immediate mode: the pre-restart hooks run on the agent thread and RestartInfo carries what the agent captured at start") {
+    const std::string pipe = unique_pipe_name();
+    FakeBroker broker(pipe);
+    REQUIRE(broker.listening());
+    ScopedPipeEnv env(pipe);
+    ScopedVar probe(L"CML_WP21_PROBE", L"at-start");
+    ScopedVar token(L"CML_RESTART_TOKEN", L"tok123");
+    hooktest_user::reset(nullptr);
+
+    Agent agent(CML_MODE_IMMEDIATE);
+    REQUIRE(agent.start().has_value());
+    probe.set(L"changed-later");  // after start-up: not what a restart must hand on
+    token.set(nullptr);
+    REQUIRE(broker.handshake());
+    CHECK(broker.hello().restart_token == "tok123");  // the broker recognises a relaunched process by it
+    REQUIRE(enable_this_module(agent, broker));
+
+    ipc::Restart restart;
+    restart.request_id = 71;
+    REQUIRE(broker.send(restart));
+    const std::optional<ipc::RestartInfo> info = broker.wait_for<ipc::RestartInfo>(15000);
+    REQUIRE(info.has_value());
+    CHECK(info->request_id == 71);
+    CHECK_MESSAGE(info->status == 0, info->message);
+    CHECK(info->hooks_run == 1);
+    const std::vector<std::string> log = hooktest_user::log();
+    REQUIRE(log.size() == 1);
+    CHECK(log[0] == "pre-restart");
+    REQUIRE(hooktest_user::threads().size() == 1);
+    CHECK(hooktest_user::threads()[0] != GetCurrentThreadId());  // the agent thread, not the test's
+
+    CHECK(info->command_line == u16_of(GetCommandLineW()));
+    wchar_t image[32768];
+    const DWORD image_size = GetModuleFileNameW(nullptr, image, 32768);
+    CHECK(info->image_path == u16_of(std::wstring(image, image_size)));
+    wchar_t cwd[32768];
+    const DWORD cwd_size = GetCurrentDirectoryW(32768, cwd);
+    CHECK(info->working_directory == u16_of(std::wstring(cwd, cwd_size)));
+    CHECK(contains_entry(info->environment, u"CML_WP21_PROBE=at-start"));
+    CHECK_FALSE(contains_entry(info->environment, u"CML_WP21_PROBE=changed-later"));
+    CHECK(contains_entry(info->environment, u"CML_RESTART_TOKEN=tok123"));  // the broker replaces it
+    REQUIRE(info->environment.size() >= 2);
+    CHECK(info->environment.substr(info->environment.size() - 2) == std::u16string(2, u'\0'));
+    CHECK(info->std_input == handle_value(STD_INPUT_HANDLE));
+    CHECK(info->std_output == handle_value(STD_OUTPUT_HANDLE));
+    CHECK(info->std_error == handle_value(STD_ERROR_HANDLE));
+    REQUIRE(info->modules.size() == 1);
+    CHECK(info->modules[0].path == hooktest_user::module_path_utf8());
+    agent.stop_and_wait_for_calls();
+    hooktest_user::reset(nullptr);
+}
+
+TEST_CASE("hot-restart, synchronised mode: nothing happens before SyncPoint, then the hooks and the answer come from that thread") {
+    const std::string pipe = unique_pipe_name();
+    FakeBroker broker(pipe);
+    REQUIRE(broker.listening());
+    ScopedPipeEnv env(pipe);
+    hooktest_user::reset(nullptr);
+
+    Agent agent(CML_MODE_SYNCHRONIZED);
+    REQUIRE(agent.start().has_value());
+    REQUIRE(broker.handshake());
+    CHECK(broker.hello().restart_token.empty());
+    REQUIRE(enable_this_module(agent, broker));
+
+    ipc::Restart restart;
+    restart.request_id = 72;
+    REQUIRE(broker.send(restart));
+    CHECK_FALSE(broker.wait_for<ipc::RestartInfo>(400).has_value());  // the application has not reached its sync point
+    CHECK(hooktest_user::log().empty());
+
+    std::optional<ipc::RestartInfo> info;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (!info && std::chrono::steady_clock::now() < deadline) {
+        agent.sync_point();
+        info = broker.wait_for<ipc::RestartInfo>(100);
+    }
+    REQUIRE(info.has_value());
+    CHECK(info->request_id == 72);
+    CHECK(info->status == 0);
+    CHECK(info->hooks_run == 1);
+    REQUIRE(hooktest_user::threads().size() == 1);
+    CHECK(hooktest_user::threads()[0] == GetCurrentThreadId());
+    agent.stop_and_wait_for_calls();
+    hooktest_user::reset(nullptr);
+}
+
+TEST_CASE("hot-restart: a module that was not enabled contributes no pre-restart hook, and the answer names no module") {
+    const std::string pipe = unique_pipe_name();
+    FakeBroker broker(pipe);
+    REQUIRE(broker.listening());
+    ScopedPipeEnv env(pipe);
+    hooktest_user::reset(nullptr);
+
+    Agent agent(CML_MODE_IMMEDIATE);
+    REQUIRE(agent.start().has_value());
+    REQUIRE(broker.handshake());
+    ipc::Restart restart;
+    restart.request_id = 73;
+    REQUIRE(broker.send(restart));
+    const std::optional<ipc::RestartInfo> info = broker.wait_for<ipc::RestartInfo>(15000);
+    REQUIRE(info.has_value());
+    CHECK(info->status == 0);
+    CHECK(info->hooks_run == 0);
+    CHECK(info->modules.empty());
+    CHECK(hooktest_user::log().empty());
+    agent.stop_and_wait_for_calls();
+}
+
+TEST_CASE("hot-restart: ReenableModules becomes EnableModule requests like the application's own calls") {
+    const std::string pipe = unique_pipe_name();
+    FakeBroker broker(pipe);
+    REQUIRE(broker.listening());
+    ScopedPipeEnv env(pipe);
+
+    Agent agent(CML_MODE_IMMEDIATE);
+    REQUIRE(agent.start().has_value());
+    REQUIRE(broker.handshake());
+
+    ipc::ReenableModules ask;
+    ask.request_id = 81;
+    ask.modules.push_back(ipc::RestartModule{ipc::kModuleOptionAllImports, "C:\\app\\a.dll"});
+    ask.modules.push_back(ipc::RestartModule{0, "b.dll"});
+    REQUIRE(broker.send(ask));
+
+    std::vector<ipc::EnableModule> enables;
+    std::optional<ipc::Reply> answer;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while ((enables.size() < 2 || !answer) && std::chrono::steady_clock::now() < deadline) {
+        std::optional<ipc::Message> message = broker.receive(100);
+        if (!message) {
+            continue;
+        }
+        if (const auto* enable = std::get_if<ipc::EnableModule>(&*message)) {
+            enables.push_back(*enable);
+            ipc::Reply reply;
+            reply.request_id = enable->request_id;
+            broker.send(reply);
+        } else if (const auto* list = std::get_if<ipc::ModuleList>(&*message)) {
+            ipc::Reply reply;
+            reply.request_id = list->request_id;
+            broker.send(reply);
+        } else if (const auto* reply = std::get_if<ipc::Reply>(&*message)) {
+            if (reply->request_id == 81) {
+                answer = *reply;
+            }
+        }
+    }
+    REQUIRE(enables.size() == 2);
+    CHECK(enables[0].path == "C:\\app\\a.dll");
+    CHECK(enables[0].options == ipc::kModuleOptionAllImports);
+    CHECK(enables[1].path == "b.dll");
+    CHECK(enables[1].options == 0);
+    REQUIRE(answer.has_value());
+    CHECK(answer->status == 0);
+    // Once the broker accepted them the agent tracks them as enabled (they survive a reconnect like any other).
+    const auto tracked_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (agent.tracked_modules_for_testing() < 2 && std::chrono::steady_clock::now() < tracked_deadline) {
+        Sleep(10);
+    }
+    CHECK(agent.tracked_modules_for_testing() == 2);
+    agent.stop_and_wait_for_calls();
 }
 
 #endif  // _WIN32

@@ -24,6 +24,7 @@ enum class StepKind {
     ExpectEvent,          // an event of this name (patch_applied, ...) must arrive (needs capability "subscribe")
     SignalFixture,        // create the file named by CML_FIXTURE_SIGNAL_FILE, which the fixture waits for (WP-17)
     ExpectReloadResult,   // an integer member of the most recent reload's result has this value (WP-16)
+    Restart,              // control command `restart` (WP-21, restart_step.h): the process is replaced by a relaunched one
 };
 
 const char* to_string(StepKind kind);

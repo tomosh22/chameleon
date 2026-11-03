@@ -25,6 +25,23 @@ std::string win32_error(DWORD error) {
     return "Win32 error " + std::to_string(error);
 }
 
+std::wstring wide_of(const std::u16string& text) {
+    return std::wstring(reinterpret_cast<const wchar_t*>(text.data()), text.size());
+}
+
+std::string utf8_of(const std::wstring& text) {
+    if (text.empty()) {
+        return std::string();
+    }
+    const int bytes = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+    if (bytes <= 0) {
+        return std::string();
+    }
+    std::string out(static_cast<std::size_t>(bytes), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(), bytes, nullptr, nullptr);
+    return out;
+}
+
 bool is_none(std::uint64_t value) {
     return value == 0 || value == static_cast<std::uint64_t>(-1);
 }
@@ -93,11 +110,13 @@ public:
         startup.StartupInfo.hStdError = duplicated_[2];
         startup.lpAttributeList = inherited.empty() ? nullptr : attributes;
 
-        const std::wstring image(spec.image_path.begin(), spec.image_path.end());
-        const std::wstring cwd(spec.working_directory.begin(), spec.working_directory.end());
-        std::vector<wchar_t> command(spec.command_line.begin(), spec.command_line.end());
+        const std::wstring image = wide_of(spec.image_path);
+        const std::wstring cwd = wide_of(spec.working_directory);
+        const std::wstring command_text = wide_of(spec.command_line);
+        std::vector<wchar_t> command(command_text.begin(), command_text.end());
         command.push_back(L'\0');
-        std::vector<wchar_t> environment(spec.environment.begin(), spec.environment.end());
+        const std::wstring environment_text = wide_of(spec.environment);
+        std::vector<wchar_t> environment(environment_text.begin(), environment_text.end());
         if (environment.size() < 2 || environment[environment.size() - 1] != L'\0' || environment[environment.size() - 2] != L'\0') {
             environment.push_back(L'\0');
             environment.push_back(L'\0');
@@ -115,7 +134,7 @@ public:
         DeleteProcThreadAttributeList(attributes);
         close_duplicates();  // the new process has its own copies now
         if (!created) {
-            return fail("CreateProcessW failed for '" + std::string(image.begin(), image.end()) + "' (" + win32_error(create_error) + ")");
+            return fail("CreateProcessW failed for '" + utf8_of(image) + "' (" + win32_error(create_error) + ")");
         }
         CloseHandle(info.hThread);
         new_process_ = info.hProcess;

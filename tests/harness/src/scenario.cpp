@@ -7,6 +7,7 @@
 #include <system_error>
 
 #include "cml/ipc/control.h"
+#include "restart_step.h"
 #include "rx.h"
 #include "toml.h"
 
@@ -26,6 +27,7 @@ const char* to_string(StepKind kind) {
         case StepKind::ExpectEvent: return "expect_event";
         case StepKind::SignalFixture: return "signal_fixture";
         case StepKind::ExpectReloadResult: return "expect_reload_result";
+        case StepKind::Restart: return "restart";
     }
     return "?";
 }
@@ -88,6 +90,12 @@ std::string Step::describe() const {
         case StepKind::ExpectEvent:
             out += " " + event + " within " + std::to_string(within_s) + " s";
             break;
+        case StepKind::Restart:
+            out += " within " + std::to_string(within_s) + " s";
+            if (has_result_value) {
+                out += " expecting " + result_key + "=" + std::to_string(result_value);
+            }
+            break;
     }
     return out;
 }
@@ -99,6 +107,7 @@ const char* Step::required_capability() const {
         case StepKind::SetOption: return cml::ipc::capability::kSetOption;
         case StepKind::Wait: return cml::ipc::capability::kWait;
         case StepKind::ExpectEvent: return cml::ipc::capability::kSubscribe;
+        case StepKind::Restart: return cml::ipc::capability::kRestart;
         default: return nullptr;
     }
 }
@@ -367,6 +376,9 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
         step.within_s = *within;
         return step;
     }
+    if (*kind == "restart") {
+        return parse_restart_step(table);  // restart_step.cpp
+    }
     if (*kind == "signal_fixture") {
         step.kind = StepKind::SignalFixture;
         cml::Result<void> keys = only_keys(table, {"kind"}, "a signal_fixture step");
@@ -392,7 +404,7 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
     (void)context;
     return invalid(table.line, "unknown step kind '" + *kind +
                                    "' (launch, expect_stdout, expect_module_enabled, edit, reload, expect_diag, expect_monotonic, set_option, wait, "
-                                   "expect_event, expect_reload_result, signal_fixture)");
+                                   "expect_event, expect_reload_result, signal_fixture, restart)");
 }
 
 }  // namespace

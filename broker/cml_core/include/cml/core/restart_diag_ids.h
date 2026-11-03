@@ -20,8 +20,6 @@ inline constexpr std::uint32_t kReapplyFailed = 5810;     // (warning) the sessi
 inline constexpr std::uint32_t kStdHandle = 5811;         // (warning) a standard handle could not be handed on; the new process has none for it
 inline constexpr std::uint32_t kNewProcessExited = 5812;  // the new process exited before it registered
 
-// Harness (tests/harness restart step), same range.
-inline constexpr std::uint32_t kStepFailed = 5840;    // the harness's restart step failed
-inline constexpr std::uint32_t kStepMismatch = 5841;  // restart result or event differs from what the scenario expects
+// The harness's restart step uses CML5840 and CML5841 (cml_ipc/control_ids.h: kRestartStepFailed, kRestartStepMismatch).
 
 }  // namespace cml::core::restart::diag

@@ -106,6 +106,24 @@ expect_error = "CML5309"     # the reload must FAIL with this diagnostic id (the
 kind = "signal_fixture"        # create the file named by the fixture's CML_FIXTURE_SIGNAL_FILE environment variable
 ```
 
+Step added by WP-21 (hot-restart, needs the broker capability `restart`):
+
+```toml
+[[step]]
+kind = "restart"               # control command `restart`: the process is terminated and started again by the broker
+within_s = 120                 # default 90
+process = "fixture"            # the process to restart (default: the first launched)
+expect_result_key = "patched"  # optional: an integer member of the restart result ("patched" = patches the re-applied
+expect_result_value = 1        # edits produced, "reapplied_files", "hooks_run", ...)
+```
+
+The step fails when the restart is refused, the new pid is not another process, a module of the old process is not enabled
+again (`not_enabled`), re-applying the session's edits failed (`reapply_error`), or the `restarted` event does not arrive
+(the step subscribes to it, it is opt-in). The supervisor then follows the new pid, so `expect_module_enabled` and the exit
+checks of `expect_stdout` refer to the relaunched process. The relaunched process writes into the same output file (the
+broker hands the standard handles on), so `expect_stdout` keeps reading one stream; the cursor of the restarted process is
+set to the end of the output when the step starts, so what the pre-restart hooks and the new process print comes after it.
+
 Unknown keys, unknown kinds, missing fields, bad values and steps that need a running process before `launch`
 are rejected with `CML5411` before anything runs; a pattern that does not compile is `CML5420`.
 
