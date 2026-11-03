@@ -1,0 +1,9 @@
+--- a/logic.cpp
++++ b/logic.cpp
+@@ -2,5 +2,5 @@
+ 
+ int compute_value()
+ {
+-    return 1;
++    return 1 + ;
+ }

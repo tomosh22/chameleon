@@ -1,0 +1,67 @@
+# Scenario `sync_point_apply` (WP-17): a synchronised agent writes the hooks only inside SyncPoint(), on the main thread.
+#
+# The fixture's hooks print the thread they run on and whether that thread is inside SyncPoint(): the compile hooks,
+# the pre-patch hook (compute_value() is still the original, 1), the post-patch hook (compute_value() is the patched
+# code, 42). Their order in the output is the order of the sync queue: compile-start, compile-success, pre, (install),
+# post. The watcher thread of the fixture reports in TICK's `change=` where the new value was first seen: 1 = while the
+# main thread was inside SyncPoint(), 2 = outside it.
+name = "sync_point_apply"
+description = "fixture sync_point (synchronised agent): hooks are installed inside SyncPoint() on the main thread, pre -> install -> post"
+fixture = "sync_point"
+timeout_s = 240
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "AGENT mode=synchronized"
+within_s = 20
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1 change=0"
+within_s = 20
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_sync_point.exe"
+within_s = 20
+
+[[step]]
+kind = "edit"
+patch = "edits/value_42.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+
+[[step]]
+kind = "expect_stdout"
+regex = "HOOK compile-start thread=main in_sync=1"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "HOOK compile-success thread=main in_sync=1"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "HOOK pre thread=main in_sync=1 value=1\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "HOOK post thread=main in_sync=1 value=42 status=0"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=42 change=1"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=42 change=1"
+within_s = 10

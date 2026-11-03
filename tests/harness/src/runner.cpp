@@ -246,6 +246,7 @@ private:
             case StepKind::SetOption: return set_option(step);
             case StepKind::Wait: return wait_step(step);
             case StepKind::ExpectEvent: return expect_event(step);
+            case StepKind::SignalFixture: return signal_fixture();
             case StepKind::ExpectReloadResult: return expect_reload_result(step);
         }
         return StepOutcome::fail(cml::ids::kScenarioFailed, "unknown step kind");
@@ -387,6 +388,14 @@ private:
         fixture.label = proc.label;
         fixture.exe = exe;
         fixture.arguments = L"--agent";
+        if (!scenario_.fixture_args.empty()) {
+            fixture.arguments += L" " + cml::proc::wide_from_utf8(scenario_.fixture_args);
+        }
+        // WP-17: a fixture that holds back SyncPoint() waits for this file; the signal_fixture step creates it.
+        signal_file_ = options_.artifacts_dir / "fixture.signal";
+        std::error_code remove_ec;
+        fs::remove(signal_file_, remove_ec);
+        fixture.environment[L"CML_FIXTURE_SIGNAL_FILE"] = signal_file_.wstring();
         if (!step.args.empty()) {
             fixture.arguments += L" " + cml::proc::wide_from_utf8(step.args);
         }
@@ -609,6 +618,16 @@ private:
         return StepOutcome::pass("reload ok " + summary + (timing.empty() ? std::string() : "; " + timing));
     }
 
+    StepOutcome signal_fixture() {
+        std::ofstream out(signal_file_, std::ios::binary | std::ios::trunc);
+        out << "go\n";
+        out.close();
+        if (!out) {
+            return StepOutcome::fail(cml::ids::kEditFailed, "cannot create the signal file " + signal_file_.string());
+        }
+        return StepOutcome::pass("created " + signal_file_.string());
+    }
+
     // The values of `key=` in the fixture's whole output never decrease and do change: state that lives in the old
     // image's storage survives the reload.
     StepOutcome expect_monotonic(const Step& step) {
@@ -771,6 +790,7 @@ private:
     ipc::json::Value last_reload_result_;
     bool has_reload_result_ = false;
     bool launched_ = false;
+    fs::path signal_file_;
     bool failed_ = false;
     std::optional<std::string> skip_reason_;
     Clock::time_point run_deadline_ = Clock::now();

@@ -13,6 +13,7 @@
 #include "heap.h"
 #include "cml/proc/diag_ids.h"
 #include "cml/util/log.h"
+#include "hook/user_hook_ids.h"
 
 #define CML_AGENT_EXPORT extern "C" __declspec(dllexport)
 
@@ -62,7 +63,8 @@ CML_AGENT_EXPORT cml_status cml_agent_destroy(void* agent) {
     if (Agent::in_guarded_call()) {
         // Destroying the agent from inside a call into it (work run by SyncPoint, say) would wait
         // for itself, or free the object under its own feet.
-        CML_LOG(Warn, "cml_destroy_agent called from inside a call into the agent; refused");
+        CML_LOG(Warn, "CML%u: cml_destroy_agent called from inside a call into the agent or from an application hook; refused",
+                cml::agent::user_hooks::ids::kDestroyInHook);
         return CML_STATUS_INVALID_ARGUMENT;
     }
     // Wakes every waiter and waits until all of them have left the agent before freeing it.
@@ -139,6 +141,12 @@ CML_AGENT_EXPORT cml_status cml_agent_set_global_hotkeys(void* agent, const cml_
     return CML_STATUS_NOT_IMPLEMENTED;
 }
 
+// Status of the most recent patch installation of this process (0 = installed, else a CMLnnnn id). Callable from
+// anywhere, also from an application hook; cml_last_patch_status() in Chameleon_API.h resolves it by name.
+CML_AGENT_EXPORT int32_t cml_agent_last_patch_status(void) {
+    return Agent::last_patch_status();
+}
+
 CML_AGENT_EXPORT int cml_agent_is_connected(void* agent) {
     if (agent == nullptr) {
         return 0;
@@ -187,5 +195,6 @@ static_assert(std::is_same_v<decltype(&cml_agent_wait_for_reload), cml_pfn_wait_
 static_assert(std::is_same_v<decltype(&cml_agent_schedule_restart), cml_pfn_call>);
 static_assert(std::is_same_v<decltype(&cml_agent_set_global_hotkeys), cml_pfn_set_hotkeys>);
 static_assert(std::is_same_v<decltype(&cml_agent_is_connected), cml_pfn_is_connected>);
+static_assert(std::is_same_v<decltype(&cml_agent_last_patch_status), cml_pfn_last_patch_status>);
 
 #endif  // _WIN32

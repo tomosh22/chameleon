@@ -24,6 +24,7 @@ const char* to_string(StepKind kind) {
         case StepKind::SetOption: return "set_option";
         case StepKind::Wait: return "wait";
         case StepKind::ExpectEvent: return "expect_event";
+        case StepKind::SignalFixture: return "signal_fixture";
         case StepKind::ExpectReloadResult: return "expect_reload_result";
     }
     return "?";
@@ -66,6 +67,8 @@ std::string Step::describe() const {
             if (!expect_error.empty()) {
                 out += " expecting the refusal " + expect_error;
             }
+            break;
+        case StepKind::SignalFixture:
             break;
         case StepKind::ExpectMonotonic:
             out += " " + key + " (at least " + std::to_string(min_samples) + " samples)";
@@ -364,6 +367,12 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
         step.within_s = *within;
         return step;
     }
+    if (*kind == "signal_fixture") {
+        step.kind = StepKind::SignalFixture;
+        cml::Result<void> keys = only_keys(table, {"kind"}, "a signal_fixture step");
+        if (!keys) return keys.error();
+        return step;
+    }
     if (*kind == "expect_reload_result") {
         step.kind = StepKind::ExpectReloadResult;
         cml::Result<void> keys = only_keys(table, {"kind", "key", "value"}, "an expect_reload_result step");
@@ -383,7 +392,7 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
     (void)context;
     return invalid(table.line, "unknown step kind '" + *kind +
                                    "' (launch, expect_stdout, expect_module_enabled, edit, reload, expect_diag, expect_monotonic, set_option, wait, "
-                                   "expect_event, expect_reload_result)");
+                                   "expect_event, expect_reload_result, signal_fixture)");
 }
 
 }  // namespace
@@ -394,7 +403,7 @@ cml::Result<Scenario> parse_scenario(std::string_view text) {
         return doc.error();
     }
     Scenario scenario;
-    cml::Result<void> root_keys = only_keys(doc->root, {"name", "description", "fixture", "timeout_s"}, "the scenario header");
+    cml::Result<void> root_keys = only_keys(doc->root, {"name", "description", "fixture", "fixture_args", "timeout_s"}, "the scenario header");
     if (!root_keys) return root_keys.error();
     if (!doc->tables.empty()) {
         return invalid(doc->tables[0].line, "plain tables are not used in scenarios (only [[step]])");
@@ -412,6 +421,17 @@ cml::Result<Scenario> parse_scenario(std::string_view text) {
     if (!fixture) return fixture.error();
     if (!name_chars_ok(*fixture, false)) return invalid(doc->root.find("fixture")->line, "'fixture' must be a fixture directory name (tests/fixtures/<name>)");
     scenario.fixture = *fixture;
+    if (const toml::Value* args = doc->root.find("fixture_args")) {
+        const bool plain = args->kind == toml::Value::Kind::String && args->text.size() <= 200 &&
+                           std::all_of(args->text.begin(), args->text.end(), [](char ch) {
+                               return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' ||
+                                      ch == '_' || ch == '=' || ch == '.' || ch == ' ';
+                           });
+        if (!plain) {
+            return invalid(args->line, "'fixture_args' must be a string of letters, digits, spaces and - _ = .");
+        }
+        scenario.fixture_args = args->text;
+    }
     if (const toml::Value* d = doc->root.find("description")) {
         if (d->kind != toml::Value::Kind::String) return invalid(d->line, "'description' must be a string");
         scenario.description = d->text;
