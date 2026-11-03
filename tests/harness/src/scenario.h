@@ -38,6 +38,8 @@ struct Step {
     std::string result_key;
     long long result_value = 0;
     bool has_result_value = false;
+    // Reload (WP-15): the reload must be refused with this diagnostic id (e.g. "CML5550"); empty = it must succeed.
+    std::string expect_error;
     // WP-16, several processes. Launch: `exe` is a fixture executable of the same build (file name, ".exe" optional; empty =
     // the fixture's primary exe) and `label` names the process (default "fixture" for the primary exe, else the exe's name
     // without extension). `process` selects the process of ExpectStdout / ExpectModuleEnabled / ExpectMonotonic (empty =

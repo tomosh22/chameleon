@@ -49,6 +49,9 @@ struct ReloadOptions {
     std::uint32_t hooks_timeout_ms = 30000;    // InstallHooks: in synchronised mode this waits for SyncPoint()
     bool release_pdb_after_reload = false;     // ADR-0017: drop the PDB mapping when a reload is done
     bool track_system_headers = false;         // baseline also hashes SDK/toolchain headers
+    // WP-15: a reload that would recompile more compilands than this does not start unless the request is confirmed
+    // (control command `reload` with "confirm": true). 0 = no limit.
+    std::uint32_t max_affected_compilands = 64;
     std::uint32_t reserve_block_mb = 64;
     std::uint32_t reserve_blocks = 4;
     unsigned max_load_attempts = 3;            // relink at another base when the range was taken (CML4203)
@@ -59,8 +62,8 @@ struct ReloadOptions {
 // Replaceable effects.
 struct PipelineEnv {
     std::function<std::vector<Result<void>>(const std::vector<toolchain::CompileRequest>&, std::vector<toolchain::CompileOutcome>&, unsigned,
-                                            toolchain::CancelToken*)>
-        compile_all;
+                                            toolchain::CancelToken*, const std::function<void(std::size_t index)>& on_done)>
+        compile_all;  // on_done (may be empty) is called from a worker thread when unit `index` has finished
     // Finds the linker that mirrors the module's (ADR-0027).
     std::function<Result<toolchain::ToolInfo>(const std::string& module_path, const std::vector<std::string>& search_dirs, const ReloadOptions&,
                                               std::vector<Diag>* warnings)>
@@ -136,6 +139,7 @@ struct PipelineContext {
     std::shared_ptr<ExportCache> exports;         // shared between reloads
     std::chrono::steady_clock::time_point deadline;
     toolchain::CancelToken* cancel = nullptr;
+    bool confirm = false;                         // WP-15: the request accepted a reload above max_affected_compilands
     std::shared_ptr<CompileCache> compile_cache;  // may be null: every compile runs
 };
 

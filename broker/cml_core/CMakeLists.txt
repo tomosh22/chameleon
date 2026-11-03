@@ -24,6 +24,7 @@ add_library(cml_core STATIC
     src/source_baseline.cpp
     src/module_audit.cpp
     src/check_command.cpp
+    src/include_scan.cpp  # WP-15: header dependencies
     src/module_index.cpp
     src/module_state.cpp
     src/agent_link.cpp

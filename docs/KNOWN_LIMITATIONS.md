@@ -12,7 +12,10 @@ diagnostic is planned, not live.
 | CML1104 | `/guard:cf` modules | Module `<module>` is built with /guard:cf; patched code would not be a valid CFG call target. | Build with /guard:cf- for development configurations. | WP-18 | **live** |
 | CML1105 | Function-level linking (`/Gy`) absent | Compiland `<obj>` was not built with /Gy; functions cannot be patched individually. | Add /Gy to the compile flags. | WP-05/WP-18 | **live** (detection: ADR-0026; FAIL when absent, WARN "unknown, recommended" when it cannot be told) |
 | CML1106 | Non-x64 module (x86, ARM64) | Module `<module>` is `<machine>`; only x64 is supported in v1. | Use an x64 build. | WP-18 | **live** (also for PE32 images, where the PE reader says CML1303) |
-| CML2101 | Header included by the PCH changed | Header `<file>` is part of the PCH; rebuild and hot-restart. | Rebuild the project and hot-restart. | WP-15 | planned |
+| CML2101 | Header included by the PCH changed | (superseded: reported as CML5550 by the broker, before anything is compiled) | - | WP-15 | superseded |
+| CML5550 | Header included by the PCH changed | The changed file `<file>` belongs to the precompiled header of `<module>`; a precompiled header cannot be hot-reloaded. | Revert the change, or rebuild and restart; edit the TUs that use the PCH instead. | WP-15 | **live** |
+| CML5552 | A compiland to recompile uses a precompiled header (`/Yu`) whose files cannot be determined | Cannot tell which files make up the precompiled header used by `<obj>`; a recompile could use a stale .pch. | Rebuild and hot-restart, or name the header with `/Yu<header>`. | WP-15 | **live** |
+| CML5551 | A reload would recompile more compilands than `max_affected_compilands` (default 64) | The change affects `<n>` compilands of `<module>`, more than the limit of `<N>`. | Repeat `reload` with `"confirm": true`, or raise the option. | WP-15 | **live** |
 | CML2102 | PCH-creating TU (`/Yc`, or clang `-emit-pch`) changed | `<file>` creates the precompiled header (/Yc); changes to it cannot be hot-reloaded. | Rebuild the project and hot-restart. | WP-05 | **live** |
 | CML3101 | Image-relative (`ADDR32NB`) reference from patch to old-module data | `<function>` references `<symbol>` in `<module>` image-relatively (ADDR32NB); this cannot be retargeted. | Move the reference behind a function or pointer, or hot-restart. | WP-07 | **live** |
 | CML3102 | Thread-local variable defined in a patched TU (v1; lifted in WP-24 for existing TLS) | `<file>` defines thread_local `<symbol>`; TLS in patched code is not supported in v1. | Move the thread_local to an unchanged TU, or hot-restart. | WP-07 (WP-24 narrows) | **live** |
@@ -51,9 +54,8 @@ diagnostic is planned, not live.
 - Control-pipe events (`patch_applied`, `diag`, `log`) are delivered asynchronously and may
   arrive after the `reload` response they belong to. A subscriber that does not read for 5 s is
   disconnected (WP-12).
-- When a header that holds no code changes on a clang-cl build, the broker warns CML5303
-  ("changed file maps to no compiland"). Edit a `.cpp` that includes the header; touching a file
-  is not a change, because only content hashes are compared (WP-12, ADR-0013).
+- Touching a file is not a change: only content hashes are compared (WP-12). A changed file that no
+  compiland lists and the include scan cannot reach is warned as CML5303.
 - Read-only data (`.rdata`, const tables, constants) is not bound to the old image: the patch uses a fresh copy, so edits to it take effect, but its ADDRESS changes across a patch (code of the old image that took and keeps the old address, or compares addresses, sees the old table).
 - Statics only match old records of exactly the same scope (same enclosing function, or file scope): a static that moved to another function is a new, fresh variable, and a lambda moved to another function is new code that is not hooked.
 - Functions currently executing on a thread's stack keep running old code until they return;
@@ -67,8 +69,14 @@ diagnostic is planned, not live.
 - Modules loaded or unloaded by the host are noticed by the agent within about 500 ms
   (polling; ADR-0016). EnableModule always refreshes the list first.
 - The agent DLL stays loaded until the process exits, even after `DestroyAgent`.
-- Header changes on clang-cl builds may miss compilands whose included headers contain no code,
-  until WP-15 adds include tracking for clang-cl (ADR-0013).
+- Header changes reach every compiland that includes the header, on cl and clang-cl (WP-15,
+  ADR-0013): the broker scans `#include` directives itself. The scan is textual: an include chosen
+  by a macro (`#include MACRO`) is not followed, an include found only through the `INCLUDE`
+  environment variable or compiler-built-in directories is not followed (those are system
+  headers, which are not tracked anyway), and a changed `-I` list needs a rebuild and a re-enable.
+  A header the scan cannot reach and the PDB does not list is reported as CML5303 (warning).
+  A quoted include is searched in the including file's directory, the directories of the files above
+  it on the include stack, then the `-I` list.
 - A dynamic initialiser of a new global in a patch that faults (access violation, C++ exception)
   is caught and reported as CML4209, and the patch stays loaded. Recovery from a *stack overflow*
   inside such an initialiser is best effort (`_resetstkoflw`): it is not covered by a test, because a real

@@ -9,7 +9,9 @@ PipelineEnv native_pipeline_env() {
     PipelineEnv env;
 #if defined(_WIN32)
     env.compile_all = [](const std::vector<toolchain::CompileRequest>& requests, std::vector<toolchain::CompileOutcome>& outcomes, unsigned max_parallel,
-                         toolchain::CancelToken* cancel) { return toolchain::compile_all(requests, outcomes, max_parallel, cancel); };
+                         toolchain::CancelToken* cancel, const std::function<void(std::size_t)>& on_done) {
+        return toolchain::compile_all(requests, outcomes, max_parallel, cancel, on_done);
+    };
     env.resolve_linker = [](const std::string& module_path, const std::vector<std::string>& search_dirs, const ReloadOptions& options,
                             std::vector<Diag>* warnings) -> Result<toolchain::ToolInfo> {
         toolchain::DetectLinkerOptions detect;

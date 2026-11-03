@@ -20,7 +20,7 @@
 namespace cml::core {
 
 struct Event {
-    std::string name;       // "diag" | "patch_applied" | "log"
+    std::string name;       // "diag" | "patch_applied" | "progress" | "log"
     ipc::json::Value body;  // the whole JSON object, including "event": name
 };
 
@@ -29,6 +29,8 @@ Event make_diag_event(const Diag& diag, const char* severity, const std::string&
 // {"event":"patch_applied","pid":N,"module":..,"generation":N,"hooks":N,"new_functions":N,"new_globals":N}
 Event make_patch_applied_event(std::uint32_t pid, const std::string& module, std::uint64_t generation, std::size_t hooks,
                                std::size_t new_functions, std::size_t new_globals);
+// {"event":"progress","stage":"compile","pid":N,"module":..,"done":N,"total":N}  (WP-15: one per finished compile)
+Event make_progress_event(const std::string& stage, std::uint32_t pid, const std::string& module, std::size_t done, std::size_t total);
 // {"event":"log","level":"info","message":..}
 Event make_log_event(const char* level, const std::string& message);
 

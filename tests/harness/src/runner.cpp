@@ -564,6 +564,17 @@ private:
         if (!response) {
             return StepOutcome::fail(response.error());
         }
+        if (!step.expect_error.empty()) {
+            // WP-15: a refusal is the expected outcome (e.g. a precompiled header change, CML5550).
+            if (response->ok) {
+                return StepOutcome::fail(cml::ids::kReloadFailed, "the reload succeeded, expected the refusal " + step.expect_error);
+            }
+            const ipc::ControlDiag& d = *response->diag;
+            if (d.id != step.expect_error) {
+                return StepOutcome::fail(cml::ids::kReloadFailed, "the reload was refused with " + d.id + ": " + d.message + ", expected " + step.expect_error);
+            }
+            return StepOutcome::pass("reload refused as expected: " + d.id + ": " + d.message + " What to do: " + d.action);
+        }
         if (!response->ok) {
             const ipc::ControlDiag& d = *response->diag;
             return StepOutcome::fail(cml::ids::kReloadFailed, "reload failed: " + d.id + ": " + d.message + " What to do: " + d.action);
