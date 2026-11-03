@@ -14,6 +14,15 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same branch (or PR) cancels the older run still queued or running: wave 5
+# runs four work packages in parallel and the Windows runner pool is small. Runs on main are never
+# cancelled, so every merge gets its full post-merge suite.
+concurrency:
+  # main gets one group per commit: a group holds only one pending run, so a shared group would drop
+  # the post-merge run of an earlier merge.
+  group: ci-${{ github.event_name }}-${{ github.ref == 'refs/heads/main' && github.sha || github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   build:
     name: ${{ matrix.os }} / ${{ matrix.compiler }} / ${{ matrix.config }}
