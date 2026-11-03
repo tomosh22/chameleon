@@ -40,6 +40,23 @@ bool read_uint(const Value& args, const char* key, std::uint32_t max, std::uint3
 
 std::string normalized_key(const std::string& p) { return normalized_path_key(p); }
 
+// Value of an environment variable ("" when unset); _dupenv_s on Windows (getenv is deprecated there, /WX).
+std::string env_value(const char* name) {
+#if defined(_WIN32)
+    char* buffer = nullptr;
+    std::size_t size = 0;
+    std::string out;
+    if (_dupenv_s(&buffer, &size, name) == 0 && buffer != nullptr) {
+        out = buffer;
+        std::free(buffer);
+    }
+    return out;
+#else
+    const char* v = std::getenv(name);
+    return v != nullptr ? v : "";
+#endif
+}
+
 }  // namespace
 
 ReloadService::ReloadService(PipelineEnv env, EventBus* events, std::string session_dir)
@@ -53,7 +70,7 @@ ReloadService::~ReloadService() {
         agents.swap(agents_);
     }
     agents.clear();  // joins the index threads outside the lock
-    if (session_dir_made_ && !keep_session_dir_ && std::getenv("CML_KEEP_SESSION") == nullptr) {
+    if (session_dir_made_ && !keep_session_dir_ && env_value("CML_KEEP_SESSION").empty()) {
         std::error_code ec;
         fs::remove_all(fs::path(session_dir_), ec);  // patch DLLs still loaded in a process cannot be removed: ignored
     }
@@ -66,7 +83,7 @@ Result<std::string> ReloadService::ensure_session_dir() {
     }
     std::error_code ec;
     if (session_dir_.empty()) {
-        if (const char* base = std::getenv("CML_SESSION_DIR"); base != nullptr && *base != '\0') {
+        if (const std::string base = env_value("CML_SESSION_DIR"); !base.empty()) {
             session_dir_ = base;
             keep_session_dir_ = true;  // the user asked for a place to look at: leave it
         } else {
