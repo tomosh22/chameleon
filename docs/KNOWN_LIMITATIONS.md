@@ -37,6 +37,18 @@ diagnostic is planned, not live.
 
 ## Documented behaviour (no diagnostic)
 
+- Compile on save (WP-14): a save whose change affects more compilands than `max_affected_compilands` is reported once as
+  CML5551 and nothing is compiled; the files stay changed until an explicit `reload` with `"confirm": true` or a smaller save.
+- Patch hooks (WP-17): a patch that hooks no function (only new functions or data) sends no `InstallHooks`, so no pre/post hooks
+  run for it and hook records it adds stay invisible. Hooks run once per patch, so a reload of several files calls them several
+  times. A hook deleted from the source keeps running (the old patch's records stay). `CML_PRERESTART_HOOK` is accepted but
+  nothing calls it until hot-restart exists. Only a processor exception in a hook is contained, not state corruption; a hook must
+  not call `DestroyAgent` (refused).
+- `unload_patch` (WP-17) waits up to 10 s for a hook that is still running and then refuses (CML4212, patch stays hidden); in
+  synchronised mode that stalls the agent thread meanwhile.
+- A thread that runs an application hook (the agent thread, or an application thread at `cml_sync_point`) gets a 64 KB stack
+  guarantee (`SetThreadStackGuarantee`) the first time, so a stack overflow in a hook can be handled; that thread's usable stack
+  is 64 KB smaller from then on (WP-17).
 - Several enabled modules and several processes (WP-16): every enabled module of every process is its own unit (own registry,
   index, patches, hooks, source baseline). One `reload` compiles each distinct recorded command line once and then links and loads
   a patch per process. A process that is started after an edit was made enables its modules against the edited sources: its
