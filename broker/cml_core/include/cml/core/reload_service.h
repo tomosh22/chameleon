@@ -54,6 +54,10 @@ public:
     // ---- control commands (args are the request's "args" object) ----
     // {"pid"?:N, "module"?:"name or path", "timeout_ms"?:N, "confirm"?:bool}
     Result<ipc::json::Value> reload(const ipc::json::Value& args);
+    // WP-22: {"pid"?:N, "module"?:"name or path", "scope"?:"last"|"all", "timeout_ms"?:N}   (`last`: the newest reload)
+    //   -> {"reverted":[{"pid","module","generation","batches","patches","hooks_restored","hooks_repointed"}],"generation":N}
+    //   plus, when only some modules could be reverted, "partial":true and "failed":[{"pid","module","id","message"}] (CML5854)
+    Result<ipc::json::Value> revert(const ipc::json::Value& args);
     // {"for"?:"idle"|"index", "timeout_ms"?:N}
     Result<ipc::json::Value> wait(const ipc::json::Value& args);
     // {"name":s, "value":s|n|b}
@@ -126,6 +130,7 @@ private:
     std::mutex reload_mutex_;  // one reload at a time
     std::atomic<bool> running_{false};
     std::atomic<std::uint64_t> generation_{0};
+    std::atomic<std::uint64_t> reload_counter_{0};  // WP-22: numbers the reload commands (PatchBatch::reload_id)
 };
 
 }  // namespace cml::core

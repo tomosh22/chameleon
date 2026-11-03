@@ -26,6 +26,7 @@ const char* to_string(StepKind kind) {
         case StepKind::ExpectEvent: return "expect_event";
         case StepKind::SignalFixture: return "signal_fixture";
         case StepKind::ExpectReloadResult: return "expect_reload_result";
+        case StepKind::Revert: return "revert";
         case StepKind::WatchExceptions: return "watch_exceptions";
         case StepKind::ExpectException: return "expect_exception";
         case StepKind::ExceptionAction: return "exception_action";
@@ -74,6 +75,12 @@ std::string Step::describe() const {
             break;
         case StepKind::SignalFixture:
             break;
+        case StepKind::Revert:
+            out += " " + revert_scope + " within " + std::to_string(within_s) + " s";
+            if (!expect_error.empty()) {
+                out += " expecting the refusal " + expect_error;
+            }
+            break;
         case StepKind::ExpectMonotonic:
             out += " " + key + " (at least " + std::to_string(min_samples) + " samples)";
             break;
@@ -111,6 +118,7 @@ std::string Step::describe() const {
 const char* Step::required_capability() const {
     switch (kind) {
         case StepKind::Reload: return cml::ipc::capability::kReload;
+        case StepKind::Revert: return cml::ipc::capability::kRevert;
         case StepKind::ExpectDiag: return cml::ipc::capability::kDiagEvents;
         case StepKind::SetOption: return cml::ipc::capability::kSetOption;
         case StepKind::Wait: return cml::ipc::capability::kWait;
@@ -387,6 +395,27 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
         step.within_s = *within;
         return step;
     }
+    if (*kind == "revert") {
+        step.kind = StepKind::Revert;
+        cml::Result<void> keys = only_keys(table, {"kind", "scope", "within_s", "expect_error"}, "a revert step");
+        if (!keys) return keys.error();
+        if (const toml::Value* scope = table.find("scope")) {
+            if (scope->kind != toml::Value::Kind::String || (scope->text != "last" && scope->text != "all")) {
+                return invalid(scope->line, "'scope' must be \"last\" or \"all\"");
+            }
+            step.revert_scope = scope->text;
+        }
+        cml::Result<int> within = int_in_range(table, "within_s", 30, 1, 3600);
+        if (!within) return within.error();
+        step.within_s = *within;
+        if (const toml::Value* ee = table.find("expect_error")) {
+            const bool shape = ee->kind == toml::Value::Kind::String && ee->text.size() == 7 && ee->text.compare(0, 3, "CML") == 0 &&
+                               std::all_of(ee->text.begin() + 3, ee->text.end(), [](char c) { return c >= '0' && c <= '9'; });
+            if (!shape) return invalid(ee->line, "'expect_error' must look like CML5850");
+            step.expect_error = ee->text;
+        }
+        return step;
+    }
     if (*kind == "signal_fixture") {
         step.kind = StepKind::SignalFixture;
         cml::Result<void> keys = only_keys(table, {"kind"}, "a signal_fixture step");
@@ -468,7 +497,7 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
     (void)context;
     return invalid(table.line, "unknown step kind '" + *kind +
                                    "' (launch, expect_stdout, expect_module_enabled, edit, reload, expect_diag, expect_monotonic, set_option, wait, "
-                                   "expect_event, expect_reload_result, signal_fixture, watch_exceptions, expect_exception, exception_action, "
+                                   "expect_event, expect_reload_result, signal_fixture, revert, watch_exceptions, expect_exception, exception_action, "
                                    "expect_pending_exceptions)");
 }
 
