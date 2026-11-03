@@ -118,18 +118,14 @@ public:
         std::optional<Diag> error;  // set when the compile failed (a failure is shared as well)
     };
     // The key of a recorded command line.
-    static std::uint64_t key_of(const toolchain::CompileRecord& record);
+    static std::string key_of(const toolchain::CompileRecord& record);
 
-    std::optional<Entry> find(std::uint64_t key) const;
-    void put(std::uint64_t key, Entry entry);
-    std::size_t compiled() const;  // entries stored = compiler runs
-    std::size_t reused() const;    // lookups that found an entry
-    void note_reuse();
+    std::optional<Entry> find(const std::string& key) const;
+    void put(const std::string& key, Entry entry);
 
 private:
     mutable std::mutex mutex_;
-    std::map<std::uint64_t, Entry> entries_;
-    std::size_t reused_ = 0;
+    std::map<std::string, Entry> entries_;
 };
 
 // Where the pipeline works and who hears about it.

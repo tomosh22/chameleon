@@ -106,7 +106,7 @@ ipc::json::Value to_json(const PatchReport& r) {
     return v;
 }
 
-std::uint64_t CompileCache::key_of(const toolchain::CompileRecord& record) {
+std::string CompileCache::key_of(const toolchain::CompileRecord& record) {
     // Everything that decides what the compiler is asked to do. Fields are separated by a byte no path or argument holds.
     std::string text;
     text += record.cwd;
@@ -121,10 +121,10 @@ std::uint64_t CompileCache::key_of(const toolchain::CompileRecord& record) {
     text += record.source;
     text.push_back('\0');
     text += record.recorded_pdb;
-    return hash64(text);
+    return text;
 }
 
-std::optional<CompileCache::Entry> CompileCache::find(std::uint64_t key) const {
+std::optional<CompileCache::Entry> CompileCache::find(const std::string& key) const {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto it = entries_.find(key);
     if (it == entries_.end()) {
@@ -133,24 +133,9 @@ std::optional<CompileCache::Entry> CompileCache::find(std::uint64_t key) const {
     return it->second;
 }
 
-void CompileCache::put(std::uint64_t key, Entry entry) {
+void CompileCache::put(const std::string& key, Entry entry) {
     std::lock_guard<std::mutex> lock(mutex_);
     entries_[key] = std::move(entry);
-}
-
-std::size_t CompileCache::compiled() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return entries_.size();
-}
-
-std::size_t CompileCache::reused() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return reused_;
-}
-
-void CompileCache::note_reuse() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    ++reused_;
 }
 
 namespace {
@@ -196,8 +181,7 @@ struct Unit {
     std::string source;
     toolchain::CompileRecord record;
     toolchain::CompileOutcome outcome;
-    std::uint64_t key = 0;
-    bool reused = false;                 // the outcome came from the reload's compile cache
+    std::string key;
     std::optional<Diag> cached_error;    // ... and it was a failure
 };
 
@@ -374,10 +358,14 @@ private:
             if (ctx_.compile_cache) {
                 if (std::optional<CompileCache::Entry> hit = ctx_.compile_cache->find(u.key)) {
                     // Another module of this reload (typically the same DLL in another process) ran this command line.
+                    if (hit->error) {
+                        // The shared compile failed: report it for this module too, without compiling anything else.
+                        return fail("compile", *hit->error);
+                    }
                     u.outcome = hit->outcome;
-                    u.cached_error = hit->error;
-                    u.reused = true;
-                    ctx_.compile_cache->note_reuse();
+                    for (const Diag& w : u.outcome.warnings) {
+                        warn(report, "compile", w);  // every module and process hears the compiler's warnings
+                    }
                     ++report.compile_reused;
                     CML_LOG(Debug, "compile of %s: reused the result of an identical command line (%s)", u.source.c_str(), u.outcome.object_path.c_str());
                     units.push_back(std::move(u));
@@ -429,10 +417,9 @@ private:
                 ctx_.compile_cache->put(u.key, CompileCache::Entry{u.outcome, u.cached_error});
             }
         }
-        for (Unit& u : units) {
-            if (u.cached_error) {
-                // Published per module (diag events carry the pid), also when the failure came from the cache.
-                const Diag shown = fail("compile", *u.cached_error);
+        for (std::size_t k = 0; k < requests.size(); ++k) {
+            if (units[fresh[k]].cached_error) {
+                const Diag shown = fail("compile", *units[fresh[k]].cached_error);
                 first_error = first_error ? first_error : std::optional<Diag>(shown);
             }
         }
@@ -488,7 +475,7 @@ private:
 
     Result<std::string> make_work_dir() {
         std::error_code ec;
-        const std::string dir = ctx_.session_dir + "/" + module_.name;
+        const std::string dir = ctx_.session_dir + "/" + module_.name + "/p" + std::to_string(pid_);
         fs::create_directories(fs::path(dir) / "obj", ec);
         if (ec) {
             return fail("compile", Diag::make(pd::kWorkDir, "cannot create the session directory '" + dir + "': " + ec.message(),
@@ -576,7 +563,7 @@ private:
         }
 
         // ---- anchor + binding object -----------------------------------------------------------------------
-        const std::string patch_dir = workdir + "/p" + std::to_string(pid_) + "_" + tag;
+        const std::string patch_dir = workdir + "/" + tag;
         std::error_code ec;
         fs::create_directories(patch_dir, ec);
         if (ec) {

@@ -1,6 +1,7 @@
 #include "scenario.h"
 
 #include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <sstream>
 #include <system_error>
@@ -125,6 +126,18 @@ cml::Result<void> only_keys(const toml::Table& table, std::initializer_list<cons
         }
     }
     return cml::Result<void>();
+}
+
+// A launched exe's default label: its file name without a (case-insensitive) ".exe" suffix, like the runner's lookup.
+std::string default_label(const std::string& exe) {
+    if (exe.size() > 4) {
+        std::string tail = exe.substr(exe.size() - 4);
+        std::transform(tail.begin(), tail.end(), tail.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (tail == ".exe") {
+            return exe.substr(0, exe.size() - 4);
+        }
+    }
+    return exe;
 }
 
 cml::Result<Step> parse_step_kind(const toml::Table& table);
@@ -337,7 +350,7 @@ cml::Result<Scenario> parse_scenario(std::string_view text) {
             if (launched && step->exe.empty()) {
                 return invalid(t.line, "a scenario can launch the primary fixture only once; further launches need 'exe' (another executable of the fixture)");
             }
-            const std::string label = !step->label.empty() ? step->label : step->exe.empty() ? std::string("fixture") : step->exe.substr(0, step->exe.rfind('.') == std::string::npos ? step->exe.size() : step->exe.rfind('.'));
+            const std::string label = !step->label.empty() ? step->label : step->exe.empty() ? std::string("fixture") : default_label(step->exe);
             if (std::find(labels.begin(), labels.end(), label) != labels.end()) {
                 return invalid(t.line, "the process label '" + label + "' is used twice (give the launch a 'label')");
             }

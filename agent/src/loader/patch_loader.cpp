@@ -47,7 +47,8 @@ unsigned long long ull(std::uint64_t v) {
 // are exercised in a real process. Unset (the normal case) it costs one environment lookup for the whole run.
 std::atomic<int> g_forced_collisions{-1};  // -1: environment not read yet
 
-bool take_forced_collision() noexcept {
+// Reads the variable once; the number of collisions still to force.
+int forced_collisions_left() noexcept {
     int n = g_forced_collisions.load();
     if (n < 0) {
         int wanted = 0;
@@ -62,12 +63,7 @@ bool take_forced_collision() noexcept {
         g_forced_collisions.compare_exchange_strong(expected, wanted);
         n = g_forced_collisions.load();
     }
-    while (n > 0) {
-        if (g_forced_collisions.compare_exchange_weak(n, n - 1)) {
-            return true;
-        }
-    }
-    return false;
+    return n;
 }
 
 std::string failure_text(const Diag& diag) {
@@ -368,6 +364,10 @@ PatchLoader& PatchLoader::shared() {
         delete created;  // another thread won; ours owns nothing yet
         return *expected;
     }
+    if (forced_collisions_left() > 0) {
+        CML_LOG(Warn, "test option CML_TEST_FORCE_LOAD_COLLISIONS is set: the first %d patch load(s) of this process will find their range taken (never use this outside tests)",
+                forced_collisions_left());
+    }
     return *created;
 }
 
@@ -546,10 +546,14 @@ Result<void> PatchLoader::try_load_candidate(const ipc::PatchCandidate& candidat
         hooks_.after_release(hooks_.context, range.base, range.size, attempt);
     }
     LPVOID squatter = nullptr;
-    if (take_forced_collision()) {
+    if (forced_collisions_left() > 0) {
         squatter = VirtualAlloc(reinterpret_cast<LPVOID>(range.base), static_cast<SIZE_T>(range.size), MEM_RESERVE, PAGE_NOACCESS);
-        CML_LOG(Warn, "test option CML_TEST_FORCE_LOAD_COLLISIONS: took %s+%s before loading %s", hex(range.base).c_str(), hex(range.size).c_str(),
-                candidate.path.c_str());
+        if (squatter != nullptr) {
+            // Only a range that was really taken uses up a collision; a failed reservation leaves the count alone.
+            g_forced_collisions.fetch_sub(1);
+            CML_LOG(Warn, "test option CML_TEST_FORCE_LOAD_COLLISIONS: took %s+%s before loading %s", hex(range.base).c_str(), hex(range.size).c_str(),
+                    candidate.path.c_str());
+        }
     }
     // 2. Load.
     HMODULE module = LoadLibraryExW(wide_path.c_str(), nullptr, 0);

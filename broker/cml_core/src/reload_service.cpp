@@ -356,7 +356,7 @@ Result<Value> ReloadService::reload(const Value& args) {
 
     Value result = Value::object();
     result.set("generation", Value::integer(static_cast<std::int64_t>(generation_.load())));
-    std::size_t hooks = 0, run = 0, patched = 0, compiled = 0, reused = 0, attempts = 0;
+    std::size_t hooks = 0, run = 0, patched = 0, compiled = 0, reused = 0, attempts = 0, modules_patched = 0;
     std::set<std::uint32_t> patched_pids;
     Value patches = Value::array();
     Value changed = Value::array();
@@ -368,6 +368,7 @@ Result<Value> ReloadService::reload(const Value& args) {
         reused += p.compile_reused;
         attempts += p.load_attempts;
         if (p.patches != 0) {
+            ++modules_patched;
             patched_pids.insert(p.pid);
         }
         for (const std::string& f : p.changed_files) {
@@ -382,7 +383,7 @@ Result<Value> ReloadService::reload(const Value& args) {
     result.set("compiled", Value::integer(static_cast<std::int64_t>(compiled)));
     result.set("compile_reused", Value::integer(static_cast<std::int64_t>(reused)));
     result.set("load_attempts", Value::integer(static_cast<std::int64_t>(attempts)));  // LoadPatch requests; more than `patched` = relinks at another base
-    result.set("modules_patched", Value::integer(static_cast<std::int64_t>(std::count_if(reports.begin(), reports.end(), [](const PatchReport& r) { return r.patches != 0; }))));
+    result.set("modules_patched", Value::integer(static_cast<std::int64_t>(modules_patched)));
     result.set("processes_patched", Value::integer(static_cast<std::int64_t>(patched_pids.size())));
     result.set("initializers_run", Value::integer(static_cast<std::int64_t>(run)));
     result.set("changed_files", std::move(changed));

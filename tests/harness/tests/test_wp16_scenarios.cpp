@@ -95,3 +95,11 @@ TEST_CASE("the checked-in WP-16 scenarios parse") {
     }
     CHECK(launches == 2);
 }
+
+TEST_CASE("scenario: the default label of a launched exe drops a case-insensitive .exe suffix only") {
+    const std::string head = "name = \"x\"\nfixture = \"f\"\n[[step]]\nkind = \"launch\"\n";
+    cml::Result<Scenario> r = parse_scenario(head + "[[step]]\nkind = \"launch\"\nexe = \"Client.EXE\"\n[[step]]\nkind = \"launch\"\nexe = \"b.exe.txt\"\n");
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    CHECK(r->steps[1].label == "Client");
+    CHECK(r->steps[2].label == "b.exe.txt");
+}
