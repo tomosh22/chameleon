@@ -100,6 +100,8 @@ struct Rig {
 
     // knobs of the fake compiler / linker / agent
     bool fail_compile = false;
+    bool compile_warning = false;               // the fake compiler reports a warning
+    std::vector<std::string> compile_outputs;   // output_object of every compile request
     std::atomic<int> compile_calls{0};
     std::atomic<int> link_calls{0};
     std::atomic<int> resolve_calls{0};
@@ -119,6 +121,7 @@ struct Rig {
     std::vector<ipc::Message> requests;         // what the agent received, in order
     std::vector<std::uint64_t> link_bases;
 
+    PipelineEnv pipeline_env;                   // a copy of what the service uses (tests that drive PatchPipeline directly)
     EventBus bus;
     std::shared_ptr<Collect> events = std::make_shared<Collect>();
     std::shared_ptr<AgentLink> link;
@@ -157,6 +160,10 @@ struct Rig {
                 }
                 outcomes[i].object_path = requests_in[i].output_object;
                 outcomes[i].compiler_used = "C:\\VC\\bin\\cl.exe";
+                compile_outputs.push_back(requests_in[i].output_object);
+                if (compile_warning) {
+                    outcomes[i].warnings.push_back(Diag::make(2201, "the compiler warned about logic.cpp", "Fix it."));
+                }
                 if (fail_compile) {
                     results.emplace_back(Diag::make(2200, "the compiler reported errors in logic.cpp", "Fix the errors."));
                     continue;
@@ -218,6 +225,7 @@ struct Rig {
             }
             return lp;
         };
+        pipeline_env = env;
         service = std::make_unique<ReloadService>(std::move(env), &bus, default_session_dir ? std::string() : dir.subdir("session"));
         link = std::make_shared<AgentLink>(1, [this](const ipc::Message& m) { return agent(m); });
         session.set_answer_sink([this](const ipc::Message& m) { return link->deliver(m); });
@@ -1049,4 +1057,205 @@ TEST_CASE("patches applied before a later compiland failed still count in the ge
     REQUIRE(accepted.size() == 1);
     CHECK(accepted[0].count("C:\\proj\\logic.cpp") == 1);
     CHECK(accepted[0].count("C:\\proj\\main.cpp") == 0);
+}
+
+// ---- WP-16: one compile per distinct command line, link and load per module ------------------------------------------------
+
+TEST_CASE("reload result: compiler runs, reused results, relinks and the modules / processes that were patched") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    rig.load_collisions = 1;
+    Result<Value> r = rig.reload();
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    CHECK(r->get_integer("patched") == 1);
+    CHECK(r->get_integer("compiled") == 1);
+    CHECK(r->get_integer("compile_reused") == 0);
+    CHECK(r->get_integer("load_attempts") == 2);  // one patch, one relink at another base
+    CHECK(r->get_integer("modules_patched") == 1);
+    CHECK(r->get_integer("processes_patched") == 1);
+    CHECK(rig.compile_calls == 1);
+
+    // A reload that changes nothing compiles and loads nothing.
+    rig.unchanged();
+    Result<Value> idle = rig.reload();
+    REQUIRE_MESSAGE(idle.has_value(), idle.error().format());
+    CHECK(idle->get_integer("compiled") == 0);
+    CHECK(idle->get_integer("load_attempts") == 0);
+    CHECK(idle->get_integer("modules_patched") == 0);
+    CHECK(idle->get_integer("processes_patched") == 0);
+}
+
+TEST_CASE("compile cache: the same command line is compiled once for the modules of one reload; the next reload compiles again") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    const ReloadOptions options = rig.service->options();
+    PipelineContext ctx;
+    ctx.session_dir = rig.service->session_dir();
+    ctx.options = &options;
+    ctx.events = &rig.bus;
+    ctx.exports = std::make_shared<ExportCache>();
+    ctx.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    ctx.compile_cache = std::make_shared<CompileCache>();
+    PatchPipeline pipeline(rig.pipeline_env);
+
+    // The first run compiles; a second run of the same command line (another process would do this) takes the result.
+    rig.changed();
+    Result<PatchReport> first = pipeline.patch_module(*rig.link, *rig.module, ctx);
+    REQUIRE_MESSAGE(first.has_value(), first.error().format());
+    CHECK(first->compiled == 1);
+    CHECK(first->compile_reused == 0);
+    rig.changed();
+    Result<PatchReport> second = pipeline.patch_module(*rig.link, *rig.module, ctx);
+    REQUIRE_MESSAGE(second.has_value(), second.error().format());
+    CHECK(second->compiled == 0);
+    CHECK(second->compile_reused == 1);
+    CHECK(rig.compile_calls == 1);
+    CHECK(rig.seen<ipc::LoadPatch>().size() == 2);  // loading is per module: both runs linked and loaded their own patch
+    CHECK(rig.link_calls == 2);
+
+    // A new reload has a new cache.
+    ctx.compile_cache = std::make_shared<CompileCache>();
+    rig.changed();
+    Result<PatchReport> third = pipeline.patch_module(*rig.link, *rig.module, ctx);
+    REQUIRE_MESSAGE(third.has_value(), third.error().format());
+    CHECK(third->compiled == 1);
+    CHECK(rig.compile_calls == 2);
+}
+
+TEST_CASE("compile cache: a failed compile is shared too and every module reports it") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.fail_compile = true;
+    const ReloadOptions options = rig.service->options();
+    PipelineContext ctx;
+    ctx.session_dir = rig.service->session_dir();
+    ctx.options = &options;
+    ctx.events = &rig.bus;
+    ctx.exports = std::make_shared<ExportCache>();
+    ctx.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    ctx.compile_cache = std::make_shared<CompileCache>();
+    PatchPipeline pipeline(rig.pipeline_env);
+    rig.changed();
+    Result<PatchReport> first = pipeline.patch_module(*rig.link, *rig.module, ctx);
+    REQUIRE_FALSE(first.has_value());
+    CHECK(first.error().code == 2200);
+    rig.changed();
+    Result<PatchReport> second = pipeline.patch_module(*rig.link, *rig.module, ctx);
+    REQUIRE_FALSE(second.has_value());
+    CHECK(second.error().code == 2200);
+    CHECK(rig.compile_calls == 1);  // the compiler ran once
+}
+
+TEST_CASE("compile cache: the key follows everything that decides what the compiler is asked to do") {
+    toolchain::CompileRecord a;
+    a.cwd = "C:\\proj";
+    a.compiler = "C:\\VC\\cl.exe";
+    a.args = {"/c", "/Zi", "x.cpp"};
+    a.source = "C:\\proj\\x.cpp";
+    toolchain::CompileRecord same = a;
+    CHECK(CompileCache::key_of(a) == CompileCache::key_of(same));
+    toolchain::CompileRecord other_args = a;
+    other_args.args.push_back("/DFOO");
+    CHECK(CompileCache::key_of(a) != CompileCache::key_of(other_args));
+    toolchain::CompileRecord other_cwd = a;
+    other_cwd.cwd = "C:\\other";
+    CHECK(CompileCache::key_of(a) != CompileCache::key_of(other_cwd));
+    toolchain::CompileRecord other_source = a;
+    other_source.source = "C:\\proj\\y.cpp";
+    CHECK(CompileCache::key_of(a) != CompileCache::key_of(other_source));
+    toolchain::CompileRecord other_compiler = a;
+    other_compiler.compiler = "C:\\llvm\\clang-cl.exe";
+    CHECK(CompileCache::key_of(a) != CompileCache::key_of(other_compiler));
+    // The argument boundaries count: {"/D", "FOO"} is not {"/DFOO"}.
+    toolchain::CompileRecord split = a;
+    split.args = {"/c", "/Zi", "/D", "FOO"};
+    toolchain::CompileRecord joined = a;
+    joined.args = {"/c", "/Zi", "/DFOO"};
+    CHECK(CompileCache::key_of(split) != CompileCache::key_of(joined));
+
+    CompileCache cache;
+    CHECK_FALSE(cache.find("k1").has_value());
+    CompileCache::Entry entry;
+    entry.outcome.object_path = "C:\\o.obj";
+    cache.put("k1", entry);
+    REQUIRE(cache.find("k1").has_value());
+    CHECK(cache.find("k1")->outcome.object_path == "C:\\o.obj");
+    CHECK_FALSE(cache.find("k2").has_value());
+}
+
+TEST_CASE("compile cache: a reused result replays the compiler's warnings for the second module") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.compile_warning = true;
+    const ReloadOptions options = rig.service->options();
+    PipelineContext ctx;
+    ctx.session_dir = rig.service->session_dir();
+    ctx.options = &options;
+    ctx.events = &rig.bus;
+    ctx.exports = std::make_shared<ExportCache>();
+    ctx.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    ctx.compile_cache = std::make_shared<CompileCache>();
+    PatchPipeline pipeline(rig.pipeline_env);
+    rig.changed();
+    Result<PatchReport> first = pipeline.patch_module(*rig.link, *rig.module, ctx);
+    REQUIRE_MESSAGE(first.has_value(), first.error().format());
+    rig.changed();
+    Result<PatchReport> second = pipeline.patch_module(*rig.link, *rig.module, ctx);
+    REQUIRE_MESSAGE(second.has_value(), second.error().format());
+    CHECK(second->compile_reused == 1);
+    const auto count_2201 = [](const PatchReport& r) {
+        int n = 0;
+        for (const Diag& w : r.warnings) {
+            n += w.code == 2201 ? 1 : 0;
+        }
+        return n;
+    };
+    CHECK(count_2201(*first) == 1);
+    CHECK(count_2201(*second) == 1);
+    CHECK(rig.compile_calls == 1);
+}
+
+TEST_CASE("compile objects go below a per-process directory, so two processes never share an object path") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    Result<Value> r = rig.reload();
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    REQUIRE(rig.compile_outputs.size() == 1);
+    const std::string marker = "/app.exe/p" + std::to_string(kPid) + "/obj";
+    std::string normalised = rig.compile_outputs[0];
+    for (char& c : normalised) {
+        c = c == '\\' ? '/' : c;
+    }
+    CHECK_MESSAGE(normalised.find(marker) != std::string::npos, normalised);
+}
+
+TEST_CASE("compile cache: a cached failure stops a module before it compiles anything else") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.fail_compile = true;
+    const ReloadOptions options = rig.service->options();
+    PipelineContext ctx;
+    ctx.session_dir = rig.service->session_dir();
+    ctx.options = &options;
+    ctx.events = &rig.bus;
+    ctx.exports = std::make_shared<ExportCache>();
+    ctx.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    ctx.compile_cache = std::make_shared<CompileCache>();
+    PatchPipeline pipeline(rig.pipeline_env);
+    rig.changed_both();  // compilands 0 and 1: both fail on the first run
+    REQUIRE_FALSE(pipeline.patch_module(*rig.link, *rig.module, ctx).has_value());
+    const int calls = rig.compile_calls;
+    rig.changed_both();
+    Result<PatchReport> second = pipeline.patch_module(*rig.link, *rig.module, ctx);
+    REQUIRE_FALSE(second.has_value());
+    CHECK(second.error().code == 2200);
+    CHECK(rig.compile_calls == calls);
 }
