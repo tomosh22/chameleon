@@ -23,12 +23,12 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-16 | Multiple modules and multiple processes | 5 | done (FU-12, FU-15 closed) | wp/16-multi-module-process | #25 | — |
 | WP-17 | Pre/post patch hooks, compile hooks, synchronised mode | 5 | done (FU-06, FU-14 closed) | wp/17-hooks-sync | #29 | — |
 | WP-18 | Diagnostics pass and build-requirement checks | 5 | done | wp/18-diagnostics | #31 | — |
-| WP-19 | ImGui broker UI (`cml_ui`, ADR-0033) | 6 | in review (fixing medium-review items) | wp/19-imgui-broker-ui | #33 | — |
+| WP-19 | ImGui broker UI (`cml_ui`, ADR-0033) | 6 | done (window/tray/hotkey not seen on a display: manual checklist in WP-19.md) | wp/19-imgui-broker-ui | #33 | — |
 | WP-20 | Crash → patch → continue | 6 | done (breakpoints deferred) | wp/20-crash-patch-continue | #34 | — |
-| WP-21 | Hot-restart | 6 | in review (fixing high-review items) | wp/21-hot-restart | #36 | — |
+| WP-21 | Hot-restart | 6 | in review — 10 review fixes pushed at e1f4efa, CI not yet verified | wp/21-hot-restart | #36 | — |
 | WP-22 | Patch revert (session reset deferred) | 6 | done | wp/22-patch-revert | #35 | — |
-| WP-24 | Thread-local variables | 6 | in progress | wp/24-thread-local | — | — |
-| WP-25 | Unchanged-function elision (scope narrowed: WP-12 narrowing exists; see brief) | 6 | in progress | wp/25-unchanged-elision | — | — |
+| WP-24 | Thread-local variables | 6 | in progress — namespace-scope TLS reads the wrong offset (see handoff) | wp/24-thread-local | — | — |
+| WP-25 | Unchanged-function elision (scope narrowed: WP-12 narrowing exists; see brief) | 6 | in review — not yet reviewed; CI on 543e55d not verified | wp/25-unchanged-elision | #37 | — |
 
 ## Orchestrator integration work
 
@@ -66,3 +66,25 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | FU-19 | WP-18 (#31) | CML3103 (layout change of a type used by unchanged code) not implemented: needs TPI/UDT access in cml_pdb | a later pdb WP |
 | FU-20 | WP-18 (#31) | CML3104 is advisory only: without /GL it cannot flag a genuinely stale copy (callers in the same TU are recompiled and re-hooked); kept as a reminder about still-executing callers. Revisit if /GL support lands | orchestrator |
 | FU-21 | WP-18 (#31) | CML1101 for link.exe relies on the PDB's recorded /DEBUG option, because a real /DEBUG:FASTLINK PDB still lists function symbols (seen in CI, link 14.44). A PDB with no recorded linker command line and FASTLINK cannot be told apart from full | next pdb WP (look for a type-server/`/DEBUG:FASTLINK` marker in the PDB) |
+
+## Handoff (2026-11-03, session paused at the user's request)
+
+Main: a637677 (WP-19 merged). CI green verified on main through 1b9fe10 (WP-22); the WP-19 merge run was still pending.
+No agents are running; every branch below is pushed and clean.
+
+- **WP-21 #36** (head e1f4efa, main incl. WP-22 merged): all 10 high-review items fixed per the agent (console: inherit /
+  `AttachConsole(old_pid)` / DETACHED; new `RestartCancel` 0x0064; split `timeout_ms` / `registration_timeout_ms`; restart
+  holds `ExclusiveRun`). Next: verify both CI runs (push 41670698010, PR 41670706810), delta-check high-severity, merge.
+  Open decision: the agent does NOT clear `CML_RESTART_TOKEN` (the plan makes it the app's restart signal); registration now
+  requires token AND pid. Accept or require clearing. `tests/harness/README.md` lacks `registration_timeout_ms`.
+- **WP-25 #37** (head 543e55d, main incl. WP-22 merged): implemented; not yet reviewed (needs a full high review: hook
+  narrowing). clang-cl RelWithDebInfo scenario failed on an earlier head because clang folded `elision_inner` into
+  `elision_outer`; fixture changed in 543e55d, unverified. To confirm: no `patch_applied` event on a no-functional-change reload.
+  WP-25.md needs updating (`hooks_kept`, fixture change, two WP-22 tests now set `narrow_hooks false`).
+- **WP-24** (branch head 37ae1bd, no PR): planner binds existing TLS to old storage; function-local `thread_local` works on
+  cl RelWithDebInfo, namespace-scope `thread_local` is read at a wrong offset after the patch (suspect: `lookup_public` RVA for a
+  TLS S_PUB32 is not the `.tls` offset — resolve via S_GTHREAD32 instead). Edit-file hunks fixed but unverified. Missing:
+  WP-24.md, PR, CI evidence on clang-cl. This is its first failure; a second failure triggers a split/spike per §0.
+- **Wave-6 close-out still to do:** docs PR from `ccr-128fe957-y1h1ox` (PROGRESS, KNOWN_LIMITATIONS for WP-19/20/22 so far;
+  add WP-21/24/25 rows when they land), decide the `agent_abi_version` bump (WP-20/21/22 added messages additively; WP-21 added a
+  trailing `Hello.restart_token` and changed `RestartInfo`), report wave 6.
