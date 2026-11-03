@@ -46,6 +46,10 @@ constexpr int kEnumerateAttempts = 3;        // tries to list the loaded modules
 constexpr DWORD kEnumerateRetryMs = 20;
 constexpr DWORD kReconnectPauseMs = 200;   // pause after a session that was up, before reconnecting
 
+// FU-01: the two agent diagnostics the public header names (CML_STATUS_NOT_RUNNING, CML_STATUS_QUEUE_FULL) are the ids used here.
+static_assert(CML_STATUS_NOT_RUNNING == static_cast<int>(ids::kRequestCancelled), "public status and agent diagnostic differ");
+static_assert(CML_STATUS_QUEUE_FULL == static_cast<int>(ids::kRequestQueueFull), "public status and agent diagnostic differ");
+
 std::atomic<int> g_enumeration_failures{0};
 
 Result<std::vector<proc::ModuleInfo>> enumerate_loaded_modules() {

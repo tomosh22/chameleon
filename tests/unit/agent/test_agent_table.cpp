@@ -164,6 +164,11 @@ TEST_CASE("stop() cancels 800 open requests for every waiter and keeps the answe
 
     std::uint64_t id = 0;
     CHECK(agent.enable_module(L"after_stop.dll", 0, &id) == static_cast<cml_status>(kCancelled));
+    // FU-01: "not running" has its own public name and is not a timeout.
+    CHECK(agent.enable_module(L"after_stop.dll", 0, &id) == CML_STATUS_NOT_RUNNING);
+    CHECK(CML_STATUS_NOT_RUNNING != CML_STATUS_TIMEOUT);
+    CHECK(CML_STATUS_NOT_RUNNING == static_cast<cml_status>(kCancelled));
+    CHECK(CML_STATUS_QUEUE_FULL == static_cast<cml_status>(kQueueFull));
 }
 
 TEST_CASE("an enabled module stays tracked however many answers were dropped") {
