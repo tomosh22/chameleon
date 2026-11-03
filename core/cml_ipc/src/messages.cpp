@@ -57,6 +57,22 @@ public:
         u32(static_cast<std::uint32_t>(s.size()));
         out_.insert(out_.end(), s.begin(), s.end());
     }
+    void u16(std::uint16_t v) {
+        out_.push_back(static_cast<std::uint8_t>(v));
+        out_.push_back(static_cast<std::uint8_t>(v >> 8));
+    }
+    // WP-21: UTF-16 text as a unit count and little-endian units.
+    void wide(const std::u16string& s) {
+        if (s.size() > kMaxWideUnits) {
+            too_large_ = true;
+            u32(0);
+            return;
+        }
+        u32(static_cast<std::uint32_t>(s.size()));
+        for (const char16_t c : s) {
+            u16(static_cast<std::uint16_t>(c));
+        }
+    }
     void entry(const ModuleEntry& e) {
         u64(e.base);
         u64(e.size);
@@ -112,6 +128,27 @@ public:
         if (!is_valid_utf8(s)) {
             fail("string is not valid UTF-8");
             return {};
+        }
+        return s;
+    }
+
+    std::u16string wide() {
+        const std::uint32_t units = u32();
+        if (!ok()) {
+            return {};
+        }
+        if (units > kMaxWideUnits) {
+            fail("wide string longer than the field limit");
+            return {};
+        }
+        if (static_cast<std::uint64_t>(units) * 2 > remaining()) {
+            fail("wide string runs past the end of the payload");
+            return {};
+        }
+        std::u16string s;
+        s.reserve(units);
+        for (std::uint32_t i = 0; i < units; ++i) {
+            s.push_back(static_cast<char16_t>(take(2)));
         }
         return s;
     }
@@ -234,6 +271,9 @@ void encode(Writer& w, const Hello& m) {
     w.u32(static_cast<std::uint32_t>(m.mode));
     w.str(m.agent_path);
     w.str(m.command_line);
+    if (!m.restart_token.empty()) {
+        w.str(m.restart_token);  // WP-21: optional trailing field
+    }
 }
 void encode(Writer& w, const Welcome& m) {
     w.u64(m.request_id);
@@ -271,6 +311,38 @@ void encode(Writer& w, const Reply& m) {
     w.u64(m.request_id);
     w.u32(m.status);
     w.str(m.message);
+}
+void encode(Writer& w, const Restart& m) {
+    w.u64(m.request_id);
+    w.u32(m.flags);
+}
+void encode_module(Writer& w, const RestartModule& m) {
+    w.u32(m.options);
+    w.str(m.path);
+}
+void encode(Writer& w, const RestartInfo& m) {
+    w.u64(m.request_id);
+    w.u32(m.status);
+    w.str(m.message);
+    w.u32(m.hooks_run);
+    w.wide(m.image_path);
+    w.wide(m.command_line);
+    w.wide(m.working_directory);
+    w.wide(m.environment);
+    w.u64(m.std_input);
+    w.u64(m.std_output);
+    w.u64(m.std_error);
+    w.u32(static_cast<std::uint32_t>(m.modules.size()));
+    for (const RestartModule& module : m.modules) {
+        encode_module(w, module);
+    }
+}
+void encode(Writer& w, const ReenableModules& m) {
+    w.u64(m.request_id);
+    w.u32(static_cast<std::uint32_t>(m.modules.size()));
+    for (const RestartModule& module : m.modules) {
+        encode_module(w, module);
+    }
 }
 void encode(Writer& w, const CompileEvent& m) {
     w.u32(static_cast<std::uint32_t>(m.phase));
@@ -393,6 +465,9 @@ Message decode_hello(Reader& r) {
     m.mode = static_cast<AgentMode>(mode);
     m.agent_path = r.str();
     m.command_line = r.str();
+    if (r.ok() && r.remaining() > 0) {
+        m.restart_token = r.str();  // WP-21: optional trailing field
+    }
     return m;
 }
 Message decode_welcome(Reader& r) {
@@ -460,6 +535,55 @@ Message decode_reply(Reader& r) {
     m.request_id = r.u64();
     m.status = r.u32();
     m.message = r.str();
+    return m;
+}
+RestartModule decode_restart_module(Reader& r) {
+    RestartModule m;
+    m.options = r.u32();
+    m.path = r.str();
+    return m;
+}
+std::vector<RestartModule> decode_restart_modules(Reader& r) {
+    std::vector<RestartModule> list;
+    // Smallest encoded module: options + empty string.
+    const std::uint32_t n = r.count(kMaxRestartModules, 4 + 4, "too many modules in one restart message");
+    if (r.ok()) {
+        list.reserve(n);
+        for (std::uint32_t i = 0; i < n && r.ok(); ++i) {
+            list.push_back(decode_restart_module(r));
+        }
+    }
+    return list;
+}
+Message decode_restart(Reader& r) {
+    Restart m;
+    m.request_id = r.u64();
+    m.flags = r.u32();
+    if (r.ok() && m.flags != 0) {
+        r.fail("unknown Restart flags");
+    }
+    return m;
+}
+Message decode_restart_info(Reader& r) {
+    RestartInfo m;
+    m.request_id = r.u64();
+    m.status = r.u32();
+    m.message = r.str();
+    m.hooks_run = r.u32();
+    m.image_path = r.wide();
+    m.command_line = r.wide();
+    m.working_directory = r.wide();
+    m.environment = r.wide();
+    m.std_input = r.u64();
+    m.std_output = r.u64();
+    m.std_error = r.u64();
+    m.modules = decode_restart_modules(r);
+    return m;
+}
+Message decode_reenable_modules(Reader& r) {
+    ReenableModules m;
+    m.request_id = r.u64();
+    m.modules = decode_restart_modules(r);
     return m;
 }
 Message decode_compile_event(Reader& r) {
@@ -688,6 +812,8 @@ const char* to_string(MessageType type) noexcept {
         case MessageType::ExceptionAction: return "ExceptionAction";
         case MessageType::Log: return "Log";
         case MessageType::Restart: return "Restart";
+        case MessageType::RestartInfo: return "RestartInfo";
+        case MessageType::ReenableModules: return "ReenableModules";
         case MessageType::CompileEvent: return "CompileEvent";
     }
     return "Unknown";
@@ -707,6 +833,9 @@ bool is_implemented(MessageType type) noexcept {
         case MessageType::HooksInstalled:
         case MessageType::Log:
         case MessageType::CompileEvent:
+        case MessageType::Restart:
+        case MessageType::RestartInfo:
+        case MessageType::ReenableModules:
         case MessageType::ReserveRange:
         case MessageType::ReserveRangeResult:
         case MessageType::ReleaseRange:
@@ -731,6 +860,9 @@ MessageType type_of(const Message& message) noexcept {
         MessageType operator()(const ModuleUnloaded&) const noexcept { return MessageType::ModuleUnloaded; }
         MessageType operator()(const Log&) const noexcept { return MessageType::Log; }
         MessageType operator()(const CompileEvent&) const noexcept { return MessageType::CompileEvent; }
+        MessageType operator()(const Restart&) const noexcept { return MessageType::Restart; }
+        MessageType operator()(const RestartInfo&) const noexcept { return MessageType::RestartInfo; }
+        MessageType operator()(const ReenableModules&) const noexcept { return MessageType::ReenableModules; }
         MessageType operator()(const Reply&) const noexcept { return MessageType::Reply; }
         MessageType operator()(const InstallHooks&) const noexcept { return MessageType::InstallHooks; }
         MessageType operator()(const HooksInstalled&) const noexcept { return MessageType::HooksInstalled; }
@@ -912,6 +1044,9 @@ Result<Message> decode_message(std::uint16_t type, std::uint16_t version, const 
         case MessageType::ModuleUnloaded: message = decode_unloaded(reader); break;
         case MessageType::Log: message = decode_log(reader); break;
         case MessageType::CompileEvent: message = decode_compile_event(reader); break;
+        case MessageType::Restart: message = decode_restart(reader); break;
+        case MessageType::RestartInfo: message = decode_restart_info(reader); break;
+        case MessageType::ReenableModules: message = decode_reenable_modules(reader); break;
         case MessageType::InstallHooks: message = decode_install_hooks(reader); break;
         case MessageType::HooksInstalled: message = decode_hooks_installed(reader); break;
         case MessageType::ReserveRange: message = decode_reserve_range(reader); break;
@@ -955,6 +1090,8 @@ bool is_request_type(std::uint16_t type) noexcept {
         case MessageType::EnableModule:
         case MessageType::DisableModule:
         case MessageType::InstallHooks:
+        case MessageType::Restart:
+        case MessageType::ReenableModules:
         case MessageType::ReserveRange:
         case MessageType::ReleaseRange:
         case MessageType::LoadPatch:
@@ -977,6 +1114,9 @@ std::optional<std::uint64_t> peek_request_id(std::uint16_t type, const std::uint
         case MessageType::DisableModule:
         case MessageType::InstallHooks:
         case MessageType::HooksInstalled:
+        case MessageType::Restart:
+        case MessageType::RestartInfo:
+        case MessageType::ReenableModules:
         case MessageType::ReserveRange:
         case MessageType::ReserveRangeResult:
         case MessageType::ReleaseRange:
@@ -1005,7 +1145,8 @@ std::string describe(const Message& message) {
                    " protocol=" + std::to_string(m.protocol_version) +
                    " abi=" + std::to_string(m.agent_abi_version) + " pid=" + std::to_string(m.pid) +
                    " mode=" + (m.mode == AgentMode::Synchronized ? "synchronized" : "immediate") +
-                   " agent=" + quoted(m.agent_path) + " cmdline=" + quoted(m.command_line);
+                   " agent=" + quoted(m.agent_path) + " cmdline=" + quoted(m.command_line) +
+                   (m.restart_token.empty() ? std::string() : " restart_token=" + quoted(m.restart_token));
         }
         std::string operator()(const Welcome& m) const {
             return "Welcome request=" + std::to_string(m.request_id) +
@@ -1033,6 +1174,18 @@ std::string describe(const Message& message) {
         }
         std::string operator()(const Log& m) const {
             return "Log level=" + std::to_string(m.level) + " text=" + quoted(m.text);
+        }
+        std::string operator()(const Restart& m) const {
+            return "Restart request=" + std::to_string(m.request_id) + " flags=" + std::to_string(m.flags);
+        }
+        std::string operator()(const RestartInfo& m) const {
+            return "RestartInfo request=" + std::to_string(m.request_id) + " status=" + std::to_string(m.status) +
+                   " hooks_run=" + std::to_string(m.hooks_run) + " command_line_units=" + std::to_string(m.command_line.size()) +
+                   " environment_units=" + std::to_string(m.environment.size()) + " modules=" + std::to_string(m.modules.size()) +
+                   (m.message.empty() ? std::string() : " message=" + quoted(m.message));
+        }
+        std::string operator()(const ReenableModules& m) const {
+            return "ReenableModules request=" + std::to_string(m.request_id) + " modules=" + std::to_string(m.modules.size());
         }
         std::string operator()(const CompileEvent& m) const {
             return std::string("CompileEvent phase=") +

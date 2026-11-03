@@ -36,6 +36,7 @@ struct LinkSnapshot {
     std::uint32_t pid = 0;
     ipc::AgentMode mode = ipc::AgentMode::Immediate;
     std::string command_line;
+    std::string restart_token;             // WP-21: CML_RESTART_TOKEN of the process
     std::vector<LoadedModule> modules;     // everything the agent reported, in order
     std::vector<std::string> enabled;      // full paths of the enabled modules
     std::uint64_t revision = 0;            // Session::revision()

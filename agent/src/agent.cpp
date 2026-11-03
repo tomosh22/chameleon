@@ -208,6 +208,7 @@ Result<void> Agent::start() {
         broker_args_ = *env;
     }
     command_line_ = proc::current_command_line();
+    capture_launch_info();  // WP-21
 
     stop_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     wake_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -557,6 +558,7 @@ bool Agent::handshake(ipc::PipeConnection& connection) {
     hello.mode = synchronized() ? ipc::AgentMode::Synchronized : ipc::AgentMode::Immediate;
     hello.agent_path = agent_path_;
     hello.command_line = command_line_;
+    hello.restart_token = restart_token_;
     if (!send_message(connection, hello)) {
         return false;
     }
@@ -1000,6 +1002,14 @@ void Agent::handle_message(const ipc::Message& message) {
     }
     if (const auto* compile = std::get_if<ipc::CompileEvent>(&message)) {
         handle_compile_event(*compile);
+        return;
+    }
+    if (const auto* restart = std::get_if<ipc::Restart>(&message)) {
+        handle_restart(*restart);  // WP-21
+        return;
+    }
+    if (const auto* reenable = std::get_if<ipc::ReenableModules>(&message)) {
+        handle_reenable(*reenable);
         return;
     }
     CML_LOG(Warn, "ignoring unexpected %s from the broker", ipc::to_string(ipc::type_of(message)));

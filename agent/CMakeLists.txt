@@ -25,6 +25,8 @@ set(CML_AGENT_WINDOWS_SOURCES
     src/hook/installer.cpp
     src/hook/dispatch.cpp
     src/hook/user_hooks_win.cpp
+    # WP-21: hot-restart (launch parameters, pre-restart hooks)
+    src/restart.cpp
     # WP-08: address-space reservation and patch loading
     src/loader/image_writer.cpp
     src/loader/patch_loader.cpp)

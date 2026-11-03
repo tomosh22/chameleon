@@ -1,6 +1,7 @@
 // The source-hash baseline and the reload sweep (WP-12, plan step 1).
 #include "cml/core/source_baseline.h"
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -179,4 +180,80 @@ TEST_CASE("progress is reported and cancellation stops the baseline") {
     SourceBaseline partial;
     partial.take(files, cancelling, nullptr);
     CHECK(partial.size() <= 10);
+}
+
+// ---- WP-21: carrying the session's edits over a restart ----------------------------------------------------------
+
+TEST_CASE("restart: a relaunched process finds again the files that had been patched, and keeps pending edits pending") {
+    QuietLogs quiet;
+    testpdb::TempDir dir;
+    const std::string patched = dir.file("patched.cpp");
+    const std::string pending = dir.file("pending.cpp");
+    const std::string quiet_file = dir.file("quiet.cpp");
+    write_text(patched, "int v = 1;");
+    write_text(pending, "int p = 1;");
+    write_text(quiet_file, "int q = 1;");
+
+    // The old process: patched.cpp is edited and its patch accepted; pending.cpp is edited but not reloaded yet.
+    SourceBaseline old_process;
+    old_process.take({patched, pending, quiet_file}, BaselineOptions{}, nullptr);
+    write_text(patched, "int v = 2;");
+    bump_mtime(patched);
+    SourceBaseline::SweepResult first = old_process.sweep();
+    REQUIRE(first.changed.size() == 1);
+    old_process.accept(first.stamps);
+    write_text(pending, "int p = 2;");
+    bump_mtime(pending);
+    CHECK(old_process.sweep().changed == std::vector<std::string>{pending});
+    const BaselineSnapshot snapshot = old_process.session_snapshot();
+    REQUIRE(snapshot.originals.size() == 1);
+    CHECK(snapshot.originals.count(patched) == 1);
+
+    // The relaunched process takes its baseline from the files as they are now: both edits are invisible to it.
+    SourceBaseline fresh;
+    fresh.take({patched, pending, quiet_file}, BaselineOptions{}, nullptr);
+    CHECK(fresh.sweep().changed.empty());
+
+    CHECK(fresh.restore(snapshot) == 1);
+    SourceBaseline::SweepResult again = fresh.sweep();
+    CHECK(again.hashed == 2);  // patched.cpp (forced) and pending.cpp (changed since the old baseline)
+    std::vector<std::string> changed = again.changed;
+    std::sort(changed.begin(), changed.end());
+    std::vector<std::string> expected{patched, pending};
+    std::sort(expected.begin(), expected.end());
+    CHECK(changed == expected);
+
+    // The reload that follows accepts both; a later restart still knows the original of patched.cpp.
+    fresh.accept(again.stamps);
+    CHECK(fresh.sweep().changed.empty());
+    const BaselineSnapshot second = fresh.session_snapshot();
+    CHECK(second.originals.count(patched) == 1);
+    CHECK(second.originals.count(pending) == 1);
+    CHECK(second.originals.at(patched).hash == snapshot.originals.at(patched).hash);
+}
+
+TEST_CASE("restart: a file edited back to its original content is not reloaded; files the new baseline does not track are ignored") {
+    QuietLogs quiet;
+    testpdb::TempDir dir;
+    const std::string a = dir.file("a.cpp");
+    const std::string gone = dir.file("gone.cpp");
+    write_text(a, "int a = 1;");
+    write_text(gone, "int g = 1;");
+    SourceBaseline old_process;
+    old_process.take({a, gone}, BaselineOptions{}, nullptr);
+    write_text(a, "int a = 2;");
+    write_text(gone, "int g = 2;");
+    bump_mtime(a);
+    bump_mtime(gone);
+    old_process.accept(old_process.sweep().stamps);
+    const BaselineSnapshot snapshot = old_process.session_snapshot();
+    REQUIRE(snapshot.originals.size() == 2);
+
+    write_text(a, "int a = 1;");  // the user took the edit out again before the restart
+    bump_mtime(a);
+    SourceBaseline fresh;
+    fresh.take({a}, BaselineOptions{}, nullptr);  // gone.cpp is not part of the relaunched module
+    CHECK(fresh.restore(snapshot) == 1);
+    CHECK(fresh.sweep().changed.empty());  // same hash as the original: nothing to do
+    CHECK(fresh.size() == 1);
 }

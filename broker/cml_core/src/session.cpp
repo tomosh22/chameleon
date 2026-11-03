@@ -77,6 +77,7 @@ SessionOutcome Session::handle_hello(const ipc::Hello& hello) {
     mode_ = hello.mode;
     agent_path_ = hello.agent_path;
     command_line_ = hello.command_line;
+    restart_token_ = hello.restart_token;
 
     ipc::Welcome welcome;
     welcome.request_id = hello.request_id;
@@ -180,7 +181,8 @@ SessionOutcome Session::on_message(const ipc::Message& message) {
         CML_LOG(Info, "agent#%llu log[%u]: %s", static_cast<unsigned long long>(agent_id_),
                 log->level, log->text.c_str());
     } else if (std::get_if<ipc::Reply>(&message) != nullptr || std::get_if<ipc::ReserveRangeResult>(&message) != nullptr ||
-               std::get_if<ipc::PatchLoaded>(&message) != nullptr || std::get_if<ipc::HooksInstalled>(&message) != nullptr) {
+               std::get_if<ipc::PatchLoaded>(&message) != nullptr || std::get_if<ipc::HooksInstalled>(&message) != nullptr ||
+               std::get_if<ipc::RestartInfo>(&message) != nullptr) {
         // Answers to the broker's own requests (WP-12). One whose request id nobody waits for (the request timed
         // out, or the id is made up) is ignored, never a protocol violation.
         if (!answer_sink_ || !answer_sink_(message)) {

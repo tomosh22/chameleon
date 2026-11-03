@@ -36,6 +36,9 @@
 
 namespace cml::core {
 
+class ProcessHost;
+class RestartCoordinator;
+
 class ReloadService {
 public:
     // `session_dir`: base directory for objects, patch DLLs and PDBs ("" = a new directory under the system
@@ -78,6 +81,19 @@ public:
     // The state of a module (tests, diagnostics); null when it is not enabled.
     std::shared_ptr<ModuleState> module_state(std::uint64_t agent_id, const std::string& module_path) const;
 
+    // ---- hot-restart (WP-21, restart.h) ----
+    // Gives the service the means to start and stop processes. The real host is installed on Windows; tests install a
+    // scripted one. Without a host `restart` is refused (CML5800) and the capability is not advertised.
+    void set_process_host(std::shared_ptr<ProcessHost> host);
+    bool restart_available() const;
+    // {"pid"?:N, "timeout_ms"?:N}
+    Result<ipc::json::Value> restart(const ipc::json::Value& args);
+    // The agent connections (handshaken or not), their modules' states, and a lookup by pid / restart token.
+    std::vector<std::shared_ptr<AgentLink>> links() const;
+    std::shared_ptr<AgentLink> link_for_pid(std::uint32_t pid) const;
+    std::shared_ptr<AgentLink> link_for_restart_token(const std::string& token) const;
+    std::vector<std::shared_ptr<ModuleState>> module_states(std::uint64_t agent_id) const;
+
 private:
     struct AgentEntry {
         std::shared_ptr<AgentLink> link;
@@ -114,6 +130,8 @@ private:
     std::shared_ptr<SaveWatcher> save_watcher_;
     std::vector<std::future<void>> retiring_;  // stopped save watchers finishing a reload
     WatcherFactory watcher_factory_;
+
+    std::unique_ptr<RestartCoordinator> restart_;  // guarded by mutex_
 
     std::mutex reload_mutex_;  // one reload at a time
     std::atomic<bool> running_{false};

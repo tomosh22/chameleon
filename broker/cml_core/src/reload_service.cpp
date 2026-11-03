@@ -10,6 +10,8 @@
 #include "cml/core/header_diag_ids.h"
 #include "cml/core/pipeline_diag_ids.h"
 #include "cml/core/process_registry.h"
+#include "cml/core/restart.h"
+#include "cml/core/restart_diag_ids.h"
 #include "cml/util/log.h"
 #include "cml/util/path.h"
 #include "cml/watch/watch_diag_ids.h"
@@ -67,6 +69,7 @@ ReloadService::ReloadService(PipelineEnv env, EventBus* events, std::string sess
     // A directory the user chose (--session-dir, $CML_SESSION_DIR) is theirs: it is never removed. Only the
     // temporary default is.
     keep_session_dir_ = !session_dir_.empty();
+    set_process_host(native_process_host());  // WP-21: null on hosts that cannot restart processes
 }
 
 ReloadService::~ReloadService() {
@@ -275,6 +278,81 @@ std::shared_ptr<ModuleState> ReloadService::module_state(std::uint64_t agent_id,
     }
     const auto m = it->second.modules.find(normalized_key(module_path));
     return m == it->second.modules.end() ? nullptr : m->second;
+}
+
+// ---- hot-restart (WP-21) --------------------------------------------------------------------------------------
+
+void ReloadService::set_process_host(std::shared_ptr<ProcessHost> host) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!host) {
+        restart_.reset();
+        return;
+    }
+    restart_ = std::make_unique<RestartCoordinator>(*this, events_, std::move(host));
+}
+
+bool ReloadService::restart_available() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return restart_ != nullptr;
+}
+
+Result<Value> ReloadService::restart(const Value& args) {
+    RestartCoordinator* coordinator = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        coordinator = restart_.get();
+    }
+    if (coordinator == nullptr) {
+        return Diag::make(restart::diag::kUnavailable, "this broker cannot restart processes on this system",
+                          "Restart the application yourself; hot-restart needs the Windows broker.");
+    }
+    return coordinator->restart(args);  // the coordinator lives as long as the service; set_process_host is a start-up call
+}
+
+std::vector<std::shared_ptr<AgentLink>> ReloadService::links() const {
+    std::vector<std::shared_ptr<AgentLink>> out;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& agent : agents_) {
+        if (agent.second.link) {
+            out.push_back(agent.second.link);
+        }
+    }
+    return out;
+}
+
+std::shared_ptr<AgentLink> ReloadService::link_for_pid(std::uint32_t pid) const {
+    for (const std::shared_ptr<AgentLink>& link : links()) {
+        const LinkSnapshot snap = link->snapshot();
+        if (snap.handshaken && snap.pid == pid && !link->closed()) {
+            return link;
+        }
+    }
+    return nullptr;
+}
+
+std::shared_ptr<AgentLink> ReloadService::link_for_restart_token(const std::string& token) const {
+    if (token.empty()) {
+        return nullptr;
+    }
+    for (const std::shared_ptr<AgentLink>& link : links()) {
+        const LinkSnapshot snap = link->snapshot();
+        if (snap.handshaken && snap.restart_token == token && !link->closed()) {
+            return link;
+        }
+    }
+    return nullptr;
+}
+
+std::vector<std::shared_ptr<ModuleState>> ReloadService::module_states(std::uint64_t agent_id) const {
+    std::vector<std::shared_ptr<ModuleState>> out;
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = agents_.find(agent_id);
+    if (it != agents_.end()) {
+        for (const auto& m : it->second.modules) {
+            out.push_back(m.second);
+        }
+    }
+    return out;
 }
 
 ReloadOptions ReloadService::options() const {

@@ -217,6 +217,19 @@ private:
     void compile_worker_run();
     void stop_compile_worker();
     std::vector<std::string> enabled_module_paths();  // the modules the application enabled (any thread)
+
+    // WP-21 hot-restart (restart.cpp). The broker's Restart request is dispatched like InstallHooks: in synchronised mode
+    // the pre-restart hooks run inside SyncPoint() on the application's thread, in immediate mode on the agent thread.
+    // The answer (RestartInfo) is queued in replies_.
+    void handle_restart(const ipc::Restart& request);
+    static void run_restart_job(void* context);
+    void apply_restart(std::uint64_t request_id);
+    // The broker asks the new process to enable modules the old one had enabled (ReenableModules): each becomes an
+    // EnableModule request, exactly as if the application had called EnableModule.
+    void handle_reenable(const ipc::ReenableModules& request);
+    // Records the command line, working directory, environment and image path (start-up, before the application can
+    // change them) and CML_RESTART_TOKEN.
+    void capture_launch_info();
     bool flush_replies(ipc::PipeConnection& connection);
 
     // Any thread ------------------------------------------------------------------------------
@@ -249,6 +262,14 @@ private:
     std::string broker_args_;
     std::string agent_path_;     // UTF-8, for Hello
     std::string command_line_;   // UTF-8, for Hello
+    std::string restart_token_;  // WP-21: CML_RESTART_TOKEN when the broker relaunched this process, for Hello
+    struct LaunchInfo {
+        bool valid = false;
+        std::u16string image_path;
+        std::u16string command_line;
+        std::u16string working_directory;
+        std::u16string environment;  // "A=b\0C=d\0\0"
+    } launch_;
 
     HANDLE thread_ = nullptr;
     HANDLE stop_event_ = nullptr;  // manual-reset: stop() was called

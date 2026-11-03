@@ -47,6 +47,8 @@ public:
     std::uint32_t pid() const noexcept { return pid_; }
     const std::string& agent_path() const noexcept { return agent_path_; }
     const std::string& command_line() const noexcept { return command_line_; }
+    // WP-21: CML_RESTART_TOKEN of the process ("" unless the broker relaunched it).
+    const std::string& restart_token() const noexcept { return restart_token_; }
     const std::vector<ipc::ModuleEntry>& modules() const noexcept { return modules_; }
     const std::vector<std::string>& enabled_modules() const noexcept { return enabled_; }
     // Incremented whenever what a status report shows changes (handshake, module list, loaded/unloaded
@@ -76,6 +78,7 @@ private:
     std::uint64_t ignored_answers_ = 0;
     std::string agent_path_;
     std::string command_line_;
+    std::string restart_token_;
     std::vector<ipc::ModuleEntry> modules_;
     std::vector<std::string> enabled_;  // full paths of enabled modules
 };
