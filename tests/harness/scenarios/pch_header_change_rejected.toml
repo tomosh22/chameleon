@@ -1,0 +1,40 @@
+# Scenario `pch_header_change_rejected` (WP-15): a change to the precompiled header cannot be hot-reloaded. The broker
+# refuses the reload with CML5550 before it compiles anything, and the program keeps running unchanged.
+name = "pch_header_change_rejected"
+description = "fixture pch: edit pch.h -> reload refused (CML5550) -> output unchanged"
+fixture = "pch"
+timeout_s = 120
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1 base=100"
+within_s = 10
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_pch.exe"
+within_s = 10
+
+# edits/pch_header.edit: pch_base() returns PCH_BASE + 1.
+[[step]]
+kind = "edit"
+patch = "edits/pch_header.edit"
+
+[[step]]
+kind = "reload"
+within_s = 60
+expect_error = "CML5550"
+
+# Nothing was patched: the program prints what it printed before.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1 base=100"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1 base=100"
+within_s = 10

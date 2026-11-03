@@ -21,6 +21,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -49,6 +50,7 @@ struct ModuleIndexSpec {
     std::string module_path;  // the module's file; its PDB is located from the debug directory
     std::string pdb_path;     // when non-empty the PDB is opened directly (tests)
     pdb::OpenOptions pdb_options;  // use_cache is forced off: the index must be releasable
+    bool scan_includes = true;     // WP-15: follow #include through the files on disk (ADR-0013); off in tests that have no sources
     BaselineOptions baseline;      // progress / cancelled are set by the index itself
     // Called from the worker thread on every state or phase change (after the status was updated).
     std::function<void(const IndexStatus&)> on_change;
@@ -74,6 +76,11 @@ public:
 
     const std::string& module_path() const noexcept { return spec_.module_path; }
 
+    // WP-15: the include graph scanned when the index was built (IncludeScanner): number of headers with at least
+    // one compiland that includes them, and whether a file is part of a precompiled header.
+    std::size_t scanned_headers() const;
+    bool is_pch_header(const std::string& normalised_path) const;
+
     // Compilands that have at least one changed file (indices ascending), the changed files, and changed
     // files that no compiland lists. `stamps` goes to accept() once the files were patched.
     struct Sweep {
@@ -81,7 +88,12 @@ public:
         std::vector<std::uint32_t> compilands;
         std::vector<std::string> unmapped;
         std::vector<std::string> missing;
-        std::map<std::string, std::vector<std::uint32_t>> file_compilands;  // changed file -> the compilands that list it
+        std::map<std::string, std::vector<std::uint32_t>> file_compilands;  // changed file -> the compilands that list or include it
+        // Changed files that belong to a precompiled header (WP-15): the /Yc compiland's headers. A change to one
+        // cannot be hot-reloaded (CML5550).
+        std::vector<std::string> pch_headers;
+        // Compilands to recompile that use a precompiled header whose files could not be determined (CML5552).
+        std::vector<std::uint32_t> pch_unverified;
         std::map<std::string, FileStamp> stamps;
         std::size_t hashed = 0;
         std::size_t checked = 0;
@@ -113,6 +125,9 @@ private:
     SourceBaseline baseline_;
     std::function<Result<Sweep>()> sweep_override_;                       // guarded by mutex_
     std::vector<std::map<std::string, FileStamp>> accepted_for_testing_;  // guarded by mutex_
+    std::map<std::string, std::vector<std::uint32_t>> header_deps_;       // guarded by mutex_: scanned header -> compilands
+    std::set<std::string> pch_files_;                                     // guarded by mutex_: files of the precompiled header(s)
+    std::set<std::uint32_t> pch_unverified_;                              // guarded by mutex_: /Yu compilands with an unknown PCH
     std::atomic<bool> cancel_{false};
     std::thread worker_;
 };

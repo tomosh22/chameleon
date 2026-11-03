@@ -97,6 +97,7 @@ cml_add_unit_test(broker_core
         broker/test_module_symbols.cpp
         broker/test_patch_image.cpp
         broker/test_source_baseline.cpp
+        broker/test_include_scan.cpp
         broker/test_agent_link.cpp
         broker/test_events_and_log.cpp
         broker/test_reload.cpp

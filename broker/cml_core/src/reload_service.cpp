@@ -7,6 +7,7 @@
 #include <set>
 #include <thread>
 
+#include "cml/core/header_diag_ids.h"
 #include "cml/core/pipeline_diag_ids.h"
 #include "cml/core/process_registry.h"
 #include "cml/util/log.h"
@@ -306,6 +307,13 @@ Result<Value> ReloadService::run_reload(const Value& args, bool automatic) {
     if (timeout_ms == 0) {
         timeout_ms = 60000;
     }
+    bool confirm = false;
+    if (const Value* c = args.find("confirm"); c != nullptr && !c->is_null()) {
+        if (!c->is_bool()) {
+            return bad_request("argument 'confirm' must be a boolean");
+        }
+        confirm = c->as_bool();
+    }
 
     std::unique_lock<std::mutex> only_one(reload_mutex_, std::try_to_lock);
     if (!only_one.owns_lock()) {
@@ -372,6 +380,7 @@ Result<Value> ReloadService::run_reload(const Value& args, bool automatic) {
     ctx.exports = exports_;
     ctx.deadline = start + std::chrono::milliseconds(timeout_ms);
     ctx.cancel = &cancel_;
+    ctx.confirm = confirm;
     // WP-16: one compile per distinct command line for the whole reload; every process still links and loads its own patch.
     ctx.compile_cache = std::make_shared<CompileCache>();
 
@@ -488,6 +497,13 @@ std::vector<std::string> ReloadService::tracked_files() const {
 
 SaveWatcherHooks::ReloadResult ReloadService::reload_for_save() {
     Result<Value> r = run_reload(Value::object(), true);
+    if (!r && r.error().code == header::diag::kTooManyCompilands) {
+        // A save that touches more compilands than max_affected_compilands: the pipeline has published CML5551 (with
+        // the way to confirm). Nobody is there to be asked, so nothing is compiled; the files stay "changed" and the
+        // next explicit `reload` (with "confirm": true) or a smaller save picks them up.
+        CML_LOG(Info, "compile-on-save: the change affects too many compilands; run `reload` with \"confirm\": true to recompile them");
+        return SaveWatcherHooks::ReloadResult::Done;
+    }
     if (r) {
         return SaveWatcherHooks::ReloadResult::Done;
     }
@@ -657,6 +673,11 @@ Result<Value> ReloadService::set_option(const Value& args) {
         std::uint32_t v = o.max_parallel_compiles;
         error = want_uint(&v, 0, 256);
         o.max_parallel_compiles = v;
+    } else if (name == "max_affected_compilands") {
+        previous = Value::integer(o.max_affected_compilands);
+        std::uint32_t v = o.max_affected_compilands;
+        error = want_uint(&v, 0, 1000000);
+        o.max_affected_compilands = v;
     } else if (name == "agent_timeout_ms") {
         previous = Value::integer(o.agent_timeout_ms);
         error = want_uint(&o.agent_timeout_ms, 100, 3600u * 1000u);
@@ -712,7 +733,7 @@ Result<Value> ReloadService::set_option(const Value& args) {
         }
     } else {
         return bad_request("unknown option '" + name +
-                           "'; options: narrow_hooks, release_pdb_after_reload, track_system_headers, max_parallel_compiles, agent_timeout_ms, "
+                           "'; options: narrow_hooks, release_pdb_after_reload, track_system_headers, max_parallel_compiles, max_affected_compilands, agent_timeout_ms, "
                            "hooks_timeout_ms, reserve_block_mb, reserve_blocks, max_load_attempts, linker, linker_path, compile_on_save, log_level");
     }
     if (error) {

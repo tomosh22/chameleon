@@ -1,7 +1,11 @@
 // Review follow-ups of WP-10 (Windows): the tests that prove the stopped-world discipline is
 // enforced and not just claimed.
 //   * An allocation made while the world is stopped is detected (agent heap always, C runtime in
-//     Debug cells), and the detector is shown to fire.
+//     Debug cells), and the detector is shown to fire. The detector is shown to fire WITHOUT allocating
+//     in a stopped world: a test that really allocates there waits for the process heap lock whenever
+//     a stopped thread was in the middle of starting (docs/wp/WP-10.md, "The second hang").
+//   * The window needs no lock at all: a thread that holds the process heap, the agent heap and the
+//     loader lock is stopped inside the window, and the installer still completes.
 //   * The window budget is enforced inside a pass: per enumeration step, per suspension, per context
 //     read; an overrun resumes everything and reports CML4309, never CML4305.
 //   * The thread table lookup stays linear in the thread count.
@@ -93,13 +97,14 @@ struct Workers {
 char* volatile g_sink = nullptr;
 void* volatile g_crt_sink = nullptr;
 
-// Called with the world stopped (test_in_window). Allocates on purpose: through `new`, which in this
-// executable is the agent's operator new, and through malloc.
-void allocate_in_window(void*) {
-    g_sink = new char[24];
-    delete[] g_sink;
-    g_crt_sink = std::malloc(24);
-    std::free(g_crt_sink);
+// Called with the world stopped (test_in_window). It must NOT allocate, not even on purpose: an
+// allocation here (the agent heap, or malloc, which is the process heap) waits for the heap lock when
+// the thread that was stopped holds it, and one of the workers can be stopped in the middle of its own
+// start (the loader allocates from the process heap while a new thread initialises). That was the hang
+// of CI run 41567946950 (windows-2022 clang-cl Debug). The probe runs the check that every allocation
+// starts with, which reports to the violation hook without touching a heap.
+void probe_guard_in_window(void*) {
+    agent_heap::probe_forbidden_for_test();
 }
 
 struct CountingScope {
@@ -146,21 +151,17 @@ TEST_CASE("another thread allocating while the window is open is not blamed on t
     CHECK(g_alloc_violations.agent_heap.load() == 0);
 }
 
-TEST_CASE("negative test: an allocation inside the stopped window is detected") {
-    Arena arena;
-    const Placed old_fn = arena.place_padded(cl_release(0), 8, 8);
-    const Placed new_fn = arena.place_padded(lea_ret(5), 8, 8);
-    arena.seal();
-    Workers workers(3);
-
-    InstallerOptions options;
-    options.test_in_window = &allocate_in_window;
-    options.window_budget_ms = 30000;  // a stalled CI runner must not turn this into a timeout (CML4309)
-    Installer installer(options);
-
+TEST_CASE("negative test: the allocators report a use while the window flag is set (agent heap and C runtime)") {
+    // No world is stopped here, so the allocations really happen: this is what shows that `new`,
+    // `delete`, malloc and free reach the detectors. The same calls inside a stopped world are not made
+    // (see probe_guard_in_window).
     CountingScope counting;
-    const BatchResult r = install_one(installer, old_fn.entry, new_fn.entry, "fn");
-    REQUIRE_MESSAGE(r.ok(), r.diag.format());
+    agent_heap::set_alloc_forbidden(true);
+    g_sink = new char[24];
+    delete[] g_sink;
+    g_crt_sink = std::malloc(24);
+    std::free(g_crt_sink);
+    agent_heap::set_alloc_forbidden(false);
     // new + delete[] through the agent heap, both seen.
     CHECK(g_alloc_violations.agent_heap.load() >= 2);
     if (kCrtHookAvailable) {
@@ -169,6 +170,26 @@ TEST_CASE("negative test: an allocation inside the stopped window is detected") 
     } else {
         MESSAGE("Release CRT: no allocation hook, only the agent heap path is checked in this cell");
     }
+}
+
+TEST_CASE("negative test: a use of the heap inside the stopped window is detected, the flag belongs to the window thread") {
+    Arena arena;
+    const Placed old_fn = arena.place_padded(cl_release(0), 8, 8);
+    const Placed new_fn = arena.place_padded(lea_ret(5), 8, 8);
+    arena.seal();
+    Workers workers(3);
+
+    InstallerOptions options;
+    options.test_in_window = &probe_guard_in_window;
+    options.window_budget_ms = 30000;  // a stalled CI runner must not turn this into a timeout (CML4309)
+    Installer installer(options);
+
+    CountingScope counting;
+    const BatchResult r = install_one(installer, old_fn.entry, new_fn.entry, "fn");
+    REQUIRE_MESSAGE(r.ok(), r.diag.format());
+    // The hook counts only the thread that owns the window: the one count is the installer's own thread
+    // reaching the guard from inside the stopped world (so the flag was set for it, by the installer).
+    CHECK(g_alloc_violations.agent_heap.load() == 1);
     CHECK_FALSE(agent_heap::alloc_forbidden());
     {
         const BatchResult checked = revert_one(installer, old_fn.entry, "fn");
@@ -204,6 +225,188 @@ TEST_CASE("positive control: installing and reverting allocate nothing while the
     }
     CHECK(g_alloc_violations.agent_heap.load() == 0);
     CHECK(g_alloc_violations.crt.load() == 0);
+}
+
+// ---- the window needs no lock ----------------------------------------------------------------------------
+
+namespace {
+
+using LdrLockLoaderLockFn = LONG(NTAPI*)(ULONG flags, ULONG* disposition, ULONG_PTR* cookie);
+using LdrUnlockLoaderLockFn = LONG(NTAPI*)(ULONG flags, ULONG_PTR cookie);
+
+// A thread that, on command, takes the locks a thread stopped at a bad moment would be holding, and
+// spins while it holds them, so the installer stops it inside that state. Exactly these three:
+//   * the process heap (HeapLock(GetProcessHeap())): what the loader allocates from and what the C
+//     runtime's malloc draws on (the CRT heap IS the process heap),
+//   * the agent's private heap (what `new` uses in this executable),
+//   * the loader lock (LdrLockLoaderLock).
+// NOT held: the C runtime's own locks (the Debug CRT's _HEAP_LOCK mutex and the debug-heap list lock),
+// which are private to the CRT and cannot be taken from here. A thread stopped inside _malloc_dbg would
+// hold those too; the window code calls no CRT function at all, which the allocation guard checks (Debug
+// cells hook every malloc / free), so that lock is covered by that check and not by this test. The calls
+// the installer thread makes (acquire / holding / release) only use atomics and SwitchToThread: they run
+// with the locks held and, for holding(), with the world stopped, so they must not allocate.
+class LockHolder {
+public:
+    LockHolder() : thread_([this] { run(); }) {}
+    ~LockHolder() {
+        command_.store(kQuit);
+        thread_.join();
+    }
+    LockHolder(const LockHolder&) = delete;
+    LockHolder& operator=(const LockHolder&) = delete;
+
+    // True once the locks are held.
+    bool acquire(ULONGLONG timeout_ms) noexcept {
+        command_.store(kTake);
+        const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+        while (state_.load() != kHolding) {
+            if (GetTickCount64() > deadline) {
+                return false;
+            }
+            SwitchToThread();
+        }
+        return true;
+    }
+    bool holding() const noexcept { return state_.load() == kHolding; }
+    // True once the locks are let go.
+    bool release(ULONGLONG timeout_ms) noexcept {
+        command_.store(kRelease);
+        const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+        while (state_.load() != kFree) {
+            if (GetTickCount64() > deadline) {
+                return false;
+            }
+            SwitchToThread();
+        }
+        return true;
+    }
+    bool loader_lock_taken() const noexcept { return loader_taken_.load(); }
+    bool heaps_locked() const noexcept { return heaps_locked_.load(); }
+
+private:
+    enum : int { kIdle = 0, kTake = 1, kRelease = 2, kQuit = 3 };
+    enum : int { kFree = 0, kHolding = 1 };
+
+    void run() {
+        const HANDLE process_heap = GetProcessHeap();
+        const HANDLE private_heap = static_cast<HANDLE>(agent_heap::native_heap_for_test());
+        const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        const auto lock_loader = ntdll == nullptr ? nullptr
+                                                  : reinterpret_cast<LdrLockLoaderLockFn>(
+                                                        reinterpret_cast<void (*)()>(GetProcAddress(ntdll, "LdrLockLoaderLock")));
+        const auto unlock_loader = ntdll == nullptr ? nullptr
+                                                    : reinterpret_cast<LdrUnlockLoaderLockFn>(
+                                                          reinterpret_cast<void (*)()>(GetProcAddress(ntdll, "LdrUnlockLoaderLock")));
+        for (;;) {
+            const int command = command_.load();
+            if (command == kQuit) {
+                return;
+            }
+            if (command != kTake) {
+                Sleep(1);
+                continue;
+            }
+            ULONG disposition = 0;
+            ULONG_PTR cookie = 0;
+            const bool loader = lock_loader != nullptr && unlock_loader != nullptr &&
+                                lock_loader(0, &disposition, &cookie) >= 0 && disposition == 1;
+            loader_taken_.store(loader);
+            const bool heaps = HeapLock(process_heap) != FALSE;
+            const bool agent = HeapLock(private_heap) != FALSE;
+            heaps_locked_.store(heaps && agent);
+            state_.store(kHolding);
+            while (command_.load() == kTake) {
+                SwitchToThread();
+            }
+            if (agent) {
+                HeapUnlock(private_heap);
+            }
+            if (heaps) {
+                HeapUnlock(process_heap);
+            }
+            if (loader) {
+                unlock_loader(0, cookie);
+            }
+            state_.store(kFree);
+            int expected = kRelease;
+            command_.compare_exchange_strong(expected, kIdle);
+        }
+    }
+
+    std::atomic<int> command_{kIdle};
+    std::atomic<int> state_{kFree};
+    std::atomic<bool> loader_taken_{false};
+    std::atomic<bool> heaps_locked_{false};
+    std::thread thread_;  // last: starts running in the constructor
+};
+
+struct HolderProbe {
+    LockHolder* holder = nullptr;
+    int calls = 0;
+    bool held_before_stop = false;
+    bool held_in_window = false;
+    bool released_after = false;
+};
+
+void holder_before_stop(void* context) {
+    auto* probe = static_cast<HolderProbe*>(context);
+    ++probe->calls;
+    probe->held_before_stop = probe->holder->acquire(20000);
+}
+
+void holder_in_window(void* context) {
+    auto* probe = static_cast<HolderProbe*>(context);
+    probe->held_in_window = probe->holder->holding();
+}
+
+void holder_after_resume(void* context) {
+    auto* probe = static_cast<HolderProbe*>(context);
+    probe->released_after = probe->holder->release(20000);
+}
+
+}  // namespace
+
+TEST_CASE("the window needs no lock: a thread holding the process heap, the agent heap and the loader lock is stopped inside it") {
+    Arena arena;
+    const Placed old_fn = arena.place_padded(cl_release(0), 8, 8);
+    const Placed new_fn = arena.place_padded(lea_ret(5), 8, 8);
+    arena.seal();
+    Workers workers(3);
+    LockHolder holder;
+
+    HolderProbe probe;
+    probe.holder = &holder;
+    InstallerOptions options;
+    options.test_before_stop = &holder_before_stop;
+    options.test_in_window = &holder_in_window;
+    options.test_after_resume = &holder_after_resume;
+    options.test_context = &probe;
+    options.window_budget_ms = 30000;  // a stalled CI runner must not turn this into a timeout (CML4309)
+    Installer installer(options);
+
+    // Planning and the bookkeeping after the window allocate; they run while the holder holds nothing.
+    // Everything in between (suspension, the check, the write, the resume) runs while it holds all three
+    // locks and is itself stopped; if any call of it needed one of them this test would hang, and the
+    // out-of-process hang watchdog would say where.
+    const BatchResult installed = install_one(installer, old_fn.entry, new_fn.entry, "fn");
+    CHECK(probe.held_before_stop);
+    CHECK(probe.held_in_window);
+    CHECK(probe.released_after);
+    CHECK(holder.loader_lock_taken());
+    CHECK(holder.heaps_locked());
+    REQUIRE_MESSAGE(installed.ok(), installed.diag.format());
+    CHECK(probe.calls == 1);
+    CHECK(old_fn.as_int()(1) == 6);  // the hook is live
+
+    probe = HolderProbe{};
+    probe.holder = &holder;
+    const BatchResult reverted = revert_one(installer, old_fn.entry, "fn");
+    CHECK(probe.held_before_stop);
+    CHECK(probe.held_in_window);
+    CHECK(probe.released_after);
+    REQUIRE_MESSAGE(reverted.ok(), reverted.diag.format());
+    CHECK(old_fn.as_int()(1) == 1);  // cl_release(0) returns x + 0
 }
 
 // ---- the budget inside a pass ----------------------------------------------------------------------------

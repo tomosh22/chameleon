@@ -400,6 +400,9 @@ bool Installer::find_conflict(const Job* jobs, std::size_t count, std::size_t* t
 // thread_set.h for the system calls used and why each is safe. The code that touches memory is
 // bracketed by heap::set_alloc_forbidden so that a stray allocation aborts in tests.
 void Installer::attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, Report* report) noexcept {
+    if (options_.test_before_stop != nullptr) {
+        options_.test_before_stop(options_.test_context);
+    }
     const ULONGLONG started = GetTickCount64();
     const ULONGLONG deadline = started + options_.window_budget_ms;
 
@@ -516,6 +519,9 @@ void Installer::attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, 
     threads_.resume_all();
     const ULONGLONG elapsed = GetTickCount64() - started;
     report->window_ms = std::max<unsigned>(report->window_ms, static_cast<unsigned>(elapsed));
+    if (options_.test_after_resume != nullptr) {
+        options_.test_after_resume(options_.test_context);
+    }
 }
 
 // ---- planning and orchestration ------------------------------------------------------------------

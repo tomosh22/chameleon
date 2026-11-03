@@ -129,6 +129,14 @@ void set_violation_hook_for_test(ViolationHook hook) noexcept {
     g_violation_hook.store(hook, std::memory_order_relaxed);
 }
 
+void probe_forbidden_for_test() noexcept {
+    check_allowed();
+}
+
+void* native_heap_for_test() noexcept {
+    return heap_handle();
+}
+
 bool alloc_forbidden() noexcept {
     return g_forbidden.load(std::memory_order_relaxed);
 }

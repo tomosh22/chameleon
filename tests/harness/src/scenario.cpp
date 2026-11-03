@@ -63,6 +63,9 @@ std::string Step::describe() const {
             if (has_result_value) {
                 out += " expecting " + result_key + "=" + std::to_string(result_value);
             }
+            if (!expect_error.empty()) {
+                out += " expecting the refusal " + expect_error;
+            }
             break;
         case StepKind::ExpectMonotonic:
             out += " " + key + " (at least " + std::to_string(min_samples) + " samples)";
@@ -251,7 +254,7 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
     }
     if (*kind == "reload") {
         step.kind = StepKind::Reload;
-        cml::Result<void> keys = only_keys(table, {"kind", "within_s", "expect_result_key", "expect_result_value"}, "a reload step");
+        cml::Result<void> keys = only_keys(table, {"kind", "within_s", "expect_result_key", "expect_result_value", "expect_error"}, "a reload step");
         if (!keys) return keys.error();
         cml::Result<int> within = int_in_range(table, "within_s", 60, 1, 3600);
         if (!within) return within.error();
@@ -271,6 +274,13 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
             step.result_key = rk->text;
             step.result_value = rv->integer;
             step.has_result_value = true;
+        }
+        if (const toml::Value* ee = table.find("expect_error")) {
+            const bool shape = ee->kind == toml::Value::Kind::String && ee->text.size() == 7 && ee->text.compare(0, 3, "CML") == 0 &&
+                               std::all_of(ee->text.begin() + 3, ee->text.end(), [](char c) { return c >= '0' && c <= '9'; });
+            if (!shape) return invalid(ee->line, "'expect_error' must look like CML5550");
+            if (rk != nullptr) return invalid(ee->line, "'expect_error' and 'expect_result_key' exclude each other");
+            step.expect_error = ee->text;
         }
         return step;
     }

@@ -35,6 +35,19 @@ min_samples = 20
     CHECK(r->steps[2].required_capability() == nullptr);
 }
 
+TEST_CASE("scenario: a reload step can expect a refusal (WP-15)") {
+    const std::string head = "name = \"x\"\nfixture = \"pch\"\n[[step]]\nkind = \"launch\"\n[[step]]\nkind = \"reload\"\n";
+    cml::Result<Scenario> r = parse_scenario(head + "expect_error = \"CML5550\"\n");
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    CHECK(r->steps[1].expect_error == "CML5550");
+    CHECK(r->steps[1].describe() == "reload within 60 s expecting the refusal CML5550");
+    for (const char* bad : {"expect_error = \"5550\"\n", "expect_error = 5550\n", "expect_error = \"CML5550\"\nexpect_result_key = \"a\"\nexpect_result_value = 1\n"}) {
+        cml::Result<Scenario> b = parse_scenario(head + bad);
+        REQUIRE_FALSE(b.has_value());
+        CHECK(b.error().code == cml::ids::kScenarioInvalid);
+    }
+}
+
 TEST_CASE("scenario: bad WP-12 keys are CML5411") {
     const std::string head = "name = \"x\"\nfixture = \"statics\"\n[[step]]\nkind = \"launch\"\n[[step]]\n";
     const auto invalid = [&](const std::string& step) {
