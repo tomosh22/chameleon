@@ -23,7 +23,10 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -87,6 +90,8 @@ struct PatchReport {
     std::size_t patches = 0;        // patches loaded by this run (one per recompiled compiland that changed code)
     std::vector<std::string> changed_files;
     std::size_t compilands = 0;
+    std::size_t compiled = 0;       // compiler runs of this module (WP-16)
+    std::size_t compile_reused = 0; // compile results taken from the reload's cache (another process or module ran the same command line)
     std::size_t hooks_planned = 0;  // before narrowing
     std::size_t hooks_installed = 0;
     std::size_t hooks_dropped = 0;
@@ -105,6 +110,27 @@ struct PatchReport {
     std::vector<Diag> warnings;
 };
 
+// Compile results shared by the modules of ONE reload (WP-16): the compile depends only on the translation unit's command
+// line (compiler, working directory, arguments, source), not on the process or the module, so a DLL shared by two
+// processes (or two modules built from one recorded command line) is compiled once; linking and loading stay per process.
+// A cache lives for one reload command: the next reload compiles again, because the sources may have changed.
+class CompileCache {
+public:
+    struct Entry {
+        toolchain::CompileOutcome outcome;
+        std::optional<Diag> error;  // set when the compile failed (a failure is shared as well)
+    };
+    // The key of a recorded command line.
+    static std::string key_of(const toolchain::CompileRecord& record);
+
+    std::optional<Entry> find(const std::string& key) const;
+    void put(const std::string& key, Entry entry);
+
+private:
+    mutable std::mutex mutex_;
+    std::map<std::string, Entry> entries_;
+};
+
 // Where the pipeline works and who hears about it.
 struct PipelineContext {
     std::string session_dir;                      // per-session temporary directory (created on demand)
@@ -114,6 +140,7 @@ struct PipelineContext {
     std::chrono::steady_clock::time_point deadline;
     toolchain::CancelToken* cancel = nullptr;
     bool confirm = false;                         // WP-15: the request accepted a reload above max_affected_compilands
+    std::shared_ptr<CompileCache> compile_cache;  // may be null: every compile runs
 };
 
 class PatchPipeline {

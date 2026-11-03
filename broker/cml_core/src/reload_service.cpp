@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <set>
 #include <thread>
 
 #include "cml/core/pipeline_diag_ids.h"
@@ -319,6 +320,8 @@ Result<Value> ReloadService::reload(const Value& args) {
     ctx.deadline = start + std::chrono::milliseconds(timeout_ms);
     ctx.cancel = &cancel_;
     ctx.confirm = confirm;
+    // WP-16: one compile per distinct command line for the whole reload; every process still links and loads its own patch.
+    ctx.compile_cache = std::make_shared<CompileCache>();
 
     std::vector<PatchReport> reports;
     std::optional<Diag> first_error;
@@ -361,13 +364,21 @@ Result<Value> ReloadService::reload(const Value& args) {
 
     Value result = Value::object();
     result.set("generation", Value::integer(static_cast<std::int64_t>(generation_.load())));
-    std::size_t hooks = 0, run = 0, patched = 0;
+    std::size_t hooks = 0, run = 0, patched = 0, compiled = 0, reused = 0, attempts = 0, modules_patched = 0;
+    std::set<std::uint32_t> patched_pids;
     Value patches = Value::array();
     Value changed = Value::array();
     for (const PatchReport& p : reports) {
         hooks += p.hooks_installed;
         run += p.initializers_run;
         patched += p.patches;
+        compiled += p.compiled;
+        reused += p.compile_reused;
+        attempts += p.load_attempts;
+        if (p.patches != 0) {
+            ++modules_patched;
+            patched_pids.insert(p.pid);
+        }
         for (const std::string& f : p.changed_files) {
             changed.push(Value::string(f));
         }
@@ -375,6 +386,13 @@ Result<Value> ReloadService::reload(const Value& args) {
     }
     result.set("patched", Value::integer(static_cast<std::int64_t>(patched)));
     result.set("hooks_installed", Value::integer(static_cast<std::int64_t>(hooks)));
+    // WP-16: compiler runs of this reload, results taken from another module's identical command line, and the
+    // modules / processes that received at least one patch.
+    result.set("compiled", Value::integer(static_cast<std::int64_t>(compiled)));
+    result.set("compile_reused", Value::integer(static_cast<std::int64_t>(reused)));
+    result.set("load_attempts", Value::integer(static_cast<std::int64_t>(attempts)));  // LoadPatch requests; more than `patched` = relinks at another base
+    result.set("modules_patched", Value::integer(static_cast<std::int64_t>(modules_patched)));
+    result.set("processes_patched", Value::integer(static_cast<std::int64_t>(patched_pids.size())));
     result.set("initializers_run", Value::integer(static_cast<std::int64_t>(run)));
     result.set("changed_files", std::move(changed));
     result.set("patches", std::move(patches));

@@ -269,6 +269,36 @@ private:
 
     bool comp_loaded_ = false;
     std::vector<pdb::SymbolView> comp_syms_;
+    // FU-12: per compiland symbol (same index as comp_syms_), the name spellings the matching needs, computed
+    // once on first use instead of once per group (O(G*N) string work).
+    struct CompNorm {
+        bool last_done = false;
+        bool done = false;
+        std::string last;       // last_component(name)
+        std::string normalized;  // normalized_pdb_name(name)
+        std::string canonical;   // canonical_lambda_names(normalized)
+        std::vector<std::string> comps;  // scope_components(normalized)
+    };
+    std::vector<CompNorm> comp_norm_;
+    CompNorm& comp_entry(const pdb::SymbolView* v) { return comp_norm_[static_cast<std::size_t>(v - comp_syms_.data())]; }
+    const std::string& comp_last(const pdb::SymbolView* v) {
+        CompNorm& n = comp_entry(v);
+        if (!n.last_done) {
+            n.last = last_component(v->name);
+            n.last_done = true;
+        }
+        return n.last;
+    }
+    const CompNorm& comp_norm(const pdb::SymbolView* v) {
+        CompNorm& n = comp_entry(v);
+        if (!n.done) {
+            n.normalized = normalized_pdb_name(v->name);
+            n.canonical = canonical_lambda_names(n.normalized);
+            n.comps = scope_components(n.normalized);
+            n.done = true;
+        }
+        return n;
+    }
     std::map<std::uint32_t, std::int64_t> delta_;  // obj section -> (old RVA - section offset); absent: unknown
     std::set<std::uint32_t> delta_conflict_;
 
@@ -633,6 +663,7 @@ bool Planner::ensure_compiland_symbols() {
         return false;
     }
     comp_syms_ = std::move(*syms);
+    comp_norm_.assign(comp_syms_.size(), CompNorm());
     comp_loaded_ = true;
     return true;
 }
@@ -657,7 +688,7 @@ std::vector<const pdb::SymbolView*> Planner::static_candidates(const std::string
         if (want_function ? !is_func : !is_data) {
             continue;
         }
-        if (last_component(v.name) != base) {
+        if (comp_last(&v) != base) {
             continue;
         }
         all.push_back(&v);
@@ -668,7 +699,7 @@ std::vector<const pdb::SymbolView*> Planner::static_candidates(const std::string
     if (!display.empty()) {
         const std::string canonical_display = canonical_lambda_names(display);
         for (const pdb::SymbolView* v : all) {
-            if (canonical_lambda_names(normalized_pdb_name(v->name)) == canonical_display) {
+            if (comp_norm(v).canonical == canonical_display) {
                 out.push_back(v);
             }
         }
@@ -682,7 +713,7 @@ std::vector<const pdb::SymbolView*> Planner::static_candidates(const std::string
         // qualified name: it must contain the enclosing function, and a file-scope function must not be
         // inside a lambda.
         for (const pdb::SymbolView* v : all) {
-            const std::vector<std::string> comps = scope_components(normalized_pdb_name(v->name));
+            const std::vector<std::string>& comps = comp_norm(v).comps;
             bool has_encl = false;
             bool in_lambda = false;
             for (std::size_t k = 0; k + 1 < comps.size(); ++k) {
@@ -923,7 +954,7 @@ void Planner::bridge_statics() {
             const Sym& sy = syms_[*it];
             std::vector<std::size_t> hits;
             for (std::size_t c = 0; c < free_cands.size(); ++c) {
-                if (normalized_pdb_name(free_cands[c]->name) == sy.dec.display) {
+                if (comp_norm(free_cands[c]).normalized == sy.dec.display) {
                     hits.push_back(c);
                 }
             }

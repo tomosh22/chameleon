@@ -48,3 +48,21 @@ function(cml_add_fixture name)
     endif()
     set_target_properties(fixture_${name} PROPERTIES FOLDER "tests/fixtures")
 endfunction()
+
+# cml_add_fixture_dll(<target> SOURCES ...)   (WP-16)
+#
+# A DLL of a multi-module fixture, built like the fixture exe: /Gy /hotpatch, full PDB, no ICF / dead stripping,
+# padded function entries. It lands beside the exe (the whole project builds into one runtime output directory,
+# DLLs included), so the exe finds it through the normal DLL search and the fixture enables it by file name
+# (cml_fixture::extra_modules()). The exe links its import library: `target_link_libraries(fixture_x PRIVATE <target>)`.
+function(cml_add_fixture_dll target)
+    cmake_parse_arguments(F "" "" "SOURCES" ${ARGN})
+    add_library(${target} SHARED ${F_SOURCES})
+    cml_target_exceptions_allowed(${target})
+    cml_target_fixture_style(${target})
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /Gy /hotpatch)
+        target_link_options(${target} PRIVATE /DEBUG:FULL /INCREMENTAL:NO /OPT:NOREF /OPT:NOICF /FUNCTIONPADMIN)
+    endif()
+    set_target_properties(${target} PROPERTIES FOLDER "tests/fixtures")
+endfunction()

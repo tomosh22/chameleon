@@ -82,6 +82,8 @@ ipc::json::Value to_json(const PatchReport& r) {
     }
     v.set("changed_files", std::move(files));
     v.set("compilands", n(r.compilands));
+    v.set("compiled", n(r.compiled));
+    v.set("compile_reused", n(r.compile_reused));
     v.set("hooks_planned", n(r.hooks_planned));
     v.set("hooks_installed", n(r.hooks_installed));
     v.set("hooks_dropped", n(r.hooks_dropped));
@@ -104,6 +106,38 @@ ipc::json::Value to_json(const PatchReport& r) {
     }
     v.set("warnings", std::move(warnings));
     return v;
+}
+
+std::string CompileCache::key_of(const toolchain::CompileRecord& record) {
+    // Everything that decides what the compiler is asked to do. Fields are separated by a byte no path or argument holds.
+    std::string text;
+    text += record.cwd;
+    text.push_back('\0');
+    text += record.compiler;
+    text.push_back('\0');
+    for (const std::string& a : record.args) {
+        text += a;
+        text.push_back('\0');
+    }
+    text.push_back('\1');
+    text += record.source;
+    text.push_back('\0');
+    text += record.recorded_pdb;
+    return text;
+}
+
+std::optional<CompileCache::Entry> CompileCache::find(const std::string& key) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = entries_.find(key);
+    if (it == entries_.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+void CompileCache::put(const std::string& key, Entry entry) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    entries_[key] = std::move(entry);
 }
 
 namespace {
@@ -149,6 +183,8 @@ struct Unit {
     std::string source;
     toolchain::CompileRecord record;
     toolchain::CompileOutcome outcome;
+    std::string key;
+    std::optional<Diag> cached_error;    // ... and it was a failure
 };
 
 class Run {
@@ -212,6 +248,8 @@ private:
     }
 
     // ---- the run -----------------------------------------------------------------------------------------
+    // Called from the compile workers concurrently: the counter is atomic, CML_LOG is thread-safe and EventBus::publish
+    // takes its own lock; everything else it reads (pid_, module_.name) is not written during the compile stage.
     void publish_progress(const char* stage, std::size_t done, std::size_t total) {
         CML_LOG(Info, "reload: %s %zu/%zu (%s)", stage, done, total, module_.name.c_str());
         if (ctx_.events != nullptr) {
@@ -335,6 +373,7 @@ private:
         }
         std::vector<Unit> units;
         std::vector<toolchain::CompileRequest> requests;
+        std::vector<std::size_t> fresh;  // index in `units` of requests[k]
         std::optional<Diag> first_error;
         for (const std::uint32_t ci : swept->compilands) {
             Unit u;
@@ -354,6 +393,24 @@ private:
             }
             u.record = *record;
             u.source = record->source;
+            u.key = CompileCache::key_of(*record);
+            if (ctx_.compile_cache) {
+                if (std::optional<CompileCache::Entry> hit = ctx_.compile_cache->find(u.key)) {
+                    // Another module of this reload (typically the same DLL in another process) ran this command line.
+                    if (hit->error) {
+                        // The shared compile failed: report it for this module too, without compiling anything else.
+                        return fail("compile", *hit->error);
+                    }
+                    u.outcome = hit->outcome;
+                    for (const Diag& w : u.outcome.warnings) {
+                        warn(report, "compile", w);  // every module and process hears the compiler's warnings
+                    }
+                    ++report.compile_reused;
+                    CML_LOG(Debug, "compile of %s: reused the result of an identical command line (%s)", u.source.c_str(), u.outcome.object_path.c_str());
+                    units.push_back(std::move(u));
+                    continue;
+                }
+            }
             toolchain::CompileRequest cr;
             cr.record = *record;
             cr.output_object = toolchain::patch_object_path(*workdir + "/obj", module_.name, hash64(u.object_name), record->source);
@@ -363,45 +420,59 @@ private:
                 cr.fallback_search_dirs.push_back(std::string(path::parent_directory(std::string_view(record->compiler))));
             }
             requests.push_back(std::move(cr));
+            fresh.push_back(units.size());
             units.push_back(std::move(u));
         }
         if (first_error) {
             return *first_error;
         }
         std::vector<toolchain::CompileOutcome> outcomes(requests.size());
-        // One call for all units with the full parallelism and one deadline budget (each request carries the time that
-        // is left). WP-15 progress: the driver reports every finished unit, so no batch barrier is needed.
-        const std::size_t total = requests.size();
-        std::atomic<std::size_t> finished{0};
-        publish_progress("compile", 0, total);
-        std::vector<Result<void>> results = env_.compile_all(
-            requests, outcomes, options_.max_parallel_compiles, ctx_.cancel,
-            [&](std::size_t) { publish_progress("compile", finished.fetch_add(1) + 1, total); });
-        // A driver that returns fewer results than units has not compiled the missing ones: that is a failure, never a success.
-        while (results.size() < units.size()) {
-            const std::string& missing = units[results.size()].source;
+        // One call for all cache misses with the full parallelism and one deadline budget (each request carries the time
+        // that is left). WP-15 progress counts every unit of the reload: the ones reused from the compile cache are done
+        // at the start, every fresh compile is counted when the driver reports it finished (on_done may run concurrently).
+        const std::size_t total = units.size();
+        std::atomic<std::size_t> finished{total - requests.size()};
+        publish_progress("compile", finished.load(), total);
+        std::vector<Result<void>> results;
+        if (!requests.empty()) {
+            results = env_.compile_all(requests, outcomes, options_.max_parallel_compiles, ctx_.cancel,
+                                       [&](std::size_t) { publish_progress("compile", finished.fetch_add(1) + 1, total); });
+        }
+        // A driver that returns fewer results than requests has not compiled the missing ones: that is a failure, never a success.
+        while (results.size() < requests.size()) {
+            const std::string& missing = units[fresh[results.size()]].source;
             results.emplace_back(Diag::make(pd::kStageFailed, "the compiler driver returned no result for '" + missing + "'",
                                             "This is a bug in the compiler driver; see the broker log."));
         }
-        for (std::size_t i = 0; i < units.size(); ++i) {
-            units[i].outcome = outcomes[i];
-            if (!results[i]) {
-                Diag d = results[i].error();
+        report.compiled += requests.size();
+        for (std::size_t k = 0; k < requests.size(); ++k) {
+            Unit& u = units[fresh[k]];
+            u.outcome = outcomes[k];
+            if (!results[k]) {
+                Diag d = results[k].error();
                 // Name the first compiler error so the diagnostic is useful on its own; the full output is in the log.
-                for (const toolchain::ToolDiagnostic& td : outcomes[i].diagnostics) {
+                for (const toolchain::ToolDiagnostic& td : outcomes[k].diagnostics) {
                     if (td.severity == toolchain::Severity::Error || td.severity == toolchain::Severity::FatalError) {
                         d.message += " First error: " + td.format();
                         break;
                     }
                 }
-                CML_LOG(Error, "compile of %s failed:\n%s", units[i].source.c_str(), outcomes[i].output.c_str());
-                const Diag shown = fail("compile", d);
-                first_error = first_error ? first_error : std::optional<Diag>(shown);
+                CML_LOG(Error, "compile of %s failed:\n%s", u.source.c_str(), outcomes[k].output.c_str());
+                u.cached_error = d;
             } else {
-                for (const Diag& w : outcomes[i].warnings) {
+                for (const Diag& w : outcomes[k].warnings) {
                     warn(report, "compile", w);
                 }
-                CML_LOG(Debug, "compile of %s: %.0f ms, %s", units[i].source.c_str(), outcomes[i].seconds * 1000.0, outcomes[i].command_line.c_str());
+                CML_LOG(Debug, "compile of %s: %.0f ms, %s", u.source.c_str(), outcomes[k].seconds * 1000.0, outcomes[k].command_line.c_str());
+            }
+            if (ctx_.compile_cache) {
+                ctx_.compile_cache->put(u.key, CompileCache::Entry{u.outcome, u.cached_error});
+            }
+        }
+        for (std::size_t k = 0; k < requests.size(); ++k) {
+            if (units[fresh[k]].cached_error) {
+                const Diag shown = fail("compile", *units[fresh[k]].cached_error);
+                first_error = first_error ? first_error : std::optional<Diag>(shown);
             }
         }
         report.times.compile = lap.lap();
@@ -456,7 +527,7 @@ private:
 
     Result<std::string> make_work_dir() {
         std::error_code ec;
-        const std::string dir = ctx_.session_dir + "/" + module_.name;
+        const std::string dir = ctx_.session_dir + "/" + module_.name + "/p" + std::to_string(pid_);
         fs::create_directories(fs::path(dir) / "obj", ec);
         if (ec) {
             return fail("compile", Diag::make(pd::kWorkDir, "cannot create the session directory '" + dir + "': " + ec.message(),

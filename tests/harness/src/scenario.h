@@ -19,6 +19,7 @@ enum class StepKind {
     Reload,               // control command `reload` (needs capability "reload")
     ExpectDiag,           // a `diag` event with this id must arrive (needs capability "diag-events")
     ExpectMonotonic,      // a `key=<int>` of the fixture's TICK lines never decreases (state kept in the old storage)
+    ExpectReloadResult,   // an integer member of the most recent reload's result has this value (WP-16)
 };
 
 const char* to_string(StepKind kind);
@@ -39,6 +40,14 @@ struct Step {
     bool has_result_value = false;
     // Reload (WP-15): the reload must be refused with this diagnostic id (e.g. "CML5550"); empty = it must succeed.
     std::string expect_error;
+    // WP-16, several processes. Launch: `exe` is a fixture executable of the same build (file name, ".exe" optional; empty =
+    // the fixture's primary exe) and `label` names the process (default "fixture" for the primary exe, else the exe's name
+    // without extension). `process` selects the process of ExpectStdout / ExpectModuleEnabled / ExpectMonotonic (empty =
+    // the first launched). ExpectReloadResult uses `key` and `result_value`.
+    std::string exe;
+    std::string label;
+    std::string args;   // Launch: extra command-line arguments of the fixture process (after --agent)
+    std::string process;
 
     // "expect_stdout /value=2/ within 10 s"
     std::string describe() const;
