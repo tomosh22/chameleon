@@ -49,3 +49,13 @@ diagnostic is planned, not live.
 - The agent DLL stays loaded until the process exits, even after `DestroyAgent`.
 - Header changes on clang-cl builds may miss compilands whose included headers contain no code,
   until WP-15 adds include tracking for clang-cl (ADR-0013).
+- A dynamic initialiser of a new global in a patch that faults (access violation, C++ exception)
+  is caught and reported as CML4209, and the patch stays loaded. Recovery from a *stack overflow*
+  inside such an initialiser is best effort (`_resetstkoflw`): it is not covered by a test, because a real
+  overflow in the test host crashed one CI cell (WP-08). If the stack cannot be restored, the
+  agent refuses to run further initialisers on that thread; hot-restart.
+- Patch DLLs never appear in the module list the agent sends to the broker (WP-08).
+- A *static* (TU-private) function whose parameter types change, keeping its name, is matched to
+  its old namesake (the PDB carries no signatures for the planner yet; ADR-0029). Callers inside
+  the patched TU are recompiled and are fine; an old function pointer to it held elsewhere would
+  be called with the old signature. Rename the function when changing its signature, or hot-restart.

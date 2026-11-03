@@ -157,7 +157,7 @@ WP-27 perf suite.
 
 ## ADR-0010 Open issue: matching obj symbols of statics to PDB symbols
 
-**Date:** 2026-10-25 · **Status:** Open (WP-03 spike to inform, WP-07 to decide)
+**Date:** 2026-10-25 · **Status:** Settled by WP-07 — see ADR-0029
 
 Plan §4.5 keys statics by (mangled name, object file). Module symbol records (`S_LPROC32`,
 `S_LDATA32`) carry display names, not the obj's decorated names, and statics have no
@@ -469,3 +469,84 @@ the in-place 64-bit addend.
 - **MSVC STL vs older clang:** STL 14.44+ rejects clang < 19 (STL1000) unless
   `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` is defined. This affects users on clang 17/18 with
   current MSVC.
+
+## ADR-0027 Patch linker mirrors the module's linker; lld-link is not the default (plan §13 Q2)
+
+**Date:** 2026-10-25 · **Status:** Accepted · **Source:** WP-09 CI measurements (PR #17)
+
+WP-09 timed the `basic` patch link with both linkers on the same objects in all 8 matrix cells (median of 5 links after a warm-up; full table in `docs/wp/WP-09.md`). link.exe was faster in every cell, by 4–16 ms. Every median was 26–46 ms, far inside the 300 ms budget.
+
+**Decision.** The patch is linked with the family that linked the module. The family is detected from the module PDB's `* Linker *` compiland, cross-checked with the PE. A user override exists. lld-link has no speed advantage that would justify the cost of mixing toolchains.
+
+**Related facts:**
+- `/IGNORE:4001,4254,4281` is not passed by default. Neither linker printed anything without it. It remains available.
+- link.exe warns LNK4210 (".CRT section exists") for patches with dynamic initialisers. The warning is surfaced as CML3357; the initialisers are run by the agent (WP-08, plan §4.10).
+- **lld-link 20.1.8 crash.** lld-link 20.1.8 crashes (0xC0000005) linking a single anchored clang-cl object with `/DEBUG:FULL /NODEFAULTLIB` and nothing else. This happens when nothing is bound, e.g. the `new_function` fixture.
+  - Workaround: the driver always links a binding object. If it has no content, it is a pad object holding `__cml_binding_pad`.
+  - Re-check when the minimum LLVM moves.
+- **Correction to WP-04's notes.** link.exe also writes an `S_ENVBLOCK` into the `* Linker *` compiland, so an env block alone identifies no linker family.
+- **Optimisation flags the driver refuses (CML3360).** These would break section locators (ADR-0024) or the `/FIXED` base:
+  - `/OPT:REF`, `/OPT:ICF[=n]`, `/OPT:SAFEICF`;
+  - `/PROFILE`, `/INCREMENTAL`, `/DYNAMICBASE`, `/FIXED:NO`, `/FORCE*`.
+
+  The driver also refuses `/DEBUG:NONE` and `/DEBUG:FASTLINK`, because the patch PDB must be full.
+
+## ADR-0028 Associative sections get a locator on demand (amends ADR-0024)
+
+**Date:** 2026-10-25 · **Status:** Accepted · **Source:** WP-07 CI evidence (PR #19)
+
+ADR-0024 said associative sections never need retargeting. That is wrong for cl. EH funclets
+live in `.text$x` associative COMDATs, and the funclet of a function with a thread-safe local
+static references the bound guard `$TSS0`.
+
+**Decision.**
+- The bind plan lists `associative_locator_sections`: the associative sections that contain a
+  site needing retargeting.
+- The patch pipeline (WP-12) passes them to `cml_coff::add_anchors` with
+  `AnchorOptions::anchor_associative`. Only those sections get an external anchor.
+- Cost: when the parent COMDAT is discarded as a duplicate, the child's anchor is undefined and
+  lld-link fails. Requesting anchors only for listed sections keeps that to the cases that need
+  it. If it happens, it surfaces as a link diagnostic, not a silent error.
+
+## ADR-0029 Matching statics, fix-up kinds and binding rules from WP-07 (settles ADR-0010)
+
+**Date:** 2026-10-25 · **Status:** Accepted · **Source:** WP-07 (PR #19), `docs/wp/WP-07.md`
+
+**Matching obj statics to PDB records (ADR-0010).**
+- Match by display name within the same compiland, **only with an identical scope**: the same
+  enclosing function, or file scope.
+- If no record has the same scope, the symbol is new. There is no fallback to other scopes.
+- Same-scope, same-name groups (overloads) are resolved only by exact qualified name or, for
+  data, by the RVA the unchanged section layout predicts. Anything else is CML3214. Groups are
+  never paired by position.
+- cl records the guard `$TSS0` in the PDB. clang-cl does not, so the planner infers it from the
+  unchanged layout, or uses a fresh guard plus warning CML3211.
+- Name spellings differ:
+  - cl spells local scopes with quotes and block numbers, and lambdas with a hash;
+  - clang-cl names internal data with plain identifiers.
+- **Gap:** cml_pdb has no type access, so a static function whose parameter types changed still
+  matches its single same-named predecessor (KNOWN_LIMITATIONS).
+
+**Binding rules.**
+- Read-only data (no `MEM_WRITE`) is always patch-fresh. Its address changes across a patch.
+- Every REL32 reference to a bind-to-old function (call or `lea`) is retargeted directly to the
+  old function's address, so pointer identity matches old code.
+- Thunks remain for ADDR32NB and for targets out of REL32 range (`thunk_fallback`).
+- Data reachable only by REL32 from another module more than 2 GiB away is rejected at plan time
+  with CML3205.
+
+**New fix-up kind `SecRel32`.**
+- Every thread-safe function-local static reads the CRT's `_Init_thread_epoch` through a SECREL
+  relocation. The value is the target's offset inside its old image section, computed by the
+  broker.
+- WP-08's wire kinds are Rel32, Addr64 and SlotWrite. **WP-12 must add a plain 32-bit write kind
+  to ApplyFixups**, or the broker must pre-apply the value. Without it, no patch with a
+  function-local static can load.
+
+**CRT functions the old image never linked** (for example `strlen` in `new_global`) resolve
+from other modules' exports, step 5 of the resolution chain. WP-12's real `ProcessModules` must
+include ntdll and ucrtbase.
+
+**Hook narrowing.** The planner hooks every defined function present in the old image: up to 83
+for STL-heavy TUs. WP-12 narrows the hook list to changed functions by comparing function bytes,
+or the COMDAT checksum, against the old image.
