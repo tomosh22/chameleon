@@ -1,0 +1,8 @@
+Dear ImGui (MIT, see LICENSE.txt)
+upstream:  https://github.com/ocornut/imgui
+tag:       v1.93.0
+commit:    c1aaac65e896a45f81f47a4d68f9959e0f86c859
+kept:      imgui*.cpp/.h, imstb_*.h, imconfig.h, backends/imgui_impl_win32.*, backends/imgui_impl_dx11.*, LICENSE.txt
+removed:   imgui_demo.cpp, docs/, examples/, misc/, other backends
+users:     broker/cml_gui (placeholder), broker/cml_ui (WP-19, ADR-0033)
+note:      vendored by WP-01 at v1.93.0; WP-19 kept that pin (the brief named v1.91.5, which is older and has no API this code needs).
