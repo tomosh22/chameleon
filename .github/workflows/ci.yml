@@ -142,6 +142,20 @@ jobs:
           & "$env:BUILD_DIR/bin/cml_broker.exe" --version *>&1 | Tee-Object -FilePath "$env:LOG_DIR/broker-version.txt"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # WP-19: the broker UI's self-test (also registered as ctest ui.self_test). It starts the broker it is given on
+      # private pipes, connects, runs `status`, drives the view model and checks the command table; no window.
+      # The CMLUI_SELFTEST line in this log is the evidence docs/wp/WP-19.md quotes.
+      - name: cml_ui --self-test (evidence)
+        run: |
+          $bin = Join-Path $PWD $env:BUILD_DIR
+          $bin = Join-Path $bin 'bin'
+          $out = Join-Path $PWD "$env:LOG_DIR/ui-self-test.txt"
+          $work = Join-Path $PWD "$env:LOG_DIR/ui-self-test"
+          $p = Start-Process -FilePath (Join-Path $bin 'cml_ui.exe') -Wait -PassThru -NoNewWindow -RedirectStandardOutput $out `
+            -ArgumentList @('--self-test', '--broker', (Join-Path $bin 'cml_broker.exe'), '--work-dir', $work)
+          Get-Content $out
+          if ($p.ExitCode -ne 0) { exit $p.ExitCode }
+
       # WP-04: what cml_pdb indexes for the fixture built by this cell's compiler. The log is the
       # evidence docs/wp/WP-04.md quotes (S_ENVBLOCK vs S_BUILDINFO, names of statics/templates).
       - name: cml_pdb_dump of fixture_basic (evidence)
