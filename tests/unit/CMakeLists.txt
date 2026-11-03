@@ -29,7 +29,7 @@ function(cml_add_unit_test name)
 endfunction()
 
 cml_add_unit_test(util
-    SOURCES util/test_diag.cpp util/test_result.cpp util/test_log.cpp util/test_hash.cpp util/test_path.cpp
+    SOURCES util/test_diag.cpp util/test_result.cpp util/test_log.cpp util/test_hash.cpp util/test_path.cpp util/test_format.cpp
     LIBS cml_util)
 if(NOT MSVC)
     find_package(Threads REQUIRED)

@@ -11,6 +11,7 @@
 #include "cml/proc/diag_ids.h"
 #include "cml/proc/loader_diag_ids.h"
 #include "cml/proc/proc.h"
+#include "cml/util/format.h"
 #include "cml/util/log.h"
 #include "image_writer.h"
 
@@ -26,16 +27,6 @@ constexpr std::uint64_t kMaxImageSize = 1ull << 30;
 constexpr std::uint64_t kDefaultReach = 1536ull << 20;
 constexpr std::size_t kMaxAllocationsPerRange = 4096;
 constexpr std::size_t kMaxRegionsPerAllocation = 4096;
-
-std::string hex(std::uint64_t value) {
-    static const char kDigits[] = "0123456789abcdef";
-    std::string s;
-    do {
-        s.insert(s.begin(), kDigits[value & 0xF]);
-        value >>= 4;
-    } while (value != 0);
-    return "0x" + s;
-}
 
 unsigned long long ull(std::uint64_t v) {
     return static_cast<unsigned long long>(v);
@@ -306,26 +297,17 @@ Result<void> PatchLoader::detach_range(const AddressRange& range) {
     return {};
 }
 
-// After a failed or undone load: reserve again whatever part of `range` is free and own it.
+// After a failed or undone load: reserve again whatever part of `range` is free and own it. The free parts come from
+// proc::query_free_regions (FU-10), which clips to the range and aligns inwards to the 64 KiB granule, as the loop that was here did.
 void PatchLoader::restore_reservation(const AddressRange& range) {
-    std::uint64_t address = range.base;
-    while (address < range.end()) {
-        MEMORY_BASIC_INFORMATION info;
-        if (!query(address, &info)) {
-            return;
+    Result<std::vector<AddressRange>> free_regions = proc::query_free_regions(range.base, range.end());
+    if (!free_regions) {
+        return;  // the address space could not be scanned: nothing is re-reserved (as when VirtualQuery failed before)
+    }
+    for (const AddressRange& part : *free_regions) {
+        if (reserve_at(part.base, part.size)) {
+            owned_add(part);
         }
-        const std::uint64_t region_end = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
-        if (region_end <= address) {
-            return;
-        }
-        if (info.State == MEM_FREE) {
-            const std::uint64_t from = proc::align_up(address, kGranule);
-            const std::uint64_t to = proc::align_down(std::min(region_end, range.end()), kGranule);
-            if (from < to && reserve_at(from, to - from)) {
-                owned_add({from, to - from});
-            }
-        }
-        address = region_end;
     }
 }
 
@@ -536,6 +518,11 @@ Result<void> PatchLoader::try_load_candidate(const ipc::PatchCandidate& candidat
                         " is not inside address space reserved by the agent",
                     "Reserve a block with ReserveRange and link the patch at a base inside it.");
     }
+    // Every failure after the range was released ends the same way: the range is ours again (FU-10: one helper).
+    const auto give_range_back = [&] {
+        owned_remove(range);
+        restore_reservation(range);
+    };
     // 1. Release exactly the image range. From here until LoadLibraryExW returns, other threads of
     //    the process may take it.
     Result<void> detached = detach_range(range);
@@ -564,8 +551,7 @@ Result<void> PatchLoader::try_load_candidate(const ipc::PatchCandidate& candidat
             VirtualFree(squatter, 0, MEM_RELEASE);
             squatter = nullptr;
         }
-        owned_remove(range);
-        restore_reservation(range);
+        give_range_back();
         if (taken || error == ERROR_INVALID_ADDRESS || error == ERROR_ILLEGAL_DLL_RELOCATION ||
             error == ERROR_NOT_ENOUGH_MEMORY) {
             return make(ids::kLoaderRangeTaken,
@@ -587,8 +573,7 @@ Result<void> PatchLoader::try_load_candidate(const ipc::PatchCandidate& candidat
         if (!FreeLibrary(module)) {
             CML_LOG(Warn, "FreeLibrary failed after a base mismatch (error %lu)", GetLastError());
         }
-        owned_remove(range);
-        restore_reservation(range);
+        give_range_back();
         return make(ids::kLoaderBaseMismatch,
                     candidate.path + " loaded at " + hex(loaded_at) + " instead of " + hex(candidate.image_base),
                     "The patch must be linked with /FIXED /BASE:<the reserved address>; relink it.");
@@ -598,8 +583,7 @@ Result<void> PatchLoader::try_load_candidate(const ipc::PatchCandidate& candidat
         if (!FreeLibrary(module)) {
             CML_LOG(Warn, "FreeLibrary failed after an image mismatch (error %lu)", GetLastError());
         }
-        owned_remove(range);
-        restore_reservation(range);
+        give_range_back();
         return make(ids::kLoaderImageMismatch, candidate.path + ": " + why,
                     "Send the SizeOfImage of the DLL that was actually linked.");
     }

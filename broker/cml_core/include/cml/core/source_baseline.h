@@ -45,6 +45,10 @@ struct FileStamp {
     long long mtime = 0;
 };
 
+// Size and modification time of a file (the cheap "unchanged" test); false when it cannot be read. Shared with the export
+// cache of module_symbols.cpp (FU-10).
+bool stat_file(const std::string& path, std::uint64_t* size, long long* mtime);
+
 class SourceBaseline {
 public:
     // Hashes every existing file of `files` (a file that cannot be read gets a warning and is not tracked).

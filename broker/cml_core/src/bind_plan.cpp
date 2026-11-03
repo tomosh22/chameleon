@@ -12,6 +12,7 @@
 #include "cml/coff/writer.h"
 #include "cml/core/bind_diag_ids.h"
 #include "cml/core/bind_names.h"
+#include "cml/util/format.h"
 #include "cml/util/log.h"
 
 namespace cml::core::bind {
@@ -124,12 +125,6 @@ bool starts_with(std::string_view s, std::string_view prefix) noexcept {
 }
 
 constexpr std::uint32_t kNone32 = 0xFFFFFFFFu;
-
-std::string hex(std::uint64_t v) {
-    char buf[32];
-    std::snprintf(buf, sizeof buf, "0x%llx", static_cast<unsigned long long>(v));
-    return buf;
-}
 
 // ---------------------------------------------------------------------------------------------
 // The planner

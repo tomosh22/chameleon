@@ -19,6 +19,7 @@
 #include "cml/core/pipeline_diag_ids.h"
 #include "cml/toolchain/rewrite.h"
 #include "cml/util/hash.h"
+#include "cml/util/format.h"
 #include "cml/util/log.h"
 #include "cml/util/path.h"
 
@@ -159,12 +160,6 @@ public:
 private:
     Clock::time_point t_;
 };
-
-std::string hex(std::uint64_t v) {
-    char buf[32];
-    std::snprintf(buf, sizeof buf, "0x%llx", static_cast<unsigned long long>(v));
-    return buf;
-}
 
 // The id of a refusal by the agent: its own diagnostic number when it is a valid one (CML42xx, CML43xx, ...),
 // otherwise CML5307/CML5308.
