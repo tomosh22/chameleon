@@ -13,7 +13,13 @@
 //      module+offset (SuspendThread returns the previous count, GetThreadContext reads the RIP,
 //      ResumeThread puts the count back),
 //   3. writes a minidump (thread info, handle data, unloaded modules) into the dump directory,
-//   4. terminates the parent with exit code 3 and exits with 3.
+//   4. runs cdb.exe on that dump, when cdb is installed, to print a symbolised stack of EVERY thread
+//      (`cdb -z <dump> -y <exe dir>[;%_NT_SYMBOL_PATH%] -c "~*kn;q"`; the test executable's PDB sits next
+//      to it). cdb writes straight to the helper's stderr, so a part of the output survives if ctest
+//      kills the tree first. It is bounded by CML_HANG_CDB_BUDGET_S (default 15 s) and found through
+//      CML_CDB_EXE, WindowsSdkDir, Program Files\Windows Kits\10 and PATH. Without cdb the lines of 2
+//      are all there is (the output says so),
+//   5. terminates the parent with exit code 3 and exits with 3.
 // Lines start with "HANGWATCH:" and go to the helper's stderr, which is the parent's stderr (inherited),
 // so ctest and the CI log show them.
 //
@@ -126,7 +132,8 @@ void report_threads(DWORD pid) {
     std::fprintf(stderr, "HANGWATCH: %u thread(s)\n", count);
 }
 
-void write_dump(HANDLE process, DWORD pid, const char* directory) {
+// Returns true and the path of the dump in `path_out` when a dump was written.
+bool write_dump(HANDLE process, DWORD pid, const char* directory, char* path_out, std::size_t path_capacity) {
     using WriteDumpFn = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION,
                                       PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION);
     HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
@@ -135,7 +142,7 @@ void write_dump(HANDLE process, DWORD pid, const char* directory) {
                                           : nullptr;
     if (write == nullptr) {
         std::fprintf(stderr, "HANGWATCH: MiniDumpWriteDump is not available; no dump written\n");
-        return;
+        return false;
     }
     CreateDirectoryA(directory, nullptr);
     char path[MAX_PATH + 64];
@@ -143,7 +150,7 @@ void write_dump(HANDLE process, DWORD pid, const char* directory) {
     HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
         std::fprintf(stderr, "HANGWATCH: cannot create %s (Win32 error %lu)\n", path, GetLastError());
-        return;
+        return false;
     }
     const auto type = static_cast<MINIDUMP_TYPE>(MiniDumpWithThreadInfo | MiniDumpWithHandleData |
                                                  MiniDumpWithUnloadedModules);
@@ -152,9 +159,116 @@ void write_dump(HANDLE process, DWORD pid, const char* directory) {
     CloseHandle(file);
     if (ok) {
         std::fprintf(stderr, "HANGWATCH: minidump written to %s\n", path);
+        std::snprintf(path_out, path_capacity, "%s", path);
     } else {
         std::fprintf(stderr, "HANGWATCH: MiniDumpWriteDump failed (Win32 error %lu)\n", error);
     }
+    return ok != FALSE;
+}
+
+bool file_exists(const char* path) {
+    const DWORD attributes = GetFileAttributesA(path);
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+// Where cdb.exe is, or false. Looked for in the order: CML_CDB_EXE, the Windows SDK the build
+// environment points at (WindowsSdkDir), the default Windows Kits install, PATH.
+bool find_cdb(char* out, std::size_t capacity) {
+    char value[MAX_PATH] = {};
+    DWORD n = GetEnvironmentVariableA("CML_CDB_EXE", value, sizeof(value));
+    if (n > 0 && n < sizeof(value) && file_exists(value)) {
+        std::snprintf(out, capacity, "%s", value);
+        return true;
+    }
+    n = GetEnvironmentVariableA("WindowsSdkDir", value, sizeof(value));
+    if (n > 0 && n < sizeof(value)) {
+        const bool slash = value[n - 1] == '\\' || value[n - 1] == '/';
+        std::snprintf(out, capacity, "%s%sDebuggers\\x64\\cdb.exe", value, slash ? "" : "\\");
+        if (file_exists(out)) {
+            return true;
+        }
+    }
+    for (const char* variable : {"ProgramFiles(x86)", "ProgramFiles"}) {
+        n = GetEnvironmentVariableA(variable, value, sizeof(value));
+        if (n > 0 && n < sizeof(value)) {
+            std::snprintf(out, capacity, "%s\\Windows Kits\\10\\Debuggers\\x64\\cdb.exe", value);
+            if (file_exists(out)) {
+                return true;
+            }
+        }
+    }
+    return SearchPathA(nullptr, "cdb.exe", nullptr, static_cast<DWORD>(capacity), out, nullptr) > 0;
+}
+
+// Runs cdb on the dump and lets it print the symbolised stack of every thread ("~*kn") to this
+// process's stderr. Gives up on it after the budget.
+void run_cdb(HANDLE parent, const char* dump) {
+    char cdb[MAX_PATH] = {};
+    if (!find_cdb(cdb, sizeof(cdb))) {
+        std::fprintf(stderr, "HANGWATCH: cdb.exe not found; no symbolised stacks (the lines above and the dump are all there is)\n");
+        return;
+    }
+    // The test executable's PDB is next to the executable.
+    char image[MAX_PATH] = {};
+    char directory[MAX_PATH] = ".";
+    if (GetModuleFileNameExA(parent, nullptr, image, sizeof(image)) > 0) {
+        std::snprintf(directory, sizeof(directory), "%s", image);
+        char* slash = std::strrchr(directory, '\\');
+        if (slash != nullptr) {
+            *slash = '\0';
+        }
+    }
+    char symbols[2 * MAX_PATH] = {};
+    char configured[MAX_PATH] = {};
+    const DWORD n = GetEnvironmentVariableA("_NT_SYMBOL_PATH", configured, sizeof(configured));
+    if (n > 0 && n < sizeof(configured)) {
+        std::snprintf(symbols, sizeof(symbols), "%s;%s", directory, configured);
+    } else {
+        std::snprintf(symbols, sizeof(symbols), "%s", directory);
+    }
+    unsigned long budget_s = 15;
+    char text[16] = {};
+    const DWORD b = GetEnvironmentVariableA("CML_HANG_CDB_BUDGET_S", text, sizeof(text));
+    if (b > 0 && b < sizeof(text)) {
+        const unsigned long value = std::strtoul(text, nullptr, 10);
+        if (value > 0) {
+            budget_s = value;
+        }
+    }
+
+    static char command[8 * MAX_PATH];
+    std::snprintf(command, sizeof(command), "\"%s\" -z \"%s\" -y \"%s\" -i \"%s\" -lines -c \"~*kn;q\"", cdb, dump,
+                  symbols, directory);
+    HANDLE out = GetStdHandle(STD_ERROR_HANDLE);
+    if (out != nullptr && out != INVALID_HANDLE_VALUE) {
+        SetHandleInformation(out, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    }
+    STARTUPINFOA startup = {};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = INVALID_HANDLE_VALUE;
+    startup.hStdOutput = out;
+    startup.hStdError = out;
+    PROCESS_INFORMATION info = {};
+    std::fprintf(stderr, "HANGWATCH: cdb stacks begin (%s, symbols %s, budget %lu s)\n", cdb, symbols, budget_s);
+    std::fflush(stderr);
+    if (!CreateProcessA(nullptr, command, nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &info)) {
+        std::fprintf(stderr, "HANGWATCH: cdb stacks end: cannot start cdb (Win32 error %lu)\n", GetLastError());
+        return;
+    }
+    CloseHandle(info.hThread);
+    if (WaitForSingleObject(info.hProcess, static_cast<DWORD>(budget_s * 1000UL)) != WAIT_OBJECT_0) {
+        TerminateProcess(info.hProcess, 1);
+        WaitForSingleObject(info.hProcess, 5000);
+        std::fprintf(stderr, "\nHANGWATCH: cdb stacks end: cdb did not finish within %lu s; its output above is partial\n",
+                     budget_s);
+    } else {
+        DWORD code = 0;
+        GetExitCodeProcess(info.hProcess, &code);
+        std::fprintf(stderr, "\nHANGWATCH: cdb stacks end: cdb exit code %lu\n", static_cast<unsigned long>(code));
+    }
+    std::fflush(stderr);
+    CloseHandle(info.hProcess);
 }
 
 int watch(DWORD pid, unsigned long timeout_s, const char* directory) {
@@ -176,7 +290,10 @@ int watch(DWORD pid, unsigned long timeout_s, const char* directory) {
     std::fflush(stderr);
     load_modules(parent);
     report_threads(pid);
-    write_dump(parent, pid, directory);
+    char dump_path[MAX_PATH + 64] = {};
+    if (write_dump(parent, pid, directory, dump_path, sizeof(dump_path))) {
+        run_cdb(parent, dump_path);
+    }
     std::fprintf(stderr, "HANGWATCH: terminating process %lu with exit code %d\n", static_cast<unsigned long>(pid),
                  kExitCode);
     std::fflush(stderr);

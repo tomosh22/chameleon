@@ -127,6 +127,19 @@ TEST_CASE("the out-of-process hang watchdog reports every thread of a process wh
     CHECK(output.find("ntdll.dll+0x") != std::string::npos);  // RIP resolved to module+offset
     CHECK(output.find("minidump written to") != std::string::npos);
 
+    // With cdb.exe installed the watcher prints a symbolised stack of every thread, from the dump and the
+    // helper's PDB: the victim's sleeper threads are named. Without cdb it says so (no failure: a runner
+    // need not have the debugger tools).
+    if (output.find("cdb stacks begin") != std::string::npos) {
+        if (output.find("cdb stacks end: cdb exit code") != std::string::npos) {
+            CHECK_MESSAGE(output.find("sleeper") != std::string::npos, "cdb ran but no stack names the sleeper threads");
+        } else {
+            MESSAGE("cdb did not finish within its budget on this machine; symbolised stacks not checked");
+        }
+    } else {
+        CHECK(output.find("cdb.exe not found") != std::string::npos);
+    }
+
     const std::string dump = directory + "\\cml_hang_" + std::to_string(victim.pid) + ".dmp";
     const DWORD attributes = GetFileAttributesA(dump.c_str());
     CHECK_MESSAGE(attributes != INVALID_FILE_ATTRIBUTES, "no dump at " << dump);
