@@ -56,6 +56,12 @@ diagnostic is planned, not live.
   application registers later as first runs before ours. At most 8 threads are held at once; a ninth fault is passed on. A held
   thread that owns the loader lock blocks patch loading until it is released. With a debugger attached nothing is held unless
   `break_with_debugger` is set. `subscribe` with an empty `events` array means the default set.
+- Patch revert (WP-22): the unit of revert is one reload (`last` undoes every patch of the newest reload; modules that reload
+  did not touch keep their patches). Patch DLLs stay loaded and the globals a reverted patch created stay alive, unused. No
+  pre/post-patch hooks run around a revert; a hook already running from a reverted patch finishes. The reverted files stay
+  changed on disk, so the next reload recompiles them. A module freed and reloaded at the same base and path is not detected as a
+  different instance. A partial multi-module revert answers ok with `partial`/`failed` and a CML5854 diag event. Session reset
+  (unloading patch DLLs) is not implemented.
 - `unload_patch` (WP-17) waits up to 10 s for a hook that is still running and then refuses (CML4212, patch stays hidden); in
   synchronised mode that stalls the agent thread meanwhile.
 - A thread that runs an application hook (the agent thread, or an application thread at `cml_sync_point`) gets a 64 KB stack

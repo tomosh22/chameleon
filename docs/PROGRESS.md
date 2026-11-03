@@ -23,12 +23,12 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-16 | Multiple modules and multiple processes | 5 | done (FU-12, FU-15 closed) | wp/16-multi-module-process | #25 | — |
 | WP-17 | Pre/post patch hooks, compile hooks, synchronised mode | 5 | done (FU-06, FU-14 closed) | wp/17-hooks-sync | #29 | — |
 | WP-18 | Diagnostics pass and build-requirement checks | 5 | done | wp/18-diagnostics | #31 | — |
-| WP-19 | ImGui broker UI (`cml_ui`, ADR-0033) | 6 | in progress | wp/19-imgui-broker-ui | — | — |
+| WP-19 | ImGui broker UI (`cml_ui`, ADR-0033) | 6 | in review (fixing medium-review items) | wp/19-imgui-broker-ui | #33 | — |
 | WP-20 | Crash → patch → continue | 6 | done (breakpoints deferred) | wp/20-crash-patch-continue | #34 | — |
-| WP-21 | Hot-restart | 6 | in progress | wp/21-hot-restart | — | — |
-| WP-22 | Patch revert | 6 | in review | wp/22-patch-revert | #35 | — |
+| WP-21 | Hot-restart | 6 | in review (fixing high-review items) | wp/21-hot-restart | #36 | — |
+| WP-22 | Patch revert (session reset deferred) | 6 | done | wp/22-patch-revert | #35 | — |
 | WP-24 | Thread-local variables | 6 | in progress | wp/24-thread-local | — | — |
-| WP-25 | Unchanged-function elision (scope narrowed: WP-12 narrowing exists; see brief) | 6 | todo | wp/25-unchanged-elision | — | WP-22 |
+| WP-25 | Unchanged-function elision (scope narrowed: WP-12 narrowing exists; see brief) | 6 | in progress | wp/25-unchanged-elision | — | — |
 
 ## Orchestrator integration work
 
