@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <set>
 #include <thread>
 
 #include "cml/core/pipeline_diag_ids.h"
@@ -68,6 +69,14 @@ ReloadService::ReloadService(PipelineEnv env, EventBus* events, std::string sess
 
 ReloadService::~ReloadService() {
     cancel_.cancel();
+    {
+        std::shared_ptr<SaveWatcher> watcher;
+        {
+            std::lock_guard<std::mutex> lock(watch_mutex_);
+            watcher.swap(save_watcher_);
+        }
+        watcher.reset();  // joins its thread (a running reload was cancelled above)
+    }
     std::map<std::uint64_t, AgentEntry> agents;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -124,6 +133,7 @@ void ReloadService::detach(std::uint64_t agent_id) {
         agents_.erase(it);
     }
     entry.modules.clear();  // index threads are joined here, outside the lock
+    rearm_save_watcher();
 }
 
 void ReloadService::on_session_changed(std::uint64_t agent_id) {
@@ -179,7 +189,11 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
             }
         }
     }
+    const bool any_dropped = !dropped.empty();
     dropped.clear();  // joins their threads
+    if (any_dropped) {
+        rearm_save_watcher();
+    }
     for (const auto& c : created) {
         std::shared_ptr<ModuleState> state;
         {
@@ -198,7 +212,10 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
         spec.module_path = state->path;
         spec.baseline.track_system = options.track_system_headers;
         const std::string name = state->name;
-        spec.on_change = [name](const IndexStatus& s) {
+        spec.on_change = [this, name](const IndexStatus& s) {
+            if (s.state == IndexState::Ready) {
+                rearm_save_watcher();  // its tracked files are known now (compile-on-save)
+            }
             if (s.state == IndexState::Failed) {
                 CML_LOG(Warn, "index of %s failed: %s", name.c_str(), s.error ? s.error->format().c_str() : "unknown error");
             } else {
@@ -206,7 +223,12 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
             }
         };
         CML_LOG(Info, "module %s enabled in process %u: loading its PDB index", state->name.c_str(), snap.pid);
-        state->index = ModuleIndex::start(std::move(spec));
+        {
+            std::shared_ptr<ModuleIndex> index = ModuleIndex::start(std::move(spec));
+            std::lock_guard<std::mutex> state_lock(state->mutex);  // tracked_files() reads it from the watcher's threads
+            state->index = std::move(index);
+        }
+        rearm_save_watcher();  // the index may have become ready before it was stored
     }
 }
 
@@ -380,6 +402,93 @@ Result<Value> ReloadService::reload(const Value& args) {
     return result;
 }
 
+// ---- compile on save (WP-14) -----------------------------------------------------------------------------------
+
+std::vector<std::string> ReloadService::tracked_files() const {
+    std::vector<std::shared_ptr<ModuleState>> modules;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& a : agents_) {
+            for (const auto& m : a.second.modules) {
+                modules.push_back(m.second);
+            }
+        }
+    }
+    std::set<std::string> files;
+    for (const std::shared_ptr<ModuleState>& m : modules) {
+        std::shared_ptr<ModuleIndex> index;
+        {
+            std::lock_guard<std::mutex> lock(m->mutex);
+            index = m->index;
+        }
+        if (index && index->status().state == IndexState::Ready) {
+            for (std::string& f : index->tracked_files()) {
+                files.insert(std::move(f));
+            }
+        }
+    }
+    return std::vector<std::string>(files.begin(), files.end());
+}
+
+SaveWatcherHooks::ReloadResult ReloadService::reload_for_save() {
+    if (running_.load()) {
+        return SaveWatcherHooks::ReloadResult::Busy;
+    }
+    Result<Value> r = reload(Value::object());
+    if (r) {
+        return SaveWatcherHooks::ReloadResult::Done;
+    }
+    return r.error().code == pd::kBusy ? SaveWatcherHooks::ReloadResult::Busy : SaveWatcherHooks::ReloadResult::Failed;
+}
+
+void ReloadService::apply_compile_on_save(bool on) {
+    std::shared_ptr<SaveWatcher> old;
+    std::shared_ptr<SaveWatcher> created;
+    {
+        std::lock_guard<std::mutex> lock(watch_mutex_);
+        if (!on) {
+            old.swap(save_watcher_);
+        } else if (!save_watcher_) {
+            SaveWatcherHooks hooks;
+            hooks.tracked_files = [this] { return tracked_files(); };
+            hooks.reload = [this] { return reload_for_save(); };
+            hooks.report = [this](const Diag& d, const char* severity) {
+                CML_LOG(Warn, "%s", d.format().c_str());
+                if (events_ != nullptr) {
+                    events_->publish(make_diag_event(d, severity, "watch"));
+                }
+            };
+            SaveWatcherOptions options;
+            options.factory = watcher_factory_;
+            save_watcher_ = std::make_shared<SaveWatcher>(std::move(hooks), std::move(options));
+            created = save_watcher_;
+        }
+    }
+    old.reset();  // joins outside the lock
+    if (created) {
+        CML_LOG(Info, "compile on save: on");
+        created->rearm();
+    } else if (!on) {
+        CML_LOG(Info, "compile on save: off");
+    }
+}
+
+void ReloadService::rearm_save_watcher() {
+    std::shared_ptr<SaveWatcher> watcher;
+    {
+        std::lock_guard<std::mutex> lock(watch_mutex_);
+        watcher = save_watcher_;
+    }
+    if (watcher) {
+        watcher->rearm();
+    }
+}
+
+void ReloadService::set_watcher_factory_for_testing(WatcherFactory factory) {
+    std::lock_guard<std::mutex> lock(watch_mutex_);
+    watcher_factory_ = std::move(factory);
+}
+
 // ---- wait ---------------------------------------------------------------------------------------------------
 
 Result<Value> ReloadService::wait(const Value& args) {
@@ -441,7 +550,7 @@ Result<Value> ReloadService::set_option(const Value& args) {
         return bad_request("set-option needs a string \"name\" and a \"value\"");
     }
     const std::string name = name_v->as_string();
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     ReloadOptions& o = options_;
     const auto want_bool = [&](bool* field) -> std::optional<Diag> {
         if (!value->is_bool()) {
@@ -466,6 +575,7 @@ Result<Value> ReloadService::set_option(const Value& args) {
     };
     Value previous;
     std::optional<Diag> error;
+    bool toggle = false;
     if (name == "narrow_hooks") {
         previous = Value::boolean(o.narrow_hooks);
         error = want_bool(&o.narrow_hooks);
@@ -515,6 +625,10 @@ Result<Value> ReloadService::set_option(const Value& args) {
     } else if (name == "linker_path") {
         previous = Value::string(o.linker_path);
         error = want_string(&o.linker_path);
+    } else if (name == "compile_on_save") {
+        previous = Value::boolean(o.compile_on_save);
+        error = want_bool(&o.compile_on_save);
+        toggle = true;
     } else if (name == "log_level") {
         static const char* const kNames[] = {"trace", "debug", "info", "warn", "error", "off"};
         previous = Value::string(kNames[static_cast<int>(log_level())]);
@@ -532,12 +646,17 @@ Result<Value> ReloadService::set_option(const Value& args) {
     } else {
         return bad_request("unknown option '" + name +
                            "'; options: narrow_hooks, release_pdb_after_reload, track_system_headers, max_parallel_compiles, agent_timeout_ms, "
-                           "hooks_timeout_ms, reserve_block_mb, reserve_blocks, max_load_attempts, linker, linker_path, log_level");
+                           "hooks_timeout_ms, reserve_block_mb, reserve_blocks, max_load_attempts, linker, linker_path, compile_on_save, log_level");
     }
     if (error) {
         return *error;
     }
     CML_LOG(Info, "option %s changed", name.c_str());
+    const bool compile_on_save = o.compile_on_save;
+    lock.unlock();  // the watcher's thread takes mutex_ (options()) while it reloads
+    if (toggle) {
+        apply_compile_on_save(compile_on_save);
+    }
     Value result = Value::object();
     result.set("name", Value::string(name));
     result.set("previous", std::move(previous));

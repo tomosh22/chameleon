@@ -20,6 +20,9 @@ const char* to_string(StepKind kind) {
         case StepKind::Reload: return "reload";
         case StepKind::ExpectDiag: return "expect_diag";
         case StepKind::ExpectMonotonic: return "expect_monotonic";
+        case StepKind::SetOption: return "set_option";
+        case StepKind::Wait: return "wait";
+        case StepKind::ExpectEvent: return "expect_event";
     }
     return "?";
 }
@@ -50,6 +53,18 @@ std::string Step::describe() const {
         case StepKind::ExpectDiag:
             out += " " + id + " within " + std::to_string(within_s) + " s";
             break;
+        case StepKind::SetOption:
+            out += " " + option + " = " +
+                   (option_kind == OptionKind::Bool ? (option_bool ? "true" : "false")
+                    : option_kind == OptionKind::Integer ? std::to_string(option_integer)
+                                                         : "\"" + option_string + "\"");
+            break;
+        case StepKind::Wait:
+            out += " for " + wait_for + " within " + std::to_string(within_s) + " s";
+            break;
+        case StepKind::ExpectEvent:
+            out += " " + event + " within " + std::to_string(within_s) + " s";
+            break;
     }
     return out;
 }
@@ -58,6 +73,9 @@ const char* Step::required_capability() const {
     switch (kind) {
         case StepKind::Reload: return cml::ipc::capability::kReload;
         case StepKind::ExpectDiag: return cml::ipc::capability::kDiagEvents;
+        case StepKind::SetOption: return cml::ipc::capability::kSetOption;
+        case StepKind::Wait: return cml::ipc::capability::kWait;
+        case StepKind::ExpectEvent: return cml::ipc::capability::kSubscribe;
         default: return nullptr;
     }
 }
@@ -221,9 +239,62 @@ cml::Result<Step> parse_step(const toml::Table& table) {
         step.min_samples = *samples;
         return step;
     }
+    if (*kind == "set_option") {
+        step.kind = StepKind::SetOption;
+        cml::Result<void> keys = only_keys(table, {"kind", "option", "value"}, "a set_option step");
+        if (!keys) return keys.error();
+        cml::Result<std::string> option = require_string(table, "option", "a set_option step");
+        if (!option) return option.error();
+        if (!name_chars_ok(*option, false)) return invalid(table.line, "'option' must be an option name (letters, digits, '_', '-')");
+        step.option = *option;
+        const toml::Value* value = table.find("value");
+        if (value == nullptr) return invalid(table.line, "a set_option step needs the key 'value'");
+        switch (value->kind) {
+            case toml::Value::Kind::Boolean:
+                step.option_kind = Step::OptionKind::Bool;
+                step.option_bool = value->boolean;
+                break;
+            case toml::Value::Kind::Integer:
+                step.option_kind = Step::OptionKind::Integer;
+                step.option_integer = value->integer;
+                break;
+            case toml::Value::Kind::String:
+                step.option_kind = Step::OptionKind::String;
+                step.option_string = value->text;
+                break;
+        }
+        return step;
+    }
+    if (*kind == "wait") {
+        step.kind = StepKind::Wait;
+        cml::Result<void> keys = only_keys(table, {"kind", "for", "within_s"}, "a wait step");
+        if (!keys) return keys.error();
+        cml::Result<std::string> what = require_string(table, "for", "a wait step");
+        if (!what) return what.error();
+        if (*what != "index" && *what != "idle") return invalid(table.line, "'for' must be \"index\" or \"idle\"");
+        step.wait_for = *what;
+        cml::Result<int> within = int_in_range(table, "within_s", 60, 1, 3600);
+        if (!within) return within.error();
+        step.within_s = *within;
+        return step;
+    }
+    if (*kind == "expect_event") {
+        step.kind = StepKind::ExpectEvent;
+        cml::Result<void> keys = only_keys(table, {"kind", "event", "within_s"}, "an expect_event step");
+        if (!keys) return keys.error();
+        cml::Result<std::string> event = require_string(table, "event", "an expect_event step");
+        if (!event) return event.error();
+        if (!name_chars_ok(*event, false)) return invalid(table.line, "'event' must be an event name (letters, digits, '_', '-')");
+        step.event = *event;
+        cml::Result<int> within = int_in_range(table, "within_s", 10, 1, 3600);
+        if (!within) return within.error();
+        step.within_s = *within;
+        return step;
+    }
     (void)context;
     return invalid(table.line, "unknown step kind '" + *kind +
-                                   "' (launch, expect_stdout, expect_module_enabled, edit, reload, expect_diag, expect_monotonic)");
+                                   "' (launch, expect_stdout, expect_module_enabled, edit, reload, expect_diag, expect_monotonic, set_option, wait, "
+                                   "expect_event)");
 }
 
 }  // namespace

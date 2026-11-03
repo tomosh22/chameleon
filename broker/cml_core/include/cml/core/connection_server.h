@@ -31,6 +31,8 @@ struct ServerOptions {
     // under the temporary directory) and the compiler/linker it uses (null = the real ones).
     std::string session_dir;
     const PipelineEnv* pipeline_env = nullptr;
+    // WP-14: start with the compile_on_save option on (cml_broker --compile-on-save).
+    bool compile_on_save = false;
     std::uint32_t exit_when_idle_ms = 0;     // 0 = never; else exit this long after the last agent left
     std::uint32_t startup_timeout_ms = 0;     // 0 = never; else exit if no agent ever connected in time
     // Optional manual-reset event handle owned by the caller (never closed by the server). Setting

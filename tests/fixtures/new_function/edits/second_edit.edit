@@ -1,0 +1,10 @@
+--- a/logic.cpp
++++ b/logic.cpp
+@@ -6,6 +6,6 @@
+ }
+ 
+ int compute_value()
+ {
+-    return 1 + new_helper();
++    return 2 + new_helper();
+ }

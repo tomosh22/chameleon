@@ -1050,3 +1050,34 @@ TEST_CASE("patches applied before a later compiland failed still count in the ge
     CHECK(accepted[0].count("C:\\proj\\logic.cpp") == 1);
     CHECK(accepted[0].count("C:\\proj\\main.cpp") == 0);
 }
+
+TEST_CASE("set-option compile_on_save validates, reports the previous value and starts and stops the watcher (WP-14)") {
+    QuietLogs quiet;
+    Rig rig;
+    std::atomic<int> factory_calls{0};
+    rig.service->set_watcher_factory_for_testing(
+        [&](const std::vector<watch::WatchRoot>&, watch::DirectoryWatcher::Sink, std::vector<Diag>*) -> Result<std::unique_ptr<watch::DirectoryWatcher>> {
+            ++factory_calls;
+            return Diag::make(5503, "fake", "none");
+        });
+    rig.enable();
+    CHECK_FALSE(rig.service->options().compile_on_save);
+    Value args = Value::object();
+    args.set("name", Value::string("compile_on_save"));
+    args.set("value", Value::integer(1));  // wrong type
+    CHECK(rig.service->set_option(args).error().id() == "CML5311");
+    CHECK_FALSE(rig.service->options().compile_on_save);
+    args.set("value", Value::boolean(true));
+    Result<Value> on = rig.service->set_option(args);
+    REQUIRE(on.has_value());
+    CHECK(on->find("previous")->as_bool() == false);
+    CHECK(rig.service->options().compile_on_save);
+    // The synthetic PDB lists files that do not exist: nothing is tracked, so no directory is watched.
+    CHECK(factory_calls.load() == 0);
+    rig.service->rearm_save_watcher();  // harmless
+    args.set("value", Value::boolean(false));
+    Result<Value> off = rig.service->set_option(args);
+    REQUIRE(off.has_value());
+    CHECK(off->find("previous")->as_bool() == true);
+    CHECK_FALSE(rig.service->options().compile_on_save);
+}

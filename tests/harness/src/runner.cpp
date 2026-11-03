@@ -235,6 +235,9 @@ private:
             case StepKind::Reload: return reload(step);
             case StepKind::ExpectDiag: return expect_diag(step);
             case StepKind::ExpectMonotonic: return expect_monotonic(step);
+            case StepKind::SetOption: return set_option(step);
+            case StepKind::Wait: return wait_step(step);
+            case StepKind::ExpectEvent: return expect_event(step);
         }
         return StepOutcome::fail(cml::ids::kScenarioFailed, "unknown step kind");
     }
@@ -537,6 +540,77 @@ private:
             return StepOutcome::fail(checked.error());
         }
         return StepOutcome::pass(*checked);
+    }
+
+    // Control command `set-option` (WP-14: compile_on_save and the other run-time options).
+    StepOutcome set_option(const Step& step) {
+        ipc::json::Value args = ipc::json::Value::object();
+        args.set("name", ipc::json::Value::string(step.option));
+        switch (step.option_kind) {
+            case Step::OptionKind::Bool: args.set("value", ipc::json::Value::boolean(step.option_bool)); break;
+            case Step::OptionKind::Integer: args.set("value", ipc::json::Value::integer(step.option_integer)); break;
+            case Step::OptionKind::String: args.set("value", ipc::json::Value::string(step.option_string)); break;
+        }
+        cml::Result<ipc::ControlResponse> response = control_->call("set-option", std::move(args), kControlTimeoutMs);
+        if (!response) {
+            return StepOutcome::fail(response.error());
+        }
+        if (!response->ok) {
+            const ipc::ControlDiag& d = *response->diag;
+            return StepOutcome::fail(cml::ids::kSetOptionFailed, "set-option " + step.option + " failed: " + d.id + ": " + d.message + " What to do: " + d.action);
+        }
+        return StepOutcome::pass("option " + step.option + " set (previous " + ipc::json::serialize(response->result.find("previous") != nullptr ? *response->result.find("previous") : ipc::json::Value()) + ")");
+    }
+
+    // Control command `wait`: the indexes are loaded ("index") and no reload runs ("idle").
+    StepOutcome wait_step(const Step& step) {
+        const std::uint32_t limit_ms = std::min<std::uint32_t>(static_cast<std::uint32_t>(step.within_s) * 1000u, remaining_ms());
+        if (limit_ms == 0) {
+            return scenario_timeout();
+        }
+        ipc::json::Value args = ipc::json::Value::object();
+        args.set("for", ipc::json::Value::string(step.wait_for));
+        args.set("timeout_ms", ipc::json::Value::integer(limit_ms));
+        cml::Result<ipc::ControlResponse> response = control_->call("wait", std::move(args), limit_ms + 5000);
+        if (!response) {
+            return StepOutcome::fail(response.error());
+        }
+        if (!response->ok) {
+            const ipc::ControlDiag& d = *response->diag;
+            return StepOutcome::fail(cml::ids::kWaitFailed, "wait for " + step.wait_for + " failed: " + d.id + ": " + d.message + " What to do: " + d.action);
+        }
+        return StepOutcome::pass("waited for " + step.wait_for + " (" + std::to_string(response->result.get_integer("waited_ms")) + " ms)");
+    }
+
+    // An event of this name (patch_applied, ...) arrives; events of other names are consumed on the way.
+    StepOutcome expect_event(const Step& step) {
+        const std::uint32_t limit_ms = std::min<std::uint32_t>(static_cast<std::uint32_t>(step.within_s) * 1000u, remaining_ms());
+        const Clock::time_point until = Clock::now() + std::chrono::milliseconds(limit_ms);
+        std::string seen;
+        for (;;) {
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(until - Clock::now()).count();
+            const std::uint32_t slice = left <= 0 ? 0u : static_cast<std::uint32_t>(std::min<long long>(left, 250));
+            cml::Result<std::optional<ipc::ControlEvent>> event = control_->next_event(slice);
+            if (!event) {
+                return StepOutcome::fail(event.error());
+            }
+            if (*event) {
+                const ipc::ControlEvent& e = **event;
+                seen += (seen.empty() ? "" : ", ") + e.name;
+                if (e.name == step.event) {
+                    return StepOutcome::pass("event " + ipc::json::serialize(e.body));
+                }
+                continue;
+            }
+            if (left <= 0) {
+                if (limit_ms < static_cast<std::uint32_t>(step.within_s) * 1000u) {
+                    return scenario_timeout();
+                }
+                return StepOutcome::fail(cml::ids::kExpectEventTimeout,
+                                         "no '" + step.event + "' event within " + std::to_string(step.within_s) + " s (events seen: " +
+                                             (seen.empty() ? "none" : seen) + ")");
+            }
+        }
     }
 
     StepOutcome expect_diag(const Step& step) {

@@ -161,6 +161,16 @@ std::size_t SourceBaseline::size() const {
     return stamps_.size();
 }
 
+std::vector<std::string> SourceBaseline::files() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::string> out;
+    out.reserve(stamps_.size());
+    for (const auto& entry : stamps_) {
+        out.push_back(entry.first);
+    }
+    return out;
+}
+
 bool SourceBaseline::tracks(const std::string& path) const {
     std::lock_guard<std::mutex> lock(mutex_);
     return stamps_.count(path) != 0;

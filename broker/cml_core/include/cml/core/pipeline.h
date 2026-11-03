@@ -51,6 +51,7 @@ struct ReloadOptions {
     unsigned max_load_attempts = 3;            // relink at another base when the range was taken (CML4203)
     std::string linker_override;               // "link" | "lld-link" | "" (detect)
     std::string linker_path;                   // explicit linker binary
+    bool compile_on_save = false;              // WP-14: watch the tracked sources and reload when one is saved
 };
 
 // Replaceable effects.

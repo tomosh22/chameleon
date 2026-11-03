@@ -12,6 +12,7 @@
 //     `RELOAD-TIMING` line per patched module).
 //   * wait() blocks until the indexes are loaded and no reload runs.
 //   * set_option() changes ReloadOptions at run time and returns the previous value.
+//   * The option compile_on_save (WP-14) starts a SaveWatcher: a save of a tracked source runs a reload.
 //
 // Portable: the agent transport, compiler and linker are behind AgentLink and PipelineEnv.
 
@@ -28,6 +29,7 @@
 #include "cml/core/event_bus.h"
 #include "cml/core/module_state.h"
 #include "cml/core/pipeline.h"
+#include "cml/core/save_watcher.h"
 #include "cml/ipc/json.h"
 #include "cml/util/result.h"
 
@@ -62,6 +64,10 @@ public:
     ReloadOptions options() const;
     const std::string& session_dir() const noexcept { return session_dir_; }
     EventBus* events() const noexcept { return events_; }
+    // Re-derives the watched directories from the enabled modules' indices (no-op unless compile_on_save is on).
+    void rearm_save_watcher();
+    // Test seam: the directory watcher factory used by the next compile_on_save activation.
+    void set_watcher_factory_for_testing(WatcherFactory factory);
     // Aborts running compiles and links (shutdown); sticky.
     void cancel() { cancel_.cancel(); }
 
@@ -79,6 +85,9 @@ private:
     };
 
     Result<std::string> ensure_session_dir();
+    void apply_compile_on_save(bool on);
+    std::vector<std::string> tracked_files() const;
+    SaveWatcherHooks::ReloadResult reload_for_save();
     std::vector<Target> targets(std::uint32_t pid, const std::string& module) const;
 
     PatchPipeline pipeline_;
@@ -92,6 +101,10 @@ private:
     mutable std::mutex mutex_;  // agents_, options_
     std::map<std::uint64_t, AgentEntry> agents_;
     ReloadOptions options_;
+
+    std::mutex watch_mutex_;  // save_watcher_, watcher_factory_
+    std::shared_ptr<SaveWatcher> save_watcher_;
+    WatcherFactory watcher_factory_;
 
     std::mutex reload_mutex_;  // one reload at a time
     std::atomic<bool> running_{false};
