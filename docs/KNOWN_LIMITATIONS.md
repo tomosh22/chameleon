@@ -47,6 +47,15 @@ diagnostic is planned, not live.
   times. A hook deleted from the source keeps running (the old patch's records stay). `CML_PRERESTART_HOOK` is accepted but
   nothing calls it until hot-restart exists. Only a processor exception in a hook is contained, not state corruption; a hook must
   not call `DestroyAgent` (refused).
+- Crash handling (WP-20) holds a faulting thread only while a control client subscribes to `exception` and `crash_handler` is on,
+  only for access violations, integer divide-by-zero and illegal instructions, and only when the faulting address is in an enabled
+  module or a patch (a fault inside a system DLL such as `memcpy(nullptr)` in ucrtbase is passed on). Breakpoints are not handled.
+  Continue re-executes the faulting instruction with the registers it had, so it only helps when the patch changed what that
+  instruction touches (memory state), not a bad value already in a register. Leave function skips `__finally` blocks and
+  destructors of the frame it leaves and sets RAX/XMM0 to 0. No function name is reported for a fault inside a patch. A handler the
+  application registers later as first runs before ours. At most 8 threads are held at once; a ninth fault is passed on. A held
+  thread that owns the loader lock blocks patch loading until it is released. With a debugger attached nothing is held unless
+  `break_with_debugger` is set. `subscribe` with an empty `events` array means the default set.
 - `unload_patch` (WP-17) waits up to 10 s for a hook that is still running and then refuses (CML4212, patch stays hidden); in
   synchronised mode that stalls the agent thread meanwhile.
 - A thread that runs an application hook (the agent thread, or an application thread at `cml_sync_point`) gets a 64 KB stack
