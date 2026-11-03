@@ -7,6 +7,6 @@
 int main(int argc, char** argv)
 {
     return cml_fixture::run(argc, argv, [](int n) {
-        std::printf("TICK n=%d base=%d tmpl=%d text=%s chain=%d\n", n, elision_base(), elision_tmpl(), elision_text(), elision_outer());
+        std::printf("TICK n=%d base=%d tmpl=%d text=%s chain=%d\n", n, elision_base(), elision_tmpl(), elision_text(), elision_outer(0));
     });
 }

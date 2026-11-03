@@ -22,13 +22,14 @@ __declspec(noinline) const char* elision_text()
     return "alpha";
 }
 
-__declspec(noinline) int elision_inner()
+// Takes a value so that the optimiser cannot fold its result into the caller (it would then be the caller that changes).
+__declspec(noinline) int elision_inner(int x)
 {
-    return 5;
+    return x + 5;
 }
 
 // A small function that calls another: the call must still resolve to the same target.
-__declspec(noinline) int elision_outer()
+__declspec(noinline) int elision_outer(int x)
 {
-    return elision_inner() + 1;
+    return elision_inner(x) + 1;
 }
