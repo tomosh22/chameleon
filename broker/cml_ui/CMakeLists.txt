@@ -34,6 +34,9 @@ if(CML_BUILD_GUI AND WIN32)
     # imgui library target itself (relaxed in third_party/CMakeLists.txt).
     cml_apply_warnings(cml_ui)
     cml_target_exceptions_allowed(cml_ui)
+    if(MINGW)
+        target_link_options(cml_ui PRIVATE -municode)  # wWinMain (mingw-w64 syntax-check builds only)
+    endif()
     set_target_properties(cml_ui PROPERTIES FOLDER "broker")
     add_dependencies(cml_ui cml_broker)
 
