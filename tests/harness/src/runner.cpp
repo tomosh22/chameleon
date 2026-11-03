@@ -682,6 +682,8 @@ private:
                                              (seen.empty() ? "none" : seen) + ")");
             }
         }
+    }
+
     // An integer member of the most recent reload's result (WP-16: "compiled", "compile_reused", "processes", ...).
     StepOutcome expect_reload_result(const Step& step) {
         if (!has_reload_result_) {
