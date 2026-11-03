@@ -1,4 +1,4 @@
-// The WP-17 scenario keys (fixture_args, set_option, signal_fixture, reload expect_failure) and the checked-in
+// The WP-17 scenario keys (fixture_args, set_option, signal_fixture, reload expect_error) and the checked-in
 // sync_point scenarios.
 #include <filesystem>
 #include <string>
@@ -10,7 +10,7 @@
 
 using namespace cmltest;
 
-TEST_CASE("scenario: fixture_args, set_option, signal_fixture and reload expect_failure parse") {
+TEST_CASE("scenario: fixture_args, set_option, signal_fixture and reload expect_error parse") {
     const char* text = R"(
 name = "x"
 fixture = "sync_point"
@@ -24,7 +24,7 @@ value = 1500
 [[step]]
 kind = "reload"
 within_s = 30
-expect_failure = "CML5309"
+expect_error = "CML5309"
 [[step]]
 kind = "signal_fixture"
 )";
@@ -36,8 +36,8 @@ kind = "signal_fixture"
     CHECK(r->steps[1].option_value == 1500);
     CHECK(std::string(r->steps[1].required_capability()) == cml::ipc::capability::kSetOption);
     CHECK(r->steps[1].describe() == "set_option hooks_timeout_ms=1500");
-    CHECK(r->steps[2].expect_failure == "CML5309");
-    CHECK(r->steps[2].describe() == "reload within 30 s expecting failure CML5309");
+    CHECK(r->steps[2].expect_error == "CML5309");
+    CHECK(r->steps[2].describe() == "reload within 30 s expecting the refusal CML5309");
     CHECK(r->steps[3].kind == StepKind::SignalFixture);
     CHECK(r->steps[3].required_capability() == nullptr);
     CHECK(std::string(to_string(StepKind::SignalFixture)) == "signal_fixture");
@@ -64,9 +64,9 @@ TEST_CASE("scenario: bad WP-17 keys are CML5411") {
     invalid(head + launch + "kind = \"set_option\"\nname = \"a b\"\nvalue = 1\n");           // bad name
     invalid(head + launch + "kind = \"set_option\"\nvalue = 1\n");                           // name missing
     invalid(head + launch + "kind = \"signal_fixture\"\nwithin_s = 3\n");                    // unknown key
-    invalid(head + launch + "kind = \"reload\"\nexpect_failure = \"5309\"\n");               // not a diagnostic id
-    invalid(head + launch + "kind = \"reload\"\nexpect_failure = 5309\n");
-    invalid(head + launch + "kind = \"reload\"\nexpect_failure = \"CML5309\"\nexpect_result_key = \"a\"\nexpect_result_value = 1\n");
+    invalid(head + launch + "kind = \"reload\"\nexpect_error = \"5309\"\n");               // not a diagnostic id
+    invalid(head + launch + "kind = \"reload\"\nexpect_error = 5309\n");
+    invalid(head + launch + "kind = \"reload\"\nexpect_error = \"CML5309\"\nexpect_result_key = \"a\"\nexpect_result_value = 1\n");
 }
 
 TEST_CASE("the checked-in sync_point scenarios parse and check what they claim to") {
@@ -92,7 +92,7 @@ TEST_CASE("the checked-in sync_point scenarios parse and check what they claim t
     bool signal = false;
     bool option = false;
     for (const Step& s : late->steps) {
-        failure = failure || (s.kind == StepKind::Reload && !s.expect_failure.empty());
+        failure = failure || (s.kind == StepKind::Reload && !s.expect_error.empty());
         signal = signal || s.kind == StepKind::SignalFixture;
         option = option || s.kind == StepKind::SetOption;
     }

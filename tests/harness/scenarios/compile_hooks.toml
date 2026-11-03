@@ -32,7 +32,7 @@ patch = "edits/break.edit"
 [[step]]
 kind = "reload"
 within_s = 120
-expect_failure = "CML2200"
+expect_error = "CML2200"
 
 [[step]]
 kind = "expect_stdout"

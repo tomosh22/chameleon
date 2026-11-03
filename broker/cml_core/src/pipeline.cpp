@@ -1,6 +1,7 @@
 #include "cml/core/pipeline.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -14,6 +15,7 @@
 #include "cml/coff/writer.h"
 #include "cml/core/bind_diag_ids.h"
 #include "cml/core/bind_plan.h"
+#include "cml/core/header_diag_ids.h"
 #include "cml/core/patch_image.h"
 #include "cml/core/pipeline_diag_ids.h"
 #include "cml/toolchain/rewrite.h"
@@ -265,6 +267,15 @@ private:
     }
 
     // ---- the run -----------------------------------------------------------------------------------------
+    // Called from the compile workers concurrently: the counter is atomic, CML_LOG is thread-safe and EventBus::publish
+    // takes its own lock; everything else it reads (pid_, module_.name) is not written during the compile stage.
+    void publish_progress(const char* stage, std::size_t done, std::size_t total) {
+        CML_LOG(Info, "reload: %s %zu/%zu (%s)", stage, done, total, module_.name.c_str());
+        if (ctx_.events != nullptr) {
+            ctx_.events->publish(make_progress_event(stage, pid_, module_.name, done, total));
+        }
+    }
+
     Result<PatchReport> run() {
         PatchReport report;
         const LinkSnapshot snap = link_.snapshot();
@@ -324,7 +335,7 @@ private:
         for (const std::string& f : swept->unmapped) {
             warn(report, "sweep",
                  Diag::make(pd::kChangedFileUnmapped, "the changed file '" + f + "' is not part of any compiland of " + module_.name,
-                            "clang-cl PDBs do not list headers that hold no code (ADR-0013). Edit a .cpp file that includes the header; touching a file does not count, only a change of its content does."));
+                            "No compiland lists the file and no scanned #include chain of the module reaches it (ADR-0013). Edit a source file that includes the header, or rebuild the project if the include path changed."));
         }
         for (const std::string& f : swept->missing) {
             warn(report, "sweep", Diag::make(pd::kBaselineFile, "the tracked file '" + f + "' is gone", "Restore it or ignore this warning."));
@@ -332,6 +343,34 @@ private:
         report.times.sweep = lap.lap();
         CML_LOG(Info, "reload: sweep of %s: %zu files checked, %zu hashed, %zu changed, %zu compilands", module_.name.c_str(), swept->checked, swept->hashed,
                 swept->changed.size(), swept->compilands.size());
+        // ---- WP-15: refuse what cannot be reloaded, and ask before a very large reload -------------------------------
+        if (!swept->pch_headers.empty()) {
+            std::string names;
+            for (const std::string& f : swept->pch_headers) {
+                names += (names.empty() ? "'" : ", '") + f + "'";
+            }
+            return fail("sweep", Diag::make(header::diag::kPchHeaderChanged,
+                                            "the changed " + std::string(swept->pch_headers.size() == 1 ? "file " : "files ") + names +
+                                                " belong to the precompiled header of " + module_.name + "; a precompiled header cannot be hot-reloaded",
+                                            "Revert the change, or rebuild and restart the application. Edit the translation units that use the precompiled header instead."));
+        }
+        if (!swept->pch_unverified.empty()) {
+            std::string names;
+            for (const std::uint32_t ci : swept->pch_unverified) {
+                names += (names.empty() ? "'" : ", '") + std::string(pdb->compiland(ci).object_name) + "'";
+            }
+            return fail("sweep", Diag::make(header::diag::kPchUnknown,
+                                            "cannot tell which files make up the precompiled header used by " + names +
+                                                "; a recompile could use a stale .pch",
+                                            "Rebuild the project and hot-restart, or build with /Yu<header> naming the precompiled header."));
+        }
+        if (options_.max_affected_compilands != 0 && swept->compilands.size() > options_.max_affected_compilands && !ctx_.confirm) {
+            return fail("sweep", Diag::make(header::diag::kTooManyCompilands,
+                                            "the change affects " + std::to_string(swept->compilands.size()) + " compilands of " + module_.name +
+                                                " (" + std::to_string(swept->changed.size()) + " changed files), more than the limit of " +
+                                                std::to_string(options_.max_affected_compilands),
+                                            "Repeat the reload with \"confirm\": true to recompile them all, or raise the option max_affected_compilands."));
+        }
         if (swept->compilands.empty()) {
             // Nothing to compile. Files that map to no compiland are accepted so they are not reported again.
             module_.index->accept(swept->stamps);
@@ -409,9 +448,22 @@ private:
             return *first_error;
         }
         std::vector<toolchain::CompileOutcome> outcomes(requests.size());
+        // One call for all cache misses with the full parallelism and one deadline budget (each request carries the time
+        // that is left). WP-15 progress counts every unit of the reload: the ones reused from the compile cache are done
+        // at the start, every fresh compile is counted when the driver reports it finished (on_done may run concurrently).
+        const std::size_t total = units.size();
+        std::atomic<std::size_t> finished{total - requests.size()};
+        publish_progress("compile", finished.load(), total);
         std::vector<Result<void>> results;
         if (!requests.empty()) {
-            results = env_.compile_all(requests, outcomes, options_.max_parallel_compiles, ctx_.cancel);
+            results = env_.compile_all(requests, outcomes, options_.max_parallel_compiles, ctx_.cancel,
+                                       [&](std::size_t) { publish_progress("compile", finished.fetch_add(1) + 1, total); });
+        }
+        // A driver that returns fewer results than requests has not compiled the missing ones: that is a failure, never a success.
+        while (results.size() < requests.size()) {
+            const std::string& missing = units[fresh[results.size()]].source;
+            results.emplace_back(Diag::make(pd::kStageFailed, "the compiler driver returned no result for '" + missing + "'",
+                                            "This is a bug in the compiler driver; see the broker log."));
         }
         report.compiled += requests.size();
         for (std::size_t k = 0; k < requests.size(); ++k) {

@@ -107,13 +107,16 @@ ipc::ControlResponse answer(const ipc::ControlRequest& request, Result<ipc::json
 }
 
 ipc::ControlResponse subscribe_response(const ipc::ControlRequest& request, const ControlContext& context) {
-    static const char* const kEvents[] = {"diag", "patch_applied", "log"};
+    static const char* const kEvents[] = {"diag", "patch_applied", "progress", "log"};
     std::set<std::string> names;
     const ipc::json::Value* events = request.args.find("events");
     if (events == nullptr || events->is_null()) {
-        names.insert(std::begin(kEvents), std::end(kEvents));
+        // `progress` (WP-15) is opt-in: it can be chatty on a big reload.
+        for (const char* k : kEvents) {
+            if (std::string(k) != "progress") names.insert(k);
+        }
     } else if (!events->is_array()) {
-        return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "argument 'events' must be an array of event names", "Use [\"diag\", \"patch_applied\", \"log\"] or a subset."));
+        return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "argument 'events' must be an array of event names", "Use [\"diag\", \"patch_applied\", \"progress\", \"log\"] or a subset."));
     } else {
         for (const ipc::json::Value& e : events->items()) {
             bool known = false;
@@ -121,7 +124,7 @@ ipc::ControlResponse subscribe_response(const ipc::ControlRequest& request, cons
                 known = known || (e.is_string() && e.as_string() == k);
             }
             if (!known) {
-                return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "unknown event name in 'events'", "Known events: diag, patch_applied, log."));
+                return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "unknown event name in 'events'", "Known events: diag, patch_applied, progress, log."));
             }
             names.insert(e.as_string());
         }

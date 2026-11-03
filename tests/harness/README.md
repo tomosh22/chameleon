@@ -90,7 +90,7 @@ value = 1500
 
 [[step]]
 kind = "reload"
-expect_failure = "CML5309"     # the reload must FAIL with this diagnostic id (the step passes then)
+expect_error = "CML5309"     # the reload must FAIL with this diagnostic id (the step passes then)
 
 [[step]]
 kind = "signal_fixture"        # create the file named by the fixture's CML_FIXTURE_SIGNAL_FILE environment variable

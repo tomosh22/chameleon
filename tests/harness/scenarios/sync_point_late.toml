@@ -41,7 +41,7 @@ patch = "edits/value_42.edit"
 [[step]]
 kind = "reload"
 within_s = 120
-expect_failure = "CML5309"
+expect_error = "CML5309"
 
 # The application is still running the old code.
 [[step]]

@@ -62,8 +62,8 @@ std::string Step::describe() const {
             if (has_result_value) {
                 out += " expecting " + result_key + "=" + std::to_string(result_value);
             }
-            if (!expect_failure.empty()) {
-                out += " expecting failure " + expect_failure;
+            if (!expect_error.empty()) {
+                out += " expecting the refusal " + expect_error;
             }
             break;
         case StepKind::SetOption:
@@ -244,7 +244,7 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
     }
     if (*kind == "reload") {
         step.kind = StepKind::Reload;
-        cml::Result<void> keys = only_keys(table, {"kind", "within_s", "expect_result_key", "expect_result_value", "expect_failure"}, "a reload step");
+        cml::Result<void> keys = only_keys(table, {"kind", "within_s", "expect_result_key", "expect_result_value", "expect_error"}, "a reload step");
         if (!keys) return keys.error();
         cml::Result<int> within = int_in_range(table, "within_s", 60, 1, 3600);
         if (!within) return within.error();
@@ -253,18 +253,6 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
         const toml::Value* rv = table.find("expect_result_value");
         if ((rk == nullptr) != (rv == nullptr)) {
             return invalid(table.line, "'expect_result_key' and 'expect_result_value' go together");
-        }
-        if (const toml::Value* failure = table.find("expect_failure")) {
-            const bool shape = failure->kind == toml::Value::Kind::String && failure->text.size() == 7 &&
-                               failure->text.compare(0, 3, "CML") == 0 &&
-                               std::all_of(failure->text.begin() + 3, failure->text.end(), [](char ch) { return ch >= '0' && ch <= '9'; });
-            if (!shape) {
-                return invalid(failure->line, "'expect_failure' must be a diagnostic id like CML5309");
-            }
-            if (rk != nullptr) {
-                return invalid(failure->line, "'expect_failure' cannot be combined with a result expectation");
-            }
-            step.expect_failure = failure->text;
         }
         if (rk != nullptr) {
             if (rk->kind != toml::Value::Kind::String || !name_chars_ok(rk->text, false)) {
@@ -276,6 +264,13 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
             step.result_key = rk->text;
             step.result_value = rv->integer;
             step.has_result_value = true;
+        }
+        if (const toml::Value* ee = table.find("expect_error")) {
+            const bool shape = ee->kind == toml::Value::Kind::String && ee->text.size() == 7 && ee->text.compare(0, 3, "CML") == 0 &&
+                               std::all_of(ee->text.begin() + 3, ee->text.end(), [](char c) { return c >= '0' && c <= '9'; });
+            if (!shape) return invalid(ee->line, "'expect_error' must look like CML5550");
+            if (rk != nullptr) return invalid(ee->line, "'expect_error' and 'expect_result_key' exclude each other");
+            step.expect_error = ee->text;
         }
         return step;
     }

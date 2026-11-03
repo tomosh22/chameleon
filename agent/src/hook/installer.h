@@ -101,6 +101,12 @@ struct InstallerOptions {
     unsigned test_expire_after_checks = 0;
     std::size_t test_step_limit = 0;
     void (*test_in_window)(void* context) = nullptr;
+    // Tests only. `test_before_stop`: called at the start of every attempt, before the first thread is
+    // suspended; `test_after_resume`: called right after the last thread was resumed. Neither runs with
+    // the world stopped, so they may spin and wait (a test uses them to make a thread hold the process
+    // heap, the agent heap and the loader lock exactly while the world is stopped, then let go).
+    void (*test_before_stop)(void* context) = nullptr;
+    void (*test_after_resume)(void* context) = nullptr;
     void* test_context = nullptr;
 };
 
