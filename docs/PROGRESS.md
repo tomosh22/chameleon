@@ -18,6 +18,11 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-09 | Linker driver (Q2 settled: ADR-0027) | 3 | done | wp/09-linker-driver | #17 | — |
 | WP-10 | Hook installer (agent) | 3 | done | wp/10-hook-installer | #20 | — |
 | WP-12 | Broker core (orchestrator integration; ADR-0030) | 4 | done — all 7 M1 scenarios green in all 8 cells under `--require-all-capabilities` (verified by orchestrator from CI logs) | wp/12-broker-core | #23 | — |
+| WP-14 | File watcher and change detection | 5 | in progress | wp/14-file-watcher | — | — |
+| WP-15 | Header dependency handling | 5 | in progress | wp/15-header-deps | — | — |
+| WP-16 | Multiple modules and multiple processes | 5 | in progress | wp/16-multi-module-process | — | — |
+| WP-17 | Pre/post patch hooks, compile hooks, synchronised mode | 5 | in progress | wp/17-hooks-sync | — | — |
+| WP-18 | Diagnostics pass and build-requirement checks | 5 | todo (starts when a wave-5 slot frees; max 4 concurrent) | wp/18-diagnostics | — | — |
 
 ## Orchestrator integration work
 

@@ -589,3 +589,18 @@ event such as `patch_applied` may arrive after the `reload` response it belongs 
 **`status` readiness.** A module appears enabled only once its PDB index exists; until then the
 index is reported as `pending`. cmltest's `expect_module_enabled` waits for `ready`, so an edit
 can never be baked into the source baseline.
+
+## ADR-0031 Diagnostic sub-ranges for wave 5 (extends ADR-0008)
+
+**Date:** 2026-11-03 · **Status:** Accepted
+
+CML5400–5499 is already used by the control pipe and cmltest (WP-12/WP-13). Wave 5 runs in
+parallel, so each work package gets its own range:
+
+| Range | Owner |
+|---|---|
+| CML5500–5549 | WP-14 file watcher and change detection |
+| CML5550–5599 | WP-15 header dependency handling |
+| CML5600–5649 | WP-16 multiple modules and processes |
+| CML5650–5699 | WP-17 patch/compile hooks and synchronised mode |
+| CML1600–1699, CML2300–2399 | WP-18 build-requirement checks (`cml_broker check`) |
