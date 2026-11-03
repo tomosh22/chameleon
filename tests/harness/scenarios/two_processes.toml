@@ -1,0 +1,120 @@
+# Scenario `two_processes` (WP-16): the same DLL in two processes (server and client) under one broker.
+# One edit of the DLL's source; one reload. The compile runs once (same command line, same source), the patch is linked and
+# loaded once per process, and every process keeps its own copy of the DLL's state (`calls=` never goes down in either).
+name = "two_processes"
+description = "fixture two_processes: one DLL edit compiled once, patched into the server and the client process"
+fixture = "two_processes"
+timeout_s = 300
+
+[[step]]
+kind = "launch"
+label = "server"
+
+[[step]]
+kind = "launch"
+exe = "fixture_two_processes_client"
+label = "client"
+
+[[step]]
+kind = "expect_stdout"
+process = "server"
+regex = "TICK n=\\d+ role=server value=7 calls=\\d+"
+within_s = 20
+
+[[step]]
+kind = "expect_stdout"
+process = "client"
+regex = "TICK n=\\d+ role=client value=7 calls=\\d+"
+within_s = 20
+
+[[step]]
+kind = "expect_module_enabled"
+process = "server"
+module = "fixture_two_processes_lib.dll"
+within_s = 30
+
+[[step]]
+kind = "expect_module_enabled"
+process = "client"
+module = "fixture_two_processes_lib.dll"
+within_s = 30
+
+# Let both counters reach 20 or more before the patch: a reset afterwards cannot hide.
+[[step]]
+kind = "expect_stdout"
+process = "server"
+regex = "TICK n=\\d+ role=server value=7 calls=([2-9][0-9]|[1-9][0-9]{2,})\\b"
+within_s = 20
+
+[[step]]
+kind = "expect_stdout"
+process = "client"
+regex = "TICK n=\\d+ role=client value=7 calls=([2-9][0-9]|[1-9][0-9]{2,})\\b"
+within_s = 20
+
+[[step]]
+kind = "edit"
+patch = "edits/value_70.edit"
+
+[[step]]
+kind = "reload"
+within_s = 150
+expect_result_key = "patched"
+expect_result_value = 2
+
+[[step]]
+kind = "expect_reload_result"
+key = "processes_patched"
+value = 2
+
+[[step]]
+kind = "expect_reload_result"
+key = "modules_patched"
+value = 2
+
+# One compile for the two processes; the second process took the first one's object.
+[[step]]
+kind = "expect_reload_result"
+key = "compiled"
+value = 1
+
+[[step]]
+kind = "expect_reload_result"
+key = "compile_reused"
+value = 1
+
+[[step]]
+kind = "expect_stdout"
+process = "server"
+regex = "TICK n=\\d+ role=server value=70 calls=\\d+"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+process = "client"
+regex = "TICK n=\\d+ role=client value=70 calls=\\d+"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+process = "server"
+regex = "TICK n=\\d+ role=server value=70 calls=\\d+"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+process = "client"
+regex = "TICK n=\\d+ role=client value=70 calls=\\d+"
+within_s = 10
+
+[[step]]
+kind = "expect_monotonic"
+process = "server"
+key = "calls"
+min_samples = 20
+
+[[step]]
+kind = "expect_monotonic"
+process = "client"
+key = "calls"
+min_samples = 20

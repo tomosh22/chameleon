@@ -1,0 +1,66 @@
+# Scenario `exe_plus_dll` (WP-16): one process, an exe and a DLL, both enabled; one reload patches both.
+#   dll=  exe -> DLL: the exe's call of lib_scale() goes through its import slot to the old entry, which the hook redirects (6 -> 60)
+#   cb=   DLL -> exe: the DLL's lib_apply() calls exe_callback() through a function pointer to the old entry (6 -> 105)
+#   imp=  the patched exe code reads the DLL's IAT slot `__imp_lib_offset` (bound by the planner through ProcessModules) (10 -> 15)
+# The two modules are separate: each has its own registry, index, patches and hooks, and one compile each.
+name = "exe_plus_dll"
+description = "fixture exe_plus_dll: exe and DLL patched in one reload, calls in both directions and via __imp_"
+fixture = "exe_plus_dll"
+timeout_s = 240
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ dll=6 cb=6 imp=10"
+within_s = 15
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_exe_plus_dll.exe"
+within_s = 30
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_exe_plus_dll_lib.dll"
+within_s = 30
+
+[[step]]
+kind = "edit"
+patch = "edits/dll_scale_30.edit"
+
+[[step]]
+kind = "edit"
+patch = "edits/exe_changes.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_result_key = "patched"
+expect_result_value = 2
+
+[[step]]
+kind = "expect_reload_result"
+key = "modules_patched"
+value = 2
+
+[[step]]
+kind = "expect_reload_result"
+key = "processes_patched"
+value = 1
+
+[[step]]
+kind = "expect_reload_result"
+key = "compiled"
+value = 2
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ dll=60 cb=105 imp=15"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ dll=60 cb=105 imp=15"
+within_s = 10

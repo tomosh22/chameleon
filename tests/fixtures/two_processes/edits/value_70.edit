@@ -1,0 +1,11 @@
+--- a/lib.cpp
++++ b/lib.cpp
+@@ -9,7 +9,7 @@
+ __declspec(noinline) int tp_value()
+ {
+     ++s_calls;
+-    return 7;
++    return 70;
+ }
+
+ __declspec(noinline) int tp_calls()
