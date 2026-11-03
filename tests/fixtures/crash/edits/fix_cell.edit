@@ -1,0 +1,13 @@
+--- a/logic.cpp
++++ b/logic.cpp
+@@ -9,5 +9,10 @@
+ 
+ void maintain()
+ {
+     g_maintain_calls.fetch_add(1);
++    if (!g_repaired.load()) {
++        DWORD old = 0;
++        VirtualProtect(g_cell, 4096, PAGE_READWRITE, &old);
++        g_repaired.store(true);
++    }
+ }

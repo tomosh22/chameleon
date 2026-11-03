@@ -414,6 +414,32 @@ std::wstring self_path() {
     return buffer;
 }
 
+// Small files through Win32 (no CRT file functions: the secure variants differ between compilers).
+std::string read_small_file(const std::wstring& path) {
+    std::string text;
+    const HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return text;
+    }
+    char buffer[256];
+    DWORD got = 0;
+    if (ReadFile(file, buffer, sizeof buffer - 1, &got, nullptr) != 0) {
+        text.assign(buffer, got);
+    }
+    CloseHandle(file);
+    return text;
+}
+
+void write_small_file(const wchar_t* path, const std::string& text) {
+    const HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    DWORD written = 0;
+    WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
+    CloseHandle(file);
+}
+
 std::wstring widen(const char* text) {
     std::wstring out;
     for (; *text != '\0'; ++text) {
@@ -452,14 +478,7 @@ long run_child(const char* name, std::string* result_text) {
     SetEnvironmentVariableW(L"CML_TEST_EXC_CHILD", nullptr);
     SetEnvironmentVariableW(L"CML_TEST_EXC_RESULT", nullptr);
     if (result_text != nullptr) {
-        result_text->clear();
-        if (FILE* f = _wfopen(result_file.c_str(), L"rb")) {
-            char buffer[256];
-            const std::size_t n = std::fread(buffer, 1, sizeof buffer - 1, f);
-            buffer[n] = 0;
-            *result_text = buffer;
-            std::fclose(f);
-        }
+        *result_text = read_small_file(result_file);
     }
     DeleteFileW(result_file.c_str());
     return code;
@@ -490,10 +509,7 @@ TEST_CASE("exc_child") {
     CHECK(g_problems.load() == 0);
     wchar_t result_file[MAX_PATH] = {};
     if (GetEnvironmentVariableW(L"CML_TEST_EXC_RESULT", result_file, MAX_PATH) != 0) {
-        if (FILE* f = _wfopen(result_file, L"wb")) {
-            std::fputs(("ok " + name).c_str(), f);
-            std::fclose(f);
-        }
+        write_small_file(result_file, "ok " + name);
     }
 }
 

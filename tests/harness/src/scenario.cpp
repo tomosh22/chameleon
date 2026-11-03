@@ -26,6 +26,10 @@ const char* to_string(StepKind kind) {
         case StepKind::ExpectEvent: return "expect_event";
         case StepKind::SignalFixture: return "signal_fixture";
         case StepKind::ExpectReloadResult: return "expect_reload_result";
+        case StepKind::WatchExceptions: return "watch_exceptions";
+        case StepKind::ExpectException: return "expect_exception";
+        case StepKind::ExceptionAction: return "exception_action";
+        case StepKind::ExpectPendingExceptions: return "expect_pending_exceptions";
     }
     return "?";
 }
@@ -88,6 +92,18 @@ std::string Step::describe() const {
         case StepKind::ExpectEvent:
             out += " " + event + " within " + std::to_string(within_s) + " s";
             break;
+        case StepKind::WatchExceptions:
+            break;
+        case StepKind::ExpectException:
+            out += (exception_code.empty() ? std::string() : " " + exception_code) + (exception_function.empty() ? std::string() : " in " + exception_function) +
+                   " within " + std::to_string(within_s) + " s";
+            break;
+        case StepKind::ExceptionAction:
+            out += " " + exception_action + (expect_error.empty() ? std::string() : " expecting the refusal " + expect_error);
+            break;
+        case StepKind::ExpectPendingExceptions:
+            out += " " + std::to_string(result_value);
+            break;
     }
     return out;
 }
@@ -99,6 +115,10 @@ const char* Step::required_capability() const {
         case StepKind::SetOption: return cml::ipc::capability::kSetOption;
         case StepKind::Wait: return cml::ipc::capability::kWait;
         case StepKind::ExpectEvent: return cml::ipc::capability::kSubscribe;
+        case StepKind::WatchExceptions:
+        case StepKind::ExpectException:
+        case StepKind::ExceptionAction:
+        case StepKind::ExpectPendingExceptions: return cml::ipc::capability::kExceptions;
         default: return nullptr;
     }
 }
@@ -389,10 +409,67 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
         step.has_result_value = true;
         return step;
     }
+    if (*kind == "watch_exceptions") {
+        step.kind = StepKind::WatchExceptions;
+        cml::Result<void> keys = only_keys(table, {"kind"}, "a watch_exceptions step");
+        if (!keys) return keys.error();
+        return step;
+    }
+    if (*kind == "expect_exception") {
+        step.kind = StepKind::ExpectException;
+        cml::Result<void> keys = only_keys(table, {"kind", "code", "function", "within_s"}, "an expect_exception step");
+        if (!keys) return keys.error();
+        if (const toml::Value* code = table.find("code")) {
+            const bool shape = code->kind == toml::Value::Kind::String && code->text.size() == 10 && code->text.compare(0, 2, "0x") == 0 &&
+                               std::all_of(code->text.begin() + 2, code->text.end(), [](char c) { return std::isxdigit(static_cast<unsigned char>(c)) != 0; });
+            if (!shape) return invalid(code->line, "'code' must look like \"0xC0000005\"");
+            step.exception_code = code->text;
+        }
+        if (const toml::Value* function = table.find("function")) {
+            if (function->kind != toml::Value::Kind::String || function->text.empty() || function->text.size() > 200) {
+                return invalid(function->line, "'function' must be a non-empty string (a substring of the function name)");
+            }
+            step.exception_function = function->text;
+        }
+        cml::Result<int> within = int_in_range(table, "within_s", 30, 1, 3600);
+        if (!within) return within.error();
+        step.within_s = *within;
+        return step;
+    }
+    if (*kind == "exception_action") {
+        step.kind = StepKind::ExceptionAction;
+        cml::Result<void> keys = only_keys(table, {"kind", "action", "expect_error"}, "an exception_action step");
+        if (!keys) return keys.error();
+        cml::Result<std::string> action = require_string(table, "action", "an exception_action step");
+        if (!action) return action.error();
+        if (*action != "continue" && *action != "leave" && *action != "ignore") {
+            return invalid(table.line, "'action' must be \"continue\", \"leave\" or \"ignore\"");
+        }
+        step.exception_action = *action;
+        if (const toml::Value* ee = table.find("expect_error")) {
+            const bool shape = ee->kind == toml::Value::Kind::String && ee->text.size() == 7 && ee->text.compare(0, 3, "CML") == 0 &&
+                               std::all_of(ee->text.begin() + 3, ee->text.end(), [](char c) { return c >= '0' && c <= '9'; });
+            if (!shape) return invalid(ee->line, "'expect_error' must look like CML4401");
+            step.expect_error = ee->text;
+        }
+        return step;
+    }
+    if (*kind == "expect_pending_exceptions") {
+        step.kind = StepKind::ExpectPendingExceptions;
+        cml::Result<void> keys = only_keys(table, {"kind", "count"}, "an expect_pending_exceptions step");
+        if (!keys) return keys.error();
+        const toml::Value* count = table.find("count");
+        if (count == nullptr || count->kind != toml::Value::Kind::Integer || count->integer < 0 || count->integer > 64) {
+            return invalid(table.line, "an expect_pending_exceptions step needs an integer 'count' from 0 to 64");
+        }
+        step.result_value = count->integer;
+        return step;
+    }
     (void)context;
     return invalid(table.line, "unknown step kind '" + *kind +
                                    "' (launch, expect_stdout, expect_module_enabled, edit, reload, expect_diag, expect_monotonic, set_option, wait, "
-                                   "expect_event, expect_reload_result, signal_fixture)");
+                                   "expect_event, expect_reload_result, signal_fixture, watch_exceptions, expect_exception, exception_action, "
+                                   "expect_pending_exceptions)");
 }
 
 }  // namespace
