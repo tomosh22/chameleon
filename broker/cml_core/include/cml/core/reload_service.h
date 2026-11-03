@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -66,6 +67,9 @@ public:
     EventBus* events() const noexcept { return events_; }
     // Re-derives the watched directories from the enabled modules' indices (no-op unless compile_on_save is on).
     void rearm_save_watcher();
+    // The reload a save starts (compile on save): only modules whose index is ready, nothing published when a reload
+    // is running (Busy: try again) or no module is ready (Done).
+    SaveWatcherHooks::ReloadResult reload_for_save();
     // Test seam: the directory watcher factory used by the next compile_on_save activation.
     void set_watcher_factory_for_testing(WatcherFactory factory);
     // Aborts running compiles and links (shutdown); sticky.
@@ -85,9 +89,13 @@ private:
     };
 
     Result<std::string> ensure_session_dir();
-    void apply_compile_on_save(bool on);
+    // Starts or stops the save watcher. Stopping does not wait for a reload that a save started: the old watcher is
+    // retired on its own thread (joined by the destructor). Returns the error when no watcher can be created.
+    std::optional<Diag> apply_compile_on_save(bool on);
+    // The reload; `automatic` is a reload started by a save: it only touches modules whose index is ready, finds a
+    // running reload or no module without publishing an error, and returns quietly (kBusy for "try again").
+    Result<ipc::json::Value> run_reload(const ipc::json::Value& args, bool automatic);
     std::vector<std::string> tracked_files() const;
-    SaveWatcherHooks::ReloadResult reload_for_save();
     std::vector<Target> targets(std::uint32_t pid, const std::string& module) const;
 
     PatchPipeline pipeline_;
@@ -104,6 +112,7 @@ private:
 
     std::mutex watch_mutex_;  // save_watcher_, watcher_factory_
     std::shared_ptr<SaveWatcher> save_watcher_;
+    std::vector<std::future<void>> retiring_;  // stopped save watchers finishing a reload
     WatcherFactory watcher_factory_;
 
     std::mutex reload_mutex_;  // one reload at a time

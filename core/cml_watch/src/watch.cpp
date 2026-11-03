@@ -41,6 +41,14 @@ void ChangeCoalescer::add(const FsEvent& event, Clock::time_point now) {
         overflow_ = true;
         return;
     }
+    if (event.action == FsAction::RootLost) {
+        overflow_ = true;  // whatever happened in that directory is unknown: re-check everything
+        const std::string key = watch_key(event.path);
+        if (std::find(lost_roots_.begin(), lost_roots_.end(), key) == lost_roots_.end()) {
+            lost_roots_.push_back(key);
+        }
+        return;
+    }
     const bool present = event.action == FsAction::Added || event.action == FsAction::Modified || event.action == FsAction::RenamedTo;
     final_present_[watch_key(event.path)] = present;
 }
@@ -60,6 +68,8 @@ bool ChangeCoalescer::take(Clock::time_point now, ChangeBatch* out) {
 ChangeBatch ChangeCoalescer::flush() {
     ChangeBatch batch;
     batch.overflow = overflow_;
+    batch.lost_roots = std::move(lost_roots_);
+    lost_roots_.clear();
     for (const auto& entry : final_present_) {  // std::map: sorted
         (entry.second ? batch.present : batch.gone).push_back(entry.first);
     }

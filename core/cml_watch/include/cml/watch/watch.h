@@ -33,6 +33,7 @@ enum class FsAction : std::uint8_t {
     RenamedFrom,  // FILE_ACTION_RENAMED_OLD_NAME: the path no longer exists
     RenamedTo,    // FILE_ACTION_RENAMED_NEW_NAME: the path now exists
     Overflow,     // the notification buffer overflowed: events were lost, everything must be re-checked
+    RootLost,     // the watched directory itself is gone or unreadable (path = the root); its events stop
 };
 
 struct FsEvent {
@@ -55,6 +56,7 @@ struct ChangeBatch {
     // Paths whose last event says they are gone (deleted, renamed away).
     std::vector<std::string> gone;
     bool overflow = false;  // events were lost: re-check everything
+    std::vector<std::string> lost_roots;  // watched directories that stopped delivering events (normalised)
 };
 
 struct CoalesceOptions {
@@ -82,6 +84,7 @@ private:
     CoalesceOptions options_;
     bool has_events_ = false;
     bool overflow_ = false;
+    std::vector<std::string> lost_roots_;
     Clock::time_point first_{};
     Clock::time_point last_{};
     std::map<std::string, bool> final_present_;  // key -> the last event left it existing

@@ -35,11 +35,7 @@ SaveWatcher::SaveWatcher(SaveWatcherHooks hooks, SaveWatcherOptions options) : h
 }
 
 SaveWatcher::~SaveWatcher() {
-    stopping_.store(true);
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        watcher_.reset();
-    }
+    stop();
     dispatcher_.reset();  // joins the thread, which may be waiting to retry a busy reload
 }
 
@@ -48,9 +44,38 @@ std::vector<watch::WatchRoot> SaveWatcher::roots() const {
     return roots_;
 }
 
-void SaveWatcher::rearm() {
+void SaveWatcher::report_once(const std::string& key, const Diag& diag, const char* severity, std::vector<std::pair<Diag, const char*>>* out) {
+    if (reported_.insert(key).second) {
+        out->emplace_back(diag, severity);
+    }
+}
+
+void SaveWatcher::flush_reports(const std::vector<std::pair<Diag, const char*>>& out) {
+    for (const auto& r : out) {
+        if (r.second[0] == 'i') {
+            CML_LOG(Info, "compile-on-save: %s", r.first.format().c_str());
+        } else {
+            CML_LOG(Warn, "compile-on-save: %s", r.first.format().c_str());
+        }
+        if (hooks_.report) {
+            hooks_.report(r.first, r.second);
+        }
+    }
+}
+
+void SaveWatcher::stop() {
+    stopping_.store(true);
+    std::unique_ptr<watch::DirectoryWatcher> old;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        old = std::move(watcher_);
+    }
+    old.reset();
+}
+
+std::optional<Diag> SaveWatcher::rearm(bool force) {
     if (stopping_.load()) {
-        return;
+        return std::nullopt;
     }
     const std::vector<std::string> files = hooks_.tracked_files ? hooks_.tracked_files() : std::vector<std::string>();
     std::unordered_set<std::string> tracked;
@@ -60,51 +85,79 @@ void SaveWatcher::rearm() {
     }
     const std::vector<watch::WatchRoot> roots = watch::plan_watch_roots(files);
 
+    std::vector<std::pair<Diag, const char*>> reports;
+    std::optional<Diag> failure;
     std::string first_file;
+    std::unique_ptr<watch::DirectoryWatcher> old;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         tracked_ = std::move(tracked);
         if (roots.empty()) {
-            watcher_.reset();
+            old = std::move(watcher_);
             roots_.clear();
-            if (hooks_.report) {
-                hooks_.report(Diag::make(wd::kNothingToWatch, "compile-on-save is on but no source directory is known yet",
-                                         "Enable a module; the directories are watched as soon as its PDB index is ready."),
-                              "info");
-            }
-            return;
-        }
-        if (watcher_ && same_roots(roots, roots_)) {
-            return;
-        }
-        std::vector<Diag> skipped;
-        Result<std::unique_ptr<watch::DirectoryWatcher>> started = options_.factory(
-            roots, [this](const watch::FsEvent& event) { dispatcher_->push(event); }, &skipped);
-        if (hooks_.report) {
+            degraded_ = false;
+            report_once("nothing", Diag::make(wd::kNothingToWatch, "compile-on-save is on but no source directory is known yet",
+                                              "Enable a module; the directories are watched as soon as its PDB index is ready."),
+                        "info", &reports);
+        } else if (watcher_ && !force && !degraded_ && same_roots(roots, roots_)) {
+            // Nothing changed.
+        } else {
+            reported_.erase("nothing");
+            std::vector<Diag> skipped;
+            Result<std::unique_ptr<watch::DirectoryWatcher>> started = options_.factory(
+                roots, [this](const watch::FsEvent& event) { dispatcher_->push(event); }, &skipped);
             for (const Diag& d : skipped) {
-                hooks_.report(d, "warning");
+                report_once("skip:" + d.message, d, "warning", &reports);
             }
-        }
-        if (!started) {
-            CML_LOG(Warn, "compile-on-save: %s", started.error().format().c_str());
-            if (hooks_.report) {
-                hooks_.report(started.error(), "warning");
+            if (!started) {
+                report_once("failed:" + started.error().message, started.error(), "warning", &reports);
+                degraded_ = true;
+                failure = started.error();
+            } else {
+                old = std::move(watcher_);  // the old watcher goes away after the new one is armed: no gap
+                watcher_ = std::move(*started);
+                roots_ = roots;
+                degraded_ = !skipped.empty();
+                if (!degraded_) {
+                    reported_.clear();  // recovered: a later problem is a new one and is reported again
+                }
+                first_file = watch::watch_key(files.front());
+                CML_LOG(Info, "compile-on-save: watching %zu directories for %zu tracked files", roots_.size(), tracked_.size());
+                for (const watch::WatchRoot& r : roots_) {
+                    CML_LOG(Debug, "compile-on-save: watching %s%s", r.directory.c_str(), r.recursive ? " (recursive)" : "");
+                }
             }
-            return;
-        }
-        watcher_ = std::move(*started);  // the old watcher goes away after the new one is armed: no gap
-        roots_ = roots;
-        first_file = watch::watch_key(files.front());
-        CML_LOG(Info, "compile-on-save: watching %zu directories for %zu tracked files", roots_.size(), tracked_.size());
-        for (const watch::WatchRoot& r : roots_) {
-            CML_LOG(Debug, "compile-on-save: watching %s%s", r.directory.c_str(), r.recursive ? " (recursive)" : "");
         }
     }
-    // Saves made before the directories were watched (between the baseline and now) are picked up by one sweep.
-    dispatcher_->push(watch::FsEvent{watch::FsAction::Modified, first_file});
+    old.reset();
+    flush_reports(reports);
+    if (!first_file.empty()) {
+        // Saves made before the directories were watched (between the baseline and now) are picked up by one sweep.
+        dispatcher_->push(watch::FsEvent{watch::FsAction::Modified, first_file});
+    }
+    return failure;
 }
 
 void SaveWatcher::on_batch(const watch::ChangeBatch& batch) {
+    if (stopping_.load()) {
+        return;
+    }
+    if (!batch.lost_roots.empty()) {
+        // A watched directory stopped delivering events (deleted, renamed, access lost). Report it once and rebuild
+        // the watch; a directory that cannot be reopened is reported as unwatched and retried by every later rearm.
+        std::vector<std::pair<Diag, const char*>> reports;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const std::string& root : batch.lost_roots) {
+                report_once("lost:" + root,
+                            Diag::make(wd::kRootNotWatched, "the directory '" + root + "' stopped delivering change events",
+                                       "Saves there are picked up by the next `reload`; the watch is being rebuilt."),
+                            "warning", &reports);
+            }
+        }
+        flush_reports(reports);
+        rearm(true);
+    }
     bool relevant = batch.overflow;
     std::size_t hits = 0;
     {
@@ -117,7 +170,7 @@ void SaveWatcher::on_batch(const watch::ChangeBatch& batch) {
         }
     }
     relevant = relevant || hits != 0;
-    if (batch.overflow) {
+    if (batch.overflow && batch.lost_roots.empty()) {
         CML_LOG(Warn, "compile-on-save: file events were lost; every tracked file is re-checked");
         if (hooks_.report) {
             hooks_.report(Diag::make(wd::kOverflow, "the directory watcher lost events (buffer overflow)",
@@ -131,6 +184,9 @@ void SaveWatcher::on_batch(const watch::ChangeBatch& batch) {
     }
     CML_LOG(Debug, "compile-on-save: %zu tracked file(s) saved; reloading", hits);
     for (;;) {
+        if (stopping_.load()) {
+            return;
+        }
         reloads_.fetch_add(1);
         const SaveWatcherHooks::ReloadResult r = hooks_.reload ? hooks_.reload() : SaveWatcherHooks::ReloadResult::Done;
         if (r == SaveWatcherHooks::ReloadResult::Done) {

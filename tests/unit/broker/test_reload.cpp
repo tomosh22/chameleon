@@ -1081,3 +1081,77 @@ TEST_CASE("set-option compile_on_save validates, reports the previous value and 
     CHECK(off->find("previous")->as_bool() == true);
     CHECK_FALSE(rig.service->options().compile_on_save);
 }
+
+TEST_CASE("reload_for_save: busy and not-ready are quiet; a ready module is compiled (WP-14)") {
+    QuietLogs quiet;
+    {
+        // No module at all: nothing to do, and no CML5300 event.
+        Rig rig;
+        CHECK(rig.service->reload_for_save() == SaveWatcherHooks::ReloadResult::Done);
+        CHECK(rig.events->diag_ids().empty());
+    }
+    {
+        // A module whose index failed is skipped without a failed reload.
+        Rig rig;
+        std::filesystem::remove(std::filesystem::path(rig.dir.file("app.pdb")));
+        ipc::Hello hello;
+        hello.request_id = 1;
+        hello.pid = kPid;
+        rig.session.on_message(hello);
+        ipc::ModuleList list;
+        list.request_id = 2;
+        list.modules.push_back({kModuleBase, 0x4000, rig.exe});
+        rig.session.on_message(list);
+        ipc::EnableModule enable_module;
+        enable_module.request_id = 3;
+        enable_module.path = rig.exe;
+        rig.session.on_message(enable_module);
+        rig.link->publish(rig.session);
+        rig.service->on_session_changed(1);
+        auto module = rig.service->module_state(1, rig.exe);
+        REQUIRE(module != nullptr);
+        CHECK(module->index->wait(20000));
+        CHECK(rig.service->reload_for_save() == SaveWatcherHooks::ReloadResult::Done);
+        CHECK(rig.events->diag_ids().empty());
+        CHECK(rig.compile_calls == 0);
+    }
+    {
+        // A reload is running: the automatic one says Busy and publishes nothing.
+        Rig rig;
+        rig.enable();
+        rig.changed();
+        std::mutex m;
+        std::condition_variable cv;
+        bool entered = false;
+        bool release = false;
+        rig.compile_hook = [&] {
+            std::unique_lock<std::mutex> lock(m);
+            entered = true;
+            cv.notify_all();
+            cv.wait(lock, [&] { return release; });
+        };
+        Result<Value> first = Diag::make(5300, "unset", "");
+        std::thread worker([&] { first = rig.reload(); });
+        {
+            std::unique_lock<std::mutex> lock(m);
+            cv.wait(lock, [&] { return entered; });
+        }
+        CHECK(rig.service->reload_for_save() == SaveWatcherHooks::ReloadResult::Busy);
+        CHECK(rig.events->diag_ids().empty());
+        {
+            std::lock_guard<std::mutex> lock(m);
+            release = true;
+        }
+        cv.notify_all();
+        worker.join();
+        CHECK(first.has_value());
+    }
+    {
+        // A ready module with a change is compiled.
+        Rig rig;
+        rig.enable();
+        rig.changed();
+        CHECK(rig.service->reload_for_save() == SaveWatcherHooks::ReloadResult::Done);
+        CHECK(rig.compile_calls >= 1);
+    }
+}

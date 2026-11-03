@@ -190,6 +190,21 @@ TEST_CASE("an overflow is reported and clears with the batch") {
     CHECK(!batch.overflow);
 }
 
+TEST_CASE("a lost root is reported once per batch and forces a re-check") {
+    ChangeCoalescer c;
+    const Clock::time_point t0 = Clock::now();
+    c.add(FsEvent{FsAction::RootLost, "C:\\Proj\\Src"}, t0);
+    c.add(FsEvent{FsAction::RootLost, "c:/proj/src"}, t0 + 1ms);
+    ChangeBatch batch;
+    REQUIRE(c.take(t0 + 200ms, &batch));
+    CHECK(batch.overflow);
+    CHECK(batch.lost_roots == std::vector<std::string>{"c:\\proj\\src"});
+    c.add(ev(FsAction::Modified, "a.cpp"), t0 + 300ms);
+    batch = c.flush();
+    CHECK(batch.lost_roots.empty());
+    CHECK_FALSE(batch.overflow);
+}
+
 TEST_CASE("plan_watch_roots: the union of the directories of the files") {
     const std::vector<WatchRoot> roots = plan_watch_roots({
         "C:\\p\\src\\a.cpp",

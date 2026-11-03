@@ -20,6 +20,8 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <set>
 #include <mutex>
 #include <string>
 #include <unordered_set>
@@ -57,8 +59,15 @@ public:
     SaveWatcher(const SaveWatcher&) = delete;
     SaveWatcher& operator=(const SaveWatcher&) = delete;
 
-    // Recomputes the watched directories from hooks.tracked_files(). Thread-safe; blocks briefly.
-    void rearm();
+    // Recomputes the watched directories from hooks.tracked_files(). Thread-safe; blocks briefly. The watcher is
+    // only restarted when the directories changed, `force` is set, or an earlier attempt left a directory
+    // unwatched (so every rearm retries those). Returns the error when no directory watcher can be created at
+    // all (CML5502 on a host without directory watching, CML5503); nullopt otherwise, including "nothing to
+    // watch yet". Problems are reported through hooks.report once per state change, not once per call.
+    std::optional<Diag> rearm(bool force = false);
+    // No further reload is started and the directory watcher is dropped (cheap). The destructor then only has to
+    // wait for a reload that is already running.
+    void stop();
     // Feeds an event as if the directory watcher had reported it (tests).
     void inject(const watch::FsEvent& event) { dispatcher_->push(event); }
 
@@ -67,13 +76,18 @@ public:
 
 private:
     void on_batch(const watch::ChangeBatch& batch);
+    // Reports `diag` unless the same problem is already reported; the key is forgotten when the state recovers.
+    void report_once(const std::string& key, const Diag& diag, const char* severity, std::vector<std::pair<Diag, const char*>>* out);
+    void flush_reports(const std::vector<std::pair<Diag, const char*>>& out);
 
     SaveWatcherHooks hooks_;
     SaveWatcherOptions options_;
     std::atomic<bool> stopping_{false};
     std::atomic<std::size_t> reloads_{0};
 
-    mutable std::mutex mutex_;  // tracked_, roots_, watcher_
+    mutable std::mutex mutex_;  // tracked_, roots_, watcher_, degraded_, reported_
+    bool degraded_ = false;     // some directory could not be watched at the last attempt
+    std::set<std::string> reported_;
     std::unordered_set<std::string> tracked_;
     std::vector<watch::WatchRoot> roots_;
     std::unique_ptr<watch::ChangeDispatcher> dispatcher_;

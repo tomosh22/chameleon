@@ -36,13 +36,16 @@ struct FakeFactory {
     std::mutex m;
     std::vector<std::vector<WatchRoot>> calls;
     bool fail = false;
+    std::uint32_t fail_code = 5503;
+    DirectoryWatcher::Sink sink;  // of the latest watcher: the test plays the part of ReadDirectoryChangesW
     WatcherFactory factory() {
-        return [this](const std::vector<WatchRoot>& roots, DirectoryWatcher::Sink, std::vector<Diag>*) -> Result<std::unique_ptr<DirectoryWatcher>> {
+        return [this](const std::vector<WatchRoot>& roots, DirectoryWatcher::Sink s, std::vector<Diag>*) -> Result<std::unique_ptr<DirectoryWatcher>> {
             std::lock_guard<std::mutex> lock(m);
             calls.push_back(roots);
             if (fail) {
-                return Diag::make(5503, "fake failure", "none");
+                return Diag::make(fail_code, "fake failure", "none");
             }
+            sink = std::move(s);
             return std::unique_ptr<DirectoryWatcher>(std::make_unique<FakeWatcher>());
         };
     }
@@ -368,4 +371,136 @@ TEST_CASE("save watcher: destruction while a reload waits to retry returns promp
         REQUIRE(wait_until([&] { return calls.load() >= 3; }));
     }
     CHECK(calls.load() >= 3);
+}
+
+TEST_CASE("save watcher: a root that dies is reported once, the watch is rebuilt and everything is re-checked") {
+    QuietLogs quiet;
+    FakeFactory fake;
+    std::atomic<int> reloads{0};
+    std::mutex m;
+    std::vector<std::uint32_t> reported;
+    SaveWatcherHooks hooks;
+    hooks.tracked_files = [] { return std::vector<std::string>{"c:\\p\\src\\a.cpp"}; };
+    hooks.reload = [&] {
+        ++reloads;
+        return SaveWatcherHooks::ReloadResult::Done;
+    };
+    hooks.report = [&](const Diag& d, const char*) {
+        std::lock_guard<std::mutex> lock(m);
+        reported.push_back(d.code);
+    };
+    SaveWatcher w(hooks, fast(fake.factory()));
+    REQUIRE_FALSE(w.rearm().has_value());
+    REQUIRE(wait_until([&] { return reloads.load() >= 1; }));
+    std::this_thread::sleep_for(100ms);
+    const int before = reloads.load();
+    REQUIRE(fake.count() == 1);
+    DirectoryWatcher::Sink sink;
+    {
+        std::lock_guard<std::mutex> lock(fake.m);
+        sink = fake.sink;
+    }
+    sink(FsEvent{FsAction::RootLost, "C:\\P\\Src"});
+    sink(FsEvent{FsAction::RootLost, "c:\\p\\src"});  // the same root twice in one burst
+    REQUIRE(wait_until([&] { return fake.count() >= 2; }));  // rebuilt
+    REQUIRE(wait_until([&] { return reloads.load() > before; }));  // and swept
+    std::this_thread::sleep_for(100ms);
+    {
+        std::lock_guard<std::mutex> lock(m);
+        REQUIRE(reported.size() == 1);
+        CHECK(reported[0] == 5500);
+    }
+    CHECK(fake.count() == 2);
+}
+
+TEST_CASE("save watcher: a root that cannot be reopened stays reported once and is retried by every rearm") {
+    QuietLogs quiet;
+    FakeFactory fake;
+    std::vector<std::uint32_t> reported;
+    std::mutex m;
+    std::atomic<bool> skip_root{true};
+    SaveWatcherHooks hooks;
+    hooks.tracked_files = [] { return std::vector<std::string>{"c:\\p\\a.cpp"}; };
+    hooks.reload = [] { return SaveWatcherHooks::ReloadResult::Done; };
+    hooks.report = [&](const Diag& d, const char*) {
+        std::lock_guard<std::mutex> lock(m);
+        reported.push_back(d.code);
+    };
+    SaveWatcherOptions options = fast({});
+    std::atomic<int> calls{0};
+    options.factory = [&](const std::vector<WatchRoot>&, DirectoryWatcher::Sink, std::vector<Diag>* skipped) -> Result<std::unique_ptr<DirectoryWatcher>> {
+        ++calls;
+        if (skip_root.load()) {
+            skipped->push_back(Diag::make(5500, "the directory 'c:\\p' cannot be watched (error 5)", "none"));
+        }
+        return std::unique_ptr<DirectoryWatcher>(std::make_unique<FakeWatcher>());
+    };
+    SaveWatcher w(hooks, std::move(options));
+    w.rearm();
+    w.rearm();  // same directories, but one was not watched: retried
+    CHECK(calls.load() == 2);
+    skip_root = false;
+    w.rearm();  // now it works
+    CHECK(calls.load() == 3);
+    w.rearm();  // healthy and unchanged: nothing to do
+    CHECK(calls.load() == 3);
+    std::lock_guard<std::mutex> lock(m);
+    CHECK(reported == std::vector<std::uint32_t>{5500});  // once, not per attempt
+}
+
+TEST_CASE("save watcher: rearm returns the error when no watcher can be created, and reports it once") {
+    QuietLogs quiet;
+    FakeFactory fake;
+    fake.fail = true;
+    fake.fail_code = 5502;
+    std::vector<std::uint32_t> reported;
+    SaveWatcherHooks hooks;
+    hooks.tracked_files = [] { return std::vector<std::string>{"c:\\p\\a.cpp"}; };
+    hooks.reload = [] { return SaveWatcherHooks::ReloadResult::Done; };
+    hooks.report = [&](const Diag& d, const char*) { reported.push_back(d.code); };
+    SaveWatcher w(hooks, fast(fake.factory()));
+    const std::optional<Diag> first = w.rearm();
+    REQUIRE(first.has_value());
+    CHECK(first->code == 5502);
+    CHECK(w.rearm().has_value());
+    CHECK(reported == std::vector<std::uint32_t>{5502});
+}
+
+TEST_CASE("save watcher: nothing-to-watch is reported once per state change") {
+    QuietLogs quiet;
+    FakeFactory fake;
+    std::vector<std::string> files;
+    std::vector<std::uint32_t> reported;
+    SaveWatcherHooks hooks;
+    hooks.tracked_files = [&] { return files; };
+    hooks.reload = [] { return SaveWatcherHooks::ReloadResult::Done; };
+    hooks.report = [&](const Diag& d, const char* severity) {
+        reported.push_back(d.code);
+        CHECK(std::string(severity) == "info");
+    };
+    SaveWatcher w(hooks, fast(fake.factory()));
+    w.rearm();
+    w.rearm();
+    w.rearm();
+    CHECK(reported == std::vector<std::uint32_t>{5504});
+}
+
+TEST_CASE("save watcher: stop() starts no further reload") {
+    QuietLogs quiet;
+    FakeFactory fake;
+    std::atomic<int> reloads{0};
+    SaveWatcherHooks hooks;
+    hooks.tracked_files = [] { return std::vector<std::string>{"c:\\p\\a.cpp"}; };
+    hooks.reload = [&] {
+        ++reloads;
+        return SaveWatcherHooks::ReloadResult::Done;
+    };
+    SaveWatcher w(hooks, fast(fake.factory()));
+    w.rearm();
+    REQUIRE(wait_until([&] { return reloads.load() >= 1; }));
+    w.stop();
+    const int before = reloads.load();
+    w.inject(modified("c:\\p\\a.cpp"));
+    std::this_thread::sleep_for(250ms);
+    CHECK(reloads.load() == before);
 }

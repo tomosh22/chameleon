@@ -1,6 +1,7 @@
 #include <string>
 #include <vector>
 
+#include "cml/proc/proc.h"
 #include "cml/util/log.h"
 #include "cml/watch/watch.h"
 #include "cml/watch/watch_diag_ids.h"
@@ -14,6 +15,7 @@
 #endif
 #include <windows.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <thread>
 #endif
@@ -33,32 +35,6 @@ namespace {
 
 constexpr DWORD kBufferBytes = 64 * 1024;
 constexpr std::size_t kMaxRoots = MAXIMUM_WAIT_OBJECTS - 1;  // one wait slot is the stop event
-
-std::string utf8_from_wide(const wchar_t* text, std::size_t length) {
-    if (length == 0) {
-        return {};
-    }
-    const int bytes = WideCharToMultiByte(CP_UTF8, 0, text, static_cast<int>(length), nullptr, 0, nullptr, nullptr);
-    if (bytes <= 0) {
-        return {};
-    }
-    std::string out(static_cast<std::size_t>(bytes), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, text, static_cast<int>(length), out.data(), bytes, nullptr, nullptr);
-    return out;
-}
-
-std::wstring wide_from_utf8(const std::string& text) {
-    if (text.empty()) {
-        return {};
-    }
-    const int chars = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
-    if (chars <= 0) {
-        return {};
-    }
-    std::wstring out(static_cast<std::size_t>(chars), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(), chars);
-    return out;
-}
 
 struct Root {
     std::string directory;
@@ -94,7 +70,7 @@ public:
         Root r;
         r.directory = root.directory;
         r.recursive = root.recursive;
-        const std::wstring wide = wide_from_utf8(root.directory);
+        const std::wstring wide = proc::wide_from_utf8(root.directory);
         r.handle = CreateFileW(wide.c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
         if (r.handle == INVALID_HANDLE_VALUE) {
@@ -137,6 +113,20 @@ private:
         return true;
     }
 
+    // The root cannot deliver events any more (the directory was deleted or renamed, access was lost, the volume
+    // went away). The consumer is told which root, so it can report it and rebuild the watch.
+    void kill_root(Root& r, DWORD error) {
+        r.armed = false;
+        if (error == ERROR_OPERATION_ABORTED) {
+            return;
+        }
+        CML_LOG(Warn, "directory watcher: '%s' is no longer watched (error %lu)", r.directory.c_str(), static_cast<unsigned long>(error));
+        FsEvent died;
+        died.action = FsAction::RootLost;
+        died.path = r.directory;
+        sink_(died);
+    }
+
     void close_root(Root& r) {
         if (r.handle != INVALID_HANDLE_VALUE) {
             if (r.armed) {
@@ -156,12 +146,18 @@ private:
 
     void deliver(const Root& r, DWORD bytes) {
         const auto* base = reinterpret_cast<const unsigned char*>(r.buffer.data());
+        constexpr DWORD kHeader = static_cast<DWORD>(offsetof(FILE_NOTIFY_INFORMATION, FileName));
         DWORD offset = 0;
         for (;;) {
-            if (offset + sizeof(FILE_NOTIFY_INFORMATION) > bytes) {
+            // Every record is validated against the bytes the kernel returned: the header, then the name.
+            if (bytes - offset < kHeader) {
                 break;
             }
             const auto* info = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(base + offset);
+            const DWORD remaining = bytes - offset;
+            if (info->FileNameLength > remaining - kHeader) {
+                break;
+            }
             FsEvent event;
             switch (info->Action) {
                 case FILE_ACTION_ADDED: event.action = FsAction::Added; break;
@@ -171,12 +167,13 @@ private:
                 case FILE_ACTION_RENAMED_NEW_NAME: event.action = FsAction::RenamedTo; break;
                 default: event.action = FsAction::Modified; break;
             }
-            event.path = r.directory + "\\" + utf8_from_wide(info->FileName, info->FileNameLength / sizeof(wchar_t));
+            event.path = r.directory + "\\" + proc::utf8_from_wide(info->FileName, info->FileNameLength / sizeof(wchar_t));
             sink_(event);
-            if (info->NextEntryOffset == 0) {
-                break;
+            const DWORD next = info->NextEntryOffset;
+            if (next == 0 || next < kHeader || next >= remaining) {
+                break;  // last record, or an offset that does not lead to another record inside the buffer
             }
-            offset += info->NextEntryOffset;
+            offset += next;
         }
     }
 
@@ -209,15 +206,18 @@ private:
             DWORD bytes = 0;
             if (!GetOverlappedResult(r.handle, &r.overlapped, &bytes, FALSE)) {
                 const DWORD error = GetLastError();
-                r.armed = false;
-                if (error != ERROR_OPERATION_ABORTED) {
-                    // The directory was deleted or the volume went away: events cannot come any more. Whatever
-                    // happened to the files in it, a re-check is the safe answer.
-                    CML_LOG(Warn, "directory watcher: '%s' is no longer watched (error %lu)", r.directory.c_str(), static_cast<unsigned long>(error));
+                if (error == ERROR_NOTIFY_ENUM_DIR) {
+                    // Too many changes for the buffer: the events are lost, not the directory. Re-check everything
+                    // and keep watching the same root.
                     FsEvent lost;
                     lost.action = FsAction::Overflow;
                     sink_(lost);
+                    if (!arm(r)) {
+                        kill_root(r, GetLastError());
+                    }
+                    continue;
                 }
+                kill_root(r, error);
                 continue;
             }
             if (bytes == 0) {
@@ -229,7 +229,7 @@ private:
                 deliver(r, bytes);
             }
             if (!arm(r)) {
-                CML_LOG(Warn, "directory watcher: cannot re-arm '%s' (error %lu)", r.directory.c_str(), static_cast<unsigned long>(GetLastError()));
+                kill_root(r, GetLastError());
             }
         }
     }
