@@ -1050,3 +1050,87 @@ TEST_CASE("patches applied before a later compiland failed still count in the ge
     CHECK(accepted[0].count("C:\\proj\\logic.cpp") == 1);
     CHECK(accepted[0].count("C:\\proj\\main.cpp") == 0);
 }
+
+// ---- WP-15: header dependency handling ----------------------------------------------------------------------------
+
+TEST_CASE("reload: a changed file of a precompiled header is refused with CML5550 before anything is compiled") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.module->index->set_sweep_override_for_testing([]() -> Result<ModuleIndex::Sweep> {
+        ModuleIndex::Sweep s;
+        const std::string pch = "C:\\proj\\pch.h";
+        s.changed = {pch};
+        s.compilands = {0, 1};
+        s.file_compilands[pch] = {0, 1};
+        s.pch_headers = {pch};
+        s.stamps[pch] = FileStamp{1, 2, 3};
+        return s;
+    });
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML5550");
+    CHECK(r.error().message.find("pch.h") != std::string::npos);
+    CHECK(rig.events->diag_ids() == std::vector<std::string>{"CML5550"});
+    CHECK(rig.compile_calls == 0);
+    CHECK(rig.requests.empty());
+    CHECK(rig.module->index->accepted_for_testing().empty());  // still "changed": reverting it makes the next reload a no-op
+}
+
+TEST_CASE("reload: more affected compilands than max_affected_compilands needs a confirmation (CML5551)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed_both();
+    rig.second_object = make_object({}, false, "no_such_function_anywhere");  // stops after the compile stage; the cap is what is tested
+    SUBCASE("above the limit and not confirmed: nothing is compiled and the count is named") {
+        rig.option("max_affected_compilands", Value::integer(1));
+        Result<Value> r = rig.reload();
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().id() == "CML5551");
+        CHECK(r.error().message.find("2 compilands") != std::string::npos);
+        CHECK(r.error().what_to_do.find("confirm") != std::string::npos);
+        CHECK(rig.compile_calls == 0);
+        CHECK(rig.requests.empty());
+    }
+    SUBCASE("confirmed: the reload proceeds") {
+        rig.option("max_affected_compilands", Value::integer(1));
+        Value args = Value::object();
+        args.set("confirm", Value::boolean(true));
+        Result<Value> r = rig.service->reload(args);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().id() == "CML3200");  // got as far as planning
+        CHECK(rig.compile_calls >= 1);
+    }
+    SUBCASE("at the limit no confirmation is needed") {
+        rig.option("max_affected_compilands", Value::integer(2));
+        Result<Value> r = rig.reload();
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().id() == "CML3200");
+    }
+    SUBCASE("with the limit off no confirmation is needed") {
+        rig.option("max_affected_compilands", Value::integer(0));
+        Result<Value> r = rig.reload();
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().id() == "CML3200");
+    }
+    SUBCASE("'confirm' must be a boolean") {
+        Value args = Value::object();
+        args.set("confirm", Value::string("yes"));
+        Result<Value> r = rig.service->reload(args);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().id() == "CML5311");
+    }
+}
+
+TEST_CASE("reload: compiles run in batches of max_parallel_compiles and report progress events") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed_both();
+    rig.second_object = make_object({}, false, "no_such_function_anywhere");
+    rig.option("max_parallel_compiles", Value::integer(1));
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(rig.events->count("progress") == 3);  // 0/2, 1/2, 2/2
+}

@@ -38,6 +38,19 @@ Event make_patch_applied_event(std::uint32_t pid, const std::string& module, std
     return e;
 }
 
+Event make_progress_event(const std::string& stage, std::uint32_t pid, const std::string& module, std::size_t done, std::size_t total) {
+    Event e;
+    e.name = "progress";
+    e.body = ipc::json::Value::object();
+    e.body.set("event", ipc::json::Value::string("progress"));
+    e.body.set("stage", ipc::json::Value::string(stage));
+    e.body.set("pid", ipc::json::Value::integer(static_cast<std::int64_t>(pid)));
+    e.body.set("module", ipc::json::Value::string(module));
+    e.body.set("done", ipc::json::Value::integer(static_cast<std::int64_t>(done)));
+    e.body.set("total", ipc::json::Value::integer(static_cast<std::int64_t>(total)));
+    return e;
+}
+
 Event make_log_event(const char* level, const std::string& message) {
     Event e;
     e.name = "log";

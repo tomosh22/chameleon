@@ -7,6 +7,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <thread>
 #include <unordered_set>
 
 #include "cml/coff/anchors.h"
@@ -14,6 +15,7 @@
 #include "cml/coff/writer.h"
 #include "cml/core/bind_diag_ids.h"
 #include "cml/core/bind_plan.h"
+#include "cml/core/header_diag_ids.h"
 #include "cml/core/patch_image.h"
 #include "cml/core/pipeline_diag_ids.h"
 #include "cml/toolchain/rewrite.h"
@@ -210,6 +212,13 @@ private:
     }
 
     // ---- the run -----------------------------------------------------------------------------------------
+    void publish_progress(const char* stage, std::size_t done, std::size_t total) {
+        CML_LOG(Info, "reload: %s %zu/%zu (%s)", stage, done, total, module_.name.c_str());
+        if (ctx_.events != nullptr) {
+            ctx_.events->publish(make_progress_event(stage, pid_, module_.name, done, total));
+        }
+    }
+
     Result<PatchReport> run() {
         PatchReport report;
         const LinkSnapshot snap = link_.snapshot();
@@ -269,7 +278,7 @@ private:
         for (const std::string& f : swept->unmapped) {
             warn(report, "sweep",
                  Diag::make(pd::kChangedFileUnmapped, "the changed file '" + f + "' is not part of any compiland of " + module_.name,
-                            "clang-cl PDBs do not list headers that hold no code (ADR-0013). Edit a .cpp file that includes the header; touching a file does not count, only a change of its content does."));
+                            "No compiland lists the file and no scanned #include chain of the module reaches it (ADR-0013). Edit a source file that includes the header, or rebuild the project if the include path changed."));
         }
         for (const std::string& f : swept->missing) {
             warn(report, "sweep", Diag::make(pd::kBaselineFile, "the tracked file '" + f + "' is gone", "Restore it or ignore this warning."));
@@ -277,6 +286,24 @@ private:
         report.times.sweep = lap.lap();
         CML_LOG(Info, "reload: sweep of %s: %zu files checked, %zu hashed, %zu changed, %zu compilands", module_.name.c_str(), swept->checked, swept->hashed,
                 swept->changed.size(), swept->compilands.size());
+        // ---- WP-15: refuse what cannot be reloaded, and ask before a very large reload -------------------------------
+        if (!swept->pch_headers.empty()) {
+            std::string names;
+            for (const std::string& f : swept->pch_headers) {
+                names += (names.empty() ? "'" : ", '") + f + "'";
+            }
+            return fail("sweep", Diag::make(header::diag::kPchHeaderChanged,
+                                            "the changed " + std::string(swept->pch_headers.size() == 1 ? "file " : "files ") + names +
+                                                " belong to the precompiled header of " + module_.name + "; a precompiled header cannot be hot-reloaded",
+                                            "Revert the change, or rebuild and restart the application. Edit the translation units that use the precompiled header instead."));
+        }
+        if (options_.max_affected_compilands != 0 && swept->compilands.size() > options_.max_affected_compilands && !ctx_.confirm) {
+            return fail("sweep", Diag::make(header::diag::kTooManyCompilands,
+                                            "the change affects " + std::to_string(swept->compilands.size()) + " compilands of " + module_.name +
+                                                " (" + std::to_string(swept->changed.size()) + " changed files), more than the limit of " +
+                                                std::to_string(options_.max_affected_compilands),
+                                            "Repeat the reload with \"confirm\": true to recompile them all, or raise the option max_affected_compilands."));
+        }
         if (swept->compilands.empty()) {
             // Nothing to compile. Files that map to no compiland are accepted so they are not reported again.
             module_.index->accept(swept->stamps);
@@ -332,8 +359,35 @@ private:
             return *first_error;
         }
         std::vector<toolchain::CompileOutcome> outcomes(requests.size());
-        const std::vector<Result<void>> results = env_.compile_all(requests, outcomes, options_.max_parallel_compiles, ctx_.cancel);
-        for (std::size_t i = 0; i < units.size(); ++i) {
+        // WP-15: compile in batches of max_parallel_compiles and report after each one. A failed batch ends the stage.
+        std::vector<Result<void>> results;
+        results.reserve(requests.size());
+        {
+            std::size_t batch = options_.max_parallel_compiles;
+            if (batch == 0) {
+                batch = std::max<std::size_t>(1, std::thread::hardware_concurrency());
+            }
+            const std::size_t total = requests.size();
+            publish_progress("compile", 0, total);
+            for (std::size_t begin = 0; begin < total; begin += batch) {
+                const std::size_t end = std::min(total, begin + batch);
+                const std::vector<toolchain::CompileRequest> part(requests.begin() + static_cast<std::ptrdiff_t>(begin),
+                                                                  requests.begin() + static_cast<std::ptrdiff_t>(end));
+                std::vector<toolchain::CompileOutcome> part_outcomes(part.size());
+                std::vector<Result<void>> part_results = env_.compile_all(part, part_outcomes, options_.max_parallel_compiles, ctx_.cancel);
+                bool failed = false;
+                for (std::size_t i = 0; i < part.size(); ++i) {
+                    outcomes[begin + i] = std::move(part_outcomes[i]);
+                    results.push_back(i < part_results.size() ? std::move(part_results[i]) : Result<void>());
+                    failed = failed || !results.back();
+                }
+                publish_progress("compile", end, total);
+                if (failed) {
+                    break;
+                }
+            }
+        }
+        for (std::size_t i = 0; i < results.size(); ++i) {
             units[i].outcome = outcomes[i];
             if (!results[i]) {
                 Diag d = results[i].error();

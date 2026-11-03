@@ -46,6 +46,9 @@ struct ReloadOptions {
     std::uint32_t hooks_timeout_ms = 30000;    // InstallHooks: in synchronised mode this waits for SyncPoint()
     bool release_pdb_after_reload = false;     // ADR-0017: drop the PDB mapping when a reload is done
     bool track_system_headers = false;         // baseline also hashes SDK/toolchain headers
+    // WP-15: a reload that would recompile more compilands than this does not start unless the request is confirmed
+    // (control command `reload` with "confirm": true). 0 = no limit.
+    std::uint32_t max_affected_compilands = 64;
     std::uint32_t reserve_block_mb = 64;
     std::uint32_t reserve_blocks = 4;
     unsigned max_load_attempts = 3;            // relink at another base when the range was taken (CML4203)
@@ -110,6 +113,7 @@ struct PipelineContext {
     std::shared_ptr<ExportCache> exports;         // shared between reloads
     std::chrono::steady_clock::time_point deadline;
     toolchain::CancelToken* cancel = nullptr;
+    bool confirm = false;                         // WP-15: the request accepted a reload above max_affected_compilands
 };
 
 class PatchPipeline {

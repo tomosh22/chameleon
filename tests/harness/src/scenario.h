@@ -37,6 +37,8 @@ struct Step {
     std::string result_key;
     long long result_value = 0;
     bool has_result_value = false;
+    // Reload (WP-15): the reload must be refused with this diagnostic id (e.g. "CML5550"); empty = it must succeed.
+    std::string expect_error;
 
     // "expect_stdout /value=2/ within 10 s"
     std::string describe() const;

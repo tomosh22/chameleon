@@ -48,7 +48,7 @@ public:
     void detach(std::uint64_t agent_id);
 
     // ---- control commands (args are the request's "args" object) ----
-    // {"pid"?:N, "module"?:"name or path", "timeout_ms"?:N}
+    // {"pid"?:N, "module"?:"name or path", "timeout_ms"?:N, "confirm"?:bool}
     Result<ipc::json::Value> reload(const ipc::json::Value& args);
     // {"for"?:"idle"|"index", "timeout_ms"?:N}
     Result<ipc::json::Value> wait(const ipc::json::Value& args);

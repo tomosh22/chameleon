@@ -4,7 +4,9 @@
 #include <chrono>
 #include <set>
 
+#include "cml/core/include_scan.h"
 #include "cml/core/pipeline_diag_ids.h"
+#include "cml/toolchain/record.h"
 #include "cml/util/log.h"
 
 namespace cml::core {
@@ -152,14 +154,59 @@ void ModuleIndex::run() {
     }
     set_status(IndexState::Loading, 30, "reading the file lists");
     std::set<std::string> files;
-    for (std::uint32_t ci = 0; ci < index->compiland_count(); ++ci) {
+    std::map<std::string, std::vector<std::uint32_t>> header_deps;
+    std::set<std::string> pch_files;
+    IncludeScanner scanner;
+    const std::uint32_t compiland_total = index->compiland_count();
+    for (std::uint32_t ci = 0; ci < compiland_total; ++ci) {
         if (!is_source_compiland(*index, ci)) {
             continue;
         }
+        if (cancel_.load(std::memory_order_acquire)) {
+            return;
+        }
+        std::set<std::string> listed;
         for (const std::string_view f : index->compiland_files_normalized(ci)) {
-            files.emplace(f);
+            listed.emplace(f);
+        }
+        files.insert(listed.begin(), listed.end());
+        if (!spec_.scan_includes) {
+            continue;
+        }
+        // WP-15 / ADR-0013: the PDB list is not an include graph for clang-cl, so follow the includes ourselves.
+        Result<pdb::BuildEnv> env = index->build_env(ci);
+        if (!env) {
+            CML_LOG(Debug, "index: compiland %u has no build environment, headers come from the PDB list only: %s", ci, env.error().format().c_str());
+            continue;
+        }
+        Result<toolchain::CompileRecord> record = toolchain::record_from_build_env(*env);
+        if (!record) {
+            continue;
+        }
+        const ScanRoots roots = scan_roots_from_record(*record);
+        const std::set<std::string> deps = scanner.dependencies(roots);
+        for (const std::string& d : deps) {
+            files.insert(d);
+            header_deps[d].push_back(ci);
+        }
+        if (roots.creates_pch) {
+            const std::string own = pdb::normalize_path(roots.source, roots.cwd);
+            for (const std::string& f : listed) {
+                if (f != own) pch_files.insert(f);
+            }
+            pch_files.insert(deps.begin(), deps.end());
+        }
+        if (ci % 16 == 0) {
+            set_status(IndexState::Loading, 10 + 20 * ci / std::max<std::uint32_t>(1, compiland_total),
+                       "scanning includes (" + std::to_string(ci) + "/" + std::to_string(compiland_total) + ")");
         }
     }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        header_deps_ = std::move(header_deps);
+        pch_files_ = std::move(pch_files);
+    }
+    CML_LOG(Debug, "index: include scan of %s: %zu files read, %zu headers mapped", spec_.module_path.c_str(), scanner.files_read(), scanned_headers());
     const Clock::time_point t1 = Clock::now();
     std::vector<std::string> list(files.begin(), files.end());
     BaselineOptions options = spec_.baseline;
@@ -212,14 +259,36 @@ Result<ModuleIndex::Sweep> ModuleIndex::sweep() {
     out.hashed = raw.hashed;
     out.checked = raw.checked;
     std::set<std::uint32_t> compilands;
+    std::map<std::string, std::vector<std::uint32_t>> scanned;
+    std::set<std::string> pch;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        scanned = header_deps_;
+        pch = pch_files_;
+    }
     for (const std::string& file : raw.changed) {
         bool mapped = false;
-        for (const std::uint32_t ci : (*index)->compilands_for_file(file)) {
-            if (is_source_compiland(**index, ci)) {
+        std::set<std::uint32_t> seen;
+        const auto map_to = [&](std::uint32_t ci) {
+            if (seen.insert(ci).second) {
                 compilands.insert(ci);
                 out.file_compilands[file].push_back(ci);
-                mapped = true;
             }
+            mapped = true;
+        };
+        for (const std::uint32_t ci : (*index)->compilands_for_file(file)) {
+            if (is_source_compiland(**index, ci)) {
+                map_to(ci);
+            }
+        }
+        // WP-15: the scanned include graph (ADR-0013) adds the compilands whose PDB list lacks the header.
+        if (const auto it = scanned.find(file); it != scanned.end()) {
+            for (const std::uint32_t ci : it->second) {
+                map_to(ci);
+            }
+        }
+        if (pch.count(file) != 0) {
+            out.pch_headers.push_back(file);
         }
         if (!mapped) {
             out.unmapped.push_back(file);
@@ -227,6 +296,16 @@ Result<ModuleIndex::Sweep> ModuleIndex::sweep() {
     }
     out.compilands.assign(compilands.begin(), compilands.end());
     return out;
+}
+
+std::size_t ModuleIndex::scanned_headers() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return header_deps_.size();
+}
+
+bool ModuleIndex::is_pch_header(const std::string& normalised_path) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return pch_files_.count(normalised_path) != 0;
 }
 
 void ModuleIndex::accept(const std::map<std::string, FileStamp>& stamps) {
