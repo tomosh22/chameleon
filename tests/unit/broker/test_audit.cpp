@@ -108,8 +108,10 @@ const AuditFinding& finding(const ModuleAudit& a, const char* check) {
 }
 
 std::string capture(int* code, const std::vector<std::string>& args, std::string* err_text = nullptr) {
-    std::FILE* out = std::tmpfile();
-    std::FILE* err = std::tmpfile();
+    // (not std::tmpfile(): on Windows it writes to the root of the drive, which needs administrator rights)
+    tp::TempDir scratch;
+    std::FILE* out = std::fopen(scratch.file("out.txt").c_str(), "w+b");
+    std::FILE* err = std::fopen(scratch.file("err.txt").c_str(), "w+b");
     REQUIRE(out != nullptr);
     REQUIRE(err != nullptr);
     *code = run_check_command(args, out, err);
