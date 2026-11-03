@@ -614,3 +614,58 @@ parallel, so each work package gets its own range:
 | CML5600–5649 | WP-16 multiple modules and processes |
 | CML5650–5699 | WP-17 patch/compile hooks and synchronised mode |
 | CML1600–1699, CML2300–2399 | WP-18 build-requirement checks (`cml_broker check`) |
+
+## ADR-0032 Wave-6 diagnostic ranges, IPC message blocks and control-pipe shapes (extends ADR-0008/0031)
+
+**Date:** 2026-11-03 · **Status:** Accepted
+
+Wave 6 (WP-19, WP-20, WP-21, WP-22, WP-24, WP-25) runs up to four packages in parallel, and three of them
+add agent messages and control commands. To keep them from colliding, and to let the UI (WP-19) be built
+against commands that land in parallel, the ids and wire shapes are fixed here.
+
+**Diagnostic ranges**
+
+| Range | Owner |
+|---|---|
+| CML5700–5749 | WP-19 broker UI (`cml_ui`) |
+| CML4400–4449, CML5750–5799 | WP-20 crash → patch → continue (agent, broker) |
+| CML4450–4499, CML5800–5849 | WP-21 hot-restart (agent, broker) |
+| CML4500–4549, CML5850–5899 | WP-22 patch revert and session reset (agent, broker) |
+| CML3400–3449, CML4550–4599 | WP-24 thread-local variables (planner, agent) |
+| CML3450–3499 | WP-25 unchanged-function elision |
+
+**Agent message types** (`core/cml_ipc/include/cml/ipc/messages.h`): WP-20 owns `Exception` 0x0050,
+`ExceptionAction` 0x0051 and may add 0x0052–0x005F; WP-21 owns `Restart` 0x0061 and may add 0x0062–0x006F
+(`Log` 0x0060 is unchanged); WP-22 owns 0x0080–0x008F; WP-24 owns 0x0090–0x009F; WP-25 owns 0x00A0–0x00AF.
+Additions are additive; no package changes `agent_abi_version` (the orchestrator bumps it once at the end of the
+wave if the merged set needs it).
+
+**Control-pipe commands and events** (request/response framing per WP-13; every package advertises its
+capability name in `hello`):
+
+| Owner | Capability | Shape |
+|---|---|---|
+| WP-20 | `exceptions` | event `{"event":"exception","pid","tid","exception_id","code":"0xC0000005","address","module","function","offset","actions":["continue","leave","ignore"]}`; command `exception-action` `{pid, exception_id, action}` → `{pid, exception_id, action}`; command `exceptions` → `{pending:[<exception event bodies>]}` |
+| WP-21 | `restart` | command `restart` `{pid, timeout_ms?}` → `{old_pid, new_pid, modules:[...]}`; event `{"event":"restarted","old_pid","new_pid"}` |
+| WP-22 | `revert` | command `revert` `{pid?, module?, scope:"last"\|"all"}` → `{reverted:[{pid, module, generation}], generation}`; event `{"event":"patch_reverted","pid","module","generation"}` |
+
+A package may add fields but not rename these. Clients (WP-19, cmltest) treat CML5402 (unknown command) or a
+missing capability as "feature not available in this broker" and disable the feature instead of failing.
+
+## ADR-0033 Broker UI is a separate control-pipe client (`cml_ui.exe`) built on vendored Dear ImGui (WP-19)
+
+**Date:** 2026-11-03 · **Status:** Accepted
+
+Plan §8 WP-19 asks for an ImGui UI and says every control-pipe operation must be reachable from it.
+**Decision:** the UI is its own executable, `cml_ui.exe` (`broker/cml_ui/`), and talks to the broker only over
+the control pipe (the same protocol cmltest uses). If no broker is running it starts `cml_broker.exe` from its own
+directory, as the agent does. Dear ImGui (MIT) is vendored under `third_party/imgui` at a pinned release tag
+with its licence file; backends are Win32 + Direct3D 11 (both ship with Windows and the SDK; no new runtime
+dependency). Single instance via a named mutex; the tray icon uses `Shell_NotifyIconW`.
+
+Reasons: the broker stays headless and fully tested by the harness; a UI defect cannot take a reload down;
+and the "every operation reachable" requirement becomes testable. The UI keeps a table of the control commands
+it drives, and a unit test checks that table against the commands the broker advertises. UI logic lives in a
+window-free view-model layer that is unit-tested; drawing code is thin. CI builds `cml_ui` in every cell and
+runs `cml_ui --self-test` (connects to a broker started by the test, runs `status`, exercises the view-model,
+creates no window). Visual acceptance is the manual checklist in `docs/wp/WP-19.md`.
