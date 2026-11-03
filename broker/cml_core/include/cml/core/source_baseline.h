@@ -71,6 +71,8 @@ public:
 
     std::size_t size() const;
     bool tracks(const std::string& path) const;
+    // Every tracked path (WP-14: the directories the file watcher watches are derived from it).
+    std::vector<std::string> files() const;
 
 private:
     mutable std::mutex mutex_;

@@ -19,6 +19,9 @@ enum class StepKind {
     Reload,               // control command `reload` (needs capability "reload")
     ExpectDiag,           // a `diag` event with this id must arrive (needs capability "diag-events")
     ExpectMonotonic,      // a `key=<int>` of the fixture's TICK lines never decreases (state kept in the old storage)
+    SetOption,            // control command `set-option` (WP-14: e.g. compile_on_save = true)
+    Wait,                 // control command `wait` for "index" or "idle"
+    ExpectEvent,          // an event of this name (patch_applied, ...) must arrive (needs capability "subscribe")
     ExpectReloadResult,   // an integer member of the most recent reload's result has this value (WP-16)
 };
 
@@ -31,7 +34,14 @@ struct Step {
     std::string module;    // ExpectModuleEnabled: file name or path suffix, compared case-insensitively
     std::string patch;     // Edit: path relative to the fixture directory
     std::string id;        // ExpectDiag: "CML3101"
-    int within_s = 10;     // ExpectStdout / ExpectModuleEnabled / Reload / ExpectDiag
+    std::string event;     // ExpectEvent: "patch_applied"
+    std::string option;    // SetOption: option name
+    enum class OptionKind { Bool, Integer, String } option_kind = OptionKind::Bool;
+    bool option_bool = false;
+    long long option_integer = 0;
+    std::string option_string;
+    std::string wait_for;  // Wait: "index" | "idle"
+    int within_s = 10;     // ExpectStdout / ExpectModuleEnabled / Reload / ExpectDiag / ExpectEvent / Wait
     std::string key;       // ExpectMonotonic: the TICK key ("calls")
     int min_samples = 10;  // ExpectMonotonic: at least this many samples of the key in the whole output
     // Reload: the result object of the reload command must hold this integer member (e.g. "initializers_run" = 1).

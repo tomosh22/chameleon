@@ -72,7 +72,7 @@ if(WIN32)
     set_tests_properties(unit.ipc unit.proc PROPERTIES TIMEOUT 120)
 endif()
 add_subdirectory(toolchain)  # WP-05: unit.toolchain
-cml_add_unit_test(watch SOURCES lib/test_watch.cpp LIBS cml_watch)
+cml_add_unit_test(watch SOURCES lib/test_watch.cpp watch/test_coalesce.cpp watch/test_directory_watcher.cpp LIBS cml_watch)  # WP-14
 # WP-11: agent pieces (SyncPoint queue, module diff, heap) link the agent core library directly; the
 # end-to-end tests load cml_agent.dll through Chameleon_API.h like an application would and talk to
 # an in-process broker (cml_core's ConnectionServer).
@@ -103,6 +103,8 @@ cml_add_unit_test(broker_core
         broker/test_reload.cpp
         # WP-18: the module audit (cml_broker check, enable-time build requirements)
         broker/test_audit.cpp
+        # WP-14: compile on save
+        broker/test_save_watcher.cpp
     LIBS cml_core)
 add_subdirectory(bind)  # WP-07: unit.bind
 if(NOT MSVC)

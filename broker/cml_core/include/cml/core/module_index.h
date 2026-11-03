@@ -108,6 +108,8 @@ public:
     // Requires Ready and a mapped index (acquire_pdb() first).
     Result<Sweep> sweep();
     void accept(const std::map<std::string, FileStamp>& stamps);
+    // The files the baseline tracks (empty until Ready). WP-14 watches their directories.
+    std::vector<std::string> tracked_files() const { return baseline_.files(); }
     // Test seam: replaces the content of sweep() (the synthetic PDBs of the unit tests have no real source
     // files behind them). The state check still applies. accept() calls are recorded for the tests.
     void set_sweep_override_for_testing(std::function<Result<Sweep>()> sweep);

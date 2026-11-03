@@ -70,6 +70,7 @@ cml_add_unit_test(harness
         tests/test_run_dirs.cpp
         tests/test_ticks.cpp
         tests/test_wp12_scenarios.cpp
+        tests/test_wp14_scenarios.cpp
         tests/test_wp16_scenarios.cpp
     LIBS cmltest_core)
 target_compile_definitions(cml_test_harness PRIVATE

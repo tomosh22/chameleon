@@ -60,6 +60,21 @@ kind = "expect_diag"           # a `diag` event with this id; needs capability "
 id = "CML3101"
 within_s = 10
 
+[[step]]
+kind = "set_option"            # control command `set-option` (WP-14); needs capability "set-option"
+option = "compile_on_save"     # option name
+value = true                   # boolean, integer or string
+
+[[step]]
+kind = "wait"                  # control command `wait` (WP-14); needs capability "wait"
+for = "index"                  # "index" (PDB indexes loaded) or "idle" (and no reload running)
+within_s = 60                  # 1..3600, default 60
+
+[[step]]
+kind = "expect_event"          # an event of this name (patch_applied, diag, log); needs capability "subscribe"
+event = "patch_applied"        # events of other names are consumed on the way
+within_s = 10
+
 # WP-16: several processes under one broker, and the reload's result counters
 [[step]]
 kind = "launch"                # a first launch starts the broker; a further launch needs `exe` (another executable of the

@@ -204,6 +204,12 @@ Result<ServerExit> ConnectionServer::run() {
     }
     ReloadService service(options_.pipeline_env != nullptr ? *options_.pipeline_env : native, &events_, options_.session_dir);
     shared.service = &service;
+    if (options_.compile_on_save) {
+        ipc::json::Value args = ipc::json::Value::object();
+        args.set("name", ipc::json::Value::string("compile_on_save"));
+        args.set("value", ipc::json::Value::boolean(true));
+        (void)service.set_option(args);
+    }
     std::unique_ptr<ControlServer> control;
     if (!options_.control_pipe_name.empty()) {
         ControlContext context;
