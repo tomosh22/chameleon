@@ -137,7 +137,7 @@ jobs:
               & "$env:BUILD_DIR/bin/cml_broker.exe" check --verbose $exe *>&1 | Tee-Object -FilePath $out -Append
               "exit code $LASTEXITCODE" | Tee-Object -FilePath $out -Append
             } else {
-              "== $m: not built in this cell ==" | Tee-Object -FilePath $out -Append
+              "== ${m}: not built in this cell ==" | Tee-Object -FilePath $out -Append
             }
           }
           exit 0
