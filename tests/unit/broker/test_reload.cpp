@@ -762,6 +762,7 @@ TEST_CASE("revert: a reload that applied two patches is one batch; a refusal by 
     QuietLogs quiet;
     Rig rig;
     rig.enable();
+    rig.option("narrow_hooks", Value::boolean(false));  // WP-25: identical code is not loaded again; this test is about batches
     rig.changed_both();
     rig.second_object = make_object();  // main.cpp patches too
     Result<Value> r = rig.reload();
@@ -815,6 +816,7 @@ TEST_CASE("revert last means the newest reload: a module that reload did not tou
     Rig rig;
     rig.enable();
     rig.enable2();
+    rig.option("narrow_hooks", Value::boolean(false));  // WP-25: identical code is not loaded again; this test is about batches
     // Reload 1 patches both processes ...
     rig.changed_on(*rig.module);
     rig.changed_on(*rig.module2);
