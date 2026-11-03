@@ -35,7 +35,7 @@ within_s = 10
 
 [[step]]
 kind = "edit"
-patch = "edits/second_edit.edit"
+patch = "edits/stacked/second_edit.edit"
 
 [[step]]
 kind = "reload"
