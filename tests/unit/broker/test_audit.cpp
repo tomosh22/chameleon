@@ -259,7 +259,7 @@ TEST_CASE("audit: a compiland without a recorded command line is CML1102 (FAIL w
     CHECK_FALSE(b.has_failures());
 }
 
-TEST_CASE("audit: a PDB without function symbols is CML1101 FAIL; the command line only decides when the PDB cannot say") {
+TEST_CASE("audit: CML1101 from a PDB without function symbols, or from /DEBUG:FASTLINK (last-wins, not for lld-link)") {
     QuietLogs quiet;
     // The PDB is the evidence: compilands that contributed code but list no function are a FASTLINK / stripped PDB.
     ModOpts bare;
@@ -271,34 +271,29 @@ TEST_CASE("audit: a PDB without function symbols is CML1101 FAIL; the command li
     CHECK(finding(b, "debug-info").id == 1101);
     CHECK(b.has_failures());
 
-    // /DEBUG:FASTLINK on the command line, but the PDB has its function symbols: a full PDB, no FAIL.
-    ModOpts overridden;
-    overridden.link = "/DEBUG:FASTLINK /DEBUG:FULL /INCREMENTAL:NO /OUT:app.exe";
-    Module m2(overridden);
-    CHECK(finding(audit_module_file(m2.exe), "debug-info").verdict == Verdict::Pass);
-    ModOpts contradicting;
-    contradicting.link = "/DEBUG:FASTLINK /INCREMENTAL:NO /OUT:app.exe";
-    Module m3(contradicting);
-    CHECK(finding(audit_module_file(m3.exe), "debug-info").verdict == Verdict::Pass);  // the symbols are there
-
-    // Nothing to sample (no section contributions): the command line decides, for link.exe ...
-    ModOpts unsampled;
-    unsampled.no_contributions = true;
-    unsampled.link = "/DEBUG:FASTLINK /OUT:app.exe";
-    Module m4(unsampled);
-    const ModuleAudit f = audit_module_file(m4.exe);
+    // A link.exe /DEBUG:FASTLINK PDB still lists its functions (CI evidence), so the symbols cannot clear the command line ...
+    ModOpts fastlink;
+    fastlink.link = "/DEBUG:FASTLINK /INCREMENTAL:NO /OUT:app.exe";
+    Module m2(fastlink);
+    const ModuleAudit f = audit_module_file(m2.exe);
     CHECK(finding(f, "debug-info").verdict == Verdict::Fail);
     CHECK(finding(f, "debug-info").id == 1101);
     CHECK(finding(f, "debug-info").message.find("FASTLINK") != std::string::npos);
-    // ... a later /DEBUG:FULL wins ...
-    unsampled.link = "/DEBUG:FASTLINK /DEBUG:FULL /OUT:app.exe";
-    Module m5(unsampled);
-    CHECK(finding(audit_module_file(m5.exe), "debug-info").verdict == Verdict::Pass);
+    // ... /DEBUG is last-wins, so a later /DEBUG:FULL makes it a full PDB ...
+    fastlink.link = "/DEBUG:FASTLINK /DEBUG:FULL /INCREMENTAL:NO /OUT:app.exe";
+    Module m3(fastlink);
+    CHECK(finding(audit_module_file(m3.exe), "debug-info").verdict == Verdict::Pass);
     // ... and lld-link writes a full PDB whatever it is given.
+    fastlink.link = "/DEBUG:FASTLINK /OUT:app.exe";
+    fastlink.link_exe = "C:\\Program Files\\LLVM\\bin\\lld-link.exe";
+    Module m4(fastlink);
+    CHECK(finding(audit_module_file(m4.exe), "debug-info").verdict == Verdict::Pass);
+    // Without section contributions nothing can be sampled; the command line still decides.
+    ModOpts unsampled;
+    unsampled.no_contributions = true;
     unsampled.link = "/DEBUG:FASTLINK /OUT:app.exe";
-    unsampled.link_exe = "C:\\Program Files\\LLVM\\bin\\lld-link.exe";
-    Module m6(unsampled);
-    CHECK(finding(audit_module_file(m6.exe), "debug-info").verdict == Verdict::Pass);
+    Module m5(unsampled);
+    CHECK(finding(audit_module_file(m5.exe), "debug-info").verdict == Verdict::Fail);
 }
 
 TEST_CASE("audit: a missing PDB is CML1410 FAIL, a PDB of another build CML1411 FAIL") {

@@ -410,8 +410,10 @@ void audit_with_pdb(const std::string& module_path, const pdb::PdbIndex& index, 
     }
 
     // ---- /DEBUG:FULL ----------------------------------------------------------------------------------------------
-    // The PDB itself is the evidence, the linker's command line only the fallback: a command line can say FASTLINK and be
-    // overridden by a later /DEBUG:FULL, and lld-link writes a full PDB whatever it is given.
+    // Two kinds of evidence. A PDB whose code-contributing compilands list no function is not a full PDB. The converse does NOT hold:
+    // CI showed that a real link.exe /DEBUG:FASTLINK PDB still lists the functions of its compilands, so function symbols prove nothing
+    // and the linker's command line must decide for link.exe. There /DEBUG is last-wins ("/DEBUG:FASTLINK /DEBUG:FULL" is a full
+    // PDB), and lld-link writes a full PDB whatever it is given.
     const ProcSample procs = sample_function_symbols(index, options);
     {
         const std::string exe_lower = detail_lower(linker.exe_path);
@@ -425,10 +427,10 @@ void audit_with_pdb(const std::string& module_path, const pdb::PdbIndex& index, 
             audit.findings.push_back(make("debug-info", Verdict::Fail, ad::kFastlinkPdb,
                                           "The PDB of " + module_name + " holds no function symbols for its compilands (a /DEBUG:FASTLINK or stripped PDB); Chameleon needs /DEBUG:FULL.",
                                           "Relink the module with /DEBUG:FULL.", evidence));
-        } else if (procs.sampled == 0 && lo.debug_fastlink.value_or(false) && !lld) {
+        } else if (lo.debug_fastlink.value_or(false) && !lld) {
             audit.findings.push_back(make("debug-info", Verdict::Fail, ad::kFastlinkPdb,
                                           "Module " + module_name + " uses a /DEBUG:FASTLINK PDB; Chameleon needs /DEBUG:FULL.",
-                                          "Relink the module with /DEBUG:FULL.", evidence + " (no function symbols could be sampled: the command line decides)"));
+                                          "Relink the module with /DEBUG:FULL.", evidence));
         } else {
             audit.findings.push_back(make("debug-info", Verdict::Pass, ad::kFastlinkPdb, "The PDB of " + module_name + " is a full PDB.", "", evidence));
         }
