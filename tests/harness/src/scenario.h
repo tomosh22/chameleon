@@ -19,6 +19,8 @@ enum class StepKind {
     Reload,               // control command `reload` (needs capability "reload")
     ExpectDiag,           // a `diag` event with this id must arrive (needs capability "diag-events")
     ExpectMonotonic,      // a `key=<int>` of the fixture's TICK lines never decreases (state kept in the old storage)
+    SetOption,            // control command `set-option` with an integer value (WP-17: hooks_timeout_ms)
+    SignalFixture,        // create the file named by CML_FIXTURE_SIGNAL_FILE, which the fixture waits for (WP-17)
 };
 
 const char* to_string(StepKind kind);
@@ -37,6 +39,12 @@ struct Step {
     std::string result_key;
     long long result_value = 0;
     bool has_result_value = false;
+    // Reload: the reload must FAIL with this diagnostic id ("CML5309"); the step passes then. WP-17 (synchronised
+    // mode, the application does not reach SyncPoint() in time).
+    std::string expect_failure;
+    // SetOption
+    std::string option_name;
+    long long option_value = 0;
 
     // "expect_stdout /value=2/ within 10 s"
     std::string describe() const;
@@ -48,6 +56,7 @@ struct Scenario {
     std::string name;
     std::string description;
     std::string fixture;  // tests/fixtures/<fixture>
+    std::string fixture_args;  // extra command-line arguments for the fixture after `--agent` (WP-17); may be empty
     int timeout_s = 120;
     std::vector<Step> steps;
     std::filesystem::path path;  // where it was loaded from (empty for parse_scenario)

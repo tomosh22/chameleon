@@ -235,6 +235,8 @@ private:
             case StepKind::Reload: return reload(step);
             case StepKind::ExpectDiag: return expect_diag(step);
             case StepKind::ExpectMonotonic: return expect_monotonic(step);
+            case StepKind::SetOption: return set_option(step);
+            case StepKind::SignalFixture: return signal_fixture();
         }
         return StepOutcome::fail(cml::ids::kScenarioFailed, "unknown step kind");
     }
@@ -345,6 +347,14 @@ private:
         fixture.label = "fixture";
         fixture.exe = built_.exe;
         fixture.arguments = L"--agent";
+        if (!scenario_.fixture_args.empty()) {
+            fixture.arguments += L" " + cml::proc::wide_from_utf8(scenario_.fixture_args);
+        }
+        // WP-17: a fixture that holds back SyncPoint() waits for this file; the signal_fixture step creates it.
+        signal_file_ = options_.artifacts_dir / "fixture.signal";
+        std::error_code remove_ec;
+        fs::remove(signal_file_, remove_ec);
+        fixture.environment[L"CML_FIXTURE_SIGNAL_FILE"] = signal_file_.wstring();
         fixture.working_directory = built_.exe.parent_path();
         fixture.output_file = fixture_stdout_;
         fixture.environment[L"CML_PIPE_NAME"] = cml::proc::wide_from_utf8(agent_pipe_);
@@ -499,6 +509,16 @@ private:
         if (!response) {
             return StepOutcome::fail(response.error());
         }
+        if (!step.expect_failure.empty()) {
+            if (response->ok) {
+                return StepOutcome::fail(cml::ids::kReloadFailed, "the reload succeeded but the scenario expected it to fail with " + step.expect_failure);
+            }
+            const ipc::ControlDiag& d = *response->diag;
+            if (d.id != step.expect_failure) {
+                return StepOutcome::fail(cml::ids::kReloadFailed, "the reload failed with " + d.id + ": " + d.message + ", expected " + step.expect_failure);
+            }
+            return StepOutcome::pass("reload failed as expected: " + d.id + ": " + d.message);
+        }
         if (!response->ok) {
             const ipc::ControlDiag& d = *response->diag;
             return StepOutcome::fail(cml::ids::kReloadFailed, "reload failed: " + d.id + ": " + d.message + " What to do: " + d.action);
@@ -526,6 +546,31 @@ private:
                               " hooks_installed=" + std::to_string(response->result.get_integer("hooks_installed")) +
                               " initializers_run=" + std::to_string(response->result.get_integer("initializers_run"));
         return StepOutcome::pass("reload ok " + summary + (timing.empty() ? std::string() : "; " + timing));
+    }
+
+    StepOutcome set_option(const Step& step) {
+        ipc::json::Value args = ipc::json::Value::object();
+        args.set("name", ipc::json::Value::string(step.option_name));
+        args.set("value", ipc::json::Value::integer(step.option_value));
+        cml::Result<ipc::ControlResponse> response = control_->call("set-option", std::move(args), kControlTimeoutMs);
+        if (!response) {
+            return StepOutcome::fail(response.error());
+        }
+        if (!response->ok) {
+            const ipc::ControlDiag& d = *response->diag;
+            return StepOutcome::fail(cml::ids::kReloadFailed, "set-option " + step.option_name + " failed: " + d.id + ": " + d.message);
+        }
+        return StepOutcome::pass("option " + step.option_name + " = " + std::to_string(step.option_value));
+    }
+
+    StepOutcome signal_fixture() {
+        std::ofstream out(signal_file_, std::ios::binary | std::ios::trunc);
+        out << "go\n";
+        out.close();
+        if (!out) {
+            return StepOutcome::fail(cml::ids::kEditFailed, "cannot create the signal file " + signal_file_.string());
+        }
+        return StepOutcome::pass("created " + signal_file_.string());
     }
 
     // The values of `key=` in the fixture's whole output never decrease and do change: state that lives in the old
@@ -600,6 +645,7 @@ private:
     std::size_t fixture_id_ = 0;
     std::size_t cursor_ = 0;
     bool launched_ = false;
+    fs::path signal_file_;
     bool failed_ = false;
     std::optional<std::string> skip_reason_;
     Clock::time_point run_deadline_ = Clock::now();

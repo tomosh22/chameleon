@@ -1,0 +1,68 @@
+# Scenario `hooks_order` (WP-17): pre-patch hook, then the install, then the post-patch hooks - in immediate mode, on the
+# agent thread.
+#
+# `pre` prints compute_value() before the hooks are written (the original, 1), `post` after (the patched code, 42), so
+# their order in the output proves pre -> install -> post. The edit also adds a post-patch hook to the PATCH
+# (OnPatchedIn, a new function with a CML_POSTPATCH_HOOK record in the patch image): it runs once, after the hook of the
+# unchanged module.
+name = "hooks_order"
+description = "fixture sync_point (immediate agent): compile hooks, pre -> install -> post, and a post-patch hook defined in the patch"
+fixture = "sync_point"
+fixture_args = "--immediate"
+timeout_s = 240
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "AGENT mode=immediate"
+within_s = 20
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1 change=0"
+within_s = 20
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_sync_point.exe"
+within_s = 20
+
+[[step]]
+kind = "edit"
+patch = "edits/add_hook.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+
+[[step]]
+kind = "expect_stdout"
+regex = "HOOK compile-start thread=other in_sync=0"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "HOOK compile-success thread=other in_sync=0"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "HOOK pre thread=other in_sync=0 value=1\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "HOOK post thread=other in_sync=0 value=42\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "HOOK patch-defined"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=42"
+within_s = 10

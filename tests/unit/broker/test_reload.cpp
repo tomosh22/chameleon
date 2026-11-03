@@ -116,7 +116,8 @@ struct Rig {
     bool close_on_load = false;
 
     std::mutex mutex;
-    std::vector<ipc::Message> requests;         // what the agent received, in order
+    std::vector<ipc::Message> requests;         // what the agent received, in order (requests only)
+    std::vector<ipc::CompileEvent> compile_events;  // WP-17: the compile notifications, in order
     std::vector<std::uint64_t> link_bases;
 
     EventBus bus;
@@ -228,6 +229,11 @@ struct Rig {
     Result<void> agent(const ipc::Message& m) {
         if (fail_send && std::holds_alternative<ipc::InstallHooks>(m)) {
             return Diag::make(ids::kPipeIoFailed, "pipe broke", "restart");
+        }
+        if (const auto* event = std::get_if<ipc::CompileEvent>(&m)) {
+            std::lock_guard<std::mutex> lock(mutex);
+            compile_events.push_back(*event);  // an event: no request id, no answer
+            return Result<void>();
         }
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -459,6 +465,13 @@ TEST_CASE("reload: the whole pipeline for the basic fixture shape") {
     CHECK(accepted[0].count("C:\\proj\\logic.cpp") == 1);
     CHECK(rig.events->count("patch_applied") == 1);
     CHECK(rig.events->diag_ids().empty());
+
+    // WP-17: the agent was told that the compile started and then that it succeeded.
+    REQUIRE(rig.compile_events.size() == 2);
+    CHECK(rig.compile_events[0].phase == ipc::CompilePhase::Start);
+    CHECK(rig.compile_events[1].phase == ipc::CompilePhase::Success);
+    CHECK(rig.compile_events[0].module.find("app") == 0);
+    CHECK(rig.compile_events[1].diag == 0);
 }
 
 TEST_CASE("reload: no changed source is a successful no-op without any agent traffic") {
@@ -532,6 +545,13 @@ TEST_CASE("reload: failures surface as diag events with the stage's own stable i
         CHECK(r.error().id() == "CML2200");
         CHECK(rig.events->diag_ids() == std::vector<std::string>{"CML2200"});
         CHECK(rig.requests.empty());
+        // WP-17: start, then error with the diagnostic's id and a one-line text for the application's hook.
+        REQUIRE(rig.compile_events.size() == 2);
+        CHECK(rig.compile_events[0].phase == ipc::CompilePhase::Start);
+        CHECK(rig.compile_events[1].phase == ipc::CompilePhase::Error);
+        CHECK(rig.compile_events[1].diag == 2200);
+        CHECK_FALSE(rig.compile_events[1].text.empty());
+        CHECK(rig.compile_events[1].text.find('\n') == std::string::npos);
         CHECK(rig.link_calls == 0);
         CHECK(rig.module->index->accepted_for_testing().empty());  // compile failed: nothing was accepted at all
     }

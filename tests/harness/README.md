@@ -61,6 +61,24 @@ id = "CML3101"
 within_s = 10
 ```
 
+Keys added by WP-17 (synchronised mode and hooks):
+
+```toml
+fixture_args = "--hold-sync"   # header key: extra fixture arguments after `--agent` (letters, digits, space, - _ = .)
+
+[[step]]
+kind = "set_option"            # control command `set-option` with an integer value; needs capability "set-option"
+name = "hooks_timeout_ms"
+value = 1500
+
+[[step]]
+kind = "reload"
+expect_failure = "CML5309"     # the reload must FAIL with this diagnostic id (the step passes then)
+
+[[step]]
+kind = "signal_fixture"        # create the file named by the fixture's CML_FIXTURE_SIGNAL_FILE environment variable
+```
+
 Unknown keys, unknown kinds, missing fields, bad values and steps that need a running process before `launch`
 are rejected with `CML5411` before anything runs; a pattern that does not compile is `CML5420`.
 

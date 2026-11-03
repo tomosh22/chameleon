@@ -22,6 +22,7 @@
 #include "hook/diag_ids.h"
 #include "hook/installer.h"
 #include "hook_test_support.h"
+#include "user_hooks_probe.h"
 
 using namespace hooktest;
 namespace ipc = cml::ipc;
@@ -115,6 +116,10 @@ public:
             if (const auto* list = std::get_if<ipc::ModuleList>(&*message)) {
                 ipc::Reply reply;
                 reply.request_id = list->request_id;
+                send(reply);
+            } else if (const auto* enable = std::get_if<ipc::EnableModule>(&*message)) {
+                ipc::Reply reply;  // WP-17: the application enabled a module; accept it
+                reply.request_id = enable->request_id;
                 send(reply);
             }
         }
@@ -289,6 +294,215 @@ TEST_CASE("synchronised mode: the hooks are applied inside SyncPoint on the call
     CHECK(snapshot(rig.old_fn.entry - 16, 64) == rig.original);
     agent.stop_and_wait_for_calls();
     set_window_probe(false);
+}
+
+// --- application hooks (WP-17) ------------------------------------------------------------------------------
+
+namespace {
+
+// Enables this test executable (whose hooks live in user_hooks_probe.cpp) through the agent and waits until the
+// agent tracks it, pumping the fake broker so that it answers the EnableModule.
+bool enable_this_module(Agent& agent, FakeBroker& broker) {
+    wchar_t path[32768];
+    if (GetModuleFileNameW(nullptr, path, 32768) == 0) {
+        return false;
+    }
+    std::uint64_t id = 0;
+    if (agent.enable_module(path, 0, &id) != CML_STATUS_OK) {
+        return false;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (agent.tracked_modules_for_testing() == 0 && std::chrono::steady_clock::now() < deadline) {
+        broker.wait_for_answer(50);
+    }
+    return agent.tracked_modules_for_testing() == 1;
+}
+
+std::ptrdiff_t index_of(const std::vector<std::string>& log, const std::string& entry) {
+    for (std::size_t i = 0; i < log.size(); ++i) {
+        if (log[i] == entry) {
+            return static_cast<std::ptrdiff_t>(i);
+        }
+    }
+    return -1;
+}
+
+ipc::CompileEvent compile_event(ipc::CompilePhase phase, const std::string& text = {}) {
+    ipc::CompileEvent event;
+    event.phase = phase;
+    event.diag = phase == ipc::CompilePhase::Error ? 2200 : 0;
+    event.module = "fixture.exe";
+    event.text = text;
+    return event;
+}
+
+// Waits until the hook log holds at least `count` entries (hooks of events that have no answer).
+bool wait_for_log(std::size_t count, Agent* sync_agent = nullptr) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (hooktest_user::log().size() < count && std::chrono::steady_clock::now() < deadline) {
+        if (sync_agent != nullptr) {
+            sync_agent->sync_point();
+        }
+        Sleep(10);
+    }
+    return hooktest_user::log().size() >= count;
+}
+
+}  // namespace
+
+TEST_CASE("application hooks, immediate mode: pre-patch, then the install, then post-patch - all on the agent thread") {
+    Rig rig;
+    const std::string pipe = unique_pipe_name();
+    FakeBroker broker(pipe);
+    REQUIRE(broker.listening());
+    ScopedPipeEnv env(pipe);
+    hooktest_user::reset(rig.old_fn.as_int());
+    set_window_probe(true);
+
+    Agent agent(CML_MODE_IMMEDIATE);
+    REQUIRE(agent.start().has_value());
+    REQUIRE(broker.handshake());
+    REQUIRE(enable_this_module(agent, broker));
+
+    SUBCASE("install, then a revert that runs no patch hooks") {
+        REQUIRE(broker.send(request(31, 0, {{rig.old_fn.entry, rig.new_1.entry}})));
+        const std::optional<ipc::HooksInstalled> answer = broker.wait_for_answer(15000);
+        REQUIRE(answer.has_value());
+        CHECK_MESSAGE(answer->status == 0, answer->message);
+        const std::vector<std::string> log = hooktest_user::log();
+        // pre saw the original function (1), post saw the replacement (101): the order is pre, install, post.
+        REQUIRE(log.size() == 3);
+        CHECK(log[0] == "pre:1");
+        CHECK(index_of(log, "post-a:101") > 0);
+        CHECK(index_of(log, "post-b:101") > 0);
+        for (const unsigned long thread : hooktest_user::threads()) {
+            CHECK(thread != GetCurrentThreadId());
+            CHECK(thread == g_window_thread.load());  // the thread that wrote the hooks
+        }
+        // The answer left only after the post-patch hooks ran: nothing is added behind it.
+        Sleep(100);
+        CHECK(hooktest_user::log().size() == 3);
+
+        REQUIRE(broker.send(request(32, ipc::kInstallHooksRevert, {{rig.old_fn.entry, nullptr}})));
+        const std::optional<ipc::HooksInstalled> reverted = broker.wait_for_answer(15000);
+        REQUIRE(reverted.has_value());
+        CHECK(hooktest_user::log().size() == 3);
+    }
+    SUBCASE("a failed install runs the pre-patch hooks and not the post-patch hooks") {
+        REQUIRE(broker.send(request(33, 0, {{rig.old_fn.entry, rig.new_1.entry}, {rig.tiny.entry, rig.new_1.entry}})));
+        const std::optional<ipc::HooksInstalled> answer = broker.wait_for_answer(15000);
+        REQUIRE(answer.has_value());
+        CHECK(answer->status == hook::ids::kFunctionTooShort);
+        const std::vector<std::string> log = hooktest_user::log();
+        REQUIRE(log.size() == 1);
+        CHECK(log[0] == "pre:1");
+    }
+    SUBCASE("an empty request runs no hooks") {
+        REQUIRE(broker.send(request(34, 0, {})));
+        const std::optional<ipc::HooksInstalled> answer = broker.wait_for_answer(15000);
+        REQUIRE(answer.has_value());
+        CHECK(hooktest_user::log().empty());
+    }
+    SUBCASE("a hook that raises an exception is reported and the next hook still runs") {
+        hooktest_user::set_fault(true);
+        REQUIRE(broker.send(request(35, 0, {{rig.old_fn.entry, rig.new_1.entry}})));
+        const std::optional<ipc::HooksInstalled> answer = broker.wait_for_answer(15000);
+        REQUIRE(answer.has_value());
+        CHECK(answer->status == 0);
+        const std::vector<std::string> log = hooktest_user::log();
+        CHECK(index_of(log, "post-fault") >= 0);
+        CHECK(index_of(log, "post-a:101") >= 0);
+        CHECK(index_of(log, "post-b:101") >= 0);
+        CHECK(rig.old_fn.as_int()(1) == 101);
+    }
+    SUBCASE("compile notifications run the compile hooks, with the error text") {
+        REQUIRE(broker.send(compile_event(ipc::CompilePhase::Start)));
+        REQUIRE(broker.send(compile_event(ipc::CompilePhase::Error, "logic.cpp(3): error C2065")));
+        REQUIRE(broker.send(compile_event(ipc::CompilePhase::Start)));
+        REQUIRE(broker.send(compile_event(ipc::CompilePhase::Success)));
+        REQUIRE(wait_for_log(4));
+        const std::vector<std::string> log = hooktest_user::log();
+        REQUIRE(log.size() == 4);
+        CHECK(log[0] == "compile-start");
+        CHECK(log[1] == "compile-error:logic.cpp(3): error C2065");
+        CHECK(log[2] == "compile-start");
+        CHECK(log[3] == "compile-success");
+        for (const unsigned long thread : hooktest_user::threads()) {
+            CHECK(thread != GetCurrentThreadId());
+        }
+    }
+    agent.stop_and_wait_for_calls();
+    set_window_probe(false);
+    hooktest_user::reset(nullptr);
+}
+
+TEST_CASE("application hooks, synchronised mode: nothing runs before SyncPoint, then pre, install, post on that thread") {
+    Rig rig;
+    const std::string pipe = unique_pipe_name();
+    FakeBroker broker(pipe);
+    REQUIRE(broker.listening());
+    ScopedPipeEnv env(pipe);
+    hooktest_user::reset(rig.old_fn.as_int());
+    set_window_probe(true);
+
+    Agent agent(CML_MODE_SYNCHRONIZED);
+    REQUIRE(agent.start().has_value());
+    REQUIRE(broker.handshake());
+    REQUIRE(enable_this_module(agent, broker));
+
+    REQUIRE(broker.send(compile_event(ipc::CompilePhase::Start)));
+    REQUIRE(broker.send(request(41, 0, {{rig.old_fn.entry, rig.new_1.entry}})));
+    REQUIRE(broker.send(compile_event(ipc::CompilePhase::Success)));
+    // Without a SyncPoint neither the hooks nor the compile notifications run.
+    CHECK_FALSE(broker.wait_for_answer(400).has_value());
+    CHECK(hooktest_user::log().empty());
+    CHECK(rig.old_fn.as_int()(1) == 1);
+    CHECK(g_window_thread.load() == 0);
+
+    std::optional<ipc::HooksInstalled> answer;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (!answer && std::chrono::steady_clock::now() < deadline) {
+        agent.sync_point();
+        answer = broker.wait_for_answer(100);
+    }
+    REQUIRE(answer.has_value());
+    CHECK_MESSAGE(answer->status == 0, answer->message);
+    REQUIRE(wait_for_log(5, &agent));
+    const std::vector<std::string> log = hooktest_user::log();
+    // Posting order is kept: compile-start, pre, (install), post x2, compile-success.
+    REQUIRE(log.size() == 5);
+    CHECK(log[0] == "compile-start");
+    CHECK(log[1] == "pre:1");
+    // (the order of two hooks of one kind is the order the linker placed them in)
+    CHECK((index_of(log, "post-a:101") == 2 || index_of(log, "post-a:101") == 3));
+    CHECK((index_of(log, "post-b:101") == 2 || index_of(log, "post-b:101") == 3));
+    CHECK(log[4] == "compile-success");
+    CHECK(g_window_thread.load() == GetCurrentThreadId());
+    for (const unsigned long thread : hooktest_user::threads()) {
+        CHECK(thread == GetCurrentThreadId());  // hooks and the install ran on the thread that called SyncPoint
+    }
+    agent.stop_and_wait_for_calls();
+    set_window_probe(false);
+    hooktest_user::reset(nullptr);
+}
+
+TEST_CASE("application hooks: a module the application did not enable contributes no hooks") {
+    Rig rig;
+    const std::string pipe = unique_pipe_name();
+    FakeBroker broker(pipe);
+    REQUIRE(broker.listening());
+    ScopedPipeEnv env(pipe);
+    hooktest_user::reset(rig.old_fn.as_int());
+
+    Agent agent(CML_MODE_IMMEDIATE);
+    REQUIRE(agent.start().has_value());
+    REQUIRE(broker.handshake());
+    // No EnableModule: the test executable's hooks are not the agent's business.
+    REQUIRE(broker.send(compile_event(ipc::CompilePhase::Start)));
+    Sleep(300);
+    CHECK(hooktest_user::log().empty());
+    agent.stop_and_wait_for_calls();
+    hooktest_user::reset(nullptr);
 }
 
 #endif  // _WIN32

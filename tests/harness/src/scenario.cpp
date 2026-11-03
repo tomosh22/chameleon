@@ -20,6 +20,8 @@ const char* to_string(StepKind kind) {
         case StepKind::Reload: return "reload";
         case StepKind::ExpectDiag: return "expect_diag";
         case StepKind::ExpectMonotonic: return "expect_monotonic";
+        case StepKind::SetOption: return "set_option";
+        case StepKind::SignalFixture: return "signal_fixture";
     }
     return "?";
 }
@@ -43,6 +45,14 @@ std::string Step::describe() const {
             if (has_result_value) {
                 out += " expecting " + result_key + "=" + std::to_string(result_value);
             }
+            if (!expect_failure.empty()) {
+                out += " expecting failure " + expect_failure;
+            }
+            break;
+        case StepKind::SetOption:
+            out += " " + option_name + "=" + std::to_string(option_value);
+            break;
+        case StepKind::SignalFixture:
             break;
         case StepKind::ExpectMonotonic:
             out += " " + key + " (at least " + std::to_string(min_samples) + " samples)";
@@ -58,6 +68,7 @@ const char* Step::required_capability() const {
     switch (kind) {
         case StepKind::Reload: return cml::ipc::capability::kReload;
         case StepKind::ExpectDiag: return cml::ipc::capability::kDiagEvents;
+        case StepKind::SetOption: return cml::ipc::capability::kSetOption;
         default: return nullptr;
     }
 }
@@ -170,7 +181,7 @@ cml::Result<Step> parse_step(const toml::Table& table) {
     }
     if (*kind == "reload") {
         step.kind = StepKind::Reload;
-        cml::Result<void> keys = only_keys(table, {"kind", "within_s", "expect_result_key", "expect_result_value"}, "a reload step");
+        cml::Result<void> keys = only_keys(table, {"kind", "within_s", "expect_result_key", "expect_result_value", "expect_failure"}, "a reload step");
         if (!keys) return keys.error();
         cml::Result<int> within = int_in_range(table, "within_s", 60, 1, 3600);
         if (!within) return within.error();
@@ -179,6 +190,18 @@ cml::Result<Step> parse_step(const toml::Table& table) {
         const toml::Value* rv = table.find("expect_result_value");
         if ((rk == nullptr) != (rv == nullptr)) {
             return invalid(table.line, "'expect_result_key' and 'expect_result_value' go together");
+        }
+        if (const toml::Value* failure = table.find("expect_failure")) {
+            const bool shape = failure->kind == toml::Value::Kind::String && failure->text.size() == 7 &&
+                               failure->text.compare(0, 3, "CML") == 0 &&
+                               std::all_of(failure->text.begin() + 3, failure->text.end(), [](char ch) { return ch >= '0' && ch <= '9'; });
+            if (!shape) {
+                return invalid(failure->line, "'expect_failure' must be a diagnostic id like CML5309");
+            }
+            if (rk != nullptr) {
+                return invalid(failure->line, "'expect_failure' cannot be combined with a result expectation");
+            }
+            step.expect_failure = failure->text;
         }
         if (rk != nullptr) {
             if (rk->kind != toml::Value::Kind::String || !name_chars_ok(rk->text, false)) {
@@ -221,9 +244,31 @@ cml::Result<Step> parse_step(const toml::Table& table) {
         step.min_samples = *samples;
         return step;
     }
+    if (*kind == "set_option") {
+        step.kind = StepKind::SetOption;
+        cml::Result<void> keys = only_keys(table, {"kind", "name", "value"}, "a set_option step");
+        if (!keys) return keys.error();
+        cml::Result<std::string> name = require_string(table, "name", "a set_option step");
+        if (!name) return name.error();
+        if (!name_chars_ok(*name, false)) return invalid(table.line, "'name' must be an option name (letters, digits, '_', '-')");
+        const toml::Value* value = table.find("value");
+        if (value == nullptr || value->kind != toml::Value::Kind::Integer) {
+            return invalid(table.line, "a set_option step needs an integer 'value'");
+        }
+        step.option_name = *name;
+        step.option_value = value->integer;
+        return step;
+    }
+    if (*kind == "signal_fixture") {
+        step.kind = StepKind::SignalFixture;
+        cml::Result<void> keys = only_keys(table, {"kind"}, "a signal_fixture step");
+        if (!keys) return keys.error();
+        return step;
+    }
     (void)context;
     return invalid(table.line, "unknown step kind '" + *kind +
-                                   "' (launch, expect_stdout, expect_module_enabled, edit, reload, expect_diag, expect_monotonic)");
+                                   "' (launch, expect_stdout, expect_module_enabled, edit, reload, expect_diag, expect_monotonic, set_option, "
+                                   "signal_fixture)");
 }
 
 }  // namespace
@@ -234,7 +279,7 @@ cml::Result<Scenario> parse_scenario(std::string_view text) {
         return doc.error();
     }
     Scenario scenario;
-    cml::Result<void> root_keys = only_keys(doc->root, {"name", "description", "fixture", "timeout_s"}, "the scenario header");
+    cml::Result<void> root_keys = only_keys(doc->root, {"name", "description", "fixture", "fixture_args", "timeout_s"}, "the scenario header");
     if (!root_keys) return root_keys.error();
     if (!doc->tables.empty()) {
         return invalid(doc->tables[0].line, "plain tables are not used in scenarios (only [[step]])");
@@ -252,6 +297,17 @@ cml::Result<Scenario> parse_scenario(std::string_view text) {
     if (!fixture) return fixture.error();
     if (!name_chars_ok(*fixture, false)) return invalid(doc->root.find("fixture")->line, "'fixture' must be a fixture directory name (tests/fixtures/<name>)");
     scenario.fixture = *fixture;
+    if (const toml::Value* args = doc->root.find("fixture_args")) {
+        const bool plain = args->kind == toml::Value::Kind::String && args->text.size() <= 200 &&
+                           std::all_of(args->text.begin(), args->text.end(), [](char ch) {
+                               return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' ||
+                                      ch == '_' || ch == '=' || ch == '.' || ch == ' ';
+                           });
+        if (!plain) {
+            return invalid(args->line, "'fixture_args' must be a string of letters, digits, spaces and - _ = .");
+        }
+        scenario.fixture_args = args->text;
+    }
     if (const toml::Value* d = doc->root.find("description")) {
         if (d->kind != toml::Value::Kind::String) return invalid(d->line, "'description' must be a string");
         scenario.description = d->text;

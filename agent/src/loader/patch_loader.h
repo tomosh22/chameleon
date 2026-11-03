@@ -129,6 +129,9 @@ public:
 
     // --- introspection (tests, logs) ---------------------------------------------------------
     std::size_t patch_count() const;
+    // Image ranges (base, image size) of the live patches, in the order they were loaded. A patch that is
+    // still being loaded is not listed. WP-17 scans them for hook records.
+    std::vector<proc::AddressRange> live_patch_images() const;
     std::vector<proc::AddressRange> owned_ranges() const;
     bool is_loaded(std::uint64_t image_base) const;
 

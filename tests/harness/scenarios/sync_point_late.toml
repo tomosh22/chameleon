@@ -1,0 +1,85 @@
+# Scenario `sync_point_late` (WP-17, FU-14): the application does not reach SyncPoint() within the broker's timeout.
+#
+# The fixture withholds SyncPoint() (--hold-sync) until the `signal_fixture` step. The broker's hook wait is cut to 1.5 s,
+# so the reload fails with CML5309 ("no HooksInstalled in time"; the inner reason is CML5320) while the patch stays
+# loaded and the hooks stay remembered. Nothing has run in the application: the old value is still printed and no HOOK
+# line was written. After the signal the next SyncPoint() runs the queued work in order - compile hooks, pre-patch hook,
+# the install, post-patch hook - and the new value appears.
+name = "sync_point_late"
+description = "fixture sync_point (synchronised agent): reload times out with CML5309 without SyncPoint(); a later SyncPoint() applies the hooks"
+fixture = "sync_point"
+fixture_args = "--hold-sync"
+timeout_s = 300
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "AGENT mode=synchronized"
+within_s = 20
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1 change=0"
+within_s = 20
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_sync_point.exe"
+within_s = 20
+
+[[step]]
+kind = "set_option"
+name = "hooks_timeout_ms"
+value = 1500
+
+[[step]]
+kind = "edit"
+patch = "edits/value_42.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_failure = "CML5309"
+
+# The application is still running the old code.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1 change=0"
+within_s = 10
+
+[[step]]
+kind = "signal_fixture"
+
+# Every line below appears only after the fixture released SyncPoint(): the order of the expectations is the order of
+# the output.
+[[step]]
+kind = "expect_stdout"
+regex = "SYNC released"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "HOOK compile-start thread=main in_sync=1"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "HOOK compile-success thread=main in_sync=1"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "HOOK pre thread=main in_sync=1 value=1\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "HOOK post thread=main in_sync=1 value=42\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=42 change=1"
+within_s = 10

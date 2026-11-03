@@ -76,6 +76,9 @@ enum class MessageType : std::uint16_t {
     // Diagnostics and lifecycle.
     Log = 0x0060,      // implemented  agent -> broker (event)
     Restart = 0x0061,  // later work package
+
+    // Compile notifications (WP-17).
+    CompileEvent = 0x0070,  // implemented  broker -> agent (event, no answer)
 };
 
 // Name for logs ("Hello"); "Unknown" for ids that are not in the enum.
@@ -199,6 +202,20 @@ struct HooksInstalled {
     std::vector<HookResult> results;  // one per hook, in request order
 };
 
+// --- compile notifications (WP-17, plan section 4.9) ---------------------------------------------
+
+// The broker tells the agent that it started compiling, finished compiling, or failed to. The agent runs the
+// application's CML_COMPILE_START_HOOK / CML_COMPILE_SUCCESS_HOOK / CML_COMPILE_ERROR_HOOK functions (on the
+// SyncPoint thread in synchronised mode). An event: nothing is answered.
+enum class CompilePhase : std::uint32_t { Start = 1, Success = 2, Error = 3 };
+
+struct CompileEvent {
+    CompilePhase phase = CompilePhase::Start;
+    std::uint32_t diag = 0;  // Error: the CMLnnnn id of the first failure, else 0
+    std::string module;      // file name of the module being reloaded (UTF-8)
+    std::string text;        // Error: the one-line message handed to the error hook; else empty
+};
+
 // --- address space and patch loading (WP-08) ---------------------------------------------------
 //
 // All of these are broker -> agent requests; ids are chosen by the broker. The agent answers
@@ -315,7 +332,7 @@ struct ReleaseRange {
 using Message = std::variant<Hello, Welcome, ModuleList, EnableModule, DisableModule, ModuleLoaded,
                              ModuleUnloaded, Log, Reply, ReserveRange, ReleaseRange, LoadPatch,
                              PatchLoaded, ApplyFixups, RunInitializers, ReserveRangeResult, InstallHooks,
-                             HooksInstalled>;
+                             HooksInstalled, CompileEvent>;
 
 MessageType type_of(const Message& message) noexcept;
 

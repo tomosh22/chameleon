@@ -125,11 +125,42 @@ Agent::~Agent() {
     }
 }
 
+namespace {
+
+// Process-wide wake-up for destroyers (FU-06). It must not be a member of Agent: the thread that brings the
+// call count to zero wakes the destroyer *after* its decrement, by which time the destroyer is free to delete
+// the Agent. It lives in static storage.
+struct IdleSignal {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::atomic<int> destroyers{0};
+};
+
+// Static storage, no heap block: the agent's live-block accounting must return to its baseline.
+IdleSignal g_idle;
+
+}  // namespace
+
+void Agent::CallGuard::leave_call(std::atomic<int>& calls) noexcept {
+    if (calls.fetch_sub(1, std::memory_order_seq_cst) != 1) {
+        return;
+    }
+    // A destroyer increments `destroyers` before it tests the count (both seq_cst), so either it sees this
+    // decrement or this thread sees it here. Nothing of the Agent is touched from this point on.
+    if (g_idle.destroyers.load(std::memory_order_seq_cst) > 0) {
+        std::lock_guard<std::mutex> lock(g_idle.mutex);
+        g_idle.changed.notify_all();
+    }
+}
+
 void Agent::stop_and_wait_for_calls() {
     stop();  // wakes every waiter; later calls see stopping_ and return at once
-    while (active_calls_.load(std::memory_order_acquire) != 0) {
-        Sleep(1);
+    g_idle.destroyers.fetch_add(1, std::memory_order_seq_cst);
+    {
+        std::unique_lock<std::mutex> lock(g_idle.mutex);
+        g_idle.changed.wait(lock, [this] { return active_calls_.load(std::memory_order_seq_cst) == 0; });
     }
+    g_idle.destroyers.fetch_sub(1, std::memory_order_seq_cst);
 }
 
 Result<void> Agent::start() {
@@ -895,6 +926,10 @@ void Agent::handle_message(const ipc::Message& message) {
     }
     if (const auto* install = std::get_if<ipc::InstallHooks>(&message)) {
         handle_install_hooks(*install);
+        return;
+    }
+    if (const auto* compile = std::get_if<ipc::CompileEvent>(&message)) {
+        handle_compile_event(*compile);
         return;
     }
     CML_LOG(Warn, "ignoring unexpected %s from the broker", ipc::to_string(ipc::type_of(message)));

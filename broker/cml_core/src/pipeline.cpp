@@ -209,6 +209,25 @@ private:
         return answer;
     }
 
+    // WP-17: tells the agent that the compile stage started, succeeded or failed, so that the application's
+    // CML_COMPILE_*_HOOK functions run. Best effort: an agent that is gone, or one without hooks, changes nothing.
+    void notify_compile(ipc::CompilePhase phase, const Diag* failure = nullptr) {
+        ipc::CompileEvent event;
+        event.phase = phase;
+        event.module = module_.name;
+        if (failure != nullptr) {
+            event.diag = failure->code;
+            std::string text = failure->message;
+            std::replace(text.begin(), text.end(), '\n', ' ');
+            std::replace(text.begin(), text.end(), '\r', ' ');
+            event.text = ipc::sanitize_utf8(text, 400);
+        }
+        const Result<void> sent = link_.send(ipc::Message(std::move(event)));
+        if (!sent) {
+            CML_LOG(Debug, "reload: compile notification not delivered: %s", sent.error().format().c_str());
+        }
+    }
+
     // ---- the run -----------------------------------------------------------------------------------------
     Result<PatchReport> run() {
         PatchReport report;
@@ -299,6 +318,7 @@ private:
         std::vector<Unit> units;
         std::vector<toolchain::CompileRequest> requests;
         std::optional<Diag> first_error;
+        notify_compile(ipc::CompilePhase::Start);
         for (const std::uint32_t ci : swept->compilands) {
             Unit u;
             u.compiland = ci;
@@ -329,6 +349,7 @@ private:
             units.push_back(std::move(u));
         }
         if (first_error) {
+            notify_compile(ipc::CompilePhase::Error, &*first_error);
             return *first_error;
         }
         std::vector<toolchain::CompileOutcome> outcomes(requests.size());
@@ -356,8 +377,10 @@ private:
         }
         report.times.compile = lap.lap();
         if (first_error) {
+            notify_compile(ipc::CompilePhase::Error, &*first_error);
             return *first_error;
         }
+        notify_compile(ipc::CompilePhase::Success);
 
         // ---- 3.. per compiland: one patch each ---------------------------------------------------------------
         std::map<std::uint32_t, bool> unit_ok;

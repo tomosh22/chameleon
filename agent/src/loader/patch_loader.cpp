@@ -376,6 +376,18 @@ std::size_t PatchLoader::patch_count() const {
     return patches_.size();
 }
 
+std::vector<AddressRange> PatchLoader::live_patch_images() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<AddressRange> images;
+    images.reserve(patches_.size());
+    for (const Patch& patch : patches_) {
+        if (patch.live && !patch.busy) {
+            images.push_back(AddressRange{patch.range.base, patch.image_size});
+        }
+    }
+    return images;
+}
+
 std::vector<AddressRange> PatchLoader::owned_ranges() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return owned_;

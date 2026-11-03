@@ -1,0 +1,73 @@
+# Scenario `compile_hooks` (WP-17): the compile-start, compile-error and compile-success hooks, notified by the broker.
+#
+# The first edit breaks logic.cpp: the reload fails with CML2200, the application hears start and then error (with the
+# compiler's first message). The second edit repairs it: start, success, then the patch.
+name = "compile_hooks"
+description = "fixture sync_point (synchronised agent): compile-start/error on a broken edit, compile-start/success on the repair"
+fixture = "sync_point"
+timeout_s = 300
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "AGENT mode=synchronized"
+within_s = 20
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1 change=0"
+within_s = 20
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_sync_point.exe"
+within_s = 20
+
+[[step]]
+kind = "edit"
+patch = "edits/break.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_failure = "CML2200"
+
+[[step]]
+kind = "expect_stdout"
+regex = "HOOK compile-start thread=main in_sync=1"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "HOOK compile-error thread=main in_sync=1 message=\"[^\"]+\""
+within_s = 10
+
+[[step]]
+kind = "edit"
+patch = "edits/fix.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+
+[[step]]
+kind = "expect_stdout"
+regex = "HOOK compile-start thread=main in_sync=1"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "HOOK compile-success thread=main in_sync=1"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "HOOK post thread=main in_sync=1 value=42\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=42 change=1"
+within_s = 10

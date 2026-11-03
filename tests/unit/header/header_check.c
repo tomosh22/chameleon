@@ -24,6 +24,56 @@ static void expect(int condition, const char* what) {
     }
 }
 
+/* --- hook macros (WP-17): every kind registers a record that survives the link and names its function --- */
+static int g_hook_probe = 0;
+static void on_pre(void) { g_hook_probe |= 1; }
+static void on_post(void) { g_hook_probe |= 2; }
+static void on_compile_start(void) { g_hook_probe |= 4; }
+static void on_compile_success(void) { g_hook_probe |= 8; }
+static void on_compile_error(const char* message) { g_hook_probe |= (message != NULL) ? 16 : 0; }
+static void on_pre_restart(void) { g_hook_probe |= 32; }
+CML_PREPATCH_HOOK(on_pre);
+CML_POSTPATCH_HOOK(on_post);
+CML_COMPILE_START_HOOK(on_compile_start);
+CML_COMPILE_SUCCESS_HOOK(on_compile_success);
+CML_COMPILE_ERROR_HOOK(on_compile_error);
+CML_PRERESTART_HOOK(on_pre_restart);
+
+/* Scans this image's ".cmlhk" section the way the agent does and checks the six records. */
+static void check_hook_records(void) {
+    const unsigned char* base = (const unsigned char*)GetModuleHandleW(NULL);
+    const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
+    const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    const IMAGE_SECTION_HEADER* section = IMAGE_FIRST_SECTION(nt);
+    unsigned seen = 0;
+    unsigned count = 0;
+    unsigned i;
+    expect(sizeof(cml_hook_entry) == 24, "a hook record is 24 bytes");
+    for (i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        if (memcmp(section[i].Name, ".cmlhk\0\0", 8) == 0) {
+            const cml_hook_entry* records = (const cml_hook_entry*)(base + section[i].VirtualAddress);
+            const size_t n = section[i].Misc.VirtualSize / sizeof(cml_hook_entry);
+            size_t k;
+            for (k = 0; k < n; ++k) {
+                if (records[k].magic == CML_HOOK_MAGIC && records[k].kind >= 1 && records[k].kind <= 6 &&
+                    records[k].fn != NULL && records[k].key != NULL && strchr(records[k].key, '|') != NULL) {
+                    seen |= 1u << records[k].kind;
+                    ++count;
+                }
+            }
+        }
+    }
+    expect(count == 6, "six hook records in the .cmlhk section");
+    expect(seen == 0x7Eu, "one record of each kind");
+    on_pre();
+    on_post();
+    on_compile_start();
+    on_compile_success();
+    on_compile_error("x");
+    on_pre_restart();
+    expect(g_hook_probe == 63, "the hook functions are callable");
+}
+
 int main(void) {
     cml_status status = CML_STATUS_OK;
     cml_agent missing = cml_create_agent(L"Z:\\cml_no_such_directory", CML_MODE_IMMEDIATE, &status);
@@ -70,6 +120,8 @@ int main(void) {
     expect(cml_get_current_module_path(tiny, 2, &length) == CML_STATUS_INVALID_ARGUMENT,
            "a too-small buffer is reported");
     expect(cml_get_current_module_path(NULL, 0, NULL) == CML_STATUS_INVALID_ARGUMENT, "null buffer");
+
+    check_hook_records();
 
     return g_failures == 0 ? 0 : 1;
 }

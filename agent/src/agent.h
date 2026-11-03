@@ -79,12 +79,16 @@ public:
         }
         ~CallGuard() {
             --depth();
-            agent_.active_calls_.fetch_sub(1, std::memory_order_acq_rel);
+            // After the decrement the Agent may be freed by a destroyer that saw the count reach zero, so
+            // leave_call() must not touch any member once it has decremented (it uses process-wide state).
+            leave_call(agent_.active_calls_);
         }
         CallGuard(const CallGuard&) = delete;
         CallGuard& operator=(const CallGuard&) = delete;
 
         static int& depth() noexcept;  // guards held by the calling thread (all agents)
+        // Decrements `calls` and, if a destroyer is waiting for it to reach zero, wakes the destroyers.
+        static void leave_call(std::atomic<int>& calls) noexcept;
 
     private:
         Agent& agent_;
@@ -164,6 +168,13 @@ private:
     static void run_hook_job(void* context);
     void apply_install_hooks(const ipc::InstallHooks& request);
     void queue_reply(ipc::Message message);
+
+    // WP-17: broker -> agent CompileEvent. Same dispatch rule as InstallHooks: the application's compile hooks
+    // run on the SyncPoint thread in synchronised mode, on the agent thread in immediate mode.
+    void handle_compile_event(const ipc::CompileEvent& event);
+    static void run_compile_job(void* context);
+    void apply_compile_event(const ipc::CompileEvent& event);
+    std::vector<std::string> enabled_module_paths();  // the modules the application enabled (any thread)
     bool flush_replies(ipc::PipeConnection& connection);
 
     // Any thread ------------------------------------------------------------------------------
