@@ -67,9 +67,9 @@ bool ModuleState::is_hooked(std::uint64_t old_va) {
     return hooked.count(old_va) != 0;
 }
 
-void ModuleState::record_code(std::uint64_t patch_entry, std::shared_ptr<const CodeImage> image) {
+void ModuleState::record_code(std::uint64_t patch_entry, std::shared_ptr<const CodeImage> record) {
     std::lock_guard<std::mutex> lock(mutex);
-    code[patch_entry] = std::move(image);
+    code[patch_entry] = std::move(record);
 }
 
 std::shared_ptr<const CodeImage> ModuleState::code_running_at(std::uint64_t entry) {

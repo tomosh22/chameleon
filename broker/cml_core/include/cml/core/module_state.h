@@ -79,7 +79,7 @@ struct ModuleState {
     // is called: the hook target when the entry is hooked, else the entry itself. Records are never removed: the patch DLLs
     // stay loaded, and a revert that re-points a hook only changes which record applies.
     std::map<std::uint64_t, std::shared_ptr<const CodeImage>> code;
-    void record_code(std::uint64_t patch_entry, std::shared_ptr<const CodeImage> image);  // takes `mutex`
+    void record_code(std::uint64_t patch_entry, std::shared_ptr<const CodeImage> record);  // takes `mutex`
     std::shared_ptr<const CodeImage> code_running_at(std::uint64_t entry);               // takes `mutex`
 };
 

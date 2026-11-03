@@ -90,6 +90,11 @@ ipc::json::Value to_json(const PatchReport& r) {
     v.set("hooks_installed", n(r.hooks_installed));
     v.set("hooks_dropped", n(r.hooks_dropped));
     v.set("no_functional_change", Value::boolean(r.no_functional_change));
+    Value kept = Value::array();
+    for (const std::string& k : r.hooks_kept) {
+        kept.push(Value::string(k));
+    }
+    v.set("hooks_kept", std::move(kept));
     v.set("new_functions", n(r.new_functions));
     v.set("new_globals", n(r.new_globals));
     v.set("thunks", n(r.thunks));
@@ -625,6 +630,9 @@ private:
         report.new_globals += plan.new_globals.size();
         report.thunks += plan.thunks.size();
         for (const NarrowDecision& d : narrowed.decisions) {
+            if (!is_dropped(d.reason)) {
+                report.hooks_kept.push_back(d.display + ": " + to_string(d.reason) + (d.detail.empty() ? "" : " - " + d.detail));
+            }
             CML_LOG(Debug, "reload: hook %s: %s%s%s", d.display.c_str(), to_string(d.reason), d.detail.empty() ? "" : " - ", d.detail.c_str());
         }
         std::vector<bind::HookEntry> hooks;

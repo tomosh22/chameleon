@@ -100,6 +100,7 @@ struct PatchReport {
     std::size_t hooks_planned = 0;  // before narrowing
     std::size_t hooks_installed = 0;
     std::size_t hooks_dropped = 0;
+    std::vector<std::string> hooks_kept;  // WP-25: "function: reason - detail" of every planned hook narrowing kept (also in the response)
     std::size_t units_unchanged = 0;   // WP-25: compilands whose recompile changed nothing (no patch was made for them)
     bool no_functional_change = false; // WP-25: every recompiled compiland was identical to the running code; nothing was loaded (CML3450)
     std::size_t new_functions = 0;
