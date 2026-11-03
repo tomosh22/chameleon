@@ -80,6 +80,10 @@ ipc::json::Value status_result(const ControlContext& context) {
                             entry.index_state = to_string(index->state);
                             entry.index_percent = index->percent;
                             entry.index_message = index->state == IndexState::Failed && index->error ? index->error->format() : index->phase;
+                        } else {
+                            // Enabled, but the service has not created the index (yet, or the module just went away):
+                            // never "ready".
+                            entry.index_state = "pending";
                         }
                     }
                     out.modules.push_back(std::move(entry));
@@ -191,6 +195,8 @@ std::string handle_control_line(std::string_view line, const ControlContext& con
 
 #include <windows.h>
 
+#include <condition_variable>
+#include <deque>
 #include <memory>
 
 namespace cml::core {
@@ -317,18 +323,31 @@ void ControlServer::accept_loop() {
 
 namespace {
 
-// The one writer of a control connection: responses and events share it, so lines never interleave. Events
-// come from whichever thread publishes them; a client that does not read is given up on quickly.
+// The one writer of a control connection: responses and events share the write lock, so lines never interleave.
+//
+// Events must never break the response path and must never block the pipeline:
+//   * on_event() (called on whichever thread publishes, e.g. the reload pipeline) only appends to a bounded queue
+//     (kMaxQueued; further events are dropped and counted) and returns at once;
+//   * a writer thread sends the queued lines with the full response timeout (kWriteTimeoutMs). A client that stops
+//     reading therefore delays only its own events; once a single write times out the connection is unusable
+//     (a partial line may be on the pipe), so the writer marks it broken: no more events and no more responses,
+//     and the connection thread ends. A stalled subscriber thus costs the pipeline nothing and is dropped after at
+//     most kWriteTimeoutMs.
 class ConnectionSender final : public EventListener {
 public:
     explicit ConnectionSender(ipc::ControlChannel* channel) : channel_(channel) {}
+    ~ConnectionSender() override { detach(); }
 
     Result<ipc::IoStatus> send_line(const std::string& line, std::uint32_t timeout_ms) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock(write_mutex_);
         if (channel_ == nullptr) {
             return ipc::IoStatus::Closed;
         }
-        return channel_->send_line(line, timeout_ms);
+        Result<ipc::IoStatus> sent = channel_->send_line(line, timeout_ms);
+        if (!sent || *sent != ipc::IoStatus::Ok) {
+            channel_ = nullptr;  // a timed-out or failed write may have left a partial line: the stream is finished
+        }
+        return sent;
     }
 
     void on_event(const Event& event) override {
@@ -339,22 +358,68 @@ public:
         if (!line) {
             return;  // too large for one control line: dropped
         }
-        Result<ipc::IoStatus> sent = send_line(*line, kEventSendTimeoutMs);
-        if (!sent || *sent != ipc::IoStatus::Ok) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            channel_ = nullptr;  // stalled or closed client: no more events
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (stopping_) {
+            return;
         }
+        if (queue_.size() >= kMaxQueued) {
+            ++dropped_;
+            return;
+        }
+        queue_.push_back(std::move(*line));
+        if (!writer_.joinable()) {
+            writer_ = std::thread([this] { run(); });
+        }
+        cv_.notify_one();
     }
 
     void detach() {
-        std::lock_guard<std::mutex> lock(mutex_);
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            stopping_ = true;
+            cv_.notify_all();
+        }
+        if (writer_.joinable()) {
+            writer_.join();
+        }
+        std::lock_guard<std::mutex> lock(write_mutex_);
         channel_ = nullptr;
     }
 
 private:
-    static constexpr std::uint32_t kEventSendTimeoutMs = 250;
-    std::mutex mutex_;
+    static constexpr std::size_t kMaxQueued = 512;
+    static constexpr std::uint32_t kWriteTimeoutMs = 5000;
+
+    void run() {
+        for (;;) {
+            std::string line;
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex_);
+                cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+                if (stopping_) {
+                    return;
+                }
+                line = std::move(queue_.front());
+                queue_.pop_front();
+            }
+            const Result<ipc::IoStatus> sent = send_line(line, kWriteTimeoutMs);
+            if (!sent || *sent != ipc::IoStatus::Ok) {
+                std::lock_guard<std::mutex> lock(queue_mutex_);
+                stopping_ = true;  // broken connection: nothing more to send
+                queue_.clear();
+                return;
+            }
+        }
+    }
+
+    std::mutex write_mutex_;
     ipc::ControlChannel* channel_;
+    std::mutex queue_mutex_;
+    std::condition_variable cv_;
+    std::deque<std::string> queue_;
+    bool stopping_ = false;
+    std::size_t dropped_ = 0;
+    std::thread writer_;
 };
 
 }  // namespace

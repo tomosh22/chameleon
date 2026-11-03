@@ -415,6 +415,7 @@ private:
                 return StepOutcome::fail(status.error());
             }
             const ipc::StatusProcess* process = status->find_process(pid);
+            bool matched_enabled = false;  // a matching module is enabled but its index is not ready: keep that message
             if (process != nullptr) {
                 for (const ipc::StatusModule& module : process->modules) {
                     if (module.enabled && module_matches(step.module, module.path)) {
@@ -424,18 +425,21 @@ private:
                             write_status_artifact(*status);
                             return StepOutcome::fail(cml::ids::kExpectModuleTimeout, "the PDB index of " + module.path + " failed: " + module.index_message);
                         }
-                        if (module.index_state.empty() || module.index_state == "ready") {
+                        // The WP-12 broker always reports the index state; a missing one is "not ready".
+                        if (module.index_state == "ready") {
                             write_status_artifact(*status);
-                            return StepOutcome::pass("pid " + std::to_string(pid) + " lists " + module.path + " enabled" +
-                                                     (module.index_state.empty() ? "" : ", index ready"));
+                            return StepOutcome::pass("pid " + std::to_string(pid) + " lists " + module.path + " enabled, index ready");
                         }
-                        last = module.path + " is enabled but its index is " + module.index_state + " (" + std::to_string(module.index_percent) + "% " +
-                               module.index_message + ")";
+                        matched_enabled = true;
+                        last = module.path + " is enabled but its index is " + (module.index_state.empty() ? std::string("not reported") : module.index_state) +
+                               " (" + std::to_string(module.index_percent) + "% " + module.index_message + ")";
                         continue;
                     }
                 }
-                last = "pid " + std::to_string(pid) + " is registered with " + std::to_string(process->modules.size()) + " modules, none matching '" +
-                       step.module + "' is enabled";
+                if (!matched_enabled) {
+                    last = "pid " + std::to_string(pid) + " is registered with " + std::to_string(process->modules.size()) + " modules, none matching '" +
+                           step.module + "' is enabled";
+                }
             } else {
                 last = "the broker does not list pid " + std::to_string(pid) + " (it knows " + std::to_string(status->processes.size()) + " processes)";
             }

@@ -92,7 +92,7 @@ TEST_CASE("an answer that nobody waits for is dropped and counted; a late answer
     const std::uint64_t id = link.next_request_id();
     Result<ipc::Message> answer = link.request(reserve(id), 30);
     REQUIRE_FALSE(answer.has_value());
-    CHECK(answer.error().id() == "CML5306");
+    CHECK(answer.error().id() == "CML5320");
     CHECK(answer.error().message.find("30 ms") != std::string::npos);
     CHECK_FALSE(link.deliver(reserve_result(id)));  // arrives too late
     CHECK(link.unmatched_answers() == 2);

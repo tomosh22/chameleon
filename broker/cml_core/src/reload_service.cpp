@@ -60,7 +60,11 @@ std::string env_value(const char* name) {
 }  // namespace
 
 ReloadService::ReloadService(PipelineEnv env, EventBus* events, std::string session_dir)
-    : pipeline_(std::move(env)), events_(events), session_dir_(std::move(session_dir)) {}
+    : pipeline_(std::move(env)), events_(events), session_dir_(std::move(session_dir)) {
+    // A directory the user chose (--session-dir, $CML_SESSION_DIR) is theirs: it is never removed. Only the
+    // temporary default is.
+    keep_session_dir_ = !session_dir_.empty();
+}
 
 ReloadService::~ReloadService() {
     cancel_.cancel();
@@ -313,7 +317,15 @@ Result<Value> ReloadService::reload(const Value& args) {
     std::size_t failed = 0;
     StageTimes sum;
     for (const Target& t : list) {
+        const auto module_generation = [&] {
+            std::lock_guard<std::mutex> lock(t.module->mutex);
+            return t.module->generation;
+        };
+        const std::uint64_t generation_before = module_generation();
         Result<PatchReport> r = pipeline_.patch_module(*t.link, *t.module, ctx);
+        // Patches that were applied count (and have published their patch_applied events) even when a later
+        // compiland of the same reload failed: the broker-wide generation follows the module's own.
+        generation_.fetch_add(module_generation() - generation_before);
         if (!r) {
             ++failed;
             keep_session_dir_ = true;  // objects, DLLs and PDBs of a failed reload are evidence
@@ -322,7 +334,6 @@ Result<Value> ReloadService::reload(const Value& args) {
             }
             continue;
         }
-        generation_.fetch_add(r->patches);
         sum.add(r->times);
         if (r->patched) {
             const std::string stem(path::base_name(std::string_view(t.module->name)));
@@ -477,7 +488,12 @@ Result<Value> ReloadService::set_option(const Value& args) {
         error = want_uint(&o.hooks_timeout_ms, 100, 3600u * 1000u);
     } else if (name == "reserve_block_mb") {
         previous = Value::integer(o.reserve_block_mb);
-        error = want_uint(&o.reserve_block_mb, 1, 1024);
+        // A patch needs room for at least 4 MiB in a block (PatchPipeline's kMinPatchRoom): smaller blocks could
+        // never be used.
+        if (value->is_integer() && value->as_integer() >= 1 && value->as_integer() < 4) {
+            return bad_request("option 'reserve_block_mb' must be at least 4 (MiB): a smaller block cannot hold a patch");
+        }
+        error = want_uint(&o.reserve_block_mb, 4, 1024);
     } else if (name == "reserve_blocks") {
         previous = Value::integer(o.reserve_blocks);
         error = want_uint(&o.reserve_blocks, 1, 64);

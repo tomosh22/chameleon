@@ -1,6 +1,7 @@
 #include "cml/core/module_symbols.h"
 
 #include <filesystem>
+#include <optional>
 #include <utility>
 
 #include "cml/core/pipeline_diag_ids.h"
@@ -82,19 +83,28 @@ std::size_t ExportCache::parses() const {
     return parses_;
 }
 
-FileProcessModules::FileProcessModules(std::vector<LoadedModule> modules, LoadedModule patched, std::shared_ptr<ExportCache> cache)
-    : modules_(std::move(modules)), patched_(std::move(patched)), cache_(cache ? std::move(cache) : std::make_shared<ExportCache>()) {}
+FileProcessModules::FileProcessModules(std::vector<LoadedModule> modules, LoadedModule patched, std::shared_ptr<ExportCache> cache,
+                                       std::shared_ptr<const pe::OwnedImage> patched_image)
+    : modules_(std::move(modules)),
+      patched_(std::move(patched)),
+      cache_(cache ? std::move(cache) : std::make_shared<ExportCache>()),
+      patched_image_(std::move(patched_image)) {}
 
 std::optional<SymbolAddress> FileProcessModules::iat_slot(std::string_view, std::string_view import_name) const {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!iat_loaded_) {
         iat_loaded_ = true;
-        Result<pe::OwnedImage> image = pe::load_image_file(patched_.path);
-        if (!image) {
-            skipped_.push_back(Diag::make(pipeline::diag::kModuleImage, "cannot read the module '" + patched_.path + "' to find its import slots: " + image.error().message,
+        // The module's file is usually already loaded by the pipeline (ModuleState::image): reuse it.
+        std::optional<Result<pe::OwnedImage>> loaded;
+        if (!patched_image_) {
+            loaded.emplace(pe::load_image_file(patched_.path));
+        }
+        const pe::Image* image = patched_image_ ? &patched_image_->image : (*loaded ? &(*loaded)->image : nullptr);
+        if (image == nullptr) {
+            skipped_.push_back(Diag::make(pipeline::diag::kModuleImage, "cannot read the module '" + patched_.path + "' to find its import slots: " + loaded->error().message,
                                           "Check that the module file still exists and is a valid x64 image."));
         } else {
-            Result<std::vector<pe::ImportModule>> imports = image->image.imports();
+            Result<std::vector<pe::ImportModule>> imports = image->imports();
             if (!imports) {
                 skipped_.push_back(imports.error());
             } else {

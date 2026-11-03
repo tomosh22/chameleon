@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "cml/core/symbol_registry.h"
+#include "cml/pe/pe.h"
 #include "cml/util/result.h"
 
 namespace cml::core {
@@ -62,7 +63,9 @@ class FileProcessModules final : public ProcessModules {
 public:
     // `modules`: the target process's modules in loader order. `patched`: the module being patched (its
     // IAT is read; its exports are not offered). `cache` may be shared between instances.
-    FileProcessModules(std::vector<LoadedModule> modules, LoadedModule patched, std::shared_ptr<ExportCache> cache = nullptr);
+    // `patched_image`: the patched module's file when the caller has it loaded already (else it is read on demand).
+    FileProcessModules(std::vector<LoadedModule> modules, LoadedModule patched, std::shared_ptr<ExportCache> cache = nullptr,
+                       std::shared_ptr<const pe::OwnedImage> patched_image = nullptr);
 
     std::optional<SymbolAddress> iat_slot(std::string_view module_name, std::string_view import_name) const override;
     std::optional<SymbolAddress> find_export(std::string_view name) const override;
@@ -74,6 +77,7 @@ private:
     std::vector<LoadedModule> modules_;
     LoadedModule patched_;
     std::shared_ptr<ExportCache> cache_;
+    std::shared_ptr<const pe::OwnedImage> patched_image_;
     mutable std::mutex mutex_;
     mutable std::unordered_map<std::string, std::uint32_t> iat_;  // import name -> IAT slot RVA of the patched module
     mutable bool iat_loaded_ = false;

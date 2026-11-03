@@ -219,13 +219,18 @@ int run_headless(const Options& options) {
     const std::optional<std::string> control_from_env = cml::proc::get_env("CML_CONTROL_PIPE");
     const bool control_requested = !options.control_pipe.empty() || (control_from_env && !control_from_env->empty());
     cml::Result<std::string> control_name = cml::ipc::resolve_control_pipe_name(options.control_pipe);
-    if (!control_name) {
+    if (!control_name && control_requested) {
         CML_LOG(Error, "%s", control_name.error().format().c_str());
         return 1;
     }
-    server_options.control_pipe_name = *control_name;
-    server_options.control_pipe_optional = !control_requested;
-    CML_LOG(Info, "control pipe=%s%s", control_name->c_str(), control_requested ? "" : " (default name)");
+    if (!control_name) {
+        // Best effort for the default name (e.g. the logon-session SID cannot be queried): run without a control pipe.
+        CML_LOG(Warn, "no control pipe: %s", control_name.error().format().c_str());
+    } else {
+        server_options.control_pipe_name = *control_name;
+        server_options.control_pipe_optional = !control_requested;
+        CML_LOG(Info, "control pipe=%s%s", control_name->c_str(), control_requested ? "" : " (default name)");
+    }
     server_options.session_dir = options.session_dir;
     server_options.exit_when_idle_ms = options.exit_when_idle_ms;
     server_options.startup_timeout_ms = options.startup_timeout_ms;

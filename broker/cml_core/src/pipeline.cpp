@@ -269,7 +269,7 @@ private:
         for (const std::string& f : swept->unmapped) {
             warn(report, "sweep",
                  Diag::make(pd::kChangedFileUnmapped, "the changed file '" + f + "' is not part of any compiland of " + module_.name,
-                            "A header that only declares things is not listed in clang-cl PDBs (ADR-0013); touch a source file that includes it."));
+                            "clang-cl PDBs do not list headers that hold no code (ADR-0013). Edit a .cpp file that includes the header; touching a file does not count, only a change of its content does."));
         }
         for (const std::string& f : swept->missing) {
             warn(report, "sweep", Diag::make(pd::kBaselineFile, "the tracked file '" + f + "' is gone", "Restore it or ignore this warning."));
@@ -430,7 +430,7 @@ private:
             return fail("plan", object.error());
         }
         std::shared_ptr<const pe::OwnedImage> image = module_image(report);
-        FileProcessModules process_modules(snapshot_.modules, LoadedModule{module_.path, module_.base, module_.size}, ctx_.exports);
+        FileProcessModules process_modules(snapshot_.modules, LoadedModule{module_.path, module_.base, module_.size}, ctx_.exports, image);
         bind::PlanInput in;
         in.object = &object->object;
         in.object_name = std::string(path::base_name(std::string_view(u.outcome.object_path)));
@@ -653,6 +653,11 @@ private:
             load.candidates.push_back(std::move(candidate));
             Result<ipc::Message> answer = ask(std::move(load), options_.agent_timeout_ms, "load");
             if (!answer) {
+                if (answer.error().code == pd::kAgentRequestTimeout) {
+                    // The agent works through requests in order, so an unload sent now runs after a LoadPatch that is
+                    // still queued: the late load does not leave an unused patch behind.
+                    unload(linked.base);
+                }
                 return answer.error();
             }
             report.times.load += lap.lap();
@@ -752,7 +757,7 @@ private:
             if (!answer) {
                 // No answer: the agent may still apply the hooks (synchronised mode waits for SyncPoint). The
                 // patch must then stay loaded; remember the hooks as installed so the next reload re-points them.
-                const bool timed_out = answer.error().code == pd::kAgentRequestFailed;
+                const bool timed_out = answer.error().code == pd::kAgentRequestTimeout;  // a send failure or a lost agent is a plain failure
                 if (timed_out) {
                     std::lock_guard<std::mutex> lock(module_.mutex);
                     for (const auto& h : installed) {
@@ -761,6 +766,7 @@ private:
                     return fail("hooks", Diag::make(pd::kHooksTimeout, "the agent did not confirm the hooks in time: " + answer.error().message,
                                                     "In synchronised mode the application must call SyncPoint(); the patch stays loaded and the hooks may still apply."));
                 }
+                abandon();
                 return fail("hooks", answer.error());
             }
             const auto* done = std::get_if<ipc::HooksInstalled>(&*answer);
@@ -881,9 +887,11 @@ private:
     }
 
     Result<void> ensure_linker(const Unit& u, PatchReport& report) {
+        // The cache is keyed by the options that decide the linker: set-option linker / linker_path takes effect.
+        const std::string key = options_.linker_override + "|" + options_.linker_path;
         {
             std::lock_guard<std::mutex> lock(module_.mutex);
-            if (module_.linker) {
+            if (module_.linker && module_.linker_key == key) {
                 return Result<void>();
             }
         }
@@ -905,6 +913,7 @@ private:
         CML_LOG(Info, "reload: linker for %s: %s %s", module_.name.c_str(), tool->path.c_str(), tool->version_text.c_str());
         std::lock_guard<std::mutex> lock(module_.mutex);
         module_.linker = *tool;
+        module_.linker_key = key;
         return Result<void>();
     }
 

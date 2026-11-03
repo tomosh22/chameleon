@@ -102,6 +102,10 @@ struct Rig {
     bool fail_compile = false;
     std::atomic<int> compile_calls{0};
     std::atomic<int> link_calls{0};
+    std::atomic<int> resolve_calls{0};
+    std::vector<std::byte> second_object;       // what the "compiler" produces for main.cpp (compiland 1), when set
+    bool fail_send = false;                     // InstallHooks cannot be sent (pipe error)
+    bool answer_load = true;                    // false: LoadPatch gets no answer (timeout)
     std::function<void()> compile_hook;         // runs inside the fake compiler
     std::uint32_t load_status = 0;              // status of PatchLoaded
     int load_collisions = 0;                    // the first n LoadPatch answer CML4203
@@ -122,12 +126,13 @@ struct Rig {
     Session session{1, "0.1.0"};
     std::shared_ptr<ModuleState> module;
 
-    Rig() {
+    explicit Rig(bool default_session_dir = false) {
         // basic_world() with the compiland's build environment recorded at the head of its module stream (before
         // the first proc), as the compilers do.
         SynthWorld w;
         w.tu().symbols.envblock({{"cwd", dir.dir()}, {"cl", "C:\\VC\\bin\\cl.exe"}, {"cmd", "/c /Zi /Gy logic.cpp"}, {"src", "C:\\proj\\logic.cpp"}});
         w.proc(w.tu(), "compute_value", 0x10);
+        w.main_obj().symbols.envblock({{"cwd", dir.dir()}, {"cl", "C:\\VC\\bin\\cl.exe"}, {"cmd", "/c /Zi /Gy main.cpp"}, {"src", "C:\\proj\\main.cpp"}});
         w.proc(w.main_obj(), "fixture_note", 0x100);
         w.data(w.main_obj(), "g_tick", 0x80, false);
         w.pub_func("?compute_value@@YAHXZ", 0x10);
@@ -159,12 +164,14 @@ struct Rig {
                 std::error_code ec;
                 std::filesystem::create_directories(std::filesystem::path(requests_in[i].output_object).parent_path(), ec);
                 std::ofstream out(requests_in[i].output_object, std::ios::binary | std::ios::trunc);
-                out.write(reinterpret_cast<const char*>(object.data()), static_cast<std::streamsize>(object.size()));
+                const std::vector<std::byte>& bytes = (!second_object.empty() && requests_in[i].record.source == "C:\\proj\\main.cpp") ? second_object : object;
+                out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
                 results.emplace_back();
             }
             return results;
         };
-        env.resolve_linker = [](const std::string&, const std::vector<std::string>&, const ReloadOptions&, std::vector<Diag>*) -> Result<toolchain::ToolInfo> {
+        env.resolve_linker = [this](const std::string&, const std::vector<std::string>&, const ReloadOptions&, std::vector<Diag>*) -> Result<toolchain::ToolInfo> {
+            ++resolve_calls;
             toolchain::ToolInfo t;
             t.family = toolchain::ToolFamily::Link;
             t.path = "C:\\VC\\bin\\link.exe";
@@ -211,7 +218,7 @@ struct Rig {
             }
             return lp;
         };
-        service = std::make_unique<ReloadService>(std::move(env), &bus, dir.subdir("session"));
+        service = std::make_unique<ReloadService>(std::move(env), &bus, default_session_dir ? std::string() : dir.subdir("session"));
         link = std::make_shared<AgentLink>(1, [this](const ipc::Message& m) { return agent(m); });
         session.set_answer_sink([this](const ipc::Message& m) { return link->deliver(m); });
         service->attach(link);
@@ -219,9 +226,15 @@ struct Rig {
 
     // The scripted agent.
     Result<void> agent(const ipc::Message& m) {
+        if (fail_send && std::holds_alternative<ipc::InstallHooks>(m)) {
+            return Diag::make(ids::kPipeIoFailed, "pipe broke", "restart");
+        }
         {
             std::lock_guard<std::mutex> lock(mutex);
             requests.push_back(m);
+        }
+        if (!answer_load && std::holds_alternative<ipc::LoadPatch>(m)) {
+            return Result<void>();  // the request was sent, no answer comes
         }
         const std::uint64_t id = *request_id_of(m);
         const auto reply = [&](std::uint32_t status, const std::string& text = {}) {
@@ -316,6 +329,21 @@ struct Rig {
             s.stamps[file] = FileStamp{1, 2, 3};
             s.checked = 1;
             s.hashed = 1;
+            return s;
+        });
+    }
+    // Both compilands changed: logic.cpp (0) and main.cpp (1).
+    void changed_both() {
+        module->index->set_sweep_override_for_testing([]() -> Result<ModuleIndex::Sweep> {
+            ModuleIndex::Sweep s;
+            for (const char* f : {"C:\\proj\\logic.cpp", "C:\\proj\\main.cpp"}) {
+                s.changed.push_back(f);
+            }
+            s.compilands = {0, 1};
+            s.file_compilands["C:\\proj\\logic.cpp"] = {0};
+            s.file_compilands["C:\\proj\\main.cpp"] = {1};
+            s.stamps["C:\\proj\\logic.cpp"] = FileStamp{1, 2, 3};
+            s.stamps["C:\\proj\\main.cpp"] = FileStamp{4, 5, 6};
             return s;
         });
     }
@@ -879,4 +907,146 @@ TEST_CASE("control: status reports the module's index state; reload / wait / set
     CHECK(subscribed.size() == 3);
     CHECK_FALSE(call(R"({"id":9,"cmd":"subscribe","args":{"events":["nothing"]}})").get_bool("ok"));
     CHECK(call(R"({"id":10,"cmd":"frobnicate"})").find("diag")->get_string("id") == "CML5402");
+}
+
+// ---- review fixes -------------------------------------------------------------------------------------------
+
+TEST_CASE("a session directory the user supplied is never removed; the temporary default is") {
+    QuietLogs quiet;
+    std::string default_dir;
+    {
+        Rig user_dir;  // constructed with dir.subdir("session")
+        user_dir.enable();
+        user_dir.unchanged();
+        REQUIRE(user_dir.reload().has_value());
+        const std::string marker = user_dir.dir.file("session/marker.txt");
+        std::ofstream(marker) << "mine";
+        const std::string session = user_dir.service->session_dir();
+        user_dir.service.reset();  // the destructor must leave the directory and its content
+        CHECK(std::filesystem::exists(std::filesystem::path(session)));
+        CHECK(std::filesystem::exists(std::filesystem::path(marker)));
+    }
+    {
+        Rig temp(true);
+        temp.enable();
+        temp.unchanged();
+        REQUIRE(temp.reload().has_value());
+        default_dir = temp.service->session_dir();
+        REQUIRE_FALSE(default_dir.empty());
+        CHECK(std::filesystem::exists(std::filesystem::path(default_dir)));
+        temp.service.reset();
+    }
+    CHECK_FALSE(std::filesystem::exists(std::filesystem::path(default_dir)));
+}
+
+TEST_CASE("status never shows an enabled module as ready before its index exists") {
+    QuietLogs quiet;
+    Rig rig;
+    ipc::Hello hello;
+    hello.request_id = 1;
+    hello.pid = kPid;
+    rig.session.on_message(hello);
+    ipc::ModuleList list;
+    list.request_id = 2;
+    list.modules.push_back({kModuleBase, 0x4000, rig.exe});
+    rig.session.on_message(list);
+    ipc::EnableModule enable_module;
+    enable_module.request_id = 3;
+    enable_module.path = rig.exe;
+    rig.session.on_message(enable_module);
+    ProcessRegistry registry;
+    registry.update(rig.session);  // published before the service created the index (the old order)
+    ControlContext context;
+    context.version = "0.1.0";
+    context.registry = &registry;
+    context.service = rig.service.get();
+    Result<Value> parsed = ipc::json::parse(handle_control_line(R"({"id":1,"cmd":"status"})", context));
+    REQUIRE(parsed.has_value());
+    const Value* index = parsed->find("result")->find("processes")->items()[0].find("modules")->items()[0].find("index");
+    REQUIRE(index != nullptr);
+    CHECK(index->get_string("state") == "pending");
+}
+
+TEST_CASE("InstallHooks that cannot be sent is a plain failure: the patch is unloaded and the hook table untouched") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    rig.fail_send = true;
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML5306");
+    CHECK(rig.seen<ipc::ReleaseRange>().size() == 1);
+    CHECK_FALSE(rig.module->is_hooked(kModuleBase + 0x1010));
+}
+
+TEST_CASE("a LoadPatch without an answer is CML5320 and the patch is unloaded behind it") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    rig.answer_load = false;
+    rig.option("agent_timeout_ms", Value::integer(150));
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML5320");
+    const auto unloads = rig.seen<ipc::ReleaseRange>();
+    REQUIRE(unloads.size() == 1);
+    CHECK(unloads[0].base == rig.seen<ipc::LoadPatch>()[0].candidates[0].image_base);
+}
+
+TEST_CASE("the resolved linker follows set-option linker / linker_path") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    REQUIRE(rig.reload().has_value());
+    CHECK(rig.resolve_calls == 1);
+    rig.changed();
+    REQUIRE(rig.reload().has_value());
+    CHECK(rig.resolve_calls == 1);  // cached while the options are unchanged
+    rig.option("linker", Value::string("lld-link"));
+    rig.changed();
+    REQUIRE(rig.reload().has_value());
+    CHECK(rig.resolve_calls == 2);
+    rig.option("linker_path", Value::string("C:\\tools\\other.exe"));
+    rig.changed();
+    REQUIRE(rig.reload().has_value());
+    CHECK(rig.resolve_calls == 3);
+}
+
+TEST_CASE("set-option reserve_block_mb below the room a patch needs is refused") {
+    QuietLogs quiet;
+    Rig rig;
+    Value args = Value::object();
+    args.set("name", Value::string("reserve_block_mb"));
+    args.set("value", Value::integer(2));
+    Result<Value> r = rig.service->set_option(args);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML5311");
+    CHECK(r.error().message.find("at least 4") != std::string::npos);
+    CHECK(rig.service->options().reserve_block_mb == 64);
+    args.set("value", Value::integer(4));
+    CHECK(rig.service->set_option(args).has_value());
+    CHECK(rig.service->options().reserve_block_mb == 4);
+}
+
+TEST_CASE("patches applied before a later compiland failed still count in the generation") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed_both();
+    rig.second_object = make_object({}, false, "no_such_function_anywhere");  // main.cpp cannot be planned
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML3200");
+    CHECK(rig.seen<ipc::LoadPatch>().size() == 1);  // logic.cpp was patched first
+    CHECK(rig.module->generation == 1);
+    CHECK(rig.service->generation() == 1);
+    CHECK(rig.events->count("patch_applied") == 1);
+    // Only logic.cpp's stamp is accepted: main.cpp is processed again by the next reload.
+    const auto accepted = rig.module->index->accepted_for_testing();
+    REQUIRE(accepted.size() == 1);
+    CHECK(accepted[0].count("C:\\proj\\logic.cpp") == 1);
+    CHECK(accepted[0].count("C:\\proj\\main.cpp") == 0);
 }

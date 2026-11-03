@@ -71,7 +71,7 @@ Result<void> preapply_write32(const std::string& dll_path, std::span<const Write
         const std::optional<std::uint64_t> offset = image->image.rva_to_offset(w.rva);
         if (!site || !offset) {
             return Diag::make(pipeline::diag::kPatchImage,
-                              "the SECREL site at rva 0x" + std::to_string(w.rva) + " is not inside the file data of a section of '" + dll_path + "'",
+                              "the SECREL site at rva " + std::to_string(w.rva) + " is not inside the file data of a section of '" + dll_path + "'",
                               "Report this with the bind plan; the patch cannot be prepared.");
         }
         offsets.push_back(*offset);

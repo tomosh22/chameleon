@@ -154,7 +154,7 @@ Result<ipc::Message> AgentLink::request(ipc::Message request, std::uint32_t time
                           "Restart the application, or wait for its agent to reconnect.");
     }
     (void)done;
-    return Diag::make(pipeline::diag::kAgentRequestFailed,
+    return Diag::make(pipeline::diag::kAgentRequestTimeout,
                       std::string("no answer to ") + ipc::to_string(ipc::type_of(request)) + " within " + std::to_string(timeout_ms) + " ms",
                       "The application may be stopped in a debugger or not reaching its sync point; try again.");
 }

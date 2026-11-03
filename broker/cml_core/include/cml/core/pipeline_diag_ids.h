@@ -28,5 +28,6 @@ inline constexpr std::uint32_t kPdbOpen = 5316;            // the module's PDB c
 inline constexpr std::uint32_t kAgentLost = 5317;          // the agent disconnected while the reload ran
 inline constexpr std::uint32_t kStageFailed = 5318;        // generic wrapper: a stage failed (message names stage and cause)
 inline constexpr std::uint32_t kNoChanges = 5319;          // (info) the sweep found no changed source
+inline constexpr std::uint32_t kAgentRequestTimeout = 5320;  // no answer within the time limit (the agent may still act on the request)
 
 }  // namespace cml::core::pipeline::diag

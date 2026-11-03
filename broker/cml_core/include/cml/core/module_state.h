@@ -65,7 +65,8 @@ struct ModuleState {
     std::mutex mutex;
     std::map<std::uint64_t, std::uint64_t> hooked;  // old entry VA -> VA it currently jumps to
     Reservation reservation;
-    std::optional<toolchain::ToolInfo> linker;      // resolved once, mirrors the module's linker
+    std::optional<toolchain::ToolInfo> linker;      // resolved once per option set, mirrors the module's linker
+    std::string linker_key;                         // the `linker` / `linker_path` options `linker` was resolved with
     std::shared_ptr<const pe::OwnedImage> image;    // the module file on disk (old code bytes, narrowing)
     std::uint64_t generation = 0;                   // patches applied to this module
     std::uint64_t patch_counter = 0;                // names patch files (also counts failed attempts)
