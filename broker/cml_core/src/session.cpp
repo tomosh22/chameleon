@@ -179,6 +179,10 @@ SessionOutcome Session::on_message(const ipc::Message& message) {
     } else if (const auto* log = std::get_if<ipc::Log>(&message)) {
         CML_LOG(Info, "agent#%llu log[%u]: %s", static_cast<unsigned long long>(agent_id_),
                 log->level, log->text.c_str());
+    } else if (const auto* exception = std::get_if<ipc::Exception>(&message)) {
+        if (exception_sink_) {
+            exception_sink_(*exception);
+        }
     } else if (std::get_if<ipc::Reply>(&message) != nullptr || std::get_if<ipc::ReserveRangeResult>(&message) != nullptr ||
                std::get_if<ipc::PatchLoaded>(&message) != nullptr || std::get_if<ipc::HooksInstalled>(&message) != nullptr) {
         // Answers to the broker's own requests (WP-12). One whose request id nobody waits for (the request timed

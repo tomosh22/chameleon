@@ -24,6 +24,9 @@ std::vector<std::string> broker_capabilities(const ControlContext& context) {
             caps.emplace_back(c);
         }
     }
+    if (context.exceptions != nullptr) {
+        caps.emplace_back(ipc::capability::kExceptions);
+    }
     return caps;
 }
 
@@ -107,16 +110,19 @@ ipc::ControlResponse answer(const ipc::ControlRequest& request, Result<ipc::json
 }
 
 ipc::ControlResponse subscribe_response(const ipc::ControlRequest& request, const ControlContext& context) {
-    static const char* const kEvents[] = {"diag", "patch_applied", "progress", "log"};
+    static const char* const kEvents[] = {"diag", "patch_applied", "progress", "log", "exception"};
     std::set<std::string> names;
     const ipc::json::Value* events = request.args.find("events");
-    if (events == nullptr || events->is_null()) {
-        // `progress` (WP-15) is opt-in: it can be chatty on a big reload.
+    // An empty array is the same as no argument: the default set. (The bus reads an empty set as "every event", which would switch
+    // on `exception` without the client naming it.)
+    if (events == nullptr || events->is_null() || (events->is_array() && events->items().empty())) {
+        // `progress` (WP-15) is opt-in: it can be chatty on a big reload. `exception` (WP-20) is opt-in because listening for it
+        // makes the agents hold faulting threads until somebody decides.
         for (const char* k : kEvents) {
-            if (std::string(k) != "progress") names.insert(k);
+            if (std::string(k) != "progress" && std::string(k) != "exception") names.insert(k);
         }
     } else if (!events->is_array()) {
-        return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "argument 'events' must be an array of event names", "Use [\"diag\", \"patch_applied\", \"progress\", \"log\"] or a subset."));
+        return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "argument 'events' must be an array of event names", "Use [\"diag\", \"patch_applied\", \"progress\", \"log\", \"exception\"] or a subset."));
     } else {
         for (const ipc::json::Value& e : events->items()) {
             bool known = false;
@@ -124,7 +130,7 @@ ipc::ControlResponse subscribe_response(const ipc::ControlRequest& request, cons
                 known = known || (e.is_string() && e.as_string() == k);
             }
             if (!known) {
-                return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "unknown event name in 'events'", "Known events: diag, patch_applied, progress, log."));
+                return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "unknown event name in 'events'", "Known events: diag, patch_applied, progress, log, exception."));
             }
             names.insert(e.as_string());
         }
@@ -159,6 +165,14 @@ ipc::ControlResponse handle_control_request(const ipc::ControlRequest& request, 
         }
         if (request.cmd == "subscribe") {
             return subscribe_response(request, context);
+        }
+    }
+    if (context.exceptions != nullptr) {
+        if (request.cmd == "exception-action") {
+            return answer(request, context.exceptions->action(request.args));
+        }
+        if (request.cmd == "exceptions") {
+            return answer(request, context.exceptions->pending(request.args));
         }
     }
     std::string provided;
@@ -441,6 +455,9 @@ void ControlServer::serve(Connection& connection) {
         } else {
             bus->update(subscription, names);
         }
+        if (context_.exceptions != nullptr) {
+            context_.exceptions->refresh(true);  // WP-20: the agents hold faulting threads only while somebody listens for `exception`
+        }
     };
     while (!stopping_.load(std::memory_order_acquire)) {
         Result<ipc::ControlChannel::Line> received = connection.channel.receive_line(ipc::kInfiniteTimeout);
@@ -468,6 +485,9 @@ void ControlServer::serve(Connection& connection) {
     }
     if (bus != nullptr && subscription != 0) {
         bus->unsubscribe(subscription);
+        if (context_.exceptions != nullptr) {
+            context_.exceptions->refresh(false);  // the last listener may be gone: release what the agents hold
+        }
     }
     sender->detach();
     connection.finished.store(true, std::memory_order_release);

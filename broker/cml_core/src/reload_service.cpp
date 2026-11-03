@@ -731,6 +731,12 @@ Result<Value> ReloadService::set_option(const Value& args) {
         previous = Value::boolean(o.compile_on_save);
         error = want_bool(&o.compile_on_save);
         toggle = true;
+    } else if (name == "crash_handler") {
+        previous = Value::boolean(o.crash_handler);
+        error = want_bool(&o.crash_handler);
+    } else if (name == "break_with_debugger") {
+        previous = Value::boolean(o.break_with_debugger);
+        error = want_bool(&o.break_with_debugger);
     } else if (name == "log_level") {
         static const char* const kNames[] = {"trace", "debug", "info", "warn", "error", "off"};
         previous = Value::string(kNames[static_cast<int>(log_level())]);
@@ -748,7 +754,7 @@ Result<Value> ReloadService::set_option(const Value& args) {
     } else {
         return bad_request("unknown option '" + name +
                            "'; options: narrow_hooks, release_pdb_after_reload, track_system_headers, max_parallel_compiles, max_affected_compilands, agent_timeout_ms, "
-                           "hooks_timeout_ms, reserve_block_mb, reserve_blocks, max_load_attempts, linker, linker_path, compile_on_save, log_level");
+                           "hooks_timeout_ms, reserve_block_mb, reserve_blocks, max_load_attempts, linker, linker_path, compile_on_save, crash_handler, break_with_debugger, log_level");
     }
     if (error) {
         return *error;
@@ -768,10 +774,23 @@ Result<Value> ReloadService::set_option(const Value& args) {
             return *unavailable;
         }
     }
+    OptionObserver observer;
+    {
+        std::lock_guard<std::mutex> observer_lock(observer_mutex_);
+        observer = option_observer_;
+    }
+    if (observer) {
+        observer(name);
+    }
     Value result = Value::object();
     result.set("name", Value::string(name));
     result.set("previous", std::move(previous));
     return result;
+}
+
+void ReloadService::set_option_observer(OptionObserver observer) {
+    std::lock_guard<std::mutex> lock(observer_mutex_);
+    option_observer_ = std::move(observer);
 }
 
 }  // namespace cml::core
