@@ -207,6 +207,16 @@ per compiland, `compile_commands.json` plus a dependency scan, or the PDB list (
 Until then, header changes on clang-cl builds may miss compilands whose headers contain no
 code.
 
+**Resolution (WP-15).** The broker scans the include graph itself when a module is indexed
+(`broker/cml_core/src/include_scan.cpp`): for every compiland, from the include directories,
+forced includes and source file of its recorded command line, it follows `#include` through the
+files on disk. This is the "dependency scan" option; it needs no compile, works for cl and
+clang-cl alike, and tracks code-less headers from the first `reload` (a `/showIncludes` capture
+only exists after a recompile, so a first header edit would have been missed). The scan is an
+over-approximation (conditional includes are followed either way), which costs at most an extra
+recompile. The PDB list stays in use and is united with the scan. `/showIncludes` capture is not
+used. See `docs/wp/WP-15.md`.
+
 ## ADR-0014 `cml_pdb` parses MSF/DBI/CodeView itself; raw_pdb is a validation gate
 
 **Date:** 2026-10-25 · **Status:** Accepted
