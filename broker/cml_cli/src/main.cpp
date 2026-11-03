@@ -43,6 +43,7 @@ void print_usage(std::FILE* out) {
         "       cml_broker --headless [--pipe NAME] [--control-pipe NAME] [--exit-when-idle MS]\n"
         "                             [--startup-timeout MS]\n"
         "                             [--log FILE] [--log-format text|json] [--verbose] [--session-dir DIR]\n"
+        "                             [--compile-on-save]\n"
         "\n"
         "  --headless            run without a GUI and serve agents on the broker pipe\n"
         "  --pipe NAME           full pipe name (default: CML_PIPE_NAME, else\n"
@@ -56,6 +57,8 @@ void print_usage(std::FILE* out) {
         "  --log FILE            append the log to FILE instead of writing it to stdout\n"
         "  --log-format F        text (default) or json: one JSON object per log record\n"
         "  --verbose             also log debug messages\n"
+        "  --compile-on-save     watch the tracked source files and reload when one is saved (same as the\n"
+        "                        control command `set-option compile_on_save true`)\n"
         "  --session-dir DIR     keep objects, patch DLLs and PDBs of reloads in DIR (default:\n"
         "                        $CML_SESSION_DIR, else a temporary directory removed at exit)\n",
         out);
@@ -66,6 +69,7 @@ struct Options {
     bool help = false;
     bool headless = false;
     bool verbose = false;
+    bool compile_on_save = false;
     std::string pipe;
     std::string control_pipe;
     std::string log_file;
@@ -108,6 +112,8 @@ bool parse_args(const std::vector<std::string>& args, Options* options) {
             options->headless = true;
         } else if (arg == "--verbose") {
             options->verbose = true;
+        } else if (arg == "--compile-on-save") {
+            options->compile_on_save = true;
         } else if (arg == "--pipe") {
             if (!value_of("--pipe", &options->pipe)) return false;
         } else if (arg == "--control-pipe") {
@@ -232,6 +238,7 @@ int run_headless(const Options& options) {
         CML_LOG(Info, "control pipe=%s%s", control_name->c_str(), control_requested ? "" : " (default name)");
     }
     server_options.session_dir = options.session_dir;
+    server_options.compile_on_save = options.compile_on_save;
     server_options.exit_when_idle_ms = options.exit_when_idle_ms;
     server_options.startup_timeout_ms = options.startup_timeout_ms;
     g_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);

@@ -1066,6 +1066,111 @@ TEST_CASE("patches applied before a later compiland failed still count in the ge
     CHECK(accepted[0].count("C:\\proj\\main.cpp") == 0);
 }
 
+TEST_CASE("set-option compile_on_save validates, reports the previous value and starts and stops the watcher (WP-14)") {
+    QuietLogs quiet;
+    Rig rig;
+    std::atomic<int> factory_calls{0};
+    rig.service->set_watcher_factory_for_testing(
+        [&](const std::vector<watch::WatchRoot>&, watch::DirectoryWatcher::Sink, std::vector<Diag>*) -> Result<std::unique_ptr<watch::DirectoryWatcher>> {
+            ++factory_calls;
+            return Diag::make(5503, "fake", "none");
+        });
+    rig.enable();
+    CHECK_FALSE(rig.service->options().compile_on_save);
+    Value args = Value::object();
+    args.set("name", Value::string("compile_on_save"));
+    args.set("value", Value::integer(1));  // wrong type
+    CHECK(rig.service->set_option(args).error().id() == "CML5311");
+    CHECK_FALSE(rig.service->options().compile_on_save);
+    args.set("value", Value::boolean(true));
+    Result<Value> on = rig.service->set_option(args);
+    REQUIRE(on.has_value());
+    CHECK(on->find("previous")->as_bool() == false);
+    CHECK(rig.service->options().compile_on_save);
+    // The synthetic PDB lists files that do not exist: nothing is tracked, so no directory is watched.
+    CHECK(factory_calls.load() == 0);
+    rig.service->rearm_save_watcher();  // harmless
+    args.set("value", Value::boolean(false));
+    Result<Value> off = rig.service->set_option(args);
+    REQUIRE(off.has_value());
+    CHECK(off->find("previous")->as_bool() == true);
+    CHECK_FALSE(rig.service->options().compile_on_save);
+}
+
+TEST_CASE("reload_for_save: busy and not-ready are quiet; a ready module is compiled (WP-14)") {
+    QuietLogs quiet;
+    {
+        // No module at all: nothing to do, and no CML5300 event.
+        Rig rig;
+        CHECK(rig.service->reload_for_save() == SaveWatcherHooks::ReloadResult::Done);
+        CHECK(rig.events->diag_ids().empty());
+    }
+    {
+        // A module whose index failed is skipped without a failed reload.
+        Rig rig;
+        std::filesystem::remove(std::filesystem::path(rig.dir.file("app.pdb")));
+        ipc::Hello hello;
+        hello.request_id = 1;
+        hello.pid = kPid;
+        rig.session.on_message(hello);
+        ipc::ModuleList list;
+        list.request_id = 2;
+        list.modules.push_back({kModuleBase, 0x4000, rig.exe});
+        rig.session.on_message(list);
+        ipc::EnableModule enable_module;
+        enable_module.request_id = 3;
+        enable_module.path = rig.exe;
+        rig.session.on_message(enable_module);
+        rig.link->publish(rig.session);
+        rig.service->on_session_changed(1);
+        auto module = rig.service->module_state(1, rig.exe);
+        REQUIRE(module != nullptr);
+        CHECK(module->index->wait(20000));
+        CHECK(rig.service->reload_for_save() == SaveWatcherHooks::ReloadResult::Done);
+        CHECK(rig.events->diag_ids().empty());
+        CHECK(rig.compile_calls == 0);
+    }
+    {
+        // A reload is running: the automatic one says Busy and publishes nothing.
+        Rig rig;
+        rig.enable();
+        rig.changed();
+        std::mutex m;
+        std::condition_variable cv;
+        bool entered = false;
+        bool release = false;
+        rig.compile_hook = [&] {
+            std::unique_lock<std::mutex> lock(m);
+            entered = true;
+            cv.notify_all();
+            cv.wait(lock, [&] { return release; });
+        };
+        Result<Value> first = Diag::make(5300, "unset", "");
+        std::thread worker([&] { first = rig.reload(); });
+        {
+            std::unique_lock<std::mutex> lock(m);
+            cv.wait(lock, [&] { return entered; });
+        }
+        CHECK(rig.service->reload_for_save() == SaveWatcherHooks::ReloadResult::Busy);
+        CHECK(rig.events->diag_ids().empty());
+        {
+            std::lock_guard<std::mutex> lock(m);
+            release = true;
+        }
+        cv.notify_all();
+        worker.join();
+        CHECK(first.has_value());
+    }
+    {
+        // A ready module with a change is compiled.
+        Rig rig;
+        rig.enable();
+        rig.changed();
+        CHECK(rig.service->reload_for_save() == SaveWatcherHooks::ReloadResult::Done);
+        CHECK(rig.compile_calls >= 1);
+    }
+}
+
 // ---- WP-15: header dependency handling ----------------------------------------------------------------------------
 
 TEST_CASE("reload: a changed file of a precompiled header is refused with CML5550 before anything is compiled") {
@@ -1392,3 +1497,65 @@ TEST_CASE("compile cache: a cached failure stops a module before it compiles any
     CHECK(second.error().code == 2200);
     CHECK(rig.compile_calls == calls);
 }
+
+TEST_CASE("reload_for_save: a change above max_affected_compilands (CML5551) is reported once and nothing is compiled or confirmed (WP-14 + WP-15)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.option("max_affected_compilands", Value::integer(1));
+    rig.changed_both();  // two compilands
+    const int calls = rig.compile_calls;
+    CHECK(rig.service->reload_for_save() == SaveWatcherHooks::ReloadResult::Done);
+    CHECK(rig.compile_calls == calls);
+    CHECK(rig.events->diag_ids() == std::vector<std::string>{"CML5551"});
+    // The explicit reload still refuses, and "confirm" still lets it through.
+    Result<Value> refused = rig.reload();
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().id() == "CML5551");
+    Value args = Value::object();
+    args.set("confirm", Value::boolean(true));
+    CHECK(rig.service->reload(args).has_value());
+}
+
+#if defined(_WIN32)
+TEST_CASE("compile on save watches the headers that only the include scan finds (WP-14 + WP-15)") {
+    QuietLogs quiet;
+    testpdb::TempDir dir;
+    const auto write_text = [](const std::string& path, const std::string& text) {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out << text;
+    };
+    std::filesystem::create_directories(std::filesystem::path(dir.dir()) / "inc");
+    write_text(dir.file("logic.cpp"), "#include \"inc/dep.h\"\nint compute_value() { return VALUE; }\n");
+    write_text(dir.file("inc\\dep.h"), "#pragma once\n#define VALUE 1\n");
+    SynthWorld w;
+    w.tu().symbols.envblock({{"cwd", dir.dir()}, {"cl", "C:\\VC\\bin\\cl.exe"}, {"cmd", "/c /Zi /Gy logic.cpp"}, {"src", dir.file("logic.cpp")}});
+    w.proc(w.tu(), "compute_value", 0x10);
+    w.pub_func("?compute_value@@YAHXZ", 0x10);
+    w.spec.guid = kGuid;
+    w.spec.age = 5;
+    const std::string pdb = dir.file("app.pdb");
+    testpdb::write_file(pdb, testpdb::build(w.spec));
+    const std::string exe = dir.file("app.exe");
+    testpdb::write_file(exe, testpdb::build_pe(kGuid, 5, "C:\\build\\app.pdb"));
+
+    ModuleIndexSpec spec;
+    spec.module_path = exe;
+    spec.pdb_path = pdb;
+    std::shared_ptr<ModuleIndex> index = ModuleIndex::start(spec);
+    REQUIRE(index->wait(30000));
+    REQUIRE(index->status().state == IndexState::Ready);
+    CHECK(index->scanned_headers() >= 1);
+
+    const std::string header = pdb::normalize_path(dir.file("inc\\dep.h"));
+    const std::vector<std::string> tracked = index->tracked_files();
+    CHECK(std::find(tracked.begin(), tracked.end(), header) != tracked.end());
+    // ... so its directory is one of the watched roots.
+    const std::vector<watch::WatchRoot> roots = watch::plan_watch_roots(tracked);
+    bool watched = false;
+    for (const watch::WatchRoot& r : roots) {
+        watched = watched || r.directory == pdb::normalize_path(dir.file("inc"));
+    }
+    CHECK(watched);
+}
+#endif
