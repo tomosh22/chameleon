@@ -83,7 +83,9 @@ TEST_CASE("quote_argument follows the CommandLineToArgvW rules") {
     CHECK(quote_argument("plain") == "plain");
     CHECK(quote_argument("") == "\"\"");
     CHECK(quote_argument("a b") == "\"a b\"");
-    CHECK(quote_argument(R"(C:\dir with space\)") == R"("C:\dir with space\\")");
+    const std::string trailing = "C:\\dir with space\\";
+    const std::string trailing_quoted = "\"C:\\dir with space\\\\\"";
+    CHECK(quote_argument(trailing) == trailing_quoted);
     const std::string said = "say \"hi\"";
     const std::string said_quoted = "\"say \\\"hi\\\"\"";
     CHECK(quote_argument(said) == said_quoted);
