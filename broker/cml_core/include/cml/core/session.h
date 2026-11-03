@@ -34,6 +34,9 @@ public:
     Session(std::uint64_t agent_id, std::string broker_version);
 
     void set_answer_sink(AnswerSink sink) { answer_sink_ = std::move(sink); }
+    // WP-20: the agent reports a thread it holds after a fault in an enabled module (Exception, an event nobody answers).
+    using ExceptionSink = std::function<void(const ipc::Exception& exception)>;
+    void set_exception_sink(ExceptionSink sink) { exception_sink_ = std::move(sink); }
     // Answers that no sink consumed (unknown request id, or no sink): counted for tests and diagnostics.
     std::uint64_t ignored_answers() const noexcept { return ignored_answers_; }
     ipc::AgentMode mode() const noexcept { return mode_; }
@@ -73,6 +76,7 @@ private:
     std::uint32_t pid_ = 0;
     ipc::AgentMode mode_ = ipc::AgentMode::Immediate;
     AnswerSink answer_sink_;
+    ExceptionSink exception_sink_;
     std::uint64_t ignored_answers_ = 0;
     std::string agent_path_;
     std::string command_line_;

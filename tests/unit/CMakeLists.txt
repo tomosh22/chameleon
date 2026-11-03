@@ -105,6 +105,8 @@ cml_add_unit_test(broker_core
         broker/test_audit.cpp
         # WP-14: compile on save
         broker/test_save_watcher.cpp
+        # WP-20: crash -> patch -> continue (broker side)
+        broker/test_exceptions.cpp
     LIBS cml_core)
 add_subdirectory(bind)  # WP-07: unit.bind
 if(NOT MSVC)
