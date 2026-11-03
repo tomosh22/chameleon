@@ -27,22 +27,6 @@ std::string lower_slashes(std::string_view path) {
     return out;
 }
 
-bool stat_of(const std::string& path, std::uint64_t* size, long long* mtime) {
-    std::error_code ec;
-    const fs::path p(path);
-    const std::uintmax_t s = fs::file_size(p, ec);
-    if (ec) {
-        return false;
-    }
-    const fs::file_time_type t = fs::last_write_time(p, ec);
-    if (ec) {
-        return false;
-    }
-    *size = static_cast<std::uint64_t>(s);
-    *mtime = static_cast<long long>(t.time_since_epoch().count());
-    return true;
-}
-
 bool hash_of(const std::string& path, std::uint64_t* hash) {
     std::ifstream in(path, std::ios::binary);
     if (!in) {
@@ -57,6 +41,22 @@ bool hash_of(const std::string& path, std::uint64_t* hash) {
 }
 
 }  // namespace
+
+bool stat_file(const std::string& path, std::uint64_t* size, long long* mtime) {
+    std::error_code ec;
+    const fs::path p(path);
+    const std::uintmax_t s = fs::file_size(p, ec);
+    if (ec) {
+        return false;
+    }
+    const fs::file_time_type t = fs::last_write_time(p, ec);
+    if (ec) {
+        return false;
+    }
+    *size = static_cast<std::uint64_t>(s);
+    *mtime = static_cast<long long>(t.time_since_epoch().count());
+    return true;
+}
 
 bool is_system_path(std::string_view path) {
     static const char* const kFragments[] = {
@@ -76,7 +76,7 @@ bool is_system_path(std::string_view path) {
 
 bool stamp_file(const std::string& path, FileStamp* out) {
     FileStamp s;
-    if (!stat_of(path, &s.size, &s.mtime) || !hash_of(path, &s.hash)) {
+    if (!stat_file(path, &s.size, &s.mtime) || !hash_of(path, &s.hash)) {
         return false;
     }
     *out = s;
@@ -128,7 +128,7 @@ SourceBaseline::SweepResult SourceBaseline::sweep() const {
         ++out.checked;
         std::uint64_t size = 0;
         long long mtime = 0;
-        if (!stat_of(entry.first, &size, &mtime)) {
+        if (!stat_file(entry.first, &size, &mtime)) {
             out.missing.push_back(entry.first);
             continue;
         }

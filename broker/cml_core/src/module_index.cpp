@@ -55,6 +55,11 @@ bool ModuleIndex::wait(std::uint32_t timeout_ms) const {
     });
 }
 
+std::optional<ModuleAudit> ModuleIndex::audit() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return audit_;
+}
+
 std::shared_ptr<const pdb::PdbIndex> ModuleIndex::pdb() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return pdb_;
@@ -100,6 +105,11 @@ Result<std::shared_ptr<const pdb::PdbIndex>> ModuleIndex::acquire_pdb() {
         return reopened.error();
     }
     std::lock_guard<std::mutex> lock(mutex_);
+    if (status_.state == IndexState::Failed) {
+        // The index failed while we were mapping: do not keep the mapping alive (ADR-0017).
+        return status_.error ? *status_.error
+                             : Diag::make(pipeline::diag::kIndexUnavailable, "the PDB index of '" + spec_.module_path + "' failed to load", "See the broker log.");
+    }
     if (!pdb_) {
         pdb_ = *reopened;
     }
@@ -117,7 +127,7 @@ bool ModuleIndex::is_source_compiland(const pdb::PdbIndex& index, std::uint32_t 
     return c.object_name.substr(0, 7) != "Import:" && c.object_name.front() != '*';
 }
 
-void ModuleIndex::set_status(IndexState state, std::uint32_t percent, std::string phase, std::optional<Diag> error) {
+void ModuleIndex::set_status(IndexState state, std::uint32_t percent, std::string phase, std::optional<Diag> error, bool drop_pdb) {
     IndexStatus snapshot;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -125,6 +135,9 @@ void ModuleIndex::set_status(IndexState state, std::uint32_t percent, std::strin
         status_.percent = percent;
         status_.phase = std::move(phase);
         status_.error = std::move(error);
+        if (drop_pdb) {
+            pdb_.reset();  // in the same critical section as the state change: acquire_pdb() sees Failed or a mapped pdb_, never a gap
+        }
         snapshot = status_;
     }
     changed_.notify_all();
@@ -151,6 +164,40 @@ void ModuleIndex::run() {
     }
     if (cancel_.load(std::memory_order_acquire)) {
         return;
+    }
+    if (spec_.audit) {
+        set_status(IndexState::Loading, 20, "checking the build requirements");
+        ModuleAudit audit = audit_opened_module(spec_.module_path, *index);
+        if (cancel_.load(std::memory_order_acquire)) {
+            return;  // the module was disabled meanwhile: no diagnostics, no Failed state
+        }
+        for (const AuditFinding& f : audit.findings) {
+            if (f.verdict == Verdict::Fail) {
+                CML_LOG(Error, "index: %s", f.diag().format().c_str());
+            } else if (f.verdict == Verdict::Warn) {
+                CML_LOG(Warn, "index: %s", f.diag().format().c_str());
+            }
+        }
+        const AuditFinding* failure = audit.first_failure();
+        std::optional<Diag> failure_diag;
+        if (failure != nullptr) {
+            failure_diag = failure->diag();
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            audit_ = audit;
+        }
+        if (spec_.on_audit) {
+            spec_.on_audit(audit);
+        }
+        if (cancel_.load(std::memory_order_acquire)) {
+            return;
+        }
+        if (failure_diag) {
+            // ADR-0017: a module that cannot be enabled must not keep its PDB mapped. State and release are one step.
+            set_status(IndexState::Failed, 0, "build requirements not met", failure_diag, /*drop_pdb=*/true);
+            return;
+        }
     }
     set_status(IndexState::Loading, 30, "reading the file lists");
     std::set<std::string> files;

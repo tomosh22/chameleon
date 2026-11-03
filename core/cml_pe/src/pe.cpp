@@ -29,7 +29,7 @@ std::uint32_t rd16(ByteSpan b, std::size_t o) noexcept {
     return rd8(b, o) | (rd8(b, o + 1) << 8);
 }
 std::uint32_t rd32(ByteSpan b, std::size_t o) noexcept {
-    return rd16(b, o) | (rd16(b, o + 2) << 16);
+    return read_u32_le(b, o);
 }
 std::uint64_t rd64(ByteSpan b, std::size_t o) noexcept {
     return static_cast<std::uint64_t>(rd32(b, o)) | (static_cast<std::uint64_t>(rd32(b, o + 4)) << 32);

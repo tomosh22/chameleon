@@ -157,7 +157,7 @@ private:
     friend struct IndexBuilder;
 };
 
-// ---- PE support (private to cml_pdb until cml_pe from WP-02 is available) --------------------
+// ---- PE support: the CodeView (RSDS) record of an image, read with cml_pe (FU-05, WP-18) -------
 Result<CodeViewRef> read_codeview_ref(const std::string& pe_path);
 Result<CodeViewRef> read_codeview_ref_from_image(const void* data, std::size_t size);
 

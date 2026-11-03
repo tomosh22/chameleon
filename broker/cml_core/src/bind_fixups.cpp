@@ -5,16 +5,12 @@
 
 #include "cml/core/bind_diag_ids.h"
 #include "cml/core/bind_plan.h"
+#include "cml/util/format.h"
 #include "cml/util/log.h"
 
 namespace cml::core::bind {
 
 namespace {
-std::string hex(std::uint64_t v) {
-    char buf[32];
-    std::snprintf(buf, sizeof buf, "0x%llx", static_cast<unsigned long long>(v));
-    return buf;
-}
 }  // namespace
 
 Result<std::vector<FixupTriple>> make_fixup_triples(const BindPlan& plan, const PatchLayout& layout) {

@@ -15,11 +15,13 @@
 #include "cml/coff/writer.h"
 #include "cml/core/bind_diag_ids.h"
 #include "cml/core/bind_plan.h"
+#include "cml/core/module_audit.h"
 #include "cml/core/header_diag_ids.h"
 #include "cml/core/patch_image.h"
 #include "cml/core/pipeline_diag_ids.h"
 #include "cml/toolchain/rewrite.h"
 #include "cml/util/hash.h"
+#include "cml/util/format.h"
 #include "cml/util/log.h"
 #include "cml/util/path.h"
 
@@ -160,12 +162,6 @@ public:
 private:
     Clock::time_point t_;
 };
-
-std::string hex(std::uint64_t v) {
-    char buf[32];
-    std::snprintf(buf, sizeof buf, "0x%llx", static_cast<unsigned long long>(v));
-    return buf;
-}
 
 // The id of a refusal by the agent: its own diagnostic number when it is a valid one (CML42xx, CML43xx, ...),
 // otherwise CML5307/CML5308.
@@ -627,6 +623,18 @@ private:
                 if (seen.insert(h.old_va).second) {
                     hooks.push_back(h);
                 }
+            }
+        }
+        // WP-18, CML3104: a changed small function of an optimised compiland may be inlined into its callers (one warning per compiland).
+        {
+            std::vector<std::string> small_changed;  // one warning per compiland, naming the small functions
+            for (const bind::HookEntry& h : hooks) {
+                if (h.old_size != 0 && h.old_size <= kSmallFunctionBytes) {
+                    small_changed.push_back(h.display);
+                }
+            }
+            if (std::optional<Diag> stale = stale_inline_warning(pdb, u.compiland, small_changed, module_.name)) {
+                warn(report, "plan", std::move(*stale));
             }
         }
         const bool has_effect = !hooks.empty() || !plan.new_functions.empty() || !plan.new_globals.empty() || !plan.initialisers.empty();

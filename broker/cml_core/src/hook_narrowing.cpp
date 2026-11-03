@@ -6,6 +6,7 @@
 #include <optional>
 #include <unordered_map>
 
+#include "cml/util/format.h"
 #include "cml/util/log.h"
 
 namespace cml::core {
@@ -29,12 +30,6 @@ const char* to_string(NarrowReason reason) noexcept {
 namespace {
 
 constexpr std::uint64_t kMaxConstantBytes = 64 * 1024;  // larger constants are not compared: the function is kept
-
-std::string hex(std::uint64_t v) {
-    char buf[32];
-    std::snprintf(buf, sizeof buf, "0x%llx", static_cast<unsigned long long>(v));
-    return buf;
-}
 
 // Width in bytes of the field a relocation of this type patches; 0 = a type this check cannot judge.
 std::uint32_t reloc_width(coff::RelocType type) {

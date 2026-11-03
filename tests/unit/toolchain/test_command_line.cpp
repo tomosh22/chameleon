@@ -193,3 +193,41 @@ TEST_CASE("response files: real cycles, limits") {
         REQUIRE_FALSE(plain);
     }
 }
+
+// FU-04 (WP-18): the response-file writer (quote_argument / join_command_line) against BOTH Windows parsers. Every argument
+// over the alphabet {a, space, tab, quote, backslash} up to length 6, between two others, must come back unchanged; `""` is
+// never written inside a quoted region, so the two parsers' different reading of it cannot matter.
+TEST_CASE("FU-04: quote_argument round-trips every short argument through the CRT parser and CommandLineToArgvW") {
+    const char alphabet[] = {'a', ' ', '\t', '"', '\\'};
+    std::vector<std::string> all = {""};
+    std::vector<std::string> layer = {""};
+    for (int length = 1; length <= 6; ++length) {
+        std::vector<std::string> next;
+        for (const std::string& prefix : layer) {
+            for (const char c : alphabet) {
+                next.push_back(prefix + c);
+            }
+        }
+        all.insert(all.end(), next.begin(), next.end());
+        layer = std::move(next);
+    }
+    std::size_t failures = 0;
+    for (const std::string& arg : all) {
+        const Tokens line = {"first", arg, "last"};
+        const std::string text = join_command_line(line);
+        for (const QuoteMode mode : {QuoteMode::Crt, QuoteMode::ShellArgv}) {
+            if (split_command_line(text, mode) != line) {
+                if (++failures <= 5) {
+                    MESSAGE("does not round-trip (mode " << (mode == QuoteMode::Crt ? "crt" : "argv") << "): [" << arg << "] -> [" << text << "]");
+                }
+            }
+        }
+        // a response file holds one argument per line: the CRLF-separated form reads back the same
+        const std::string lines = quote_argument(arg) + "\r\n";
+        if (split_command_line(lines) != Tokens{arg}) {
+            ++failures;
+        }
+    }
+    CHECK(failures == 0);
+    CHECK(all.size() > 15000);
+}

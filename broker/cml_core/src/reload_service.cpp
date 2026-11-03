@@ -235,6 +235,20 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
                 CML_LOG(Debug, "index of %s: %s %u%% (%s)", name.c_str(), to_string(s.state), s.percent, s.phase.c_str());
             }
         };
+        // WP-18: the build requirements (the same audit as `cml_broker check`). Warnings and failures are published as
+        // diag events (stage "enable"); a failure also fails the index, so a reload names it.
+        spec.audit = true;
+        if (events_ != nullptr) {
+            EventBus* bus = events_;
+            const std::uint32_t pid = snap.pid;
+            spec.on_audit = [bus, pid](const ModuleAudit& audit) {
+                for (const AuditFinding& f : audit.findings) {
+                    if (f.verdict != Verdict::Pass) {
+                        bus->publish(make_diag_event(f.diag(), f.verdict == Verdict::Fail ? "error" : "warning", "enable", pid));
+                    }
+                }
+            };
+        }
         CML_LOG(Info, "module %s enabled in process %u: loading its PDB index", state->name.c_str(), snap.pid);
         {
             std::shared_ptr<ModuleIndex> index = ModuleIndex::start(std::move(spec));

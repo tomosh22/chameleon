@@ -143,7 +143,10 @@ struct LinkOutputSummary {
     std::vector<std::string> warnings;           // one per warning line
     std::vector<std::string> unresolved;         // symbol names of LNK2001/LNK2019 and "undefined symbol:"
 };
-LinkOutputSummary summarize_link_output(std::string_view output);
+// lld prefixes its diagnostics with the stem of argv[0] ("lld-link: error: ...", "lld-link-18: error: ..." for a versioned binary):
+// a line that starts with a word beginning "lld-link", or equal to linker_stem (the configured linker's file name without its
+// extension; may be empty), followed by ": error:" or ": warning:" counts.
+LinkOutputSummary summarize_link_output(std::string_view output, std::string_view linker_stem = {});
 
 // ---- 3. the linked patch ----------------------------------------------------------------------------------
 

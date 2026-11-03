@@ -26,6 +26,7 @@
 #include <thread>
 #include <vector>
 
+#include "cml/core/module_audit.h"
 #include "cml/core/source_baseline.h"
 #include "cml/pdb/index.h"
 #include "cml/util/result.h"
@@ -54,6 +55,10 @@ struct ModuleIndexSpec {
     BaselineOptions baseline;      // progress / cancelled are set by the index itself
     // Called from the worker thread on every state or phase change (after the status was updated).
     std::function<void(const IndexStatus&)> on_change;
+    // WP-18: audit the module against the build requirements (module_audit.h) once its PDB is open. A FAIL finding fails
+    // the index with that finding's diagnostic (the PDB is released); `on_audit` hears every audit (worker thread).
+    bool audit = false;
+    std::function<void(const ModuleAudit&)> on_audit;
 };
 
 class ModuleIndex {
@@ -75,6 +80,8 @@ public:
     void release_pdb();
 
     const std::string& module_path() const noexcept { return spec_.module_path; }
+    // The enable-time audit (spec.audit); nullopt before it ran or when it was not asked for.
+    std::optional<ModuleAudit> audit() const;
 
     // WP-15: the include graph scanned when the index was built (IncludeScanner): number of headers with at least
     // one compiland that includes them, and whether a file is part of a precompiled header.
@@ -114,13 +121,14 @@ public:
 private:
     explicit ModuleIndex(ModuleIndexSpec spec);
     void run();
-    void set_status(IndexState state, std::uint32_t percent, std::string phase, std::optional<Diag> error = std::nullopt);
+    void set_status(IndexState state, std::uint32_t percent, std::string phase, std::optional<Diag> error = std::nullopt, bool drop_pdb = false);
     Result<std::shared_ptr<const pdb::PdbIndex>> open_pdb();
 
     ModuleIndexSpec spec_;
     mutable std::mutex mutex_;
     mutable std::condition_variable changed_;
     IndexStatus status_;
+    std::optional<ModuleAudit> audit_;
     std::shared_ptr<const pdb::PdbIndex> pdb_;
     SourceBaseline baseline_;
     std::function<Result<Sweep>()> sweep_override_;                       // guarded by mutex_
