@@ -171,6 +171,42 @@ TEST_CASE("stop() cancels 800 open requests for every waiter and keeps the answe
     CHECK(CML_STATUS_QUEUE_FULL == static_cast<cml_status>(kQueueFull));
 }
 
+TEST_CASE("FU-02: an answer nobody collected for the idle time is dropped; a tracked module stays tracked") {
+    Agent agent(CML_MODE_IMMEDIATE);
+    std::uint64_t id = 0;
+    REQUIRE(agent.enable_module(L"idle_old.dll", 0, &id) == CML_STATUS_OK);
+    agent.complete_for_testing(id, 0, "ok");
+    const std::uint64_t t0 = GetTickCount64();
+    REQUIRE(agent.done_answers_for_testing() == 1);
+    // Not idle for long enough yet: nothing is dropped.
+    CHECK(agent.trim_idle_answers_for_testing(t0 + Agent::kAnswerIdleMs - 5000) == 0);
+    CHECK(agent.done_answers_for_testing() == 1);
+    // Idle for longer than the limit: dropped, and its id is unknown from now on.
+    CHECK(agent.trim_idle_answers_for_testing(t0 + Agent::kAnswerIdleMs + 5000) == 1);
+    CHECK(agent.done_answers_for_testing() == 0);
+    cml_reply reply{};
+    CHECK(agent.wait_request(id, 0, &reply) == CML_STATUS_UNKNOWN_REQUEST);
+    // The tracked set is not the answer table: the module is still tracked for re-enabling.
+    CHECK(agent.tracked_modules_for_testing() == 1);
+    agent.stop();
+}
+
+TEST_CASE("FU-02: an answer somebody is waiting for is never trimmed") {
+    Agent agent(CML_MODE_IMMEDIATE);
+    std::uint64_t id = 0;
+    REQUIRE(agent.enable_module(L"idle_waited.dll", 0, &id) == CML_STATUS_OK);
+    cml_reply reply{};
+    std::atomic<cml_status> status{CML_STATUS_TIMEOUT};
+    std::thread waiter([&] { status = agent.wait_request(id, 20000, &reply); });
+    REQUIRE(wait_for_waiters(agent, 1));
+    agent.complete_for_testing(id, 0, "ok");
+    // The waiter may or may not have collected it yet; either way the trim must not take it from under the waiter.
+    agent.trim_idle_answers_for_testing(GetTickCount64() + Agent::kAnswerIdleMs + 5000);
+    waiter.join();
+    CHECK(status.load() == CML_STATUS_OK);
+    agent.stop();
+}
+
 TEST_CASE("an enabled module stays tracked however many answers were dropped") {
     Agent agent(CML_MODE_IMMEDIATE);
     // 600 enables answered "ok" and never collected: the tracked set is not the answer table, so

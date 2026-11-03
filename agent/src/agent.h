@@ -106,6 +106,11 @@ public:
     void complete_for_testing(std::uint64_t request_id, std::uint32_t status, const std::string& text);
     std::size_t waiters_for_testing();
     std::size_t tracked_modules_for_testing();
+    // FU-02 test hooks: trim as if it were `now_ms` (GetTickCount64 scale); the number of Done answers kept.
+    std::size_t trim_idle_answers_for_testing(std::uint64_t now_ms);
+    std::size_t done_answers_for_testing();
+    // How long an answer may wait to be collected before the agent drops it (ms).
+    static constexpr std::uint64_t kAnswerIdleMs = 10ull * 60ull * 1000ull;
     std::size_t active_calls_for_testing() const noexcept { return static_cast<std::size_t>(active_calls_.load()); }
 
 private:
@@ -118,6 +123,8 @@ private:
     //  I4. done_order_ lists exactly the Done entries, oldest first. Only a Done entry with
     //      waiters == 0 may be evicted (oldest first, beyond kMaxUnconsumedAnswers); an entry with a
     //      thread inside wait_request is never evicted, nor is anything while stop() cancels.
+    //  I4b. A Done entry with waiters == 0 that nobody collected for kAnswerIdleMs is dropped (idle trimming; it runs
+    //      with every module poll and every new answer, never while stop() cancels). Its id is then UNKNOWN_REQUEST.
     //  I5. Internal entries and entries created without a request id are erased when they finish.
     //  I6. A lost connection fails Sent entries but never changes the enabled-module set.
     enum class State { Queued, Sent, Done };
@@ -132,6 +139,7 @@ private:
         ipc::Message message;
         std::uint32_t status = 0;  // valid when Done
         std::string text;          // valid when Done
+        std::uint64_t done_at_ms = 0;  // GetTickCount64() when it became Done (idle trimming, FU-02)
     };
 
     // Agent thread -------------------------------------------------------------------------
@@ -181,6 +189,9 @@ private:
     void finish_locked(std::map<std::uint64_t, Entry>::iterator it, std::uint32_t status, const char* text,
                        bool answered_by_broker, bool evict);
     void evict_oldest_answers_locked();
+    // FU-02: drops Done answers nobody collected for kAnswerIdleMs (waiters == 0 only). done_order_ is oldest first,
+    // so the scan stops at the first answer that is still young. Returns how many were dropped.
+    std::size_t trim_idle_answers_locked(std::uint64_t now_ms);
     void queue_reenables(bool only_flagged);
     void note_list_accepted();
     void erase_done_locked(std::uint64_t id);

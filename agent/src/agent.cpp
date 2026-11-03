@@ -670,6 +670,13 @@ bool Agent::flush_logs(ipc::PipeConnection& connection) {
 
 bool Agent::poll_modules(ipc::PipeConnection& connection) {
     last_module_poll_ = GetTickCount64();
+    {
+        // FU-02: answers nobody collected for a long time (a fire-and-forget caller that did pass a request id).
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!stopping_.load(std::memory_order_acquire)) {
+            trim_idle_answers_locked(last_module_poll_);
+        }
+    }
     if (full_list_pending_ && GetTickCount64() >= full_list_not_before_) {
         return send_module_list(connection);  // the broker refused (or we could not build) the last full list
     }
@@ -761,10 +768,44 @@ void Agent::finish_locked(std::map<std::uint64_t, Entry>::iterator it, std::uint
     entry.state = State::Done;
     entry.status = status;
     entry.text = text;
+    entry.done_at_ms = GetTickCount64();
     done_order_.push_back(it->first);
     if (evict) {
         evict_oldest_answers_locked();
+        trim_idle_answers_locked(GetTickCount64());
     }
+}
+
+std::size_t Agent::trim_idle_answers_locked(std::uint64_t now_ms) {
+    std::size_t dropped = 0;
+    for (auto candidate = done_order_.begin(); candidate != done_order_.end();) {
+        const auto entry = entries_.find(*candidate);
+        if (entry == entries_.end()) {
+            candidate = done_order_.erase(candidate);  // (not expected: keeps I4 true)
+            continue;
+        }
+        if (now_ms < entry->second.done_at_ms || now_ms - entry->second.done_at_ms < kAnswerIdleMs) {
+            break;  // oldest first: everything behind this one is younger
+        }
+        if (entry->second.waiters > 0) {
+            ++candidate;  // someone is about to collect it
+            continue;
+        }
+        entries_.erase(entry);
+        candidate = done_order_.erase(candidate);
+        ++dropped;
+    }
+    return dropped;
+}
+
+std::size_t Agent::trim_idle_answers_for_testing(std::uint64_t now_ms) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return trim_idle_answers_locked(now_ms);
+}
+
+std::size_t Agent::done_answers_for_testing() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return done_order_.size();
 }
 
 void Agent::evict_oldest_answers_locked() {
