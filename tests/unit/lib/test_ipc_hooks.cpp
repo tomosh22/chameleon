@@ -88,6 +88,13 @@ TEST_CASE("InstallHooks and HooksInstalled round-trip") {
         CHECK(std::get<InstallHooks>(round_trip(in)).flags == kInstallHooksRevert);
         CHECK(std::get<InstallHooks>(round_trip(InstallHooks{})).hooks.empty());
     }
+    SUBCASE("InstallHooks with the quiet flag (WP-22), alone and with revert") {
+        InstallHooks in = sample_install_hooks();
+        in.flags = kInstallHooksQuiet;
+        CHECK(std::get<InstallHooks>(round_trip(in)).flags == kInstallHooksQuiet);
+        in.flags = kInstallHooksQuiet | kInstallHooksRevert;
+        CHECK(std::get<InstallHooks>(round_trip(in)).flags == (kInstallHooksQuiet | kInstallHooksRevert));
+    }
     SUBCASE("HooksInstalled") {
         const auto in = sample_hooks_installed();
         const auto out = std::get<HooksInstalled>(round_trip(in));

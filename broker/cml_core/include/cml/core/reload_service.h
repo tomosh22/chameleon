@@ -40,6 +40,29 @@ namespace cml::core {
 class ProcessHost;
 class RestartCoordinator;
 
+// One reload or revert at a time (WP-12, WP-22): takes the lock without waiting and, while held, shows the service as running
+// (`wait idle` waits for it).
+class ExclusiveRun {
+public:
+    ExclusiveRun(std::mutex& mutex, std::atomic<bool>& running) : lock_(mutex, std::try_to_lock), running_(running) {
+        if (lock_.owns_lock()) {
+            running_.store(true);
+        }
+    }
+    ~ExclusiveRun() {
+        if (lock_.owns_lock()) {
+            running_.store(false);
+        }
+    }
+    ExclusiveRun(const ExclusiveRun&) = delete;
+    ExclusiveRun& operator=(const ExclusiveRun&) = delete;
+    bool acquired() const { return lock_.owns_lock(); }
+
+private:
+    std::unique_lock<std::mutex> lock_;
+    std::atomic<bool>& running_;
+};
+
 class ReloadService {
 public:
     // `session_dir`: base directory for objects, patch DLLs and PDBs ("" = a new directory under the system
@@ -57,6 +80,10 @@ public:
     // ---- control commands (args are the request's "args" object) ----
     // {"pid"?:N, "module"?:"name or path", "timeout_ms"?:N, "confirm"?:bool}
     Result<ipc::json::Value> reload(const ipc::json::Value& args);
+    // WP-22: {"pid"?:N, "module"?:"name or path", "scope"?:"last"|"all", "timeout_ms"?:N}   (`last`: the newest reload)
+    //   -> {"reverted":[{"pid","module","generation","batches","patches","hooks_restored","hooks_repointed"}],"generation":N}
+    //   plus, when only some modules could be reverted, "partial":true and "failed":[{"pid","module","id","message"}] (CML5854)
+    Result<ipc::json::Value> revert(const ipc::json::Value& args);
     // {"for"?:"idle"|"index", "timeout_ms"?:N}
     Result<ipc::json::Value> wait(const ipc::json::Value& args);
     // {"name":s, "value":s|n|b}
@@ -102,7 +129,7 @@ public:
     std::shared_ptr<AgentLink> link_for_restart_token(const std::string& token, std::uint32_t pid) const;
     // Holds off every reload (they are refused busy, CML5304) for as long as the returned lock lives. Not owned when a
     // reload is running. A restart calls reload_locked() meanwhile.
-    std::unique_lock<std::mutex> lock_reloads();
+    std::unique_ptr<ExclusiveRun> lock_reloads();
     Result<ipc::json::Value> reload_locked(const ipc::json::Value& args);
     std::vector<std::shared_ptr<ModuleState>> module_states(std::uint64_t agent_id) const;
 
@@ -150,6 +177,7 @@ private:
     std::mutex reload_mutex_;  // one reload at a time
     std::atomic<bool> running_{false};
     std::atomic<std::uint64_t> generation_{0};
+    std::atomic<std::uint64_t> reload_counter_{0};  // WP-22: numbers the reload commands (PatchBatch::reload_id)
 };
 
 }  // namespace cml::core

@@ -153,8 +153,8 @@ Result<Value> RestartCoordinator::restart(const Value& args) {
     // Reloads are held off for the whole restart: a patch applied to the old process after its baseline was taken would be lost in
     // the new one. A reload that is running now makes this restart busy; one that arrives meanwhile is refused busy (CML5304).
     std::unique_lock<std::mutex> only_one(mutex_, std::try_to_lock);
-    std::unique_lock<std::mutex> no_reloads = service_.lock_reloads();
-    if (!only_one.owns_lock() || !no_reloads.owns_lock()) {
+    std::unique_ptr<ExclusiveRun> no_reloads = service_.lock_reloads();  // the run lock of reloads and reverts (shows as running)
+    if (!only_one.owns_lock() || !no_reloads) {
         return fail(Diag::make(rd::kBusy, "another restart or a reload is still running", "Wait for it to finish (control command `wait`) and try again."), pid);
     }
 
@@ -412,7 +412,7 @@ Result<Value> RestartCoordinator::restart(const Value& args) {
         // ---- 5. the edits of the session: the baseline goes back to the original binary's sources ----
         for (const Carried& c : carried) {
             if (path::same_path(c.path, full)) {
-                restored += index->restore_baseline(c.baseline);
+                restored += index->restore_session_baseline(c.baseline);
             }
         }
     }

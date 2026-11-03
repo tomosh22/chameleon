@@ -1,0 +1,112 @@
+# Scenario `revert` (WP-22): revert the last reload, then every reload, without unloading anything.
+#
+# fixture revert: value A=1. Edit + reload -> B=2 (patch 1 adds the new function revert_helper). Edit + reload -> C=3
+# (patch 2 binds to patch 1's helper and hooks compute_value a second time). `revert last` puts patch 1's jump back: TICK
+# shows B again (LIFO: the previous patch becomes live, not the original code). `revert all` restores the original bytes:
+# TICK shows A. A last reload must recompile the file (the sources stay edited on disk; the broker's baseline went back)
+# and must not bind to patch 1's helper (the registry forgot it): TICK shows C again. The program keeps ticking throughout.
+name = "revert"
+description = "fixture revert: 1 -> reload 2 -> reload 3 -> revert last (2) -> revert all (1) -> reload (3)"
+fixture = "revert"
+timeout_s = 300
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1\\b"
+within_s = 15
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_revert.exe"
+within_s = 15
+
+[[step]]
+kind = "edit"
+patch = "edits/to_b.edit"
+
+[[step]]
+kind = "reload"
+within_s = 90
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2\\b"
+within_s = 10
+
+[[step]]
+kind = "edit"
+patch = "edits/stacked/to_c.edit"
+
+[[step]]
+kind = "reload"
+within_s = 90
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=3\\b"
+within_s = 10
+
+# The newest reload goes: patch 1's code is live again.
+[[step]]
+kind = "revert"
+scope = "last"
+
+[[step]]
+kind = "expect_event"
+event = "patch_reverted"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2\\b"
+within_s = 10
+
+# Keeps running on the previous patch.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2\\b"
+within_s = 10
+
+# Everything goes: the original bytes are back.
+[[step]]
+kind = "revert"
+scope = "all"
+
+[[step]]
+kind = "expect_event"
+event = "patch_reverted"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1\\b"
+within_s = 10
+
+# Nothing is left to revert.
+[[step]]
+kind = "revert"
+scope = "all"
+expect_error = "CML5850"
+
+# The edited file differs from the live code: the next reload recompiles it and the new code shows.
+[[step]]
+kind = "reload"
+within_s = 90
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=3\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=3\\b"
+within_s = 10

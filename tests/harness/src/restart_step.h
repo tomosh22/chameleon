@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "scenario.h"
 #include "toml.h"
@@ -40,7 +41,8 @@ struct RestartStepOutcome {
 #if defined(_WIN32)
 // Runs the step against the broker behind `control` for the process `old_pid`. `limit_ms` is what is left of the step's
 // time (and of the scenario's).
-RestartStepOutcome run_restart_step(cml::ipc::ControlClient& control, std::uint32_t old_pid, const Step& step, std::uint32_t limit_ms);
+RestartStepOutcome run_restart_step(cml::ipc::ControlClient& control, const std::vector<std::string>& capabilities, std::uint32_t old_pid,
+                                    const Step& step, std::uint32_t limit_ms);
 #endif
 
 }  // namespace cmltest

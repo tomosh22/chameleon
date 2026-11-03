@@ -21,6 +21,8 @@
 #include "exception_steps.h"
 #include "fixture_builder.h"
 #include "restart_step.h"
+#include "revert_step.h"
+#include "subscription.h"
 #include "rx.h"
 #include "supervisor.h"
 #include "ticks.h"
@@ -251,6 +253,7 @@ private:
             case StepKind::SignalFixture: return signal_fixture();
             case StepKind::ExpectReloadResult: return expect_reload_result(step);
             case StepKind::Restart: return restart_process(step);
+            case StepKind::Revert: return revert(step);
             case StepKind::WatchExceptions: return from_exception(exception_steps_.watch(*control_, kControlTimeoutMs));
             case StepKind::ExpectException: {
                 const std::uint32_t limit_ms = std::min<std::uint32_t>(static_cast<std::uint32_t>(step.within_s) * 1000u, remaining_ms());
@@ -363,7 +366,7 @@ private:
         if (status->has_capability(ipc::capability::kSubscribe)) {
             ipc::json::Value args = ipc::json::Value::object();
             ipc::json::Value events = ipc::json::Value::array();
-            for (const char* e : {"diag", "patch_applied", "log"}) {
+            for (const std::string& e : subscription_events(capabilities_)) {
                 events.push(ipc::json::Value::string(e));
             }
             args.set("events", std::move(events));
@@ -646,7 +649,7 @@ private:
         }
         proc->cursor = read_whole_file(proc->stdout_file).size();  // what the hooks and the new process print belongs to the restart
         const std::uint32_t old_pid = supervisor_.pid(proc->id);
-        const RestartStepOutcome restarted = run_restart_step(*control_, old_pid, step, limit_ms);
+        const RestartStepOutcome restarted = run_restart_step(*control_, capabilities_, old_pid, step, limit_ms);
         if (!restarted.ok) {
             return StepOutcome::fail(restarted.diag_code, restarted.detail);
         }
@@ -655,6 +658,22 @@ private:
             return StepOutcome::fail(followed.error());
         }
         return StepOutcome::pass(restarted.detail);
+    }
+
+    // WP-22: control command `revert` (the body is in revert_step.cpp).
+    StepOutcome revert(const Step& step) {
+        const std::uint32_t limit_ms = std::min<std::uint32_t>(static_cast<std::uint32_t>(step.within_s) * 1000u, remaining_ms());
+        if (limit_ms == 0) {
+            return scenario_timeout();
+        }
+        for (Proc& p : procs_) {  // output printed from now on belongs to the reverted program
+            p.cursor = read_whole_file(p.stdout_file).size();
+        }
+        const RevertStepResult result = run_revert_step(*control_, step, limit_ms);
+        if (!result.diag) {
+            return StepOutcome::pass(result.detail);
+        }
+        return StepOutcome::fail(*result.diag);
     }
 
     StepOutcome signal_fixture() {

@@ -111,6 +111,9 @@ TEST_CASE("WP-08 messages round-trip") {
         CHECK(out.base == in.base);
         CHECK(out.size == in.size);
         CHECK(out.mode == ReleaseMode::UnloadPatch);
+        in.mode = ReleaseMode::Uncommit;  // WP-22
+        CHECK(std::get<ReleaseRange>(round_trip(in)).mode == ReleaseMode::Uncommit);
+        CHECK(describe(Message(in)).find("uncommit") != std::string::npos);
     }
     SUBCASE("LoadPatch") {
         const LoadPatch in = sample_load_patch();
@@ -285,7 +288,7 @@ TEST_CASE("WP-08 malformed payloads are diagnosed") {
     SUBCASE("ReleaseRange: unknown mode") {
         ReleaseRange m;
         std::vector<std::uint8_t> frame = frame_bytes(m);
-        frame[kFrameHeaderSize + 24] = 2;
+        frame[kFrameHeaderSize + 24] = 3;  // 0 free, 1 unload-patch, 2 uncommit (WP-22)
         CHECK(error_code(decode_frame(frame.data(), frame.size())) == ids::kPayloadMalformed);
     }
     SUBCASE("every truncation of a LoadPatch is rejected, never read out of range") {

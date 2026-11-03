@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "cml/ipc/control_ids.h"
+#include "subscription.h"
 
 namespace cmltest {
 
@@ -75,15 +76,17 @@ RestartStepOutcome fail(std::uint32_t code, std::string detail) {
 
 }  // namespace
 
-RestartStepOutcome run_restart_step(ipc::ControlClient& control, std::uint32_t old_pid, const Step& step, std::uint32_t limit_ms) {
+RestartStepOutcome run_restart_step(ipc::ControlClient& control, const std::vector<std::string>& capabilities, std::uint32_t old_pid, const Step& step,
+                                    std::uint32_t limit_ms) {
     constexpr std::uint32_t kControlTimeoutMs = 15000;
     // The `restarted` event is opt-in: replace this connection's subscription (the runner's default set plus the event).
     {
         ipc::json::Value args = ipc::json::Value::object();
         ipc::json::Value events = ipc::json::Value::array();
-        for (const char* e : {"diag", "patch_applied", "log", "restarted"}) {
+        for (const std::string& e : subscription_events(capabilities)) {  // the runner's set (also what other capabilities add) ...
             events.push(ipc::json::Value::string(e));
         }
+        events.push(ipc::json::Value::string("restarted"));  // ... plus ours
         args.set("events", std::move(events));
         cml::Result<ipc::ControlResponse> subscribed = control.call("subscribe", std::move(args), kControlTimeoutMs);
         if (!subscribed) {

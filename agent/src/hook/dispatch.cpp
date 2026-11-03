@@ -86,6 +86,7 @@ void Agent::run_hook_job(void* context) {
 
 void Agent::apply_install_hooks(const ipc::InstallHooks& request) {
     const bool revert = (request.flags & ipc::kInstallHooksRevert) != 0;
+    const bool quiet = revert || (request.flags & ipc::kInstallHooksQuiet) != 0;  // WP-22: part of a patch revert
     const std::size_t count = request.hooks.size();
     CML_LOG(Info, "hooks: request %llu: %s %llu function(s)", static_cast<unsigned long long>(request.request_id),
             revert ? "revert" : "install", static_cast<unsigned long long>(count));
@@ -99,7 +100,7 @@ void Agent::apply_install_hooks(const ipc::InstallHooks& request) {
     // state down in the first rebuilds it in the second and asks cml_last_patch_status() how it went.
     // In immediate mode this is the agent thread: calls that would wait for the agent thread are refused for
     // the duration (Agent::HookThread).
-    const bool run_user_hooks = !revert && count != 0;
+    const bool run_user_hooks = !quiet && count != 0;
     std::unique_ptr<user_hooks::Session> session;
     if (run_user_hooks) {
         session.reset(new (std::nothrow) user_hooks::Session(enabled_module_paths()));
@@ -127,7 +128,7 @@ void Agent::apply_install_hooks(const ipc::InstallHooks& request) {
     const hook::BatchResult batch =
         revert ? installer.revert(specs.data(), count, outcomes) : installer.install(specs.data(), count, outcomes);
 
-    if (!revert) {
+    if (!quiet) {
         set_last_patch_status(static_cast<std::int32_t>(batch.diag.code));
     }
     if (session != nullptr) {

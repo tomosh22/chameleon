@@ -671,8 +671,8 @@ TEST_CASE("restart: reloads are refused busy while a restart runs, and the basel
 TEST_CASE("restart: a restart cannot start while a reload runs") {
     QuietLogs quiet;
     Rig rig;
-    std::unique_lock<std::mutex> running = rig.service.lock_reloads();  // what a running reload holds
-    REQUIRE(running.owns_lock());
+    std::unique_ptr<ExclusiveRun> running = rig.service.lock_reloads();  // what a running reload holds
+    REQUIRE(running != nullptr);
     Result<Value> result = rig.service.restart(args_for(100, 1000));
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().code == restart::diag::kBusy);
