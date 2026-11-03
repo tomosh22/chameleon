@@ -2,9 +2,8 @@
 # headless broker (with a control pipe), check its output and its registration with the broker,
 # patch the COPY of the sources and reload.
 #
-# The reload half needs the broker pipeline of WP-12. Until the broker advertises the `reload`
-# capability, cmltest reports `reload` and every later step as SKIPPED (not passed) and the run as
-# PARTIAL; WP-12 switches CI to --require-all-capabilities, which turns that into a failure.
+# The broker (WP-12) provides `reload`; CI runs every scenario with --require-all-capabilities, so a skipped
+# step would fail the run.
 name = "basic"
 description = "fixture basic: value=1 -> edit -> reload -> value=2"
 fixture = "basic"
@@ -33,6 +32,17 @@ patch = "edits/value_2.edit"
 [[step]]
 kind = "reload"
 within_s = 60
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2"
+within_s = 10
+
+# The patched program keeps ticking.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2"
+within_s = 10
 
 [[step]]
 kind = "expect_stdout"

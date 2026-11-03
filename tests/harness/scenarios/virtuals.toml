@@ -1,0 +1,42 @@
+# Scenario `virtuals`: objects created at startup keep working after the virtual override's body changed
+# (the vtables of the old objects still point at the old function, whose entry is hooked).
+name = "virtuals"
+description = "fixture virtuals: value=19 -> edit (Square::area doubled) -> reload -> value=28"
+fixture = "virtuals"
+timeout_s = 180
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=19 shapes=2"
+within_s = 15
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_virtuals.exe"
+within_s = 15
+
+[[step]]
+kind = "edit"
+patch = "edits/square_doubled.edit"
+
+[[step]]
+kind = "reload"
+within_s = 90
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=28 shapes=2"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=28 shapes=2"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=28 shapes=2"
+within_s = 10

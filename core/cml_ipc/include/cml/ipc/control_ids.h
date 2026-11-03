@@ -35,5 +35,7 @@ inline constexpr std::uint32_t kDumpFailed = 5423;              // crash dump co
 inline constexpr std::uint32_t kReloadFailed = 5424;            // reload command answered with an error
 inline constexpr std::uint32_t kCapabilitySkipped = 5425;       // steps skipped for a missing capability (failure under --require-all-capabilities)
 inline constexpr std::uint32_t kJunitWriteFailed = 5426;        // report file could not be written
+inline constexpr std::uint32_t kCounterNotMonotonic = 5427;     // expect_monotonic: counter reset, constant or too few samples (WP-12)
+inline constexpr std::uint32_t kResultMismatch = 5428;          // reload result field differs from the scenario's expectation (WP-12)
 
 }  // namespace cml::ids

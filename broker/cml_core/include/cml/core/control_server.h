@@ -2,20 +2,22 @@
 
 // Broker side of the control protocol (cml_ipc/control.h, docs/wp/WP-13.md).
 //
-// WP-13 scope: the minimal server. It implements `status` (capabilities: ["status"]) and answers
-// every other command with a proper CML5402 diagnostic. WP-12 extends handle_control_request()
-// with reload / wait / set-option / subscribe and the matching capabilities; the request/response
-// plumbing and the pipe server below carry over unchanged.
+// WP-13 implemented `status` (capabilities: ["status"]) and answered every other command with a proper
+// CML5402 diagnostic. WP-12 adds reload / wait / set-option / subscribe (and the diag / patch_applied / log
+// events) when the context has a ReloadService; without one the broker still offers `status` only.
 //
 // handle_control_line() is portable and unit-testable without pipes; ControlServer (Windows)
 // serves it on a named pipe with a thread per connection.
 
 #include <atomic>
+#include <functional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "cml/core/process_registry.h"
+#include "cml/core/reload_service.h"
 #include "cml/ipc/control.h"
 
 namespace cml::core {
@@ -25,10 +27,16 @@ struct ControlContext {
     const ProcessRegistry* registry = nullptr;   // may be null (no processes)
     // Health of the control accept loop (ControlServer sets it); null = healthy. Reported by `status`.
     const std::atomic<bool>* pipe_healthy = nullptr;
+    // WP-12: the reload pipeline behind reload / wait / set-option / subscribe (null: status only).
+    ReloadService* service = nullptr;
+    // Set per connection by the server: subscribes the connection to the given events (empty = all). Null
+    // (handle_control_line used without a connection): `subscribe` is answered with an empty subscription.
+    std::function<void(const std::set<std::string>& events)> subscribe;
 };
 
 // The capabilities this broker provides. A command is only available when its capability is here.
-std::vector<std::string> broker_capabilities();
+std::vector<std::string> broker_capabilities();                              // status only (WP-13)
+std::vector<std::string> broker_capabilities(const ControlContext& context);  // + reload, wait, set-option, subscribe, diag-events
 
 // `status` is bounded: modules per process (enabled ones first) and the total size of the response
 // (about 75% of the 1 MiB line limit). When anything is left out the result has "truncated": true and

@@ -88,7 +88,19 @@ if(WIN32)
     set_target_properties(cml_test_hang_watch PROPERTIES FOLDER "tests")
 endif()
 add_subdirectory(agent_hook)  # WP-10: unit.agent_hook, unit.agent_hook_stress
-cml_add_unit_test(broker_core SOURCES broker/test_core.cpp broker/test_session.cpp LIBS cml_core)
+cml_add_unit_test(broker_core
+    SOURCES
+        broker/test_core.cpp
+        broker/test_session.cpp
+        # WP-12: the reload pipeline pieces (all portable)
+        broker/test_narrowing.cpp
+        broker/test_module_symbols.cpp
+        broker/test_patch_image.cpp
+        broker/test_source_baseline.cpp
+        broker/test_agent_link.cpp
+        broker/test_events_and_log.cpp
+        broker/test_reload.cpp
+    LIBS cml_core)
 add_subdirectory(bind)  # WP-07: unit.bind
 if(NOT MSVC)
     # Portable pieces are tested on non-Windows hosts too (CML_ALLOW_NON_WINDOWS).

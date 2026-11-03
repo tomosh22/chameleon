@@ -1,16 +1,30 @@
 #include "cml/core/control_server.h"
 
 #include <algorithm>
+#include <iterator>
+#include <optional>
+#include <set>
 #include <utility>
 
+#include "cml/core/pipeline_diag_ids.h"
 #include "cml/proc/diag_ids.h"
 #include "cml/util/log.h"
 
 namespace cml::core {
 
 std::vector<std::string> broker_capabilities() {
-    // WP-12 adds "reload", "wait", "set-option", "subscribe", "diag-events" here as it implements them.
     return {ipc::capability::kStatus};
+}
+
+std::vector<std::string> broker_capabilities(const ControlContext& context) {
+    std::vector<std::string> caps = broker_capabilities();
+    if (context.service != nullptr) {
+        for (const char* c : {ipc::capability::kReload, ipc::capability::kWait, ipc::capability::kSetOption, ipc::capability::kSubscribe,
+                              ipc::capability::kDiagEvents}) {
+            caps.emplace_back(c);
+        }
+    }
+    return caps;
 }
 
 namespace {
@@ -25,7 +39,11 @@ std::size_t module_json_size(const RegisteredModule& module) {
 ipc::json::Value status_result(const ControlContext& context) {
     ipc::StatusReport report;
     report.version = context.version;
-    report.capabilities = broker_capabilities();
+    report.capabilities = broker_capabilities(context);
+    if (context.service != nullptr) {
+        report.reload_running = context.service->reload_running();
+        report.generation = context.service->generation();
+    }
     report.control_pipe_healthy = context.pipe_healthy == nullptr || context.pipe_healthy->load();
     // Fixed part of the response, with some slack for the per-process framing.
     std::size_t used = 256 + report.version.size();
@@ -54,7 +72,21 @@ ipc::json::Value status_result(const ControlContext& context) {
                         continue;
                     }
                     used += size;
-                    out.modules.push_back(ipc::StatusModule{module.path, module.enabled});
+                    ipc::StatusModule entry;
+                    entry.path = module.path;
+                    entry.enabled = module.enabled;
+                    if (module.enabled && context.service != nullptr) {
+                        if (const std::optional<IndexStatus> index = context.service->index_status(process.agent_id, module.path)) {
+                            entry.index_state = to_string(index->state);
+                            entry.index_percent = index->percent;
+                            entry.index_message = index->state == IndexState::Failed && index->error ? index->error->format() : index->phase;
+                        } else {
+                            // Enabled, but the service has not created the index (yet, or the module just went away):
+                            // never "ready".
+                            entry.index_state = "pending";
+                        }
+                    }
+                    out.modules.push_back(std::move(entry));
                 }
             }
             report.processes.push_back(std::move(out));
@@ -65,20 +97,76 @@ ipc::json::Value status_result(const ControlContext& context) {
 
 }  // namespace
 
+namespace {
+
+ipc::ControlResponse answer(const ipc::ControlRequest& request, Result<ipc::json::Value> result) {
+    if (!result) {
+        return ipc::make_error_response(request.id, result.error());
+    }
+    return ipc::make_ok_response(request.id, std::move(*result));
+}
+
+ipc::ControlResponse subscribe_response(const ipc::ControlRequest& request, const ControlContext& context) {
+    static const char* const kEvents[] = {"diag", "patch_applied", "log"};
+    std::set<std::string> names;
+    const ipc::json::Value* events = request.args.find("events");
+    if (events == nullptr || events->is_null()) {
+        names.insert(std::begin(kEvents), std::end(kEvents));
+    } else if (!events->is_array()) {
+        return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "argument 'events' must be an array of event names", "Use [\"diag\", \"patch_applied\", \"log\"] or a subset."));
+    } else {
+        for (const ipc::json::Value& e : events->items()) {
+            bool known = false;
+            for (const char* k : kEvents) {
+                known = known || (e.is_string() && e.as_string() == k);
+            }
+            if (!known) {
+                return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "unknown event name in 'events'", "Known events: diag, patch_applied, log."));
+            }
+            names.insert(e.as_string());
+        }
+    }
+    if (context.subscribe) {
+        context.subscribe(names);
+    }
+    ipc::json::Value result = ipc::json::Value::object();
+    ipc::json::Value list = ipc::json::Value::array();
+    for (const std::string& n : names) {
+        list.push(ipc::json::Value::string(n));
+    }
+    result.set("events", std::move(list));
+    return ipc::make_ok_response(request.id, std::move(result));
+}
+
+}  // namespace
+
 ipc::ControlResponse handle_control_request(const ipc::ControlRequest& request, const ControlContext& context) {
     if (request.cmd == "status") {
         return ipc::make_ok_response(request.id, status_result(context));
     }
+    if (context.service != nullptr) {
+        if (request.cmd == "reload") {
+            return answer(request, context.service->reload(request.args));
+        }
+        if (request.cmd == "wait") {
+            return answer(request, context.service->wait(request.args));
+        }
+        if (request.cmd == "set-option") {
+            return answer(request, context.service->set_option(request.args));
+        }
+        if (request.cmd == "subscribe") {
+            return subscribe_response(request, context);
+        }
+    }
     std::string provided;
-    for (const std::string& capability : broker_capabilities()) {
+    for (const std::string& capability : broker_capabilities(context)) {
         provided += (provided.empty() ? "" : ", ") + capability;
     }
     return ipc::make_error_response(
         request.id,
         Diag::make(ids::kControlUnknownCommand,
                    "control command '" + request.cmd + "' is not provided by this broker (it provides: " + provided + ")",
-                   "Query `status` for the broker's capabilities and only send commands it lists; reload and the other "
-                   "commands arrive with the full broker (WP-12)."));
+                   "Query `status` for the broker's capabilities and only send commands it lists."));
 }
 
 std::string handle_control_line(std::string_view line, const ControlContext& context) {
@@ -107,6 +195,8 @@ std::string handle_control_line(std::string_view line, const ControlContext& con
 
 #include <windows.h>
 
+#include <condition_variable>
+#include <deque>
 #include <memory>
 
 namespace cml::core {
@@ -231,7 +321,124 @@ void ControlServer::accept_loop() {
     }
 }
 
+namespace {
+
+// The one writer of a control connection: responses and events share the write lock, so lines never interleave.
+//
+// Events must never break the response path and must never block the pipeline:
+//   * on_event() (called on whichever thread publishes, e.g. the reload pipeline) only appends to a bounded queue
+//     (kMaxQueued; further events are dropped and counted) and returns at once;
+//   * a writer thread sends the queued lines with the full response timeout (kWriteTimeoutMs). A client that stops
+//     reading therefore delays only its own events; once a single write times out the connection is unusable
+//     (a partial line may be on the pipe), so the writer marks it broken: no more events and no more responses,
+//     and the connection thread ends. A stalled subscriber thus costs the pipeline nothing and is dropped after at
+//     most kWriteTimeoutMs.
+class ConnectionSender final : public EventListener {
+public:
+    explicit ConnectionSender(ipc::ControlChannel* channel) : channel_(channel) {}
+    ~ConnectionSender() override { detach(); }
+
+    Result<ipc::IoStatus> send_line(const std::string& line, std::uint32_t timeout_ms) {
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        if (channel_ == nullptr) {
+            return ipc::IoStatus::Closed;
+        }
+        Result<ipc::IoStatus> sent = channel_->send_line(line, timeout_ms);
+        if (!sent || *sent != ipc::IoStatus::Ok) {
+            channel_ = nullptr;  // a timed-out or failed write may have left a partial line: the stream is finished
+        }
+        return sent;
+    }
+
+    void on_event(const Event& event) override {
+        ipc::ControlEvent out;
+        out.name = event.name;
+        out.body = event.body;
+        Result<std::string> line = ipc::encode_event(out);
+        if (!line) {
+            return;  // too large for one control line: dropped
+        }
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (stopping_) {
+            return;
+        }
+        if (queue_.size() >= kMaxQueued) {
+            ++dropped_;
+            return;
+        }
+        queue_.push_back(std::move(*line));
+        if (!writer_.joinable()) {
+            writer_ = std::thread([this] { run(); });
+        }
+        cv_.notify_one();
+    }
+
+    void detach() {
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            stopping_ = true;
+            cv_.notify_all();
+        }
+        if (writer_.joinable()) {
+            writer_.join();
+        }
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        channel_ = nullptr;
+    }
+
+private:
+    static constexpr std::size_t kMaxQueued = 512;
+    static constexpr std::uint32_t kWriteTimeoutMs = 5000;
+
+    void run() {
+        for (;;) {
+            std::string line;
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex_);
+                cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+                if (stopping_) {
+                    return;
+                }
+                line = std::move(queue_.front());
+                queue_.pop_front();
+            }
+            const Result<ipc::IoStatus> sent = send_line(line, kWriteTimeoutMs);
+            if (!sent || *sent != ipc::IoStatus::Ok) {
+                std::lock_guard<std::mutex> lock(queue_mutex_);
+                stopping_ = true;  // broken connection: nothing more to send
+                queue_.clear();
+                return;
+            }
+        }
+    }
+
+    std::mutex write_mutex_;
+    ipc::ControlChannel* channel_;
+    std::mutex queue_mutex_;
+    std::condition_variable cv_;
+    std::deque<std::string> queue_;
+    bool stopping_ = false;
+    std::size_t dropped_ = 0;
+    std::thread writer_;
+};
+
+}  // namespace
+
 void ControlServer::serve(Connection& connection) {
+    auto sender = std::make_shared<ConnectionSender>(&connection.channel);
+    EventBus* bus = context_.service != nullptr ? context_.service->events() : nullptr;
+    EventBus::Id subscription = 0;
+    ControlContext local = context_;  // per connection: `subscribe` belongs to this connection
+    local.subscribe = [&](const std::set<std::string>& names) {
+        if (bus == nullptr) {
+            return;
+        }
+        if (subscription == 0) {
+            subscription = bus->subscribe(sender, names);
+        } else {
+            bus->update(subscription, names);
+        }
+    };
     while (!stopping_.load(std::memory_order_acquire)) {
         Result<ipc::ControlChannel::Line> received = connection.channel.receive_line(ipc::kInfiniteTimeout);
         if (!received) {
@@ -240,7 +447,7 @@ void ControlServer::serve(Connection& connection) {
             CML_LOG(Warn, "control connection: %s", received.error().format().c_str());
             Result<std::string> reply = ipc::encode_response(ipc::make_error_response(std::nullopt, received.error()));
             if (reply) {
-                (void)connection.channel.send_line(*reply, kSendTimeoutMs);
+                (void)sender->send_line(*reply, kSendTimeoutMs);
             }
             break;
         }
@@ -250,12 +457,16 @@ void ControlServer::serve(Connection& connection) {
         if (received->text.empty()) {
             continue;
         }
-        const std::string answer = handle_control_line(received->text, context_);
-        Result<ipc::IoStatus> sent = connection.channel.send_line(answer, kSendTimeoutMs);
+        const std::string answer = handle_control_line(received->text, local);
+        Result<ipc::IoStatus> sent = sender->send_line(answer, kSendTimeoutMs);
         if (!sent || *sent != ipc::IoStatus::Ok) {
             break;
         }
     }
+    if (bus != nullptr && subscription != 0) {
+        bus->unsubscribe(subscription);
+    }
+    sender->detach();
     connection.finished.store(true, std::memory_order_release);
 }
 

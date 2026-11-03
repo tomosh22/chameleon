@@ -274,6 +274,15 @@ json::Value status_to_json(const StatusReport& report) {
             json::Value module = json::Value::object();
             module.set("path", json::Value::string(m.path));
             module.set("enabled", json::Value::boolean(m.enabled));
+            if (!m.index_state.empty()) {
+                json::Value index = json::Value::object();
+                index.set("state", json::Value::string(m.index_state));
+                index.set("percent", json::Value::integer(static_cast<std::int64_t>(m.index_percent)));
+                if (!m.index_message.empty()) {
+                    index.set("message", json::Value::string(m.index_message));
+                }
+                module.set("index", std::move(index));
+            }
             modules.push(std::move(module));
         }
         process.set("modules", std::move(modules));
@@ -284,6 +293,12 @@ json::Value status_to_json(const StatusReport& report) {
     }
     out.set("processes", std::move(processes));
     out.set("control_pipe_healthy", json::Value::boolean(report.control_pipe_healthy));
+    if (report.reload_running) {
+        out.set("reload_running", json::Value::boolean(true));
+    }
+    if (report.generation != 0) {
+        out.set("generation", json::Value::integer(static_cast<std::int64_t>(report.generation)));
+    }
     if (report.truncated) {
         out.set("truncated", json::Value::boolean(true));
     }
@@ -298,6 +313,8 @@ Result<StatusReport> status_from_json(const json::Value& result) {
     report.version = result.get_string("version");
     report.truncated = result.get_bool("truncated", false);
     report.control_pipe_healthy = result.get_bool("control_pipe_healthy", true);
+    report.reload_running = result.get_bool("reload_running", false);
+    report.generation = static_cast<std::uint64_t>(result.get_integer("generation", 0));
     const json::Value* caps = result.find("capabilities");
     if (caps == nullptr || !caps->is_array()) {
         return response_invalid("status result needs a \"capabilities\" array");
@@ -328,7 +345,16 @@ Result<StatusReport> status_from_json(const json::Value& result) {
             if (path == nullptr || !path->is_string() || enabled == nullptr || !enabled->is_bool()) {
                 return response_invalid("each module needs a string \"path\" and a boolean \"enabled\"");
             }
-            process.modules.push_back(StatusModule{path->as_string(), enabled->as_bool()});
+            StatusModule module_entry;
+            module_entry.path = path->as_string();
+            module_entry.enabled = enabled->as_bool();
+            if (const json::Value* index = m.find("index"); index != nullptr && index->is_object()) {
+                module_entry.index_state = index->get_string("state");
+                const std::int64_t percent = index->get_integer("percent", 0);
+                module_entry.index_percent = percent < 0 ? 0u : (percent > 100 ? 100u : static_cast<std::uint32_t>(percent));
+                module_entry.index_message = index->get_string("message");
+            }
+            process.modules.push_back(std::move(module_entry));
         }
         report.processes.push_back(std::move(process));
     }
