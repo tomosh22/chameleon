@@ -108,6 +108,9 @@ public:
     // Requires Ready and a mapped index (acquire_pdb() first).
     Result<Sweep> sweep();
     void accept(const std::map<std::string, FileStamp>& stamps);
+    // WP-22: the stamps the baseline holds for these files now, and the undo of an accept() (the stamps go back as they were).
+    std::map<std::string, FileStamp> baseline_stamps(const std::vector<std::string>& files) const { return baseline_.stamps_of(files); }
+    void restore_baseline(const std::map<std::string, FileStamp>& stamps) { baseline_.accept(stamps); }
     // The files the baseline tracks (empty until Ready). WP-14 watches their directories.
     std::vector<std::string> tracked_files() const { return baseline_.files(); }
     // Test seam: replaces the content of sweep() (the synthetic PDBs of the unit tests have no real source

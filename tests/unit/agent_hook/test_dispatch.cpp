@@ -241,6 +241,32 @@ TEST_CASE("immediate mode: the agent thread applies InstallHooks and answers Hoo
         CHECK(snapshot(rig.old_fn.entry - 16, 64) == rig.original);
         CHECK(rig.old_fn.as_int()(1) == 1);
     }
+    SUBCASE("WP-22: a quiet re-point is applied like any other, and a quiet revert restores the original bytes") {
+        REQUIRE(broker.send(request(13, 0, {{rig.old_fn.entry, rig.new_1.entry}})));
+        std::optional<ipc::HooksInstalled> answer = broker.wait_for_answer(15000);
+        REQUIRE(answer.has_value());
+        CHECK(answer->status == 0);
+        CHECK(rig.old_fn.as_int()(1) == 101);
+
+        REQUIRE(broker.send(request(14, ipc::kInstallHooksQuiet, {{rig.old_fn.entry, rig.new_2.entry}})));
+        answer = broker.wait_for_answer(15000);
+        REQUIRE(answer.has_value());
+        CHECK(answer->request_id == 14);
+        CHECK_MESSAGE(answer->status == 0, answer->message);
+        REQUIRE(answer->results.size() == 1);
+        CHECK(answer->results[0].status == ipc::HookResultStatus::Repointed);
+        CHECK(rig.old_fn.as_int()(1) == 201);
+
+        REQUIRE(broker.send(request(15, ipc::kInstallHooksRevert | ipc::kInstallHooksQuiet, {{rig.old_fn.entry, nullptr}})));
+        answer = broker.wait_for_answer(15000);
+        REQUIRE(answer.has_value());
+        CHECK(answer->request_id == 15);
+        CHECK_MESSAGE(answer->status == 0, answer->message);
+        REQUIRE(answer->results.size() == 1);
+        CHECK(answer->results[0].status == ipc::HookResultStatus::Reverted);
+        CHECK(rig.old_fn.as_int()(1) == 1);
+        CHECK(snapshot(rig.old_fn.entry - 16, 64) == rig.original);
+    }
     SUBCASE("an empty request is answered") {
         REQUIRE(broker.send(request(11, 0, {})));
         std::optional<ipc::HooksInstalled> answer = broker.wait_for_answer(15000);

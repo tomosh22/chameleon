@@ -53,6 +53,9 @@ public:
     // ---- control commands (args are the request's "args" object) ----
     // {"pid"?:N, "module"?:"name or path", "timeout_ms"?:N, "confirm"?:bool}
     Result<ipc::json::Value> reload(const ipc::json::Value& args);
+    // WP-22: {"pid"?:N, "module"?:"name or path", "scope"?:"last"|"all"}
+    //   -> {"reverted":[{"pid","module","generation","batches","patches","hooks_restored","hooks_repointed"}],"generation":N}
+    Result<ipc::json::Value> revert(const ipc::json::Value& args);
     // {"for"?:"idle"|"index", "timeout_ms"?:N}
     Result<ipc::json::Value> wait(const ipc::json::Value& args);
     // {"name":s, "value":s|n|b}

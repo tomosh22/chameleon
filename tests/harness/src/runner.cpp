@@ -19,6 +19,7 @@
 #include "cml/ipc/pipe.h"
 #include "cml/proc/proc.h"
 #include "fixture_builder.h"
+#include "revert_step.h"
 #include "rx.h"
 #include "supervisor.h"
 #include "ticks.h"
@@ -248,6 +249,7 @@ private:
             case StepKind::ExpectEvent: return expect_event(step);
             case StepKind::SignalFixture: return signal_fixture();
             case StepKind::ExpectReloadResult: return expect_reload_result(step);
+            case StepKind::Revert: return revert(step);
         }
         return StepOutcome::fail(cml::ids::kScenarioFailed, "unknown step kind");
     }
@@ -349,7 +351,7 @@ private:
         if (status->has_capability(ipc::capability::kSubscribe)) {
             ipc::json::Value args = ipc::json::Value::object();
             ipc::json::Value events = ipc::json::Value::array();
-            for (const char* e : {"diag", "patch_applied", "log"}) {
+            for (const char* e : {"diag", "patch_applied", "patch_reverted", "log"}) {
                 events.push(ipc::json::Value::string(e));
             }
             args.set("events", std::move(events));
@@ -616,6 +618,22 @@ private:
                               " hooks_installed=" + std::to_string(response->result.get_integer("hooks_installed")) +
                               " initializers_run=" + std::to_string(response->result.get_integer("initializers_run"));
         return StepOutcome::pass("reload ok " + summary + (timing.empty() ? std::string() : "; " + timing));
+    }
+
+    // WP-22: control command `revert` (the body is in revert_step.cpp).
+    StepOutcome revert(const Step& step) {
+        const std::uint32_t limit_ms = std::min<std::uint32_t>(static_cast<std::uint32_t>(step.within_s) * 1000u, remaining_ms());
+        if (limit_ms == 0) {
+            return scenario_timeout();
+        }
+        for (Proc& p : procs_) {  // output printed from now on belongs to the reverted program
+            p.cursor = read_whole_file(p.stdout_file).size();
+        }
+        const RevertStepResult result = run_revert_step(*control_, step, limit_ms);
+        if (!result.diag) {
+            return StepOutcome::pass(result.detail);
+        }
+        return StepOutcome::fail(*result.diag);
     }
 
     StepOutcome signal_fixture() {

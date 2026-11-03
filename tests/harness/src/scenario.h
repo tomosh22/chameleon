@@ -24,6 +24,7 @@ enum class StepKind {
     ExpectEvent,          // an event of this name (patch_applied, ...) must arrive (needs capability "subscribe")
     SignalFixture,        // create the file named by CML_FIXTURE_SIGNAL_FILE, which the fixture waits for (WP-17)
     ExpectReloadResult,   // an integer member of the most recent reload's result has this value (WP-16)
+    Revert,               // control command `revert` with scope "last" or "all" (WP-22; needs capability "revert")
 };
 
 const char* to_string(StepKind kind);
@@ -59,6 +60,8 @@ struct Step {
     std::string label;
     std::string args;   // Launch: extra command-line arguments of the fixture process (after --agent)
     std::string process;
+    // Revert (WP-22): "last" (the newest reload) or "all"; `expect_error` (a CML id) makes a refusal the expected outcome.
+    std::string revert_scope = "last";
 
     // "expect_stdout /value=2/ within 10 s"
     std::string describe() const;

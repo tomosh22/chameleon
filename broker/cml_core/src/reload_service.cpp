@@ -10,6 +10,8 @@
 #include "cml/core/header_diag_ids.h"
 #include "cml/core/pipeline_diag_ids.h"
 #include "cml/core/process_registry.h"
+#include "cml/core/revert.h"
+#include "cml/core/revert_diag_ids.h"
 #include "cml/util/log.h"
 #include "cml/util/path.h"
 #include "cml/watch/watch_diag_ids.h"
@@ -478,6 +480,101 @@ Result<Value> ReloadService::run_reload(const Value& args, bool automatic) {
         fixture.resize(dot);
     }
     result.set("timing", Value::string(timing_line(fixture, sum)));
+    return result;
+}
+
+// ---- revert (WP-22) -------------------------------------------------------------------------------------------
+
+Result<Value> ReloadService::revert(const Value& args) {
+    std::uint32_t pid = 0;
+    std::optional<Diag> error;
+    if (!read_uint(args, "pid", 0xFFFFFFFFu, &pid, &error)) {
+        return *error;
+    }
+    const std::string module = args.get_string("module");
+    if (const Value* m = args.find("module"); m != nullptr && !m->is_null() && !m->is_string()) {
+        return bad_request("argument 'module' must be a string");
+    }
+    RevertScope scope = RevertScope::Last;
+    if (const Value* sc = args.find("scope"); sc != nullptr && !sc->is_null()) {
+        if (!sc->is_string() || (sc->as_string() != "last" && sc->as_string() != "all")) {
+            return Diag::make(revert::diag::kBadScope, "argument 'scope' must be \"last\" or \"all\"",
+                              "Send {\"scope\":\"last\"} to undo the newest reload, {\"scope\":\"all\"} to undo every reload.");
+        }
+        scope = sc->as_string() == "all" ? RevertScope::All : RevertScope::Last;
+    }
+    // A revert and a reload never overlap: both change the hooks and the broker's per-module patch list.
+    std::unique_lock<std::mutex> only_one(reload_mutex_, std::try_to_lock);
+    if (!only_one.owns_lock()) {
+        const Diag d = Diag::make(pd::kBusy, "a reload is still running", "Wait for it to finish (control command `wait`) and try again.");
+        if (events_ != nullptr) {
+            events_->publish(make_diag_event(d, "error", "revert"));
+        }
+        return d;
+    }
+    struct Running {
+        std::atomic<bool>& flag;
+        explicit Running(std::atomic<bool>& f) : flag(f) { flag.store(true); }
+        ~Running() { flag.store(false); }
+    } running(running_);
+
+    const std::vector<Target> list = targets(pid, module);
+    RevertOptions revert_options;
+    revert_options.timeout_ms = options().hooks_timeout_ms;
+    revert_options.events = events_;
+    Value reverted = Value::array();
+    std::size_t reverted_count = 0;
+    std::optional<Diag> first_error;
+    for (const Target& t : list) {
+        Result<RevertReport> r = revert_module(*t.link, *t.module, scope, revert_options);
+        if (!r) {
+            CML_LOG(Warn, "revert: %s", r.error().format().c_str());
+            if (events_ != nullptr) {
+                events_->publish(make_diag_event(r.error(), "error", "revert", t.link->snapshot().pid));
+            }
+            if (!first_error) {
+                first_error = r.error();
+            }
+            continue;
+        }
+        for (const Diag& w : r->warnings) {
+            CML_LOG(Warn, "revert: %s", w.format().c_str());
+            if (events_ != nullptr) {
+                events_->publish(make_diag_event(w, "warning", "revert", r->pid));
+            }
+        }
+        if (r->batches == 0) {
+            continue;
+        }
+        // The broker-wide generation counts the live patches: it goes back with the module's.
+        generation_.fetch_sub(std::min<std::uint64_t>(generation_.load(), r->generation_before - r->generation));
+        Value entry = Value::object();
+        entry.set("pid", Value::integer(static_cast<std::int64_t>(r->pid)));
+        entry.set("module", Value::string(r->module));
+        entry.set("generation", Value::integer(static_cast<std::int64_t>(r->generation)));
+        entry.set("batches", Value::integer(static_cast<std::int64_t>(r->batches)));
+        entry.set("patches", Value::integer(static_cast<std::int64_t>(r->patches)));
+        entry.set("hooks_restored", Value::integer(static_cast<std::int64_t>(r->hooks_restored)));
+        entry.set("hooks_repointed", Value::integer(static_cast<std::int64_t>(r->hooks_repointed)));
+        reverted.push(std::move(entry));
+        ++reverted_count;
+    }
+    if (first_error) {
+        return *first_error;
+    }
+    if (reverted_count == 0) {
+        const Diag d = Diag::make(revert::diag::kNothingToRevert,
+                                  std::string("no patch to revert") + (list.empty() ? ": no enabled module" : "") + (pid != 0 ? " in process " + std::to_string(pid) : "") +
+                                      (module.empty() ? "" : " matching '" + module + "'"),
+                                  "A revert undoes patches that a `reload` applied in this session; reload first.");
+        if (events_ != nullptr) {
+            events_->publish(make_diag_event(d, "error", "revert"));
+        }
+        return d;
+    }
+    Value result = Value::object();
+    result.set("reverted", std::move(reverted));
+    result.set("generation", Value::integer(static_cast<std::int64_t>(generation_.load())));
     return result;
 }
 

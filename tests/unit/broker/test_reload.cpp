@@ -548,6 +548,261 @@ TEST_CASE("reload: a second patch re-points the hook; new functions become canon
     CHECK(rig.service->generation() == 2);
 }
 
+// ---- WP-22: patch revert ------------------------------------------------------------------------------------------
+
+namespace {
+
+Result<Value> revert_with(Rig& rig, const char* scope) {
+    Value args = Value::object();
+    if (scope != nullptr) {
+        args.set("scope", Value::string(scope));
+    }
+    return rig.service->revert(args);
+}
+
+// Patch 1 defines new_helper and hooks compute_value; patch 2 calls the helper and hooks compute_value again.
+void apply_two_patches(Rig& rig) {
+    rig.object = make_object({}, true);
+    rig.changed();
+    Result<Value> first = rig.reload();
+    REQUIRE_MESSAGE(first.has_value(), first.error().format());
+    rig.object = make_object("?new_helper@@YAHXZ");
+    rig.changed();
+    Result<Value> second = rig.reload();
+    REQUIRE_MESSAGE(second.has_value(), second.error().format());
+}
+
+}  // namespace
+
+TEST_CASE("revert last: the function jumps back to the previous patch; its symbols, generation and baseline stay") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    apply_two_patches(rig);
+    const auto loads = rig.seen<ipc::LoadPatch>();
+    REQUIRE(loads.size() == 2);
+    const std::uint64_t base1 = loads[0].candidates[0].image_base;
+    const std::uint64_t base2 = loads[1].candidates[0].image_base;
+    CHECK(rig.module->hooked.at(kModuleBase + 0x1010) == base2 + 0x1000);
+    REQUIRE(rig.module->batches.size() == 2);
+
+    Result<Value> r = revert_with(rig, "last");
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    const Value* reverted = r->find("reverted");
+    REQUIRE(reverted != nullptr);
+    REQUIRE(reverted->items().size() == 1);
+    CHECK(reverted->items()[0].get_integer("pid") == kPid);
+    CHECK(reverted->items()[0].get_integer("generation") == 1);
+    CHECK(reverted->items()[0].get_integer("hooks_repointed") == 1);
+    CHECK(reverted->items()[0].get_integer("hooks_restored") == 0);
+    CHECK(r->get_integer("generation") == 1);
+
+    // The agent was asked to re-point (not to restore the original bytes), quietly, to patch 1's function.
+    const auto hooks = rig.seen<ipc::InstallHooks>();
+    REQUIRE(hooks.size() == 3);
+    CHECK(hooks[2].flags == ipc::kInstallHooksQuiet);
+    REQUIRE(hooks[2].hooks.size() == 1);
+    CHECK(hooks[2].hooks[0].old_entry == kModuleBase + 0x1010);
+    CHECK(hooks[2].hooks[0].new_entry == base1 + 0x1000);
+    CHECK(rig.module->hooked.at(kModuleBase + 0x1010) == base1 + 0x1000);
+    CHECK(rig.module->generation == 1);
+    CHECK(rig.service->generation() == 1);
+    CHECK(rig.module->batches.size() == 1);
+    CHECK(rig.events->count("patch_reverted") == 1);
+    // Patch 1's helper is still canonical: a later reload may bind to it.
+    CHECK(rig.module->registry.find("?new_helper@@YAHXZ").has_value());
+    // The loaded patches stay where they are (no ReleaseRange for a revert).
+    CHECK(rig.seen<ipc::ReleaseRange>().size() == 0);
+}
+
+TEST_CASE("revert all: the original bytes come back, the registry forgets the patches' symbols and the next reload cannot bind to them") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    apply_two_patches(rig);
+
+    Result<Value> r = revert_with(rig, "all");
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    REQUIRE(r->find("reverted")->items().size() == 1);
+    CHECK(r->find("reverted")->items()[0].get_integer("batches") == 2);
+    CHECK(r->find("reverted")->items()[0].get_integer("patches") == 2);
+    CHECK(r->find("reverted")->items()[0].get_integer("hooks_restored") == 1);
+    CHECK(r->find("reverted")->items()[0].get_integer("hooks_repointed") == 0);
+    CHECK(r->find("reverted")->items()[0].get_integer("generation") == 0);
+    CHECK(r->get_integer("generation") == 0);
+
+    const auto hooks = rig.seen<ipc::InstallHooks>();
+    REQUIRE(hooks.size() == 3);
+    CHECK(hooks[2].flags == ipc::kInstallHooksRevert);
+    REQUIRE(hooks[2].hooks.size() == 1);
+    CHECK(hooks[2].hooks[0].old_entry == kModuleBase + 0x1010);
+    CHECK(rig.module->hooked.empty());
+    CHECK(rig.module->generation == 0);
+    CHECK(rig.service->generation() == 0);
+    CHECK(rig.module->batches.empty());
+    CHECK_FALSE(rig.module->registry.find("?new_helper@@YAHXZ").has_value());
+    CHECK(rig.events->count("patch_reverted") == 1);
+
+    // A reload after the revert: the helper of the reverted patch must not be found (FU-13's second-reload case).
+    rig.object = make_object("?new_helper@@YAHXZ");
+    rig.changed();
+    Result<Value> again = rig.reload();
+    REQUIRE_FALSE(again.has_value());
+    CHECK(again.error().id() == "CML3200");
+
+    // With a definition of its own the reload works, and the numbering of the patch files carries on (the earlier
+    // DLLs are still loaded, their names are taken).
+    rig.object = make_object({}, true);
+    rig.changed();
+    Result<Value> third = rig.reload();
+    REQUIRE_MESSAGE(third.has_value(), third.error().format());
+    CHECK(rig.module->generation == 1);
+    const auto loads = rig.seen<ipc::LoadPatch>();
+    REQUIRE(loads.size() == 3);
+    CHECK(loads[2].candidates[0].image_base > loads[1].candidates[0].image_base);
+    CHECK(loads[2].candidates[0].path != loads[0].candidates[0].path);
+    CHECK(loads[2].candidates[0].path != loads[1].candidates[0].path);
+}
+
+TEST_CASE("revert last, then last again, then nothing: LIFO, and CML5850 when no patch is left") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    apply_two_patches(rig);
+    REQUIRE(revert_with(rig, nullptr).has_value());  // scope defaults to "last"
+    CHECK(rig.module->generation == 1);
+    Result<Value> second = revert_with(rig, "last");
+    REQUIRE_MESSAGE(second.has_value(), second.error().format());
+    CHECK(second->find("reverted")->items()[0].get_integer("hooks_restored") == 1);
+    CHECK(rig.module->generation == 0);
+    CHECK(rig.module->hooked.empty());
+    Result<Value> third = revert_with(rig, "last");
+    REQUIRE_FALSE(third.has_value());
+    CHECK(third.error().id() == "CML5850");
+    CHECK(rig.seen<ipc::InstallHooks>().size() == 4);  // two applied + two reverted; the refused third sent nothing
+}
+
+TEST_CASE("revert: the reload that follows recompiles the files again (the source baseline went back)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    REQUIRE(rig.reload().has_value());
+    REQUIRE(rig.module->index->accepted_for_testing().size() == 1);
+    REQUIRE(revert_with(rig, "all").has_value());
+    // The batch replaced the baseline stamp of logic.cpp; the revert puts the previous one back. The synthetic index has
+    // no baseline of real files, so there is nothing to put back here: what must hold is that a revert restores and does
+    // not count as an accept, and that a following reload still patches.
+    CHECK(rig.module->index->accepted_for_testing().size() == 1);
+    rig.changed();
+    Result<Value> again = rig.reload();
+    REQUIRE_MESSAGE(again.has_value(), again.error().format());
+    CHECK(again->get_integer("patched") == 1);
+    CHECK(rig.module->generation == 1);
+}
+
+TEST_CASE("revert: a reload that applied two patches is one batch; a refusal by the agent changes nothing (CML5851)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed_both();
+    rig.second_object = make_object();  // main.cpp patches too
+    Result<Value> r = rig.reload();
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    REQUIRE(rig.module->batches.size() == 1);
+    CHECK(rig.module->batches[0].patches.size() == 2);
+    CHECK(rig.module->generation == 2);
+
+    rig.hooks_status = 4305;  // a thread would not leave the function
+    Result<Value> refused = revert_with(rig, "last");
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().id() == "CML5851");
+    CHECK(refused.error().message.find("CML4305") != std::string::npos);
+    CHECK(rig.module->generation == 2);
+    CHECK(rig.module->batches.size() == 1);
+    CHECK_FALSE(rig.module->hooked.empty());
+    CHECK(rig.service->generation() == 2);
+    CHECK(rig.events->count("patch_reverted") == 0);
+    CHECK(rig.events->diag_ids().back() == "CML5851");
+
+    rig.hooks_status = 0;
+    Result<Value> ok = revert_with(rig, "last");
+    REQUIRE_MESSAGE(ok.has_value(), ok.error().format());
+    CHECK(ok->find("reverted")->items()[0].get_integer("patches") == 2);
+    CHECK(rig.module->generation == 0);
+    CHECK(rig.service->generation() == 0);
+}
+
+TEST_CASE("revert: arguments are validated; a module or process that does not match has nothing to revert") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    apply_two_patches(rig);
+    Result<Value> bad = revert_with(rig, "everything");
+    REQUIRE_FALSE(bad.has_value());
+    CHECK(bad.error().id() == "CML5853");
+    Value args = Value::object();
+    args.set("pid", Value::integer(kPid + 1));
+    Result<Value> other = rig.service->revert(args);
+    REQUIRE_FALSE(other.has_value());
+    CHECK(other.error().id() == "CML5850");
+    Value named = Value::object();
+    named.set("module", Value::string("app.exe"));
+    named.set("scope", Value::string("last"));
+    CHECK(rig.service->revert(named).has_value());
+    CHECK(rig.module->generation == 1);
+}
+
+TEST_CASE("revert: in synchronised mode an unconfirmed request is a warning, and the broker's state still goes back") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    REQUIRE(rig.reload().has_value());
+    rig.answer_hooks = false;  // the application does not reach SyncPoint()
+    rig.option("hooks_timeout_ms", Value::integer(100));
+    Result<Value> r = revert_with(rig, "all");
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    CHECK(rig.module->generation == 0);
+    CHECK(rig.module->hooked.empty());
+    bool warned = false;
+    for (const Event& e : rig.events->events) {
+        warned = warned || (e.name == "diag" && e.body.get_string("id") == "CML5852");
+    }
+    CHECK(warned);
+}
+
+TEST_CASE("control: revert is advertised and answers over the line protocol; patch_reverted is a known event") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    apply_two_patches(rig);
+    ProcessRegistry registry;
+    registry.update(rig.session);
+    std::set<std::string> subscribed;
+    ControlContext context;
+    context.version = "0.1.0";
+    context.registry = &registry;
+    context.service = rig.service.get();
+    context.subscribe = [&](const std::set<std::string>& names) { subscribed = names; };
+    const std::vector<std::string> caps = broker_capabilities(context);
+    CHECK(std::find(caps.begin(), caps.end(), "revert") != caps.end());
+    const auto call = [&](const std::string& line) {
+        Result<Value> parsed = ipc::json::parse(handle_control_line(line, context));
+        REQUIRE(parsed.has_value());
+        return *parsed;
+    };
+    const Value done = call(R"({"id":1,"cmd":"revert","args":{"scope":"last"}})");
+    REQUIRE_MESSAGE(done.get_bool("ok"), ipc::json::serialize(done));
+    CHECK(done.find("result")->find("reverted")->items()[0].get_integer("generation") == 1);
+    CHECK(call(R"({"id":2,"cmd":"status"})").find("result")->get_integer("generation") == 1);
+    CHECK(call(R"({"id":3,"cmd":"subscribe","args":{"events":["patch_reverted"]}})").get_bool("ok"));
+    CHECK(subscribed == std::set<std::string>{"patch_reverted"});
+    const Value bad = call(R"({"id":4,"cmd":"revert","args":{"scope":"x"}})");
+    CHECK_FALSE(bad.get_bool("ok"));
+    CHECK(bad.find("diag")->get_string("id") == "CML5853");
+}
+
 TEST_CASE("reload: failures surface as diag events with the stage's own stable id") {
     QuietLogs quiet;
     SUBCASE("compile error: CML2200, nothing reaches the agent, the baseline is not advanced") {
@@ -939,7 +1194,7 @@ TEST_CASE("control: status reports the module's index state; reload / wait / set
     CHECK(call(R"({"id":7,"cmd":"subscribe","args":{"events":["diag","log"]}})").get_bool("ok"));
     CHECK(subscribed == std::set<std::string>{"diag", "log"});
     CHECK(call(R"({"id":8,"cmd":"subscribe"})").get_bool("ok"));
-    CHECK(subscribed.size() == 3);
+    CHECK(subscribed.size() == 4);  // diag, patch_applied, patch_reverted (WP-22), log
     CHECK_FALSE(call(R"({"id":9,"cmd":"subscribe","args":{"events":["nothing"]}})").get_bool("ok"));
     CHECK(call(R"({"id":10,"cmd":"frobnicate"})").find("diag")->get_string("id") == "CML5402");
 }

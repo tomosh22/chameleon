@@ -19,6 +19,22 @@ void SharedRegistry::add(std::string name, SymbolAddress address) {
     registry_.add(std::move(name), std::move(address));
 }
 
+std::optional<SymbolAddress> SharedRegistry::replace(std::string name, SymbolAddress address) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::optional<SymbolAddress> previous = registry_.find(name);
+    registry_.add(std::move(name), std::move(address));
+    return previous;
+}
+
+void SharedRegistry::restore(const std::string& name, const std::optional<SymbolAddress>& previous) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (previous) {
+        registry_.add(name, *previous);
+    } else {
+        registry_.remove(name);
+    }
+}
+
 std::size_t SharedRegistry::size() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return registry_.size();

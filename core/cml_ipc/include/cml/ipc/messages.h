@@ -159,7 +159,10 @@ struct Reply {
 // operation on the same list, applied under the same stop-the-world window, and answered by the
 // same HooksInstalled; with the flag set `new_entry` is ignored and the original bytes come back.
 inline constexpr std::uint32_t kInstallHooksRevert = 1u;
-inline constexpr std::uint32_t kInstallHooksKnownFlags = kInstallHooksRevert;
+// WP-22: the request is part of a patch revert (a hook is re-pointed back at the previous patch). The application's
+// pre/post-patch hooks do not run and cml_last_patch_status() is not touched, as for a plain revert.
+inline constexpr std::uint32_t kInstallHooksQuiet = 0x100u;
+inline constexpr std::uint32_t kInstallHooksKnownFlags = kInstallHooksRevert | kInstallHooksQuiet;
 
 struct HookSpec {
     std::uint64_t old_entry = 0;  // entry of the function being replaced (its first hook's target)

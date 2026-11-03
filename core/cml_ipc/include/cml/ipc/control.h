@@ -39,6 +39,7 @@ inline constexpr const char* kReload = "reload";
 inline constexpr const char* kWait = "wait";
 inline constexpr const char* kSetOption = "set-option";
 inline constexpr const char* kSubscribe = "subscribe";
+inline constexpr const char* kRevert = "revert";  // WP-22: control command `revert` and the `patch_reverted` event
 inline constexpr const char* kDiagEvents = "diag-events";  // `diag` events are delivered to subscribers
 }  // namespace capability
 

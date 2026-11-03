@@ -32,6 +32,8 @@ add_library(cml_core STATIC
     src/log_hub.cpp
     src/pipeline.cpp
     src/pipeline_native.cpp
+    # WP-22: patch revert
+    src/revert.cpp
     # WP-14: compile on save
     src/save_watcher.cpp
     src/reload_service.cpp)
