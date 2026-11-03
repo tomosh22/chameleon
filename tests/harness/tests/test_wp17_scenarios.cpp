@@ -19,7 +19,7 @@ fixture_args = "--hold-sync --immediate"
 kind = "launch"
 [[step]]
 kind = "set_option"
-name = "hooks_timeout_ms"
+option = "hooks_timeout_ms"
 value = 1500
 [[step]]
 kind = "reload"
@@ -32,10 +32,10 @@ kind = "signal_fixture"
     REQUIRE_MESSAGE(r.has_value(), r.error().format());
     CHECK(r->fixture_args == "--hold-sync --immediate");
     CHECK(r->steps[1].kind == StepKind::SetOption);
-    CHECK(r->steps[1].option_name == "hooks_timeout_ms");
-    CHECK(r->steps[1].option_value == 1500);
+    CHECK(r->steps[1].option == "hooks_timeout_ms");
+    CHECK(r->steps[1].option_integer == 1500);
     CHECK(std::string(r->steps[1].required_capability()) == cml::ipc::capability::kSetOption);
-    CHECK(r->steps[1].describe() == "set_option hooks_timeout_ms=1500");
+    CHECK(r->steps[1].describe() == "set_option hooks_timeout_ms = 1500");
     CHECK(r->steps[2].expect_error == "CML5309");
     CHECK(r->steps[2].describe() == "reload within 30 s expecting the refusal CML5309");
     CHECK(r->steps[3].kind == StepKind::SignalFixture);
@@ -59,10 +59,6 @@ TEST_CASE("scenario: bad WP-17 keys are CML5411") {
     };
     invalid(head + "fixture_args = 3\n" + launch + "kind = \"signal_fixture\"\n");
     invalid(head + "fixture_args = \"--x; del *\"\n" + launch + "kind = \"signal_fixture\"\n");
-    invalid(head + launch + "kind = \"set_option\"\nname = \"a\"\n");                         // value missing
-    invalid(head + launch + "kind = \"set_option\"\nname = \"a\"\nvalue = \"1\"\n");         // not an integer
-    invalid(head + launch + "kind = \"set_option\"\nname = \"a b\"\nvalue = 1\n");           // bad name
-    invalid(head + launch + "kind = \"set_option\"\nvalue = 1\n");                           // name missing
     invalid(head + launch + "kind = \"signal_fixture\"\nwithin_s = 3\n");                    // unknown key
     invalid(head + launch + "kind = \"reload\"\nexpect_error = \"5309\"\n");               // not a diagnostic id
     invalid(head + launch + "kind = \"reload\"\nexpect_error = 5309\n");

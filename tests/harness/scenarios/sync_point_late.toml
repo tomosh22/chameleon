@@ -31,7 +31,7 @@ within_s = 20
 
 [[step]]
 kind = "set_option"
-name = "hooks_timeout_ms"
+option = "hooks_timeout_ms"
 value = 1500
 
 [[step]]

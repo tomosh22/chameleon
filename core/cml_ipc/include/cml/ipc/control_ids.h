@@ -38,4 +38,9 @@ inline constexpr std::uint32_t kJunitWriteFailed = 5426;        // report file c
 inline constexpr std::uint32_t kCounterNotMonotonic = 5427;     // expect_monotonic: counter reset, constant or too few samples (WP-12)
 inline constexpr std::uint32_t kResultMismatch = 5428;          // reload result field differs from the scenario's expectation (WP-12)
 
+// --- cmltest harness steps added by WP-14 (the rest of CML55xx belongs to change detection, cml_watch) ---
+inline constexpr std::uint32_t kExpectEventTimeout = 5510;      // expect_event: no event of that name in time
+inline constexpr std::uint32_t kSetOptionFailed = 5511;         // set_option: the broker refused the option
+inline constexpr std::uint32_t kWaitFailed = 5512;              // wait: the broker's `wait` failed or timed out
+
 }  // namespace cml::ids

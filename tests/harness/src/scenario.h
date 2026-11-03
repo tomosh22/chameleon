@@ -19,7 +19,9 @@ enum class StepKind {
     Reload,               // control command `reload` (needs capability "reload")
     ExpectDiag,           // a `diag` event with this id must arrive (needs capability "diag-events")
     ExpectMonotonic,      // a `key=<int>` of the fixture's TICK lines never decreases (state kept in the old storage)
-    SetOption,            // control command `set-option` with an integer value (WP-17: hooks_timeout_ms)
+    SetOption,            // control command `set-option` (WP-14: e.g. compile_on_save = true)
+    Wait,                 // control command `wait` for "index" or "idle"
+    ExpectEvent,          // an event of this name (patch_applied, ...) must arrive (needs capability "subscribe")
     SignalFixture,        // create the file named by CML_FIXTURE_SIGNAL_FILE, which the fixture waits for (WP-17)
     ExpectReloadResult,   // an integer member of the most recent reload's result has this value (WP-16)
 };
@@ -33,7 +35,14 @@ struct Step {
     std::string module;    // ExpectModuleEnabled: file name or path suffix, compared case-insensitively
     std::string patch;     // Edit: path relative to the fixture directory
     std::string id;        // ExpectDiag: "CML3101"
-    int within_s = 10;     // ExpectStdout / ExpectModuleEnabled / Reload / ExpectDiag
+    std::string event;     // ExpectEvent: "patch_applied"
+    std::string option;    // SetOption: option name
+    enum class OptionKind { Bool, Integer, String } option_kind = OptionKind::Bool;
+    bool option_bool = false;
+    long long option_integer = 0;
+    std::string option_string;
+    std::string wait_for;  // Wait: "index" | "idle"
+    int within_s = 10;     // ExpectStdout / ExpectModuleEnabled / Reload / ExpectDiag / ExpectEvent / Wait
     std::string key;       // ExpectMonotonic: the TICK key ("calls")
     int min_samples = 10;  // ExpectMonotonic: at least this many samples of the key in the whole output
     // Reload: the result object of the reload command must hold this integer member (e.g. "initializers_run" = 1).
@@ -42,9 +51,6 @@ struct Step {
     bool has_result_value = false;
     // Reload (WP-15): the reload must be refused with this diagnostic id (e.g. "CML5550"); empty = it must succeed.
     std::string expect_error;
-    // SetOption (WP-17, generic: control command `set-option` with `name` and an integer `value`)
-    std::string option_name;
-    long long option_value = 0;
     // WP-16, several processes. Launch: `exe` is a fixture executable of the same build (file name, ".exe" optional; empty =
     // the fixture's primary exe) and `label` names the process (default "fixture" for the primary exe, else the exe's name
     // without extension). `process` selects the process of ExpectStdout / ExpectModuleEnabled / ExpectMonotonic (empty =

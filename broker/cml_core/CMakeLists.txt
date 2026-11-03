@@ -30,11 +30,13 @@ add_library(cml_core STATIC
     src/log_hub.cpp
     src/pipeline.cpp
     src/pipeline_native.cpp
+    # WP-14: compile on save
+    src/save_watcher.cpp
     src/reload_service.cpp)
 target_include_directories(cml_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_BINARY_DIR}/generated")
-target_link_libraries(cml_core PUBLIC cml_util cml_ipc cml_coff cml_pdb cml_pe cml_toolchain)
+target_link_libraries(cml_core PUBLIC cml_util cml_ipc cml_coff cml_pdb cml_pe cml_toolchain cml_watch)
 if(NOT MSVC)
     find_package(Threads REQUIRED)
     target_link_libraries(cml_core PUBLIC Threads::Threads)

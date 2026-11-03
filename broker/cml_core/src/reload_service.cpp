@@ -7,10 +7,12 @@
 #include <set>
 #include <thread>
 
+#include "cml/core/header_diag_ids.h"
 #include "cml/core/pipeline_diag_ids.h"
 #include "cml/core/process_registry.h"
 #include "cml/util/log.h"
 #include "cml/util/path.h"
+#include "cml/watch/watch_diag_ids.h"
 
 namespace cml::core {
 
@@ -69,6 +71,25 @@ ReloadService::ReloadService(PipelineEnv env, EventBus* events, std::string sess
 
 ReloadService::~ReloadService() {
     cancel_.cancel();
+    {
+        std::shared_ptr<SaveWatcher> watcher;
+        {
+            std::lock_guard<std::mutex> lock(watch_mutex_);
+            watcher.swap(save_watcher_);
+        }
+        if (watcher) {
+            watcher->stop();
+        }
+        watcher.reset();  // joins its thread (a running reload was cancelled above)
+        std::vector<std::future<void>> retiring;
+        {
+            std::lock_guard<std::mutex> lock(watch_mutex_);
+            retiring.swap(retiring_);
+        }
+        for (std::future<void>& f : retiring) {
+            f.wait();
+        }
+    }
     std::map<std::uint64_t, AgentEntry> agents;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -125,6 +146,7 @@ void ReloadService::detach(std::uint64_t agent_id) {
         agents_.erase(it);
     }
     entry.modules.clear();  // index threads are joined here, outside the lock
+    rearm_save_watcher();
 }
 
 void ReloadService::on_session_changed(std::uint64_t agent_id) {
@@ -180,7 +202,11 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
             }
         }
     }
+    const bool any_dropped = !dropped.empty();
     dropped.clear();  // joins their threads
+    if (any_dropped) {
+        rearm_save_watcher();
+    }
     for (const auto& c : created) {
         std::shared_ptr<ModuleState> state;
         {
@@ -199,7 +225,10 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
         spec.module_path = state->path;
         spec.baseline.track_system = options.track_system_headers;
         const std::string name = state->name;
-        spec.on_change = [name](const IndexStatus& s) {
+        spec.on_change = [this, name](const IndexStatus& s) {
+            if (s.state == IndexState::Ready) {
+                rearm_save_watcher();  // its tracked files are known now (compile-on-save)
+            }
             if (s.state == IndexState::Failed) {
                 CML_LOG(Warn, "index of %s failed: %s", name.c_str(), s.error ? s.error->format().c_str() : "unknown error");
             } else {
@@ -207,7 +236,12 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
             }
         };
         CML_LOG(Info, "module %s enabled in process %u: loading its PDB index", state->name.c_str(), snap.pid);
-        state->index = ModuleIndex::start(std::move(spec));
+        {
+            std::shared_ptr<ModuleIndex> index = ModuleIndex::start(std::move(spec));
+            std::lock_guard<std::mutex> state_lock(state->mutex);  // tracked_files() reads it from the watcher's threads
+            state->index = std::move(index);
+        }
+        rearm_save_watcher();  // the index may have become ready before it was stored
     }
 }
 
@@ -256,6 +290,10 @@ std::vector<ReloadService::Target> ReloadService::targets(std::uint32_t pid, con
 // ---- reload -------------------------------------------------------------------------------------------------
 
 Result<Value> ReloadService::reload(const Value& args) {
+    return run_reload(args, false);
+}
+
+Result<Value> ReloadService::run_reload(const Value& args, bool automatic) {
     std::uint32_t pid = 0;
     std::uint32_t timeout_ms = 60000;
     std::optional<Diag> error;
@@ -280,6 +318,9 @@ Result<Value> ReloadService::reload(const Value& args) {
     std::unique_lock<std::mutex> only_one(reload_mutex_, std::try_to_lock);
     if (!only_one.owns_lock()) {
         const Diag d = Diag::make(pd::kBusy, "another reload is still running", "Wait for it to finish (control command `wait`) and try again.");
+        if (automatic) {
+            return d;  // the caller retries quietly
+        }
         if (events_ != nullptr) {
             events_->publish(make_diag_event(d, "error", "reload"));
         }
@@ -292,7 +333,27 @@ Result<Value> ReloadService::reload(const Value& args) {
     } running(running_);
 
     const Clock::time_point start = Clock::now();
-    const std::vector<Target> list = targets(pid, module);
+    std::vector<Target> list = targets(pid, module);
+    if (automatic) {
+        // A save while a module is still indexing (or its index failed) is not a failed reload: that module is
+        // skipped here, and picked up when its index becomes ready (the watcher is re-armed then).
+        list.erase(std::remove_if(list.begin(), list.end(),
+                                  [](const Target& t) {
+                                      std::shared_ptr<ModuleIndex> index;
+                                      {
+                                          std::lock_guard<std::mutex> lock(t.module->mutex);
+                                          index = t.module->index;
+                                      }
+                                      return !index || index->status().state != IndexState::Ready;
+                                  }),
+                   list.end());
+        if (list.empty()) {
+            CML_LOG(Debug, "compile-on-save: no module with a ready index; nothing to reload");
+            Value none = Value::object();
+            none.set("patched", Value::integer(0));
+            return none;
+        }
+    }
     if (list.empty()) {
         const Diag d = Diag::make(pd::kNoTarget,
                                   std::string("no enabled module to reload") + (pid != 0 ? " in process " + std::to_string(pid) : "") +
@@ -406,6 +467,111 @@ Result<Value> ReloadService::reload(const Value& args) {
     return result;
 }
 
+// ---- compile on save (WP-14) -----------------------------------------------------------------------------------
+
+std::vector<std::string> ReloadService::tracked_files() const {
+    std::vector<std::shared_ptr<ModuleState>> modules;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& a : agents_) {
+            for (const auto& m : a.second.modules) {
+                modules.push_back(m.second);
+            }
+        }
+    }
+    std::set<std::string> files;
+    for (const std::shared_ptr<ModuleState>& m : modules) {
+        std::shared_ptr<ModuleIndex> index;
+        {
+            std::lock_guard<std::mutex> lock(m->mutex);
+            index = m->index;
+        }
+        if (index && index->status().state == IndexState::Ready) {
+            for (std::string& f : index->tracked_files()) {
+                files.insert(std::move(f));
+            }
+        }
+    }
+    return std::vector<std::string>(files.begin(), files.end());
+}
+
+SaveWatcherHooks::ReloadResult ReloadService::reload_for_save() {
+    Result<Value> r = run_reload(Value::object(), true);
+    if (!r && r.error().code == header::diag::kTooManyCompilands) {
+        // A save that touches more compilands than max_affected_compilands: the pipeline has published CML5551 (with
+        // the way to confirm). Nobody is there to be asked, so nothing is compiled; the files stay "changed" and the
+        // next explicit `reload` (with "confirm": true) or a smaller save picks them up.
+        CML_LOG(Info, "compile-on-save: the change affects too many compilands; run `reload` with \"confirm\": true to recompile them");
+        return SaveWatcherHooks::ReloadResult::Done;
+    }
+    if (r) {
+        return SaveWatcherHooks::ReloadResult::Done;
+    }
+    return r.error().code == pd::kBusy ? SaveWatcherHooks::ReloadResult::Busy : SaveWatcherHooks::ReloadResult::Failed;
+}
+
+std::optional<Diag> ReloadService::apply_compile_on_save(bool on) {
+    std::shared_ptr<SaveWatcher> old;
+    std::shared_ptr<SaveWatcher> created;
+    std::shared_ptr<SaveWatcher> existing;
+    {
+        std::lock_guard<std::mutex> lock(watch_mutex_);
+        if (!on) {
+            old.swap(save_watcher_);
+        } else if (save_watcher_) {
+            existing = save_watcher_;
+        } else {
+            SaveWatcherHooks hooks;
+            hooks.tracked_files = [this] { return tracked_files(); };
+            hooks.reload = [this] { return reload_for_save(); };
+            hooks.report = [this](const Diag& d, const char* severity) {
+                if (events_ != nullptr) {
+                    events_->publish(make_diag_event(d, severity, "watch"));
+                }
+            };
+            SaveWatcherOptions options;
+            options.factory = watcher_factory_;
+            save_watcher_ = std::make_shared<SaveWatcher>(std::move(hooks), std::move(options));
+            created = save_watcher_;
+        }
+    }
+    if (old) {
+        // Switching off returns at once: no new reload starts, and a reload a save already started finishes on its
+        // own (it is joined when the service is destroyed).
+        old->stop();
+        std::lock_guard<std::mutex> lock(watch_mutex_);
+        retiring_.erase(std::remove_if(retiring_.begin(), retiring_.end(),
+                                       [](std::future<void>& f) { return f.wait_for(std::chrono::seconds(0)) == std::future_status::ready; }),
+                        retiring_.end());
+        retiring_.push_back(std::async(std::launch::async, [w = std::move(old)]() mutable { w.reset(); }));
+    }
+    if (!on) {
+        CML_LOG(Info, "compile on save: off");
+        return std::nullopt;
+    }
+    if (created) {
+        CML_LOG(Info, "compile on save: on");
+        return created->rearm();
+    }
+    return existing->rearm();
+}
+
+void ReloadService::rearm_save_watcher() {
+    std::shared_ptr<SaveWatcher> watcher;
+    {
+        std::lock_guard<std::mutex> lock(watch_mutex_);
+        watcher = save_watcher_;
+    }
+    if (watcher) {
+        (void)watcher->rearm();
+    }
+}
+
+void ReloadService::set_watcher_factory_for_testing(WatcherFactory factory) {
+    std::lock_guard<std::mutex> lock(watch_mutex_);
+    watcher_factory_ = std::move(factory);
+}
+
 // ---- wait ---------------------------------------------------------------------------------------------------
 
 Result<Value> ReloadService::wait(const Value& args) {
@@ -467,7 +633,7 @@ Result<Value> ReloadService::set_option(const Value& args) {
         return bad_request("set-option needs a string \"name\" and a \"value\"");
     }
     const std::string name = name_v->as_string();
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     ReloadOptions& o = options_;
     const auto want_bool = [&](bool* field) -> std::optional<Diag> {
         if (!value->is_bool()) {
@@ -492,6 +658,7 @@ Result<Value> ReloadService::set_option(const Value& args) {
     };
     Value previous;
     std::optional<Diag> error;
+    bool toggle = false;
     if (name == "narrow_hooks") {
         previous = Value::boolean(o.narrow_hooks);
         error = want_bool(&o.narrow_hooks);
@@ -546,6 +713,10 @@ Result<Value> ReloadService::set_option(const Value& args) {
     } else if (name == "linker_path") {
         previous = Value::string(o.linker_path);
         error = want_string(&o.linker_path);
+    } else if (name == "compile_on_save") {
+        previous = Value::boolean(o.compile_on_save);
+        error = want_bool(&o.compile_on_save);
+        toggle = true;
     } else if (name == "log_level") {
         static const char* const kNames[] = {"trace", "debug", "info", "warn", "error", "off"};
         previous = Value::string(kNames[static_cast<int>(log_level())]);
@@ -563,12 +734,26 @@ Result<Value> ReloadService::set_option(const Value& args) {
     } else {
         return bad_request("unknown option '" + name +
                            "'; options: narrow_hooks, release_pdb_after_reload, track_system_headers, max_parallel_compiles, max_affected_compilands, agent_timeout_ms, "
-                           "hooks_timeout_ms, reserve_block_mb, reserve_blocks, max_load_attempts, linker, linker_path, log_level");
+                           "hooks_timeout_ms, reserve_block_mb, reserve_blocks, max_load_attempts, linker, linker_path, compile_on_save, log_level");
     }
     if (error) {
         return *error;
     }
     CML_LOG(Info, "option %s changed", name.c_str());
+    const bool compile_on_save = o.compile_on_save;
+    lock.unlock();  // the watcher's thread takes mutex_ (options()) while it reloads
+    if (toggle) {
+        const std::optional<Diag> unavailable = apply_compile_on_save(compile_on_save);
+        if (unavailable && unavailable->code == watch::diag::kUnsupported) {
+            // No directory watcher on this host: the option cannot be active, so it must not look as if it were.
+            {
+                std::lock_guard<std::mutex> relock(mutex_);
+                options_.compile_on_save = false;
+            }
+            (void)apply_compile_on_save(false);
+            return *unavailable;
+        }
+    }
     Value result = Value::object();
     result.set("name", Value::string(name));
     result.set("previous", std::move(previous));
