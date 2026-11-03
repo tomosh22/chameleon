@@ -278,6 +278,8 @@ private:
         }
     }
 
+    std::vector<AppliedPatch> applied_;  // WP-22: the patches this run made live, oldest first
+
     Result<PatchReport> run() {
         PatchReport report;
         const LinkSnapshot snap = link_.snapshot();
@@ -506,6 +508,10 @@ private:
         notify_compile(ipc::CompilePhase::Success);
 
         // ---- 3.. per compiland: one patch each ---------------------------------------------------------------
+        const std::uint64_t generation_before = [&] {
+            std::lock_guard<std::mutex> lock(module_.mutex);
+            return module_.generation;
+        }();
         std::map<std::uint32_t, bool> unit_ok;
         std::optional<Diag> failure;
         for (Unit& u : units) {
@@ -542,7 +548,23 @@ private:
                 accepted[f] = st->second;
             }
         }
+        // WP-22: the patches of this reload are one batch a `revert` can undo, together with the baseline they replaced.
+        PatchBatch batch;
+        if (!applied_.empty()) {
+            std::vector<std::string> accepted_files;
+            for (const auto& entry : accepted) {
+                accepted_files.push_back(entry.first);
+            }
+            batch.baseline_before = module_.index->baseline_stamps(accepted_files);
+            batch.patches = std::move(applied_);
+            batch.generation_before = generation_before;
+            batch.reload_id = ctx_.reload_id;
+        }
         module_.index->accept(accepted);
+        if (!batch.patches.empty()) {
+            std::lock_guard<std::mutex> lock(module_.mutex);
+            module_.batches.push_back(std::move(batch));
+        }
         if (failure) {
             return *failure;
         }
@@ -911,7 +933,10 @@ private:
         report.times.init += lap.lap();
 
         // ---- hooks -------------------------------------------------------------------------------------------------
-        std::vector<std::pair<std::uint64_t, std::uint64_t>> installed;
+        AppliedPatch applied;  // WP-22: what a revert needs; applied.hooks is also the list of the hook table entries below
+        applied.number = patch_no;
+        applied.base = base;
+        applied.dll_path = linked.dll_path;
         // WP-25: remember what the functions of this patch look like, so the next reload of the unit can compare with it
         // (hooked functions: keyed by the patch entry the hook jumps to; new functions: by their own address).
         const auto record_code = [&] {
@@ -932,10 +957,10 @@ private:
                 recorded->display = display;
                 module_.record_code(entry, std::make_shared<const CodeImage>(std::move(*recorded)));
             };
-            for (const std::pair<std::uint64_t, std::uint64_t>& h : installed) {
+            for (const AppliedHook& h : applied.hooks) {
                 for (const bind::HookEntry& e : hooks) {
-                    if (e.old_va == h.first) {
-                        record_one(e.new_symbol, e.display, h.second);
+                    if (e.old_va == h.old_entry) {
+                        record_one(e.new_symbol, e.display, h.new_entry);
                         break;
                     }
                 }
@@ -957,7 +982,7 @@ private:
                                                     "Report this with the bind plan."));
                 }
                 req.hooks.push_back(ipc::HookSpec{h.old_va, *target, h.display});
-                installed.emplace_back(h.old_va, *target);
+                applied.hooks.push_back(AppliedHook{h.old_va, *target, h.display});
             }
             Result<ipc::Message> answer = link_.request(ipc::Message(std::move(req)), clamp_timeout(options_.hooks_timeout_ms));
             if (!answer) {
@@ -967,11 +992,12 @@ private:
                 if (timed_out) {
                     {
                         std::lock_guard<std::mutex> lock(module_.mutex);
-                        for (const auto& h : installed) {
-                            module_.hooked[h.first] = h.second;
+                        for (const AppliedHook& h : applied.hooks) {
+                            module_.hooked[h.old_entry] = h.new_entry;
                         }
                     }
-                    record_code();  // takes the module lock itself
+                    record_code();  // WP-25; takes the module lock itself
+                    applied_.push_back(std::move(applied));  // WP-22: still live (or about to be), so a revert has to know it
                     return fail("hooks", Diag::make(pd::kHooksTimeout, "the agent did not confirm the hooks in time: " + answer.error().message,
                                                     "In synchronised mode the application must call SyncPoint(); the patch stays loaded and the hooks may still apply."));
                 }
@@ -998,8 +1024,8 @@ private:
         // ---- commit: the process symbol registry and the hook table (plan step 9) -----------------------------------
         {
             std::lock_guard<std::mutex> lock(module_.mutex);
-            for (const auto& h : installed) {
-                module_.hooked[h.first] = h.second;
+            for (const AppliedHook& h : applied.hooks) {
+                module_.hooked[h.old_entry] = h.new_entry;
             }
             ++module_.generation;
             report.generation = module_.generation;
@@ -1012,7 +1038,7 @@ private:
                 a.va = *va;
                 a.is_function = true;
                 a.origin = "patch " + std::to_string(patch_no);
-                module_.registry.add(f.name, std::move(a));
+                applied.registry.push_back(RegistryUndo{f.name, module_.registry.replace(f.name, std::move(a))});
             } else {
                 warn(report, "hooks", Diag::make(bind::diag::kLayoutIncomplete, "the new function '" + f.display + "' has no address in the patch layout; later patches cannot bind to it",
                                                  "Report this with the bind plan."));
@@ -1024,12 +1050,13 @@ private:
                 a.va = *va;
                 a.is_function = false;
                 a.origin = "patch " + std::to_string(patch_no);
-                module_.registry.add(g.name, std::move(a));
+                applied.registry.push_back(RegistryUndo{g.name, module_.registry.replace(g.name, std::move(a))});
             } else {
                 warn(report, "hooks", Diag::make(bind::diag::kLayoutIncomplete, "the new global '" + g.display + "' has no address in the patch layout; later patches cannot bind to it",
                                                  "Report this with the bind plan."));
             }
         }
+        applied_.push_back(std::move(applied));
         report.dll_path = linked.dll_path;
         report.patched = true;
         if (ctx_.events != nullptr) {

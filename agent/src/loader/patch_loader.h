@@ -176,6 +176,9 @@ public:
     // committed, its target is the module (from `modules`) holding the old entry, or the target of the patch
     // that does.
     void commit_hooked(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& hooks, const std::vector<proc::ModuleInfo>& modules);
+    // WP-22: the patch at `image_base` was reverted. Its hook records stop being collected (committed = false); the image stays
+    // loaded and hooks that already run from it finish (they hold a lease). CML5207-style unknown-patch error when no patch is there.
+    Result<void> uncommit_patch(std::uint64_t image_base);
     std::vector<proc::AddressRange> owned_ranges() const;
     bool is_loaded(std::uint64_t image_base) const;
 

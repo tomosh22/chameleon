@@ -147,6 +147,7 @@ struct PipelineContext {
     std::shared_ptr<ExportCache> exports;         // shared between reloads
     std::chrono::steady_clock::time_point deadline;
     toolchain::CancelToken* cancel = nullptr;
+    std::uint64_t reload_id = 0;                  // WP-22: the reload command this run belongs to (a revert of `last` undoes one id)
     bool confirm = false;                         // WP-15: the request accepted a reload above max_affected_compilands
     std::shared_ptr<CompileCache> compile_cache;  // may be null: every compile runs
 };

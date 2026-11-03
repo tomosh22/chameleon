@@ -660,6 +660,51 @@ TEST_CASE("hook leases: a patch is invisible until committed; unload hides it, w
     CHECK(session.loader.patch_count() == 0);
 }
 
+TEST_CASE("WP-22: ReleaseRange mode Uncommit hides a committed patch from hook collection and leaves the image loaded") {
+    LoaderSession session(1);
+    const std::uint64_t first = session.blocks[0].base;
+    const ipc::PatchLoaded a = session.load(make_request(first, "hook_uncommit", false, false));
+    REQUIRE_MESSAGE(a.status == 0, a.message);
+    const proc::ModuleInfo host{host_base(), host_size(), "host.exe"};
+    session.loader.commit_hooked({{host_base() + 0x10, first + proto().rva_answer}}, {host});
+    {
+        PatchLoader::HookLease lease = session.loader.acquire_hook_lease();
+        REQUIRE(lease.images().size() == 1);
+        CHECK(lease.images()[0].committed);
+        CHECK(lease.images()[0].target_base == host_base());
+    }
+    ipc::ReleaseRange request;
+    request.request_id = 41;
+    request.base = first;
+    request.mode = ipc::ReleaseMode::Uncommit;
+    CHECK(PatchLoader::is_loader_request(ipc::Message(request)));
+    ipc::Message answer = session.loader.handle_request(request);
+    REQUIRE(std::holds_alternative<ipc::Reply>(answer));
+    CHECK_MESSAGE(std::get<ipc::Reply>(answer).status == 0, std::get<ipc::Reply>(answer).message);
+    CHECK(std::get<ipc::Reply>(answer).request_id == 41);
+    {
+        PatchLoader::HookLease lease = session.loader.acquire_hook_lease();
+        REQUIRE(lease.images().size() == 1);  // still loaded and leased ...
+        CHECK_FALSE(lease.images()[0].committed);  // ... but its records are no longer collected
+        CHECK(lease.images()[0].target_base == 0);
+    }
+    CHECK(is_module_loaded_at(first));
+    // An address that is no patch is refused.
+    request.request_id = 42;
+    request.base = first + 0x10000000ull;
+    answer = session.loader.handle_request(request);
+    REQUIRE(std::holds_alternative<ipc::Reply>(answer));
+    CHECK(std::get<ipc::Reply>(answer).status == ids::kLoaderUnknownPatch);
+    // A later commit (a new InstallHooks of the same patch) makes it visible again.
+    session.loader.commit_hooked({{host_base() + 0x10, first + proto().rva_answer}}, {host});
+    {
+        PatchLoader::HookLease lease = session.loader.acquire_hook_lease();
+        REQUIRE(lease.images().size() == 1);
+        CHECK(lease.images()[0].committed);
+    }
+    REQUIRE(session.loader.unload_patch(first).has_value());
+}
+
 TEST_CASE("hook leases: an unload that cannot get the leases back says so, keeps the patch and hides its hooks") {
     LoaderSession session(1);
     const std::uint64_t first = session.blocks[0].base;

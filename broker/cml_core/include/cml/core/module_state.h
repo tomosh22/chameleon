@@ -16,6 +16,7 @@
 
 #include "cml/core/hook_narrowing.h"
 #include "cml/core/module_index.h"
+#include "cml/core/source_baseline.h"
 #include "cml/core/symbol_registry.h"
 #include "cml/ipc/messages.h"
 #include "cml/pe/pe.h"
@@ -28,7 +29,9 @@ namespace cml::core {
 class SharedRegistry final : public SymbolRegistry {
 public:
     std::optional<SymbolAddress> find(std::string_view decorated_name) const override;
-    void add(std::string name, SymbolAddress address);
+    // Registers `name`; returns what it resolved to before (nullopt: it was not registered). WP-22: restore() is the undo.
+    std::optional<SymbolAddress> replace(std::string name, SymbolAddress address);
+    void restore(const std::string& name, const std::optional<SymbolAddress>& previous);
     std::size_t size() const;
 
 private:
@@ -54,6 +57,37 @@ private:
     std::vector<std::uint64_t> next_;  // per block: first free address
 };
 
+// A function hooked by a patch (WP-22: kept so a revert can put the previous patch's jump back).
+struct AppliedHook {
+    std::uint64_t old_entry = 0;
+    std::uint64_t new_entry = 0;
+    std::string name;
+};
+
+// A registry entry a patch added, and what the name resolved to before.
+struct RegistryUndo {
+    std::string name;
+    std::optional<SymbolAddress> previous;
+};
+
+// One patch that is live in the process (WP-22). Its DLL stays loaded for the rest of the session.
+struct AppliedPatch {
+    std::uint64_t number = 0;  // the patch counter value that names its files
+    std::uint64_t base = 0;
+    std::string dll_path;
+    std::vector<AppliedHook> hooks;
+    std::vector<RegistryUndo> registry;  // in the order the entries were added
+};
+
+// The patches one reload applied to the module: the unit a `revert` with scope `last` undoes (a reload that
+// recompiles three translation units makes three patches; undoing one of them would leave a mixed state).
+struct PatchBatch {
+    std::vector<AppliedPatch> patches;
+    std::uint64_t generation_before = 0;                 // the module's generation before the batch
+    std::uint64_t reload_id = 0;                         // the reload command that made it (ReloadService numbers them 1, 2, ...)
+    std::map<std::string, FileStamp> baseline_before;    // the source baseline the batch replaced
+};
+
 struct ModuleState {
     std::string path;  // full path of the module file
     std::string name;  // file name ("fixture_basic.exe")
@@ -70,7 +104,8 @@ struct ModuleState {
     std::string linker_key;                         // the `linker` / `linker_path` options `linker` was resolved with
     std::shared_ptr<const pe::OwnedImage> image;    // the module file on disk (old code bytes, narrowing)
     std::uint64_t generation = 0;                   // patches applied to this module
-    std::uint64_t patch_counter = 0;                // names patch files (also counts failed attempts)
+    std::uint64_t patch_counter = 0;                // names patch files (also counts failed attempts; never goes back)
+    std::vector<PatchBatch> batches;                // live patches, oldest first (WP-22)
 
     bool is_hooked(std::uint64_t old_va);
 

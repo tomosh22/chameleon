@@ -34,6 +34,7 @@ to the fixture directory).
 | `exe_plus_dll` | present (WP-16) | exe + `fixture_exe_plus_dll_lib.dll`, both enabled; `TICK dll= cb= imp=`; edits `dll_scale_30` (DLL) and `exe_changes` (exe callback + code reading `__imp_lib_offset`) |
 | `two_processes` | present (WP-16) | `fixture_two_processes` (server) and `fixture_two_processes_client` share `fixture_two_processes_lib.dll`; edit `value_70` (7 → 70, per-process call counter) |
 | `elision` | present (WP-25) | one TU: template (two instantiations), string literal, small function + caller; edits `base_20` and, stacked, `inner_7` and `comment`; scenario `only_one_function_changed` |
+| `revert` | present (WP-22) | three versions of `compute_value()` (1, then 2 via edit `to_b` adding `revert_helper()`, then 3 via the stacked edit `edits/stacked/to_c`); scenario `revert` reloads twice, reverts `last` and `all`, reloads again |
 
 Fixtures after `basic` share `common/fixture_runtime.h` (TICK loop, `--ticks`, `--agent`,
 `--agent-wait`), which only `main.cpp` includes; scenarios never patch `main.cpp`.
