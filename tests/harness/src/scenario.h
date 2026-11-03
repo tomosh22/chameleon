@@ -25,6 +25,11 @@ enum class StepKind {
     SignalFixture,        // create the file named by CML_FIXTURE_SIGNAL_FILE, which the fixture waits for (WP-17)
     ExpectReloadResult,   // an integer member of the most recent reload's result has this value (WP-16)
     Restart,              // control command `restart` (WP-21, restart_step.h): the process is replaced by a relaunched one
+    // WP-20, crash -> patch -> continue (bodies in exception_steps.cpp, needs the capability "exceptions").
+    WatchExceptions,          // subscribe to `exception` events: the agents start holding faulting threads
+    ExpectException,          // an `exception` event arrives (optional code / function must match)
+    ExceptionAction,          // control command `exception-action` for the current exception
+    ExpectPendingExceptions,  // control command `exceptions` lists exactly `count` held threads
 };
 
 const char* to_string(StepKind kind);
@@ -60,6 +65,12 @@ struct Step {
     std::string label;
     std::string args;   // Launch: extra command-line arguments of the fixture process (after --agent)
     std::string process;
+    // WP-20. ExpectException: `exception_code` ("0xC0000005") and `exception_function` (substring) must match when set.
+    // ExceptionAction: `exception_action` is continue | leave | ignore; `expect_error` (CMLnnnn) = the action must be refused.
+    // ExpectPendingExceptions: `result_value` is the expected count.
+    std::string exception_code;
+    std::string exception_function;
+    std::string exception_action;
 
     // "expect_stdout /value=2/ within 10 s"
     std::string describe() const;

@@ -350,6 +350,27 @@ void encode(Writer& w, const CompileEvent& m) {
     w.str(m.module);
     w.str(m.text);
 }
+void encode(Writer& w, const Exception& m) {
+    w.u32(m.exception_id);
+    w.u32(m.thread_id);
+    w.u32(m.code);
+    w.u32(m.flags);
+    w.u32(m.access);
+    w.u64(m.address);
+    w.u64(m.data_address);
+    w.u64(m.stack_pointer);
+    w.u64(m.module_base);
+    w.str(m.module_path);
+}
+void encode(Writer& w, const ExceptionAction& m) {
+    w.u64(m.request_id);
+    w.u32(m.exception_id);
+    w.u32(static_cast<std::uint32_t>(m.action));
+}
+void encode(Writer& w, const ExceptionConfig& m) {
+    w.u64(m.request_id);
+    w.u32(m.flags);
+}
 void encode(Writer& w, const InstallHooks& m) {
     w.u64(m.request_id);
     w.u32(m.flags);
@@ -598,6 +619,40 @@ Message decode_compile_event(Reader& r) {
     m.text = r.str();
     return m;
 }
+Message decode_exception(Reader& r) {
+    Exception m;
+    m.exception_id = r.u32();
+    m.thread_id = r.u32();
+    m.code = r.u32();
+    m.flags = r.u32();
+    m.access = r.u32();
+    m.address = r.u64();
+    m.data_address = r.u64();
+    m.stack_pointer = r.u64();
+    m.module_base = r.u64();
+    m.module_path = r.str();
+    return m;
+}
+Message decode_exception_action(Reader& r) {
+    ExceptionAction m;
+    m.request_id = r.u64();
+    m.exception_id = r.u32();
+    const std::uint32_t action = r.u32();
+    if (r.ok() && (action < 1 || action > 3)) {
+        r.fail("unknown exception action");
+    }
+    m.action = static_cast<ExceptionActionKind>(action);
+    return m;
+}
+Message decode_exception_config(Reader& r) {
+    ExceptionConfig m;
+    m.request_id = r.u64();
+    m.flags = r.u32();
+    if (r.ok() && (m.flags & ~kExceptionConfigKnownFlags) != 0) {
+        r.fail("unknown ExceptionConfig flags");
+    }
+    return m;
+}
 Message decode_install_hooks(Reader& r) {
     InstallHooks m;
     m.request_id = r.u64();
@@ -810,6 +865,7 @@ const char* to_string(MessageType type) noexcept {
         case MessageType::SyncPointReady: return "SyncPointReady";
         case MessageType::Exception: return "Exception";
         case MessageType::ExceptionAction: return "ExceptionAction";
+        case MessageType::ExceptionConfig: return "ExceptionConfig";
         case MessageType::Log: return "Log";
         case MessageType::Restart: return "Restart";
         case MessageType::RestartInfo: return "RestartInfo";
@@ -836,6 +892,9 @@ bool is_implemented(MessageType type) noexcept {
         case MessageType::Restart:
         case MessageType::RestartInfo:
         case MessageType::ReenableModules:
+        case MessageType::Exception:
+        case MessageType::ExceptionAction:
+        case MessageType::ExceptionConfig:
         case MessageType::ReserveRange:
         case MessageType::ReserveRangeResult:
         case MessageType::ReleaseRange:
@@ -864,6 +923,9 @@ MessageType type_of(const Message& message) noexcept {
         MessageType operator()(const RestartInfo&) const noexcept { return MessageType::RestartInfo; }
         MessageType operator()(const ReenableModules&) const noexcept { return MessageType::ReenableModules; }
         MessageType operator()(const Reply&) const noexcept { return MessageType::Reply; }
+        MessageType operator()(const Exception&) const noexcept { return MessageType::Exception; }
+        MessageType operator()(const ExceptionAction&) const noexcept { return MessageType::ExceptionAction; }
+        MessageType operator()(const ExceptionConfig&) const noexcept { return MessageType::ExceptionConfig; }
         MessageType operator()(const InstallHooks&) const noexcept { return MessageType::InstallHooks; }
         MessageType operator()(const HooksInstalled&) const noexcept { return MessageType::HooksInstalled; }
         MessageType operator()(const ReserveRange&) const noexcept { return MessageType::ReserveRange; }
@@ -1047,6 +1109,9 @@ Result<Message> decode_message(std::uint16_t type, std::uint16_t version, const 
         case MessageType::Restart: message = decode_restart(reader); break;
         case MessageType::RestartInfo: message = decode_restart_info(reader); break;
         case MessageType::ReenableModules: message = decode_reenable_modules(reader); break;
+        case MessageType::Exception: message = decode_exception(reader); break;
+        case MessageType::ExceptionAction: message = decode_exception_action(reader); break;
+        case MessageType::ExceptionConfig: message = decode_exception_config(reader); break;
         case MessageType::InstallHooks: message = decode_install_hooks(reader); break;
         case MessageType::HooksInstalled: message = decode_hooks_installed(reader); break;
         case MessageType::ReserveRange: message = decode_reserve_range(reader); break;
@@ -1092,6 +1157,8 @@ bool is_request_type(std::uint16_t type) noexcept {
         case MessageType::InstallHooks:
         case MessageType::Restart:
         case MessageType::ReenableModules:
+        case MessageType::ExceptionAction:
+        case MessageType::ExceptionConfig:
         case MessageType::ReserveRange:
         case MessageType::ReleaseRange:
         case MessageType::LoadPatch:
@@ -1117,6 +1184,8 @@ std::optional<std::uint64_t> peek_request_id(std::uint16_t type, const std::uint
         case MessageType::Restart:
         case MessageType::RestartInfo:
         case MessageType::ReenableModules:
+        case MessageType::ExceptionAction:
+        case MessageType::ExceptionConfig:
         case MessageType::ReserveRange:
         case MessageType::ReserveRangeResult:
         case MessageType::ReleaseRange:
@@ -1196,6 +1265,18 @@ std::string describe(const Message& message) {
         std::string operator()(const Reply& m) const {
             return "Reply request=" + std::to_string(m.request_id) +
                    " status=" + std::to_string(m.status) + " message=" + quoted(m.message);
+        }
+        std::string operator()(const Exception& m) const {
+            return "Exception id=" + std::to_string(m.exception_id) + " tid=" + std::to_string(m.thread_id) + " code=0x" + hex(m.code, 8) +
+                   " address=0x" + hex(m.address) + " data=0x" + hex(m.data_address) + " module=" + quoted(m.module_path) +
+                   (m.flags != 0 ? " flags=" + std::to_string(m.flags) : std::string());
+        }
+        std::string operator()(const ExceptionAction& m) const {
+            return "ExceptionAction request=" + std::to_string(m.request_id) + " id=" + std::to_string(m.exception_id) +
+                   (m.action == ExceptionActionKind::Continue ? " continue" : m.action == ExceptionActionKind::Leave ? " leave" : " ignore");
+        }
+        std::string operator()(const ExceptionConfig& m) const {
+            return "ExceptionConfig request=" + std::to_string(m.request_id) + " flags=" + std::to_string(m.flags);
         }
         std::string operator()(const InstallHooks& m) const {
             return std::string("InstallHooks request=") + std::to_string(m.request_id) +

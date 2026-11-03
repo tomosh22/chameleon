@@ -232,6 +232,19 @@ private:
     void capture_launch_info();
     bool flush_replies(ipc::PipeConnection& connection);
 
+    // WP-20: crash -> patch -> continue (crash/exception_agent.cpp; the faulting thread's half is crash/exception_gate.cpp).
+    // The broker enables holding with ExceptionConfig; held threads are reported with Exception and released by
+    // ExceptionAction. All of these run on the agent thread except install_crash_handler (Agent::start).
+    void install_crash_handler();
+    void begin_crash_thread();   // agent thread start: never hold this thread; its wake event is the gate's notify event
+    void end_crash_thread();     // agent thread end
+    void end_crash_session();    // a session ended: no broker to ask any more, release every held thread (Ignore)
+    void handle_exception_config(const ipc::ExceptionConfig& config);
+    void handle_exception_action(const ipc::ExceptionAction& action);
+    bool flush_exceptions(ipc::PipeConnection& connection);
+    void refresh_exception_ranges();
+    void refresh_exception_ranges_if_due();
+
     // Any thread ------------------------------------------------------------------------------
     cml_status enqueue(std::uint64_t id, ipc::Message message, bool wanted);
     template <class Build>
@@ -311,6 +324,9 @@ private:
     ULONGLONG full_list_not_before_ = 0;    // earliest tick for the next full-list resend
     DWORD list_backoff_ms_ = 1000;          // 1 s, 2 s ... 30 s; reset when a list is accepted
     bool full_list_pending_ = false;         // the broker refused a ModuleList: send a full one on the next poll
+    // WP-20: set when something the crash handler's table of application ranges is built from changed (module list, enabled set,
+    // patch set); the agent thread rebuilds the table then, and only then.
+    std::atomic<bool> ranges_dirty_{false};
 };
 
 }  // namespace cml::agent

@@ -29,7 +29,10 @@ set(CML_AGENT_WINDOWS_SOURCES
     src/restart.cpp
     # WP-08: address-space reservation and patch loading
     src/loader/image_writer.cpp
-    src/loader/patch_loader.cpp)
+    src/loader/patch_loader.cpp
+    # WP-20: crash -> patch -> continue
+    src/crash/exception_gate.cpp
+    src/crash/exception_agent.cpp)
 
 add_library(cml_agent_core STATIC ${CML_AGENT_PORTABLE_SOURCES} ${CML_AGENT_WINDOWS_SOURCES})
 target_include_directories(cml_agent_core

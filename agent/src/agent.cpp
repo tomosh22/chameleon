@@ -18,6 +18,8 @@
 #include "cml/proc/proc.h"
 #include "cml/util/log.h"
 #include "cml/util/path.h"
+#include "crash/diag_ids.h"
+#include "crash/exception_gate.h"
 #include "hook/installer.h"
 #include "hook/user_hook_ids.h"
 #include "loader/patch_loader.h"
@@ -187,6 +189,7 @@ void Agent::stop_and_wait_for_calls() {
 
 Result<void> Agent::start() {
     install_logging();
+    install_crash_handler();  // WP-20: registered first, but does nothing until the broker enables it
 
     Result<std::string> pipe = ipc::resolve_pipe_name(std::string());
     if (!pipe) {
@@ -477,6 +480,7 @@ bool Agent::try_connect(ipc::PipeConnection& out, ConnectState& state) {
 
 void Agent::run() {
     CML_LOG(Debug, "agent thread running");
+    begin_crash_thread();
     ConnectState state;
     while (!stopping_.load(std::memory_order_acquire)) {
         ipc::PipeConnection connection;
@@ -496,6 +500,7 @@ void Agent::run() {
         // Never hammer a broker that refuses or drops us: always pause before the next attempt.
         WaitForSingleObject(stop_event_, established ? kReconnectPauseMs : state.backoff_ms);
     }
+    end_crash_thread();
     CML_LOG(Debug, "agent thread exiting");
 }
 
@@ -515,6 +520,7 @@ bool Agent::run_session(ipc::PipeConnection& connection) {
         serve(connection);
     }
     connected_.store(false, std::memory_order_release);
+    end_crash_session();
     register_connection(nullptr);
     connection.close();
     if (!stopping_.load(std::memory_order_acquire)) {
@@ -659,6 +665,7 @@ bool Agent::send_module_list(ipc::PipeConnection& connection) {
         return false;
     }
     known_modules_ = list.modules;
+    ranges_dirty_.store(true, std::memory_order_release);
     last_module_poll_ = GetTickCount64();
     if (modules) {
         polled_seq_ = seq_mark;
@@ -759,6 +766,9 @@ bool Agent::poll_modules(ipc::PipeConnection& connection) {
         }
     }
     known_modules_ = std::move(current);
+    if (!delta.loaded.empty() || !delta.unloaded.empty()) {
+        ranges_dirty_.store(true, std::memory_order_release);
+    }
     polled_seq_ = seq_mark;
     return true;
 }
@@ -773,6 +783,7 @@ void Agent::note_sent_locked(Entry& entry) {
 }
 
 void Agent::track_enabled_locked(const Entry& entry, std::uint32_t status) {
+    ranges_dirty_.store(true, std::memory_order_release);  // WP-20: the enabled set may change
     if (const auto* enable = std::get_if<ipc::EnableModule>(&entry.message)) {
         const auto same = [enable](const EnabledModule& m) { return same_module(m.path, enable->path); };
         if (status == 0) {
@@ -1012,12 +1023,21 @@ void Agent::handle_message(const ipc::Message& message) {
         handle_reenable(*reenable);
         return;
     }
+    if (const auto* config = std::get_if<ipc::ExceptionConfig>(&message)) {
+        handle_exception_config(*config);
+        return;
+    }
+    if (const auto* action = std::get_if<ipc::ExceptionAction>(&message)) {
+        handle_exception_action(*action);
+        return;
+    }
     CML_LOG(Warn, "ignoring unexpected %s from the broker", ipc::to_string(ipc::type_of(message)));
 }
 
 void Agent::serve(ipc::PipeConnection& connection) {
     while (!stopping_.load(std::memory_order_acquire)) {
-        if (!flush_outgoing(connection) || !flush_replies(connection) || !flush_logs(connection)) {
+        refresh_exception_ranges_if_due();
+        if (!flush_outgoing(connection) || !flush_replies(connection) || !flush_logs(connection) || !flush_exceptions(connection)) {
             return;
         }
         if (GetTickCount64() - last_module_poll_ >= kModulePollMs && !poll_modules(connection)) {
@@ -1036,6 +1056,9 @@ void Agent::serve(ipc::PipeConnection& connection) {
                     CML_LOG(Debug, "<- %s", ipc::describe(received->message).c_str());
                     if (!send_message(connection, loader::PatchLoader::shared().handle_request(received->message))) {
                         return;
+                    }
+                    if (crash::ExceptionGate::shared().enabled()) {
+                        refresh_exception_ranges();  // a patch image that was just loaded (or unloaded) changes what counts as application code
                     }
                     break;
                 }

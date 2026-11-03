@@ -34,6 +34,8 @@ add_library(cml_core STATIC
     src/pipeline_native.cpp
     # WP-14: compile on save
     src/save_watcher.cpp
+    # WP-20: crash -> patch -> continue
+    src/exception_service.cpp
     src/reload_service.cpp
     # WP-21: hot-restart (portable orchestration; restart_win.cpp is the Windows ProcessHost)
     src/restart.cpp

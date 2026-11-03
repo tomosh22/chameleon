@@ -58,6 +58,10 @@ struct ReloadOptions {
     std::string linker_override;               // "link" | "lld-link" | "" (detect)
     std::string linker_path;                   // explicit linker binary
     bool compile_on_save = false;              // WP-14: watch the tracked sources and reload when one is saved
+    // WP-20 (crash -> patch -> continue): the agent holds a thread that faulted in an enabled module only while a control
+    // client listens for `exception` events AND crash_handler is on.
+    bool crash_handler = true;
+    bool break_with_debugger = false;          // also hold the fault when a debugger is attached to the application
 };
 
 // Replaceable effects.

@@ -41,6 +41,7 @@ inline constexpr const char* kSetOption = "set-option";
 inline constexpr const char* kSubscribe = "subscribe";
 inline constexpr const char* kDiagEvents = "diag-events";  // `diag` events are delivered to subscribers
 inline constexpr const char* kRestart = "restart";  // WP-21: `restart` command, `restarted` event
+inline constexpr const char* kExceptions = "exceptions";    // WP-20: `exception` events, `exception-action` and `exceptions` commands
 }  // namespace capability
 
 struct ControlDiag {
