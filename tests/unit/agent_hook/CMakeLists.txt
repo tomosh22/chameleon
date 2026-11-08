@@ -57,3 +57,20 @@ if(MSVC AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../fixtures/basic/CMakeLists.
         PASS_REGULAR_EXPRESSION "LDE-SUMMARY functions=[1-9][0-9]* decoded=[1-9][0-9]*"
         TIMEOUT 300)
 endif()
+
+# WP-26 (plan section 11, the decoder corpus test): the same probe over every function entry of the other fixtures'
+# PDBs, counting the outcomes of plan_hook() (padding / five-byte / refused). An unknown-opcode refusal (CML4300) other
+# than for a VEX/EVEX instruction (documented limitation, counted as refused_vex) is a decoder bug and fails the test;
+# the large real-project PDBs are run by .github/workflows/corpus.yml.
+if(MSVC)
+    foreach(_cml_lde_fx basic templates virtuals statics lambdas optimised tls pch bigobj elision hot_restart new_function)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../fixtures/${_cml_lde_fx}/CMakeLists.txt")
+            add_dependencies(cml_lde_probe fixture_${_cml_lde_fx})
+            add_test(NAME tool.lde_corpus_${_cml_lde_fx}
+                COMMAND cml_lde_probe $<TARGET_FILE:fixture_${_cml_lde_fx}> --quiet --fail-on-unknown-opcode --min-functions 5)
+            set_tests_properties(tool.lde_corpus_${_cml_lde_fx} PROPERTIES
+                PASS_REGULAR_EXPRESSION "LDE-OUTCOME functions=[1-9][0-9]* padding=[0-9]+ five_byte=[0-9]+ refused=[0-9]+ refused_vex=[0-9]+ refused_unknown_opcode=0 "
+                TIMEOUT 300)
+        endif()
+    endforeach()
+endif()

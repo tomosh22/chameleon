@@ -1,0 +1,126 @@
+{
+  "name": "imgui",
+  "repo": "https://github.com/ocornut/imgui.git",
+  "tag": "v1.91.9b",
+  "commit": "f5befd2d29e66809cd1110a152e375a7f1981f06",
+  "license": "MIT",
+  "support_dir": ".",
+  "patch": "chameleon.patch",
+  "args": [],
+  "env": {},
+  "edits": [
+    {
+      "id": "backend-dx11",
+      "file": "backends/imgui_impl_dx11.cpp",
+      "replace": [
+        {
+          "find": "void ImGui_ImplDX11_NewFrame()\n{\n",
+          "with": "void ImGui_ImplDX11_NewFrame()\n{\n    cml_corpus_marker(\"imgui_dx11_newframe_v2\");\n"
+        }
+      ],
+      "include": "chameleon_corpus.h",
+      "expect": "markers=\\S*imgui_dx11_newframe_v2:\\d+"
+    },
+    {
+      "id": "backend-win32",
+      "file": "backends/imgui_impl_win32.cpp",
+      "replace": [
+        {
+          "find": "void    ImGui_ImplWin32_NewFrame()\n{\n",
+          "with": "void    ImGui_ImplWin32_NewFrame()\n{\n    cml_corpus_marker(\"imgui_win32_newframe_v2\");\n"
+        }
+      ],
+      "include": "chameleon_corpus.h",
+      "expect": "markers=\\S*imgui_win32_newframe_v2:\\d+",
+      "compiler": "clang-cl"
+    },
+    {
+      "id": "example-main-tu",
+      "file": "examples/example_win32_directx11/main.cpp",
+      "replace": [
+        {
+          "find": "    g_CmlCorpusExampleFrames = g_CmlCorpusExampleFrames + 1;\n}",
+          "with": "    cml_corpus_marker(\"imgui_example_frame_v2\");\n    g_CmlCorpusExampleFrames = g_CmlCorpusExampleFrames + 1;\n}"
+        }
+      ],
+      "expect": "markers=\\S*imgui_example_frame_v2:\\d+"
+    },
+    {
+      "id": "header-inline-support",
+      "file": "chameleon_corpus.h",
+      "replace": [
+        {
+          "find": "    return 1;",
+          "with": "    return 2;"
+        }
+      ],
+      "expect": "inline=2 "
+    },
+    {
+      "id": "template-support",
+      "file": "chameleon_corpus.h",
+      "replace": [
+        {
+          "find": "static_cast<T>(2)",
+          "with": "static_cast<T>(3)"
+        }
+      ],
+      "expect": "tmpl=64 "
+    },
+    {
+      "id": "unsupported-static-overloads-win32-backend",
+      "file": "backends/imgui_impl_win32.cpp",
+      "replace": [
+        {
+          "find": "void    ImGui_ImplWin32_NewFrame()\n{\n",
+          "with": "void    ImGui_ImplWin32_NewFrame()\n{\n    cml_corpus_marker(\"imgui_win32_newframe_v2\");\n"
+        }
+      ],
+      "include": "chameleon_corpus.h",
+      "expect_error": "CML3214",
+      "compiler": "msvc"
+    },
+    {
+      "id": "unsupported-static-overloads-library-tu",
+      "file": "imgui.cpp",
+      "replace": [
+        {
+          "find": "void ImGui::NewFrame()\n{\n",
+          "with": "void ImGui::NewFrame()\n{\n    cml_corpus_marker(\"imgui_newframe_v2\");\n"
+        }
+      ],
+      "include": "chameleon_corpus.h",
+      "expect_error": "CML3214"
+    },
+    {
+      "id": "unsupported-static-overloads-header",
+      "file": "imgui_internal.h",
+      "replace": [
+        {
+          "find": "static inline float  ImFloor(float f)                                           { return (float)((f >= 0 || (float)(int)f == f) ? (int)f : (int)f - 1); } // Decent replacement for floorf()",
+          "with": "static inline float  ImFloor(float f)                                           { cml_corpus_marker(\"imgui_floor_v2\"); return (float)((f >= 0 || (float)(int)f == f) ? (int)f : (int)f - 1); } // Decent replacement for floorf()"
+        }
+      ],
+      "include": "chameleon_corpus.h",
+      "expect_error": "CML3214",
+      "include_anchor": "#include <stdio.h>"
+    },
+    {
+      "id": "unsupported-new-thread-local",
+      "file": "backends/imgui_impl_dx11.cpp",
+      "replace": [
+        {
+          "find": "void ImGui_ImplDX11_Shutdown()\n{\n",
+          "with": "void ImGui_ImplDX11_Shutdown()\n{\n    static thread_local int cml_corpus_tls = 0;\n    cml_corpus_tls++;\n"
+        }
+      ],
+      "expect_error": "CML3400"
+    }
+  ],
+  "reload_timeout_s": 120,
+  "observe_timeout_s": 30,
+  "start_timeout_s": 90,
+  "index_timeout_s": 300,
+  "min_functions": 1000,
+  "expected_failures": []
+}

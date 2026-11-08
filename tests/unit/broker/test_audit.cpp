@@ -552,3 +552,25 @@ TEST_CASE("enable time: the index of a module that fails the audit fails with th
     CHECK(index3->status().state == IndexState::Ready);
     CHECK_FALSE(index3->audit().has_value());
 }
+
+// WP-26, finding F-1 (docs/wp/WP-26.md): the real-project corpus showed that code linked in from a static library (raylib built as
+// a CMake library, every directory of Godot) is never a source compiland, so a change to it reloads nothing. This pins the rule
+// as it is today: the PDB names the archive as the module's object, and ModuleIndex::is_source_compiland() says no.
+TEST_CASE("corpus F-1: a member of a static library is not a source compiland") {
+    QuietLogs quiet;
+    Module m;
+    pdb::OpenOptions options;
+    options.use_cache = false;
+    {
+        Result<std::shared_ptr<const pdb::PdbIndex>> index = pdb::PdbIndex::open_for_pe(m.exe, options);
+        REQUIRE(index);
+        CHECK(ModuleIndex::is_source_compiland(**index, 0));  // a.cpp.obj linked directly
+    }
+    m.spec.modules[0].lib = "C:\\proj\\raylib.lib";  // the same translation unit, now a member of an archive
+    tp::write_file(m.pdb, tp::build(m.spec));
+    {
+        Result<std::shared_ptr<const pdb::PdbIndex>> index = pdb::PdbIndex::open_for_pe(m.exe, options);
+        REQUIRE(index);
+        CHECK_FALSE(ModuleIndex::is_source_compiland(**index, 0));
+    }
+}
