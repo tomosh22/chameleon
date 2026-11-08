@@ -100,7 +100,16 @@ Wave 6 complete (WP-19..22, 24, 25). Wave 7 is paused at the user's request, wit
   - `#if` instead of `if constexpr` for the OFF build, plus a fuzz.yml job that builds with OFF.
 - Both PRs must merge main (WP-27 touched the harness files) and each other's IPC, capability and harness additions.
 
-**Still running:** WP-26 (corpus, wp/26-corpus). Told to finish its current CI iteration, then report; WP-26.md records the state.
+**WP-26 (#46, head 53e4d43): stopped, not yet accepted.**
+- The corpus workflow was green at fd81a45, all five cells: raylib and ImGui under cl and clang-cl, and Godot 4.5.1 under cl (cold build 1444 s).
+- The final head's `ci` and `corpus` runs are not verified yet.
+- Findings, with repros under tests/corpus/repro/:
+  - F-1 (decision needed): members of a static library are never reloaded, and the reload silently returns patched:0. A diagnostic or KNOWN_LIMITATIONS is needed.
+  - F-2: cl CML3101 on indexing a global array by a variable (`__ImageBase`).
+  - F-3 (bug, open): raylib rcore.c under clang-cl crashes after reload, probably static matching for C TUs in bind_plan.cpp. Planner trace output was added.
+  - F-4: CML3214 blocks TUs that use overloaded statics.
+- VEX: the decoder refuses VEX opcodes; this was counted, not fixed.
+- On resume: verify CI on the final head, then do a medium review. Decide F-1 (a diagnostic, not silence). F-3 needs a fix WP, or an explicit refusal, before WP-26 is accepted.
 
 **To resume**
 1. Verify each re-push's CI myself (both runs, plus the fuzz run for WP-28).
