@@ -1,0 +1,127 @@
+# Scenario `perf` (WP-27): the compile -> applied and idle-CPU budgets. Run by the `pdb-benchmark` CI job only (not by the
+# scenarios loop of the build cells: it idles for a minute).
+#
+#   1. the broker has one connected fixture (fixture `perf`, one 2000-line translation unit) and its index is ready;
+#   2. compile_on_save is on, so the file watcher is active, and the broker idles for 60 s: its CPU time must stay under
+#      1 % of one core (budget 0.5 %, CI threshold 1 % = 2x slack for shared runners);
+#   3. compile_on_save goes off again (an edit would otherwise be compiled by the watcher before the explicit reload) and
+#      the fixture's source is edited and reloaded five times (1 -> 2 -> 3 -> 4 -> 5 -> 6);
+#   4. perf_report: median over the five reloads of (total - compile) must stay under 3000 ms (budget 1500 ms, 2x slack);
+#      the per-stage median and maximum, and the broker's peak private bytes, go to perf-reload.json ($CML_PERF_JSON).
+name = "perf"
+description = "fixture perf: broker idle CPU with the watcher on, then five reloads of a 2000-line TU with per-stage timing"
+fixture = "perf"
+timeout_s = 900
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1 sum=\\d+"
+within_s = 30
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_perf.exe"
+within_s = 60
+
+[[step]]
+kind = "wait"
+for = "idle"
+within_s = 60
+
+[[step]]
+kind = "set_option"
+option = "compile_on_save"
+value = true
+
+[[step]]
+kind = "perf_idle"
+duration_s = 60
+max_cpu_permille = 10
+
+[[step]]
+kind = "set_option"
+option = "compile_on_save"
+value = false
+
+[[step]]
+kind = "edit"
+patch = "edits/value_2.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2 sum=\\d+"
+within_s = 10
+
+[[step]]
+kind = "edit"
+patch = "edits/stacked/value_3.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=3 sum=\\d+"
+within_s = 10
+
+[[step]]
+kind = "edit"
+patch = "edits/stacked/value_4.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=4 sum=\\d+"
+within_s = 10
+
+[[step]]
+kind = "edit"
+patch = "edits/stacked/value_5.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=5 sum=\\d+"
+within_s = 10
+
+[[step]]
+kind = "edit"
+patch = "edits/stacked/value_6.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=6 sum=\\d+"
+within_s = 10
+
+[[step]]
+kind = "perf_report"
+max_median_ms = 3000
+min_reloads = 5

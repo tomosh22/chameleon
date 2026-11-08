@@ -1,6 +1,6 @@
 // cml_pdb_bench: load-time and memory benchmark for cml_pdb on a (large) PDB.
 //
-//   cml_pdb_bench <file.pdb> [--min-size-mb N] [--slack S] [--threads N] [--smoke]
+//   cml_pdb_bench <file.pdb> [--min-size-mb N] [--slack S] [--threads N] [--json FILE] [--smoke]
 //
 // Budgets (docs/IMPLEMENTATION_PLAN.md WP-04, ADR-0009):
 //   load time   2 s for a 500 MB PDB, scaled linearly with the file size, times the CI slack S
@@ -10,6 +10,7 @@
 //               the mapped file size (the whole mapping counts, resident or not).
 // Exit code: 0 all assertions hold, 1 a budget or sanity check failed, 2 usage / cannot open.
 // --smoke only checks that everything works (used by ctest on the tiny fixture PDB).
+// --json FILE (WP-27) writes the numbers the CI trend output keeps: size, load time and its budget, memory measure and ratio.
 //
 // The OS cache is warmed first by reading the file in 1 MiB chunks (reported separately): the
 // budget is about parsing, not about a cold disk.
@@ -98,6 +99,7 @@ int main(int argc, char** argv) {
     double slack = 2.0;
     unsigned threads = 0;
     bool smoke = false;
+    std::string json_path;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--min-size-mb" && i + 1 < argc) {
@@ -108,15 +110,17 @@ int main(int argc, char** argv) {
             threads = static_cast<unsigned>(std::atoi(argv[++i]));
         } else if (a == "--smoke") {
             smoke = true;
+        } else if (a == "--json" && i + 1 < argc) {
+            json_path = argv[++i];
         } else if (!a.empty() && a[0] != '-' && path.empty()) {
             path = a;
         } else {
-            std::fprintf(stderr, "usage: cml_pdb_bench <file.pdb> [--min-size-mb N] [--slack S] [--threads N] [--smoke]\n");
+            std::fprintf(stderr, "usage: cml_pdb_bench <file.pdb> [--min-size-mb N] [--slack S] [--threads N] [--json FILE] [--smoke]\n");
             return 2;
         }
     }
     if (path.empty()) {
-        std::fprintf(stderr, "usage: cml_pdb_bench <file.pdb> [--min-size-mb N] [--slack S] [--threads N] [--smoke]\n");
+        std::fprintf(stderr, "usage: cml_pdb_bench <file.pdb> [--min-size-mb N] [--slack S] [--threads N] [--json FILE] [--smoke]\n");
         return 2;
     }
 
@@ -263,10 +267,21 @@ int main(int argc, char** argv) {
                  std::to_string(resolved) + "/" + std::to_string(looked_up) + " resolved in " + fmt("%.1f ms", q_ms));
 
     // ---- budgets ------------------------------------------------------------------------------
+    const double budget_ms = std::max(100.0, 2000.0 * (size_mb / 500.0) * slack);
+    if (!json_path.empty()) {
+        std::ofstream out(json_path, std::ios::binary | std::ios::trunc);
+        char buf[512];
+        std::snprintf(buf, sizeof buf,
+                      "{\"size_bytes\":%llu,\"load_ms\":%.1f,\"budget_ms\":%.1f,\"slack\":%.2f,\"ms_per_500mb\":%.1f,"
+                      "\"memory_measure_bytes\":%.0f,\"memory_over_pdb\":%.4f}\n",
+                      static_cast<unsigned long long>(file_bytes), load_ms, budget_ms, slack,
+                      size_mb > 0 ? load_ms * 500.0 / size_mb : 0.0, budget_mem,
+                      file_bytes > 0 ? budget_mem / static_cast<double>(file_bytes) : 0.0);
+        out << buf;
+    }
     if (smoke) {
         std::printf("\n(smoke mode: budgets are not enforced)\n");
     } else {
-        const double budget_ms = std::max(100.0, 2000.0 * (size_mb / 500.0) * slack);
         check.expect(load_ms <= budget_ms, "load time within budget",
                      fmt("%.0f ms <= %.0f ms (2 s per 500 MB x slack %.1f)", load_ms, budget_ms, slack));
         const double mem_budget = 1.5 * static_cast<double>(file_bytes);
