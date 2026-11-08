@@ -40,3 +40,10 @@ foreach(_cml_m6 crash hot_restart revert tls elision)
         add_subdirectory(${_cml_m6})
     endif()
 endforeach()
+
+# Wave 7 fixture directories (ADR-0035), built only once a work package adds them.
+foreach(_cml_m7 crash_reexecute perf inject)
+    if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/${_cml_m7}/CMakeLists.txt")
+        add_subdirectory(${_cml_m7})
+    endif()
+endforeach()
