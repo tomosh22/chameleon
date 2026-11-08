@@ -17,7 +17,6 @@ const std::vector<CommandInfo>& command_table() {
         {"subscribe", ipc::capability::kSubscribe, "compile output, change list, patch history, log view"},
         {"exceptions", "exceptions", "pending exceptions list"},
         {"exception-action", "exceptions", "exception dialog: Continue / Leave function / Ignore"},
-        {"exception-action", "reexecute", "exception dialog: Re-execute function button (offered when `actions` has \"reexecute\"; `exception_updated` events)"},
         {"restart", "restart", "Restart process button"},
         {"revert", "revert", "Revert last / Revert all buttons"},
     };
@@ -27,6 +26,7 @@ const std::vector<CommandInfo>& command_table() {
 const std::vector<std::string>& passive_capabilities() {
     static const std::vector<std::string> passive = {
         ipc::capability::kDiagEvents,  // `diag` events: the compile output panel
+        ipc::capability::kReexecute,   // WP-23: a further action of `exception-action` (and `exception_updated` events), not a command
     };
     return passive;
 }
