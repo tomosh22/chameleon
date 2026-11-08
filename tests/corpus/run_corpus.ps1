@@ -134,7 +134,7 @@ $fetched = Invoke-Step 'fetch' {
     Copy-Item (Join-Path $here 'common/chameleon_corpus.h') $support
     Copy-Item (Join-Path $here 'common/chameleon_corpus.cpp') $support
     Copy-Item (Join-Path $repo 'agent/include/Chameleon_API.h') $support
-    Invoke-Native 'git apply' 'git' @('-C', $src, '-c', 'core.autocrlf=false', 'apply', '--whitespace=nowarn', $patchFile)
+    Invoke-Native 'git apply' 'git' @('-C', $src, '-c', 'core.autocrlf=false', 'apply', '--whitespace=nowarn', '--ignore-whitespace', $patchFile)
     Set-Content -Path $marker -Value "$($cfg.tag) $head patch=$patchHash"
     "$($cfg.repo) $($cfg.tag) $head"
 }
@@ -209,15 +209,19 @@ function Apply-Edit($edit) {
     if (-not (Test-Path $path)) { throw "edit $($edit.id): $($edit.file) does not exist" }
     $text = $latin1.GetString([System.IO.File]::ReadAllBytes($path))
     if (-not $script:Originals.ContainsKey($path)) { $script:Originals[$path] = $text }
+    # Some projects are checked out with CRLF line endings (.gitattributes); the edits are written with LF.
+    $eol = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
     foreach ($r in @($edit.replace)) {
-        $count = ([regex]::Matches($text, [regex]::Escape([string]$r.find))).Count
+        $find = ([string]$r.find).Replace("`r`n", "`n").Replace("`n", $eol)
+        $with = ([string]$r.with).Replace("`r`n", "`n").Replace("`n", $eol)
+        $count = ([regex]::Matches($text, [regex]::Escape($find))).Count
         if ($count -ne 1) { throw "edit $($edit.id): '$($r.find)' occurs $count times in $($edit.file), expected once" }
-        $text = $text.Replace([string]$r.find, [string]$r.with)
+        $text = $text.Replace($find, $with)
     }
     if ($edit.include) {
         $m = [regex]::Match($text, '(?m)^#\s*include')
         if (-not $m.Success) { throw "edit $($edit.id): no #include line in $($edit.file)" }
-        $text = $text.Insert($m.Index, "#include `"$($edit.include)`"`n")
+        $text = $text.Insert($m.Index, "#include `"$($edit.include)`"$eol")
     }
     [System.IO.File]::WriteAllBytes($path, $latin1.GetBytes($text))
 }

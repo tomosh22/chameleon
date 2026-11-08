@@ -58,7 +58,7 @@ public sealed class CmlControl : IDisposable
     public string Call(string cmd, string argsJson, int timeoutMs)
     {
         int id = nextId++;
-        string request = "{\"id\":" + id + ",\"cmd\":\"" + cmd + "\"" + (argsJson != null ? ",\"args\":" + argsJson : "") + "}";
+        string request = "{\"id\":" + id + ",\"cmd\":\"" + cmd + "\"" + (!string.IsNullOrEmpty(argsJson) ? ",\"args\":" + argsJson : "") + "}";
         writer.WriteLine(request);
         Stopwatch watch = Stopwatch.StartNew();
         while (true)
