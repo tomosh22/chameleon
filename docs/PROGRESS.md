@@ -22,7 +22,13 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-15 | Header dependency handling | 5 | done | wp/15-header-deps | #28 | — |
 | WP-16 | Multiple modules and multiple processes | 5 | done (FU-12, FU-15 closed) | wp/16-multi-module-process | #25 | — |
 | WP-17 | Pre/post patch hooks, compile hooks, synchronised mode | 5 | done (FU-06, FU-14 closed) | wp/17-hooks-sync | #29 | — |
-| WP-18 | Diagnostics pass and build-requirement checks | 5 | done | wp/18-diagnostics | #31 | 0d97b48 |
+| WP-18 | Diagnostics pass and build-requirement checks | 5 | done | wp/18-diagnostics | #31 | — |
+| WP-19 | ImGui broker UI (`cml_ui`, ADR-0033) | 6 | done (window/tray/hotkey not seen on a display: manual checklist in WP-19.md) | wp/19-imgui-broker-ui | #33 | — |
+| WP-20 | Crash → patch → continue | 6 | done (breakpoints deferred) | wp/20-crash-patch-continue | #34 | — |
+| WP-21 | Hot-restart (`ScheduleRestart` API still not implemented) | 6 | done | wp/21-hot-restart | #36 | — |
+| WP-22 | Patch revert (session reset deferred) | 6 | done | wp/22-patch-revert | #35 | — |
+| WP-24 | Thread-local variables | 6 | in progress — acceptance failed once (namespace-scope TLS offset); re-delegated with diagnosis | wp/24-thread-local | — | — |
+| WP-25 | Unchanged-function elision (scope narrowed, ADR-0034) | 6 | in review — fixing high-review items (one blocking: callers of re-hooked functions) | wp/25-unchanged-elision | #37 | — |
 
 ## Orchestrator integration work
 
@@ -60,3 +66,12 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | FU-19 | WP-18 (#31) | CML3103 (layout change of a type used by unchanged code) not implemented: needs TPI/UDT access in cml_pdb | a later pdb WP |
 | FU-20 | WP-18 (#31) | CML3104 is advisory only: without /GL it cannot flag a genuinely stale copy (callers in the same TU are recompiled and re-hooked); kept as a reminder about still-executing callers. Revisit if /GL support lands | orchestrator |
 | FU-21 | WP-18 (#31) | CML1101 for link.exe relies on the PDB's recorded /DEBUG option, because a real /DEBUG:FASTLINK PDB still lists function symbols (seen in CI, link 14.44). A PDB with no recorded linker command line and FASTLINK cannot be told apart from full | next pdb WP (look for a type-server/`/DEBUG:FASTLINK` marker in the PDB) |
+| FU-22 | WP-21 (#36) | When the broker has no console, it borrows the old process's console (`AttachConsole`) during the relaunch, so for that moment its own standard handles may refer to the user's console. Untested; restore the std handles around attach/free | next broker WP |
+| FU-23 | WP-19 (#33) | `cml_ui` window, tray icon, hotkey, single instance and editor launch have never been exercised on a display; the manual checklist in WP-19.md is unchecked | needs a person on Windows |
+| FU-24 | WP-19 (#33) | `patch_applied` carries no changed file names or timings, so the UI history is thin for broker-triggered (compile-on-save) reloads; add `changed_files` and `timing_ms` to the event | next broker WP |
+
+## Handoff (2026-11-08)
+
+Main: 6715388 (WP-21 merged); green verified through a637677 (WP-19). Agent ABI decision taken (ADR-0034: no bump).
+Open: WP-24 (re-delegated after its first acceptance failure), WP-25 #37 (high-review fixes). Then the docs PR and the
+wave-6 report.

@@ -72,7 +72,8 @@ public:
 
 // Object bytes of the patched TU: compute_value (hooked), reading g_tick and calling fixture_note (both bound to
 // the old image), optionally calling `callee` (a symbol the registry may know).
-std::vector<std::byte> make_object(const std::string& callee = {}, bool define_helper = false, const std::string& unknown_symbol = {}) {
+// `const_fill` >= 0 also defines `g_const` (8 bytes of that value), data the old image owns (Rig(..., const_symbol = true)).
+std::vector<std::byte> make_object(const std::string& callee = {}, bool define_helper = false, const std::string& unknown_symbol = {}, int const_fill = -1) {
     SynthObj o;
     auto f = o.function("?compute_value@@YAHXZ", true, 32);
     const std::uint32_t tick = o.undefined("?g_tick@@3HA");
@@ -89,6 +90,13 @@ std::vector<std::byte> make_object(const std::string& callee = {}, bool define_h
     }
     if (define_helper) {
         o.function("?new_helper@@YAHXZ", true, 16);
+    }
+    if (const_fill >= 0) {
+        const std::uint32_t sec = o.section(".data$g", kDataComdat, 8, coff::ComdatSelection::Any);
+        o.symbol("?g_const@@3HB", 0, static_cast<std::int32_t>(sec), false, true);
+        for (std::byte& b : o.model().sections[sec - 1].data) {
+            b = static_cast<std::byte>(const_fill);
+        }
     }
     Built b = o.build();
     return std::vector<std::byte>(b.owned->bytes.begin(), b.owned->bytes.end());
@@ -137,7 +145,7 @@ struct Rig {
     Session session2{2, "0.1.0"};
     std::shared_ptr<ModuleState> module2;
 
-    explicit Rig(bool default_session_dir = false, const std::string& logic_flags = std::string()) {
+    explicit Rig(bool default_session_dir = false, const std::string& logic_flags = std::string(), bool const_symbol = false) {
         // basic_world() with the compiland's build environment recorded at the head of its module stream (before
         // the first proc), as the compilers do.
         SynthWorld w;
@@ -149,6 +157,9 @@ struct Rig {
         w.pub_func("?compute_value@@YAHXZ", 0x10);
         w.pub_func("fixture_note", 0x100);
         w.pub_data("?g_tick@@3HA", 0x80);
+        if (const_symbol) {
+            w.pub_data("?g_const@@3HB", 0x30, SynthWorld::kRdataSec);  // WP-25: data of the old image (RVA 0x2030, in the synthetic PE's .rdata)
+        }
         w.spec.guid = kGuid;
         w.spec.age = 5;
         const std::string pdb = dir.file("app.pdb");
@@ -762,6 +773,7 @@ TEST_CASE("revert: a reload that applied two patches is one batch; a refusal by 
     QuietLogs quiet;
     Rig rig;
     rig.enable();
+    rig.option("narrow_hooks", Value::boolean(false));  // WP-25: identical code is not loaded again; this test is about batches
     rig.changed_both();
     rig.second_object = make_object();  // main.cpp patches too
     Result<Value> r = rig.reload();
@@ -815,6 +827,7 @@ TEST_CASE("revert last means the newest reload: a module that reload did not tou
     Rig rig;
     rig.enable();
     rig.enable2();
+    rig.option("narrow_hooks", Value::boolean(false));  // WP-25: identical code is not loaded again; this test is about batches
     // Reload 1 patches both processes ...
     rig.changed_on(*rig.module);
     rig.changed_on(*rig.module2);
@@ -1551,6 +1564,8 @@ TEST_CASE("the resolved linker follows set-option linker / linker_path") {
     QuietLogs quiet;
     Rig rig;
     rig.enable();
+    // WP-25: reloading identical code loads nothing; this test is about the linker of every reload, so hook everything.
+    rig.option("narrow_hooks", Value::boolean(false));
     rig.changed();
     REQUIRE(rig.reload().has_value());
     CHECK(rig.resolve_calls == 1);
@@ -1866,6 +1881,8 @@ TEST_CASE("compile cache: the same command line is compiled once for the modules
     QuietLogs quiet;
     Rig rig;
     rig.enable();
+    // WP-25: reloading identical code loads nothing; this test is about the compile cache, so hook everything.
+    rig.option("narrow_hooks", Value::boolean(false));
     const ReloadOptions options = rig.service->options();
     PipelineContext ctx;
     ctx.session_dir = rig.service->session_dir();
@@ -2096,3 +2113,279 @@ TEST_CASE("compile on save watches the headers that only the include scan finds 
     CHECK(watched);
 }
 #endif
+
+// ---- WP-25: unchanged-function elision ---------------------------------------------------------------------------------
+
+namespace {
+
+// The diag events of one severity and id the rig's listener has seen.
+int count_diag(Rig& rig, const std::string& id, const std::string& severity) {
+    std::lock_guard<std::mutex> lock(rig.events->mutex);
+    int n = 0;
+    for (const Event& e : rig.events->events) {
+        if (e.name == "diag" && e.body.get_string("id") == id && e.body.get_string("severity") == severity) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+}  // namespace
+
+TEST_CASE("elision: a reload that recompiles to identical code loads nothing, advances nothing and warns CML3450") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    Result<Value> first = rig.reload();
+    REQUIRE_MESSAGE(first.has_value(), first.error().format());
+    CHECK(first->get_integer("hooks_planned") == 1);
+    CHECK(first->get_integer("hooks_dropped") == 0);
+    CHECK(first->get_integer("hooks_installed") == 1);
+    CHECK_FALSE(first->get_bool("no_functional_change"));
+    CHECK(count_diag(rig, "CML3450", "warning") == 0);
+    REQUIRE(rig.module->generation == 1);
+
+    // The same object again: compute_value is hooked by patch 1 and equals what patch 1 put there.
+    rig.changed();
+    Result<Value> second = rig.reload();
+    REQUIRE_MESSAGE(second.has_value(), second.error().format());
+    CHECK(second->get_integer("patched") == 0);
+    CHECK(second->get_integer("hooks_planned") == 1);
+    CHECK(second->get_integer("hooks_dropped") == 1);
+    CHECK(second->get_integer("hooks_installed") == 0);
+    CHECK(second->get_integer("modules_unchanged") == 1);
+    CHECK(second->get_bool("no_functional_change"));
+    CHECK(second->get_integer("generation") == 1);
+    CHECK(rig.module->generation == 1);
+    CHECK(rig.service->generation() == 1);
+    // Nothing reached the agent for the second reload: one load, one hook request, no unload.
+    CHECK(rig.seen<ipc::LoadPatch>().size() == 1);
+    CHECK(rig.seen<ipc::InstallHooks>().size() == 1);
+    CHECK(rig.seen<ipc::ReleaseRange>().empty());
+    CHECK(rig.link_calls == 1);
+    // The warning is in the response and a diag event; no patch_applied event for the empty reload.
+    const Value* module_report = second->find("patches");  // the warnings are per module report (no second copy at the top)
+    REQUIRE(module_report != nullptr);
+    REQUIRE(module_report->items().size() == 1);
+    CHECK(second->find("warnings") == nullptr);
+    const Value* warnings = module_report->items()[0].find("warnings");
+    REQUIRE(warnings != nullptr);
+    bool in_response = false;
+    for (const Value& w : warnings->items()) {
+        in_response = in_response || (w.as_string().find("CML3450") != std::string::npos && w.as_string().find("identical code") != std::string::npos);
+    }
+    CHECK(in_response);
+    CHECK(count_diag(rig, "CML3450", "warning") == 1);
+    CHECK(rig.events->count("patch_applied") == 1);
+    CHECK(rig.events->diag_ids().empty());  // a warning, not an error
+    // The source baseline moved on, so the next sweep does not report the file again.
+    CHECK(rig.module->index->accepted_for_testing().size() == 2);
+}
+
+TEST_CASE("elision: a partly unchanged reload reports how many hooks were dropped") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    REQUIRE(rig.reload().has_value());
+    // Patch 2: compute_value is unchanged, but the object now also defines a new function, so it is loaded without a hook.
+    rig.object = make_object({}, true);
+    rig.changed();
+    Result<Value> second = rig.reload();
+    REQUIRE_MESSAGE(second.has_value(), second.error().format());
+    CHECK(second->get_integer("patched") == 1);
+    CHECK(second->get_integer("hooks_planned") == 1);
+    CHECK(second->get_integer("hooks_dropped") == 1);
+    CHECK(second->get_integer("hooks_installed") == 0);
+    CHECK_FALSE(second->get_bool("no_functional_change"));
+    CHECK(count_diag(rig, "CML3450", "warning") == 0);
+    const auto patch_events = [&] {
+        std::lock_guard<std::mutex> lock(rig.events->mutex);
+        std::vector<Value> v;
+        for (const Event& e : rig.events->events) {
+            if (e.name == "patch_applied") {
+                v.push_back(e.body);
+            }
+        }
+        return v;
+    }();
+    REQUIRE(patch_events.size() == 2);
+    CHECK(patch_events[1].get_integer("hooks_planned") == 1);
+    CHECK(patch_events[1].get_integer("hooks_dropped") == 1);
+    CHECK(patch_events[1].get_integer("hooks") == 0);
+}
+
+TEST_CASE("elision: a function that changed since the earlier patch is hooked again, one that did not is not") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    REQUIRE(rig.reload().has_value());
+    // Patch 2 calls a function patch 1 did not know: other relocations, so compute_value differs from patch 1's code.
+    rig.object = make_object({}, true);
+    rig.changed();
+    REQUIRE(rig.reload().has_value());  // defines new_helper (loaded, compute_value dropped)
+    rig.object = make_object("?new_helper@@YAHXZ");
+    rig.changed();
+    Result<Value> third = rig.reload();
+    REQUIRE_MESSAGE(third.has_value(), third.error().format());
+    CHECK(third->get_integer("hooks_planned") == 1);
+    CHECK(third->get_integer("hooks_dropped") == 0);
+    CHECK(third->get_integer("hooks_installed") == 1);
+    CHECK_FALSE(third->get_bool("no_functional_change"));
+}
+
+TEST_CASE("elision: narrow_hooks false hooks everything again, and a no-op reload then still loads") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    REQUIRE(rig.reload().has_value());
+    rig.option("narrow_hooks", Value::boolean(false));
+    rig.changed();
+    Result<Value> second = rig.reload();
+    REQUIRE_MESSAGE(second.has_value(), second.error().format());
+    CHECK(second->get_integer("patched") == 1);
+    CHECK(second->get_integer("hooks_dropped") == 0);
+    CHECK(second->get_integer("hooks_installed") == 1);
+    CHECK_FALSE(second->get_bool("no_functional_change"));
+}
+
+// ---- WP-25 review items ------------------------------------------------------------------------------------------------
+
+namespace {
+
+// The module file the rig's pipeline compares with: the synthetic PE instead of the minimal one, with 8 zero bytes where the
+// PDB puts g_const (RVA 0x2030, inside .rdata's raw data).
+void use_rich_module_file(Rig& rig) {
+    cml_test::PeBytes pe = cml_test::build_pe_on_disk();
+    for (std::size_t i = 0; i < 8; ++i) {
+        pe[cml_test::rdata_off(0x2030) + i] = 0;
+    }
+    std::ofstream out(rig.exe, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(pe.data()), static_cast<std::streamsize>(pe.size()));
+    out.close();
+    std::lock_guard<std::mutex> lock(rig.module->mutex);
+    rig.module->image.reset();  // the pipeline reads the file again
+}
+
+Value module_report(const Value& result) { return result.find("patches")->items().at(0); }
+
+}  // namespace
+
+TEST_CASE("elision: identical code but a changed initial value of data in the running image warns CML3451, not CML3450, and loads nothing") {
+    QuietLogs quiet;
+    Rig rig(false, std::string(), true);
+    rig.enable();
+    use_rich_module_file(rig);
+    rig.changed();
+    REQUIRE(rig.reload().has_value());  // patch 1: compute_value is hooked
+    REQUIRE(rig.module->generation == 1);
+
+    SUBCASE("the data differs from the old image's") {
+        rig.object = make_object({}, false, {}, 0x2A);
+        rig.changed();
+        Result<Value> second = rig.reload();
+        REQUIRE_MESSAGE(second.has_value(), second.error().format());
+        const Value report = module_report(*second);
+        CHECK(report.get_bool("data_only_change"));
+        CHECK_FALSE(report.get_bool("no_functional_change"));
+        CHECK_FALSE(second->get_bool("no_functional_change"));
+        CHECK(second->get_integer("patched") == 0);
+        CHECK(rig.module->generation == 1);
+        CHECK(rig.seen<ipc::LoadPatch>().size() == 1);
+        CHECK(count_diag(rig, "CML3451", "warning") == 1);
+        CHECK(count_diag(rig, "CML3450", "warning") == 0);
+        const std::string text = report.find("warnings")->items().at(0).as_string();
+        CHECK(text.find("g_const") != std::string::npos);
+        CHECK(text.find("do not run again") != std::string::npos);
+    }
+    SUBCASE("the data equals the old image's: plain CML3450") {
+        rig.object = make_object({}, false, {}, 0);
+        rig.changed();
+        Result<Value> second = rig.reload();
+        REQUIRE_MESSAGE(second.has_value(), second.error().format());
+        CHECK(second->get_bool("no_functional_change"));
+        CHECK_FALSE(module_report(*second).get_bool("data_only_change"));
+        CHECK(count_diag(rig, "CML3450", "warning") == 1);
+        CHECK(count_diag(rig, "CML3451", "warning") == 0);
+    }
+}
+
+TEST_CASE("elision: hooks_kept leaves out 'narrowing off' and the counts add up") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.option("narrow_hooks", Value::boolean(false));
+    rig.changed();
+    Result<Value> r = rig.reload();
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    const Value report = module_report(*r);
+    CHECK(report.find("hooks_kept")->items().empty());
+    CHECK(report.get_integer("hooks_planned") - report.get_integer("hooks_dropped") == report.get_integer("hooks_installed"));
+}
+
+TEST_CASE("elision: code records follow the hooks: reverted patches are pruned") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    REQUIRE(rig.reload().has_value());  // patch 1 hooks compute_value: one record
+    {
+        std::lock_guard<std::mutex> lock(rig.module->mutex);
+        CHECK(rig.module->code.size() == 1);
+    }
+    // Patch 2: compute_value is unchanged (dropped), it only introduces new_helper, which gets a record of its own.
+    rig.object = make_object({}, true);
+    rig.changed();
+    REQUIRE(rig.reload().has_value());
+    {
+        std::lock_guard<std::mutex> lock(rig.module->mutex);
+        CHECK(rig.module->code.size() == 2);
+    }
+    Result<Value> reverted = revert_with(rig, "last");
+    REQUIRE_MESSAGE(reverted.has_value(), reverted.error().format());
+    {
+        std::lock_guard<std::mutex> lock(rig.module->mutex);
+        CHECK(rig.module->code.size() == 1);  // new_helper is no longer canonical: its record is gone
+    }
+    REQUIRE(revert_with(rig, "all").has_value());
+    {
+        std::lock_guard<std::mutex> lock(rig.module->mutex);
+        CHECK(rig.module->code.empty());
+    }
+}
+
+TEST_CASE("elision: prune_code keeps what the hook table reaches and the canonical new functions, and nothing else") {
+    ModuleState m;
+    const auto record = [](const char* symbol) {
+        auto image = std::make_shared<CodeImage>();
+        image->symbol = symbol;
+        return std::shared_ptr<const CodeImage>(image);
+    };
+    m.record_code(0x1000, record("?hooked@@YAXXZ"));      // the target of a hook
+    m.record_code(0x2000, record("?superseded@@YAXXZ"));  // an older hook target
+    m.record_code(0x3000, record("?fresh@@YAXXZ"));       // a function a patch introduced, canonical in the registry
+    m.record_code(0x4000, record("?gone@@YAXXZ"));        // introduced by a patch that was reverted (not in the registry)
+    m.record_code(0x5000, record("?moved@@YAXXZ"));       // introduced and canonical, but hooked since: the hook target's record applies
+    m.record_code(0x6000, record("?moved@@YAXXZ"));
+    m.hooked[0xA000] = 0x1000;
+    m.hooked[0x5000] = 0x6000;
+    SymbolAddress a;
+    a.va = 0x3000;
+    a.is_function = true;
+    m.registry.replace("?fresh@@YAXXZ", a);
+    SymbolAddress b;
+    b.va = 0x5000;
+    b.is_function = true;
+    m.registry.replace("?moved@@YAXXZ", b);
+    m.prune_code();
+    CHECK(m.code.count(0x1000) == 1);
+    CHECK(m.code.count(0x2000) == 0);
+    CHECK(m.code.count(0x3000) == 1);
+    CHECK(m.code.count(0x4000) == 0);
+    CHECK(m.code.count(0x5000) == 0);
+    CHECK(m.code.count(0x6000) == 1);
+    CHECK(m.code_running_at(0xA000) != nullptr);
+}
