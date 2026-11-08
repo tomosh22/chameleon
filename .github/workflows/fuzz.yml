@@ -92,14 +92,7 @@ jobs:
           Get-ChildItem $win | ForEach-Object { Write-Host $_.Name }
           "### clang-cl for the fuzz targets`n$v" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
 
-      # Diagnostic only: the link line the clang-cl driver itself would use, to compare with the runtimes tests/fuzz/CMakeLists.txt names.
-      - name: Show the driver's link line for libFuzzer + ASan
-        continue-on-error: true
-        run: |
-          Set-Content -Path probe.cpp -Value 'extern "C" int LLVMFuzzerTestOneInput(const unsigned char*, unsigned long long) { return 0; }'
-          & $env:CML_CXX /MT -fsanitize=fuzzer,address -### probe.cpp 2>&1 | Where-Object { $_ -match 'lld-link|link\.exe' } | ForEach-Object { $_ -replace '"\s+"', "`n  " }
-
-      # RelWithDebInfo: AddressSanitizer needs the release CRT (/MT; the project is static-CRT), never /MTd.
+      # RelWithDebInfo: AddressSanitizer needs the release CRT (/MT; the project is static-CRT, and libFuzzer is built for it), never /MTd.
       - name: Configure
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER="$env:CML_CXX" -DCML_FUZZ=ON `
