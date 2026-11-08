@@ -194,6 +194,7 @@ Offer evaluate(const std::vector<std::shared_ptr<ModuleState>>& modules, const i
     const HookMap now = snapshot_hooks(modules);
     std::string static_reason;      // why the innermost examinable frame could not be re-executed, whichever patch comes
     std::uint32_t static_diag = 0;
+    bool examined_one = false;
     std::string frame0_note;        // the faulting frame itself could not be identified (patch code, PDB missing)
     for (std::size_t i = 0; i < exception.frames.size(); ++i) {
         const ipc::ExceptionFrame& frame = exception.frames[i];
@@ -240,8 +241,12 @@ Offer evaluate(const std::vector<std::shared_ptr<ModuleState>>& modules, const i
                 recipe = build_recipe(*info, hint, static_cast<std::uint32_t>(rva), frame);
             }
         }
+        const bool innermost_examined = !examined_one;
+        examined_one = true;
         if (!replaced) {
-            if (!recipe.ok && static_reason.empty()) {
+            // Only the innermost function says why re-execute is not available before any patch: the frames above it (the
+            // application's loop, templates around it) are not what a person would re-execute.
+            if (innermost_examined && !recipe.ok) {
                 static_reason = recipe.reason;
                 static_diag = recipe.diag;
             }
