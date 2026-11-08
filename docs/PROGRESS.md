@@ -75,7 +75,36 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | FU-24 | WP-19 (#33) | `patch_applied` carries no changed file names or timings, so the UI history is thin for broker-triggered (compile-on-save) reloads; add `changed_files` and `timing_ms` to the event | next broker WP |
 | FU-25 | WP-24 (#39) | SECREL value comes from `section_offset_from_rva` of the record's RVA, not the record's own section offset; correct on CI (both compilers, threads keep values) but would break if a linker merged `.tls` into another section; also no check that a patch DLL has no TLS directory, and WP-24.md still says "inside the old `.tls` section" (the code decides by thread records) | next bind-planner WP |
 
-## Handoff (2026-11-08)
+## Handoff (2026-11-08, wave 7 paused)
 
-Wave 6 complete: WP-19..22, 24, 25 merged; main at 61e1e29 (WP-24). Agent ABI decision taken (ADR-0034: no bump).
-WP-24 failed acceptance once (S_PUB32 RVA is not the .tls offset) and passed on re-delegation.
+Wave 6 complete (WP-19..22, 24, 25). Wave 7 is paused at the user's request, with each agent finishing its current round.
+
+**Merged**
+- WP-27 (#42, f39dc19).
+- Main run 42469196628 failed only in 3 clang-cl probe jobs, on the LLVM download (504); those jobs were re-run.
+- PR #45 caches the LLVM install so this stops recurring.
+
+**Waiting on the agent's fix round**
+- WP-23 (#43): 10 high-review findings.
+  - Agent side: unwind bounds and `__try` guard, slot race in resolve_reexecute, executable check on the return address.
+  - Broker side: patch-during-evaluate race, stale fields after a withdrawn offer, per-frame recipe cost, entry_rsp check order.
+  - PDB: duplicate TPI/IPI table, S_DEFRANGE_SUBFIELD_REGISTER range offset (8).
+  - Docs and offer caveat: re-execute uses the parameters' values at the fault.
+- WP-28 (#44): 8 high-review findings plus a ruling: the post-patch-hooks stage fires before commit and before the app's post-patch hooks.
+  - Never unload a patch after a partial rollback.
+  - hook-install is consumed only by the reload path.
+  - Arming is all-or-nothing; fixes to "none" disarm semantics.
+  - Arming reservation is refused once the module is already reserved.
+  - Injected stages return the reservation space they used.
+  - Replay ctests check the exit code.
+  - `#if` instead of `if constexpr` for the OFF build, plus a fuzz.yml job that builds with OFF.
+- Both PRs must merge main (WP-27 touched the harness files) and each other's IPC, capability and harness additions.
+
+**Still running:** WP-26 (corpus, wp/26-corpus). Told to finish its current CI iteration, then report; WP-26.md records the state.
+
+**To resume**
+1. Verify each re-push's CI myself (both runs, plus the fuzz run for WP-28).
+2. Delta-review the fixes only (ADR-0018).
+3. Merge one at a time and confirm main after each.
+4. Update KNOWN_LIMITATIONS from the proposed wording in WP-23.md and WP-28.md.
+5. Then wave 8: WP-29..32.
