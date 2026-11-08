@@ -29,10 +29,10 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-22 | Patch revert (session reset deferred) | 6 | done | wp/22-patch-revert | #35 | — |
 | WP-24 | Thread-local variables | 6 | done | wp/24-thread-local | #39 | — |
 | WP-25 | Unchanged-function elision (scope narrowed, ADR-0034) | 6 | done | wp/25-unchanged-elision | #37 | — |
-| WP-23 | Re-execute function after crash (ADR-0035) | 7 | in progress | wp/23-crash-reexecute | — | — |
+| WP-23 | Re-execute function after crash (ADR-0035) | 7 | in review (fixes) | wp/23-crash-reexecute | #43 | CI 14/14 x2 at 42d4909 verified; high review: 10 findings sent (unwind guard, slot race, offer staleness, defrange offset) |
 | WP-26 | Real-project corpus (raylib, Dear ImGui, Godot; ADR-0035) | 7 | in progress | wp/26-corpus | — | — |
 | WP-27 | Performance budgets | 7 | done | wp/27-perf-budgets | #42 (f39dc19) | CI 14/14 push 42460887634 + PR 42460890741 at 00e0ac6; pdb index 328 ms/544 MiB (budget 4352), reload excl. compile median 40.9 ms, idle CPU 0.000 %, large-PDB broker 219 MiB = 0.40x PDB, session broker peak 11.0 MiB (limit 1.5x PDB + 32 MiB baseline). Test-coverage gap: no reload measured inside the large PDB (benchmark has no agent). |
-| WP-28 | Fuzzing and failure injection | 7 | in progress | wp/28-fuzz-injection | — | — |
+| WP-28 | Fuzzing and failure injection | 7 | in review (fixes) | wp/28-fuzz-injection | #44 | CI 14/14 x2 + fuzz 5/5 at 74b6d04 verified; high review: 8 findings + post-patch-hooks ruling (fire before commit) |
 
 ## Orchestrator integration work
 
