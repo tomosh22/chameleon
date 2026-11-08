@@ -186,6 +186,11 @@ public:
         recs_.add(0x1603, b);
         return next_++;
     }
+    // WP-23: any record (type records for a TPI built with this class). Returns its id.
+    std::uint32_t record(std::uint16_t kind, const Bytes& body) {
+        recs_.add(kind, body);
+        return next_++;
+    }
     Bytes stream() const {
         Bytes s;
         put32(s, 20040203);  // version
@@ -218,6 +223,7 @@ struct Spec {
     std::vector<Section> sections;
     std::vector<Contribution> contributions;
     Ipi ipi;
+    Ipi tpi;  // WP-23: written as stream 2 when it has records (else the stream stays empty, as before)
     bool omit_section_stream = false;
     // Deliberate defects.
     bool bad_dbi_signature = false;
@@ -243,6 +249,9 @@ inline Bytes build(const Spec& spec) {
     }
     if (spec.empty_info_stream) {
         streams[1].clear();
+    }
+    if (!spec.tpi.empty()) {
+        streams[2] = spec.tpi.stream();
     }
     streams[4] = spec.ipi.stream();
     streams[5] = spec.symrec.bytes();

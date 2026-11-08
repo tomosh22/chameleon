@@ -12,6 +12,12 @@
 //   exception_action           control command `exception-action` for the current exception: continue | leave | ignore. With
 //                              `expect_error = "CMLnnnn"` the action must be refused with that diagnostic.
 //   expect_pending_exceptions  control command `exceptions`: exactly `count` threads wait for a decision.
+//
+// WP-23 (needs capability "reexecute"; bodies in exception_steps.cpp):
+//   expect_exception           also accepts `offers` / `lacks` (an action that must / must not be in the event's `actions`) and `reason`
+//                              (a substring of `reasons.<lacks>`, `reasons.reexecute` by default).
+//   expect_exception_updated   the next `exception_updated` event of the current exception that satisfies `offers` / `lacks` / `reason`.
+//   exception_action           accepts `action = "reexecute"`.
 
 #if defined(_WIN32)
 
@@ -36,6 +42,8 @@ public:
     ExceptionStepResult expect(cml::ipc::ControlClient& control, const Step& step, std::uint32_t limit_ms, bool limited_by_scenario);
     ExceptionStepResult act(cml::ipc::ControlClient& control, const Step& step, std::uint32_t timeout_ms);
     ExceptionStepResult pending(cml::ipc::ControlClient& control, const Step& step, std::uint32_t timeout_ms);
+    // WP-23. `limit_ms` as for expect().
+    ExceptionStepResult updated(cml::ipc::ControlClient& control, const Step& step, std::uint32_t limit_ms, bool limited_by_scenario);
 
 private:
     bool have_current_ = false;

@@ -220,6 +220,11 @@ LONG ExceptionGate::on_exception(PEXCEPTION_POINTERS info) {
         slot->data_address = static_cast<std::uint64_t>(record->ExceptionInformation[1]);
     }
     slot->stack_pointer = info->ContextRecord->Rsp;
+    {
+        const NT_TIB* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+        slot->stack_low = reinterpret_cast<std::uint64_t>(tib->StackLimit);
+        slot->stack_high = reinterpret_cast<std::uint64_t>(tib->StackBase);
+    }
     slot->context = *info->ContextRecord;
     slot->action.store(static_cast<std::int32_t>(Action::None), std::memory_order_release);
     slot->state.store(kPending, std::memory_order_release);
@@ -227,8 +232,9 @@ LONG ExceptionGate::on_exception(PEXCEPTION_POINTERS info) {
         SetEvent(notify);
     }
     for (;;) {
-        if (slot->action.load(std::memory_order_acquire) != static_cast<std::int32_t>(Action::None)) {
-            break;
+        const std::int32_t current = slot->action.load(std::memory_order_acquire);
+        if (current != static_cast<std::int32_t>(Action::None) && current != kResolving) {
+            break;  // an answer (kResolving: the agent thread is still computing one)
         }
         // (A wake-up without an answer is a stale signal from an earlier occupant of this slot: wait again.)
         WaitForSingleObject(slot->event, kWaitSliceMs);
@@ -243,7 +249,7 @@ LONG ExceptionGate::on_exception(PEXCEPTION_POINTERS info) {
     LONG result = EXCEPTION_CONTINUE_SEARCH;
     if (action == Action::Continue) {
         result = EXCEPTION_CONTINUE_EXECUTION;
-    } else if (action == Action::Leave) {
+    } else if (action == Action::Leave || action == Action::Reexecute) {
         *info->ContextRecord = slot->out_context;
         result = EXCEPTION_CONTINUE_EXECUTION;
     }
@@ -266,6 +272,7 @@ bool ExceptionGate::take_new(Held* out) {
         out->stack_pointer = slot.stack_pointer;
         out->module_base = slot.module_base;
         out->in_patch = slot.in_patch;
+        out->frame_count = static_cast<std::uint32_t>(unwind_frames(slot.context, out->frames, kMaxFrames, slot.stack_low, slot.stack_high));
         return true;
     }
     return false;
@@ -282,20 +289,62 @@ ExceptionGate::Slot* ExceptionGate::find_open(std::uint32_t id) noexcept {
     return nullptr;
 }
 
-Result<void> ExceptionGate::resolve(std::uint32_t id, Action action) {
+ExceptionGate::Slot* ExceptionGate::claim_open(std::uint32_t id) noexcept {
     Slot* slot = find_open(id);
+    if (slot == nullptr) {
+        return nullptr;
+    }
+    std::int32_t none = static_cast<std::int32_t>(Action::None);
+    if (!slot->action.compare_exchange_strong(none, kResolving, std::memory_order_acq_rel)) {
+        return nullptr;  // answered (or released) since the lookup
+    }
+    // The slot may have been released and refilled by another fault between find_open() and the exchange. The id of the new occupant
+    // differs, and while it is being filled its state is not Pending/Reported: give the claim back.
+    const int state = slot->state.load(std::memory_order_acquire);
+    if (slot->id != id || (state != kPending && state != kReported)) {
+        std::int32_t mine = kResolving;
+        slot->action.compare_exchange_strong(mine, static_cast<std::int32_t>(Action::None), std::memory_order_acq_rel);
+        return nullptr;
+    }
+    return slot;
+}
+
+void ExceptionGate::finish_claim(Slot* slot, std::int32_t final_action) noexcept {
+    slot->action.store(final_action, std::memory_order_release);
+    if (final_action != static_cast<std::int32_t>(Action::None)) {
+        SetEvent(slot->event);
+    }
+}
+
+Result<void> ExceptionGate::resolve(std::uint32_t id, Action action) {
+    Slot* slot = claim_open(id);
     if (slot == nullptr) {
         return Diag::make(ids::kUnknownException, "no thread is held for exception " + std::to_string(id),
                           "It was answered already, or its process went through a reconnect; query `exceptions` for the open ones.");
     }
     if (action == Action::Leave) {
-        Result<void> left = compute_leave(slot->context, &slot->out_context);
+        Result<void> left = compute_leave(slot->context, &slot->out_context, slot->stack_low, slot->stack_high);
         if (!left) {
+            finish_claim(slot, static_cast<std::int32_t>(Action::None));  // the thread stays held
             return left.error();
         }
     }
-    slot->action.store(static_cast<std::int32_t>(action), std::memory_order_release);
-    SetEvent(slot->event);
+    finish_claim(slot, static_cast<std::int32_t>(action));
+    return Result<void>();
+}
+
+Result<void> ExceptionGate::resolve_reexecute(std::uint32_t id, const ReexecutePlan& plan) {
+    Slot* slot = claim_open(id);
+    if (slot == nullptr) {
+        return Diag::make(ids::kUnknownException, "no thread is held for exception " + std::to_string(id),
+                          "It was answered already, or its process went through a reconnect; query `exceptions` for the open ones.");
+    }
+    Result<void> built = compute_reexecute(slot->context, plan, &slot->out_context, slot->stack_low, slot->stack_high);
+    if (!built) {
+        finish_claim(slot, static_cast<std::int32_t>(Action::None));  // the thread stays held
+        return built.error();
+    }
+    finish_claim(slot, static_cast<std::int32_t>(Action::Reexecute));
     return Result<void>();
 }
 
@@ -323,27 +372,191 @@ std::size_t ExceptionGate::held_count() const noexcept {
     return n;
 }
 
-Result<void> ExceptionGate::compute_leave(const CONTEXT& in, CONTEXT* out) {
-    *out = in;
-    CONTEXT& ctx = *out;
-    DWORD64 image_base = 0;
-    PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
-    if (function != nullptr) {
-        PVOID handler_data = nullptr;
-        DWORD64 establisher_frame = 0;
-        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, function, &ctx, &handler_data, &establisher_frame, nullptr);
-    } else {
+namespace {
+
+// RtlLookupFunctionEntry + RtlVirtualUnwind of one frame under SEH: the context being unwound belongs to a thread whose stack may be
+// damaged (the fault can be a stack smash), and the unwinder reads the stack. POD locals only (__try cannot coexist with objects that
+// need unwinding). `*leaf` is set when the code has no unwind data.
+bool seh_unwind(DWORD64 lookup, CONTEXT& ctx, std::uint64_t* function_start, bool* leaf) noexcept {
+#if defined(_MSC_VER)
+    __try {
+#endif
+        DWORD64 image_base = 0;
+        PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(lookup, &image_base, nullptr);
+        if (function != nullptr) {
+            *leaf = false;
+            if (function_start != nullptr) {
+                *function_start = image_base + function->BeginAddress;
+            }
+            PVOID handler_data = nullptr;
+            DWORD64 establisher_frame = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, function, &ctx, &handler_data, &establisher_frame, nullptr);
+        } else {
+            *leaf = true;
+        }
+        return true;
+#if defined(_MSC_VER)
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#endif
+}
+
+bool read_memory(std::uint64_t address, void* buffer, std::size_t size) noexcept;
+
+// One unwind step of `ctx`; `innermost` says whether ctx.Rip is the faulting instruction (else a return address, so the function is
+// looked up at Rip - 1: a call that ends a function must not be attributed to the next one). Returns false when the frame cannot be
+// unwound or the result is not plausible: RSP outside [stack_low, stack_high) (when bounded), misaligned, or not moving up.
+// `*function_start` is the function's start (0 for a leaf without unwind data).
+bool unwind_one(CONTEXT& ctx, bool innermost, std::uint64_t* function_start, std::uint64_t stack_low, std::uint64_t stack_high) noexcept {
+    if ((ctx.Rsp & 7u) != 0 || (stack_high != 0 && (ctx.Rsp < stack_low || ctx.Rsp >= stack_high))) {
+        return false;
+    }
+    const DWORD64 before = ctx.Rsp;
+    if (function_start != nullptr) {
+        *function_start = 0;
+    }
+    bool leaf = false;
+    if (!seh_unwind(innermost ? ctx.Rip : ctx.Rip - 1, ctx, function_start, &leaf)) {
+        return false;
+    }
+    if (leaf) {
         // No unwind information: a leaf function, which has not touched RSP, so the return address is on top of the stack.
         DWORD64 return_address = 0;
-        SIZE_T read = 0;
-        if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(in.Rsp), &return_address, sizeof return_address, &read) == 0 ||
-            read != sizeof return_address) {
-            return Diag::make(ids::kLeaveUnwindFailed,
-                              "cannot leave the function at " + cml::hex(in.Rip) + ": it has no unwind information and the stack top is unreadable",
-                              "Use Ignore, or Continue after a patch fixed the cause.");
+        if (!read_memory(ctx.Rsp, &return_address, sizeof return_address)) {
+            return false;
         }
         ctx.Rip = return_address;
         ctx.Rsp += 8;
+    }
+    return ctx.Rsp > before && (stack_high == 0 || ctx.Rsp <= stack_high);
+}
+
+bool read_memory(std::uint64_t address, void* buffer, std::size_t size) noexcept {
+    SIZE_T read = 0;
+    return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), buffer, size, &read) != 0 && read == size;
+}
+
+}  // namespace
+
+std::size_t ExceptionGate::unwind_frames(const CONTEXT& in, Frame* out, std::size_t max, std::uint64_t stack_low, std::uint64_t stack_high) {
+    CONTEXT ctx = in;
+    std::size_t n = 0;
+    while (n < max) {
+        Frame& f = out[n];
+        f = Frame();
+        f.rip = ctx.Rip;
+        f.rsp = ctx.Rsp;
+        f.rbp = ctx.Rbp;
+        f.r13 = ctx.R13;
+        if (!unwind_one(ctx, n == 0, &f.function_start, stack_low, stack_high)) {
+            ++n;  // reported without an entry RSP
+            break;
+        }
+        f.entry_rsp = ctx.Rsp - 8;
+        ++n;
+        if (ctx.Rip == 0 || !executable_code(ctx.Rip)) {
+            break;  // the thread's outermost frame, or a return address that is not code (a smashed stack): stop with what we have
+        }
+    }
+    return n;
+}
+
+Result<void> ExceptionGate::compute_reexecute(const CONTEXT& in, const ReexecutePlan& plan, CONTEXT* out, std::uint64_t stack_low, std::uint64_t stack_high) {
+    if (plan.param_count > 4 || plan.frame_index >= kMaxFrames) {
+        return Diag::make(ids::kReexecuteBadFrame, "the re-execute recipe names frame " + std::to_string(plan.frame_index) + " with " + std::to_string(plan.param_count) + " parameters",
+                          "Use Leave function or Ignore instead.");
+    }
+    CONTEXT ctx = in;
+    for (std::uint32_t i = 0; i < plan.frame_index; ++i) {
+        if (!unwind_one(ctx, i == 0, nullptr, stack_low, stack_high) || ctx.Rip == 0) {
+            return Diag::make(ids::kReexecuteBadFrame, "the stack of the held thread cannot be unwound to frame " + std::to_string(plan.frame_index),
+                              "Use Leave function or Ignore instead.");
+        }
+    }
+    const CONTEXT frame = ctx;  // the registers the chosen frame has at its rip
+    if (!unwind_one(ctx, plan.frame_index == 0, nullptr, stack_low, stack_high) || ctx.Rip == 0 || ctx.Rsp < 8 || ctx.Rsp <= frame.Rsp) {
+        return Diag::make(ids::kReexecuteBadFrame, "frame " + std::to_string(plan.frame_index) + " of the held thread cannot be unwound",
+                          "Use Leave function or Ignore instead.");
+    }
+    if (!executable_code(ctx.Rip)) {
+        // The same check Leave makes: a return address that is not code means the stack is damaged; the function would return into the void.
+        return Diag::make(ids::kReexecuteBadReturn,
+                          "the return address of frame " + std::to_string(plan.frame_index) + " (" + cml::hex(ctx.Rip) + ") is not executable code",
+                          "The stack looks damaged; use Ignore, or Continue after a patch.");
+    }
+    const std::uint64_t entry_rsp = ctx.Rsp - 8;
+    if (entry_rsp != plan.entry_rsp) {
+        return Diag::make(ids::kReexecuteStackMismatch,
+                          "frame " + std::to_string(plan.frame_index) + " was entered with RSP " + cml::hex(entry_rsp) + ", the recipe expected " + cml::hex(plan.entry_rsp),
+                          "The stack changed since the fault was reported; use Leave function or Ignore instead.");
+    }
+    if (!executable_code(plan.target)) {
+        return Diag::make(ids::kReexecuteBadTarget, "the replacement function address " + cml::hex(plan.target) + " is not executable code",
+                          "Use Leave function or Ignore instead.");
+    }
+    // The registers the arguments are loaded from.
+    std::uint64_t values[4] = {0, 0, 0, 0};
+    for (std::uint32_t i = 0; i < plan.param_count; ++i) {
+        const ReexecuteParam& p = plan.params[i];
+        std::uint64_t base = 0;
+        switch (p.base_register) {
+            case 335: base = frame.Rsp; break;
+            case 334: base = frame.Rbp; break;
+            case 341: base = frame.R13; break;
+            default:
+                return Diag::make(ids::kReexecuteBadLocation, "parameter " + std::to_string(p.position) + " is addressed from register " + std::to_string(p.base_register) +
+                                                                  ", which re-execute cannot read",
+                                  "Use Leave function or Ignore instead.");
+        }
+        if (p.position > 3 || (p.size != 1 && p.size != 2 && p.size != 4 && p.size != 8)) {
+            return Diag::make(ids::kReexecuteBadLocation, "parameter " + std::to_string(p.position) + " has an invalid size or position", "Use Leave function or Ignore instead.");
+        }
+        const std::uint64_t address = base + static_cast<std::int64_t>(p.offset);
+        std::uint64_t raw = 0;
+        if (!read_memory(address, &raw, p.size)) {  // little endian: the low bytes of `raw`
+            return Diag::make(ids::kReexecuteBadLocation, "the memory of parameter " + std::to_string(p.position) + " at " + cml::hex(address) + " cannot be read",
+                              "Use Leave function or Ignore instead.");
+        }
+        values[p.position] = raw;
+    }
+    // Entry state of the function: the context after unwinding the frame has the registers the caller had when it made the call.
+    *out = ctx;
+    out->Rip = plan.target;
+    out->Rsp = entry_rsp;
+    for (std::uint32_t i = 0; i < plan.param_count; ++i) {
+        const ReexecuteParam& p = plan.params[i];
+        const std::uint64_t v = values[p.position];
+        if (!p.is_float) {
+            // Sub-register arguments: the upper bits of the register are unspecified for the callee, zero them.
+            switch (p.position) {
+                case 0: out->Rcx = v; break;
+                case 1: out->Rdx = v; break;
+                case 2: out->R8 = v; break;
+                default: out->R9 = v; break;
+            }
+        } else {
+            M128A* xmm = nullptr;
+            switch (p.position) {
+                case 0: xmm = &out->Xmm0; break;
+                case 1: xmm = &out->Xmm1; break;
+                case 2: xmm = &out->Xmm2; break;
+                default: xmm = &out->Xmm3; break;
+            }
+            xmm->Low = v;
+            xmm->High = 0;
+        }
+    }
+    return Result<void>();
+}
+
+Result<void> ExceptionGate::compute_leave(const CONTEXT& in, CONTEXT* out, std::uint64_t stack_low, std::uint64_t stack_high) {
+    *out = in;
+    CONTEXT& ctx = *out;
+    if (!unwind_one(ctx, true, nullptr, stack_low, stack_high)) {
+        return Diag::make(ids::kLeaveUnwindFailed,
+                          "cannot leave the function at " + cml::hex(in.Rip) + ": it cannot be unwound (no unwind information and an unreadable stack top, or a damaged stack)",
+                          "Use Ignore, or Continue after a patch fixed the cause.");
     }
     if (ctx.Rip == 0 || ctx.Rsp <= in.Rsp || !executable_code(ctx.Rip)) {
         return Diag::make(ids::kLeaveBadFrame,
