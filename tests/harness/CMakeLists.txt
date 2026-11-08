@@ -85,6 +85,7 @@ cml_add_unit_test(harness
         tests/test_wp28_scenarios.cpp
         tests/test_subscription.cpp
         tests/test_wp20_scenarios.cpp
+        tests/test_wp23_scenarios.cpp
         tests/test_wp27_scenarios.cpp
     LIBS cmltest_core)
 target_compile_definitions(cml_test_harness PRIVATE

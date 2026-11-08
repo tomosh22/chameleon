@@ -262,6 +262,10 @@ private:
                 const std::uint32_t limit_ms = std::min<std::uint32_t>(static_cast<std::uint32_t>(step.within_s) * 1000u, remaining_ms());
                 return from_exception(exception_steps_.expect(*control_, step, limit_ms, limit_ms < static_cast<std::uint32_t>(step.within_s) * 1000u));
             }
+            case StepKind::ExpectExceptionUpdated: {
+                const std::uint32_t limit_ms = std::min<std::uint32_t>(static_cast<std::uint32_t>(step.within_s) * 1000u, remaining_ms());
+                return from_exception(exception_steps_.updated(*control_, step, limit_ms, limit_ms < static_cast<std::uint32_t>(step.within_s) * 1000u));
+            }
             case StepKind::ExceptionAction: return from_exception(exception_steps_.act(*control_, step, kControlTimeoutMs));
             case StepKind::ExpectPendingExceptions: return from_exception(exception_steps_.pending(*control_, step, kControlTimeoutMs));
             case StepKind::PerfIdle: return perf_idle(step);

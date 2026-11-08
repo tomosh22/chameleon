@@ -43,6 +43,7 @@ inline constexpr const char* kRevert = "revert";  // WP-22: control command `rev
 inline constexpr const char* kDiagEvents = "diag-events";  // `diag` events are delivered to subscribers
 inline constexpr const char* kRestart = "restart";  // WP-21: `restart` command, `restarted` event
 inline constexpr const char* kFaultInjection = "fault-injection";  // WP-28: `inject-failure` and `fault-stages` commands (compiled in under CML_FAULT_INJECTION)
+inline constexpr const char* kReexecute = "reexecute";        // WP-23: `exception-action` accepts "reexecute"; `exception_updated` events
 inline constexpr const char* kExceptions = "exceptions";    // WP-20: `exception` events, `exception-action` and `exceptions` commands
 }  // namespace capability
 

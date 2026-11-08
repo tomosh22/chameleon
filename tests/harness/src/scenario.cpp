@@ -36,6 +36,7 @@ const char* to_string(StepKind kind) {
         case StepKind::ExpectException: return "expect_exception";
         case StepKind::ExceptionAction: return "exception_action";
         case StepKind::ExpectPendingExceptions: return "expect_pending_exceptions";
+        case StepKind::ExpectExceptionUpdated: return "expect_exception_updated";
         case StepKind::PerfIdle: return "perf_idle";
         case StepKind::PerfReport: return "perf_report";
     }
@@ -127,6 +128,10 @@ std::string Step::describe() const {
             out += " " + fault_stage + (fault_count != 1 ? " x" + std::to_string(fault_count) : std::string()) +
                    (expect_error.empty() ? std::string() : " expecting the refusal " + expect_error);
             break;
+        case StepKind::ExpectExceptionUpdated:
+            out += (exception_offers.empty() ? std::string() : " offering " + exception_offers) + (exception_lacks.empty() ? std::string() : " without " + exception_lacks) +
+                   " within " + std::to_string(within_s) + " s";
+            break;
         case StepKind::PerfIdle:
             out += " " + std::to_string(within_s) + " s, at most " + std::to_string(result_value) + " permille CPU";
             break;
@@ -147,9 +152,10 @@ const char* Step::required_capability() const {
         case StepKind::ExpectEvent: return cml::ipc::capability::kSubscribe;
         case StepKind::Restart: return cml::ipc::capability::kRestart;
         case StepKind::InjectFailure: return cml::ipc::capability::kFaultInjection;
+        case StepKind::ExpectExceptionUpdated: return cml::ipc::capability::kReexecute;
+        case StepKind::ExceptionAction: return exception_action == "reexecute" ? cml::ipc::capability::kReexecute : cml::ipc::capability::kExceptions;
         case StepKind::WatchExceptions:
         case StepKind::ExpectException:
-        case StepKind::ExceptionAction:
         case StepKind::ExpectPendingExceptions: return cml::ipc::capability::kExceptions;
         default: return nullptr;
     }
@@ -169,6 +175,31 @@ bool name_chars_ok(const std::string& s, bool allow_dot) {
                return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' ||
                       (allow_dot && c == '.');
            });
+}
+
+// WP-23: the keys 'offers', 'lacks' and 'reason' of expect_exception / expect_exception_updated (an action name, an action name, a substring).
+cml::Result<void> parse_exception_offers(const toml::Table& table, Step& step) {
+    const auto action_name = [&](const char* key, std::string& into) -> cml::Result<void> {
+        if (const toml::Value* v = table.find(key)) {
+            if (v->kind != toml::Value::Kind::String ||
+                (v->text != "continue" && v->text != "leave" && v->text != "ignore" && v->text != "reexecute")) {
+                return invalid(v->line, std::string("'") + key + "' must be an action name: continue, leave, ignore or reexecute");
+            }
+            into = v->text;
+        }
+        return cml::Result<void>();
+    };
+    cml::Result<void> offers = action_name("offers", step.exception_offers);
+    if (!offers) return offers;
+    cml::Result<void> lacks = action_name("lacks", step.exception_lacks);
+    if (!lacks) return lacks;
+    if (const toml::Value* reason = table.find("reason")) {
+        if (reason->kind != toml::Value::Kind::String || reason->text.empty() || reason->text.size() > 200) {
+            return invalid(reason->line, "'reason' must be a non-empty string (a substring of the reason text)");
+        }
+        step.exception_reason = reason->text;
+    }
+    return cml::Result<void>();
 }
 
 cml::Result<std::string> require_string(const toml::Table& table, const char* key, const char* context) {
@@ -477,10 +508,26 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
         if (!keys) return keys.error();
         return step;
     }
+    if (*kind == "expect_exception_updated") {
+        step.kind = StepKind::ExpectExceptionUpdated;
+        cml::Result<void> keys = only_keys(table, {"kind", "offers", "lacks", "reason", "within_s"}, "an expect_exception_updated step");
+        if (!keys) return keys.error();
+        cml::Result<void> offers = parse_exception_offers(table, step);
+        if (!offers) return offers.error();
+        if (step.exception_offers.empty() && step.exception_lacks.empty()) {
+            return invalid(table.line, "an expect_exception_updated step needs 'offers' or 'lacks'");
+        }
+        cml::Result<int> within = int_in_range(table, "within_s", 30, 1, 3600);
+        if (!within) return within.error();
+        step.within_s = *within;
+        return step;
+    }
     if (*kind == "expect_exception") {
         step.kind = StepKind::ExpectException;
-        cml::Result<void> keys = only_keys(table, {"kind", "code", "function", "within_s"}, "an expect_exception step");
+        cml::Result<void> keys = only_keys(table, {"kind", "code", "function", "within_s", "offers", "lacks", "reason"}, "an expect_exception step");
         if (!keys) return keys.error();
+        cml::Result<void> offers = parse_exception_offers(table, step);
+        if (!offers) return offers.error();
         if (const toml::Value* code = table.find("code")) {
             const bool shape = code->kind == toml::Value::Kind::String && code->text.size() == 10 && code->text.compare(0, 2, "0x") == 0 &&
                                std::all_of(code->text.begin() + 2, code->text.end(), [](char c) { return std::isxdigit(static_cast<unsigned char>(c)) != 0; });
@@ -504,8 +551,8 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
         if (!keys) return keys.error();
         cml::Result<std::string> action = require_string(table, "action", "an exception_action step");
         if (!action) return action.error();
-        if (*action != "continue" && *action != "leave" && *action != "ignore") {
-            return invalid(table.line, "'action' must be \"continue\", \"leave\" or \"ignore\"");
+        if (*action != "continue" && *action != "leave" && *action != "ignore" && *action != "reexecute") {
+            return invalid(table.line, "'action' must be \"continue\", \"leave\", \"ignore\" or \"reexecute\"");
         }
         step.exception_action = *action;
         if (const toml::Value* ee = table.find("expect_error")) {
@@ -531,7 +578,7 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
     return invalid(table.line, "unknown step kind '" + *kind +
                                    "' (launch, expect_stdout, expect_module_enabled, edit, reload, expect_diag, expect_monotonic, set_option, wait, "
                                    "expect_event, expect_reload_result, signal_fixture, revert, watch_exceptions, expect_exception, exception_action, "
-                                   "expect_pending_exceptions, restart, perf_idle, perf_report, inject_failure)");
+                                   "expect_pending_exceptions, expect_exception_updated, restart, perf_idle, perf_report, inject_failure)");
 }
 
 }  // namespace

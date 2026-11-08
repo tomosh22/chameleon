@@ -74,6 +74,9 @@ enum class MessageType : std::uint16_t {
     ExceptionAction = 0x0051,  // implemented  broker -> agent (request, answered by Reply)
     ExceptionConfig = 0x0052,  // implemented  broker -> agent (request, answered by Reply)
 
+    // Re-execute function after a crash (WP-23, ADR-0035: 0x00B0..0x00BF).
+    Reexecute = 0x00B0,  // implemented  broker -> agent (request, answered by Reply)
+
     // Diagnostics and lifecycle.
     Log = 0x0060,      // implemented  agent -> broker (event)
     Restart = 0x0061,        // implemented (WP-21)  broker -> agent (request, answered by RestartInfo)
@@ -223,6 +226,20 @@ struct HooksInstalled {
 inline constexpr std::uint32_t kExceptionFlagInPatch = 1u;  // the faulting address lies in a patch image, not in an enabled module
 inline constexpr std::uint32_t kExceptionAccessNone = 0xFFFFFFFFu;  // not an access violation
 
+// WP-23: one frame of a held thread's stack, innermost first. The agent unwinds the faulting context with RtlVirtualUnwind
+// when it reports the fault, so the broker can tell which frames belong to which function and where their parameters live.
+// `rsp`, `rbp` and `r13` are the values in that frame at `rip` (callee-saved registers are restored by the unwind, so they
+// are right for frames above the faulting one too).
+struct ExceptionFrame {
+    std::uint64_t rip = 0;             // the instruction (innermost frame) or the return address into the frame (outer frames)
+    std::uint64_t entry_rsp = 0;       // RSP when the function was entered: it points at the return address
+    std::uint64_t rsp = 0;
+    std::uint64_t rbp = 0;
+    std::uint64_t r13 = 0;
+    std::uint64_t function_start = 0;  // start of the function per the unwind data; 0 when the frame has none
+};
+inline constexpr std::uint32_t kMaxExceptionFrames = 64;
+
 struct Exception {
     std::uint32_t exception_id = 0;
     std::uint32_t thread_id = 0;
@@ -234,6 +251,8 @@ struct Exception {
     std::uint64_t stack_pointer = 0; // RSP at the fault
     std::uint64_t module_base = 0;   // base of the module or patch image holding `address`
     std::string module_path;         // its file, UTF-8
+    // WP-23: the stack of the held thread, innermost first (appended after module_path, only when not empty).
+    std::vector<ExceptionFrame> frames;
 };
 
 // The agent's answer (Reply status) when ExceptionAction names a thread that is not held. Shared so the broker can tell "gone"
@@ -252,6 +271,29 @@ struct ExceptionAction {
     std::uint64_t request_id = 0;
     std::uint32_t exception_id = 0;
     ExceptionActionKind action = ExceptionActionKind::Ignore;
+};
+
+// WP-23: "Re-execute function". The broker resolved, from the PDB, where the parameters of the function of `frame_index` live and
+// which function replaced it. The agent rebuilds the entry state of that frame (RSP = entry_rsp, the callee-saved registers the
+// frame's caller had), loads the register arguments from the described locations, sets RIP = `target` and resumes the thread.
+// Frames above the chosen one are discarded without running destructors (as Leave function does). Answered by Reply: status 0
+// once the thread was released, else a CML46xx id and the thread stays held.
+struct ReexecuteParam {
+    std::uint32_t position = 0;       // 0..3: RCX/RDX/R8/R9 (is_float == 0) or XMM0..XMM3 (is_float == 1)
+    std::uint32_t is_float = 0;
+    std::uint32_t size = 0;           // bytes read from memory: 1, 2, 4 or 8
+    std::uint32_t base_register = 0;  // CV_AMD64 register number of the base: 334 RBP, 335 RSP, 341 R13
+    std::int32_t offset = 0;          // the value is at [base register of the chosen frame + offset]
+};
+inline constexpr std::uint32_t kMaxReexecuteParams = 4;
+
+struct Reexecute {
+    std::uint64_t request_id = 0;
+    std::uint32_t exception_id = 0;
+    std::uint32_t frame_index = 0;   // index into Exception::frames
+    std::uint64_t entry_rsp = 0;     // what the broker saw in that frame; the agent refuses when its own unwind differs
+    std::uint64_t target = 0;        // entry of the function to run (the replacement)
+    std::vector<ReexecuteParam> params;
 };
 
 // Bit flags of ExceptionConfig::flags.
@@ -474,7 +516,7 @@ using Message = std::variant<Hello, Welcome, ModuleList, EnableModule, DisableMo
                              ModuleUnloaded, Log, Reply, ReserveRange, ReleaseRange, LoadPatch,
                              PatchLoaded, ApplyFixups, RunInitializers, ReserveRangeResult, InstallHooks,
                              HooksInstalled, CompileEvent, Exception, ExceptionAction, ExceptionConfig, Restart, RestartInfo,
-                             ReenableModules, RestartCancel, ArmFault>;
+                             ReenableModules, RestartCancel, Reexecute, ArmFault>;
 
 MessageType type_of(const Message& message) noexcept;
 

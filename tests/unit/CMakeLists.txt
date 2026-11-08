@@ -111,6 +111,7 @@ cml_add_unit_test(broker_core
         broker/test_exceptions.cpp
     LIBS cml_core)
 add_subdirectory(bind)  # WP-07: unit.bind
+add_subdirectory(reexecute)  # WP-23: unit.reexecute (recipe builder, wire format, broker decision, fixture PDB records)
 add_subdirectory(ui)    # WP-19: unit.ui (broker UI view model, parsing, settings)
 if(NOT MSVC)
     # Portable pieces are tested on non-Windows hosts too (CML_ALLOW_NON_WINDOWS).

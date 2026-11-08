@@ -38,6 +38,7 @@ add_library(cml_core STATIC
     src/save_watcher.cpp
     # WP-20: crash -> patch -> continue
     src/exception_service.cpp
+    src/reexecute.cpp  # WP-23: re-execute function after a crash
     src/reload_service.cpp
     # WP-28: failure injection (control commands inject-failure, fault-stages)
     src/fault_injection.cpp

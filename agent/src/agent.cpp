@@ -1036,6 +1036,10 @@ void Agent::handle_message(const ipc::Message& message) {
         handle_exception_action(*action);
         return;
     }
+    if (const auto* reexecute = std::get_if<ipc::Reexecute>(&message)) {
+        handle_reexecute(*reexecute);  // WP-23
+        return;
+    }
     CML_LOG(Warn, "ignoring unexpected %s from the broker", ipc::to_string(ipc::type_of(message)));
 }
 
