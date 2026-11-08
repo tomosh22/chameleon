@@ -33,6 +33,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # `push` runs (branch wp/26-*) skip Godot, whose cold build takes hours and would be cancelled by the next push; the
+  # pull_request, schedule and workflow_dispatch runs include it. workflow_dispatch can pick one project.
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          ONLY: ${{ inputs.only }}
+        run: |
+          cells='[{"project":"raylib","compiler":"msvc"},{"project":"raylib","compiler":"clang-cl"},{"project":"imgui","compiler":"msvc"},{"project":"imgui","compiler":"clang-cl"},{"project":"godot","compiler":"msvc"}]'
+          if [ "$EVENT" = "push" ]; then
+            cells=$(echo "$cells" | jq -c 'map(select(.project != "godot"))')
+          elif [ -n "$ONLY" ] && [ "$ONLY" != "all" ]; then
+            cells=$(echo "$cells" | jq -c --arg o "$ONLY" 'map(select(.project == $o))')
+          fi
+          echo "matrix={\"include\":$cells}" >> "$GITHUB_OUTPUT"
+          echo "$cells"
+
   chameleon:
     name: build chameleon
     runs-on: windows-2022
@@ -62,23 +85,14 @@ jobs:
 
   corpus:
     name: ${{ matrix.project }} / ${{ matrix.compiler }}
-    needs: chameleon
+    needs: [plan, chameleon]
     runs-on: windows-2022
-    # `push` runs (branch wp/26-*) skip Godot, whose cold build takes hours and would be cancelled by the next push; the
-    # pull_request, schedule and workflow_dispatch runs include it. workflow_dispatch can pick one project.
-    if: ${{ (github.event_name != 'workflow_dispatch' || inputs.only == '' || inputs.only == 'all' || inputs.only == matrix.project) && (github.event_name != 'push' || matrix.project != 'godot') }}
     # Godot is the large one: a cold scons build of the editor with debug information. The driver step is limited to
     # 130 minutes; the cache is saved afterwards (also on failure) so that a partial build is continued by the next run.
     timeout-minutes: ${{ matrix.project == 'godot' && 175 || 90 }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - { project: raylib, compiler: msvc }
-          - { project: raylib, compiler: clang-cl }
-          - { project: imgui, compiler: msvc }
-          - { project: imgui, compiler: clang-cl }
-          - { project: godot, compiler: msvc }
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     defaults:
       run:
         shell: pwsh
