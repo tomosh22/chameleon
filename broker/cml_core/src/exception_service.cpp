@@ -100,6 +100,21 @@ ExceptionService::~ExceptionService() {
     }
 }
 
+void ExceptionService::set_evaluator_for_testing(Evaluator evaluator) {
+    std::lock_guard<std::mutex> lock(evaluator_mutex_);
+    evaluator_ = std::move(evaluator);
+}
+
+reexecute::Offer ExceptionService::evaluate(const std::vector<std::shared_ptr<ModuleState>>& modules, const ipc::Exception& exception,
+                                            const reexecute::HookMap& at_fault) const {
+    Evaluator evaluator;
+    {
+        std::lock_guard<std::mutex> lock(evaluator_mutex_);
+        evaluator = evaluator_;
+    }
+    return evaluator ? evaluator(modules, exception, at_fault) : reexecute::evaluate(modules, exception, at_fault);
+}
+
 std::vector<std::shared_ptr<ModuleState>> ExceptionService::modules_of(const std::shared_ptr<AgentLink>& link) const {
     return service_->module_states(link->agent_id());
 }
@@ -209,7 +224,7 @@ void ExceptionService::on_exception(const std::shared_ptr<AgentLink>& link, std:
     // WP-23: what re-execute would do, judged from the stack the agent reported and the PDB (evaluated before the lock: it reads PDBs).
     const std::vector<std::shared_ptr<ModuleState>> modules = modules_of(link);
     reexecute::HookMap hooks_at_fault = reexecute::snapshot_hooks(modules);
-    reexecute::Offer offer = reexecute::evaluate(modules, exception, hooks_at_fault);
+    reexecute::Offer offer = evaluate(modules, exception, hooks_at_fault);
     CML_LOG(Info, "process %u: exception %u: re-execute %s", pid, exception.exception_id, offer.offered ? "offered" : offer.reason.c_str());
     event.body = describe(link, pid, exception, offer);
     bool release = false;
@@ -373,7 +388,7 @@ void ExceptionService::on_patch_event(const Event& event) {
         }
     }
     for (Work& w : work) {
-        reexecute::Offer now = reexecute::evaluate(modules_of(w.link), w.raw, w.at_fault);
+        reexecute::Offer now = evaluate(modules_of(w.link), w.raw, w.at_fault);
         if (now.same_as(w.old_offer)) {
             continue;
         }

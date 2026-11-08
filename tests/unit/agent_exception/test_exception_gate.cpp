@@ -26,6 +26,8 @@ using cml::agent::crash::Action;
 using cml::agent::crash::ExceptionGate;
 using cml::agent::crash::Held;
 using cml::agent::crash::Range;
+using cml::agent::crash::ReexecuteParam;
+using cml::agent::crash::ReexecutePlan;
 
 #if defined(_MSC_VER)
 #define CML_TEST_NOINLINE __declspec(noinline)
@@ -74,6 +76,18 @@ CML_TEST_NOINLINE int outer_calls(volatile int* p, volatile int* a, volatile int
 // mov eax,100 ; xor edx,edx ; idiv dword ptr [rcx] ; ret   (the divisor is read from memory, so a fix of that memory makes a retry safe)
 const unsigned char kDivideStub[] = {0xB8, 0x64, 0x00, 0x00, 0x00, 0x31, 0xD2, 0xF7, 0x39, 0xC3};
 using DivideFn = int (*)(volatile int*);
+
+// WP-23. Two leaf functions in one executable page, int f(int* p, double... no: f(int* p [rcx], int k [edx], double scale [xmm2]).
+// "old" spills its register arguments to its home space the way an unoptimised MSVC function does, then reads *p (the fault):
+//   mov [rsp+8],rcx ; mov [rsp+16],edx ; movsd [rsp+24],xmm2 ; mov eax,[rcx] ; add eax,edx ; cvttsd2si ecx,xmm2 ; add eax,ecx ; ret
+const unsigned char kReexecuteOld[] = {0x48, 0x89, 0x4C, 0x24, 0x08, 0x89, 0x54, 0x24, 0x10, 0xF2, 0x0F, 0x11, 0x54, 0x24, 0x18,
+                                       0x8B, 0x01, 0x01, 0xD0, 0xF2, 0x0F, 0x2C, 0xCA, 0x01, 0xC8, 0xC3};
+constexpr std::size_t kReexecuteOldFaultOffset = 15;  // the `mov eax,[rcx]`
+// "new" does not read through p: return (low 32 bits of p) + k + (int)scale
+//   mov eax,ecx ; add eax,edx ; cvttsd2si ecx,xmm2 ; add eax,ecx ; ret
+const unsigned char kReexecuteNew[] = {0x89, 0xC8, 0x01, 0xD0, 0xF2, 0x0F, 0x2C, 0xCA, 0x01, 0xC8, 0xC3};
+constexpr std::size_t kReexecuteNewOffset = 64;
+using ReexecuteFn = int (*)(int*, int, double);
 
 // ---- the process under test ---------------------------------------------------------------------------------------------
 
@@ -174,6 +188,32 @@ char* make_noaccess_page() {
     DWORD old = 0;
     REQUIRE(VirtualProtect(page, 4096, PAGE_NOACCESS, &old) != 0);
     return static_cast<char*>(page);
+}
+
+// WP-23: one executable page holding both stubs, registered as a "patch image".
+unsigned char* make_reexecute_stubs() {
+    void* code = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    REQUIRE(code != nullptr);
+    std::memset(code, 0xCC, 4096);
+    std::memcpy(code, kReexecuteOld, sizeof kReexecuteOld);
+    std::memcpy(static_cast<unsigned char*>(code) + kReexecuteNewOffset, kReexecuteNew, sizeof kReexecuteNew);
+    FlushInstructionCache(GetCurrentProcess(), code, 4096);
+    std::vector<Range> ranges = image_ranges();
+    ranges.push_back(Range{reinterpret_cast<std::uint64_t>(code), 4096, true});
+    ExceptionGate::shared().set_ranges(ranges.data(), ranges.size());
+    return static_cast<unsigned char*>(code);
+}
+
+ReexecutePlan reexecute_plan(const Held& held, const unsigned char* code) {
+    ReexecutePlan plan;
+    plan.frame_index = 0;
+    plan.entry_rsp = held.frames[0].entry_rsp;
+    plan.target = reinterpret_cast<std::uint64_t>(code + kReexecuteNewOffset);
+    plan.param_count = 3;
+    plan.params[0] = ReexecuteParam{0, false, 8, 335, 8};   // p at [rsp+8]
+    plan.params[1] = ReexecuteParam{1, false, 4, 335, 16};  // k at [rsp+16]
+    plan.params[2] = ReexecuteParam{2, true, 8, 335, 24};   // scale at [rsp+24]
+    return plan;
 }
 
 void* make_divide_stub() {
@@ -385,6 +425,98 @@ void scenario_slot_overflow_is_passed_on() {
     CHECK(ExceptionGate::shared().held_count() == 0);
 }
 
+// WP-23. The held thread runs the replacement from its entry with p, k and scale reloaded from the home space.
+void scenario_reexecute_reloads_arguments() {
+    ChildProcess process;
+    char* page = make_noaccess_page();
+    unsigned char* code = make_reexecute_stubs();
+    int* p = reinterpret_cast<int*>(page + 16);
+    Decider decider([&](const Held& held) {
+        expect(held.code == EXCEPTION_ACCESS_VIOLATION, "an access violation");
+        expect(held.in_patch, "in the stub page");
+        expect(held.frame_count >= 2, "at least two frames reported");
+        expect(held.frames[0].rip == reinterpret_cast<std::uint64_t>(code) + kReexecuteOldFaultOffset, "frame 0 is the faulting instruction");
+        expect(held.frames[0].entry_rsp == held.stack_pointer, "a leaf function is entered with the RSP it faults with");
+        expect(held.frames[1].rsp == held.frames[0].entry_rsp + 8, "the caller's RSP is just above the return address");
+        expect(ExceptionGate::shared().resolve_reexecute(held.id, reexecute_plan(held, code)).has_value(), "reexecute accepted");
+    });
+    const int result = reinterpret_cast<ReexecuteFn>(code)(p, 40, 2.5);
+    const int expected = static_cast<int>(static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(p))) + 40 + 2;
+    CHECK(result == expected);
+    CHECK(decider.wait_for_handled(1));
+    CHECK(g_next_handler_saw.load() == 0);
+}
+
+// A recipe that does not match the stack is refused and the thread stays held (Leave then releases it).
+void scenario_reexecute_refused_stack_mismatch() {
+    ChildProcess process;
+    char* page = make_noaccess_page();
+    unsigned char* code = make_reexecute_stubs();
+    Decider decider([&](const Held& held) {
+        ReexecutePlan plan = reexecute_plan(held, code);
+        plan.entry_rsp += 16;
+        const cml::Result<void> refused = ExceptionGate::shared().resolve_reexecute(held.id, plan);
+        expect(!refused.has_value() && refused.error().code == 4601, "a wrong entry RSP is refused with CML4601");
+        plan = reexecute_plan(held, code);
+        plan.frame_index = 1;  // the caller: its entry RSP is not the leaf's
+        const cml::Result<void> other = ExceptionGate::shared().resolve_reexecute(held.id, plan);
+        expect(!other.has_value() && (other.error().code == 4601 || other.error().code == 4600), "the wrong frame is refused");
+        plan = reexecute_plan(held, code);
+        plan.params[0].base_register = 328;  // RAX: not a register re-execute reads
+        const cml::Result<void> bad_register = ExceptionGate::shared().resolve_reexecute(held.id, plan);
+        expect(!bad_register.has_value() && bad_register.error().code == 4603, "an unsupported base register is refused with CML4603");
+        expect(ExceptionGate::shared().held_count() == 1, "the thread is still held");
+        expect(ExceptionGate::shared().resolve(held.id, Action::Leave).has_value(), "leave accepted");
+    });
+    CHECK(reinterpret_cast<ReexecuteFn>(code)(reinterpret_cast<int*>(page), 1, 1.0) == 0);
+    CHECK(decider.wait_for_handled(1));
+}
+
+void scenario_reexecute_refused_bad_target() {
+    ChildProcess process;
+    char* page = make_noaccess_page();
+    unsigned char* code = make_reexecute_stubs();
+    Decider decider([&](const Held& held) {
+        ReexecutePlan plan = reexecute_plan(held, code);
+        plan.target = reinterpret_cast<std::uint64_t>(page);  // not executable
+        const cml::Result<void> refused = ExceptionGate::shared().resolve_reexecute(held.id, plan);
+        expect(!refused.has_value() && refused.error().code == 4602, "a target that is not code is refused with CML4602");
+        // A parameter whose location is the inaccessible page (when it is within reach of a 32-bit offset from RSP).
+        const std::int64_t delta = static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(page)) - static_cast<std::int64_t>(held.frames[0].rsp);
+        if (delta > -0x7FFF0000LL && delta < 0x7FFF0000LL) {
+            plan = reexecute_plan(held, code);
+            plan.params[1].offset = static_cast<std::int32_t>(delta);
+            const cml::Result<void> unreadable = ExceptionGate::shared().resolve_reexecute(held.id, plan);
+            expect(!unreadable.has_value() && unreadable.error().code == 4603, "an unreadable parameter is refused with CML4603");
+        }
+        expect(ExceptionGate::shared().resolve(held.id, Action::Leave).has_value(), "leave accepted");
+    });
+    CHECK(reinterpret_cast<ReexecuteFn>(code)(reinterpret_cast<int*>(page), 1, 1.0) == 0);
+    CHECK(decider.wait_for_handled(1));
+}
+
+CML_TEST_NOINLINE std::size_t capture_frames(cml::agent::crash::Frame* frames, std::size_t max, std::uint64_t* here) {
+    CONTEXT context;
+    RtlCaptureContext(&context);
+    *here = context.Rip;
+    return ExceptionGate::unwind_frames(context, frames, max);
+}
+
+// No fault: the unwinder's frames of this very function.
+void scenario_unwind_frames() {
+    cml::agent::crash::Frame frames[cml::agent::crash::kMaxFrames];
+    std::uint64_t here = 0;
+    const std::size_t n = capture_frames(frames, cml::agent::crash::kMaxFrames, &here);
+    REQUIRE(n >= 2);
+    CHECK(frames[0].rip == here);
+    CHECK(frames[0].function_start != 0);
+    CHECK(frames[0].function_start <= frames[0].rip);
+    CHECK(frames[0].entry_rsp > frames[0].rsp);
+    CHECK(frames[1].rsp == frames[0].entry_rsp + 8);
+    CHECK(frames[1].function_start != 0);
+    CHECK(frames[1].entry_rsp > frames[1].rsp);
+}
+
 struct Scenario {
     const char* name;
     void (*run)();
@@ -404,6 +536,10 @@ const Scenario kScenarios[] = {
     {"switch_off_releases", &scenario_switching_off_releases_the_thread_as_ignore},
     {"resolve_unknown", &scenario_resolve_unknown_id},
     {"slot_overflow", &scenario_slot_overflow_is_passed_on},
+    {"reexecute_reloads_arguments", &scenario_reexecute_reloads_arguments},
+    {"reexecute_refused_stack_mismatch", &scenario_reexecute_refused_stack_mismatch},
+    {"reexecute_refused_bad_target", &scenario_reexecute_refused_bad_target},
+    {"unwind_frames", &scenario_unwind_frames},
 };
 
 // ---- the parent side -------------------------------------------------------------------------------------------------------

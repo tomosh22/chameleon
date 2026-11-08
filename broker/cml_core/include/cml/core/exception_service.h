@@ -22,6 +22,7 @@
 // action / pending / refresh run on control connection threads (refresh may wait for the agents' answers).
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -76,6 +77,10 @@ public:
 
     std::size_t pending_count() const;
 
+    // WP-23 test seam: replaces reexecute::evaluate (which reads PDBs of enabled modules).
+    using Evaluator = std::function<reexecute::Offer(const std::vector<std::shared_ptr<ModuleState>>&, const ipc::Exception&, const reexecute::HookMap&)>;
+    void set_evaluator_for_testing(Evaluator evaluator);
+
 private:
     struct Key {
         std::uint64_t agent_id = 0;
@@ -111,6 +116,9 @@ private:
     bool holding_ = false;      // the agents may hold threads; set together with clearing pending_ (under mutex_)
     std::map<std::uint64_t, std::shared_ptr<AgentLink>> links_;
     std::map<Key, Pending> pending_;
+    reexecute::Offer evaluate(const std::vector<std::shared_ptr<ModuleState>>& modules, const ipc::Exception& exception, const reexecute::HookMap& at_fault) const;
+    mutable std::mutex evaluator_mutex_;
+    Evaluator evaluator_;
     std::shared_ptr<PatchListener> patch_listener_;
     EventBus::Id patch_subscription_ = 0;
 };
