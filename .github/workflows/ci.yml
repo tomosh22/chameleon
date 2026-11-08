@@ -639,15 +639,25 @@ jobs:
         with:
           arch: x64
 
+      # The release download from github.com returns 504 often enough to fail runs; the installed tree is cached per
+      # version, so the download only happens on a cache miss.
+      - name: Restore the LLVM ${{ matrix.llvm }} install from the cache
+        id: llvmcache
+        uses: actions/cache@v4
+        with:
+          path: C:\llvm\${{ matrix.llvm }}
+          key: llvm-${{ matrix.llvm }}-win64-v1
+
       - name: Install LLVM ${{ matrix.llvm }} into C:\llvm\${{ matrix.llvm }}
+        if: steps.llvmcache.outputs.cache-hit != 'true'
         run: |
           $v = '${{ matrix.llvm }}'
           $dir = "C:\llvm\$v"
           $installer = Join-Path $env:RUNNER_TEMP "LLVM-$v-win64.exe"
           $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$v/LLVM-$v-win64.exe"
-          foreach ($i in 1..4) {
+          foreach ($i in 1..7) {
             try { Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing; break }
-            catch { Write-Host "download attempt $i failed: $_"; Start-Sleep -Seconds ([math]::Pow(2, $i)) }
+            catch { Remove-Item $installer -ErrorAction SilentlyContinue; Write-Host "download attempt $i failed: $_"; Start-Sleep -Seconds ([math]::Min(60, [math]::Pow(2, $i + 1))) }
           }
           if (-not (Test-Path $installer)) { throw "could not download $url" }
           Start-Process -FilePath $installer -ArgumentList '/S', "/D=$dir" -Wait

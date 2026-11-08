@@ -29,10 +29,10 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-22 | Patch revert (session reset deferred) | 6 | done | wp/22-patch-revert | #35 | — |
 | WP-24 | Thread-local variables | 6 | done | wp/24-thread-local | #39 | — |
 | WP-25 | Unchanged-function elision (scope narrowed, ADR-0034) | 6 | done | wp/25-unchanged-elision | #37 | — |
-| WP-23 | Re-execute function after crash (ADR-0035) | 7 | in progress | wp/23-crash-reexecute | — | — |
+| WP-23 | Re-execute function after crash (ADR-0035) | 7 | done | wp/23-crash-reexecute | #43 (3230b6f) | CI 14/14 x2 at bff09cb verified (crash_reexecute 25/25 incl. windows-2025 msvc RelWithDebInfo, clang-cl Debug; agent_hook 25/25); 10 high findings fixed, delta checked |
 | WP-26 | Real-project corpus (raylib, Dear ImGui, Godot; ADR-0035) | 7 | in progress | wp/26-corpus | — | — |
-| WP-27 | Performance budgets | 7 | in progress | wp/27-perf-budgets | — | — |
-| WP-28 | Fuzzing and failure injection | 7 | in progress | wp/28-fuzz-injection | — | — |
+| WP-27 | Performance budgets | 7 | done | wp/27-perf-budgets | #42 (f39dc19) | CI 14/14 push 42460887634 + PR 42460890741 at 00e0ac6; pdb index 328 ms/544 MiB (budget 4352), reload excl. compile median 40.9 ms, idle CPU 0.000 %, large-PDB broker 219 MiB = 0.40x PDB, session broker peak 11.0 MiB (limit 1.5x PDB + 32 MiB baseline). Test-coverage gap: no reload measured inside the large PDB (benchmark has no agent). |
+| WP-28 | Fuzzing and failure injection | 7 | in review (fixes) | wp/28-fuzz-injection | #44 | CI 14/14 x2 + fuzz 5/5 at 74b6d04 verified; high review: 8 findings + post-patch-hooks ruling (fire before commit) |
 
 ## Orchestrator integration work
 
@@ -75,7 +75,45 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | FU-24 | WP-19 (#33) | `patch_applied` carries no changed file names or timings, so the UI history is thin for broker-triggered (compile-on-save) reloads; add `changed_files` and `timing_ms` to the event | next broker WP |
 | FU-25 | WP-24 (#39) | SECREL value comes from `section_offset_from_rva` of the record's RVA, not the record's own section offset; correct on CI (both compilers, threads keep values) but would break if a linker merged `.tls` into another section; also no check that a patch DLL has no TLS directory, and WP-24.md still says "inside the old `.tls` section" (the code decides by thread records) | next bind-planner WP |
 
-## Handoff (2026-11-08)
+## Handoff (2026-11-08, wave 7 paused)
 
-Wave 6 complete: WP-19..22, 24, 25 merged; main at 61e1e29 (WP-24). Agent ABI decision taken (ADR-0034: no bump).
-WP-24 failed acceptance once (S_PUB32 RVA is not the .tls offset) and passed on re-delegation.
+Wave 6 complete (WP-19..22, 24, 25). Wave 7 is paused at the user's request, with each agent finishing its current round.
+
+**Merged**
+- WP-27 (#42, f39dc19).
+- Main run 42469196628 failed only in 3 clang-cl probe jobs, on the LLVM download (504); those jobs were re-run.
+- PR #45 caches the LLVM install so this stops recurring.
+
+**Waiting on the agent's fix round**
+- WP-23 (#43): DONE, merged 3230b6f after the fix round.
+  - Agent side: unwind bounds and `__try` guard, slot race in resolve_reexecute, executable check on the return address.
+  - Broker side: patch-during-evaluate race, stale fields after a withdrawn offer, per-frame recipe cost, entry_rsp check order.
+  - PDB: duplicate TPI/IPI table, S_DEFRANGE_SUBFIELD_REGISTER range offset (8).
+  - Docs and offer caveat: re-execute uses the parameters' values at the fault.
+- WP-28 (#44): 8 high-review findings plus a ruling: the post-patch-hooks stage fires before commit and before the app's post-patch hooks.
+  - Never unload a patch after a partial rollback.
+  - hook-install is consumed only by the reload path.
+  - Arming is all-or-nothing; fixes to "none" disarm semantics.
+  - Arming reservation is refused once the module is already reserved.
+  - Injected stages return the reservation space they used.
+  - Replay ctests check the exit code.
+  - `#if` instead of `if constexpr` for the OFF build, plus a fuzz.yml job that builds with OFF.
+- Both PRs must merge main (WP-27 touched the harness files) and each other's IPC, capability and harness additions.
+
+**WP-26 (#46, head 53e4d43): stopped, not yet accepted.**
+- The corpus workflow was green at fd81a45, all five cells: raylib and ImGui under cl and clang-cl, and Godot 4.5.1 under cl (cold build 1444 s).
+- The final head's `ci` and `corpus` runs are not verified yet.
+- Findings, with repros under tests/corpus/repro/:
+  - F-1 (decision needed): members of a static library are never reloaded, and the reload silently returns patched:0. A diagnostic or KNOWN_LIMITATIONS is needed.
+  - F-2: cl CML3101 on indexing a global array by a variable (`__ImageBase`).
+  - F-3 (bug, open): raylib rcore.c under clang-cl crashes after reload, probably static matching for C TUs in bind_plan.cpp. Planner trace output was added.
+  - F-4: CML3214 blocks TUs that use overloaded statics.
+- VEX: the decoder refuses VEX opcodes; this was counted, not fixed.
+- On resume: verify CI on the final head, then do a medium review. Decide F-1 (a diagnostic, not silence). F-3 needs a fix WP, or an explicit refusal, before WP-26 is accepted.
+
+**To resume**
+1. Verify each re-push's CI myself (both runs, plus the fuzz run for WP-28).
+2. Delta-review the fixes only (ADR-0018).
+3. Merge one at a time and confirm main after each.
+4. Update KNOWN_LIMITATIONS from the proposed wording in WP-23.md and WP-28.md.
+5. Then wave 8: WP-29..32.

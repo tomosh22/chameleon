@@ -131,3 +131,13 @@ diagnostic is planned, not live.
   its old namesake (the PDB carries no signatures for the planner yet; ADR-0029). Callers inside
   the patched TU are recompiled and are fine; an old function pointer to it held elsewhere would
   be called with the old signature. Rename the function when changing its signature, or hot-restart.
+- **Re-execute after a crash (WP-23)** is offered only for an unoptimised frame of an enabled module with a loaded PDB. The recorded
+  build command must end in `/Od`/`-O0`. Frames in patch code are never offered (patch PDBs are not indexed).
+  - It reloads the parameters' values *at the fault*. They equal the call arguments only if the function did not assign to a
+    parameter first. Nothing detects this; every offer carries `notes.reexecute`.
+  - Side effects before the fault happen again.
+  - Destructors and `__finally`/`__except` of the discarded frames do not run, so locks and handles held there stay held.
+  - Never offered for: by-value aggregates among the first four parameters, member pointers, 80/128-bit floats, variadic
+    functions, and functions returning a class by value (CML5900-5907).
+  - A patch committed between the fault and the broker receiving the report counts as present at the fault. Re-execute is then not
+    offered for that function until a later patch.
