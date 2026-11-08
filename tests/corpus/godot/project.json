@@ -17,40 +17,26 @@
   "env": {},
   "edits": [
     {
-      "id": "main-iteration",
-      "file": "main/main.cpp",
+      "id": "os-windows-tu",
+      "file": "platform/windows/os_windows.cpp",
       "replace": [
         {
-          "find": "bool Main::iteration() {\n\titerating++;\n",
-          "with": "bool Main::iteration() {\n\tcml_corpus_marker(\"godot_iteration_v2\");\n\titerating++;\n"
+          "find": "uint64_t OS_Windows::get_ticks_usec() const {\n",
+          "with": "uint64_t OS_Windows::get_ticks_usec() const {\n\tcml_corpus_marker(\"godot_ticks_v2\");\n"
         }
       ],
-      "include": "platform/windows/chameleon_corpus.h",
-      "expect": "markers=\\S*godot_iteration_v2:\\d+"
+      "expect": "markers=\\S*godot_ticks_v2:\\d+"
     },
     {
-      "id": "scene-tree-process",
-      "file": "scene/main/scene_tree.cpp",
+      "id": "windows-utils-tu",
+      "file": "platform/windows/windows_utils.cpp",
       "replace": [
         {
-          "find": "bool SceneTree::process(double p_time) {\n",
-          "with": "bool SceneTree::process(double p_time) {\n\tcml_corpus_marker(\"godot_scenetree_process_v2\");\n"
+          "find": "\tg_cml_corpus_utils_ticks = g_cml_corpus_utils_ticks + 1;\n",
+          "with": "\tcml_corpus_marker(\"godot_utils_v2\");\n\tg_cml_corpus_utils_ticks = g_cml_corpus_utils_ticks + 1;\n"
         }
       ],
-      "include": "platform/windows/chameleon_corpus.h",
-      "expect": "markers=\\S*godot_scenetree_process_v2:\\d+"
-    },
-    {
-      "id": "call-queue-flush",
-      "file": "core/object/message_queue.cpp",
-      "replace": [
-        {
-          "find": "Error CallQueue::flush() {\n\tLOCK_MUTEX;\n",
-          "with": "Error CallQueue::flush() {\n\tcml_corpus_marker(\"godot_callqueue_flush_v2\");\n\tLOCK_MUTEX;\n"
-        }
-      ],
-      "include": "platform/windows/chameleon_corpus.h",
-      "expect": "markers=\\S*godot_callqueue_flush_v2:\\d+"
+      "expect": "markers=\\S*godot_utils_v2:\\d+"
     },
     {
       "id": "header-inline-support",
@@ -76,14 +62,40 @@
     },
     {
       "id": "unsupported-new-thread-local",
-      "file": "core/os/os.cpp",
+      "file": "platform/windows/windows_utils.cpp",
       "replace": [
         {
-          "find": "String OS::get_executable_path() const {\n\treturn _execpath;\n}",
-          "with": "String OS::get_executable_path() const {\n\tstatic thread_local int cml_corpus_tls = 0;\n\tcml_corpus_tls++;\n\treturn _execpath;\n}"
+          "find": "void cml_corpus_utils_frame(void) {\n",
+          "with": "void cml_corpus_utils_frame(void) {\n\tstatic thread_local int cml_corpus_tls = 0;\n\tcml_corpus_tls++;\n"
         }
       ],
       "expect_error": "CML3400"
+    },
+    {
+      "id": "static-lib-main",
+      "file": "main/main.cpp",
+      "replace": [
+        {
+          "find": "bool Main::iteration() {\n\titerating++;\n",
+          "with": "bool Main::iteration() {\n\tcml_corpus_marker(\"godot_iteration_v2\");\n\titerating++;\n"
+        }
+      ],
+      "include": "platform/windows/chameleon_corpus.h",
+      "expect": "markers=\\S*godot_iteration_v2:\\d+",
+      "final": true
+    },
+    {
+      "id": "static-lib-scene-tree",
+      "file": "scene/main/scene_tree.cpp",
+      "replace": [
+        {
+          "find": "bool SceneTree::process(double p_time) {\n",
+          "with": "bool SceneTree::process(double p_time) {\n\tcml_corpus_marker(\"godot_scenetree_process_v2\");\n"
+        }
+      ],
+      "include": "platform/windows/chameleon_corpus.h",
+      "expect": "markers=\\S*godot_scenetree_process_v2:\\d+",
+      "final": true
     }
   ],
   "reload_timeout_s": 900,
@@ -91,5 +103,16 @@
   "start_timeout_s": 600,
   "index_timeout_s": 1800,
   "min_functions": 50000,
-  "expected_failures": []
+  "expected_failures": [
+    {
+      "step": "edit:static-lib-main",
+      "compiler": "*",
+      "reason": "F-1: main/ is linked from a static library; its members are not source compilands, the reload patches nothing"
+    },
+    {
+      "step": "edit:static-lib-scene-tree",
+      "compiler": "*",
+      "reason": "F-1: scene/ is linked from a static library; its members are not source compilands, the reload patches nothing"
+    }
+  ]
 }

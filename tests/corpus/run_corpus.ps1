@@ -335,6 +335,7 @@ if ($built) {
                         "refused with $($edit.expect_error) as expected; application keeps running"
                     } else {
                         if (-not $r.ok) { throw "reload failed: $resp" }
+                        if ([int]$r.result.patched -eq 0) { throw "the reload patched nothing (changed_files: $(@($r.result.changed_files).Count)): $($edit.file) maps to no source compiland of the module" }
                         $line = Wait-Corpus $edit.expect $from $cfg.observe_timeout_s
                         $t = $r.result.timing_ms
                         "reload {0:N1}s wall, total {1} ms (compile {2}, link {3}, load {4}, hooks {5}); patched={6} hooks={7}; observed: {8}" -f $wall, $t.total, $t.compile, $t.link, $t.load, $t.hooks, $r.result.patched, $r.result.hooks_installed, $line

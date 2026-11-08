@@ -31,19 +31,21 @@ index 62d28f4..329e66a 100644
      "display_server_windows.cpp",
      "key_mapping_windows.cpp",
 diff --git a/platform/windows/os_windows.cpp b/platform/windows/os_windows.cpp
-index 6c76e53..a34062d 100644
+index 6c76e53..a3b761d 100644
 --- a/platform/windows/os_windows.cpp
 +++ b/platform/windows/os_windows.cpp
-@@ -30,6 +30,8 @@
+@@ -30,6 +30,10 @@
  
  #include "os_windows.h"
  
 +#include "chameleon_corpus.h" // Chameleon corpus (WP-26)
 +
++extern "C" void cml_corpus_utils_frame(void); // Chameleon corpus (WP-26): windows_utils.cpp
++
  #include "display_server_windows.h"
  #include "lang_table.h"
  #include "windows_terminal_logger.h"
-@@ -2327,11 +2329,13 @@ void OS_Windows::run() {
+@@ -2327,11 +2331,14 @@ void OS_Windows::run() {
  
  	main_loop->initialize();
  
@@ -54,6 +56,33 @@ index 6c76e53..a34062d 100644
  			break;
  		}
 +		cml_corpus_frame(); // Chameleon corpus (WP-26)
++		cml_corpus_utils_frame(); // Chameleon corpus (WP-26)
  	}
  
  	main_loop->finalize();
+diff --git a/platform/windows/windows_utils.cpp b/platform/windows/windows_utils.cpp
+index 7015f63..f70f5eb 100644
+--- a/platform/windows/windows_utils.cpp
++++ b/platform/windows/windows_utils.cpp
+@@ -30,6 +30,8 @@
+ 
+ #include "windows_utils.h"
+ 
++#include "chameleon_corpus.h" // Chameleon corpus (WP-26)
++
+ #ifdef WINDOWS_ENABLED
+ 
+ #include "core/error/error_macros.h"
+@@ -278,4 +280,12 @@ void WindowsUtils::remove_temp_pdbs(const String &p_dll_path) {
+ #endif
+ }
+ 
++// Chameleon corpus (WP-26): a function of this translation unit that runs once per frame (an edit target).
++extern "C" {
++int g_cml_corpus_utils_ticks = 0;
++void cml_corpus_utils_frame(void) {
++	g_cml_corpus_utils_ticks = g_cml_corpus_utils_ticks + 1;
++}
++}
++
+ #endif // WINDOWS_ENABLED
