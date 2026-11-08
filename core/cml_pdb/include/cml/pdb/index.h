@@ -127,6 +127,12 @@ public:
     // compiland: nullopt, not an error.
     Result<std::optional<SymbolView>> find_proc_by_rva(std::uint32_t rva) const;
 
+    // WP-23: the parameters of `proc` (a proc symbol of this index, as returned by find_proc_by_rva / compiland_symbols) with the
+    // locations the compiler recorded for them (S_FRAMEPROC, S_LOCAL + S_DEFRANGE_*, S_REGREL32) and their types resolved
+    // through the TPI/IPI streams. Loads the compiland's symbols and the type streams. A function whose type cannot be read
+    // still returns a ProcInfo (params_known == false); an error only when the symbol records are unreadable.
+    Result<ProcInfo> proc_info(const SymbolView& proc) const;
+
     // ---- Loading control -----------------------------------------------------------------
     Result<void> load_publics() const;
     Result<void> load_compiland(std::uint32_t ci) const;

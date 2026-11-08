@@ -99,6 +99,15 @@ struct IpiTable {
     Vec<std::uint32_t> offsets;  // per record, relative to records_begin
 };
 
+// A type stream (TPI = 2, IPI = 4) indexed by record, for the parameter types of WP-23 (index_locals.cpp).
+struct TypeTable {
+    StreamData data;
+    std::uint64_t records_begin = 0;
+    std::uint64_t records_end = 0;
+    std::uint32_t type_begin = 0;
+    Vec<std::uint32_t> offsets;  // per record, relative to records_begin
+};
+
 struct FileEntry {
     std::uint32_t raw_off = 0;  // into the DBI source-info names block
     std::uint32_t raw_len = 0;
@@ -164,6 +173,12 @@ struct PdbIndex::Impl {
     mutable std::optional<Diag> ipi_error;
     mutable std::unique_ptr<detail::IpiTable> ipi;
     mutable std::atomic<std::uint64_t> ipi_ns{0};
+
+    // WP-23: [0] = TPI (stream 2), [1] = IPI (stream 4), built on first use by proc_info().
+    mutable std::mutex types_mutex;
+    mutable bool types_tried[2] = {false, false};
+    mutable std::unique_ptr<detail::TypeTable> type_tables[2];
+    mutable std::optional<Diag> types_error[2];
 
     mutable std::unique_ptr<std::atomic<std::uint8_t>[]> module_state;
     mutable std::vector<std::unique_ptr<detail::ModuleSymbols>> module_symbols;
