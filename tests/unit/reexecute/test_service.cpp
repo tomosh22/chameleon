@@ -9,6 +9,7 @@
 #include <variant>
 #include <vector>
 
+#include "cml/core/control_server.h"
 #include "cml/core/exception_service.h"
 #include "cml/core/reexecute_diag_ids.h"
 #include "cml/ipc/control.h"
@@ -107,7 +108,7 @@ struct Rig {
         });
         exceptions.agent_ready(link);
         collector = std::make_shared<Collect>();
-        bus.subscribe(collector, {"exception"});
+        bus.subscribe(collector, {"exception", "exception_updated"});
         exceptions.refresh(true);
     }
     ~Rig() {
@@ -313,4 +314,28 @@ TEST_CASE("reexecute: an agent that cannot apply the recipe leaves the thread he
 
 TEST_CASE("reexecute: the capability is advertised with the exception commands") {
     CHECK(std::string(ipc::capability::kReexecute) == "reexecute");
+}
+
+TEST_CASE("reexecute: `exception_updated` is a known event name and not part of the default subscription") {
+    EventBus bus;
+    ReloadService service(PipelineEnv{}, &bus, "");
+    std::set<std::string> subscribed;
+    ControlContext context;
+    context.service = &service;
+    context.subscribe = [&](const std::set<std::string>& names) { subscribed = names; };
+    ipc::ControlRequest request;
+    request.id = 1;
+    request.cmd = "subscribe";
+    Value events = Value::array();
+    events.push(Value::string("exception_updated"));
+    request.args.set("events", events);
+    ipc::ControlResponse response = handle_control_request(request, context);
+    REQUIRE(response.ok);
+    CHECK(subscribed == std::set<std::string>{"exception_updated"});
+
+    request.args = Value::object();
+    response = handle_control_request(request, context);
+    REQUIRE(response.ok);
+    CHECK(subscribed.count("exception") == 0);
+    CHECK(subscribed.count("exception_updated") == 0);
 }

@@ -393,7 +393,7 @@ void ExceptionService::on_patch_event(const Event& event) {
             continue;
         }
         Event updated;
-        updated.name = "exception";  // delivered to everybody who listens for exception events
+        updated.name = "exception_updated";  // the wire "event" is the name; a subscription to `exception` includes it (control_server.cpp)
         {
             std::lock_guard<std::mutex> lock(mutex_);
             const auto it = pending_.find(w.key);
