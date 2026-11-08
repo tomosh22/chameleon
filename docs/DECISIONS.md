@@ -694,3 +694,57 @@ it created match.
 
 The old bytes still come from the module file, not process memory: after the first gap is closed, reading memory adds
 nothing, and it breaks when something else writes the code.
+
+## ADR-0035 Wave-7 ranges, message blocks, CI ownership and design rulings (extends ADR-0008/0031/0032)
+
+**Date:** 2026-11-08 · **Status:** Accepted
+
+Wave 7 (WP-23, WP-26, WP-27, WP-28) runs all four packages in parallel.
+
+**Diagnostic ranges**
+
+| Range | Owner |
+|---|---|
+| CML4600–4649, CML5900–5919 | WP-23 re-execute function after crash (agent, broker) |
+| CML3500–3549, CML1470–1479, CML5920–5939 | WP-26 real-project corpus (fixes in planner/linker/toolchain, PDB reader, broker) |
+| CML5940–5959 | WP-27 performance budgets |
+| CML1280–1289, CML1380–1389, CML1480–1489, CML4650–4699, CML5960–5989 | WP-28 fuzzing and failure injection (COFF/PE/PDB reader hardening, agent, broker) |
+
+**Agent message types:** WP-23 owns 0x00B0–0x00BF, WP-28 owns 0x00C0–0x00CF. `agent_abi_version` is unchanged (ADR-0034).
+
+**Control pipe**
+
+| Owner | Capability | Shape |
+|---|---|---|
+| WP-23 | `reexecute` | the `exception` event's `actions` contains `"reexecute"` only when it is offered; event `{"event":"exception_updated","pid","exception_id","actions":[...],"reasons":{...}}` when a patch changes what is offered; `exception-action` accepts `"action":"reexecute"` |
+| WP-28 | `fault-injection` | command `inject-failure` `{stage, pid?, count?}` → `{stage, armed}`; `{"stage":"none"}` disarms; command `fault-stages` → `{stages:[...]}` |
+
+**CI ownership.** WP-27 is the only package that edits `.github/workflows/ci.yml`, and only the steps of the
+`pdb-benchmark` job (job names and the job count, 14, stay). WP-26 adds `.github/workflows/corpus.yml`, WP-28 adds
+`.github/workflows/fuzz.yml`; both run on `schedule`, `workflow_dispatch`, and on `pull_request` filtered to their own
+paths, so the PR that adds them carries its own acceptance run. Fixture directories `crash_reexecute`, `perf`,
+`inject` and test directories `tests/fuzz`, `tests/corpus` are pre-registered.
+
+**WP-23 (re-execute).** Plan §4.11 says "four register arguments reloaded from the frame's home space". clang-cl at
+`-O0` spills parameters to its own locals, not to the home space, so the rule is generalised: parameter values are
+read from the locations the PDB records for the faulting function's parameters (`S_REGREL32`, `S_LOCAL` +
+`S_DEFRANGE_*`), which covers MSVC's home-space spill and clang-cl alike. Re-execute is offered only when the function
+was compiled without optimisation, a patch applied after the fault replaces it, every register parameter's location
+is known, and the frame unwinds; otherwise the event says why not. The frame re-executed is the innermost frame whose
+function has a newer patched version; frames above it are discarded without running destructors (as Leave function).
+The stack pointer is restored to its value at function entry; stack-passed arguments stay in the caller's frame.
+Repeated side effects and parameters the function assigned to before the fault are documented behaviour.
+
+**WP-26 (corpus).** Projects: a raylib example game (zlib), Dear ImGui `example_win32_directx11` (MIT), and the Godot 4
+editor (MIT) as the large one; pinned tags, fetched at CI time, never vendored; the few lines that create the agent and
+the required compiler/linker flags are patch files in `tests/corpus/<project>/`. No GPL code anywhere in the chain.
+Every corpus PDB also feeds the hook decoder over all function entries (plan §11), reporting counts per outcome.
+
+**WP-27 (performance).** CI thresholds keep ADR-0009's 2× slack for shared runners on time and CPU budgets; memory has
+none. Trend output is a JSON artefact plus the step summary, compared against the latest successful `main` run when
+one is available; only absolute budgets fail the job.
+
+**WP-28 (fuzzing, injection).** CMake option `CML_FUZZ` (clang-cl, libFuzzer + ASan) builds fuzzers; without it each
+target builds as a replay executable registered with ctest over its checked-in seed corpus, so every cell exercises
+it. Failure injection is compiled in under CMake option `CML_FAULT_INJECTION` (default ON; the release packaging WP
+turns it off) and is reachable only through the `fault-injection` control capability.
