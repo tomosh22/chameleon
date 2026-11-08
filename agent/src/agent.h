@@ -242,6 +242,7 @@ private:
     void end_crash_session();    // a session ended: no broker to ask any more, release every held thread (Ignore)
     void handle_exception_config(const ipc::ExceptionConfig& config);
     void handle_exception_action(const ipc::ExceptionAction& action);
+    void handle_reexecute(const ipc::Reexecute& request);  // WP-23
     bool flush_exceptions(ipc::PipeConnection& connection);
     void refresh_exception_ranges();
     void refresh_exception_ranges_if_due();

@@ -123,6 +123,35 @@ void Agent::handle_exception_action(const ipc::ExceptionAction& request) {
     queue_reply(reply);
 }
 
+void Agent::handle_reexecute(const ipc::Reexecute& request) {
+    crash::ReexecutePlan plan;
+    plan.frame_index = request.frame_index;
+    plan.entry_rsp = request.entry_rsp;
+    plan.target = request.target;
+    plan.param_count = static_cast<std::uint32_t>(request.params.size() < 4 ? request.params.size() : 4);
+    for (std::uint32_t i = 0; i < plan.param_count; ++i) {
+        const ipc::ReexecuteParam& p = request.params[i];
+        plan.params[i].position = p.position;
+        plan.params[i].is_float = p.is_float != 0;
+        plan.params[i].size = p.size;
+        plan.params[i].base_register = p.base_register;
+        plan.params[i].offset = p.offset;
+    }
+    ipc::Reply reply;
+    reply.request_id = request.request_id;
+    Result<void> resolved = crash::ExceptionGate::shared().resolve_reexecute(request.exception_id, plan);
+    if (!resolved) {
+        reply.status = resolved.error().code;
+        reply.message = ipc::sanitize_utf8(resolved.error().message + " " + resolved.error().what_to_do, 512);
+        CML_LOG(Warn, "exception %u: re-execute refused: %s", request.exception_id, resolved.error().format().c_str());
+    } else {
+        reply.message = std::string("exception ") + std::to_string(request.exception_id) + ": re-execute frame " + std::to_string(request.frame_index);
+        CML_LOG(Info, "exception %u: re-execute frame %u at 0x%llx with %u register arguments", request.exception_id, request.frame_index,
+                static_cast<unsigned long long>(request.target), plan.param_count);
+    }
+    queue_reply(reply);
+}
+
 bool Agent::flush_exceptions(ipc::PipeConnection& connection) {
     crash::ExceptionGate& gate = crash::ExceptionGate::shared();
     const std::uint32_t overflow = gate.take_overflow_count();
@@ -141,6 +170,11 @@ bool Agent::flush_exceptions(ipc::PipeConnection& connection) {
         message.data_address = held.data_address;
         message.stack_pointer = held.stack_pointer;
         message.module_base = held.module_base;
+        message.frames.reserve(held.frame_count);
+        for (std::uint32_t i = 0; i < held.frame_count; ++i) {
+            const crash::Frame& f = held.frames[i];
+            message.frames.push_back(ipc::ExceptionFrame{f.rip, f.entry_rsp, f.rsp, f.rbp, f.r13, f.function_start});
+        }
         for (const ipc::ModuleEntry& module : known_modules_) {
             if (module.base == held.module_base) {
                 message.module_path = module.path;

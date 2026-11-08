@@ -1,0 +1,11 @@
+--- a/opt.cpp
++++ b/opt.cpp
+@@ -5,6 +5,6 @@
+ __declspec(noinline) int opt_step(int* p, int k)
+ {
+     volatile int* q = p;
+-    const int v = *q;
+-    return v + k;
++    const int v = (p != nullptr) ? *q : -7;
++    return v + k + 5000;
+ }

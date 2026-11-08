@@ -30,6 +30,7 @@ std::vector<std::string> broker_capabilities(const ControlContext& context) {
     }
     if (context.exceptions != nullptr) {
         caps.emplace_back(ipc::capability::kExceptions);
+        caps.emplace_back(ipc::capability::kReexecute);  // WP-23
     }
     return caps;
 }
@@ -114,7 +115,7 @@ ipc::ControlResponse answer(const ipc::ControlRequest& request, Result<ipc::json
 }
 
 ipc::ControlResponse subscribe_response(const ipc::ControlRequest& request, const ControlContext& context) {
-    static const char* const kEvents[] = {"diag", "patch_applied", "patch_reverted", "progress", "log", "exception", "restarted"};
+    static const char* const kEvents[] = {"diag", "patch_applied", "patch_reverted", "progress", "log", "exception", "restarted", "exception_updated"};
     std::set<std::string> names;
     const ipc::json::Value* events = request.args.find("events");
     // An empty array is the same as no argument: the default set. (The bus reads an empty set as "every event", which would switch
@@ -123,7 +124,7 @@ ipc::ControlResponse subscribe_response(const ipc::ControlRequest& request, cons
         // `progress` (WP-15) is opt-in: it can be chatty on a big reload. `exception` (WP-20) is opt-in because listening for it
         // makes the agents hold faulting threads until somebody decides.
         for (const char* k : kEvents) {
-            if (std::string(k) != "progress" && std::string(k) != "exception" && std::string(k) != "restarted") names.insert(k);
+            if (std::string(k) != "progress" && std::string(k) != "exception" && std::string(k) != "exception_updated" && std::string(k) != "restarted") names.insert(k);
         }
     } else if (!events->is_array()) {
         return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "argument 'events' must be an array of event names", "Use [\"diag\", \"patch_applied\", \"patch_reverted\", \"progress\", \"log\", \"exception\", \"restarted\"] or a subset."));
@@ -456,9 +457,14 @@ void ControlServer::serve(Connection& connection) {
     EventBus* bus = context_.service != nullptr ? context_.service->events() : nullptr;
     EventBus::Id subscription = 0;
     ControlContext local = context_;  // per connection: `subscribe` belongs to this connection
-    local.subscribe = [&](const std::set<std::string>& names) {
+    local.subscribe = [&](const std::set<std::string>& requested) {
         if (bus == nullptr) {
             return;
+        }
+        // WP-23: a client that listens for `exception` also gets `exception_updated` (what is offered changed after a patch).
+        std::set<std::string> names = requested;
+        if (names.count("exception") != 0) {
+            names.insert("exception_updated");
         }
         if (subscription == 0) {
             subscription = bus->subscribe(sender, names);
