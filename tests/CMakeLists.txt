@@ -31,3 +31,12 @@ endif()
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench/CMakeLists.txt")
     add_subdirectory(bench)
 endif()
+
+# Wave 7 (ADR-0035): fuzz targets (WP-28; corpus replay runs as ordinary ctests in every cell) and the
+# real-project corpus driver (WP-26; its projects build only in .github/workflows/corpus.yml).
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/fuzz/CMakeLists.txt")
+    add_subdirectory(fuzz)
+endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/corpus/CMakeLists.txt")
+    add_subdirectory(corpus)
+endif()

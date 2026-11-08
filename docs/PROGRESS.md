@@ -29,6 +29,10 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-22 | Patch revert (session reset deferred) | 6 | done | wp/22-patch-revert | #35 | — |
 | WP-24 | Thread-local variables | 6 | done | wp/24-thread-local | #39 | — |
 | WP-25 | Unchanged-function elision (scope narrowed, ADR-0034) | 6 | done | wp/25-unchanged-elision | #37 | — |
+| WP-23 | Re-execute function after crash (ADR-0035) | 7 | in progress | wp/23-crash-reexecute | — | — |
+| WP-26 | Real-project corpus (raylib, Dear ImGui, Godot; ADR-0035) | 7 | in progress | wp/26-corpus | — | — |
+| WP-27 | Performance budgets | 7 | in progress | wp/27-perf-budgets | — | — |
+| WP-28 | Fuzzing and failure injection | 7 | in progress | wp/28-fuzz-injection | — | — |
 
 ## Orchestrator integration work
 
