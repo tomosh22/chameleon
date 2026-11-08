@@ -32,6 +32,9 @@ enum class StepKind {
     ExceptionAction,          // control command `exception-action` for the current exception
     ExpectPendingExceptions,  // control command `exceptions` lists exactly `count` held threads
     ExpectExceptionUpdated,   // WP-23: an `exception_updated` event for the current exception arrives with the given offers (needs "reexecute")
+    // WP-27 (perf_steps.h; run by tests/bench/scenarios/perf.toml in the pdb-benchmark job).
+    PerfIdle,    // observe the broker's CPU time while it idles with a connected fixture
+    PerfReport,  // statistics of the recorded reloads, the broker's peak memory, perf-reload.json
 };
 
 const char* to_string(StepKind kind);

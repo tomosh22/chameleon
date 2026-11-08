@@ -20,6 +20,7 @@ add_library(cmltest_core STATIC
     src/run_dirs.cpp
     src/ticks.cpp
     src/restart_step.cpp  # WP-21
+    src/perf_steps.cpp    # WP-27
     src/subscription.cpp)
 target_include_directories(cmltest_core PUBLIC src)
 target_link_libraries(cmltest_core PUBLIC cml_ipc cml_util)
@@ -34,8 +35,9 @@ if(WIN32)
         src/fixture_builder.cpp
         src/revert_step.cpp
         src/exception_steps.cpp  # WP-20
+        src/perf_runtime.cpp     # WP-27
         src/runner.cpp)
-    target_link_libraries(cmltest PRIVATE cmltest_core cml_ipc cml_proc dbghelp)
+    target_link_libraries(cmltest PRIVATE cmltest_core cml_ipc cml_proc dbghelp psapi)
     cml_apply_warnings(cmltest)
     cml_target_exceptions_allowed(cmltest)
     set_target_properties(cmltest PROPERTIES FOLDER "tests/harness")
@@ -82,11 +84,14 @@ cml_add_unit_test(harness
         tests/test_subscription.cpp
         tests/test_wp20_scenarios.cpp
         tests/test_wp23_scenarios.cpp
+        tests/test_wp27_scenarios.cpp
     LIBS cmltest_core)
 target_compile_definitions(cml_test_harness PRIVATE
     "CML_HARNESS_SCENARIOS_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/scenarios\""
     "CML_FIXTURE_BASIC_EDIT=\"${PROJECT_SOURCE_DIR}/tests/fixtures/basic/edits/value_2.edit\""
-    "CML_FIXTURE_BASIC_DIR=\"${PROJECT_SOURCE_DIR}/tests/fixtures/basic\"")
+    "CML_FIXTURE_BASIC_DIR=\"${PROJECT_SOURCE_DIR}/tests/fixtures/basic\""
+    "CML_BENCH_SCENARIOS_DIR=\"${PROJECT_SOURCE_DIR}/tests/bench/scenarios\""
+    "CML_FIXTURE_PERF_DIR=\"${PROJECT_SOURCE_DIR}/tests/fixtures/perf\"")
 
 cml_add_unit_test(control
     SOURCES
