@@ -3,8 +3,9 @@
 // for every input) and opened with PdbIndex::open_pdb. When it opens, every query of the index runs once, and
 // load_all() forces every compiland's symbol stream through the record walkers. The first 4 KiB, if they look like a PE
 // image, are additionally given to the CodeView reference reader.
-#include <cstdio>
+#include <cstddef>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -45,12 +46,13 @@ struct ScratchCleanup {
 
 bool write_scratch(const std::uint8_t* data, std::size_t size) {
     static const ScratchCleanup cleanup;
-    std::FILE* f = std::fopen(scratch_path().c_str(), "wb");
-    if (f == nullptr) {
+    std::ofstream out(scratch_path(), std::ios::binary | std::ios::trunc);
+    if (!out) {
         return false;
     }
-    const bool ok = size == 0 || std::fwrite(data, 1, size, f) == size;
-    return std::fclose(f) == 0 && ok;
+    out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
+    out.close();
+    return static_cast<bool>(out);
 }
 
 void exercise(const cml::pdb::PdbIndex& idx) {
