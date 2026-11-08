@@ -13,10 +13,10 @@
 #                      with it). `fuzz.replay.<target>` then runs the libFuzzer binary with -runs=0 over the corpus.
 #                      .github/workflows/fuzz.yml uses this: RelWithDebInfo, 10 minutes per target.
 #
-# AddressSanitizer on Windows comes in two shapes (the LLVM 20 installer ships only the second): the static runtime for the
-# static CRT (/MT, clang_rt.asan-x86_64.lib), and the dynamic runtime for /MD (clang_rt.asan_dynamic-x86_64.lib + its DLL).
-# This file takes the static one when the LLVM install has it and otherwise builds the instrumented libraries and the targets
-# with /MD, and puts the runtime DLL next to the executables.
+# AddressSanitizer on Windows comes in two shapes: the static runtime (clang_rt.asan-x86_64.lib, older LLVM installers) and,
+# since LLVM 19, a static thunk in front of the runtime DLL (clang_rt.asan_static_runtime_thunk-x86_64.lib +
+# clang_rt.asan_dynamic-x86_64.lib/.dll; the LLVM 20.1.8 of the windows-2022 image has only this one). Both work with the
+# project's static CRT (/MT); libFuzzer is built for it, so /MD is no option. The DLL is copied next to the executables.
 
 option(CML_FUZZ "Build the fuzz targets as libFuzzer + ASan binaries (clang-cl only; see tests/fuzz/CMakeLists.txt)" OFF)
 
@@ -32,7 +32,6 @@ set(CML_FUZZ_INSTRUMENTED cml_util cml_coff cml_pe cml_pdb cml_ipc cml_proc cml_
 set(_cml_fuzz_san_flags "")
 set(_cml_fuzz_link_libs "")
 set(_cml_fuzz_link_opts "")
-set(_cml_fuzz_dynamic_crt FALSE)
 set(_cml_fuzz_asan_dll "")
 if(CML_FUZZ)
     if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
@@ -54,16 +53,18 @@ if(CML_FUZZ)
         if(NOT EXISTS "${_cml_rt}/clang_rt.fuzzer-x86_64.lib")
             message(FATAL_ERROR "CML_FUZZ: ${_cml_rt}/clang_rt.fuzzer-x86_64.lib not found; this LLVM install lacks libFuzzer")
         endif()
+        set(_cml_fuzz_whole "/wholearchive:${_cml_rt}/clang_rt.fuzzer-x86_64.lib")
         if(EXISTS "${_cml_rt}/clang_rt.asan-x86_64.lib" AND EXISTS "${_cml_rt}/clang_rt.asan_cxx-x86_64.lib")
+            # Older LLVM: the static runtime.
             set(_cml_fuzz_link_libs "${_cml_rt}/clang_rt.fuzzer-x86_64.lib" "${_cml_rt}/clang_rt.asan-x86_64.lib" "${_cml_rt}/clang_rt.asan_cxx-x86_64.lib")
-            set(_cml_fuzz_link_opts "/wholearchive:${_cml_rt}/clang_rt.fuzzer-x86_64.lib" "/wholearchive:${_cml_rt}/clang_rt.asan-x86_64.lib"
+            set(_cml_fuzz_link_opts ${_cml_fuzz_whole} "/wholearchive:${_cml_rt}/clang_rt.asan-x86_64.lib"
                                     "/wholearchive:${_cml_rt}/clang_rt.asan_cxx-x86_64.lib" /debug /incremental:no)
-        elseif(EXISTS "${_cml_rt}/clang_rt.asan_dynamic-x86_64.lib" AND EXISTS "${_cml_rt}/clang_rt.asan_dynamic_runtime_thunk-x86_64.lib")
-            set(_cml_fuzz_dynamic_crt TRUE)
+        elseif(EXISTS "${_cml_rt}/clang_rt.asan_dynamic-x86_64.lib" AND EXISTS "${_cml_rt}/clang_rt.asan_static_runtime_thunk-x86_64.lib")
+            # LLVM 19 and later: the static CRT (/MT, what the project uses; libFuzzer is built for it) with the dynamic
+            # runtime DLL behind a static thunk.
             set(_cml_fuzz_link_libs "${_cml_rt}/clang_rt.fuzzer-x86_64.lib" "${_cml_rt}/clang_rt.asan_dynamic-x86_64.lib"
-                                    "${_cml_rt}/clang_rt.asan_dynamic_runtime_thunk-x86_64.lib")
-            set(_cml_fuzz_link_opts "/wholearchive:${_cml_rt}/clang_rt.fuzzer-x86_64.lib"
-                                    "/wholearchive:${_cml_rt}/clang_rt.asan_dynamic_runtime_thunk-x86_64.lib"
+                                    "${_cml_rt}/clang_rt.asan_static_runtime_thunk-x86_64.lib")
+            set(_cml_fuzz_link_opts ${_cml_fuzz_whole} "/wholearchive:${_cml_rt}/clang_rt.asan_static_runtime_thunk-x86_64.lib"
                                     /include:__asan_seh_interceptor /debug /incremental:no)
             foreach(_dir "${_cml_rt}" "${_cml_resource_dir}/../../../bin")
                 if(EXISTS "${_dir}/clang_rt.asan_dynamic-x86_64.dll")
@@ -75,9 +76,9 @@ if(CML_FUZZ)
                 message(FATAL_ERROR "CML_FUZZ: clang_rt.asan_dynamic-x86_64.dll not found next to the runtime libraries or in the LLVM bin directory")
             endif()
         else()
-            message(FATAL_ERROR "CML_FUZZ: neither the static nor the dynamic AddressSanitizer runtime is in ${_cml_rt}")
+            message(FATAL_ERROR "CML_FUZZ: no usable AddressSanitizer runtime in ${_cml_rt}")
         endif()
-        message(STATUS "CML_FUZZ: ASan runtime: ${_cml_fuzz_dynamic_crt} (TRUE = dynamic, /MD) ${_cml_fuzz_asan_dll}")
+        message(STATUS "CML_FUZZ: ASan runtime DLL: ${_cml_fuzz_asan_dll}")
     endif()
     # The STL's container annotations need every object of a binary to agree; the readers do not need them.
     set(_cml_fuzz_san_flags -fsanitize=fuzzer-no-link,address)
@@ -91,9 +92,6 @@ if(CML_FUZZ)
         if(TARGET ${_lib})
             target_compile_options(${_lib} PRIVATE ${_cml_fuzz_san_flags})
             target_compile_definitions(${_lib} PRIVATE ${_cml_fuzz_defs})
-            if(_cml_fuzz_dynamic_crt)
-                set_property(TARGET ${_lib} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
-            endif()
         endif()
     endforeach()
 endif()
@@ -107,8 +105,7 @@ foreach(_t IN LISTS CML_FUZZ_TARGETS)
         target_link_libraries(${_exe} PRIVATE ${CML_FUZZ_LIBS_${_t}} ${_cml_fuzz_link_libs})
         if(MSVC)
             target_link_options(${_exe} PRIVATE ${_cml_fuzz_link_opts})
-            if(_cml_fuzz_dynamic_crt)
-                set_property(TARGET ${_exe} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+            if(_cml_fuzz_asan_dll)
                 add_custom_command(TARGET ${_exe} POST_BUILD
                     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_cml_fuzz_asan_dll}" "$<TARGET_FILE_DIR:${_exe}>")
             endif()
