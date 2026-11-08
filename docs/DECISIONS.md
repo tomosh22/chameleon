@@ -669,3 +669,28 @@ it drives, and a unit test checks that table against the commands the broker adv
 window-free view-model layer that is unit-tested; drawing code is thin. CI builds `cml_ui` in every cell and
 runs `cml_ui --self-test` (connects to a broker started by the test, runs `status`, exercises the view-model,
 creates no window). Visual acceptance is the manual checklist in `docs/wp/WP-19.md`.
+
+## ADR-0034 Wave-6 close-out rulings (agent ABI, restart token, WP-25 scope)
+
+**Date:** 2026-11-08 · **Status:** Accepted
+
+**`CML_AGENT_ABI_VERSION` stays 2.** It versions the C interface between `Chameleon_API.h` and `cml_agent.dll` (exports,
+`CreateAgent` parameters, status codes). No wave-6 package changed that interface: `ScheduleRestart` still returns
+`CML_STATUS_NOT_IMPLEMENTED`, and only comments in the header changed. A bump would force every application to rebuild
+for nothing. The broker–agent wire is versioned per message (`version` in the frame header) and by capabilities. The new
+messages are additive: WP-20 `Exception`/`ExceptionAction`/`ExceptionConfig`, WP-21 `Restart`/`RestartInfo`/`ReenableModules`/
+`RestartCancel` and the optional trailing `Hello.restart_token`, and WP-22 `ReleaseMode::Uncommit`. Agent and broker ship
+from one build. An older agent that does not know `Uncommit` refuses it, and the broker turns that into warning CML5855.
+
+**The restart token stays in the relaunched process's environment (WP-21).** Plan §4.12 makes `CML_RESTART_TOKEN` the way
+an application learns it was restarted, and the `hot_restart` fixture relies on it. A child process that inherits it cannot be
+taken for the restarted process, because the broker accepts a registration only when both the token and the pid of the process
+it created match.
+
+**WP-25 was narrowed.** WP-12 had already implemented the elision rule ("hook narrowing", ADR-0030). WP-25 closes the gaps:
+- functions already hooked by an earlier patch are compared against that patch's code;
+- a reload that compiles to identical code loads nothing and reports CML3450;
+- hook counts are reported.
+
+The old bytes still come from the module file, not process memory: after the first gap is closed, reading memory adds
+nothing, and it breaks when something else writes the code.

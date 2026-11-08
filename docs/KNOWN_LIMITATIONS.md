@@ -47,6 +47,30 @@ diagnostic is planned, not live.
   times. A hook deleted from the source keeps running (the old patch's records stay). `CML_PRERESTART_HOOK` is accepted but
   nothing calls it until hot-restart exists. Only a processor exception in a hook is contained, not state corruption; a hook must
   not call `DestroyAgent` (refused).
+- Crash handling (WP-20) holds a faulting thread only while a control client subscribes to `exception` and `crash_handler` is on,
+  only for access violations, integer divide-by-zero and illegal instructions, and only when the faulting address is in an enabled
+  module or a patch (a fault inside a system DLL such as `memcpy(nullptr)` in ucrtbase is passed on). Breakpoints are not handled.
+  Continue re-executes the faulting instruction with the registers it had, so it only helps when the patch changed what that
+  instruction touches (memory state), not a bad value already in a register. Leave function skips `__finally` blocks and
+  destructors of the frame it leaves and sets RAX/XMM0 to 0. No function name is reported for a fault inside a patch. A handler the
+  application registers later as first runs before ours. At most 8 threads are held at once; a ninth fault is passed on. A held
+  thread that owns the loader lock blocks patch loading until it is released. With a debugger attached nothing is held unless
+  `break_with_debugger` is set. `subscribe` with an empty `events` array means the default set.
+- Patch revert (WP-22): the unit of revert is one reload (`last` undoes every patch of the newest reload; modules that reload
+  did not touch keep their patches). Patch DLLs stay loaded and the globals a reverted patch created stay alive, unused. No
+  pre/post-patch hooks run around a revert; a hook already running from a reverted patch finishes. The reverted files stay
+  changed on disk, so the next reload recompiles them. A module freed and reloaded at the same base and path is not detected as a
+  different instance. A partial multi-module revert answers ok with `partial`/`failed` and a CML5854 diag event. Session reset
+  (unloading patch DLLs) is not implemented.
+- Hot-restart (WP-21) restores the command line, working directory, environment and the three standard handles; other inherited
+  handles, the parent process, the console title and window state are not restored. With no console of its own, the broker
+  borrows the old process's console during the relaunch. Reloads are refused (CML5304) while a restart runs. `timeout_ms` bounds
+  the preparation (the pre-restart hooks); after the old process is terminated, `registration_timeout_ms` (default 30 s) bounds
+  registration, re-enabling and re-applying the edits. Modules the application loads lazily after start-up are reported (CML5809)
+  and not enabled again. `CML_RESTART_TOKEN` stays in the new process's environment (ADR-0034). `Agent::ScheduleRestart` still
+  returns `CML_STATUS_NOT_IMPLEMENTED`. A broker started with a short `--exit-when-idle` can exit during the restart gap.
+- Broker UI (WP-19): enable/disable of modules is shown but not switchable (the control protocol has no such command); a relative
+  path in compiler output is resolved best-effort against the modules' directories.
 - `unload_patch` (WP-17) waits up to 10 s for a hook that is still running and then refuses (CML4212, patch stays hidden); in
   synchronised mode that stalls the agent thread meanwhile.
 - A thread that runs an application hook (the agent thread, or an application thread at `cml_sync_point`) gets a 64 KB stack
