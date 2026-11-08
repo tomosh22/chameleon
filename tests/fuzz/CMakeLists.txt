@@ -80,7 +80,12 @@ if(CML_FUZZ)
         message(STATUS "CML_FUZZ: ASan runtime: ${_cml_fuzz_dynamic_crt} (TRUE = dynamic, /MD) ${_cml_fuzz_asan_dll}")
     endif()
     # The STL's container annotations need every object of a binary to agree; the readers do not need them.
-    set(_cml_fuzz_san_flags -fsanitize=fuzzer-no-link,address -fno-omit-frame-pointer)
+    set(_cml_fuzz_san_flags -fsanitize=fuzzer-no-link,address)
+    if(MSVC)
+        list(APPEND _cml_fuzz_san_flags /Oy-)  # frame pointers: readable stacks in crash reports
+    else()
+        list(APPEND _cml_fuzz_san_flags -fno-omit-frame-pointer)
+    endif()
     set(_cml_fuzz_defs _DISABLE_VECTOR_ANNOTATION _DISABLE_STRING_ANNOTATION)
     foreach(_lib IN LISTS CML_FUZZ_INSTRUMENTED)
         if(TARGET ${_lib})
