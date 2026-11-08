@@ -8,6 +8,7 @@
 
 #include "cml/ipc/control.h"
 #include "fault_step.h"
+#include "perf_steps.h"
 #include "restart_step.h"
 #include "rx.h"
 #include "toml.h"
@@ -35,6 +36,8 @@ const char* to_string(StepKind kind) {
         case StepKind::ExpectException: return "expect_exception";
         case StepKind::ExceptionAction: return "exception_action";
         case StepKind::ExpectPendingExceptions: return "expect_pending_exceptions";
+        case StepKind::PerfIdle: return "perf_idle";
+        case StepKind::PerfReport: return "perf_report";
     }
     return "?";
 }
@@ -123,6 +126,12 @@ std::string Step::describe() const {
         case StepKind::InjectFailure:
             out += " " + fault_stage + (fault_count != 1 ? " x" + std::to_string(fault_count) : std::string()) +
                    (expect_error.empty() ? std::string() : " expecting the refusal " + expect_error);
+            break;
+        case StepKind::PerfIdle:
+            out += " " + std::to_string(within_s) + " s, at most " + std::to_string(result_value) + " permille CPU";
+            break;
+        case StepKind::PerfReport:
+            out += " median at most " + std::to_string(result_value) + " ms over at least " + std::to_string(min_samples) + " reloads";
             break;
     }
     return out;
@@ -437,6 +446,9 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
         }
         return step;
     }
+    if (*kind == "perf_idle" || *kind == "perf_report") {
+        return parse_perf_step(table, *kind);  // perf_steps.cpp (WP-27)
+    }
     if (*kind == "signal_fixture") {
         step.kind = StepKind::SignalFixture;
         cml::Result<void> keys = only_keys(table, {"kind"}, "a signal_fixture step");
@@ -519,7 +531,7 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
     return invalid(table.line, "unknown step kind '" + *kind +
                                    "' (launch, expect_stdout, expect_module_enabled, edit, reload, expect_diag, expect_monotonic, set_option, wait, "
                                    "expect_event, expect_reload_result, signal_fixture, revert, watch_exceptions, expect_exception, exception_action, "
-                                   "expect_pending_exceptions, restart, inject_failure)");
+                                   "expect_pending_exceptions, restart, perf_idle, perf_report, inject_failure)");
 }
 
 }  // namespace
