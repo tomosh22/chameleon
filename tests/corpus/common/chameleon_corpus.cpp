@@ -46,6 +46,40 @@ std::wstring env_w(const wchar_t* name) {
     return std::wstring(buffer, n);
 }
 
+// A fatal first-chance exception is described in the log before the process dies (the corpus driver quotes it):
+// code, address as module+offset, the access address of an access violation, and the registers that matter.
+LONG CALLBACK fatal_exception_logger(EXCEPTION_POINTERS* ep) {
+    const DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_STACK_OVERFLOW &&
+        code != EXCEPTION_PRIV_INSTRUCTION && code != EXCEPTION_INT_DIVIDE_BY_ZERO) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    static volatile long reported = 0;
+    if (InterlockedExchange(&reported, 1) != 0) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const void* at = ep->ExceptionRecord->ExceptionAddress;
+    HMODULE module = nullptr;
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCSTR>(at), &module)) {
+        GetModuleFileNameA(module, name, MAX_PATH);
+    }
+    const char* base = std::strrchr(name, '\\');
+    char line[768];
+    std::snprintf(line, sizeof(line),
+                  "CRASH code=%08lx tid=%lu at=%p module=%s+0x%llx info0=%llu info1=%p rip=%p rsp=%p rax=%p rcx=%p rdx=%p r8=%p",
+                  code, GetCurrentThreadId(), at, base != nullptr ? base + 1 : name,
+                  static_cast<unsigned long long>(static_cast<const char*>(at) - reinterpret_cast<const char*>(module)),
+                  ep->ExceptionRecord->NumberParameters > 0 ? static_cast<unsigned long long>(ep->ExceptionRecord->ExceptionInformation[0]) : 0ull,
+                  ep->ExceptionRecord->NumberParameters > 1 ? reinterpret_cast<void*>(ep->ExceptionRecord->ExceptionInformation[1]) : nullptr,
+                  reinterpret_cast<void*>(ep->ContextRecord->Rip), reinterpret_cast<void*>(ep->ContextRecord->Rsp),
+                  reinterpret_cast<void*>(ep->ContextRecord->Rax), reinterpret_cast<void*>(ep->ContextRecord->Rcx),
+                  reinterpret_cast<void*>(ep->ContextRecord->Rdx), reinterpret_cast<void*>(ep->ContextRecord->R8));
+    out_line(line);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 }  // namespace
 
 extern "C" void cml_corpus_marker(const char* name) {
@@ -79,6 +113,7 @@ extern "C" void cml_corpus_init(void) {
     if (env_w(L"CML_CORPUS_AGENT") != L"1") {
         return;
     }
+    AddVectoredExceptionHandler(1, fatal_exception_logger);
     const std::wstring dir = env_w(L"CML_CORPUS_AGENT_DIR");
     cml_status status = CML_STATUS_OK;
     g_agent = cml::CreateDefaultAgent(dir.c_str(), &status);

@@ -198,6 +198,25 @@ function Stop-Session {
     if ($script:Broker -and -not $script:Broker.HasExited) { try { $script:Broker.Kill($true) } catch { } }
 }
 
+# Describes a CRASH line of the application's log (chameleon_corpus.cpp): the module and offset, symbolised with the PDB of
+# the executable or of the patch DLL.
+function Report-Crash {
+    foreach ($line in (Get-CorpusLines | Where-Object { $_ -like 'CRASH *' })) {
+        Write-Host "::error::$line"
+        if ($line -match 'module=(\S+)\+0x([0-9a-f]+)') {
+            $mod = $Matches[1]; $off = $Matches[2]
+            $target = $null
+            if ($mod -ieq (Split-Path $script:ExePath -Leaf)) { $target = $script:ExePath }
+            else { $target = (Get-ChildItem (Join-Path $out 'session') -Recurse -Filter $mod -ErrorAction SilentlyContinue | Select-Object -First 1).FullName }
+            if ($target) {
+                $pdb = [System.IO.Path]::ChangeExtension($target, '.pdb')
+                Write-Host "symbolising $mod+0x$off with $pdb"
+                & (Join-Path $ChameleonBin 'cml_pdb_dump.exe') $pdb --rva $off *>&1 | Out-Host
+            } else { Write-Host "no file found for module $mod" }
+        }
+    }
+}
+
 function Restore-Originals {
     foreach ($path in $script:Originals.Keys) {
         [System.IO.File]::WriteAllBytes($path, $latin1.GetBytes($script:Originals[$path]))
@@ -287,7 +306,8 @@ if ($built) {
         if (-not $ran) {
             foreach ($e in $cfg.edits) { Skip-Step "edit:$($e.id)" 'enable failed' }
         } else {
-            foreach ($edit in $cfg.edits) {
+            $doEdit = {
+                param($edit)
                 $refused = [bool]$edit.expect_error
                 $name = if ($refused) { "refused:$($edit.id)" } else { "edit:$($edit.id)" }
                 Invoke-Step $name {
@@ -321,16 +341,23 @@ if ($built) {
                     }
                 } | Out-Null
             }
-            Invoke-Step 'still-running' {
+            $stillRunning = {
                 if ($script:App.HasExited) { throw "the application exited (code $($script:App.ExitCode))" }
                 $before = (Get-CorpusLines).Count
                 Wait-Corpus 'CORPUS frame=' $before 20 | Out-Null
                 'frames still printed after the last edit'
-            } | Out-Null
+            }
+            foreach ($e in @($cfg.edits | Where-Object { -not $_.final })) { & $doEdit $e }
+            Invoke-Step 'still-running' $stillRunning | Out-Null
+            # `final` edits last: one that is expected to take the process down comes after the check above.
+            $finals = @($cfg.edits | Where-Object { $_.final })
+            foreach ($e in $finals) { & $doEdit $e }
+            if ($finals.Count -gt 0) { Invoke-Step 'still-running-final' $stillRunning | Out-Null }
         }
     } finally {
         Stop-Session
         Restore-Originals
+        Report-Crash
         foreach ($f in 'broker.log', 'app.stderr.txt') {
             $p = Join-Path $out $f
             if ((Test-Path $p) -and $script:Failed) { Write-Host "---- tail of $f"; Get-Content $p -Tail 40 | Out-Host }

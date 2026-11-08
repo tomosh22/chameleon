@@ -73,7 +73,7 @@ jobs:
           $cxx = (Get-Command cl).Source
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo "-DCMAKE_CXX_COMPILER=$cxx"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cmake --build build --parallel --target cml_broker cml_agent cml_lde_probe
+          cmake --build build --parallel --target cml_broker cml_agent cml_lde_probe cml_pdb_dump
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-ChildItem build/bin | Select-Object Name, Length
       - uses: actions/upload-artifact@v4
