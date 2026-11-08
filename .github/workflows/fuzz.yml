@@ -65,29 +65,31 @@ jobs:
         with:
           arch: x64
 
-      # clang-cl with the libFuzzer and AddressSanitizer runtimes for Windows (clang_rt.fuzzer-x86_64.lib, clang_rt.asan-x86_64.lib,
-      # clang_rt.asan_cxx-x86_64.lib in <resource dir>\lib\windows). The windows-2022 image ships an LLVM that has them; if a future
-      # image does not, the step installs the current LLVM release with chocolatey.
+      # clang-cl with the libFuzzer and AddressSanitizer runtimes for Windows (<resource dir>\lib\windows: clang_rt.fuzzer-x86_64.lib and
+      # either the static ASan runtime or clang_rt.asan_dynamic-x86_64.lib, see tests/fuzz/CMakeLists.txt). The windows-2022 image ships
+      # LLVM 20.1.8, which has them; if a future image does not, the step upgrades LLVM with chocolatey.
       - name: Select clang-cl and print its version
         run: |
           New-Item -ItemType Directory -Force -Path ci-logs | Out-Null
           $llvm = 'C:\Program Files\LLVM\bin\clang-cl.exe'
           if (-not (Test-Path $llvm)) { $llvm = (Get-Command clang-cl).Source }
           $res = (& $llvm /clang:-print-resource-dir).Trim()
-          $need = @('clang_rt.fuzzer-x86_64.lib', 'clang_rt.asan-x86_64.lib', 'clang_rt.asan_cxx-x86_64.lib')
-          $missing = $need | Where-Object { -not (Test-Path (Join-Path $res "lib\windows\$_")) }
-          if ($missing) {
-            Write-Host "missing runtimes: $missing; installing LLVM"
-            choco install llvm -y --no-progress --allow-downgrade
+          $win = Join-Path $res 'lib\windows'
+          $haveFuzzer = Test-Path (Join-Path $win 'clang_rt.fuzzer-x86_64.lib')
+          $haveAsan = (Test-Path (Join-Path $win 'clang_rt.asan-x86_64.lib')) -or (Test-Path (Join-Path $win 'clang_rt.asan_dynamic-x86_64.lib'))
+          if (-not ($haveFuzzer -and $haveAsan)) {
+            Write-Host "libFuzzer or AddressSanitizer runtime missing in $win; installing the current LLVM"
+            choco upgrade llvm -y --no-progress
             $llvm = 'C:\Program Files\LLVM\bin\clang-cl.exe'
             $res = (& $llvm /clang:-print-resource-dir).Trim()
+            $win = Join-Path $res 'lib\windows'
           }
           "CML_CXX=$llvm" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "LLVM_BIN=$(Split-Path $llvm)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           $v = (& $llvm --version | Out-String)
           Write-Host $v
           Write-Host "resource dir: $res"
-          Get-ChildItem (Join-Path $res 'lib\windows') -Filter '*fuzzer*' | ForEach-Object { Write-Host $_.Name }
+          Get-ChildItem $win | ForEach-Object { Write-Host $_.Name }
           "### clang-cl for the fuzz targets`n$v" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
 
       # RelWithDebInfo: AddressSanitizer needs the release CRT (/MT; the project is static-CRT), never /MTd.

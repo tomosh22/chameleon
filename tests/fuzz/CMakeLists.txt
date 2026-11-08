@@ -11,8 +11,12 @@
 #   -DCML_FUZZ=ON      libFuzzer + AddressSanitizer binaries; clang-cl only. The readers under test are instrumented too, so
 #                      build ONLY the cml_fuzz_* targets in such a tree (the unit tests and the agent are not meant to link
 #                      with it). `fuzz.replay.<target>` then runs the libFuzzer binary with -runs=0 over the corpus.
-#                      .github/workflows/fuzz.yml uses this: RelWithDebInfo (ASan needs the release CRT, /MT), 10 minutes per
-#                      target.
+#                      .github/workflows/fuzz.yml uses this: RelWithDebInfo, 10 minutes per target.
+#
+# AddressSanitizer on Windows comes in two shapes (the LLVM 20 installer ships only the second): the static runtime for the
+# static CRT (/MT, clang_rt.asan-x86_64.lib), and the dynamic runtime for /MD (clang_rt.asan_dynamic-x86_64.lib + its DLL).
+# This file takes the static one when the LLVM install has it and otherwise builds the instrumented libraries and the targets
+# with /MD, and puts the runtime DLL next to the executables.
 
 option(CML_FUZZ "Build the fuzz targets as libFuzzer + ASan binaries (clang-cl only; see tests/fuzz/CMakeLists.txt)" OFF)
 
@@ -26,39 +30,65 @@ set(CML_FUZZ_LIBS_control cml_ipc cml_proc cml_util)
 set(CML_FUZZ_INSTRUMENTED cml_util cml_coff cml_pe cml_pdb cml_ipc cml_proc cml_third_party_raw_pdb)
 
 set(_cml_fuzz_san_flags "")
-set(_cml_fuzz_runtime_libs "")
+set(_cml_fuzz_link_libs "")
+set(_cml_fuzz_link_opts "")
+set(_cml_fuzz_dynamic_crt FALSE)
+set(_cml_fuzz_asan_dll "")
 if(CML_FUZZ)
     if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
         message(FATAL_ERROR "CML_FUZZ needs clang-cl (libFuzzer + AddressSanitizer on Windows); this compiler is ${CMAKE_CXX_COMPILER_ID}")
     endif()
-  if(MSVC)
-    # The CMake link step calls the linker directly, so the sanitizer runtimes the clang-cl driver would add are named here
-    # (what clang's MSVC toolchain passes: whole-archive asan + asan_cxx for a static CRT, whole-archive fuzzer).
-    execute_process(COMMAND "${CMAKE_CXX_COMPILER}" /clang:-print-resource-dir
-                    OUTPUT_VARIABLE _cml_resource_dir OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE _cml_rc)
-    if(NOT _cml_rc EQUAL 0 OR NOT _cml_resource_dir)
-        message(FATAL_ERROR "CML_FUZZ: cannot ask ${CMAKE_CXX_COMPILER} for its resource directory")
-    endif()
-    file(TO_CMAKE_PATH "${_cml_resource_dir}" _cml_resource_dir)
-    set(_cml_rt "${_cml_resource_dir}/lib/windows")
-    foreach(_lib clang_rt.fuzzer-x86_64.lib clang_rt.asan-x86_64.lib clang_rt.asan_cxx-x86_64.lib)
-        if(NOT EXISTS "${_cml_rt}/${_lib}")
-            message(FATAL_ERROR "CML_FUZZ: ${_cml_rt}/${_lib} not found; this LLVM install lacks the libFuzzer / ASan runtime")
+    if(MSVC)
+        # The CMake link step calls the linker directly, so the runtimes the clang-cl driver would add are named here, as
+        # clang's MSVC toolchain passes them: whole-archive fuzzer; for ASan either whole-archive asan + asan_cxx (static
+        # CRT) or asan_dynamic + whole-archive asan_dynamic_runtime_thunk + /include:__asan_seh_interceptor (dynamic CRT).
+        execute_process(COMMAND "${CMAKE_CXX_COMPILER}" /clang:-print-resource-dir
+                        OUTPUT_VARIABLE _cml_resource_dir OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE _cml_rc)
+        if(NOT _cml_rc EQUAL 0 OR NOT _cml_resource_dir)
+            message(FATAL_ERROR "CML_FUZZ: cannot ask ${CMAKE_CXX_COMPILER} for its resource directory")
         endif()
-    endforeach()
-    message(STATUS "CML_FUZZ: sanitizer runtimes from ${_cml_rt}")
-  endif()
+        file(TO_CMAKE_PATH "${_cml_resource_dir}" _cml_resource_dir)
+        set(_cml_rt "${_cml_resource_dir}/lib/windows")
+        file(GLOB _cml_rt_found "${_cml_rt}/*.lib" "${_cml_rt}/*.dll")
+        message(STATUS "CML_FUZZ: runtimes in ${_cml_rt}: ${_cml_rt_found}")
+        if(NOT EXISTS "${_cml_rt}/clang_rt.fuzzer-x86_64.lib")
+            message(FATAL_ERROR "CML_FUZZ: ${_cml_rt}/clang_rt.fuzzer-x86_64.lib not found; this LLVM install lacks libFuzzer")
+        endif()
+        if(EXISTS "${_cml_rt}/clang_rt.asan-x86_64.lib" AND EXISTS "${_cml_rt}/clang_rt.asan_cxx-x86_64.lib")
+            set(_cml_fuzz_link_libs "${_cml_rt}/clang_rt.fuzzer-x86_64.lib" "${_cml_rt}/clang_rt.asan-x86_64.lib" "${_cml_rt}/clang_rt.asan_cxx-x86_64.lib")
+            set(_cml_fuzz_link_opts "/wholearchive:${_cml_rt}/clang_rt.fuzzer-x86_64.lib" "/wholearchive:${_cml_rt}/clang_rt.asan-x86_64.lib"
+                                    "/wholearchive:${_cml_rt}/clang_rt.asan_cxx-x86_64.lib" /debug /incremental:no)
+        elseif(EXISTS "${_cml_rt}/clang_rt.asan_dynamic-x86_64.lib" AND EXISTS "${_cml_rt}/clang_rt.asan_dynamic_runtime_thunk-x86_64.lib")
+            set(_cml_fuzz_dynamic_crt TRUE)
+            set(_cml_fuzz_link_libs "${_cml_rt}/clang_rt.fuzzer-x86_64.lib" "${_cml_rt}/clang_rt.asan_dynamic-x86_64.lib"
+                                    "${_cml_rt}/clang_rt.asan_dynamic_runtime_thunk-x86_64.lib")
+            set(_cml_fuzz_link_opts "/wholearchive:${_cml_rt}/clang_rt.fuzzer-x86_64.lib"
+                                    "/wholearchive:${_cml_rt}/clang_rt.asan_dynamic_runtime_thunk-x86_64.lib"
+                                    /include:__asan_seh_interceptor /debug /incremental:no)
+            foreach(_dir "${_cml_rt}" "${_cml_resource_dir}/../../../bin")
+                if(EXISTS "${_dir}/clang_rt.asan_dynamic-x86_64.dll")
+                    set(_cml_fuzz_asan_dll "${_dir}/clang_rt.asan_dynamic-x86_64.dll")
+                    break()
+                endif()
+            endforeach()
+            if(NOT _cml_fuzz_asan_dll)
+                message(FATAL_ERROR "CML_FUZZ: clang_rt.asan_dynamic-x86_64.dll not found next to the runtime libraries or in the LLVM bin directory")
+            endif()
+        else()
+            message(FATAL_ERROR "CML_FUZZ: neither the static nor the dynamic AddressSanitizer runtime is in ${_cml_rt}")
+        endif()
+        message(STATUS "CML_FUZZ: ASan runtime: ${_cml_fuzz_dynamic_crt} (TRUE = dynamic, /MD) ${_cml_fuzz_asan_dll}")
+    endif()
     # The STL's container annotations need every object of a binary to agree; the readers do not need them.
     set(_cml_fuzz_san_flags -fsanitize=fuzzer-no-link,address -fno-omit-frame-pointer)
     set(_cml_fuzz_defs _DISABLE_VECTOR_ANNOTATION _DISABLE_STRING_ANNOTATION)
-    if(MSVC)
-        set(_cml_fuzz_runtime_libs
-            "${_cml_rt}/clang_rt.fuzzer-x86_64.lib" "${_cml_rt}/clang_rt.asan-x86_64.lib" "${_cml_rt}/clang_rt.asan_cxx-x86_64.lib")
-    endif()
     foreach(_lib IN LISTS CML_FUZZ_INSTRUMENTED)
         if(TARGET ${_lib})
             target_compile_options(${_lib} PRIVATE ${_cml_fuzz_san_flags})
             target_compile_definitions(${_lib} PRIVATE ${_cml_fuzz_defs})
+            if(_cml_fuzz_dynamic_crt)
+                set_property(TARGET ${_lib} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+            endif()
         endif()
     endforeach()
 endif()
@@ -69,13 +99,14 @@ foreach(_t IN LISTS CML_FUZZ_TARGETS)
         add_executable(${_exe} fuzz_${_t}.cpp)
         target_compile_options(${_exe} PRIVATE ${_cml_fuzz_san_flags})
         target_compile_definitions(${_exe} PRIVATE ${_cml_fuzz_defs})
-        target_link_libraries(${_exe} PRIVATE ${CML_FUZZ_LIBS_${_t}} ${_cml_fuzz_runtime_libs})
+        target_link_libraries(${_exe} PRIVATE ${CML_FUZZ_LIBS_${_t}} ${_cml_fuzz_link_libs})
         if(MSVC)
-            target_link_options(${_exe} PRIVATE
-                "/wholearchive:${_cml_rt}/clang_rt.fuzzer-x86_64.lib"
-                "/wholearchive:${_cml_rt}/clang_rt.asan-x86_64.lib"
-                "/wholearchive:${_cml_rt}/clang_rt.asan_cxx-x86_64.lib"
-                /debug /incremental:no)
+            target_link_options(${_exe} PRIVATE ${_cml_fuzz_link_opts})
+            if(_cml_fuzz_dynamic_crt)
+                set_property(TARGET ${_exe} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+                add_custom_command(TARGET ${_exe} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_cml_fuzz_asan_dll}" "$<TARGET_FILE_DIR:${_exe}>")
+            endif()
         else()
             target_link_options(${_exe} PRIVATE -fsanitize=fuzzer,address)  # portable syntax-check hosts (Linux clang)
         endif()
@@ -88,7 +119,6 @@ foreach(_t IN LISTS CML_FUZZ_TARGETS)
     cml_target_core_style(${_exe})
     set_target_properties(${_exe} PROPERTIES FOLDER "tests/fuzz")
 
-    # PDB: the scratch file lives in the temp directory; give every ctest its own.
     if(CML_FUZZ)
         add_test(NAME fuzz.replay.${_t} COMMAND ${_exe} -runs=0 "${CMAKE_CURRENT_SOURCE_DIR}/corpus/${_t}")
     else()
@@ -99,7 +129,7 @@ foreach(_t IN LISTS CML_FUZZ_TARGETS)
         PASS_REGULAR_EXPRESSION "REPLAY inputs=[1-9][0-9]*|Executed .* in [0-9]+ ms")
 endforeach()
 
-# The pdb target maps files and the corpus holds PDB-sized inputs: the PDB library is Windows-complete only.
+# The pdb target maps files with the platform's API; off Windows it needs the thread library.
 if(NOT MSVC)
     find_package(Threads REQUIRED)
     target_link_libraries(cml_fuzz_pdb PRIVATE Threads::Threads)
