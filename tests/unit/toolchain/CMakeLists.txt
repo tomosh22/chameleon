@@ -55,7 +55,7 @@ if(WIN32)
     # WP-09 acceptance: every M1 fixture's edited TU is compiled, anchored, bound and linked with link.exe and
     # lld-link, and the patch PDB is read back (unit.link_patch). Writes <build>/test_work/link_patch/evidence.txt,
     # which CI prints. Needs both linkers for the "other linker" half; skips (and says so) when one is missing.
-    set(_cml_link_fixtures basic statics virtuals templates lambdas new_function new_global)
+    set(_cml_link_fixtures basic statics virtuals templates lambdas new_function new_global tls)
     set(_lp_paths_file "${CMAKE_CURRENT_BINARY_DIR}/link_patch_fixture_paths_$<CONFIG>.txt")
     set(_lp_content "config=$<CONFIG>\n")
     foreach(_fx IN LISTS _cml_link_fixtures)

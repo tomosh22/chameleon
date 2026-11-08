@@ -311,7 +311,7 @@ TEST_CASE("a fatal error does not hide the diagnostics collected before it, and 
     SynthObj o;
     o.function("?compute_value@@YAHXZ");
     const std::uint32_t tls = o.section(".tls$", kData, 8);
-    o.symbol("?t_counter@@3HA", 0, static_cast<std::int32_t>(tls), false);  // CML3102, collected first
+    o.symbol("?t_counter@@3HA", 0, static_cast<std::int32_t>(tls), false);  // CML3400, collected first
     const std::uint32_t d = o.section(".data", kData, 0x10);
     o.symbol("?s@?A0x1@@3HA", 0, static_cast<std::int32_t>(d), false, false);  // needs the TU's records: fatal
     Built b = o.build();
@@ -320,7 +320,7 @@ TEST_CASE("a fatal error does not hide the diagnostics collected before it, and 
     auto r = plan_bind(w.input(b), &errors, &partial);
     REQUIRE(!r.has_value());
     REQUIRE(errors.size() == 2);
-    CHECK(errors[0].code == diag::kThreadLocal);
+    CHECK(errors[0].code == diag::kNewThreadLocal);
     CHECK(errors[1].code == 1413);  // the fatal one, last
     CHECK(r.error().code == 1413);
     CHECK_FALSE(partial.decisions.empty());

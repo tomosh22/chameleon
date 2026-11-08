@@ -467,6 +467,12 @@ void plan_fixture(const std::string& name) {
         brief("INITIALISER " + tag + " " + e.function + " table=" + e.table_section_name + "+" + std::to_string(e.table_offset) +
              (e.tu_wide ? " tu-wide" : "") + " globals=" + std::to_string(e.globals.size()));
     }
+    for (const Fixup& f : p.fixups) {
+        if (f.kind == FixupKind::SecRel32) {
+            brief("FIXUP-SECREL " + tag + " sec=" + std::to_string(f.section_index) + "(" + f.section_name + ") off=" + hex(f.offset) + " symbol=" + f.symbol +
+                 " section_offset=" + hex(f.target_section_offset) + " addend=" + std::to_string(f.addend) + " target_rva=" + hex(f.target_rva));
+        }
+    }
     for (const ThunkEntry& t : p.thunks) {
         line("THUNK " + tag + " " + t.display + " source=" + to_string(t.source) + (t.target.rva != kNoRva ? " rva=" + hex(t.target.rva) : " va=" + hex(t.target.va)));
     }
@@ -639,3 +645,4 @@ TEST_CASE("fixture templates: a.cpp offset_100") { plan_fixture("templates"); }
 TEST_CASE("fixture lambdas: lambdas.cpp lambda_times_10") { plan_fixture("lambdas"); }
 TEST_CASE("fixture new_function: logic.cpp add_helper") { plan_fixture("new_function"); }
 TEST_CASE("fixture new_global: logic.cpp add_tracker") { plan_fixture("new_global"); }
+TEST_CASE("fixture tls: logic.cpp step_5") { plan_fixture("tls"); }

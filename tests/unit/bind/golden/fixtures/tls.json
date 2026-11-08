@@ -1,0 +1,16 @@
+{
+  "fixture": "tls",
+  "edit": "step_5.edit (logic.cpp)",
+  "min_hooks": 1,
+  "min_fixups": 2,
+  "min_bind_old_data": 2,
+  "expect": [
+    { "symbol": "tls_step", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol": "t_counter", "decision": "bind-old-data" },
+    { "symbol_contains": "calls", "decision": "bind-old-data" }
+  ],
+  "absent": [
+    { "symbol": "t_counter", "decision": "patch-new-data" },
+    { "symbol_contains": "calls", "decision": "patch-new-data" }
+  ]
+}

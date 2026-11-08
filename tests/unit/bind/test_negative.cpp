@@ -115,7 +115,7 @@ TEST_CASE("the same relocation kinds against patch-local symbols are not our bus
     CHECK(r->fixups.empty());
 }
 
-TEST_CASE("SECREL against module data is retargeted (the CRT's thread-safe-static epoch); other TLS cases are CML3102") {
+TEST_CASE("SECREL against anything but a thread-local of the old image is CML3102") {
     SynthWorld w = basic_world();
     {
         SynthObj o;
@@ -123,22 +123,14 @@ TEST_CASE("SECREL against module data is retargeted (the CRT's thread-safe-stati
         const std::uint32_t tick = o.undefined("?g_tick@@3HA", false);
         o.reloc(f.section, 0, tick, coff::RelocType::SecRel, 4);
         Built b = o.build();
-        auto r = plan_bind(w.input(b));
-        REQUIRE_MESSAGE(r.has_value(), err(r));
-        REQUIRE(r->fixups.size() == 1);
-        const Fixup& fx = r->fixups[0];
-        CHECK(fx.kind == FixupKind::SecRel32);
-        CHECK(fx.target_section_offset == 0x80);  // 0x3080 inside .data (rva 0x3000)
-        CHECK(fx.addend == 4);
-        PatchLayout l;
-        l.patch_base = 0x150000000ull;
-        l.section_rva[f.section] = 0x1000;
-        auto t = make_fixup_triples(*r, l);
-        REQUIRE_MESSAGE(t.has_value(), err(t));
-        REQUIRE(t->size() == 1);
-        CHECK((*t)[0].kind == FixupKind::SecRel32);
-        CHECK((*t)[0].rva == 0x1000);
-        CHECK((*t)[0].value == 0x84);
+        // WP-24 invariant: a SECREL against old-module data must land inside the old .tls section. (The CRT's
+        // _Init_thread_epoch, the real case, is covered in test_thread_local.cpp.) Ordinary data is CML3102.
+        std::vector<cml::Diag> errors;
+        auto r = plan_bind(w.input(b), &errors);
+        REQUIRE(!r.has_value());
+        REQUIRE(errors.size() == 1);
+        CHECK(errors[0].code == diag::kThreadLocal);
+        CHECK(contains(errors[0].message, "g_tick"));
     }
     {
         // SECREL against a symbol that is not in the patched module (registry): cannot be computed.
@@ -181,7 +173,7 @@ TEST_CASE("SECREL against module data is retargeted (the CRT's thread-safe-stati
         auto r = plan_bind(w.input(b), &errors);
         REQUIRE(!r.has_value());
         REQUIRE(errors.size() == 1);
-        CHECK(errors[0].code == diag::kThreadLocal);
+        CHECK(errors[0].code == diag::kNewThreadLocal);  // WP-24: a thread_local the old image lacks is CML3400
         CHECK(contains(errors[0].message, "t_counter"));
     }
 }
