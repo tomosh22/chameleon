@@ -29,7 +29,7 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-22 | Patch revert (session reset deferred) | 6 | done | wp/22-patch-revert | #35 | — |
 | WP-24 | Thread-local variables | 6 | done | wp/24-thread-local | #39 | — |
 | WP-25 | Unchanged-function elision (scope narrowed, ADR-0034) | 6 | done | wp/25-unchanged-elision | #37 | — |
-| WP-23 | Re-execute function after crash (ADR-0035) | 7 | in review (fixes) | wp/23-crash-reexecute | #43 | CI 14/14 x2 at 42d4909 verified; high review: 10 findings sent (unwind guard, slot race, offer staleness, defrange offset) |
+| WP-23 | Re-execute function after crash (ADR-0035) | 7 | done | wp/23-crash-reexecute | #43 (3230b6f) | CI 14/14 x2 at bff09cb verified (crash_reexecute 25/25 incl. windows-2025 msvc RelWithDebInfo, clang-cl Debug; agent_hook 25/25); 10 high findings fixed, delta checked |
 | WP-26 | Real-project corpus (raylib, Dear ImGui, Godot; ADR-0035) | 7 | in progress | wp/26-corpus | — | — |
 | WP-27 | Performance budgets | 7 | done | wp/27-perf-budgets | #42 (f39dc19) | CI 14/14 push 42460887634 + PR 42460890741 at 00e0ac6; pdb index 328 ms/544 MiB (budget 4352), reload excl. compile median 40.9 ms, idle CPU 0.000 %, large-PDB broker 219 MiB = 0.40x PDB, session broker peak 11.0 MiB (limit 1.5x PDB + 32 MiB baseline). Test-coverage gap: no reload measured inside the large PDB (benchmark has no agent). |
 | WP-28 | Fuzzing and failure injection | 7 | in review (fixes) | wp/28-fuzz-injection | #44 | CI 14/14 x2 + fuzz 5/5 at 74b6d04 verified; high review: 8 findings + post-patch-hooks ruling (fire before commit) |
@@ -85,7 +85,7 @@ Wave 6 complete (WP-19..22, 24, 25). Wave 7 is paused at the user's request, wit
 - PR #45 caches the LLVM install so this stops recurring.
 
 **Waiting on the agent's fix round**
-- WP-23 (#43): 10 high-review findings.
+- WP-23 (#43): DONE, merged 3230b6f after the fix round.
   - Agent side: unwind bounds and `__try` guard, slot race in resolve_reexecute, executable check on the return address.
   - Broker side: patch-during-evaluate race, stale fields after a withdrawn offer, per-frame recipe cost, entry_rsp check order.
   - PDB: duplicate TPI/IPI table, S_DEFRANGE_SUBFIELD_REGISTER range offset (8).
