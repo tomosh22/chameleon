@@ -48,6 +48,7 @@ void AgentLink::publish(const Session& session) {
     snapshot_.pid = session.pid();
     snapshot_.mode = session.mode();
     snapshot_.command_line = session.command_line();
+    snapshot_.restart_token = session.restart_token();
     snapshot_.enabled = session.enabled_modules();
     snapshot_.modules.clear();
     snapshot_.modules.reserve(session.modules().size());

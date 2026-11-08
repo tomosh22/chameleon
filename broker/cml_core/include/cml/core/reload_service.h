@@ -37,6 +37,32 @@
 
 namespace cml::core {
 
+class ProcessHost;
+class RestartCoordinator;
+
+// One reload or revert at a time (WP-12, WP-22): takes the lock without waiting and, while held, shows the service as running
+// (`wait idle` waits for it).
+class ExclusiveRun {
+public:
+    ExclusiveRun(std::mutex& mutex, std::atomic<bool>& running) : lock_(mutex, std::try_to_lock), running_(running) {
+        if (lock_.owns_lock()) {
+            running_.store(true);
+        }
+    }
+    ~ExclusiveRun() {
+        if (lock_.owns_lock()) {
+            running_.store(false);
+        }
+    }
+    ExclusiveRun(const ExclusiveRun&) = delete;
+    ExclusiveRun& operator=(const ExclusiveRun&) = delete;
+    bool acquired() const { return lock_.owns_lock(); }
+
+private:
+    std::unique_lock<std::mutex> lock_;
+    std::atomic<bool>& running_;
+};
+
 class ReloadService {
 public:
     // `session_dir`: base directory for objects, patch DLLs and PDBs ("" = a new directory under the system
@@ -87,6 +113,26 @@ public:
     // The state of a module (tests, diagnostics); null when it is not enabled.
     std::shared_ptr<ModuleState> module_state(std::uint64_t agent_id, const std::string& module_path) const;
 
+    // ---- hot-restart (WP-21, restart.h) ----
+    // Gives the service the means to start and stop processes. The real host is installed on Windows; tests install a
+    // scripted one. Without a host `restart` is refused (CML5800) and the capability is not advertised.
+    void set_process_host(std::shared_ptr<ProcessHost> host);
+    bool restart_available() const;
+    void set_restart_trace_for_testing(std::function<void(const std::string&)> trace);
+    // {"pid"?:N, "timeout_ms"?:N}
+    Result<ipc::json::Value> restart(const ipc::json::Value& args);
+    // The agent connections (handshaken or not), their modules' states, and a lookup by pid / restart token.
+    std::vector<std::shared_ptr<AgentLink>> links() const;
+    std::shared_ptr<AgentLink> link_for_pid(std::uint32_t pid) const;
+    // The connection whose Hello carried `token` and came from process `pid` (the pid the broker started; a child that
+    // inherited the token cannot be mistaken for the restarted process).
+    std::shared_ptr<AgentLink> link_for_restart_token(const std::string& token, std::uint32_t pid) const;
+    // Holds off every reload (they are refused busy, CML5304) for as long as the returned lock lives. Not owned when a
+    // reload is running. A restart calls reload_locked() meanwhile.
+    std::unique_ptr<ExclusiveRun> lock_reloads();
+    Result<ipc::json::Value> reload_locked(const ipc::json::Value& args);
+    std::vector<std::shared_ptr<ModuleState>> module_states(std::uint64_t agent_id) const;
+
 private:
     struct AgentEntry {
         std::shared_ptr<AgentLink> link;
@@ -103,7 +149,7 @@ private:
     std::optional<Diag> apply_compile_on_save(bool on);
     // The reload; `automatic` is a reload started by a save: it only touches modules whose index is ready, finds a
     // running reload or no module without publishing an error, and returns quietly (kBusy for "try again").
-    Result<ipc::json::Value> run_reload(const ipc::json::Value& args, bool automatic);
+    Result<ipc::json::Value> run_reload(const ipc::json::Value& args, bool automatic, bool lock_held = false);
     std::vector<std::string> tracked_files() const;
     std::vector<Target> targets(std::uint32_t pid, const std::string& module) const;
 
@@ -124,6 +170,7 @@ private:
     std::vector<std::future<void>> retiring_;  // stopped save watchers finishing a reload
     WatcherFactory watcher_factory_;
 
+    std::shared_ptr<RestartCoordinator> restart_;  // guarded by mutex_; restart() works on a copy
     std::mutex observer_mutex_;
     OptionObserver option_observer_;
 
