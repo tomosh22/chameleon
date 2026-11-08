@@ -27,7 +27,7 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-20 | Crash → patch → continue | 6 | done (breakpoints deferred) | wp/20-crash-patch-continue | #34 | — |
 | WP-21 | Hot-restart (`ScheduleRestart` API still not implemented) | 6 | done | wp/21-hot-restart | #36 | — |
 | WP-22 | Patch revert (session reset deferred) | 6 | done | wp/22-patch-revert | #35 | — |
-| WP-24 | Thread-local variables | 6 | in review — fixing high-review items (SECREL must resolve inside the old .tls) | wp/24-thread-local | #39 | — |
+| WP-24 | Thread-local variables | 6 | done | wp/24-thread-local | #39 | — |
 | WP-25 | Unchanged-function elision (scope narrowed, ADR-0034) | 6 | done | wp/25-unchanged-elision | #37 | — |
 
 ## Orchestrator integration work
@@ -69,9 +69,9 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | FU-22 | WP-21 (#36) | When the broker has no console, it borrows the old process's console (`AttachConsole`) during the relaunch, so for that moment its own standard handles may refer to the user's console. Untested; restore the std handles around attach/free | next broker WP |
 | FU-23 | WP-19 (#33) | `cml_ui` window, tray icon, hotkey, single instance and editor launch have never been exercised on a display; the manual checklist in WP-19.md is unchecked | needs a person on Windows |
 | FU-24 | WP-19 (#33) | `patch_applied` carries no changed file names or timings, so the UI history is thin for broker-triggered (compile-on-save) reloads; add `changed_files` and `timing_ms` to the event | next broker WP |
+| FU-25 | WP-24 (#39) | SECREL value comes from `section_offset_from_rva` of the record's RVA, not the record's own section offset; correct on CI (both compilers, threads keep values) but would break if a linker merged `.tls` into another section; also no check that a patch DLL has no TLS directory, and WP-24.md still says "inside the old `.tls` section" (the code decides by thread records) | next bind-planner WP |
 
 ## Handoff (2026-11-08)
 
-Main: 6715388 (WP-21 merged); green verified through a637677 (WP-19). Agent ABI decision taken (ADR-0034: no bump).
-Open: WP-24 (re-delegated after its first acceptance failure), WP-25 #37 (high-review fixes). Then the docs PR and the
-wave-6 report.
+Wave 6 complete: WP-19..22, 24, 25 merged; main at 61e1e29 (WP-24). Agent ABI decision taken (ADR-0034: no bump).
+WP-24 failed acceptance once (S_PUB32 RVA is not the .tls offset) and passed on re-delegation.
