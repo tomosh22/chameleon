@@ -71,6 +71,11 @@ diagnostic is planned, not live.
   returns `CML_STATUS_NOT_IMPLEMENTED`. A broker started with a short `--exit-when-idle` can exit during the restart gap.
 - Broker UI (WP-19): enable/disable of modules is shown but not switchable (the control protocol has no such command); a relative
   path in compiler output is resolved best-effort against the modules' directories.
+- Unchanged-function elision (WP-25): a reload whose recompiled code is identical to the running code loads nothing and warns
+  CML3450; one whose only change is the initial value of a writable global that lives in the running image warns CML3451 (the
+  initialiser of an existing global does not run again). Read-only constants are fresh copies in the patch and do take effect.
+  Data that is unreadable in the module file or holds pointers is not compared, so such an edit may get plain CML3450. The old
+  bytes are read from the module file, not process memory. `hooks_kept` in the reload response lists at most 50 entries.
 - `unload_patch` (WP-17) waits up to 10 s for a hook that is still running and then refuses (CML4212, patch stays hidden); in
   synchronised mode that stalls the agent thread meanwhile.
 - A thread that runs an application hook (the agent thread, or an application thread at `cml_sync_point`) gets a 64 KB stack

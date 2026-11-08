@@ -27,8 +27,8 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-20 | Crash → patch → continue | 6 | done (breakpoints deferred) | wp/20-crash-patch-continue | #34 | — |
 | WP-21 | Hot-restart (`ScheduleRestart` API still not implemented) | 6 | done | wp/21-hot-restart | #36 | — |
 | WP-22 | Patch revert (session reset deferred) | 6 | done | wp/22-patch-revert | #35 | — |
-| WP-24 | Thread-local variables | 6 | in progress — acceptance failed once (namespace-scope TLS offset); re-delegated with diagnosis | wp/24-thread-local | — | — |
-| WP-25 | Unchanged-function elision (scope narrowed, ADR-0034) | 6 | in review — fixing high-review items (one blocking: callers of re-hooked functions) | wp/25-unchanged-elision | #37 | — |
+| WP-24 | Thread-local variables | 6 | in review — fixing high-review items (SECREL must resolve inside the old .tls) | wp/24-thread-local | #39 | — |
+| WP-25 | Unchanged-function elision (scope narrowed, ADR-0034) | 6 | done | wp/25-unchanged-elision | #37 | — |
 
 ## Orchestrator integration work
 
