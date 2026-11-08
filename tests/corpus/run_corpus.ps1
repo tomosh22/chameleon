@@ -211,6 +211,13 @@ function Report-Crash {
             if ($target) {
                 $pdb = [System.IO.Path]::ChangeExtension($target, '.pdb')
                 Write-Host "symbolising $mod+0x$off with $pdb"
+                $bl = Join-Path $out 'broker.log'
+                if (Test-Path $bl) {
+                    Write-Host '---- planner decisions for the statics of the last patched object (broker.log, trace)'
+                    Select-String -Path $bl -Pattern 'bind: sym=.* defined=1 static=1' | Select-Object -Last 120 | ForEach-Object { $_.Line } | Out-Host
+                    Write-Host '---- planner decisions naming platform / CORE'
+                    Select-String -Path $bl -Pattern 'bind: sym=[^ ]*(platform|CORE)' | Select-Object -Last 40 | ForEach-Object { $_.Line } | Out-Host
+                }
                 & (Join-Path $ChameleonBin 'cml_pdb_dump.exe') $pdb --rva $off *>&1 | Out-Host
             } else { Write-Host "no file found for module $mod" }
         }
@@ -288,6 +295,10 @@ if ($built) {
             $sub = $script:Ctl.Call('subscribe', '{"events":["diag","patch_applied"]}', 15000) | ConvertFrom-Json
             if (-not $sub.ok) { throw "subscribe failed: $($sub | ConvertTo-Json -Compress)" }
 
+            if ($cfg.trace) {
+                $lv = $script:Ctl.Call('set-option', '{"name":"log_level","value":"trace"}', 15000)
+                Write-Host "log_level trace: $lv"
+            }
             $env:CML_PIPE_NAME = $agentPipe
             $env:CML_CORPUS_AGENT = '1'
             $env:CML_CORPUS_AGENT_DIR = $ChameleonBin

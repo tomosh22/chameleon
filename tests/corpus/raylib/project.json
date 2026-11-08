@@ -104,5 +104,6 @@
       "compiler": "clang-cl",
       "reason": "F-3: the process crashed after the rcore.c reload"
     }
-  ]
+  ],
+  "trace": true
 }
