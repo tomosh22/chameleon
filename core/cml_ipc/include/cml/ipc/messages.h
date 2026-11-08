@@ -83,6 +83,9 @@ enum class MessageType : std::uint16_t {
 
     // Compile notifications (WP-17).
     CompileEvent = 0x0070,  // implemented  broker -> agent (event, no answer)
+
+    // Failure injection (WP-28, ADR-0035: 0x00C0..0x00CF).
+    ArmFault = 0x00C0,  // implemented  broker -> agent (request, answered by Reply)
 };
 
 // Name for logs ("Hello"); "Unknown" for ids that are not in the enum.
@@ -452,11 +455,25 @@ struct ReenableModules {
     std::vector<RestartModule> modules;
 };
 
+// --- failure injection (WP-28, ADR-0035) -----------------------------------------------------------------------------------
+//
+// Broker -> agent request, answered by Reply (status 0 once armed): the broker sends it for the control command
+// `inject-failure` when the stage is one of the agent's (cml/ipc/fault_stages.h). `stage` is a stage name or "none"
+// (disarm everything); `count` (1..kMaxCount for a stage, ignored for "none") is how many passes of the stage fail.
+// An agent built without CML_FAULT_INJECTION answers CML4655, an unknown or broker-side stage CML4654.
+inline constexpr std::uint32_t kMaxFaultStageBytes = 64;
+
+struct ArmFault {
+    std::uint64_t request_id = 0;
+    std::string stage;
+    std::uint32_t count = 1;
+};
+
 using Message = std::variant<Hello, Welcome, ModuleList, EnableModule, DisableModule, ModuleLoaded,
                              ModuleUnloaded, Log, Reply, ReserveRange, ReleaseRange, LoadPatch,
                              PatchLoaded, ApplyFixups, RunInitializers, ReserveRangeResult, InstallHooks,
                              HooksInstalled, CompileEvent, Exception, ExceptionAction, ExceptionConfig, Restart, RestartInfo,
-                             ReenableModules, RestartCancel>;
+                             ReenableModules, RestartCancel, ArmFault>;
 
 MessageType type_of(const Message& message) noexcept;
 

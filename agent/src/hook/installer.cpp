@@ -12,6 +12,7 @@
 
 #include "cml/util/log.h"
 #include "diag_ids.h"
+#include "fault/fault_injection.h"
 #include "heap.h"
 
 namespace cml::agent::hook {
@@ -284,6 +285,9 @@ Diag batch_diag(std::uint32_t code, ThreadSet::Result result, std::uint32_t thre
                                      "abandoned and they run again.",
                                      options.window_budget_ms),
                               "Reduce the number of functions per reload or report this as a bug.");
+        case ipc::fault::ids::kAgentHookInstall:  // WP-28: built after the threads run again
+            return Diag::make(code, "injected failure at the stage 'hook-install' (inside the window with the application's threads suspended); nothing was written",
+                              "This failure was requested with the control command inject-failure. Reload again: without it the hooks install.");
         default:
             return Diag::make(code, format("hook installation failed (internal code %u).", code), "Report this as a bug.");
     }
@@ -417,6 +421,12 @@ void Installer::attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, 
         std::size_t thread_index = 0;
         std::size_t job_index = 0;
         if (!find_conflict(jobs, count, &thread_index, &job_index)) {
+            // WP-28: failure injection (stage hook-install). One lock-free atomic decrement: nothing here allocates or takes a
+            // lock. Nothing was written; the threads are resumed below and the batch fails with the stage's diagnostic.
+            if (fault::consume(ipc::fault::Stage::HookInstall)) {
+                report->diag = ipc::fault::ids::kAgentHookInstall;
+                break;
+            }
             // Nobody is inside any window. Verify, then write.
             bool intact = true;
             for (std::size_t j = 0; j < count && intact; ++j) {

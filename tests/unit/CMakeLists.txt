@@ -64,7 +64,7 @@ endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     target_compile_definitions(cml_test_pdb PRIVATE CML_TEST_COMPILER_IS_CL=1)  # cl.exe, not clang-cl
 endif()
-cml_add_unit_test(ipc SOURCES lib/test_ipc.cpp lib/test_ipc_hooks.cpp lib/test_ipc_loader.cpp lib/test_ipc_compile.cpp lib/test_ipc_exception.cpp lib/test_ipc_restart.cpp LIBS cml_ipc)
+cml_add_unit_test(ipc SOURCES lib/test_ipc.cpp lib/test_ipc_hooks.cpp lib/test_ipc_loader.cpp lib/test_ipc_compile.cpp lib/test_ipc_exception.cpp lib/test_ipc_restart.cpp lib/test_ipc_fault.cpp LIBS cml_ipc)
 cml_add_unit_test(proc SOURCES lib/test_proc.cpp lib/test_proc_address_space.cpp LIBS cml_proc)
 if(WIN32)
     # WP-11: named-pipe transport tests (real pipes, in-process client and server threads).
@@ -77,7 +77,7 @@ cml_add_unit_test(watch SOURCES lib/test_watch.cpp watch/test_coalesce.cpp watch
 # end-to-end tests load cml_agent.dll through Chameleon_API.h like an application would and talk to
 # an in-process broker (cml_core's ConnectionServer).
 cml_add_unit_test(agent
-    SOURCES agent/test_sync_queue.cpp agent/test_module_diff.cpp
+    SOURCES agent/test_sync_queue.cpp agent/test_module_diff.cpp agent/test_fault.cpp
     LIBS cml_agent_core)
 if(WIN32)
     # WP-10: out-of-process hang watchdog (the in-process one is stopped together with every other thread

@@ -1,0 +1,154 @@
+name: fuzz
+
+# WP-28 (ADR-0035): libFuzzer + AddressSanitizer on the COFF reader, the PE reader, the PDB reader and the IPC deserialiser (and
+# the control-pipe JSON codec), clang-cl on windows-2022. One job per target, 10 minutes each. A crash, a sanitizer report or a
+# hang fails the job and uploads the reproducer as an artefact; add it to tests/fuzz/corpus/<target>/ with the fix (docs/wp/WP-28.md).
+#
+# The replay of the checked-in corpus (`fuzz.replay.<target>`) is an ordinary ctest in the `ci` workflow's every cell; this
+# workflow is the part that mutates.
+#
+# Runs nightly, on demand, and on pull requests that touch a fuzz target, the readers or the IPC code, so the PR that changes
+# them carries its own run. It does not edit ci.yml (ADR-0035).
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: 'Minutes of fuzzing per target'
+        required: false
+        default: '10'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tests/fuzz/**'
+      - '.github/workflows/fuzz.yml'
+      - 'core/cml_coff/**'
+      - 'core/cml_pe/**'
+      - 'core/cml_pdb/**'
+      - 'core/cml_ipc/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.event_name }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  fuzz:
+    name: fuzz / ${{ matrix.target }}
+    runs-on: windows-2022
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: coff,    max_len: 65536 }
+          - { target: pe,      max_len: 65536 }
+          - { target: pdb,     max_len: 131072 }
+          - { target: ipc,     max_len: 65536 }
+          - { target: control, max_len: 16384 }
+    env:
+      FUZZ_MINUTES: ${{ github.event.inputs.minutes || '10' }}
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Puts the Windows SDK, the MSVC CRT/STL headers and libs, CMake and Ninja on PATH (x64). clang-cl uses them.
+      - name: Set up MSVC developer environment (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # clang-cl with the libFuzzer and AddressSanitizer runtimes for Windows (clang_rt.fuzzer-x86_64.lib, clang_rt.asan-x86_64.lib,
+      # clang_rt.asan_cxx-x86_64.lib in <resource dir>\lib\windows). The windows-2022 image ships an LLVM that has them; if a future
+      # image does not, the step installs the current LLVM release with chocolatey.
+      - name: Select clang-cl and print its version
+        run: |
+          New-Item -ItemType Directory -Force -Path ci-logs | Out-Null
+          $llvm = 'C:\Program Files\LLVM\bin\clang-cl.exe'
+          if (-not (Test-Path $llvm)) { $llvm = (Get-Command clang-cl).Source }
+          $res = (& $llvm /clang:-print-resource-dir).Trim()
+          $need = @('clang_rt.fuzzer-x86_64.lib', 'clang_rt.asan-x86_64.lib', 'clang_rt.asan_cxx-x86_64.lib')
+          $missing = $need | Where-Object { -not (Test-Path (Join-Path $res "lib\windows\$_")) }
+          if ($missing) {
+            Write-Host "missing runtimes: $missing; installing LLVM"
+            choco install llvm -y --no-progress --allow-downgrade
+            $llvm = 'C:\Program Files\LLVM\bin\clang-cl.exe'
+            $res = (& $llvm /clang:-print-resource-dir).Trim()
+          }
+          "CML_CXX=$llvm" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "LLVM_BIN=$(Split-Path $llvm)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          $v = (& $llvm --version | Out-String)
+          Write-Host $v
+          Write-Host "resource dir: $res"
+          Get-ChildItem (Join-Path $res 'lib\windows') -Filter '*fuzzer*' | ForEach-Object { Write-Host $_.Name }
+          "### clang-cl for the fuzz targets`n$v" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+
+      # RelWithDebInfo: AddressSanitizer needs the release CRT (/MT; the project is static-CRT), never /MTd.
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER="$env:CML_CXX" -DCML_FUZZ=ON `
+            *>&1 | Tee-Object -FilePath ci-logs/configure.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Only the fuzz target: the readers it links are built with the sanitizers, the rest of the tree is not.
+      - name: Build cml_fuzz_${{ matrix.target }}
+        run: |
+          cmake --build build --target cml_fuzz_${{ matrix.target }} -- -v *>&1 | Tee-Object -FilePath ci-logs/build.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # The corpus of earlier runs (cache) is merged with the checked-in seeds; the checked-in seeds always run first.
+      - name: Restore the grown corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz-corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: Replay the checked-in corpus (instrumented binary)
+        run: |
+          $exe = "build/bin/cml_fuzz_${{ matrix.target }}.exe"
+          & $exe -runs=0 "tests/fuzz/corpus/${{ matrix.target }}" *>&1 | Tee-Object -FilePath ci-logs/replay.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Fuzz for ${{ env.FUZZ_MINUTES }} minutes
+        env:
+          ASAN_OPTIONS: detect_leaks=0:handle_abort=1:allocator_may_return_null=1
+        run: |
+          $env:PATH = "$env:LLVM_BIN;$env:PATH"   # llvm-symbolizer, for readable stacks
+          New-Item -ItemType Directory -Force -Path "fuzz-corpus/${{ matrix.target }}", crashes | Out-Null
+          $exe = "build/bin/cml_fuzz_${{ matrix.target }}.exe"
+          $seconds = [int]$env:FUZZ_MINUTES * 60
+          & $exe "-max_total_time=$seconds" "-max_len=${{ matrix.max_len }}" -timeout=60 -rss_limit_mb=4096 -print_final_stats=1 `
+            "-artifact_prefix=crashes/" "fuzz-corpus/${{ matrix.target }}" "tests/fuzz/corpus/${{ matrix.target }}" `
+            *>&1 | Tee-Object -FilePath ci-logs/fuzz.log
+          $code = $LASTEXITCODE
+          $stats = Select-String -Path ci-logs/fuzz.log -Pattern 'stat::|^#\d+\s+(DONE|INITED)|Done \d+ runs' | ForEach-Object { $_.Line }
+          "### fuzz ${{ matrix.target }} (${{ env.FUZZ_MINUTES }} min), exit code $code`n``````n$($stats -join "`n")`n``````" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          exit $code
+
+      # A crash leaves crash-*, leak-*, timeout-* and oom-* files in crashes/.
+      - name: Upload the reproducer
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: |
+            crashes/
+            ci-logs/
+          if-no-files-found: warn
+
+      - name: Upload logs
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-logs-${{ matrix.target }}
+          path: ci-logs/
+          retention-days: 14

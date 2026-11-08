@@ -31,6 +31,7 @@ enum class StepKind {
     ExpectException,          // an `exception` event arrives (optional code / function must match)
     ExceptionAction,          // control command `exception-action` for the current exception
     ExpectPendingExceptions,  // control command `exceptions` lists exactly `count` held threads
+    InjectFailure,            // WP-28 (fault_step.h): arm a failure-injection stage (needs the capability "fault-injection")
 };
 
 const char* to_string(StepKind kind);
@@ -74,6 +75,9 @@ struct Step {
     std::string exception_code;
     std::string exception_function;
     std::string exception_action;
+    // WP-28. InjectFailure: the stage name (or "none"), how many passes fail, and `expect_error` = the command must be refused.
+    std::string fault_stage;
+    int fault_count = 1;
 
     // "expect_stdout /value=2/ within 10 s"
     std::string describe() const;
