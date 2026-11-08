@@ -64,7 +64,7 @@ endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     target_compile_definitions(cml_test_pdb PRIVATE CML_TEST_COMPILER_IS_CL=1)  # cl.exe, not clang-cl
 endif()
-cml_add_unit_test(ipc SOURCES lib/test_ipc.cpp lib/test_ipc_hooks.cpp lib/test_ipc_loader.cpp lib/test_ipc_compile.cpp lib/test_ipc_exception.cpp LIBS cml_ipc)
+cml_add_unit_test(ipc SOURCES lib/test_ipc.cpp lib/test_ipc_hooks.cpp lib/test_ipc_loader.cpp lib/test_ipc_compile.cpp lib/test_ipc_exception.cpp lib/test_ipc_restart.cpp LIBS cml_ipc)
 cml_add_unit_test(proc SOURCES lib/test_proc.cpp lib/test_proc_address_space.cpp LIBS cml_proc)
 if(WIN32)
     # WP-11: named-pipe transport tests (real pipes, in-process client and server threads).
@@ -105,6 +105,8 @@ cml_add_unit_test(broker_core
         broker/test_audit.cpp
         # WP-14: compile on save
         broker/test_save_watcher.cpp
+        # WP-21: hot-restart
+        broker/test_restart.cpp
         # WP-20: crash -> patch -> continue (broker side)
         broker/test_exceptions.cpp
     LIBS cml_core)

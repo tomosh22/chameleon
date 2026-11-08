@@ -24,6 +24,7 @@ enum class StepKind {
     ExpectEvent,          // an event of this name (patch_applied, ...) must arrive (needs capability "subscribe")
     SignalFixture,        // create the file named by CML_FIXTURE_SIGNAL_FILE, which the fixture waits for (WP-17)
     ExpectReloadResult,   // an integer member of the most recent reload's result has this value (WP-16)
+    Restart,              // control command `restart` (WP-21, restart_step.h): the process is replaced by a relaunched one
     Revert,               // control command `revert` with scope "last" or "all" (WP-22; needs capability "revert")
     // WP-20, crash -> patch -> continue (bodies in exception_steps.cpp, needs the capability "exceptions").
     WatchExceptions,          // subscribe to `exception` events: the agents start holding faulting threads

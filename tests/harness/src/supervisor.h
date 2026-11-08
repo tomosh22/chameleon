@@ -59,6 +59,11 @@ public:
     void kill(std::size_t id);
     void kill_all();
 
+    // WP-21: the child `id` was replaced by another process (the broker restarted it): from now on `id` stands for process
+    // `new_pid` (pid(), exit_code(), wait_exit(), dump_running() and kill() act on it). The old process handle is closed.
+    // CML5415 when the new process cannot be opened.
+    cml::Result<void> adopt(std::size_t id, std::uint32_t new_pid);
+
 private:
     struct Child {
         std::string label;

@@ -38,7 +38,10 @@ add_library(cml_core STATIC
     src/save_watcher.cpp
     # WP-20: crash -> patch -> continue
     src/exception_service.cpp
-    src/reload_service.cpp)
+    src/reload_service.cpp
+    # WP-21: hot-restart (portable orchestration; restart_win.cpp is the Windows ProcessHost)
+    src/restart.cpp
+    src/restart_win.cpp)
 target_include_directories(cml_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_BINARY_DIR}/generated")
