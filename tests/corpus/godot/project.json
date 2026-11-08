@@ -1,0 +1,95 @@
+{
+  "name": "godot",
+  "repo": "https://github.com/godotengine/godot.git",
+  "tag": "4.3-stable",
+  "commit": "77dcf97d82cbfe4e4615475fa52ca03da645dbd8",
+  "license": "MIT",
+  "support_dir": "platform/windows",
+  "patch": "chameleon.patch",
+  "args": [
+    "--headless",
+    "--editor",
+    "--max-fps",
+    "30",
+    "--path",
+    "{work}/godot_project"
+  ],
+  "env": {},
+  "edits": [
+    {
+      "id": "main-iteration",
+      "file": "main/main.cpp",
+      "replace": [
+        {
+          "find": "bool Main::iteration() {\n\titerating++;\n",
+          "with": "bool Main::iteration() {\n\tcml_corpus_marker(\"godot_iteration_v2\");\n\titerating++;\n"
+        }
+      ],
+      "include": "platform/windows/chameleon_corpus.h",
+      "expect": "markers=\\S*godot_iteration_v2:\\d+"
+    },
+    {
+      "id": "scene-tree-process",
+      "file": "scene/main/scene_tree.cpp",
+      "replace": [
+        {
+          "find": "bool SceneTree::process(double p_time) {\n",
+          "with": "bool SceneTree::process(double p_time) {\n\tcml_corpus_marker(\"godot_scenetree_process_v2\");\n"
+        }
+      ],
+      "include": "platform/windows/chameleon_corpus.h",
+      "expect": "markers=\\S*godot_scenetree_process_v2:\\d+"
+    },
+    {
+      "id": "call-queue-flush",
+      "file": "core/object/message_queue.cpp",
+      "replace": [
+        {
+          "find": "Error CallQueue::flush() {\n\tLOCK_MUTEX;\n",
+          "with": "Error CallQueue::flush() {\n\tcml_corpus_marker(\"godot_callqueue_flush_v2\");\n\tLOCK_MUTEX;\n"
+        }
+      ],
+      "include": "platform/windows/chameleon_corpus.h",
+      "expect": "markers=\\S*godot_callqueue_flush_v2:\\d+"
+    },
+    {
+      "id": "header-inline-support",
+      "file": "platform/windows/chameleon_corpus.h",
+      "replace": [
+        {
+          "find": "    return 1;",
+          "with": "    return 2;"
+        }
+      ],
+      "expect": "inline=2 "
+    },
+    {
+      "id": "template-support",
+      "file": "platform/windows/chameleon_corpus.h",
+      "replace": [
+        {
+          "find": "static_cast<T>(2)",
+          "with": "static_cast<T>(3)"
+        }
+      ],
+      "expect": "tmpl=64 "
+    },
+    {
+      "id": "unsupported-new-thread-local",
+      "file": "core/os/os.cpp",
+      "replace": [
+        {
+          "find": "String OS::get_executable_path() const {\n\treturn _execpath;\n}",
+          "with": "String OS::get_executable_path() const {\n\tstatic thread_local int cml_corpus_tls = 0;\n\tcml_corpus_tls++;\n\treturn _execpath;\n}"
+        }
+      ],
+      "expect_error": "CML3400"
+    }
+  ],
+  "reload_timeout_s": 900,
+  "observe_timeout_s": 120,
+  "start_timeout_s": 600,
+  "index_timeout_s": 1800,
+  "min_functions": 50000,
+  "expected_failures": []
+}

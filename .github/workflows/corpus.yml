@@ -1,0 +1,136 @@
+name: corpus
+
+# WP-26 (ADR-0035): Chameleon against three open-source projects (raylib, Dear ImGui, the Godot 4 editor), pinned by
+# tag and fetched at run time, never vendored. Nightly, on demand, and on pull requests that touch tests/corpus or this
+# file, so the PR that changes the corpus carries its own acceptance run. The matrix (project x compiler x step) is in
+# each cell's step summary and in docs/wp/WP-26.md.
+
+on:
+  schedule:
+    - cron: '41 2 * * *'
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tests/corpus/**'
+      - '.github/workflows/corpus.yml'
+  push:
+    branches: ['wp/26-*']
+    paths:
+      - 'tests/corpus/**'
+      - '.github/workflows/corpus.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: corpus-${{ github.event_name }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  chameleon:
+    name: build chameleon
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Configure and build the broker, the agent and the decoder probe
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
+          $cxx = (Get-Command cl).Source
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo "-DCMAKE_CXX_COMPILER=$cxx"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --parallel --target cml_broker cml_agent cml_lde_probe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem build/bin | Select-Object Name, Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chameleon-bin
+          path: build/bin
+          retention-days: 3
+          if-no-files-found: error
+
+  corpus:
+    name: ${{ matrix.project }} / ${{ matrix.compiler }}
+    needs: chameleon
+    runs-on: windows-2022
+    # Godot is the large one: a cold scons build of the editor with debug information. The driver step is limited to
+    # 130 minutes; the cache is saved afterwards (also on failure) so that a partial build is continued by the next run.
+    timeout-minutes: ${{ matrix.project == 'godot' && 175 || 90 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { project: raylib, compiler: msvc }
+          - { project: raylib, compiler: clang-cl }
+          - { project: imgui, compiler: msvc }
+          - { project: imgui, compiler: clang-cl }
+          - { project: godot, compiler: msvc }
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      WORK: ${{ github.workspace }}/corpus-work
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: chameleon-bin
+          path: chameleon-bin
+
+      - name: Restore the Godot build tree
+        if: matrix.project == 'godot'
+        id: godot-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: corpus-work/src-godot
+          key: corpus-godot-4.3-stable-msvc-${{ hashFiles('tests/corpus/godot/chameleon.patch', 'tests/corpus/godot/build.ps1') }}
+
+      - name: Select the compiler
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
+          if ('${{ matrix.compiler }}' -eq 'clang-cl') {
+            $llvm = 'C:\Program Files\LLVM\bin\clang-cl.exe'
+            if (Test-Path $llvm) { $cxx = $llvm } else { $cxx = (Get-Command clang-cl).Source }
+          } else {
+            $cxx = (Get-Command cl).Source
+          }
+          "CXX=$cxx" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          Write-Host "compiler: $cxx"
+          Write-Host "cache hit: ${{ steps.godot-cache.outputs.cache-hit }}"
+
+      - name: Run the corpus (${{ matrix.project }}, ${{ matrix.compiler }})
+        timeout-minutes: ${{ matrix.project == 'godot' && 130 || 75 }}
+        run: |
+          pwsh -NoProfile -File tests/corpus/run_corpus.ps1 -Project ${{ matrix.project }} -Compiler ${{ matrix.compiler }} `
+            -ChameleonBin chameleon-bin -WorkDir $env:WORK -CxxPath $env:CXX
+          exit $LASTEXITCODE
+
+      - name: Save the Godot build tree
+        if: always() && matrix.project == 'godot' && steps.godot-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: corpus-work/src-godot
+          key: corpus-godot-4.3-stable-msvc-${{ hashFiles('tests/corpus/godot/chameleon.patch', 'tests/corpus/godot/build.ps1') }}
+
+      - name: Upload logs and the matrix
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-${{ matrix.project }}-${{ matrix.compiler }}
+          path: |
+            corpus-work/out-${{ matrix.project }}-${{ matrix.compiler }}
+            !corpus-work/out-${{ matrix.project }}-${{ matrix.compiler }}/session/**/*.obj
+            !corpus-work/out-${{ matrix.project }}-${{ matrix.compiler }}/session/**/*.pdb
+          if-no-files-found: warn
+          retention-days: 14
