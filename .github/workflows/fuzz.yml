@@ -154,3 +154,36 @@ jobs:
           name: fuzz-logs-${{ matrix.target }}
           path: ci-logs/
           retention-days: 14
+
+  # Release packaging turns failure injection off (-DCML_FAULT_INJECTION=OFF): that configuration must keep compiling, with
+  # /W4 /WX, and the unit tests that do not need injection must pass. cl, RelWithDebInfo.
+  no-fault-injection:
+    name: build / CML_FAULT_INJECTION=OFF (cl RelWithDebInfo)
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC developer environment (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=cl -DCML_FAULT_INJECTION=OFF
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build the agent, the broker and the unit tests that touch injection
+        run: |
+          cmake --build build --parallel --target cml_agent cml_broker cml_test_agent cml_test_broker_core cml_test_ipc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test
+        run: |
+          ctest --test-dir build -C RelWithDebInfo --output-on-failure -R '^unit\.(agent|broker_core|ipc)$'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

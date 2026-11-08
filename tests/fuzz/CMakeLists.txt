@@ -121,14 +121,18 @@ foreach(_t IN LISTS CML_FUZZ_TARGETS)
     cml_target_core_style(${_exe})
     set_target_properties(${_exe} PROPERTIES FOLDER "tests/fuzz")
 
+    # The exit code decides: replay_main.cpp returns non-zero for no input at all, libFuzzer for a crash. Under CML_FUZZ the
+    # corpus files are passed one by one (-runs=0 replays them without mutating); an empty corpus is a configure-time error.
     if(CML_FUZZ)
-        add_test(NAME fuzz.replay.${_t} COMMAND ${_exe} -runs=0 "${CMAKE_CURRENT_SOURCE_DIR}/corpus/${_t}")
+        file(GLOB _cml_fuzz_seeds CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/corpus/${_t}/*")
+        if(NOT _cml_fuzz_seeds)
+            message(FATAL_ERROR "tests/fuzz/corpus/${_t} has no seed files")
+        endif()
+        add_test(NAME fuzz.replay.${_t} COMMAND ${_exe} -runs=0 ${_cml_fuzz_seeds})
     else()
         add_test(NAME fuzz.replay.${_t} COMMAND ${_exe} "${CMAKE_CURRENT_SOURCE_DIR}/corpus/${_t}")
     endif()
-    set_tests_properties(fuzz.replay.${_t} PROPERTIES
-        TIMEOUT 300
-        PASS_REGULAR_EXPRESSION "REPLAY inputs=[1-9][0-9]*|Executed .* in [0-9]+ ms")
+    set_tests_properties(fuzz.replay.${_t} PROPERTIES TIMEOUT 300)
 endforeach()
 
 # The pdb target maps files with the platform's API; off Windows it needs the thread library.

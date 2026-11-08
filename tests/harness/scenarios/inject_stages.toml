@@ -10,7 +10,8 @@
 #   5. reloads again without injection: the same edit now applies and the new value appears.
 #
 # The agent's stages end in the agent's own diagnostics (CML4650-4653); hook-install fails inside the window in which the
-# application's threads are suspended, post-patch-hooks fails after the hooks were installed and rolls them back, patch-load
+# application's threads are suspended, post-patch-hooks fails after the hooks were installed (before they are committed and before the
+# application's post-patch hooks run) and rolls them back, patch-load
 # fails after the DLL was mapped and unloads it again. Ids of the broker's stages are CML5963-5969.
 #
 # The reservation goes first: a module's address space is reserved once, on its first patch, so only the first reload
@@ -73,6 +74,12 @@ within_s = 180
 kind = "expect_stdout"
 regex = "TICK n=\\d+ value=2 calls=\\d+"
 within_s = 10
+
+# The module has its reservation now: arming that stage again would fire on an unrelated later reload, so it is refused.
+[[step]]
+kind = "inject_failure"
+stage = "reservation"
+expect_error = "CML5970"
 
 # ---- stage 2: pdb-load -> CML5963 ----
 [[step]]

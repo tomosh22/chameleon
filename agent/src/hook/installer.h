@@ -127,7 +127,9 @@ public:
 
     // Hooks every request (or re-points the ones that are already hooked). Safe from any thread;
     // concurrent batches are serialised. `outcomes` is resized to `count`.
-    BatchResult install(const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes);
+    // `injectable` (WP-28): this batch is a reload's InstallHooks, the only kind the failure-injection stage hook-install may
+    // fail; reverts, quiet re-points and the rollbacks of the injection itself pass false.
+    BatchResult install(const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes, bool injectable = false);
     // Puts the original bytes back (requests[i].replacement is ignored).
     BatchResult revert(const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes);
 
@@ -157,8 +159,8 @@ private:
     struct Job;
     struct Report;
 
-    BatchResult apply(bool revert, const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes);
-    void attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, Report* report) noexcept;
+    BatchResult apply(bool revert, const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes, bool injectable);
+    void attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, Report* report, bool injectable) noexcept;
     bool find_conflict(const Job* jobs, std::size_t count, std::size_t* thread_index, std::size_t* job_index) const noexcept;
     Record* find_record(std::uintptr_t target);
     const Record* find_record(std::uintptr_t target) const;

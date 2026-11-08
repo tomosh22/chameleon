@@ -870,6 +870,7 @@ private:
             Result<void> prepared = prepare_fixups(plan, linked, report, &fixups, &init_rvas, &triples);
             report.times.fixups += lap.lap();
             if (!prepared) {
+                give_back_range(linked.base, linked.image_size);  // nothing was loaded: the address space is free again
                 return prepared;
             }
 
@@ -886,6 +887,7 @@ private:
             candidate.image_size = linked.image_size;
             load.candidates.push_back(std::move(candidate));
             if (const std::optional<Diag> f = injected(ipc::fault::Stage::SendPatch)) {
+                give_back_range(linked.base, linked.image_size);
                 return fail("load", *f);  // LoadPatch is never sent: nothing is loaded in the application
             }
             Result<ipc::Message> answer = ask(std::move(load), options_.agent_timeout_ms, "load");
@@ -920,6 +922,7 @@ private:
                     CML_LOG(Warn, "reload: the address range at %s was taken (CML%u); relinking at another base", hex(linked.base).c_str(), status);
                     continue;
                 }
+                give_back_range(linked.base, linked.image_size);  // the agent refused: the image is not mapped
                 return fail("load", agent_refusal("LoadPatch", status, message, pd::kLoadFailed));
             }
         }
@@ -1049,6 +1052,20 @@ private:
                 const auto* rep = std::get_if<ipc::Reply>(&*answer);
                 return fail("hooks", agent_refusal("InstallHooks", rep != nullptr ? rep->status : 5306, rep != nullptr ? rep->message : "unexpected answer",
                                                    pd::kHooksFailed));
+            }
+            if (done->status == ipc::fault::ids::kAgentRollbackIncomplete) {
+                // WP-28: the agent could not take every hook of this request out again; a live hook may still jump into the patch.
+                // The image must stay mapped (never free an image a live hook can target): leak it, remember the hooks as installed
+                // like after a timeout, and report the failure.
+                {
+                    std::lock_guard<std::mutex> lock(module_.mutex);
+                    for (const AppliedHook& h : applied.hooks) {
+                        module_.hooked[h.old_entry] = h.new_entry;
+                    }
+                }
+                record_code();
+                applied_.push_back(std::move(applied));
+                return fail("hooks", agent_refusal("InstallHooks", done->status, done->message, pd::kHooksFailed));
             }
             if (done->status != 0) {
                 abandon();
@@ -1266,6 +1283,12 @@ private:
         }
         (void)report;
         return Result<void>();
+    }
+
+    // The patch at [base, base + size) was linked but never loaded: its slice of the reserved address space is free again.
+    void give_back_range(std::uint64_t base, std::uint32_t size) {
+        std::lock_guard<std::mutex> lock(module_.mutex);
+        module_.reservation.release_tail(base, size);
     }
 
     void unload(std::uint64_t base) {

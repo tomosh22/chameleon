@@ -137,33 +137,16 @@ void Agent::apply_install_hooks(const ipc::InstallHooks& request) {
             }
         }
     }
-    hook::BatchResult batch =
-        revert ? installer.revert(specs.data(), count, outcomes) : installer.install(specs.data(), count, outcomes);
+    // `injectable`: only a reload's own InstallHooks may be failed by the hook-install stage, never a revert, a quiet re-point or
+    // the rollback below.
+    hook::BatchResult batch = revert ? installer.revert(specs.data(), count, outcomes) : installer.install(specs.data(), count, outcomes, !quiet);
 
-    if (!quiet) {
-        set_last_patch_status(static_cast<std::int32_t>(batch.diag.code));
-    }
-    if (session != nullptr) {
-        if (batch.ok()) {
-            // The hooks are written: the patches that hold the new functions count from now on (their own
-            // post-patch hooks included).
-            std::vector<std::pair<std::uint64_t, std::uint64_t>> pairs;
-            pairs.reserve(count);
-            for (const ipc::HookSpec& h : request.hooks) {
-                pairs.emplace_back(h.old_entry, h.new_entry);
-            }
-            session->commit(pairs);
-        }
-        ScopedHookThread scope(hook_thread_here);
-        const std::size_t ran = session->run(user_hooks::Kind::PostPatch, nullptr);
-        CML_LOG(Info, "hooks: request %llu: %llu post-patch hook(s) ran (install %s)", static_cast<unsigned long long>(request.request_id),
-                static_cast<unsigned long long>(ran), batch.ok() ? "succeeded" : "failed");
-        session.reset();  // releases the patch images
-    }
-
-    // WP-28: failure injection after the post-patch hooks ran. The hooks are in; take them out again (functions that were
-    // hooked to an earlier patch go back to that patch, the others get their original bytes) so that the answer's failure
-    // is true: the application runs its previous code and the broker unloads the patch.
+    // WP-28 (stage post-patch-hooks): the hooks are installed, but nothing has been committed and the application's post-patch
+    // hooks have not run. Take the hooks out again (functions that were hooked to an earlier patch go back to that patch, the
+    // others get their original bytes back; both are windows with the threads suspended) and fail with CML4653, so the
+    // post-patch hooks see a failed patch (cml_last_patch_status) exactly as for a failed install, nothing is committed, and the
+    // broker unloads the patch. If putting the hooks back fails, a live hook may still jump into the patch image: the answer is
+    // CML4656 and the broker must keep the image mapped.
     if (!quiet && batch.ok() && !previous.empty() && fault::consume(ipc::fault::Stage::PostPatchHooks)) {
         std::vector<hook::HookRequest> undo_revert;
         std::vector<hook::HookRequest> undo_repoint;
@@ -184,16 +167,41 @@ void Agent::apply_install_hooks(const ipc::InstallHooks& request) {
         if (!undo_repoint.empty()) {
             rolled_back = installer.install(undo_repoint.data(), undo_repoint.size(), undo_outcomes).ok() && rolled_back;
         }
-        batch.diag = Diag::make(ipc::fault::ids::kAgentPostPatchHooks,
-                                std::string("injected failure at the stage 'post-patch-hooks' (after the post-patch hooks ran); ") +
-                                    (rolled_back ? "the hooks of this request were rolled back" : "the hooks of this request could NOT all be rolled back"),
-                                "This failure was requested with the control command inject-failure. Reload again: without it the patch applies.");
-        set_last_patch_status(static_cast<std::int32_t>(batch.diag.code));
+        if (rolled_back) {
+            batch.diag = Diag::make(ipc::fault::ids::kAgentPostPatchHooks,
+                                    "injected failure at the stage 'post-patch-hooks' (after the hooks were installed, before they were committed); the hooks of this request were rolled back",
+                                    "This failure was requested with the control command inject-failure. Reload again: without it the patch applies.");
+        } else {
+            batch.diag = Diag::make(ipc::fault::ids::kAgentRollbackIncomplete,
+                                    "injected failure at the stage 'post-patch-hooks', and the hooks of this request could NOT all be rolled back; the patch image stays mapped because a live hook may still jump into it",
+                                    "Restart the application. The patch stays mapped; some of its hooks may be live.");
+        }
         for (hook::HookOutcome& o : outcomes) {
             o.status = hook::HookStatus::NotAttempted;
             o.diag = batch.diag;
         }
         CML_LOG(Warn, "hooks: request %llu: %s", static_cast<unsigned long long>(request.request_id), batch.diag.format().c_str());
+    }
+
+    if (!quiet) {
+        set_last_patch_status(static_cast<std::int32_t>(batch.diag.code));
+    }
+    if (session != nullptr) {
+        if (batch.ok()) {
+            // The hooks are written: the patches that hold the new functions count from now on (their own
+            // post-patch hooks included).
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> pairs;
+            pairs.reserve(count);
+            for (const ipc::HookSpec& h : request.hooks) {
+                pairs.emplace_back(h.old_entry, h.new_entry);
+            }
+            session->commit(pairs);
+        }
+        ScopedHookThread scope(hook_thread_here);
+        const std::size_t ran = session->run(user_hooks::Kind::PostPatch, nullptr);
+        CML_LOG(Info, "hooks: request %llu: %llu post-patch hook(s) ran (install %s)", static_cast<unsigned long long>(request.request_id),
+                static_cast<unsigned long long>(ran), batch.ok() ? "succeeded" : "failed");
+        session.reset();  // releases the patch images
     }
 
     ipc::HooksInstalled reply;

@@ -372,12 +372,12 @@ bool Installer::find(const void* target, HookInfo* info) const {
     return true;
 }
 
-BatchResult Installer::install(const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes) {
-    return apply(false, requests, count, outcomes);
+BatchResult Installer::install(const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes, bool injectable) {
+    return apply(false, requests, count, outcomes, injectable);
 }
 
 BatchResult Installer::revert(const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes) {
-    return apply(true, requests, count, outcomes);
+    return apply(true, requests, count, outcomes, false);
 }
 
 // ---- the stopped-world part ---------------------------------------------------------------------
@@ -403,7 +403,7 @@ bool Installer::find_conflict(const Job* jobs, std::size_t count, std::size_t* t
 // Runs with the application's threads stopped. No allocation, no logging, no locks, no CRT: see
 // thread_set.h for the system calls used and why each is safe. The code that touches memory is
 // bracketed by heap::set_alloc_forbidden so that a stray allocation aborts in tests.
-void Installer::attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, Report* report) noexcept {
+void Installer::attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, Report* report, bool injectable) noexcept {
     if (options_.test_before_stop != nullptr) {
         options_.test_before_stop(options_.test_context);
     }
@@ -423,7 +423,7 @@ void Installer::attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, 
         if (!find_conflict(jobs, count, &thread_index, &job_index)) {
             // WP-28: failure injection (stage hook-install). One lock-free atomic decrement: nothing here allocates or takes a
             // lock. Nothing was written; the threads are resumed below and the batch fails with the stage's diagnostic.
-            if (fault::consume(ipc::fault::Stage::HookInstall)) {
+            if (injectable && fault::consume(ipc::fault::Stage::HookInstall)) {
                 report->diag = ipc::fault::ids::kAgentHookInstall;
                 break;
             }
@@ -559,7 +559,7 @@ struct Interval {
 }  // namespace
 
 BatchResult Installer::apply(bool reverting, const HookRequest* requests, std::size_t count,
-                             std::vector<HookOutcome>& outcomes) {
+                             std::vector<HookOutcome>& outcomes, bool injectable) {
     std::lock_guard<std::mutex> lock(mutex_);
     BatchResult result;
     outcomes.assign(count, HookOutcome{});
@@ -936,7 +936,7 @@ BatchResult Installer::apply(bool reverting, const HookRequest* requests, std::s
     if (any_write) {
         for (;;) {
             report = Report{};
-            attempt(jobs.data(), count, &conflicts, &report);
+            attempt(jobs.data(), count, &conflicts, &report, injectable);
             ++result.stats.attempts;
             result.stats.threads = std::max(result.stats.threads, report.threads);
             result.stats.passes = std::max(result.stats.passes, report.passes);

@@ -459,7 +459,8 @@ struct ReenableModules {
 //
 // Broker -> agent request, answered by Reply (status 0 once armed): the broker sends it for the control command
 // `inject-failure` when the stage is one of the agent's (cml/ipc/fault_stages.h). `stage` is a stage name or "none"
-// (disarm everything); `count` (1..kMaxCount for a stage, ignored for "none") is how many passes of the stage fail.
+// (disarm everything, success also for an agent built without injection); `count` (1..kMaxCount) is how many passes of the stage
+// fail, 0 disarms that stage only.
 // An agent built without CML_FAULT_INJECTION answers CML4655, an unknown or broker-side stage CML4654.
 inline constexpr std::uint32_t kMaxFaultStageBytes = 64;
 

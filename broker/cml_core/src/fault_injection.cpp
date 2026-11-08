@@ -1,9 +1,11 @@
 #include "cml/core/fault_injection.h"
 
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "cml/core/agent_link.h"
+#include "cml/core/module_state.h"
 #include "cml/core/reload_service.h"
 #include "cml/util/log.h"
 
@@ -20,9 +22,12 @@ Diag FaultInjector::make_diag(fault::Stage stage) {
 
 Result<void> FaultInjector::arm(fault::Stage stage, std::uint32_t count, std::optional<std::uint32_t> pid) {
     const fault::StageInfo& info = fault::info(stage);
-    if constexpr (!kFaultInjectionBuilt) {
-        return Diag::make(fault::ids::kBadRequest, "this broker was built without CML_FAULT_INJECTION", "Use a build with failure injection (the default).");
-    }
+#if !defined(CML_FAULT_INJECTION)
+    (void)count;
+    (void)pid;
+    return Diag::make(fault::ids::kBadRequest, std::string("this broker was built without CML_FAULT_INJECTION (stage '") + info.name + "')",
+                      "Use a build with failure injection (the default).");
+#else
     if (info.agent_side) {
         return Diag::make(fault::ids::kBadRequest, std::string("the stage '") + info.name + "' belongs to the agent",
                           "Arm it through the control command inject-failure, which sends it to the agent.");
@@ -33,6 +38,7 @@ Result<void> FaultInjector::arm(fault::Stage stage, std::uint32_t count, std::op
     std::lock_guard<std::mutex> lock(mutex_);
     armed_[static_cast<std::size_t>(stage)] = Arming{count, pid};
     return Result<void>();
+#endif
 }
 
 void FaultInjector::disarm_all() {
@@ -41,9 +47,11 @@ void FaultInjector::disarm_all() {
 }
 
 std::optional<Diag> FaultInjector::hit(fault::Stage stage, std::uint32_t pid) {
-    if constexpr (!kFaultInjectionBuilt) {
-        return std::nullopt;
-    }
+#if !defined(CML_FAULT_INJECTION)
+    (void)stage;
+    (void)pid;
+    return std::nullopt;
+#else
     {
         std::lock_guard<std::mutex> lock(mutex_);
         Arming& a = armed_[static_cast<std::size_t>(stage)];
@@ -55,6 +63,7 @@ std::optional<Diag> FaultInjector::hit(fault::Stage stage, std::uint32_t pid) {
     const Diag d = make_diag(stage);
     CML_LOG(Warn, "failure injection: %s", d.format().c_str());
     return d;
+#endif
 }
 
 std::uint32_t FaultInjector::armed(fault::Stage stage) const {
@@ -106,6 +115,29 @@ Result<void> arm_agent(AgentLink& link, const std::string& stage, std::uint32_t 
 
 }  // namespace
 
+namespace {
+
+// True when one of the process's enabled modules has not reserved address space yet (the stage `reservation` can fire).
+bool has_unreserved_module(ReloadService& service, const AgentLink& link) {
+    for (const std::shared_ptr<ModuleState>& m : service.module_states(link.agent_id())) {
+        std::lock_guard<std::mutex> lock(m->mutex);
+        if (!m->reservation.reserved()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string pid_list(const std::vector<std::uint32_t>& pids) {
+    std::string text;
+    for (const std::uint32_t pid : pids) {
+        text += (text.empty() ? "" : ", ") + std::to_string(pid);
+    }
+    return text;
+}
+
+}  // namespace
+
 Result<Value> inject_failure(ReloadService& service, const Value& args) {
     const Value* stage_value = args.find("stage");
     if (stage_value == nullptr || !stage_value->is_string()) {
@@ -140,17 +172,31 @@ Result<Value> inject_failure(ReloadService& service, const Value& args) {
             }
         }
     }
+    // A pid that matches no agent is refused before anything is changed (also for "none" and for the broker's stages).
+    if (pid && targets.empty()) {
+        return Diag::make(fault::ids::kNoSuchProcess, "no agent is connected for process " + std::to_string(*pid), "Query `status` for the connected processes.");
+    }
 
     Value result = Value::object();
     Value processes = Value::array();
 
     if (stage_name == fault::kDisarm) {
+        // Disarm everything that can be disarmed, then say which agents could not be.
         service.faults().disarm_all();
+        std::vector<std::uint32_t> failed;
+        std::string reasons;
         for (const std::shared_ptr<AgentLink>& link : targets) {
             if (Result<void> r = arm_agent(*link, fault::kDisarm, 1); !r) {
-                return r.error();
+                failed.push_back(link->snapshot().pid);
+                reasons += (reasons.empty() ? "" : "; ") + r.error().message;
+            } else {
+                processes.push(Value::integer(link->snapshot().pid));
             }
-            processes.push(Value::integer(link->snapshot().pid));
+        }
+        if (!failed.empty()) {
+            return Diag::make(fault::ids::kPartialDisarm,
+                              "the broker's stages are disarmed, but the agents of process(es) " + pid_list(failed) + " could not be disarmed: " + reasons,
+                              "Check that those processes are still running, then send {\"stage\":\"none\"} again.");
         }
         result.set("stage", Value::string(fault::kDisarm));
         result.set("armed", Value::boolean(false));
@@ -169,20 +215,32 @@ Result<Value> inject_failure(ReloadService& service, const Value& args) {
     }
     if (info->agent_side) {
         if (targets.empty()) {
-            return Diag::make(fault::ids::kNoSuchProcess,
-                              pid ? "no agent is connected for process " + std::to_string(*pid) : std::string("no agent is connected"),
-                              "Start the application with the agent and wait for `status` to list it.");
+            return Diag::make(fault::ids::kNoSuchProcess, "no agent is connected", "Start the application with the agent and wait for `status` to list it.");
         }
+        if (info->stage == fault::Stage::Reservation) {
+            // A module reserves address space once, on its first patch: an armed counter would fire on an unrelated later reload.
+            for (const std::shared_ptr<AgentLink>& link : targets) {
+                if (!has_unreserved_module(service, *link)) {
+                    return Diag::make(fault::ids::kNotApplicable,
+                                      "the stage 'reservation' fires only on a module's first patch, and every enabled module of process " + std::to_string(link->snapshot().pid) +
+                                          " has reserved its address space already (or none is enabled)",
+                                      "Arm it right after the module is enabled and before its first reload, or start a new process.");
+                }
+            }
+        }
+        // All or nothing: the agents already armed are disarmed again when one of them refuses.
+        std::vector<std::shared_ptr<AgentLink>> armed;
         for (const std::shared_ptr<AgentLink>& link : targets) {
             if (Result<void> r = arm_agent(*link, stage_name, count); !r) {
-                return r.error();
+                for (const std::shared_ptr<AgentLink>& done : armed) {
+                    (void)arm_agent(*done, stage_name, 0);  // count 0: disarm this stage only
+                }
+                return r.error();  // names the pid that refused
             }
+            armed.push_back(link);
             processes.push(Value::integer(link->snapshot().pid));
         }
     } else {
-        if (pid && targets.empty()) {
-            return Diag::make(fault::ids::kNoSuchProcess, "no agent is connected for process " + std::to_string(*pid), "Query `status` for the connected processes.");
-        }
         if (Result<void> r = service.faults().arm(info->stage, count, pid); !r) {
             return r.error();
         }

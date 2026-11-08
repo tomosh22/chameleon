@@ -43,10 +43,15 @@ inline constexpr std::uint32_t kAgentHookInstall = 4652;
 inline constexpr std::uint32_t kAgentPostPatchHooks = 4653;
 inline constexpr std::uint32_t kAgentBadArm = 4654;          // ArmFault names an unknown stage / a stage of the broker
 inline constexpr std::uint32_t kAgentNotCompiledIn = 4655;   // the agent was built without CML_FAULT_INJECTION
+// HooksInstalled status: the post-patch-hooks stage failed AND putting the hooks back failed (partly): the patch image is still
+// the target of live hooks. The broker must not unload it; it stays mapped (leaked) until the process ends.
+inline constexpr std::uint32_t kAgentRollbackIncomplete = 4656;
 
 inline constexpr std::uint32_t kBadRequest = 5960;           // inject-failure: missing/unknown stage, bad count or pid
 inline constexpr std::uint32_t kNoSuchProcess = 5961;        // inject-failure: no agent with that pid
 inline constexpr std::uint32_t kArmRefused = 5962;           // the agent did not arm the stage
+inline constexpr std::uint32_t kNotApplicable = 5970;       // inject-failure: the stage cannot fire for that process (reservation already made)
+inline constexpr std::uint32_t kPartialDisarm = 5971;        // inject-failure "none": some agents could not be disarmed
 inline constexpr std::uint32_t kPdbLoad = 5963;
 inline constexpr std::uint32_t kChangeDetection = 5964;
 inline constexpr std::uint32_t kCompile = 5965;
