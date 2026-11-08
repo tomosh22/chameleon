@@ -13,4 +13,10 @@ inline constexpr std::uint32_t kSlotsFull = 4403;          // more threads fault
 inline constexpr std::uint32_t kHandlerInstallFailed = 4404;  // AddVectoredExceptionHandler failed: crash handling is off
 inline constexpr std::uint32_t kNoSlotEvent = 4405;        // the handler's wait events could not be created: crash handling is off
 
+// WP-23 (ADR-0035: CML4600-4649): re-execute function after a crash.
+inline constexpr std::uint32_t kReexecuteBadFrame = 4600;        // the stack of the held thread cannot be unwound to the chosen frame
+inline constexpr std::uint32_t kReexecuteStackMismatch = 4601;   // the chosen frame was entered with another RSP than the broker saw
+inline constexpr std::uint32_t kReexecuteBadTarget = 4602;       // the replacement function is not executable code
+inline constexpr std::uint32_t kReexecuteBadLocation = 4603;     // a parameter's location cannot be read (register not supported, memory unreadable)
+
 }  // namespace cml::agent::crash::ids

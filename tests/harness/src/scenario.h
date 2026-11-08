@@ -31,6 +31,7 @@ enum class StepKind {
     ExpectException,          // an `exception` event arrives (optional code / function must match)
     ExceptionAction,          // control command `exception-action` for the current exception
     ExpectPendingExceptions,  // control command `exceptions` lists exactly `count` held threads
+    ExpectExceptionUpdated,   // WP-23: an `exception_updated` event for the current exception arrives with the given offers (needs "reexecute")
 };
 
 const char* to_string(StepKind kind);
@@ -74,6 +75,11 @@ struct Step {
     std::string exception_code;
     std::string exception_function;
     std::string exception_action;
+    // WP-23. ExpectException / ExpectExceptionUpdated: `exception_offers` must be among the event's `actions`, `exception_lacks` must not
+    // be, and `exception_reason` is a substring of `reasons.<exception_lacks>` (or `reasons.reexecute` when only the reason is given).
+    std::string exception_offers;
+    std::string exception_lacks;
+    std::string exception_reason;
 
     // "expect_stdout /value=2/ within 10 s"
     std::string describe() const;

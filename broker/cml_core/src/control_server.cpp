@@ -30,6 +30,7 @@ std::vector<std::string> broker_capabilities(const ControlContext& context) {
     }
     if (context.exceptions != nullptr) {
         caps.emplace_back(ipc::capability::kExceptions);
+        caps.emplace_back(ipc::capability::kReexecute);  // WP-23
     }
     return caps;
 }

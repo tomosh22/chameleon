@@ -7,6 +7,8 @@
 //   Continue  resume at the faulting instruction (after a patch fixed the state the instruction reads)
 //   Leave     unwind the faulting function one frame and return 0 from it
 //   Ignore    pass the exception to the next handler (what would have happened without Chameleon)
+//   Reexecute (WP-23) run the replacement of a function again from its entry, with the register arguments reloaded from the
+//             locations the PDB records for the parameters (the broker resolves them; see compute_reexecute)
 //
 // The handler acts only when ALL of this holds, and otherwise returns EXCEPTION_CONTINUE_SEARCH at once:
 //   * the gate is enabled (the broker says a control client listens for `exception` events and `crash_handler` is on);
@@ -36,11 +38,38 @@
 
 namespace cml::agent::crash {
 
-enum class Action : std::int32_t { None = 0, Continue = 1, Leave = 2, Ignore = 3 };
+enum class Action : std::int32_t { None = 0, Continue = 1, Leave = 2, Ignore = 3, Reexecute = 4 };
 
 inline constexpr std::size_t kMaxSlots = 8;
 inline constexpr std::size_t kMaxRanges = 256;
 inline constexpr std::size_t kMaxIgnoredThreads = 8;
+inline constexpr std::size_t kMaxFrames = 32;  // frames reported per held thread (WP-23)
+
+// One frame of a held thread's stack, innermost first (the agent-side twin of ipc::ExceptionFrame).
+struct Frame {
+    std::uint64_t rip = 0;
+    std::uint64_t entry_rsp = 0;       // RSP at the function's entry (points at the return address); 0 when unknown
+    std::uint64_t rsp = 0;
+    std::uint64_t rbp = 0;
+    std::uint64_t r13 = 0;
+    std::uint64_t function_start = 0;  // per the unwind data; 0 when the frame has none
+};
+
+// The broker's recipe for Reexecute (the agent-side twin of ipc::Reexecute).
+struct ReexecuteParam {
+    std::uint32_t position = 0;       // 0..3
+    bool is_float = false;
+    std::uint32_t size = 0;           // 1, 2, 4, 8
+    std::uint32_t base_register = 0;  // CV_AMD64: 334 RBP, 335 RSP, 341 R13
+    std::int32_t offset = 0;
+};
+struct ReexecutePlan {
+    std::uint32_t frame_index = 0;
+    std::uint64_t entry_rsp = 0;
+    std::uint64_t target = 0;
+    std::uint32_t param_count = 0;
+    ReexecuteParam params[4];
+};
 
 // An address range in which a fault is the application's business.
 struct Range {
@@ -60,6 +89,8 @@ struct Held {
     std::uint64_t stack_pointer = 0;
     std::uint64_t module_base = 0;       // base of the range holding `address`
     bool in_patch = false;
+    std::uint32_t frame_count = 0;       // WP-23: the unwound stack, innermost first
+    Frame frames[kMaxFrames];
 };
 
 #if defined(_MSC_VER)
@@ -108,6 +139,10 @@ public:
     // Agent thread. Releases the thread with `id`. CML4400 when no thread with that id is waiting for an answer; for Leave
     // CML4401 / CML4402 when the frame cannot be unwound (the thread stays held; choose another action).
     Result<void> resolve(std::uint32_t id, Action action);
+    // WP-23. Agent thread. Releases the thread with `id` at the entry of `plan.target`, as described by `plan`
+    // (compute_reexecute). CML4400 when no thread with that id is waiting; CML4600..4603 when the plan cannot be applied (the thread
+    // stays held; choose another action).
+    Result<void> resolve_reexecute(std::uint32_t id, const ReexecutePlan& plan);
     // Every held thread gets Ignore.
     void release_all() noexcept;
     // Threads waiting for an answer.
@@ -118,6 +153,16 @@ public:
     // The context a Leave resumes with: `in` unwound one frame (RtlVirtualUnwind; a function without unwind information is a
     // leaf, whose return address is at RSP), RAX = 0, XMM0 = 0. Public so a test can check it without a fault.
     static Result<void> compute_leave(const CONTEXT& in, CONTEXT* out);
+
+    // WP-23. The stack of `in`, innermost first: for every frame the registers the frame has at its `rip` (RtlVirtualUnwind restores the
+    // callee-saved ones, so they are right for the outer frames too) and the RSP the function was entered with. Stops at a frame that
+    // cannot be unwound, at RIP 0 or after `max` frames. Returns the number of frames written. Public for the unit test.
+    static std::size_t unwind_frames(const CONTEXT& in, Frame* out, std::size_t max);
+    // The context a Reexecute resumes with. Unwinds `in` to the frame of `plan.frame_index`, checks that the function was entered with
+    // `plan.entry_rsp`, reads the parameters from [base register of that frame + offset], and builds the entry state of the function:
+    // RSP = entry_rsp, the callee-saved registers its caller had, RIP = target, RCX/RDX/R8/R9 and XMM0..3 loaded. Public so a test can
+    // check it without a fault.
+    static Result<void> compute_reexecute(const CONTEXT& in, const ReexecutePlan& plan, CONTEXT* out);
 
     // The handler (exposed for the unit test that registers its own).
     static LONG CALLBACK handler(PEXCEPTION_POINTERS info);
