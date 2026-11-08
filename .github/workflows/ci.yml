@@ -457,6 +457,10 @@ jobs:
     name: pdb-benchmark (windows-2022 / msvc / RelWithDebInfo)
     runs-on: windows-2022
     timeout-minutes: 90
+    # WP-27: the trend step downloads the perf-results artifact of the last successful main run.
+    permissions:
+      contents: read
+      actions: read
     env:
       BENCH_ID: tus900-f1000-h24-s1-Z7
       LOG_DIR: ci-logs
@@ -503,24 +507,104 @@ jobs:
           path: bench-pdb/bench_project.pdb
           key: pdb-bench-${{ env.BENCH_ID }}-${{ hashFiles('tests/bench/gen_pdb_project.py') }}
 
-      - name: Build cml_pdb_bench
+      # WP-27: besides the PDB benchmark this job builds what the other budgets need: the broker memory tool, and cmltest
+      # with the broker and the agent (the `perf` scenario).
+      - name: Build the benchmark tools
+        id: buildbench
         run: |
           New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
           if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=cl *>&1 | Tee-Object -FilePath "$env:LOG_DIR/configure.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cmake --build build --target cml_pdb_bench *>&1 | Tee-Object -FilePath "$env:LOG_DIR/build.log"
+          cmake --build build --target cml_pdb_bench cml_broker_mem cmltest cml_broker cml_agent *>&1 | Tee-Object -FilePath "$env:LOG_DIR/build.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run the benchmark (asserts the load-time and memory budgets)
+        if: ${{ !cancelled() && steps.buildbench.outcome == 'success' }}
         run: |
           New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
-          build/bin/cml_pdb_bench.exe bench-pdb/bench_project.pdb --min-size-mb 500 *>&1 | Tee-Object -FilePath "$env:LOG_DIR/pdb-benchmark.txt"
+          build/bin/cml_pdb_bench.exe bench-pdb/bench_project.pdb --min-size-mb 500 --json "$env:LOG_DIR/perf-pdb.json" *>&1 | Tee-Object -FilePath "$env:LOG_DIR/pdb-benchmark.txt"
           $rc = $LASTEXITCODE
           '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
           Get-Content "$env:LOG_DIR/pdb-benchmark.txt" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
           '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
           if ($rc -ne 0) { exit $rc }
+
+      # WP-27: broker memory (at most 1.5x the PDB size, no slack): the broker's own ModuleIndex and sweeps on the large PDB.
+      - name: Broker memory on the large PDB (asserts 1.5x the PDB size)
+        if: ${{ !cancelled() && steps.buildbench.outcome == 'success' }}
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          # Deterministic input: the sources the PDB lists are ALWAYS present (a cache hit has the PDB only, so the generator,
+          # which is deterministic and writes the same paths, recreates them), and the tool refuses to run with fewer than 900
+          # tracked files, so the source baseline is part of every measurement.
+          if (-not (Test-Path bench-src/CMakeLists.txt)) {
+            python tests/bench/gen_pdb_project.py bench-src --tus 900 --funcs-per-tu 1000 --headers 24 --seed 1 --debug-format Z7 *>&1 | Tee-Object -FilePath "$env:LOG_DIR/bench-regenerate.log" | Out-Null
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          build/bin/cml_broker_mem.exe bench-pdb/bench_project.pdb --factor 1.5 --min-tracked-files 900 --json "$env:LOG_DIR/perf-broker-mem.json" *>&1 | Tee-Object -FilePath "$env:LOG_DIR/broker-memory.txt"
+          $rc = $LASTEXITCODE
+          '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          Get-Content "$env:LOG_DIR/broker-memory.txt" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          if ($rc -ne 0) { exit $rc }
+
+      # WP-27: compile -> applied (excluding compiler time) on the 2000-line TU of fixture `perf`, and broker idle CPU with
+      # the file watcher active. The scenario asserts median(total - compile) <= 3000 ms (budget 1500 ms, 2x slack) and
+      # idle CPU <= 1 % of one core (budget 0.5 %, 2x slack), and writes the per-stage numbers to perf-reload.json.
+      # It lives in tests/bench/scenarios, not in tests/harness/scenarios, so the build cells do not run it.
+      - name: Reload and idle-CPU budgets (cmltest scenario perf)
+        if: ${{ !cancelled() && steps.buildbench.outcome == 'success' }}
+        env:
+          CML_PERF_JSON: ${{ github.workspace }}/ci-logs/perf-reload.json
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          & build/bin/cmltest.exe --scenario tests/bench/scenarios/perf.toml `
+            --build-dir build --generator ninja --config RelWithDebInfo --cxx cl `
+            --require-all-capabilities `
+            --artifacts "$PWD/$env:LOG_DIR/cmltest-perf" --junit "$PWD/$env:LOG_DIR/cmltest-perf-junit.xml" `
+            *>&1 | Tee-Object -FilePath "$env:LOG_DIR/cmltest-perf.log"
+          $rc = $LASTEXITCODE
+          '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          Get-Content "$env:LOG_DIR/cmltest-perf.log" | Where-Object { $_ -match '^(CMLTEST_RESULT|PERF|RELOAD-TIMING|PARTIAL|FAILED)' } | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          Get-Content "$env:LOG_DIR/cmltest-perf.log" | Where-Object { $_ -match '^(CMLTEST_RESULT|PERF|RELOAD-TIMING)' }
+          if ($rc -ne 0) { exit $rc }
+
+      # WP-27: trend output. perf-results.json (sha, runner, every number) is uploaded as the artifact `perf-results`, the
+      # numbers go to the step summary, and they are compared with the artifact of the latest successful run on main. Only
+      # the absolute budgets above fail the job; a regression of more than 25 % prints a ::warning:: line.
+      - name: Perf results and trend
+        if: ${{ !cancelled() && steps.buildbench.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          $prevDir = ''
+          try {
+            # The newest completed main push run that has a perf-results artifact (a run that failed elsewhere still
+            # measured the benchmark job; a run from before this job produced the artifact does not count).
+            $ids = @(gh run list --repo $env:GITHUB_REPOSITORY --workflow ci --branch main --event push --status completed --limit 20 --json databaseId --jq '.[].databaseId' 2>$null)
+            foreach ($id in $ids) {
+              if (-not $id) { continue }
+              Remove-Item -Recurse -Force prev-perf -ErrorAction SilentlyContinue
+              gh run download "$id" --repo $env:GITHUB_REPOSITORY --name perf-results --dir prev-perf 2>$null | Out-Null
+              if (Test-Path prev-perf/perf-results.json) { $prevDir = 'prev-perf'; Write-Host "trend baseline: main run $id"; break }
+            }
+            if (-not $prevDir) { Write-Host 'no main run with a perf-results artifact to compare with' }
+          } catch { Write-Host "could not fetch the previous main run: $_" }
+          ./tests/ci/perf_results.ps1 -PdbJson "$env:LOG_DIR/perf-pdb.json" -MemJson "$env:LOG_DIR/perf-broker-mem.json" `
+            -ReloadJson "$env:LOG_DIR/perf-reload.json" -Out perf-results.json -PreviousDir $prevDir `
+            -Sha $env:GITHUB_SHA -Runner "${{ runner.os }} / windows-2022 / msvc / RelWithDebInfo" -RunId $env:GITHUB_RUN_ID
+          Copy-Item perf-results.json "$env:LOG_DIR/perf-results.json"
+
+      - name: Upload perf results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-results
+          path: perf-results.json
+          if-no-files-found: warn
 
       - name: Upload benchmark logs
         if: always()
