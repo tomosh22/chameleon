@@ -17,7 +17,10 @@ if (-not (Test-Path (Join-Path $mesaDir 'x64/opengl32.dll'))) {
     $archive = Join-Path $WorkDir "mesa-$mesaVersion.7z"
     $url = "https://github.com/pal1000/mesa-dist-win/releases/download/$mesaVersion/mesa3d-$mesaVersion-release-msvc.7z"
     Write-Host "downloading $url"
-    Invoke-WebRequest -Uri $url -OutFile $archive
+    for ($attempt = 1; $attempt -le 6; $attempt++) {
+        try { Invoke-WebRequest -Uri $url -OutFile $archive; break }
+        catch { Write-Host "download attempt $attempt failed: $($_.Exception.Message)"; if ($attempt -eq 6) { throw }; Start-Sleep -Seconds (10 * $attempt) }
+    }
     Invoke-Native '7z' '7z' @('x', $archive, "-o$mesaDir", '-y') (Join-Path $out 'mesa.log')
 }
 foreach ($dll in 'opengl32.dll', 'libgallium_wgl.dll', 'libglapi.dll') {

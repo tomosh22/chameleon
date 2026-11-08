@@ -21,12 +21,15 @@
 // reports one count per outcome of plan_hook() (nothing is ever relocated, ADR-0020: a hook either uses the padding
 // in front of the entry or overwrites whole instructions at the entry):
 //
-//   LDE-OUTCOME functions=N padding=A five_byte=B refused=C refused_unknown_opcode=D refused_other=E
+//   LDE-OUTCOME functions=N padding=A five_byte=B refused=C refused_vex=V refused_unknown_opcode=D refused_other=E
 //   LDE-REFUSED CML4300 <function> rva=0x... at=+N bytes=xx xx xx    (every refusal for an unknown opcode, at most 200)
 //
-// --fail-on-unknown-opcode makes a refusal for CML4300 an error (exit code 3): on a real project that is a decoder bug
-// (a common prologue the decoder does not know) and must be reduced to a unit test. --min-functions N exits with 4 when
-// fewer than N functions were examined (a PDB that lost its functions would otherwise pass).
+// refused_vex counts the CML4300 refusals whose instruction starts with a VEX/EVEX prefix (C4, C5, 62): AVX code in a
+// function entry, a documented limitation of the decoder (KNOWN_LIMITATIONS CML4300, WP-10: "no VEX, no EVEX"). The
+// STL's vectorised algorithms (__std_minmax_*, __std_find_*) are the usual source in MSVC builds.
+// --fail-on-unknown-opcode makes any OTHER refusal for CML4300 an error (exit code 3): on a real project that is a
+// decoder bug (a common prologue the decoder does not know) and must be reduced to a unit test. --min-functions N exits
+// with 4 when fewer than N functions were examined (a PDB that lost its functions would otherwise pass).
 //
 // Exit code: 0, 1 when the module or its PDB cannot be read, 2 for a bad command line, 3 / 4 as above.
 #include <algorithm>
@@ -150,7 +153,7 @@ int main(int argc, char** argv) {
     std::size_t decoded_ok = 0, unknown_count = 0, with_flow_end = 0;
     std::map<std::string, std::size_t> plans;
     std::map<std::string, std::size_t> unknown_bytes;
-    std::size_t outcome_padding = 0, outcome_five_byte = 0, outcome_refused = 0, refused_unknown_opcode = 0;
+    std::size_t outcome_padding = 0, outcome_five_byte = 0, outcome_refused = 0, refused_unknown_opcode = 0, refused_vex = 0;
     std::size_t refused_listed = 0;
     for (const auto& [rva, name] : by_rva) {
         const std::vector<std::uint8_t> head = read_clamped(owned->image, rva, 16);
@@ -205,7 +208,11 @@ int main(int argc, char** argv) {
             ++outcome_five_byte;
         } else {
             ++outcome_refused;
-            if (plan.diag == cml::agent::hook::ids::kDecodeUnknown) {
+            const bool vex = plan.fail_byte_count > 0 &&
+                             (plan.fail_bytes[0] == 0xC4 || plan.fail_bytes[0] == 0xC5 || plan.fail_bytes[0] == 0x62);
+            if (plan.diag == cml::agent::hook::ids::kDecodeUnknown && vex) {
+                ++refused_vex;
+            } else if (plan.diag == cml::agent::hook::ids::kDecodeUnknown) {
                 ++refused_unknown_opcode;
                 if (refused_listed < 200) {
                     ++refused_listed;
@@ -232,9 +239,9 @@ int main(int argc, char** argv) {
     for (const auto& [text, count] : plans) {
         std::printf("LDE-PLAN %s %zu\n", text.c_str(), count);
     }
-    std::printf("LDE-OUTCOME functions=%zu padding=%zu five_byte=%zu refused=%zu refused_unknown_opcode=%zu refused_other=%zu\n",
-                by_rva.size(), outcome_padding, outcome_five_byte, outcome_refused, refused_unknown_opcode,
-                outcome_refused - refused_unknown_opcode);
+    std::printf("LDE-OUTCOME functions=%zu padding=%zu five_byte=%zu refused=%zu refused_vex=%zu refused_unknown_opcode=%zu refused_other=%zu\n",
+                by_rva.size(), outcome_padding, outcome_five_byte, outcome_refused, refused_vex, refused_unknown_opcode,
+                outcome_refused - refused_vex - refused_unknown_opcode);
     std::vector<std::pair<std::size_t, std::string>> ranked;
     for (const auto& [bytes, count] : unknown_bytes) {
         ranked.emplace_back(count, bytes);
