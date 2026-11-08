@@ -72,6 +72,6 @@ function(cml_bind_edited_fixture fx)
     set_property(GLOBAL APPEND PROPERTY CML_BIND_FIXTURE_TARGETS fixture_${fx} ${objs})
 endfunction()
 
-foreach(fx basic statics virtuals templates lambdas new_function new_global)
+foreach(fx basic statics virtuals templates lambdas new_function new_global tls)
     cml_bind_edited_fixture(${fx})
 endforeach()
