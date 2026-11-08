@@ -103,7 +103,12 @@ function Wait-Corpus([string]$Regex, [int]$From, [int]$TimeoutSec) {
     throw "no output line matching /$Regex/ within ${TimeoutSec}s; last lines: $tail"
 }
 
-function Get-BrokerCaps { ($script:Ctl.Call('status', $null, 30000) | ConvertFrom-Json) }
+function Get-BrokerCaps {
+    $raw = $script:Ctl.Call('status', $null, 30000)
+    if ($null -eq $raw) { throw 'no answer to status on the control pipe (connection closed or timeout)' }
+    Write-Host "status: $raw"
+    return ($raw | ConvertFrom-Json)
+}
 
 # ---------------------------------------------------------------------------------------------------------------------
 # fetch + patch
@@ -305,6 +310,10 @@ if ($built) {
     } finally {
         Stop-Session
         Restore-Originals
+        foreach ($f in 'broker.log', 'app.stderr.txt') {
+            $p = Join-Path $out $f
+            if ((Test-Path $p) -and $script:Failed) { Write-Host "---- tail of $f"; Get-Content $p -Tail 40 | Out-Host }
+        }
     }
 } else {
     Skip-Step 'enable' 'build failed'

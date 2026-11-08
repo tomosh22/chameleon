@@ -9,6 +9,11 @@ on:
   schedule:
     - cron: '41 2 * * *'
   workflow_dispatch:
+    inputs:
+      only:
+        description: 'run one project only (raylib, imgui, godot); empty or all runs every cell'
+        required: false
+        default: 'all'
   pull_request:
     branches: [main]
     paths:
@@ -59,6 +64,9 @@ jobs:
     name: ${{ matrix.project }} / ${{ matrix.compiler }}
     needs: chameleon
     runs-on: windows-2022
+    # `push` runs (branch wp/26-*) skip Godot, whose cold build takes hours and would be cancelled by the next push; the
+    # pull_request, schedule and workflow_dispatch runs include it. workflow_dispatch can pick one project.
+    if: ${{ (github.event_name != 'workflow_dispatch' || inputs.only == '' || inputs.only == 'all' || inputs.only == matrix.project) && (github.event_name != 'push' || matrix.project != 'godot') }}
     # Godot is the large one: a cold scons build of the editor with debug information. The driver step is limited to
     # 130 minutes; the cache is saved afterwards (also on failure) so that a partial build is continued by the next run.
     timeout-minutes: ${{ matrix.project == 'godot' && 175 || 90 }}
