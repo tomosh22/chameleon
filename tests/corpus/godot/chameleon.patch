@@ -1,28 +1,28 @@
 diff --git a/SConstruct b/SConstruct
-index 0ae8f1a..7d8638d 100644
+index a450b04..d5ba17e 100644
 --- a/SConstruct
 +++ b/SConstruct
-@@ -700,9 +700,13 @@ if env.msvc:
+@@ -763,9 +763,13 @@ if env.msvc:
      else:
-         env.Append(LINKFLAGS=["/DEBUG:NONE"])
+         env.AppendUnique(LINKFLAGS=["/DEBUG:NONE"])
  
 +    # Chameleon corpus (WP-26): the build requirements of docs/BUILD_REQUIREMENTS.md.
-+    env.Append(CCFLAGS=["/Gy", "/hotpatch"])
-+    env.Append(LINKFLAGS=["/FUNCTIONPADMIN"])
++    env.AppendUnique(CCFLAGS=["/Gy", "/hotpatch"])
++    env.AppendUnique(LINKFLAGS=["/FUNCTIONPADMIN"])
 +
      if env["optimize"].startswith("speed"):
--        env.Append(CCFLAGS=["/O2"])
--        env.Append(LINKFLAGS=["/OPT:REF"])
-+        env.Append(CCFLAGS=["/O2", "/Ob0"])  # Chameleon corpus (WP-26): /Ob0, no stale inlined copies
-+        env.Append(LINKFLAGS=["/OPT:NOREF", "/OPT:NOICF"])  # Chameleon corpus (WP-26): was /OPT:REF
+-        env["OPTIMIZELEVEL"] = "/O2"
+-        env.AppendUnique(LINKFLAGS=["/OPT:REF"])
++        env["OPTIMIZELEVEL"] = "/O2 /Ob0"  # Chameleon corpus (WP-26): /Ob0, no stale inlined copies
++        env.AppendUnique(LINKFLAGS=["/OPT:NOREF", "/OPT:NOICF"])  # Chameleon corpus (WP-26): was /OPT:REF
          if env["optimize"] == "speed_trace":
-             env.Append(LINKFLAGS=["/OPT:NOICF"])
-     elif env["optimize"] == "size":
+             env.AppendUnique(LINKFLAGS=["/OPT:NOICF"])
+     elif env["optimize"].startswith("size"):
 diff --git a/platform/windows/SCsub b/platform/windows/SCsub
-index f8ed8b7..46a1d58 100644
+index 62d28f4..329e66a 100644
 --- a/platform/windows/SCsub
 +++ b/platform/windows/SCsub
-@@ -11,6 +11,7 @@ sources = []
+@@ -14,6 +14,7 @@ sources = []
  
  common_win = [
      "godot_windows.cpp",
@@ -31,7 +31,7 @@ index f8ed8b7..46a1d58 100644
      "display_server_windows.cpp",
      "key_mapping_windows.cpp",
 diff --git a/platform/windows/os_windows.cpp b/platform/windows/os_windows.cpp
-index 9025f53..54880c2 100644
+index 6c76e53..a34062d 100644
 --- a/platform/windows/os_windows.cpp
 +++ b/platform/windows/os_windows.cpp
 @@ -30,6 +30,8 @@
@@ -41,9 +41,9 @@ index 9025f53..54880c2 100644
 +#include "chameleon_corpus.h" // Chameleon corpus (WP-26)
 +
  #include "display_server_windows.h"
- #include "joypad_windows.h"
  #include "lang_table.h"
-@@ -1661,11 +1663,13 @@ void OS_Windows::run() {
+ #include "windows_terminal_logger.h"
+@@ -2327,11 +2329,13 @@ void OS_Windows::run() {
  
  	main_loop->initialize();
  

@@ -304,7 +304,7 @@ if ($built) {
             "module enabled and indexed in the running process (pid $($script:App.Id)); first line: $first"
         }
         if (-not $ran) {
-            foreach ($e in $cfg.edits) { Skip-Step "edit:$($e.id)" 'enable failed' }
+            foreach ($e in $cfg.edits) { if (-not $e.compiler -or $e.compiler -eq $Compiler) { Skip-Step "edit:$($e.id)" 'enable failed' } }
         } else {
             $doEdit = {
                 param($edit)
@@ -347,10 +347,11 @@ if ($built) {
                 Wait-Corpus 'CORPUS frame=' $before 20 | Out-Null
                 'frames still printed after the last edit'
             }
-            foreach ($e in @($cfg.edits | Where-Object { -not $_.final })) { & $doEdit $e }
+            $mine = @($cfg.edits | Where-Object { -not $_.compiler -or $_.compiler -eq $Compiler })
+            foreach ($e in @($mine | Where-Object { -not $_.final })) { & $doEdit $e }
             Invoke-Step 'still-running' $stillRunning | Out-Null
             # `final` edits last: one that is expected to take the process down comes after the check above.
-            $finals = @($cfg.edits | Where-Object { $_.final })
+            $finals = @($mine | Where-Object { $_.final })
             foreach ($e in $finals) { & $doEdit $e }
             if ($finals.Count -gt 0) { Invoke-Step 'still-running-final' $stillRunning | Out-Null }
         }

@@ -116,7 +116,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: corpus-work/src-godot
-          key: corpus-godot-4.3-stable-msvc-${{ hashFiles('tests/corpus/godot/chameleon.patch', 'tests/corpus/godot/build.ps1') }}
+          key: corpus-godot-4.5.1-msvc-${{ hashFiles('tests/corpus/godot/chameleon.patch', 'tests/corpus/godot/build.ps1') }}-${{ github.run_id }}
+          restore-keys: |
+            corpus-godot-4.5.1-msvc-${{ hashFiles('tests/corpus/godot/chameleon.patch', 'tests/corpus/godot/build.ps1') }}-
 
       - name: Select the compiler
         run: |
@@ -139,11 +141,11 @@ jobs:
           exit $LASTEXITCODE
 
       - name: Save the Godot build tree
-        if: always() && matrix.project == 'godot' && steps.godot-cache.outputs.cache-hit != 'true'
+        if: always() && matrix.project == 'godot'
         uses: actions/cache/save@v4
         with:
           path: corpus-work/src-godot
-          key: corpus-godot-4.3-stable-msvc-${{ hashFiles('tests/corpus/godot/chameleon.patch', 'tests/corpus/godot/build.ps1') }}
+          key: corpus-godot-4.5.1-msvc-${{ hashFiles('tests/corpus/godot/chameleon.patch', 'tests/corpus/godot/build.ps1') }}-${{ github.run_id }}
 
       - name: Upload logs and the matrix
         if: always()

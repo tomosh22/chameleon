@@ -1,8 +1,8 @@
 {
   "name": "godot",
   "repo": "https://github.com/godotengine/godot.git",
-  "tag": "4.3-stable",
-  "commit": "77dcf97d82cbfe4e4615475fa52ca03da645dbd8",
+  "tag": "4.5.1-stable",
+  "commit": "f62fdbde15035c5576dad93e586201f4d41ef0cb",
   "license": "MIT",
   "support_dir": "platform/windows",
   "patch": "chameleon.patch",

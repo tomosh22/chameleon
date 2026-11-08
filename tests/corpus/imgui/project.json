@@ -22,12 +22,25 @@
       "expect": "markers=\\S*imgui_dx11_newframe_v2:\\d+"
     },
     {
+      "id": "backend-win32",
+      "file": "backends/imgui_impl_win32.cpp",
+      "replace": [
+        {
+          "find": "void    ImGui_ImplWin32_NewFrame()\n{\n",
+          "with": "void    ImGui_ImplWin32_NewFrame()\n{\n    cml_corpus_marker(\"imgui_win32_newframe_v2\");\n"
+        }
+      ],
+      "include": "chameleon_corpus.h",
+      "expect": "markers=\\S*imgui_win32_newframe_v2:\\d+",
+      "compiler": "clang-cl"
+    },
+    {
       "id": "example-main-tu",
       "file": "examples/example_win32_directx11/main.cpp",
       "replace": [
         {
-          "find": "void CmlCorpusExampleFrame()\n{\n}",
-          "with": "void CmlCorpusExampleFrame()\n{\n    cml_corpus_marker(\"imgui_example_frame_v2\");\n}"
+          "find": "    g_CmlCorpusExampleFrames = g_CmlCorpusExampleFrames + 1;\n}",
+          "with": "    cml_corpus_marker(\"imgui_example_frame_v2\");\n    g_CmlCorpusExampleFrames = g_CmlCorpusExampleFrames + 1;\n}"
         }
       ],
       "expect": "markers=\\S*imgui_example_frame_v2:\\d+"
@@ -64,7 +77,8 @@
         }
       ],
       "include": "chameleon_corpus.h",
-      "expect_error": "CML3214"
+      "expect_error": "CML3214",
+      "compiler": "msvc"
     },
     {
       "id": "unsupported-static-overloads-library-tu",

@@ -1,5 +1,5 @@
 # Dot-sourced by tests/corpus/run_corpus.ps1 (variables: $src $buildDir $Compiler $Config $CxxPath $repo $here $out $WorkDir).
-# Builds the Godot 4.3 editor (MIT) with scons and cl (RelWithDebInfo equivalent: /O2 /Zi, /DEBUG:FULL; the patch adds
+# Builds the Godot 4.5.1 editor (MIT) with scons and cl (RelWithDebInfo equivalent: /O2 /Zi, /DEBUG:FULL; the patch adds
 # /Gy /hotpatch /Ob0 and /OPT:NOREF /OPT:NOICF /FUNCTIONPADMIN, the flags of docs/BUILD_REQUIREMENTS.md).
 #
 # Licensing: Godot's thirdparty tree is permissive, with two exceptions that this build leaves out:
