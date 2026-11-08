@@ -366,9 +366,7 @@ private:
     };
     ThreadLookup lookup_thread_global(const Sym& sy);
     bool in_old_tls(std::uint32_t rva);
-    std::uint32_t tls_rva_ = 0;
-    std::uint32_t tls_size_ = 0;
-    bool tls_known_ = false;
+    std::set<std::uint32_t> tls_rvas_;  // RVAs of the thread-local records looked at
     bool ensure_compiland_symbols();
     std::vector<const pdb::SymbolView*> static_candidates(const std::string& base, const std::string& encl, bool want_function,
                                                           const std::string& display = {}, int tls_mode = 0);
@@ -688,6 +686,7 @@ Planner::ThreadLookup Planner::lookup_thread_global(const Sym& sy) {
     if (found == nullptr) {
         return out;
     }
+    tls_rvas_.insert(found->rva);
     OldRef r;
     r.addr = module_address(found->rva);
     r.source = BindSource::PdbGlobal;
@@ -697,19 +696,16 @@ Planner::ThreadLookup Planner::lookup_thread_global(const Sym& sy) {
     return out;
 }
 
-// Is the RVA inside the old image's .tls section (the TLS template)?
+// Does the RVA belong to the old image's thread-local storage? Exactly: it is the address of a thread-local record
+// the planner has looked at (S_GTHREAD32 / S_LTHREAD32), or it lies in a section named .tls. (CI evidence: the
+// section name alone is not reliable on MSVC images, so the records decide.)
 bool Planner::in_old_tls(std::uint32_t rva) {
-    if (!tls_known_) {
-        tls_known_ = true;
-        for (const pdb::SectionHeader& h : pdb_.sections()) {
-            if (starts_with(std::string_view(h.name.data()), ".tls")) {
-                tls_rva_ = h.rva;
-                tls_size_ = std::max(h.virtual_size, h.raw_size);
-                break;
-            }
-        }
+    if (tls_rvas_.count(rva) != 0) {
+        return true;
     }
-    return tls_size_ != 0 && rva >= tls_rva_ && rva - tls_rva_ < tls_size_;
+    const std::optional<pdb::SectionOffset> so = pdb_.section_offset_from_rva(rva);
+    const std::span<const pdb::SectionHeader> secs = pdb_.sections();
+    return so && so->section >= 1 && so->section <= secs.size() && starts_with(std::string_view(secs[so->section - 1u].name.data()), ".tls");
 }
 
 bool Planner::ensure_compiland_symbols() {
@@ -757,6 +753,9 @@ std::vector<const pdb::SymbolView*> Planner::static_candidates(const std::string
         }
         if (comp_last(&v) != base) {
             continue;
+        }
+        if (!want_function && (v.kind == pdb::SymbolKind::LocalThread || v.kind == pdb::SymbolKind::GlobalThread)) {
+            tls_rvas_.insert(v.rva);
         }
         all.push_back(&v);
     }
@@ -1488,7 +1487,8 @@ void Planner::build_fixups() {
                 if (secrel && !(in_tls && thread_source)) {
                     error(diag::kThreadLocal,
                           "SECREL reference to " + describe(ts) + " from " + where() + " in " + in_.object_name +
-                              ", which is not a thread-local variable of the old image (" + (in_tls ? "no thread-local record" : "outside its .tls section") + ")",
+                              ", which is not a thread-local variable of the old image (" + (in_tls ? "no thread-local record" : "not in the thread-local storage") + "; source " + to_string(src) +
+                              ", rva " + hex(ts.dec.old_address.rva) + ")",
                           "Move the thread_local to an unchanged source file, or hot-restart.");
                     continue;
                 }
