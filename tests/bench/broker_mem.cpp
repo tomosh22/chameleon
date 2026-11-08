@@ -139,6 +139,9 @@ int main(int argc, char** argv) {
     std::printf("  PEAK PRIVATE BYTES                %9.1f MiB = %.3f x PDB size   (budget %.1f x = %.1f MiB)\n", mib(end.peak_private),
                 size > 0 ? end.peak_private / size : 0.0, factor, mib(budget));
     std::printf("  peak working set (incl. mapped)   %9.1f MiB\n", mib(end.peak_working_set));
+    // Information: the same accounting as cml_pdb_bench (private bytes plus the whole file mapping, resident or not).
+    std::printf("  peak private + mapped file        %9.1f MiB = %.3f x PDB size   [information only]\n", mib(end.peak_private + size),
+                size > 0 ? (end.peak_private + size) / size : 0.0);
 
     if (!json_path.empty()) {
         std::ofstream out(json_path, std::ios::binary | std::ios::trunc);
