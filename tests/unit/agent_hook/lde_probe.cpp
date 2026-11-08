@@ -1,7 +1,7 @@
 // cml_lde_probe: runs the hook installer's instruction-length decoder over the first 16 bytes of every
 // function of a module and prints what it finds (CI evidence for WP-10; see docs/wp/WP-10.md).
 //
-//   cml_lde_probe <image.exe|dll> [--quiet]
+//   cml_lde_probe <image.exe|dll> [--quiet] [--fail-on-unknown-opcode] [--min-functions N]
 //
 // The functions come from the module's PDB (every S_GPROC32 / S_LPROC32 of every compiland plus the
 // function publics); the bytes come from the image file. Output, one line per function:
@@ -17,7 +17,18 @@
 //   LDE-PLAN <strategy or CML43xx> count
 //   LDE-UNKNOWN <first bytes of the unknown instruction> count      (most frequent first)
 //
-// Exit code: 0, or 1 when the module or its PDB cannot be read.
+// WP-26 (real-project corpus, plan section 11): the same walk over every function entry of the large corpus PDBs
+// reports one count per outcome of plan_hook() (nothing is ever relocated, ADR-0020: a hook either uses the padding
+// in front of the entry or overwrites whole instructions at the entry):
+//
+//   LDE-OUTCOME functions=N padding=A five_byte=B refused=C refused_unknown_opcode=D refused_other=E
+//   LDE-REFUSED CML4300 <function> rva=0x... at=+N bytes=xx xx xx    (every refusal for an unknown opcode, at most 200)
+//
+// --fail-on-unknown-opcode makes a refusal for CML4300 an error (exit code 3): on a real project that is a decoder bug
+// (a common prologue the decoder does not know) and must be reduced to a unit test. --min-functions N exits with 4 when
+// fewer than N functions were examined (a PDB that lost its functions would otherwise pass).
+//
+// Exit code: 0, 1 when the module or its PDB cannot be read, 2 for a bad command line, 3 / 4 as above.
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -83,13 +94,24 @@ std::vector<std::uint8_t> read_clamped(const cml::pe::Image& image, std::uint32_
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: cml_lde_probe <image.exe|dll> [--quiet]\n");
+        std::fprintf(stderr, "usage: cml_lde_probe <image.exe|dll> [--quiet] [--fail-on-unknown-opcode] [--min-functions N]\n");
         return 2;
     }
     const std::string path = argv[1];
     bool quiet = false;
+    bool fail_on_unknown_opcode = false;
+    std::size_t min_functions = 0;
     for (int i = 2; i < argc; ++i) {
-        quiet = quiet || std::strcmp(argv[i], "--quiet") == 0;
+        if (std::strcmp(argv[i], "--quiet") == 0) {
+            quiet = true;
+        } else if (std::strcmp(argv[i], "--fail-on-unknown-opcode") == 0) {
+            fail_on_unknown_opcode = true;
+        } else if (std::strcmp(argv[i], "--min-functions") == 0 && i + 1 < argc) {
+            min_functions = static_cast<std::size_t>(std::strtoull(argv[++i], nullptr, 10));
+        } else {
+            std::fprintf(stderr, "cml_lde_probe: unknown argument %s\n", argv[i]);
+            return 2;
+        }
     }
 
     auto owned = cml::pe::load_image_file(path);
@@ -128,6 +150,8 @@ int main(int argc, char** argv) {
     std::size_t decoded_ok = 0, unknown_count = 0, with_flow_end = 0;
     std::map<std::string, std::size_t> plans;
     std::map<std::string, std::size_t> unknown_bytes;
+    std::size_t outcome_padding = 0, outcome_five_byte = 0, outcome_refused = 0, refused_unknown_opcode = 0;
+    std::size_t refused_listed = 0;
     for (const auto& [rva, name] : by_rva) {
         const std::vector<std::uint8_t> head = read_clamped(owned->image, rva, 16);
         if (head.empty()) {
@@ -175,6 +199,21 @@ int main(int argc, char** argv) {
                                           ? cml::agent::hook::to_string(plan.strategy)
                                           : "CML" + std::to_string(plan.diag);
         ++plans[plan_text];
+        if (plan.strategy == cml::agent::hook::Strategy::PaddingTwoByte) {
+            ++outcome_padding;
+        } else if (plan.strategy == cml::agent::hook::Strategy::FiveByte) {
+            ++outcome_five_byte;
+        } else {
+            ++outcome_refused;
+            if (plan.diag == cml::agent::hook::ids::kDecodeUnknown) {
+                ++refused_unknown_opcode;
+                if (refused_listed < 200) {
+                    ++refused_listed;
+                    std::printf("LDE-REFUSED CML%u %s rva=0x%x at=+%u bytes=%s\n", plan.diag, name.c_str(), rva, plan.fail_offset,
+                                hex_bytes(plan.fail_bytes, plan.fail_byte_count).c_str());
+                }
+            }
+        }
 
         if (unknown) {
             ++unknown_count;
@@ -193,6 +232,9 @@ int main(int argc, char** argv) {
     for (const auto& [text, count] : plans) {
         std::printf("LDE-PLAN %s %zu\n", text.c_str(), count);
     }
+    std::printf("LDE-OUTCOME functions=%zu padding=%zu five_byte=%zu refused=%zu refused_unknown_opcode=%zu refused_other=%zu\n",
+                by_rva.size(), outcome_padding, outcome_five_byte, outcome_refused, refused_unknown_opcode,
+                outcome_refused - refused_unknown_opcode);
     std::vector<std::pair<std::size_t, std::string>> ranked;
     for (const auto& [bytes, count] : unknown_bytes) {
         ranked.emplace_back(count, bytes);
@@ -200,6 +242,14 @@ int main(int argc, char** argv) {
     std::sort(ranked.rbegin(), ranked.rend());
     for (std::size_t i = 0; i < ranked.size() && i < 40; ++i) {
         std::printf("LDE-UNKNOWN %s %zu\n", ranked[i].second.c_str(), ranked[i].first);
+    }
+    if (fail_on_unknown_opcode && refused_unknown_opcode != 0) {
+        std::fprintf(stderr, "cml_lde_probe: %zu function(s) refused for an unknown opcode (CML4300)\n", refused_unknown_opcode);
+        return 3;
+    }
+    if (by_rva.size() < min_functions) {
+        std::fprintf(stderr, "cml_lde_probe: %zu function(s) examined, fewer than the required %zu\n", by_rva.size(), min_functions);
+        return 4;
     }
     return 0;
 }
