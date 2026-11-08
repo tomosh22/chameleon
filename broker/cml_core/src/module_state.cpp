@@ -1,6 +1,8 @@
 #include "cml/core/module_state.h"
 
 #include <algorithm>
+#include <iterator>
+#include <set>
 
 namespace cml::core {
 
@@ -88,6 +90,26 @@ std::shared_ptr<const CodeImage> ModuleState::code_running_at(std::uint64_t entr
     const auto hooked_to = hooked.find(entry);
     const auto found = code.find(hooked_to != hooked.end() ? hooked_to->second : entry);
     return found != code.end() ? found->second : nullptr;
+}
+
+void ModuleState::prune_code() {
+    std::lock_guard<std::mutex> lock(mutex);
+    prune_code_locked();
+}
+
+void ModuleState::prune_code_locked() {
+    std::set<std::uint64_t> reachable;
+    for (const auto& h : hooked) {
+        reachable.insert(h.second);
+    }
+    for (auto it = code.begin(); it != code.end();) {
+        bool keep = reachable.count(it->first) != 0;
+        if (!keep && it->second && !it->second->symbol.empty() && hooked.count(it->first) == 0) {
+            const std::optional<SymbolAddress> canonical = registry.find(it->second->symbol);
+            keep = canonical && canonical->va == it->first;  // a function a patch introduced, still the registry's
+        }
+        it = keep ? std::next(it) : code.erase(it);
+    }
 }
 
 }  // namespace cml::core

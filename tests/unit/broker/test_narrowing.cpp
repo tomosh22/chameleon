@@ -102,6 +102,20 @@ struct Scenario {
         return std::make_shared<const CodeImage>(std::move(*image));
     }
 
+    // WP-25: the data symbols bound to the old image whose initial value this scenario's object changes.
+    std::vector<std::string> data_changes() {
+        Built built = obj.build();
+        keep = std::move(built);
+        auto image = pe::Image::parse(cml_test::pe_span(disk), pe::ImageKind::OnDisk);
+        REQUIRE_MESSAGE(image.has_value(), image.error().format());
+        NarrowInput in;
+        in.object = &keep.obj();
+        in.plan = &plan;
+        in.old_image = &*image;
+        in.load_base = load_base;
+        return bound_data_changes(in);
+    }
+
     NarrowResult run(bool enabled = true, std::function<bool(std::uint64_t)> hooked = {}) {
         Built built = obj.build();
         keep = std::move(built);
@@ -622,4 +636,164 @@ TEST_CASE("elision: a function that cannot be recorded (pointer-holding constant
     std::string why;
     CHECK_FALSE(capture_code(in, "?foo@@YAHXZ", &why).has_value());
     CHECK(why.find("holds pointers") != std::string::npos);
+}
+
+// ---- WP-25 review: callers that still call the earlier patch's copy of a callee, counts, bound data ----------------------
+
+namespace {
+
+constexpr std::uint32_t kInnerRva = 0x1180;  // inside the synthetic module's .text
+constexpr std::uint64_t kInnerVa = kPreferred + kInnerRva;
+
+// Two functions in one object: `?foo@@YAHXZ` (outer) calls `?inner@@YAHXZ`, both hooked by the planner. The old module's inner
+// is `mov eax, 1 ; ret` at kInnerRva; `inner_code` is what this object's inner holds.
+struct Chain {
+    Scenario s;
+    SynthObj::Func inner;
+
+    explicit Chain(const std::vector<std::uint8_t>& inner_code) {
+        inner = s.obj.function("?inner@@YAHXZ", true, 16);
+        coff::ModelSection& is = s.obj.model().sections[inner.section - 1];
+        for (std::byte& b : is.data) {
+            b = std::byte{0xCC};
+        }
+        for (std::size_t i = 0; i < inner_code.size(); ++i) {
+            is.data[i] = static_cast<std::byte>(inner_code[i]);
+        }
+        s.new_code({0xE8, 0, 0, 0, 0, 0xC3});
+        s.obj.reloc(s.foo.section, 1, inner.symbol, kRel32, 0);
+        s.hook();  // outer
+        SymbolDecision& d = s.decision(inner.symbol, "?inner@@YAHXZ", DecisionKind::PatchHooked);
+        d.defined = true;
+        d.type = SymbolType::Function;
+        d.section = inner.section;
+        d.value = 0;
+        d.old_address.valid = true;
+        d.old_address.va = kInnerVa;
+        d.old_address.rva = kInnerRva;
+        HookEntry h;
+        h.new_symbol = "?inner@@YAHXZ";
+        h.display = "inner";
+        h.old_va = kInnerVa;
+        h.old_rva = kInnerRva;
+        h.old_size = 16;
+        s.plan.hooks.push_back(h);
+        const std::vector<std::uint8_t> old_inner = {0xB8, 1, 0, 0, 0, 0xC3};
+        for (std::size_t i = 0; i < old_inner.size(); ++i) {
+            s.disk[text_off(kInnerRva) + i] = old_inner[i];
+        }
+    }
+};
+
+const std::vector<std::uint8_t> kInnerAsOld = {0xB8, 1, 0, 0, 0, 0xC3};
+const std::vector<std::uint8_t> kInnerChanged = {0xB8, 7, 0, 0, 0, 0xC3};
+
+}  // namespace
+
+TEST_CASE("elision: a caller whose earlier-patch copy calls a callee that is hooked again is hooked again too") {
+    QuietLogs quiet;
+    // Patch 1 changed `outer` only: its code calls patch 1's own copy of `inner`.
+    Chain first(kInnerAsOld);
+    const std::shared_ptr<const CodeImage> prior = first.s.capture();
+    REQUIRE(prior->relocs.size() == 1);
+    CHECK(prior->relocs[0].target.local_callee == "?inner@@YAHXZ");
+
+    SUBCASE("patch 2 changes inner: outer must be hooked again, or it goes on calling the stale copy") {
+        Chain second(kInnerChanged);
+        second.s.prior = [&](std::uint64_t va) { return entry_is_hooked(va) ? prior : nullptr; };
+        const NarrowResult r = second.s.run(true, entry_is_hooked);
+        REQUIRE(r.decisions.size() == 2);
+        CHECK(r.decisions[1].reason == NarrowReason::BytesDiffer);  // inner
+        CHECK_MESSAGE(r.decisions[0].reason == NarrowReason::TargetChanged, to_string(r.decisions[0].reason));
+        CHECK(r.decisions[0].detail.find("inner") != std::string::npos);
+        CHECK(r.hooks.size() == 2);
+        CHECK(r.dropped == 0);
+    }
+    SUBCASE("patch 2 leaves inner alone: outer stays dropped") {
+        Chain second(kInnerAsOld);
+        second.s.prior = [&](std::uint64_t va) { return entry_is_hooked(va) ? prior : nullptr; };
+        const NarrowResult r = second.s.run(true, entry_is_hooked);
+        REQUIRE(r.decisions.size() == 2);
+        CHECK(r.decisions[0].reason == NarrowReason::Unchanged);
+        CHECK(r.decisions[1].reason == NarrowReason::Unchanged);
+        CHECK(r.hooks.empty());
+        CHECK(r.planned == 2);
+        CHECK(r.dropped == 2);
+    }
+}
+
+TEST_CASE("elision: counts are per old entry: plan hooks that share an entry count once") {
+    QuietLogs quiet;
+    Scenario s;
+    s.old_code({0xB8, 1, 0, 0, 0, 0xC3});
+    s.new_code({0xB8, 1, 0, 0, 0, 0xC3});
+    s.hook();  // foo: identical to the old code, dropped
+    HookEntry twin = s.plan.hooks[0];
+    twin.new_symbol = "?twin@@YAHXZ";  // no definition in the object: cannot be judged, kept
+    twin.display = "twin";
+    s.plan.hooks.push_back(twin);
+    const NarrowResult r = s.run();
+    REQUIRE(r.decisions.size() == 2);
+    CHECK(r.decisions[0].reason == NarrowReason::Unchanged);
+    CHECK(r.decisions[1].reason == NarrowReason::Unverifiable);
+    CHECK(r.hooks.size() == 1);
+    CHECK(r.planned == 1);
+    CHECK(r.dropped == 0);
+    CHECK(r.planned - r.dropped == r.hooks.size());
+
+    SUBCASE("two different entries, one dropped") {
+        Scenario t;
+        t.old_code({0xB8, 1, 0, 0, 0, 0xC3});
+        t.new_code({0xB8, 1, 0, 0, 0, 0xC3});
+        t.hook();
+        HookEntry other = t.plan.hooks[0];
+        other.new_symbol = "?other@@YAHXZ";
+        other.old_va += 0x100;
+        t.plan.hooks.push_back(other);
+        const NarrowResult two = t.run();
+        CHECK(two.planned == 2);
+        CHECK(two.dropped == 1);
+        CHECK(two.hooks.size() == 1);
+    }
+}
+
+TEST_CASE("elision: data the old image owns whose initial value changed is reported; equal data and uninitialised data are not") {
+    QuietLogs quiet;
+    const auto build = [](Scenario& s, bool same) {
+        const std::uint32_t sec = s.obj.section(".rdata$g", kRdata | coff::scn::LnkComdat, 8, coff::ComdatSelection::Any);
+        const std::uint32_t g = s.obj.symbol("?g_const@@3HB", 0, static_cast<std::int32_t>(sec), false, true);
+        coff::ModelSection& ms = s.obj.model().sections[sec - 1];
+        for (int i = 0; i < 8; ++i) {
+            ms.data[static_cast<std::size_t>(i)] = static_cast<std::byte>(i == 3 && !same ? 9 : i);
+        }
+        std::uint8_t old_data[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+        std::memcpy(s.disk.data() + cml_test::rdata_off(kConstRva), old_data, 8);
+        SymbolDecision& d = s.decision(g, "?g_const@@3HB", DecisionKind::BindOldData);
+        d.defined = true;
+        d.type = SymbolType::Data;
+        d.section = sec;
+        d.value = 0;
+        d.old_address.valid = true;
+        d.old_address.va = kPreferred + kConstRva;
+        d.old_address.rva = kConstRva;
+        d.display = "g_const";
+    };
+    SUBCASE("changed") {
+        Scenario s;
+        build(s, false);
+        const std::vector<std::string> changed = s.data_changes();
+        REQUIRE(changed.size() == 1);
+        CHECK(changed[0] == "g_const");
+    }
+    SUBCASE("equal") {
+        Scenario s;
+        build(s, true);
+        CHECK(s.data_changes().empty());
+    }
+    SUBCASE("the old bytes cannot be read: not reported") {
+        Scenario s;
+        build(s, false);
+        s.plan.decisions.back().old_address.rva = 0x9000;  // outside the file's sections
+        CHECK(s.data_changes().empty());
+    }
 }

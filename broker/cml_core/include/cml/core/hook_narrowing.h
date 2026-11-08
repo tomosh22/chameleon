@@ -61,6 +61,10 @@ struct CodeTarget {
     std::uint64_t value = 0;
     std::vector<std::uint8_t> bytes;
     std::string name;
+    // Set when the reference is to a function the patch defines AND hooks (PatchHooked): the linked patch calls its own copy of
+    // it, not the old entry. Not part of the comparison (the address says what it is); used by narrow_hooks to keep a caller
+    // whose earlier-patch copy would go on calling a stale copy of a callee that is hooked again.
+    std::string local_callee;
     bool operator==(const CodeTarget& o) const { return kind == o.kind && value == o.value && bytes == o.bytes && name == o.name; }
 };
 
@@ -77,6 +81,7 @@ struct CodeImage {
     std::vector<std::uint8_t> bytes;  // relocation sites zeroed
     std::vector<CodeReloc> relocs;    // in section order
     std::string display;
+    std::string symbol;  // decorated name of the function (lets the broker tell whether a record is still reachable)
 };
 
 // Turns the NewSymbol targets into addresses once the patch is laid out; false when one cannot be resolved (the image
@@ -104,6 +109,7 @@ struct NarrowDecision {
     std::string display;
     NarrowReason reason = NarrowReason::Unchanged;
     std::string detail;   // e.g. "byte 12 differs", "relocation to 'g' resolves to 0x..., expected 0x..."
+    bool from_prior = false;  // WP-25: judged against the record of an earlier patch (not against the module file)
 };
 
 struct NarrowInput {
@@ -123,14 +129,35 @@ struct NarrowInput {
 };
 
 struct NarrowResult {
-    std::vector<bind::HookEntry> hooks;  // the hooks to install, in plan order
+    std::vector<bind::HookEntry> hooks;  // the hooks to install, in plan order, one per old entry (the first kept entry of an old entry wins)
     std::vector<NarrowDecision> decisions;  // one per plan hook (kept and dropped), in plan order
-    std::size_t dropped = 0;
+    // WP-25 counts, after merging plan hooks that share an old entry: planned - dropped == hooks.size().
+    std::size_t planned = 0;  // distinct old entries the planner wanted to hook
+    std::size_t dropped = 0;  // of those, the ones not hooked
 };
 
-// WP-25: records the code of the function defined as `symbol` in the new object, for `prior_code` of a later patch.
-// nullopt (and `*why`, when given) when it cannot be judged: such a function is simply kept next time.
+// WP-25: records the code of functions defined in the new object, for `prior_code` of a later patch. One recorder per object:
+// the maps over the plan and the resolved relocations of each section are built once.
+class CodeRecorder {
+public:
+    explicit CodeRecorder(const NarrowInput& input);  // `input` must outlive the recorder
+    ~CodeRecorder();
+    CodeRecorder(const CodeRecorder&) = delete;
+    CodeRecorder& operator=(const CodeRecorder&) = delete;
+    // nullopt (and `*why`, when given) when it cannot be judged: such a function is simply kept next time.
+    std::optional<CodeImage> capture(const std::string& symbol, std::string* why = nullptr) const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+// One-off convenience over CodeRecorder.
 std::optional<CodeImage> capture_code(const NarrowInput& input, const std::string& symbol, std::string* why = nullptr);
+
+// WP-25: names of the data symbols the object defines that are bound to the old image's storage (BindOldData) and whose
+// initial contents differ from the old image's: an edit that only changes these compiles to "identical code" but is not applied
+// (the patch's copy is dead, initialisers do not run again). At most `limit` names. Symbols that cannot be judged are left out.
+std::vector<std::string> bound_data_changes(const NarrowInput& input, std::size_t limit = 5);
 
 // Never fails: whatever cannot be judged is kept. Every decision is logged at trace level.
 NarrowResult narrow_hooks(const NarrowInput& input);

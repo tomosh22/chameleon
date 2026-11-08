@@ -97,9 +97,12 @@ struct PatchReport {
     std::size_t compilands = 0;
     std::size_t compiled = 0;       // compiler runs of this module (WP-16)
     std::size_t compile_reused = 0; // compile results taken from the reload's cache (another process or module ran the same command line)
-    std::size_t hooks_planned = 0;  // before narrowing
+    std::size_t hooks_planned = 0;  // distinct old entries the planner wanted to hook (before narrowing); planned - dropped = installed
     std::size_t hooks_installed = 0;
     std::size_t hooks_dropped = 0;
+    std::size_t hooks_kept_more = 0;      // hooks_kept entries left out (the list is capped)
+    std::vector<std::string> data_changes;  // WP-25: data symbols bound to the running image whose initial value the edit changed (units that load nothing)
+    bool data_only_change = false;          // WP-25: nothing was loaded, but the edit changed such data (CML3451)
     std::vector<std::string> hooks_kept;  // WP-25: "function: reason - detail" of every planned hook narrowing kept (also in the response)
     std::size_t units_unchanged = 0;   // WP-25: compilands whose recompile changed nothing (no patch was made for them)
     bool no_functional_change = false; // WP-25: every recompiled compiland was identical to the running code; nothing was loaded (CML3450)

@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <optional>
+#include <set>
 #include <unordered_map>
 
 #include "cml/util/format.h"
@@ -71,6 +73,18 @@ struct Keep {
     std::string detail;
 };
 
+// Bytes from `value` to the next symbol defined in the same section (or the section end).
+std::uint64_t section_extent(const coff::Object& object, const coff::Section& sec, std::uint32_t sec_index, std::uint32_t value) {
+    std::uint64_t end = sec.data.size();
+    for (const coff::Symbol& s : object.symbols()) {
+        if (s.section_number != static_cast<std::int32_t>(sec_index) || s.value <= value) {
+            continue;
+        }
+        end = std::min<std::uint64_t>(end, s.value);
+    }
+    return end > value ? end - value : 0;
+}
+
 class Narrower {
 public:
     explicit Narrower(const NarrowInput& in) : in_(in) {
@@ -94,14 +108,19 @@ public:
             out.reason = NarrowReason::Disabled;
             return out;
         }
+        last_prior_.reset();
         if (const std::optional<Keep> keep = check(h)) {
             out.reason = keep->reason;
             out.detail = keep->detail;
         } else {
             out.reason = NarrowReason::Unchanged;
         }
+        out.from_prior = last_prior_ != nullptr;
         return out;
     }
+
+    // The record the last judge() compared with (null: it compared with the module file, or with nothing).
+    std::shared_ptr<const CodeImage> last_prior() const { return last_prior_; }
 
 private:
     // Where the new function lives in the new object.
@@ -133,13 +152,14 @@ private:
     // nullopt: identical, drop the hook.
     std::optional<Keep> check(const bind::HookEntry& h) const {
         if (in_.object == nullptr) {
-            return Keep{NarrowReason::OldBytesUnavailable, "no module image"};
+            return Keep{NarrowReason::Unverifiable, "no object to compare"};
         }
         const bool hooked = in_.is_hooked && in_.is_hooked(h.old_va);
         if (hooked || h.old_rva == bind::kNoRva) {
             // WP-25: the entry runs code of an earlier patch (hooked, or defined by one): compare with what the broker recorded.
             if (in_.prior_code) {
-                if (const std::shared_ptr<const CodeImage> prior = in_.prior_code(h.old_va)) {
+                if (std::shared_ptr<const CodeImage> prior = in_.prior_code(h.old_va)) {
+                    last_prior_ = prior;
                     return check_prior(h, *prior);
                 }
             }
@@ -172,9 +192,10 @@ private:
         if (!old_bytes) {
             return Keep{NarrowReason::OldBytesUnavailable, old_bytes.error().message};
         }
-        Result<std::vector<coff::ResolvedRelocation>> relocs = in_.object->resolve_relocations(*sec);
-        if (!relocs) {
-            return Keep{NarrowReason::Unverifiable, relocs.error().message};
+        std::string relocs_error;
+        const std::vector<coff::ResolvedRelocation>* relocs = relocs_of(*sec, &relocs_error);
+        if (relocs == nullptr) {
+            return Keep{NarrowReason::Unverifiable, relocs_error};
         }
         std::vector<std::uint8_t> masked(len, 0);
         std::vector<const coff::ResolvedRelocation*> inside;
@@ -221,10 +242,12 @@ private:
         if (loc.len == 0 || loc.start + loc.len > sec.data.size()) {
             return Keep{NarrowReason::Unverifiable, "the function leaves its section"};
         }
-        Result<std::vector<coff::ResolvedRelocation>> relocs = in_.object->resolve_relocations(sec);
-        if (!relocs) {
-            return Keep{NarrowReason::Unverifiable, relocs.error().message};
+        std::string relocs_error;
+        const std::vector<coff::ResolvedRelocation>* relocs = relocs_of(sec, &relocs_error);
+        if (relocs == nullptr) {
+            return Keep{NarrowReason::Unverifiable, relocs_error};
         }
+        out->symbol = symbol;
         out->bytes.assign(loc.len, 0);
         for (std::uint64_t i = 0; i < loc.len; ++i) {
             out->bytes[i] = std::to_integer<std::uint8_t>(sec.data[loc.start + i]);
@@ -284,6 +307,9 @@ private:
                 }
                 out->kind = CodeTarget::Kind::Address;
                 out->value = d.old_address.va;
+                if (d.decision == bind::DecisionKind::PatchHooked) {
+                    out->local_callee = d.name;  // the linked patch calls its own copy of it
+                }
                 return std::nullopt;
             case bind::DecisionKind::LinkerProvided:
                 out->kind = CodeTarget::Kind::Address;
@@ -448,9 +474,10 @@ private:
     // A constant that holds pointers (vtables, jump tables, function tables) is not judged: where its relocations
     // point cannot be compared, so the function that uses it is kept.
     std::optional<Keep> fresh_no_pointers(const bind::SymbolDecision& d, const coff::Section& tsec, std::uint64_t len) const {
-        Result<std::vector<coff::ResolvedRelocation>> relocs = in_.object->resolve_relocations(tsec);
-        if (!relocs) {
-            return Keep{NarrowReason::Unverifiable, relocs.error().message};
+        std::string relocs_error;
+        const std::vector<coff::ResolvedRelocation>* relocs = relocs_of(tsec, &relocs_error);
+        if (relocs == nullptr) {
+            return Keep{NarrowReason::Unverifiable, relocs_error};
         }
         for (const coff::ResolvedRelocation& rr : *relocs) {
             if (rr.reloc.virtual_address >= d.value && rr.reloc.virtual_address < d.value + len) {
@@ -487,14 +514,21 @@ private:
 
     // Bytes from `value` to the next symbol defined in the same section (or the section end).
     std::uint64_t extent_in_section(const coff::Section& sec, std::uint32_t sec_index, std::uint32_t value) const {
-        std::uint64_t end = sec.data.size();
-        for (const coff::Symbol& s : in_.object->symbols()) {
-            if (s.section_number != static_cast<std::int32_t>(sec_index) || s.value <= value) {
-                continue;
-            }
-            end = std::min<std::uint64_t>(end, s.value);
+        return section_extent(*in_.object, sec, sec_index, value);
+    }
+
+    // The relocations of a section with their targets, resolved once per section.
+    const std::vector<coff::ResolvedRelocation>* relocs_of(const coff::Section& sec, std::string* error) const {
+        const auto it = relocs_.find(&sec);
+        if (it != relocs_.end()) {
+            return &it->second;
         }
-        return end > value ? end - value : 0;
+        Result<std::vector<coff::ResolvedRelocation>> resolved = in_.object->resolve_relocations(sec);
+        if (!resolved) {
+            *error = resolved.error().message;
+            return nullptr;
+        }
+        return &relocs_.emplace(&sec, std::move(*resolved)).first->second;
     }
 
     const bind::SymbolDecision* by_raw_name(const std::string& name) const {
@@ -504,6 +538,8 @@ private:
     const NarrowInput& in_;
     std::unordered_map<std::uint32_t, const bind::SymbolDecision*> by_raw_index_;
     std::unordered_map<std::uint64_t, const bind::Fixup*> secrel_;
+    mutable std::unordered_map<const coff::Section*, std::vector<coff::ResolvedRelocation>> relocs_;
+    mutable std::shared_ptr<const CodeImage> last_prior_;
 };
 
 }  // namespace
@@ -524,13 +560,25 @@ bool finalize_code(CodeImage& image, const std::function<std::optional<std::uint
     return true;
 }
 
-std::optional<CodeImage> capture_code(const NarrowInput& input, const std::string& symbol, std::string* why) {
-    if (input.plan == nullptr || input.object == nullptr) {
+struct CodeRecorder::Impl {
+    explicit Impl(const NarrowInput& in) : narrower(in) {}
+    Narrower narrower;
+};
+
+CodeRecorder::CodeRecorder(const NarrowInput& input) {
+    if (input.plan != nullptr && input.object != nullptr) {
+        impl_ = std::make_unique<Impl>(input);
+    }
+}
+
+CodeRecorder::~CodeRecorder() = default;
+
+std::optional<CodeImage> CodeRecorder::capture(const std::string& symbol, std::string* why) const {
+    if (!impl_) {
         return std::nullopt;
     }
-    const Narrower narrower(input);
     CodeImage image;
-    if (const std::optional<Keep> keep = narrower.capture_code(symbol, &image)) {
+    if (const std::optional<Keep> keep = impl_->narrower.capture_code(symbol, &image)) {
         if (why != nullptr) {
             *why = keep->detail;
         }
@@ -539,24 +587,107 @@ std::optional<CodeImage> capture_code(const NarrowInput& input, const std::strin
     return image;
 }
 
+std::optional<CodeImage> capture_code(const NarrowInput& input, const std::string& symbol, std::string* why) {
+    const CodeRecorder recorder(input);
+    return recorder.capture(symbol, why);
+}
+
 NarrowResult narrow_hooks(const NarrowInput& input) {
     NarrowResult out;
     if (input.plan == nullptr) {
         return out;
     }
     const Narrower narrower(input);
-    out.decisions.reserve(input.plan->hooks.size());
-    for (const bind::HookEntry& h : input.plan->hooks) {
-        NarrowDecision d = narrower.judge(h);
-        CML_LOG(Trace, "narrow: %s -> %s%s%s", h.display.c_str(), to_string(d.reason), d.detail.empty() ? "" : ": ", d.detail.c_str());
-        if (is_dropped(d.reason)) {
-            ++out.dropped;
-        } else {
-            out.hooks.push_back(h);
-        }
-        out.decisions.push_back(std::move(d));
+    const std::vector<bind::HookEntry>& planned = input.plan->hooks;
+    out.decisions.reserve(planned.size());
+    std::vector<std::shared_ptr<const CodeImage>> priors;
+    priors.reserve(planned.size());
+    std::unordered_map<std::string, std::size_t> by_symbol;
+    for (std::size_t i = 0; i < planned.size(); ++i) {
+        out.decisions.push_back(narrower.judge(planned[i]));
+        priors.push_back(narrower.last_prior());
+        by_symbol.emplace(planned[i].new_symbol, i);
     }
+    // A function judged equal to the code an earlier patch put at its entry still calls THAT patch's copy of every function the
+    // patch defines and hooks. If such a callee is hooked again now, the earlier copy of the caller would go on calling the stale
+    // copy of the callee: the caller is hooked again as well (repeat: this can ripple up a chain of callers).
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (std::size_t i = 0; i < planned.size(); ++i) {
+            NarrowDecision& d = out.decisions[i];
+            if (!is_dropped(d.reason) || !priors[i]) {
+                continue;
+            }
+            for (const CodeReloc& r : priors[i]->relocs) {
+                if (r.target.local_callee.empty()) {
+                    continue;
+                }
+                const auto callee = by_symbol.find(r.target.local_callee);
+                if (callee != by_symbol.end() && !is_dropped(out.decisions[callee->second].reason)) {
+                    d.reason = NarrowReason::TargetChanged;
+                    d.detail = "it calls '" + planned[callee->second].display + "', which is hooked again; the earlier patch's copy of this function calls the earlier copy";
+                    changed = true;
+                    break;
+                }
+            }
+        }
+    }
+    std::set<std::uint64_t> all_entries;
+    std::set<std::uint64_t> kept_entries;
+    for (std::size_t i = 0; i < planned.size(); ++i) {
+        const NarrowDecision& d = out.decisions[i];
+        CML_LOG(Trace, "narrow: %s -> %s%s%s", planned[i].display.c_str(), to_string(d.reason), d.detail.empty() ? "" : ": ", d.detail.c_str());
+        all_entries.insert(planned[i].old_va);
+        if (!is_dropped(d.reason) && kept_entries.insert(planned[i].old_va).second) {
+            out.hooks.push_back(planned[i]);
+        }
+    }
+    out.planned = all_entries.size();
+    out.dropped = all_entries.size() - kept_entries.size();
     return out;
+}
+
+std::vector<std::string> bound_data_changes(const NarrowInput& input, std::size_t limit) {
+    std::vector<std::string> changed;
+    if (input.plan == nullptr || input.object == nullptr || input.old_image == nullptr) {
+        return changed;
+    }
+    for (const bind::SymbolDecision& d : input.plan->decisions) {
+        if (changed.size() >= limit) {
+            break;
+        }
+        if (d.decision != bind::DecisionKind::BindOldData || !d.defined || d.section == 0 || d.type != bind::SymbolType::Data) {
+            continue;
+        }
+        const coff::Section* sec = input.object->section(d.section);
+        if (sec == nullptr || sec->is_code() || sec->data.empty() || !d.old_address.valid || d.old_address.rva == bind::kNoRva) {
+            continue;  // uninitialised, or nothing to compare with
+        }
+        const std::uint64_t len = sec->is_comdat() ? sec->data.size() - std::min<std::uint64_t>(d.value, sec->data.size())
+                                                   : section_extent(*input.object, *sec, d.section, d.value);
+        if (len == 0 || len > kMaxConstantBytes || d.value + len > sec->data.size()) {
+            continue;
+        }
+        Result<pe::ByteSpan> old_bytes = input.old_image->read_rva(d.old_address.rva, len);
+        Result<std::vector<coff::ResolvedRelocation>> relocs = input.object->resolve_relocations(*sec);
+        if (!old_bytes || !relocs) {
+            continue;
+        }
+        bool holds_pointers = false;
+        for (const coff::ResolvedRelocation& rr : *relocs) {
+            holds_pointers = holds_pointers || (rr.reloc.virtual_address >= d.value && rr.reloc.virtual_address < d.value + len);
+        }
+        if (holds_pointers) {
+            continue;
+        }
+        for (std::uint64_t i = 0; i < len; ++i) {
+            if (sec->data[d.value + i] != (*old_bytes)[i]) {
+                changed.push_back(d.display);
+                break;
+            }
+        }
+    }
+    return changed;
 }
 
 }  // namespace cml::core

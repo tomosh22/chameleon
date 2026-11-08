@@ -31,5 +31,6 @@ inline constexpr std::uint32_t kNoChanges = 5319;          // (info) the sweep f
 inline constexpr std::uint32_t kAgentRequestTimeout = 5320;  // no answer within the time limit (the agent may still act on the request)
 // WP-25 owns CML3450-3499 (ADR-0032).
 inline constexpr std::uint32_t kNoFunctionalChange = 3450;   // (warning) the edit compiled to identical code: nothing was loaded
+inline constexpr std::uint32_t kBoundDataChangeOnly = 3451;  // (warning) identical code, but the initial value of data in the running image changed: nothing was loaded
 
 }  // namespace cml::core::pipeline::diag

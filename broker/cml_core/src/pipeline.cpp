@@ -90,9 +90,13 @@ ipc::json::Value to_json(const PatchReport& r) {
     v.set("hooks_installed", n(r.hooks_installed));
     v.set("hooks_dropped", n(r.hooks_dropped));
     v.set("no_functional_change", Value::boolean(r.no_functional_change));
+    v.set("data_only_change", Value::boolean(r.data_only_change));
     Value kept = Value::array();
     for (const std::string& k : r.hooks_kept) {
         kept.push(Value::string(k));
+    }
+    if (r.hooks_kept_more != 0) {
+        kept.push(Value::string("... and " + std::to_string(r.hooks_kept_more) + " more"));
     }
     v.set("hooks_kept", std::move(kept));
     v.set("new_functions", n(r.new_functions));
@@ -570,13 +574,27 @@ private:
         }
         report.patched = report.generation != 0;
         // WP-25: every compiled unit turned out identical to the running code and nothing else came with it: say so.
-        if (report.patches == 0 && !units.empty() && report.units_unchanged == units.size()) {
-            report.no_functional_change = true;
-            warn(report, "plan",
-                 Diag::make(pd::kNoFunctionalChange,
-                            "the edit compiled to identical code (" + std::to_string(report.hooks_dropped) + " of " + std::to_string(report.hooks_planned) +
-                                " planned hooks are identical to the running code, nothing new): no patch was loaded for " + module_.name,
-                            "Nothing to do. Change code or data that reaches the generated code, or set-option narrow_hooks false to hook everything."));
+        if (!units.empty() && report.units_unchanged == units.size()) {
+            if (report.data_changes.empty()) {
+                report.no_functional_change = true;
+                warn(report, "plan",
+                     Diag::make(pd::kNoFunctionalChange,
+                                "the edit compiled to identical code (" + std::to_string(report.hooks_dropped) + " of " + std::to_string(report.hooks_planned) +
+                                    " planned hooks are identical to the running code, nothing new): no patch was loaded for " + module_.name,
+                                "Nothing to do. Change code or data that reaches the generated code, or set-option narrow_hooks false to hook everything."));
+            } else {
+                // The code is identical, but the initial value of data the running image owns changed: nothing can apply that.
+                report.data_only_change = true;
+                std::string names;
+                for (const std::string& n : report.data_changes) {
+                    names += (names.empty() ? "" : ", ") + n;
+                }
+                warn(report, "plan",
+                     Diag::make(pd::kBoundDataChangeOnly,
+                                "the edit only changes the initial value of data that lives in the running image (" + names + "): the code is identical, so no patch was loaded for " +
+                                    module_.name + " and the running program keeps its current values (initialisers of existing globals do not run again)",
+                                "Restart the application to pick the new initial value up, or assign the value from code that runs again (a function the patch can hook)."));
+            }
         }
         return report;
     }
@@ -646,26 +664,23 @@ private:
         ni.enabled = options_.narrow_hooks;
         ni.prior_code = [this](std::uint64_t va) { return module_.code_running_at(va); };  // WP-25
         const NarrowResult narrowed = narrow_hooks(ni);
-        report.hooks_planned += plan.hooks.size();
+        // After merging plan hooks that share an old entry: planned - dropped == hooks.size() == hooks installed by this patch.
+        report.hooks_planned += narrowed.planned;
         report.hooks_dropped += narrowed.dropped;
         report.new_functions += plan.new_functions.size();
         report.new_globals += plan.new_globals.size();
         report.thunks += plan.thunks.size();
         for (const NarrowDecision& d : narrowed.decisions) {
-            if (!is_dropped(d.reason)) {
-                report.hooks_kept.push_back(d.display + ": " + to_string(d.reason) + (d.detail.empty() ? "" : " - " + d.detail));
+            if (!is_dropped(d.reason) && d.reason != NarrowReason::Disabled) {
+                if (report.hooks_kept.size() < kMaxKeptNotes) {
+                    report.hooks_kept.push_back(d.display + ": " + to_string(d.reason) + (d.detail.empty() ? "" : " - " + d.detail));
+                } else {
+                    ++report.hooks_kept_more;
+                }
             }
             CML_LOG(Debug, "reload: hook %s: %s%s%s", d.display.c_str(), to_string(d.reason), d.detail.empty() ? "" : " - ", d.detail.c_str());
         }
-        std::vector<bind::HookEntry> hooks;
-        {
-            std::set<std::uint64_t> seen;
-            for (const bind::HookEntry& h : narrowed.hooks) {
-                if (seen.insert(h.old_va).second) {
-                    hooks.push_back(h);
-                }
-            }
-        }
+        const std::vector<bind::HookEntry>& hooks = narrowed.hooks;  // one per old entry
         // WP-18, CML3104: a changed small function of an optimised compiland may be inlined into its callers (one warning per compiland).
         {
             std::vector<std::string> small_changed;  // one warning per compiland, naming the small functions
@@ -682,8 +697,11 @@ private:
         report.times.plan += lap.lap();
         if (!has_effect) {
             CML_LOG(Info, "reload: %s changes no code (all %zu planned hooks are identical to the running code); nothing to load", u.source.c_str(),
-                    plan.hooks.size());
-            ++report.units_unchanged;  // WP-25: run() turns "every unit unchanged" into the CML3450 warning
+                    narrowed.planned);
+            ++report.units_unchanged;  // WP-25: run() turns "every unit unchanged" into the CML3450 / CML3451 warning
+            for (std::string& name : bound_data_changes(ni)) {
+                report.data_changes.push_back(std::move(name));
+            }
             return Result<void>();
         }
 
@@ -947,9 +965,10 @@ private:
                 }
                 return symbol_va(plan, linked, name, d->section, d->value);
             };
+            const CodeRecorder recorder(ni);  // the maps over the plan and the resolved relocations are built once
             const auto record_one = [&](const std::string& symbol, const std::string& display, std::uint64_t entry) {
                 std::string why;
-                std::optional<CodeImage> recorded = capture_code(ni, symbol, &why);
+                std::optional<CodeImage> recorded = recorder.capture(symbol, &why);
                 if (!recorded || !finalize_code(*recorded, address_of)) {
                     CML_LOG(Trace, "reload: the code of %s is not recorded%s%s", display.c_str(), why.empty() ? "" : ": ", why.c_str());
                     return;
@@ -957,13 +976,8 @@ private:
                 recorded->display = display;
                 module_.record_code(entry, std::make_shared<const CodeImage>(std::move(*recorded)));
             };
-            for (const AppliedHook& h : applied.hooks) {
-                for (const bind::HookEntry& e : hooks) {
-                    if (e.old_va == h.old_entry) {
-                        record_one(e.new_symbol, e.display, h.new_entry);
-                        break;
-                    }
-                }
+            for (std::size_t i = 0; i < applied.hooks.size() && i < hooks.size(); ++i) {  // applied.hooks is index-aligned with hooks
+                record_one(hooks[i].new_symbol, hooks[i].display, applied.hooks[i].new_entry);
             }
             for (const bind::NewFunction& f : plan.new_functions) {
                 if (const std::optional<std::uint64_t> va = symbol_va(plan, linked, f.name, f.section, f.value)) {
@@ -1056,12 +1070,13 @@ private:
                                                  "Report this with the bind plan."));
             }
         }
+        module_.prune_code();  // records of patches nothing reaches any more (superseded hooks)
         applied_.push_back(std::move(applied));
         report.dll_path = linked.dll_path;
         report.patched = true;
         if (ctx_.events != nullptr) {
             ctx_.events->publish(make_patch_applied_event(pid_, module_.name, report.generation, hooks.size(), plan.new_functions.size(), plan.new_globals.size(),
-                                                                  plan.hooks.size(), narrowed.dropped));
+                                                                  narrowed.planned, narrowed.dropped));
         }
         CML_LOG(Info, "reload: patch %llu of %s applied at %s (%zu hooks, %zu dropped, %zu new functions, %zu new globals, %zu fix-ups, %zu initialisers)",
                 static_cast<unsigned long long>(report.generation), module_.name.c_str(), hex(base).c_str(), hooks.size(), narrowed.dropped, plan.new_functions.size(),
@@ -1070,6 +1085,7 @@ private:
     }
 
     // ---- pieces -----------------------------------------------------------------------------------------------
+    static constexpr std::size_t kMaxKeptNotes = 50;  // entries of PatchReport::hooks_kept
     static constexpr std::uint64_t kMinPatchRoom = 4ull << 20;  // a patch needs room for at least this much image
 
     std::shared_ptr<const pe::OwnedImage> module_image(PatchReport& report) {

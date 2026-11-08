@@ -1,0 +1,9 @@
+--- a/elision.cpp
++++ b/elision.cpp
+@@ -31,5 +31,5 @@
+ // A small function that calls another: the call must still resolve to the same target.
+ __declspec(noinline) int elision_outer(int x)
+ {
+-    return elision_inner(x) + 1;
++    return elision_inner(x) + 2;
+ }

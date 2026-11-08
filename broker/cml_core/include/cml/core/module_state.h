@@ -116,6 +116,11 @@ struct ModuleState {
     std::map<std::uint64_t, std::shared_ptr<const CodeImage>> code;
     void record_code(std::uint64_t patch_entry, std::shared_ptr<const CodeImage> record);  // takes `mutex`
     std::shared_ptr<const CodeImage> code_running_at(std::uint64_t entry);               // takes `mutex`
+    // Drops the records nothing reaches: those that are no value of `hooked` and no function a patch introduced that is still
+    // canonical in the registry and not hooked since. Call after `hooked` / `registry` changed (a new patch superseded a hook, a
+    // revert undid one, the module went away). `prune_code_locked` needs `mutex` held.
+    void prune_code();
+    void prune_code_locked();
 };
 
 }  // namespace cml::core
