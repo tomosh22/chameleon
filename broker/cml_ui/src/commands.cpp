@@ -17,6 +17,7 @@ const std::vector<CommandInfo>& command_table() {
         {"subscribe", ipc::capability::kSubscribe, "compile output, change list, patch history, log view"},
         {"exceptions", "exceptions", "pending exceptions list"},
         {"exception-action", "exceptions", "exception dialog: Continue / Leave function / Ignore"},
+        {"exception-action", "reexecute", "exception dialog: Re-execute function button (offered when `actions` has \"reexecute\"; `exception_updated` events)"},
         {"restart", "restart", "Restart process button"},
         {"revert", "revert", "Revert last / Revert all buttons"},
     };

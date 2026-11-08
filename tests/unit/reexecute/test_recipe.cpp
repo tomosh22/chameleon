@@ -146,9 +146,7 @@ TEST_CASE("recipe: only code built without optimisation is accepted, and an unkn
     const RecipeResult unknown = build_recipe(msvc_step(), pdb::OptimizationHint::Unknown, 0x20, msvc_frame());
     CHECK_FALSE(unknown.ok);
     CHECK(unknown.diag == diag::kOptimisationUnknown);
-    pdb::ProcInfo speed = msvc_step();
-    speed.opt_for_speed = true;  // the frame record says "optimised for speed" even though the command line did not
-    CHECK(build_recipe(speed, pdb::OptimizationHint::Disabled, 0x20, msvc_frame()).diag == diag::kOptimised);
+    // (S_FRAMEPROC's "optimised for speed" bit is set by cl even at /Od - CI evidence - so it is not consulted.)
 }
 
 TEST_CASE("recipe: a function whose parameters cannot be read, or that shifts the arguments, is refused with the reason") {

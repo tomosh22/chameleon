@@ -49,7 +49,7 @@ RecipeResult build_recipe(const pdb::ProcInfo& proc, pdb::OptimizationHint optim
     if (optimisation == pdb::OptimizationHint::Unknown) {
         return refuse(diag::kOptimisationUnknown, name + " is in a compiland whose recorded build command does not show that optimisation was off (no /Od); re-execute is only offered for unoptimised code");
     }
-    if (optimisation != pdb::OptimizationHint::Disabled || proc.opt_for_speed) {
+    if (optimisation != pdb::OptimizationHint::Disabled) {
         return refuse(diag::kOptimised, name + " is in a compiland built with optimisation (" + std::string(optimisation_name(optimisation)) +
                                             "); its parameters are not kept in fixed places, so re-execute is only offered for code built with /Od");
     }
