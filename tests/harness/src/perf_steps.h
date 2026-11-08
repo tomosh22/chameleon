@@ -42,5 +42,8 @@ struct StageStats {
 // "total_excl_compile" (total - compile per reload). Empty input gives an empty result.
 std::vector<StageStats> compute_stage_stats(const std::vector<cml::ipc::json::Value>& timings);
 double median_of(std::vector<double> values);
+// Empty when every sample has numeric, non-negative members for all stages (sweep ... total) and total >= compile;
+// otherwise the first problem. A sample that cannot be trusted must fail the budget, not count as 0.
+std::string validate_timings(const std::vector<cml::ipc::json::Value>& timings);
 
 }  // namespace cmltest

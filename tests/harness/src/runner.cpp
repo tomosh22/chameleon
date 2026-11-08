@@ -689,7 +689,7 @@ private:
             return StepOutcome::fail(cml::ids::kScenarioFailed, "perf_idle needs a launched broker and fixture");
         }
         const std::size_t fixture_id = proc->id;
-        const PerfStepResult r = perf_.idle(supervisor_.pid(broker_id_), step, [this, fixture_id] { return !supervisor_.exit_code(fixture_id).has_value(); });
+        const PerfStepResult r = perf_.idle(supervisor_.pid(broker_id_), step, remaining_ms(), [this, fixture_id] { return !supervisor_.exit_code(fixture_id).has_value(); });
         return r.ok ? StepOutcome::pass(r.detail) : StepOutcome::fail(cml::ids::kScenarioFailed, r.detail);
     }
 
@@ -697,7 +697,8 @@ private:
         if (!control_) {
             return StepOutcome::fail(cml::ids::kScenarioFailed, "perf_report needs a launched broker");
         }
-        const PerfStepResult r = perf_.report(supervisor_.pid(broker_id_), step, scenario_.name, options_.artifacts_dir);
+        const PerfStepResult r = perf_.report(supervisor_.pid(broker_id_), step, scenario_.name, options_.artifacts_dir,
+                                              fs::path(built_.exe).replace_extension(".pdb"));
         return r.ok ? StepOutcome::pass(r.detail) : StepOutcome::fail(cml::ids::kScenarioFailed, r.detail);
     }
 

@@ -267,14 +267,14 @@ int main(int argc, char** argv) {
                  std::to_string(resolved) + "/" + std::to_string(looked_up) + " resolved in " + fmt("%.1f ms", q_ms));
 
     // ---- budgets ------------------------------------------------------------------------------
-    const double budget_ms_json = std::max(100.0, 2000.0 * (size_mb / 500.0) * slack);
+    const double budget_ms = std::max(100.0, 2000.0 * (size_mb / 500.0) * slack);
     if (!json_path.empty()) {
         std::ofstream out(json_path, std::ios::binary | std::ios::trunc);
         char buf[512];
         std::snprintf(buf, sizeof buf,
                       "{\"size_bytes\":%llu,\"load_ms\":%.1f,\"budget_ms\":%.1f,\"slack\":%.2f,\"ms_per_500mb\":%.1f,"
                       "\"memory_measure_bytes\":%.0f,\"memory_over_pdb\":%.4f}\n",
-                      static_cast<unsigned long long>(file_bytes), load_ms, budget_ms_json, slack,
+                      static_cast<unsigned long long>(file_bytes), load_ms, budget_ms, slack,
                       size_mb > 0 ? load_ms * 500.0 / size_mb : 0.0, budget_mem,
                       file_bytes > 0 ? budget_mem / static_cast<double>(file_bytes) : 0.0);
         out << buf;
@@ -282,7 +282,6 @@ int main(int argc, char** argv) {
     if (smoke) {
         std::printf("\n(smoke mode: budgets are not enforced)\n");
     } else {
-        const double budget_ms = std::max(100.0, 2000.0 * (size_mb / 500.0) * slack);
         check.expect(load_ms <= budget_ms, "load time within budget",
                      fmt("%.0f ms <= %.0f ms (2 s per 500 MB x slack %.1f)", load_ms, budget_ms, slack));
         const double mem_budget = 1.5 * static_cast<double>(file_bytes);

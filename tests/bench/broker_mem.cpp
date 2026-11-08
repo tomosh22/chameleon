@@ -1,6 +1,6 @@
 // cml_broker_mem: the broker's memory on a large PDB (WP-27).
 //
-//   cml_broker_mem <file.pdb> [--factor F] [--json FILE] [--timeout-s N] [--smoke]
+//   cml_broker_mem <file.pdb> [--factor F] [--json FILE] [--timeout-s N] [--min-tracked-files N] [--smoke]
 //
 // Budget (plan WP-27): broker memory at most 1.5 x the PDB size. Measured here on the broker's own code path: the
 // ModuleIndex the broker creates when it enables a module (PDB open with publics, file lists of every compiland, build
@@ -62,6 +62,7 @@ int main(int argc, char** argv) {
     std::string json_path;
     double factor = 1.5;
     unsigned timeout_s = 600;
+    std::size_t min_tracked = 0;
     bool smoke = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -71,17 +72,19 @@ int main(int argc, char** argv) {
             json_path = argv[++i];
         } else if (a == "--timeout-s" && i + 1 < argc) {
             timeout_s = static_cast<unsigned>(std::atoi(argv[++i]));
+        } else if (a == "--min-tracked-files" && i + 1 < argc) {
+            min_tracked = static_cast<std::size_t>(std::atoll(argv[++i]));
         } else if (a == "--smoke") {
             smoke = true;
         } else if (!a.empty() && a[0] != '-' && path.empty()) {
             path = a;
         } else {
-            std::fprintf(stderr, "usage: cml_broker_mem <file.pdb> [--factor F] [--json FILE] [--timeout-s N] [--smoke]\n");
+            std::fprintf(stderr, "usage: cml_broker_mem <file.pdb> [--factor F] [--json FILE] [--timeout-s N] [--min-tracked-files N] [--smoke]\n");
             return 2;
         }
     }
     if (path.empty()) {
-        std::fprintf(stderr, "usage: cml_broker_mem <file.pdb> [--factor F] [--json FILE] [--timeout-s N] [--smoke]\n");
+        std::fprintf(stderr, "usage: cml_broker_mem <file.pdb> [--factor F] [--json FILE] [--timeout-s N] [--min-tracked-files N] [--smoke]\n");
         return 2;
     }
     std::uint64_t file_bytes = 0;
@@ -114,6 +117,11 @@ int main(int argc, char** argv) {
     }
     std::printf("index: ready in %.0f ms, %zu compilands, %zu tracked files (pdb %.0f ms, baseline %.0f ms)\n", index_ms, status.compilands,
                 status.files, status.pdb_ms, status.baseline_ms);
+    if (status.files < min_tracked) {
+        std::fprintf(stderr, "only %zu source files are tracked, expected at least %zu: the sources the PDB lists are missing, so the measurement would not include the source baseline\n",
+                     status.files, min_tracked);
+        return 1;
+    }
     const Memory after_index = read_memory();
 
     // What a reload does with the index: sweep (maps the PDB again after a release), release, sweep again.

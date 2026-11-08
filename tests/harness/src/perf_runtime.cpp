@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <system_error>
 
 #include "perf_steps.h"
 
@@ -23,6 +24,7 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
+constexpr double kBrokerBaselineMiB = 32.0;  // fixed cost of the broker process, whatever the PDB
 constexpr DWORD kSettleMs = 5000;  // the broker has just finished its index and hashing work; let it go quiet
 
 struct ProcessHandle {
@@ -73,8 +75,15 @@ void PerfRecorder::add_reload(const cml::ipc::json::Value& reload_result) {
     }
 }
 
-PerfStepResult PerfRecorder::idle_impl(std::uint32_t broker_pid, const Step& step, const std::function<bool()>& fixture_alive) {
+PerfStepResult PerfRecorder::idle_impl(std::uint32_t broker_pid, const Step& step, std::uint32_t limit_ms, const std::function<bool()>& fixture_alive) {
     PerfStepResult result;
+    const std::uint64_t needed_ms = static_cast<std::uint64_t>(kSettleMs) + static_cast<std::uint64_t>(step.within_s) * 1000u + 2000u;
+    if (needed_ms > limit_ms) {
+        result.ok = false;
+        result.detail = "the scenario's remaining time (" + std::to_string(limit_ms / 1000) + " s) is shorter than the settling time plus the " +
+                        std::to_string(step.within_s) + " s observation; raise timeout_s";
+        return result;
+    }
     ProcessHandle broker(broker_pid);
     if (broker.h == nullptr) {
         result.ok = false;
@@ -104,8 +113,17 @@ PerfStepResult PerfRecorder::idle_impl(std::uint32_t broker_pid, const Step& ste
         }
     }
     double cpu1 = 0;
-    cpu_ms(broker.h, &cpu1);
+    if (!cpu_ms(broker.h, &cpu1)) {
+        result.ok = false;
+        result.detail = "GetProcessTimes failed for the broker at the end of the observation (error " + std::to_string(GetLastError()) + ")";
+        return result;
+    }
     const double wall_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    if (cpu1 < cpu0 || wall_ms <= 0) {
+        result.ok = false;
+        result.detail = fmt("the broker's CPU time went backwards (%.1f ms -> %.1f ms) or no time passed", cpu0, cpu1);
+        return result;
+    }
     idle_cpu_ms_ = cpu1 - cpu0;
     idle_wall_s_ = wall_ms / 1000.0;
     idle_cpu_percent_ = wall_ms > 0 ? 100.0 * idle_cpu_ms_ / wall_ms : 0.0;
@@ -124,12 +142,19 @@ PerfStepResult PerfRecorder::idle_impl(std::uint32_t broker_pid, const Step& ste
     return result;
 }
 
-PerfStepResult PerfRecorder::report(std::uint32_t broker_pid, const Step& step, const std::string& scenario, const fs::path& artifacts_dir) {
+PerfStepResult PerfRecorder::report(std::uint32_t broker_pid, const Step& step, const std::string& scenario, const fs::path& artifacts_dir,
+                                    const fs::path& module_pdb) {
     using cml::ipc::json::Value;
     PerfStepResult result;
     if (timings_.size() < static_cast<std::size_t>(step.min_samples)) {
         result.ok = false;
         result.detail = "only " + std::to_string(timings_.size()) + " reloads were recorded, the step needs at least " + std::to_string(step.min_samples);
+        return result;
+    }
+    const std::string invalid = validate_timings(timings_);
+    if (!invalid.empty()) {
+        result.ok = false;
+        result.detail = "the recorded reload timings cannot be trusted: " + invalid;
         return result;
     }
     const std::vector<StageStats> stats = compute_stage_stats(timings_);
@@ -156,7 +181,23 @@ PerfStepResult PerfRecorder::report(std::uint32_t broker_pid, const Step& step, 
     Value broker = Value::object();
     ProcessHandle process(broker_pid);
     PROCESS_MEMORY_COUNTERS_EX pmc{};
-    if (process.h != nullptr && GetProcessMemoryInfo(process.h, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof pmc)) {
+    std::string memory_problem;
+    if (process.h == nullptr || !GetProcessMemoryInfo(process.h, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof pmc)) {
+        memory_problem = "cannot read the broker's memory counters (error " + std::to_string(GetLastError()) + ")";
+    } else {
+        std::error_code size_ec;
+        const std::uintmax_t pdb_bytes = fs::file_size(module_pdb, size_ec);
+        if (size_ec || pdb_bytes == 0) {
+            memory_problem = "cannot read the size of the module PDB " + module_pdb.string();
+        } else {
+            const double limit = 1.5 * static_cast<double>(pdb_bytes) + kBrokerBaselineMiB * 1024.0 * 1024.0;
+            broker.set("module_pdb_bytes", Value::integer(static_cast<std::int64_t>(pdb_bytes)));
+            broker.set("peak_private_limit_bytes", Value::number(limit));
+            if (static_cast<double>(pmc.PeakPagefileUsage) > limit) {
+                memory_problem = fmt("the broker's peak private bytes (%.1f MiB) exceed 1.5 x the module PDB plus the process baseline (%.1f MiB)",
+                                     static_cast<double>(pmc.PeakPagefileUsage) / 1048576.0, limit / 1048576.0);
+            }
+        }
         // PeakPagefileUsage is the peak commit charge of the process: its private bytes at their highest.
         broker.set("peak_private_bytes", Value::integer(static_cast<std::int64_t>(pmc.PeakPagefileUsage)));
         broker.set("private_bytes", Value::integer(static_cast<std::int64_t>(pmc.PrivateUsage)));
@@ -200,6 +241,10 @@ PerfStepResult PerfRecorder::report(std::uint32_t broker_pid, const Step& step, 
     if (median_excl > static_cast<double>(step.result_value)) {
         result.ok = false;
         result.detail = "over budget: " + result.detail;
+    }
+    if (!memory_problem.empty()) {
+        result.ok = false;
+        result.detail = memory_problem + "; " + result.detail;
     }
     return result;
 }

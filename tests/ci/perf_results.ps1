@@ -89,7 +89,7 @@ foreach ($name in $limits.Keys) {
     $curText = if ($null -ne $cur) { ('{0:N3}' -f $cur) } else { 'not measured' }
     $beforeText = if ($null -ne $before) { ('{0:N3}' -f $before) } else { '-' }
     $lines += "| $name | $curText | $($limits[$name][0]) | $($limits[$name][1]) | $beforeText |"
-    if ($null -ne $cur -and $null -ne $before -and $before -gt 0 -and $cur -gt $before * 1.25 -and ($cur - $before) -gt $floors[$name]) {
+    if ($null -ne $cur -and $null -ne $before -and $cur -gt $before * 1.25 -and ($cur - $before) -gt $floors[$name]) {
         $warnings += "perf regression: $name is $('{0:N3}' -f $cur), more than 25 % above $('{0:N3}' -f $before) on the last successful main run"
     }
 }

@@ -71,6 +71,29 @@ double median_of(std::vector<double> values) {
     return n % 2 == 1 ? values[n / 2] : (values[n / 2 - 1] + values[n / 2]) / 2.0;
 }
 
+std::string validate_timings(const std::vector<cml::ipc::json::Value>& timings) {
+    static const char* const kStages[] = {"sweep", "compile", "plan", "anchor", "link", "load", "fixups", "init", "hooks", "total"};
+    for (std::size_t i = 0; i < timings.size(); ++i) {
+        const cml::ipc::json::Value& t = timings[i];
+        if (!t.is_object()) {
+            return "reload " + std::to_string(i + 1) + ": timing_ms is not an object";
+        }
+        for (const char* stage : kStages) {
+            const cml::ipc::json::Value* v = t.find(stage);
+            if (v == nullptr || !v->is_number()) {
+                return "reload " + std::to_string(i + 1) + ": timing_ms." + stage + " is missing or not a number";
+            }
+            if (v->as_double() < 0) {
+                return "reload " + std::to_string(i + 1) + ": timing_ms." + stage + " is negative";
+            }
+        }
+        if (t.find("total")->as_double() < t.find("compile")->as_double()) {
+            return "reload " + std::to_string(i + 1) + ": total is smaller than compile";
+        }
+    }
+    return std::string();
+}
+
 std::vector<StageStats> compute_stage_stats(const std::vector<cml::ipc::json::Value>& timings) {
     static const char* const kStages[] = {"sweep", "compile", "plan", "anchor", "link", "load", "fixups", "init", "hooks", "total"};
     std::vector<StageStats> out;

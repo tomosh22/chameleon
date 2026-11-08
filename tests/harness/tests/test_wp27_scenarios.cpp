@@ -99,6 +99,36 @@ TEST_CASE("stage statistics: median and maximum per stage, total minus compile")
     CHECK(median_of({}) == doctest::Approx(0.0));
 }
 
+TEST_CASE("validate_timings: a missing, non-numeric or inconsistent stage is an error, never a 0") {
+    using cml::ipc::json::Value;
+    const auto full = [](double compile, double total) {
+        Value v = Value::object();
+        for (const char* k : {"sweep", "plan", "anchor", "link", "load", "fixups", "init", "hooks"}) v.set(k, Value::number(1));
+        v.set("compile", Value::number(compile));
+        v.set("total", Value::number(total));
+        return v;
+    };
+    CHECK(validate_timings({full(10, 20), full(5, 6)}).empty());
+    CHECK_FALSE(validate_timings({full(10, 5)}).empty());  // total < compile: total_excl_compile would be negative
+    Value no_total = full(10, 20);
+    no_total = Value::object();
+    no_total.set("compile", Value::number(10));
+    CHECK_FALSE(validate_timings({no_total}).empty());
+    Value no_compile = full(10, 20);
+    Value rebuilt = Value::object();
+    for (std::size_t i = 0; i < no_compile.size(); ++i) {
+        if (no_compile.key_at(i) != "compile") rebuilt.set(no_compile.key_at(i), no_compile.value_at(i));
+    }
+    CHECK_FALSE(validate_timings({rebuilt}).empty());
+    Value text = full(10, 20);
+    text.set("total", Value::string("20"));
+    CHECK_FALSE(validate_timings({text}).empty());
+    Value negative = full(10, 20);
+    negative.set("link", Value::number(-1));
+    CHECK_FALSE(validate_timings({negative}).empty());
+    CHECK_FALSE(validate_timings({Value::integer(3)}).empty());
+}
+
 #ifdef CML_BENCH_SCENARIOS_DIR
 TEST_CASE("the checked-in perf scenario parses: the watcher idles first, then five reloads, then the report") {
     namespace fs = std::filesystem;
