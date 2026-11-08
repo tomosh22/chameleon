@@ -262,6 +262,31 @@ void Supervisor::kill(std::size_t id) {
     }
 }
 
+cml::Result<void> Supervisor::adopt(std::size_t id, std::uint32_t new_pid) {
+    if (id >= children_.size()) {
+        return cml::Diag::make(cml::ids::kLaunchFailed, "no such child to follow to pid " + std::to_string(new_pid), "This is a harness bug; report it.");
+    }
+    HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, new_pid);
+    if (process == nullptr) {
+        // MiniDumpWriteDump wants more rights than the rest needs; without them the dump is the only thing lost.
+        process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, FALSE, new_pid);
+    }
+    if (process == nullptr) {
+        return cml::Diag::make(cml::ids::kLaunchFailed, "cannot open the relaunched process " + std::to_string(new_pid) + " (" + win32_error_text(GetLastError()) + ")",
+                               "The process may have exited right after it registered.");
+    }
+    if (job_ != nullptr) {
+        AssignProcessToJobObject(job_, process);  // normally already a member (the broker's child inherits the job); failure is harmless
+    }
+    Child& child = children_[id];
+    if (child.process != nullptr) {
+        CloseHandle(child.process);
+    }
+    child.process = process;
+    child.pid = new_pid;
+    return cml::Result<void>();
+}
+
 void Supervisor::kill_all() {
     for (std::size_t i = 0; i < children_.size(); ++i) {
         kill(i);

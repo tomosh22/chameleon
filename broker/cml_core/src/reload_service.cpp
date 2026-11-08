@@ -7,9 +7,12 @@
 #include <set>
 #include <thread>
 
+#include "cml/core/control_args.h"
 #include "cml/core/header_diag_ids.h"
 #include "cml/core/pipeline_diag_ids.h"
 #include "cml/core/process_registry.h"
+#include "cml/core/restart.h"
+#include "cml/core/restart_diag_ids.h"
 #include "cml/core/revert.h"
 #include "cml/core/revert_diag_ids.h"
 #include "cml/util/log.h"
@@ -31,42 +34,10 @@ Diag bad_request(const std::string& message) {
 
 // Reads an optional unsigned integer argument; false (and *error set) when present with a wrong type or range.
 bool read_uint(const Value& args, const char* key, std::uint32_t max, std::uint32_t* out, std::optional<Diag>* error) {
-    const Value* v = args.find(key);
-    if (v == nullptr || v->is_null()) {
-        return true;
-    }
-    if (!v->is_integer() || v->as_integer() < 0 || v->as_integer() > static_cast<std::int64_t>(max)) {
-        *error = bad_request(std::string("argument '") + key + "' must be an integer from 0 to " + std::to_string(max));
-        return false;
-    }
-    *out = static_cast<std::uint32_t>(v->as_integer());
-    return true;
+    return read_uint_arg(args, key, max, out, error, bad_request);
 }
 
 std::string normalized_key(const std::string& p) { return normalized_path_key(p); }
-
-// One reload or revert at a time (WP-12, WP-22): takes the lock without waiting and, while held, shows the service as running
-// (`wait idle` waits for it).
-class ExclusiveRun {
-public:
-    ExclusiveRun(std::mutex& mutex, std::atomic<bool>& running) : lock_(mutex, std::try_to_lock), running_(running) {
-        if (lock_.owns_lock()) {
-            running_.store(true);
-        }
-    }
-    ~ExclusiveRun() {
-        if (lock_.owns_lock()) {
-            running_.store(false);
-        }
-    }
-    ExclusiveRun(const ExclusiveRun&) = delete;
-    ExclusiveRun& operator=(const ExclusiveRun&) = delete;
-    bool acquired() const { return lock_.owns_lock(); }
-
-private:
-    std::unique_lock<std::mutex> lock_;
-    std::atomic<bool>& running_;
-};
 
 // Value of an environment variable ("" when unset); _dupenv_s on Windows (getenv is deprecated there, /WX).
 std::string env_value(const char* name) {
@@ -92,6 +63,7 @@ ReloadService::ReloadService(PipelineEnv env, EventBus* events, std::string sess
     // A directory the user chose (--session-dir, $CML_SESSION_DIR) is theirs: it is never removed. Only the
     // temporary default is.
     keep_session_dir_ = !session_dir_.empty();
+    set_process_host(native_process_host());  // WP-21: null on hosts that cannot restart processes
 }
 
 ReloadService::~ReloadService() {
@@ -302,6 +274,88 @@ std::shared_ptr<ModuleState> ReloadService::module_state(std::uint64_t agent_id,
     return m == it->second.modules.end() ? nullptr : m->second;
 }
 
+// ---- hot-restart (WP-21) --------------------------------------------------------------------------------------
+
+void ReloadService::set_process_host(std::shared_ptr<ProcessHost> host) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!host) {
+        restart_.reset();
+        return;
+    }
+    restart_ = std::make_shared<RestartCoordinator>(*this, events_, std::move(host));
+}
+
+void ReloadService::set_restart_trace_for_testing(std::function<void(const std::string&)> trace) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (restart_) {
+        restart_->set_trace_for_testing(std::move(trace));
+    }
+}
+
+bool ReloadService::restart_available() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return restart_ != nullptr;
+}
+
+Result<Value> ReloadService::restart(const Value& args) {
+    std::shared_ptr<RestartCoordinator> coordinator;  // held for the whole call: set_process_host may replace it meanwhile
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        coordinator = restart_;
+    }
+    if (coordinator == nullptr) {
+        return Diag::make(restart::diag::kUnavailable, "this broker cannot restart processes on this system",
+                          "Restart the application yourself; hot-restart needs the Windows broker.");
+    }
+    return coordinator->restart(args);
+}
+
+std::vector<std::shared_ptr<AgentLink>> ReloadService::links() const {
+    std::vector<std::shared_ptr<AgentLink>> out;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& agent : agents_) {
+        if (agent.second.link) {
+            out.push_back(agent.second.link);
+        }
+    }
+    return out;
+}
+
+std::shared_ptr<AgentLink> ReloadService::link_for_pid(std::uint32_t pid) const {
+    for (const std::shared_ptr<AgentLink>& link : links()) {
+        const LinkSnapshot snap = link->snapshot();
+        if (snap.handshaken && snap.pid == pid && !link->closed()) {
+            return link;
+        }
+    }
+    return nullptr;
+}
+
+std::shared_ptr<AgentLink> ReloadService::link_for_restart_token(const std::string& token, std::uint32_t pid) const {
+    if (token.empty()) {
+        return nullptr;
+    }
+    for (const std::shared_ptr<AgentLink>& link : links()) {
+        const LinkSnapshot snap = link->snapshot();
+        if (snap.handshaken && snap.restart_token == token && snap.pid == pid && !link->closed()) {
+            return link;
+        }
+    }
+    return nullptr;
+}
+
+std::vector<std::shared_ptr<ModuleState>> ReloadService::module_states(std::uint64_t agent_id) const {
+    std::vector<std::shared_ptr<ModuleState>> out;
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = agents_.find(agent_id);
+    if (it != agents_.end()) {
+        for (const auto& m : it->second.modules) {
+            out.push_back(m.second);
+        }
+    }
+    return out;
+}
+
 ReloadOptions ReloadService::options() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return options_;
@@ -332,7 +386,19 @@ Result<Value> ReloadService::reload(const Value& args) {
     return run_reload(args, false);
 }
 
-Result<Value> ReloadService::run_reload(const Value& args, bool automatic) {
+std::unique_ptr<ExclusiveRun> ReloadService::lock_reloads() {
+    auto run = std::make_unique<ExclusiveRun>(reload_mutex_, running_);
+    if (!run->acquired()) {
+        return nullptr;
+    }
+    return run;
+}
+
+Result<Value> ReloadService::reload_locked(const Value& args) {
+    return run_reload(args, false, true);
+}
+
+Result<Value> ReloadService::run_reload(const Value& args, bool automatic, bool lock_held) {
     std::uint32_t pid = 0;
     std::uint32_t timeout_ms = 60000;
     std::optional<Diag> error;
@@ -354,8 +420,11 @@ Result<Value> ReloadService::run_reload(const Value& args, bool automatic) {
         confirm = c->as_bool();
     }
 
-    ExclusiveRun exclusive(reload_mutex_, running_);
-    if (!exclusive.acquired()) {
+    std::optional<ExclusiveRun> exclusive;  // WP-21: a restart holds the run lock itself (lock_reloads) and calls reload_locked()
+    if (!lock_held) {
+        exclusive.emplace(reload_mutex_, running_);
+    }
+    if (!lock_held && !exclusive->acquired()) {
         const Diag d = Diag::make(pd::kBusy, "another reload is still running", "Wait for it to finish (control command `wait`) and try again.");
         if (automatic) {
             return d;  // the caller retries quietly

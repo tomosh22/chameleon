@@ -37,7 +37,8 @@
  *   CML_COMPILE_START_HOOK(fn)    void fn(void)  the broker started compiling
  *   CML_COMPILE_SUCCESS_HOOK(fn)  void fn(void)  the compile finished without errors
  *   CML_COMPILE_ERROR_HOOK(fn)    void fn(const char* message)  the compile failed (UTF-8, one line)
- *   CML_PRERESTART_HOOK(fn)       void fn(void)  reserved: restart is not implemented yet, never called
+ *   CML_PRERESTART_HOOK(fn)       void fn(void)  runs in the process just before the broker terminates it to start it
+ *                                 again (hot-restart; same thread rules as the patch hooks, an exception is contained)
  * Patch hooks run on the thread that applies the patch: inside SyncPoint() in synchronised mode,
  * on the agent thread in immediate mode. Once the pre-patch hooks ran, the post-patch hooks run too, also when
  * the installation failed (ask cml_last_patch_status()). Compile hooks run inside SyncPoint() in synchronised

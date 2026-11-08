@@ -1,0 +1,119 @@
+# Scenario `hot_restart` (WP-21, plan 4.12): the broker terminates the running process and starts it again with the same
+# command line, working directory and environment (plus CML_RESTART_TOKEN) and the same standard handles, waits for the new
+# agent to register, enables the same modules again, and re-applies the edits of the session.
+#
+#  1. value=1 -> edit -> reload -> value=2 in the first process.
+#  2. `restart`: the application's CML_PRERESTART_HOOK runs first (PRERESTART line), then the process is replaced.
+#     The fixture does NOT enable its module in a relaunched process (CML_RESTART_TOKEN is set), so a module that is
+#     enabled afterwards was enabled by the broker. The new process starts from the original binary (value=1, n=0) and
+#     the broker's re-applied reload brings the edited value (value=2) back; the restart result says one patch was applied.
+#  3. The relaunched process writes into the same output file (the standard handles were handed on), so expect_stdout keeps
+#     reading one stream; `label=kept cwd_ok=1 env_ok=1` show command line, working directory and environment survived.
+#  4. A second restart carries the same edit over again (the original binary's baseline is remembered across restarts).
+name = "hot_restart"
+description = "fixture hot_restart: value=1 -> edit+reload -> 2 -> restart (hooks, same args/cwd/env/stdout, module re-enabled, edit re-applied) -> restart again"
+fixture = "hot_restart"
+fixture_args = "--label=kept"
+timeout_s = 300
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1 pid=\\d+ restarted=0 label=kept cwd_ok=1 env_ok=1"
+within_s = 20
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_hot_restart.exe"
+within_s = 20
+
+[[step]]
+kind = "edit"
+patch = "edits/value_2.edit"
+
+[[step]]
+kind = "reload"
+within_s = 90
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2 pid=\\d+ restarted=0"
+within_s = 15
+
+# --- first restart ---
+[[step]]
+kind = "restart"
+within_s = 120
+expect_result_key = "patched"
+expect_result_value = 1
+
+# The hook ran in the old process, with the edited code, before it was terminated.
+[[step]]
+kind = "expect_stdout"
+regex = "PRERESTART pid=\\d+ value=2"
+within_s = 10
+
+# The new process: another pid, the token in its environment, no EnableModule of its own.
+[[step]]
+kind = "expect_stdout"
+regex = "START pid=\\d+ restarted=1"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "AGENT module not enabled by the application"
+within_s = 10
+
+# It starts from the original binary ...
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=0 value=1 pid=\\d+ restarted=1 label=kept cwd_ok=1 env_ok=1"
+within_s = 10
+
+# ... and registered with the broker with its module enabled by the broker (the harness follows the new pid).
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_hot_restart.exe"
+within_s = 30
+
+# The edit of the session is back.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2 pid=\\d+ restarted=1 label=kept cwd_ok=1 env_ok=1"
+within_s = 15
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2 pid=\\d+ restarted=1"
+within_s = 10
+
+# --- second restart: the original sources' baseline travels along ---
+[[step]]
+kind = "restart"
+within_s = 120
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=0 value=1 pid=\\d+ restarted=1"
+within_s = 10
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_hot_restart.exe"
+within_s = 30
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2 pid=\\d+ restarted=1 label=kept"
+within_s = 15
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2 pid=\\d+ restarted=1 label=kept"
+within_s = 10
