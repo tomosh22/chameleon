@@ -16,7 +16,7 @@ std::atomic<std::uint32_t> g_remaining[ipc::fault::kStageCount];
 }  // namespace
 
 bool consume(ipc::fault::Stage stage) noexcept {
-    if (!kBuilt) {
+    if constexpr (!kBuilt) {
         return false;
     }
     std::atomic<std::uint32_t>& slot = g_remaining[static_cast<std::size_t>(stage)];
@@ -57,7 +57,7 @@ ipc::Message handle_arm_request(const ipc::Message& message) {
         return reply;
     }
     reply.request_id = request->request_id;
-    if (!kBuilt) {
+    if constexpr (!kBuilt) {
         reply.status = f::ids::kAgentNotCompiledIn;
         reply.message = "this agent was built without CML_FAULT_INJECTION; use a build with failure injection (the default)";
         return reply;

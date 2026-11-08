@@ -36,7 +36,7 @@ cml::ipc::Message arm_message(const std::string& stage, std::uint32_t count, std
 
 TEST_CASE("agent fault: consume uses up exactly the armed passes") {
     Disarmed guard;
-    if (!af::kBuilt) {
+    if constexpr (!af::kBuilt) {
         CHECK_FALSE(af::consume(f::Stage::HookInstall));
         return;
     }
@@ -57,7 +57,7 @@ TEST_CASE("agent fault: consume uses up exactly the armed passes") {
 
 TEST_CASE("agent fault: concurrent consumers use each pass exactly once") {
     Disarmed guard;
-    if (!af::kBuilt) {
+    if constexpr (!af::kBuilt) {
         return;
     }
     constexpr std::uint32_t kPasses = 1000;
@@ -84,7 +84,7 @@ TEST_CASE("agent fault: ArmFault arms an agent stage, answers with the request i
     Disarmed guard;
     CHECK(af::is_arm_request(arm_message("link", 1)));
     CHECK_FALSE(af::is_arm_request(cml::ipc::Message(cml::ipc::Reply{})));
-    if (!af::kBuilt) {
+    if constexpr (!af::kBuilt) {
         const cml::ipc::Reply r = reply_of(af::handle_arm_request(arm_message("patch-load", 1)));
         CHECK(r.status == f::ids::kAgentNotCompiledIn);
         CHECK(r.request_id == 7);
@@ -102,7 +102,7 @@ TEST_CASE("agent fault: ArmFault arms an agent stage, answers with the request i
 
 TEST_CASE("agent fault: unknown stages, stages of the broker and bad counts are CML4654 and arm nothing") {
     Disarmed guard;
-    if (!af::kBuilt) {
+    if constexpr (!af::kBuilt) {
         return;
     }
     for (const char* stage : {"", "nope", "link", "compile", "Patch-Load", "none "}) {

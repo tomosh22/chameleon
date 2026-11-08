@@ -20,7 +20,7 @@ Diag FaultInjector::make_diag(fault::Stage stage) {
 
 Result<void> FaultInjector::arm(fault::Stage stage, std::uint32_t count, std::optional<std::uint32_t> pid) {
     const fault::StageInfo& info = fault::info(stage);
-    if (!kFaultInjectionBuilt) {
+    if constexpr (!kFaultInjectionBuilt) {
         return Diag::make(fault::ids::kBadRequest, "this broker was built without CML_FAULT_INJECTION", "Use a build with failure injection (the default).");
     }
     if (info.agent_side) {
@@ -41,7 +41,7 @@ void FaultInjector::disarm_all() {
 }
 
 std::optional<Diag> FaultInjector::hit(fault::Stage stage, std::uint32_t pid) {
-    if (!kFaultInjectionBuilt) {
+    if constexpr (!kFaultInjectionBuilt) {
         return std::nullopt;
     }
     {
