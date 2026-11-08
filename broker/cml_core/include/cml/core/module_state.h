@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "cml/core/hook_narrowing.h"
 #include "cml/core/module_index.h"
 #include "cml/core/source_baseline.h"
 #include "cml/core/symbol_registry.h"
@@ -107,6 +108,19 @@ struct ModuleState {
     std::vector<PatchBatch> batches;                // live patches, oldest first (WP-22)
 
     bool is_hooked(std::uint64_t old_va);
+
+    // WP-25: what the patches' functions look like, keyed by the address of the patch code (the new entry of a hook, or the
+    // address of a function a patch introduced). `code_running_at(entry)` is the record of the code that runs when `entry`
+    // is called: the hook target when the entry is hooked, else the entry itself. Records are never removed: the patch DLLs
+    // stay loaded, and a revert that re-points a hook only changes which record applies.
+    std::map<std::uint64_t, std::shared_ptr<const CodeImage>> code;
+    void record_code(std::uint64_t patch_entry, std::shared_ptr<const CodeImage> record);  // takes `mutex`
+    std::shared_ptr<const CodeImage> code_running_at(std::uint64_t entry);               // takes `mutex`
+    // Drops the records nothing reaches: those that are no value of `hooked` and no function a patch introduced that is still
+    // canonical in the registry and not hooked since. Call after `hooked` / `registry` changed (a new patch superseded a hook, a
+    // revert undid one, the module went away). `prune_code_locked` needs `mutex` held.
+    void prune_code();
+    void prune_code_locked();
 };
 
 }  // namespace cml::core
