@@ -27,7 +27,8 @@ inline constexpr std::uint32_t kUnmatchedInitialiser = 3215; // dynamic initiali
 
 // WP-24 (ADR-0032: CML3400..CML3449).
 inline constexpr std::uint32_t kNewThreadLocal = 3400;     // thread_local the old image does not have (error)
-inline constexpr std::uint32_t kThreadLocalInit = 3401;    // dynamic initialiser/destructor of a thread_local stays the old one (warning)
+inline constexpr std::uint32_t kAmbiguousThreadLocal = 3402;  // several S_GTHREAD32 records for one name (error)
+inline constexpr std::uint32_t kThreadLocalInit = 3401;   // dynamic initialiser/destructor of a thread_local stays the old one (warning)
 
 // Warnings (the plan is still produced).
 inline constexpr std::uint32_t kSharedInitialiser = 3210;  // TU-wide initialiser may re-run initialisers of bound globals

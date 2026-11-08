@@ -152,6 +152,8 @@ struct Sym {
     bool weak = false;
     bool common = false;
     bool decided = false;
+    bool via_secrel = false;  // referenced by a SECREL relocation (thread-local access)
+    bool diagnosed = false;   // an error was already raised for it
     SymbolDecision dec;
 };
 
@@ -349,7 +351,7 @@ private:
     void bridge_statics();
     void reject_new_thread_locals();
     void warn_thread_local_initialisers();
-    void new_thread_local_error(const Sym& sy);
+    void new_thread_local_error(Sym& sy);  // marks sy diagnosed
     void resolve_undefined();
     void build_fixups();
     void assemble();
@@ -358,10 +360,18 @@ private:
     // ---- lookups ----
     std::optional<OldRef> lookup_registry(const std::string& name, SymbolType want);
     std::optional<OldRef> lookup_public(const std::string& name, SymbolType want);
-    std::optional<OldRef> lookup_thread_global(const Sym& sy);
+    struct ThreadLookup {
+        std::optional<OldRef> ref;
+        bool ambiguous = false;
+    };
+    ThreadLookup lookup_thread_global(const Sym& sy);
+    bool in_old_tls(std::uint32_t rva);
+    std::uint32_t tls_rva_ = 0;
+    std::uint32_t tls_size_ = 0;
+    bool tls_known_ = false;
     bool ensure_compiland_symbols();
     std::vector<const pdb::SymbolView*> static_candidates(const std::string& base, const std::string& encl, bool want_function,
-                                                          const std::string& display = {});
+                                                          const std::string& display = {}, int tls_mode = 0);
     std::optional<OldRef> resolve_name(Sym& sy);  // the undefined-symbol chain
 
     void decide(Sym& sy, DecisionKind kind, BindSource source, SymbolType type, const TargetAddress& addr, std::string reason);
@@ -656,12 +666,13 @@ std::optional<OldRef> Planner::lookup_public(const std::string& name, SymbolType
 // section, offset = offset inside it). The S_PUB32 of a thread-local does NOT carry that offset (CI evidence,
 // WP-24: the public's RVA of a namespace-scope thread_local was ~0x10d54 past its neighbour's S_LTHREAD32 offset
 // of 0x8 in the same object), so publics must not be used to place a SECREL.
-std::optional<OldRef> Planner::lookup_thread_global(const Sym& sy) {
+Planner::ThreadLookup Planner::lookup_thread_global(const Sym& sy) {
+    ThreadLookup out;
     const std::string& disp = sy.dec.display.empty() ? sy.name : sy.dec.display;
     Result<std::vector<pdb::SymbolView>> globals = pdb_.find_global_data(disp);
     if (!globals) {
         fatal(globals.error());
-        return std::nullopt;
+        return out;
     }
     const pdb::SymbolView* found = nullptr;
     for (const pdb::SymbolView& v : *globals) {
@@ -669,20 +680,36 @@ std::optional<OldRef> Planner::lookup_thread_global(const Sym& sy) {
             continue;
         }
         if (found != nullptr) {
-            CML_LOG(Trace, "bind: thread_local '%s' has several S_GTHREAD32 records: not used", disp.c_str());
-            return std::nullopt;
+            out.ambiguous = true;
+            return out;
         }
         found = &v;
     }
     if (found == nullptr) {
-        return std::nullopt;
+        return out;
     }
     OldRef r;
     r.addr = module_address(found->rva);
     r.source = BindSource::PdbGlobal;
     r.type = SymbolType::Data;
     r.note = "S_GTHREAD32 at rva " + hex(found->rva) + " (section " + std::to_string(found->section) + " offset " + hex(found->offset) + ")";
-    return r;
+    out.ref = std::move(r);
+    return out;
+}
+
+// Is the RVA inside the old image's .tls section (the TLS template)?
+bool Planner::in_old_tls(std::uint32_t rva) {
+    if (!tls_known_) {
+        tls_known_ = true;
+        for (const pdb::SectionHeader& h : pdb_.sections()) {
+            if (starts_with(std::string_view(h.name.data()), ".tls")) {
+                tls_rva_ = h.rva;
+                tls_size_ = std::max(h.virtual_size, h.raw_size);
+                break;
+            }
+        }
+    }
+    return tls_size_ != 0 && rva >= tls_rva_ && rva - tls_rva_ < tls_size_;
 }
 
 bool Planner::ensure_compiland_symbols() {
@@ -701,7 +728,7 @@ bool Planner::ensure_compiland_symbols() {
 }
 
 std::vector<const pdb::SymbolView*> Planner::static_candidates(const std::string& base, const std::string& encl, bool want_function,
-                                                                const std::string& display) {
+                                                                const std::string& display, int tls_mode) {
     // A static matches an old record ONLY when its scope matches exactly: the same enclosing function, or
     // file scope. Records of other scopes are never candidates (a wrong match would bind live state or a
     // hook to an unrelated entity): "f::counter" is not "g::counter", and a new file-scope "count" is
@@ -719,6 +746,14 @@ std::vector<const pdb::SymbolView*> Planner::static_candidates(const std::string
         const bool is_data = pdb::is_data_kind(v.kind);
         if (want_function ? !is_func : !is_data) {
             continue;
+        }
+        // S_LTHREAD32 / S_GTHREAD32 and S_LDATA32 / S_GDATA32 never stand for each other: a static whose
+        // thread_local-ness changed is a different variable (tls_mode 0: plain data, 1: thread-local, -1: either).
+        if (!want_function && tls_mode >= 0) {
+            const bool thread = v.kind == pdb::SymbolKind::LocalThread || v.kind == pdb::SymbolKind::GlobalThread;
+            if (thread != (tls_mode == 1)) {
+                continue;
+            }
         }
         if (comp_last(&v) != base) {
             continue;
@@ -815,9 +850,9 @@ void Planner::decide_defined() {
         const SymbolType type = (si != nullptr && si->code) ? SymbolType::Function : SymbolType::Data;
         sy.dec.type = type;
 
-        // thread_local data (WP-24): an external one is looked up like any other global below (the
-        // module's publics carry it with its offset in the old .tls section); a static one is matched in
-        // bridge_statics(). Whatever is not in the old image is rejected (new_thread_local_error).
+        // thread_local data (WP-24): an external one is looked up through its S_GTHREAD32 record
+        // (lookup_thread_global, never the publics: their offset is not the TLS offset); a static one is matched
+        // in bridge_statics(). Whatever is not in the old image is rejected (CML3400).
         // Fresh copies (plan 4.5): vtables, RTTI, constants, unwind tables, initialiser stubs, funclets.
         if (type == SymbolType::Data && (is_fresh_data_name(sy.name) || sy.name.find("$rtc") != std::string::npos ||
                                          (si != nullptr && si->runtime_table))) {
@@ -856,11 +891,34 @@ void Planner::decide_defined() {
         }
 
         // External (or COMMON): registry, then the module's publics.
-        std::optional<OldRef> old = lookup_registry(sy.name, type);
+        std::optional<OldRef> old;
         if (si != nullptr && si->tls) {
-            old = lookup_thread_global(sy);  // never the public: its offset is not the TLS offset
-        } else if (!old) {
-            old = lookup_public(sy.name, type);
+            const ThreadLookup tl = lookup_thread_global(sy);
+            if (tl.ambiguous) {
+                error(diag::kAmbiguousThreadLocal,
+                      "thread_local '" + sy.dec.display + "' (" + sy.name + ") matches several S_GTHREAD32 records of the old image; cannot tell which one it is",
+                      "Rename one of the thread_locals, or hot-restart.");
+                decide(sy, DecisionKind::PatchNewData, BindSource::None, type, {}, "ambiguous thread_local (CML3402)");
+                continue;
+            }
+            old = tl.ref;
+        } else {
+            old = lookup_registry(sy.name, type);
+            if (type == SymbolType::Data) {
+                // The old definition may have been thread_local while this one is not: its public would give a
+                // meaningless address.
+                const ThreadLookup tl = lookup_thread_global(sy);
+                if (tl.ref || tl.ambiguous) {
+                    error(diag::kThreadLocal,
+                          "'" + sy.dec.display + "' is a thread_local in the old image but " + in_.object_name + " defines it as ordinary data; storage of a different kind cannot be bound",
+                          "Keep the thread_local keyword, or hot-restart.");
+                    decide(sy, DecisionKind::PatchNewData, BindSource::None, type, {}, "was thread_local in the old image (CML3102)");
+                    continue;
+                }
+            }
+            if (!old) {
+                old = lookup_public(sy.name, type);
+            }
         }
         if (type == SymbolType::Function) {
             if (old) {
@@ -888,6 +946,7 @@ void Planner::bridge_statics() {
     // S_LPROC32 / S_LDATA32 records by (name, compiland); ties by position and by RVA.
     struct Group {
         bool is_func = false;
+        bool is_tls = false;
         std::string base;
         std::string encl;
         std::string display;
@@ -915,9 +974,11 @@ void Planner::bridge_statics() {
             continue;
         }
         const std::string encl = enclosing_function(sy.name);
-        const std::string key = std::string(is_func ? "F|" : "D|") + canonical_lambda_names(sy.dec.display) + "|" + base + "|" + encl;
+        const bool is_tls = !is_func && sy.dec.section != 0 && secs_[sy.dec.section - 1].tls;
+        const std::string key = std::string(is_func ? "F|" : (is_tls ? "T|" : "D|")) + canonical_lambda_names(sy.dec.display) + "|" + base + "|" + encl;
         Group& g = groups[key];
         g.is_func = is_func;
+        g.is_tls = is_tls;
         g.base = base;
         g.encl = encl;
         g.display = sy.dec.display == sy.name ? std::string() : sy.dec.display;
@@ -943,7 +1004,7 @@ void Planner::bridge_statics() {
 
     // Pass A: unambiguous name matches (also learns the section deltas).
     for (auto& [key, g] : groups) {
-        const std::vector<const pdb::SymbolView*> cands = static_candidates(g.base, g.encl, g.is_func, g.display);
+        const std::vector<const pdb::SymbolView*> cands = static_candidates(g.base, g.encl, g.is_func, g.display, g.is_tls ? 1 : 0);
         if (cands.empty()) {
             for (const std::uint32_t pos : g.members) {
                 Sym& sy = syms_[pos];
@@ -982,7 +1043,7 @@ void Planner::bridge_statics() {
     // overloads apart, but cml_pdb offers no type access yet.)
     for (const std::string& key : deferred) {
         Group& g = groups[key];
-        const std::vector<const pdb::SymbolView*> cands = static_candidates(g.base, g.encl, g.is_func, g.display);
+        const std::vector<const pdb::SymbolView*> cands = static_candidates(g.base, g.encl, g.is_func, g.display, g.is_tls ? 1 : 0);
         std::vector<std::uint32_t> unmatched = g.members;
         std::vector<const pdb::SymbolView*> free_cands = cands;
         // (1) exact qualified names, one-to-one
@@ -1034,6 +1095,7 @@ void Planner::bridge_statics() {
                           "; cannot tell which old function each new one replaces (" + std::to_string(g.members.size()) + " in the patch, " +
                           std::to_string(cands.size()) + " records named '" + g.base + "' in compiland " + std::to_string(ci_) + ")",
                       "Rename one overload, or hot-restart.");
+                sy.diagnosed = true;
                 decide(sy, DecisionKind::PatchNewFunction, BindSource::None, sy.dec.type, {}, "ambiguous static overloads (CML3214)");
                 continue;
             }
@@ -1041,6 +1103,7 @@ void Planner::bridge_statics() {
                   "static data '" + sy.dec.display + "' (" + sy.name + ") matches " + std::to_string(cands.size()) +
                       " records named '" + g.base + "' in compiland " + std::to_string(ci_) + " but the patch object defines " + std::to_string(g.members.size()) + " of them",
                   "Rename one of the statics, keep their number unchanged, or hot-restart.");
+            sy.diagnosed = true;
             decide(sy, DecisionKind::PatchNewData, BindSource::None, sy.dec.type, {}, "ambiguous static (CML3207)");
         }
     }
@@ -1076,6 +1139,10 @@ void Planner::bridge_statics() {
                 }
             }
         }
+        if (sy.dec.section != 0 && secs_[sy.dec.section - 1].tls) {
+            decide(sy, DecisionKind::PatchNewData, BindSource::None, SymbolType::Data, {}, "guard variable of a function-local thread_local not found in the old image (rejected: CML3400)");
+            continue;
+        }
         warn(diag::kGuardUnmatched, "guard variable '" + sy.dec.display + "' of a function-local static was not found in the old image; the patch gets a fresh guard",
              "Keep the layout of the statics in this source file unchanged, or hot-restart if the static must not be initialised again.");
         decide(sy, DecisionKind::PatchNewData, BindSource::None, SymbolType::Data, {}, "guard variable not found in the old image (CML3211): new");
@@ -1090,17 +1157,25 @@ void Planner::bridge_statics() {
 
 // ---- thread_local (WP-24) ----------------------------------------------------------------------
 
-void Planner::new_thread_local_error(const Sym& sy) {
+void Planner::new_thread_local_error(Sym& sy) {
+    sy.diagnosed = true;
+    if (is_guard_variable(sy.name)) {
+        error(diag::kNewThreadLocal,
+              "the initialisation guard '" + sy.dec.display + "' of a function-local thread_local in " + in_.object_name +
+                  " was not found in the old image (the thread_local is new, or the layout of the thread-locals of this source file changed); patch-local thread-local storage is not supported",
+              "Hot-restart, or keep the thread_locals of this source file unchanged.");
+        return;
+    }
     error(diag::kNewThreadLocal,
           "'" + sy.dec.display + "' is a new thread_local: " + in_.object_name + " defines it but the old image has no such thread-local variable; patch-local thread-local storage is not supported",
           "Hot-restart, or move the new thread_local to an unchanged source file (and rebuild).");
 }
 
 // Statics are decided in bridge_statics(); a thread_local static that did not match an old record (or whose
-// match is not bound) is new.
+// match is not bound) is new. One error per variable: statics that already got a diagnostic (ambiguity) are skipped.
 void Planner::reject_new_thread_locals() {
     for (Sym& sy : syms_) {
-        if (!sy.defined || !sy.decided || sy.dec.section == 0 || !secs_[sy.dec.section - 1].tls || !sy.is_static) {
+        if (!sy.defined || !sy.decided || sy.dec.section == 0 || !secs_[sy.dec.section - 1].tls || !sy.is_static || sy.diagnosed) {
             continue;
         }
         if (sy.dec.decision == DecisionKind::BindOldData) {
@@ -1167,7 +1242,7 @@ std::optional<OldRef> Planner::resolve_name(Sym& sy) {
         const std::string base = base_identifier(name);
         const std::string encl = enclosing_function(name);
         for (const bool want_function : {false, true}) {
-            const std::vector<const pdb::SymbolView*> cands = static_candidates(base, encl, want_function, sy.dec.display == name ? std::string() : sy.dec.display);
+            const std::vector<const pdb::SymbolView*> cands = static_candidates(base, encl, want_function, sy.dec.display == name ? std::string() : sy.dec.display, -1);
             if (cands.size() == 1) {
                 OldRef r;
                 r.addr = module_address(cands.front()->rva);
@@ -1181,11 +1256,31 @@ std::optional<OldRef> Planner::resolve_name(Sym& sy) {
     if (fatal_) {
         return std::nullopt;
     }
-    // (3a) an external thread_local of the module: S_GTHREAD32 (its public does not carry the TLS offset)
-    if (std::optional<OldRef> t = lookup_thread_global(sy)) {
-        return t;
+    // (3a) an external thread_local of the module: S_GTHREAD32 (its public does not carry the TLS offset). One
+    // global-stream lookup serves every undefined data symbol; a SECREL target must come from here (or from the
+    // compiland's S_LTHREAD32 above), never from the publics.
+    {
+        const ThreadLookup tl = lookup_thread_global(sy);
+        if (tl.ambiguous) {
+            error(diag::kAmbiguousThreadLocal,
+                  "thread_local " + describe(sy) + " matches several S_GTHREAD32 records of the old image; cannot tell which one " + in_.object_name + " uses",
+                  "Rename one of the thread_locals, or hot-restart.");
+            sy.diagnosed = true;
+            return std::nullopt;
+        }
+        if (tl.ref) {
+            return tl.ref;
+        }
     }
     if (fatal_) {
+        return std::nullopt;
+    }
+    if (sy.via_secrel) {
+        error(diag::kThreadLocal,
+              "thread-local reference to " + describe(sy) + " from " + referencing_description(sy.dec.first_ref_section, sy.dec.first_ref_offset) + " in " + in_.object_name +
+                  ": the old image's PDB has no S_GTHREAD32 / S_LTHREAD32 record for it, and a public symbol does not give a thread-local's offset",
+              "Move the thread_local to an unchanged source file, or hot-restart.");
+        sy.diagnosed = true;
         return std::nullopt;
     }
     // (3) PDB publics, then global data
@@ -1275,6 +1370,9 @@ void Planner::resolve_undefined() {
                 continue;
             }
             Sym& sy = syms_[pos];
+            if (rr.reloc.type == coff::RelocType::SecRel) {
+                sy.via_secrel = true;
+            }
             if (!referenced[pos]) {
                 referenced[pos] = true;
                 sy.dec.first_ref_section = static_cast<std::uint32_t>(i + 1);
@@ -1304,10 +1402,12 @@ void Planner::resolve_undefined() {
                 decide(sy, DecisionKind::WeakDefault, BindSource::None, SymbolType::Data, {}, "weak external found nowhere: the default symbol of the object is used");
                 continue;
             }
-            const std::string where = referencing_description(sy.dec.first_ref_section, sy.dec.first_ref_offset);
-            error(diag::kUnresolved,
-                  "unresolved external symbol " + describe(sy) + " referenced from " + where + " in " + in_.object_name,
-                  "Define it in a module of the process (or link the library that provides it into the patched module), or hot-restart.");
+            if (!sy.diagnosed) {
+                const std::string where = referencing_description(sy.dec.first_ref_section, sy.dec.first_ref_offset);
+                error(diag::kUnresolved,
+                      "unresolved external symbol " + describe(sy) + " referenced from " + where + " in " + in_.object_name,
+                      "Define it in a module of the process (or link the library that provides it into the patched module), or hot-restart.");
+            }
             decide(sy, DecisionKind::Unresolved, BindSource::None, SymbolType::Function, {}, "not found in the registry, the module's PDB, its imports or other modules' exports");
             continue;
         }
@@ -1378,13 +1478,27 @@ void Planner::build_fixups() {
                 continue;
             }
             const bool secrel = type == coff::RelocType::SecRel;
-            if (!secrel && ts.defined && ts.dec.section != 0 && secs_[ts.dec.section - 1].tls) {
-                // The address of a thread_local is per thread; only the SECREL access sequence is understood.
-                error(diag::kThreadLocal,
-                      std::string(coff::reloc_type_name(type)) + " reference to thread_local " + describe(ts) + " from " + where() + " in " + in_.object_name +
-                          "; only the SECREL access sequence of thread-local variables can be retargeted",
-                      "Hot-restart, or move the thread_local to an unchanged source file.");
-                continue;
+            // The TLS invariant: a SECREL against data of the old image must resolve inside the old .tls section
+            // from a thread-local record (S_GTHREAD32 / S_LTHREAD32), and nothing else may point into .tls (the
+            // address of a thread-local is per thread, a REL32/ADDR64 to the template is silent corruption).
+            if (dk == DecisionKind::BindOldData && ts.dec.old_address.rva != kNoRva) {
+                const bool in_tls = in_old_tls(ts.dec.old_address.rva);
+                const BindSource src = ts.dec.source;
+                const bool thread_source = src == BindSource::PdbGlobal || src == BindSource::CompilandStatic || src == BindSource::CompilandRva;
+                if (secrel && !(in_tls && thread_source)) {
+                    error(diag::kThreadLocal,
+                          "SECREL reference to " + describe(ts) + " from " + where() + " in " + in_.object_name +
+                              ", which is not a thread-local variable of the old image (" + (in_tls ? "no thread-local record" : "outside its .tls section") + ")",
+                          "Move the thread_local to an unchanged source file, or hot-restart.");
+                    continue;
+                }
+                if (!secrel && in_tls) {
+                    error(diag::kThreadLocal,
+                          std::string(coff::reloc_type_name(type)) + " reference to thread_local " + describe(ts) + " from " + where() + " in " + in_.object_name +
+                              "; only the SECREL access sequence of thread-local variables can be retargeted",
+                          "Hot-restart, or move the thread_local to an unchanged source file.");
+                    continue;
+                }
             }
             std::uint32_t section_offset = 0;
             if (secrel) {

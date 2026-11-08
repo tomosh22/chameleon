@@ -7,6 +7,7 @@
 #include "cml/core/bind_plan.h"
 #include "doctest.h"
 #include "synth.h"
+#include "tls_world.h"
 #include "worlds.h"
 
 using namespace cml_bind_test;
@@ -15,28 +16,7 @@ using namespace cml::core::bind;
 
 namespace {
 
-constexpr std::uint16_t kTlsSec = 4;
-
 bool contains(const std::string& hay, const std::string& needle) { return hay.find(needle) != std::string::npos; }
-
-// basic_world plus a .tls image section (rva 0x4000) with `g_tls_counter` (public, offset 0x8) and, in the
-// TU's compiland, the function-local static thread_local f::calls (S_LTHREAD32, offset 0x10).
-SynthWorld tls_world() {
-    SynthWorld w = basic_world(false);
-    w.spec.sections.push_back({".tls", 0x100, 0x4000, 0x100, 0xC0000040});
-    // The public of a thread-local carries a different offset than its S_GTHREAD32 (as in real MSVC PDBs): the
-    // planner must use the S_GTHREAD32 record.
-    w.pub_data("?g_tls_counter@@3HA", 0x60, kTlsSec);
-    w.spec.symrec.data(0x1113, "g_tls_counter", kTlsSec, 0x8);
-    w.pub_data("_Init_thread_epoch", 0x70, kTlsSec);
-    w.spec.symrec.data(0x1113, "_Init_thread_epoch", kTlsSec, 0x4);
-    w.pub_data("_tls_index", 0x120);
-    w.tu().symbols.proc(0x1110, "f", SynthWorld::kTextSec, 0x50, 0x30);
-    w.tu().symbols.data(0x1112, "calls", kTlsSec, 0x10);
-    w.tu().symbols.end();
-    w.open();
-    return w;
-}
 
 }  // namespace
 
@@ -66,6 +46,20 @@ TEST_CASE("tls: an existing external thread_local binds to the old storage; SECR
     }
     CHECK(saw);
     CHECK(r->warnings.empty());
+    PatchLayout l;
+    l.patch_base = 0x150000000ull;
+    l.section_rva[f.section] = 0x1000;
+    auto t = make_fixup_triples(*r, l);
+    REQUIRE_MESSAGE(t.has_value(), err(t));
+    bool triple = false;
+    for (const FixupTriple& ft : *t) {
+        if (ft.kind == FixupKind::SecRel32) {
+            triple = true;
+            CHECK(ft.rva == 0x1010);
+            CHECK(ft.value == 0x8);
+        }
+    }
+    CHECK(triple);
 }
 
 TEST_CASE("tls: an undefined thread_local of the module (the CRT's epoch) is placed by its S_GTHREAD32, not its public") {

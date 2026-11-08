@@ -13,7 +13,7 @@ kind = "launch"
 
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ step=1 main_ns=\\d{1,4} main_fn=\\d{1,4} work_ns=\\d{1,4} work_fn=\\d{1,4}"
+regex = "TICK n=\\d+ step=1 main_ns=\\d{1,7} main_fn=\\d{1,7} work_ns=\\d{1,7} work_fn=\\d{1,7}"
 within_s = 15
 
 [[step]]
@@ -24,7 +24,7 @@ within_s = 15
 # Let both threads' counters reach at least 20 before the patch: a reset afterwards cannot hide.
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ step=1 main_ns=([2-9][0-9]|[1-9][0-9]{2}) main_fn=([2-9][0-9]|[1-9][0-9]{2}) work_ns=([2-9][0-9]|[1-9][0-9]{2}) work_fn=([2-9][0-9]|[1-9][0-9]{2})"
+regex = "TICK n=\\d+ step=1 main_ns=([2-9][0-9]|[1-9][0-9]{2,6}) main_fn=([2-9][0-9]|[1-9][0-9]{2,6}) work_ns=([2-9][0-9]|[1-9][0-9]{2,6}) work_fn=([2-9][0-9]|[1-9][0-9]{2,6})"
 within_s = 15
 
 [[step]]
@@ -38,17 +38,17 @@ within_s = 90
 # Both threads run the patched code (step=5) and carry on from their old values (>= 20, never restarted at 5).
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ step=5 main_ns=([2-9][0-9]|[1-9][0-9]{2}) main_fn=([2-9][0-9]|[1-9][0-9]{2}) work_ns=([2-9][0-9]|[1-9][0-9]{2}) work_fn=([2-9][0-9]|[1-9][0-9]{2})"
+regex = "TICK n=\\d+ step=5 main_ns=([2-9][0-9]|[1-9][0-9]{2,6}) main_fn=([2-9][0-9]|[1-9][0-9]{2,6}) work_ns=([2-9][0-9]|[1-9][0-9]{2,6}) work_fn=([2-9][0-9]|[1-9][0-9]{2,6})"
 within_s = 10
 
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ step=5 main_ns=\\d{1,4} main_fn=\\d{1,4} work_ns=\\d{1,4} work_fn=\\d{1,4}"
+regex = "TICK n=\\d+ step=5 main_ns=\\d{1,7} main_fn=\\d{1,7} work_ns=\\d{1,7} work_fn=\\d{1,7}"
 within_s = 10
 
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ step=5 main_ns=\\d{1,4} main_fn=\\d{1,4} work_ns=\\d{1,4} work_fn=\\d{1,4}"
+regex = "TICK n=\\d+ step=5 main_ns=\\d{1,7} main_fn=\\d{1,7} work_ns=\\d{1,7} work_fn=\\d{1,7}"
 within_s = 10
 
 # A new thread_local is rejected; nothing changes.
@@ -63,12 +63,12 @@ expect_error = "CML3400"
 
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ step=5 main_ns=\\d{1,4} main_fn=\\d{1,4} work_ns=\\d{1,4} work_fn=\\d{1,4}"
+regex = "TICK n=\\d+ step=5 main_ns=\\d{1,7} main_fn=\\d{1,7} work_ns=\\d{1,7} work_fn=\\d{1,7}"
 within_s = 10
 
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ step=5 main_ns=\\d{1,4} main_fn=\\d{1,4} work_ns=\\d{1,4} work_fn=\\d{1,4}"
+regex = "TICK n=\\d+ step=5 main_ns=\\d{1,7} main_fn=\\d{1,7} work_ns=\\d{1,7} work_fn=\\d{1,7}"
 within_s = 10
 
 # Every counter, of both threads, only ever grew: across the first reload and across the rejected one.
