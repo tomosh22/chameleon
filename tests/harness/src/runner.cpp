@@ -20,6 +20,7 @@
 #include "cml/proc/proc.h"
 #include "exception_steps.h"
 #include "fixture_builder.h"
+#include "perf_runtime.h"
 #include "restart_step.h"
 #include "revert_step.h"
 #include "subscription.h"
@@ -261,6 +262,8 @@ private:
             }
             case StepKind::ExceptionAction: return from_exception(exception_steps_.act(*control_, step, kControlTimeoutMs));
             case StepKind::ExpectPendingExceptions: return from_exception(exception_steps_.pending(*control_, step, kControlTimeoutMs));
+            case StepKind::PerfIdle: return perf_idle(step);
+            case StepKind::PerfReport: return perf_report(step);
         }
         return StepOutcome::fail(cml::ids::kScenarioFailed, "unknown step kind");
     }
@@ -620,6 +623,7 @@ private:
         }
         last_reload_result_ = response->result;
         has_reload_result_ = true;
+        perf_.add_reload(response->result);  // WP-27: the per-stage timing of every reload feeds perf_report
         if (step.has_result_value) {
             const ipc::json::Value* member = response->result.find(step.result_key);
             if (member == nullptr || !member->is_integer() || member->as_integer() != step.result_value) {
@@ -676,6 +680,25 @@ private:
             return StepOutcome::pass(result.detail);
         }
         return StepOutcome::fail(*result.diag);
+    }
+
+    // WP-27 (bodies in perf_runtime.cpp): the broker's CPU while idle, and the statistics of the recorded reloads.
+    StepOutcome perf_idle(const Step& step) {
+        Proc* proc = find_proc(std::string());
+        if (proc == nullptr || !control_) {
+            return StepOutcome::fail(cml::ids::kScenarioFailed, "perf_idle needs a launched broker and fixture");
+        }
+        const std::size_t fixture_id = proc->id;
+        const PerfStepResult r = perf_.idle(supervisor_.pid(broker_id_), step, [this, fixture_id] { return !supervisor_.exit_code(fixture_id).has_value(); });
+        return r.ok ? StepOutcome::pass(r.detail) : StepOutcome::fail(cml::ids::kScenarioFailed, r.detail);
+    }
+
+    StepOutcome perf_report(const Step& step) {
+        if (!control_) {
+            return StepOutcome::fail(cml::ids::kScenarioFailed, "perf_report needs a launched broker");
+        }
+        const PerfStepResult r = perf_.report(supervisor_.pid(broker_id_), step, scenario_.name, options_.artifacts_dir);
+        return r.ok ? StepOutcome::pass(r.detail) : StepOutcome::fail(cml::ids::kScenarioFailed, r.detail);
     }
 
     StepOutcome signal_fixture() {
@@ -852,6 +875,7 @@ private:
     bool launched_ = false;
     fs::path signal_file_;
     ExceptionSteps exception_steps_;  // WP-20
+    PerfRecorder perf_;               // WP-27
     bool failed_ = false;
     std::optional<std::string> skip_reason_;
     Clock::time_point run_deadline_ = Clock::now();

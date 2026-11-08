@@ -18,3 +18,18 @@ set_target_properties(cml_pdb_bench PROPERTIES FOLDER "tests")
 if(MSVC AND TARGET fixture_basic)
     add_test(NAME bench.pdb_smoke COMMAND cml_pdb_bench "$<TARGET_PDB_FILE:fixture_basic>" --smoke)
 endif()
+
+# WP-27: the broker's memory on a large PDB (ModuleIndex + sweeps), asserted by the `pdb-benchmark` CI job; ctest runs it in
+# --smoke mode on the fixture PDB so the tool cannot rot. The reload/idle budgets are measured by the `perf` scenario
+# (tests/bench/scenarios/perf.toml, run by cmltest in the same job).
+if(WIN32)
+    add_executable(cml_broker_mem broker_mem.cpp)
+    target_link_libraries(cml_broker_mem PRIVATE cml_core psapi)
+    cml_apply_warnings(cml_broker_mem)
+    cml_target_core_style(cml_broker_mem)
+    set_target_properties(cml_broker_mem PROPERTIES FOLDER "tests")
+    if(MSVC AND TARGET fixture_basic)
+        add_test(NAME bench.broker_mem_smoke COMMAND cml_broker_mem "$<TARGET_PDB_FILE:fixture_basic>" --smoke)
+        set_tests_properties(bench.broker_mem_smoke PROPERTIES TIMEOUT 120)
+    endif()
+endif()

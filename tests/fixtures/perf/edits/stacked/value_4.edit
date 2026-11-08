@@ -1,0 +1,9 @@
+--- a/perf_work.cpp
++++ b/perf_work.cpp
+@@ -1996,5 +1996,5 @@
+ // padding 34
+ int perf_value()
+ {
+-    return 3;
++    return 4;
+ }
