@@ -27,6 +27,9 @@ std::vector<std::string> broker_capabilities(const ControlContext& context) {
             caps.emplace_back(ipc::capability::kRestart);  // WP-21
         }
         caps.emplace_back(ipc::capability::kRevert);  // WP-22
+#if defined(CML_FAULT_INJECTION)
+        caps.emplace_back(ipc::capability::kFaultInjection);  // WP-28
+#endif
     }
     if (context.exceptions != nullptr) {
         caps.emplace_back(ipc::capability::kExceptions);
@@ -174,6 +177,14 @@ ipc::ControlResponse handle_control_request(const ipc::ControlRequest& request, 
         if (request.cmd == "subscribe") {
             return subscribe_response(request, context);
         }
+#if defined(CML_FAULT_INJECTION)
+        if (request.cmd == "inject-failure") {
+            return answer(request, inject_failure(*context.service, request.args));  // WP-28
+        }
+        if (request.cmd == "fault-stages") {
+            return ipc::make_ok_response(request.id, fault_stages());  // WP-28
+        }
+#endif
         if (request.cmd == "restart" && context.service->restart_available()) {
             return answer(request, context.service->restart(request.args));  // WP-21
         }

@@ -7,6 +7,7 @@
 #include <system_error>
 
 #include "cml/ipc/control.h"
+#include "fault_step.h"
 #include "perf_steps.h"
 #include "restart_step.h"
 #include "rx.h"
@@ -30,6 +31,7 @@ const char* to_string(StepKind kind) {
         case StepKind::ExpectReloadResult: return "expect_reload_result";
         case StepKind::Restart: return "restart";
         case StepKind::Revert: return "revert";
+        case StepKind::InjectFailure: return "inject_failure";
         case StepKind::WatchExceptions: return "watch_exceptions";
         case StepKind::ExpectException: return "expect_exception";
         case StepKind::ExceptionAction: return "exception_action";
@@ -122,6 +124,10 @@ std::string Step::describe() const {
         case StepKind::ExpectPendingExceptions:
             out += " " + std::to_string(result_value);
             break;
+        case StepKind::InjectFailure:
+            out += " " + fault_stage + (fault_count != 1 ? " x" + std::to_string(fault_count) : std::string()) +
+                   (expect_error.empty() ? std::string() : " expecting the refusal " + expect_error);
+            break;
         case StepKind::ExpectExceptionUpdated:
             out += (exception_offers.empty() ? std::string() : " offering " + exception_offers) + (exception_lacks.empty() ? std::string() : " without " + exception_lacks) +
                    " within " + std::to_string(within_s) + " s";
@@ -145,6 +151,7 @@ const char* Step::required_capability() const {
         case StepKind::Wait: return cml::ipc::capability::kWait;
         case StepKind::ExpectEvent: return cml::ipc::capability::kSubscribe;
         case StepKind::Restart: return cml::ipc::capability::kRestart;
+        case StepKind::InjectFailure: return cml::ipc::capability::kFaultInjection;
         case StepKind::ExpectExceptionUpdated: return cml::ipc::capability::kReexecute;
         case StepKind::ExceptionAction: return exception_action == "reexecute" ? cml::ipc::capability::kReexecute : cml::ipc::capability::kExceptions;
         case StepKind::WatchExceptions:
@@ -446,6 +453,9 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
     if (*kind == "restart") {
         return parse_restart_step(table);  // restart_step.cpp
     }
+    if (*kind == "inject_failure") {
+        return parse_inject_step(table);  // fault_step.cpp (WP-28)
+    }
     if (*kind == "revert") {
         step.kind = StepKind::Revert;
         cml::Result<void> keys = only_keys(table, {"kind", "scope", "within_s", "expect_error"}, "a revert step");
@@ -568,7 +578,7 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
     return invalid(table.line, "unknown step kind '" + *kind +
                                    "' (launch, expect_stdout, expect_module_enabled, edit, reload, expect_diag, expect_monotonic, set_option, wait, "
                                    "expect_event, expect_reload_result, signal_fixture, revert, watch_exceptions, expect_exception, exception_action, "
-                                   "expect_pending_exceptions, expect_exception_updated, restart, perf_idle, perf_report)");
+                                   "expect_pending_exceptions, expect_exception_updated, restart, perf_idle, perf_report, inject_failure)");
 }
 
 }  // namespace

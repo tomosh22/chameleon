@@ -26,6 +26,12 @@ TEST_CASE("every capability a broker advertises today is covered") {
     CHECK(uncovered_capabilities({"status", "teleport"}) == std::vector<std::string>{"teleport"});
 }
 
+TEST_CASE("the test-only fault-injection capability (WP-28) needs no UI command") {
+    CHECK(uncovered_capabilities({"status", "reload", "fault-injection"}).empty());
+    const auto unavailable = unavailable_commands({"status", "reload", "wait", "set-option", "subscribe", "fault-injection"});
+    CHECK(std::find(unavailable.begin(), unavailable.end(), "fault-injection") == unavailable.end());
+}
+
 TEST_CASE("commands of a missing capability are reported unavailable") {
     const auto unavailable = unavailable_commands({"status", "reload", "wait", "set-option", "subscribe"});
     CHECK(unavailable == std::vector<std::string>{"exceptions", "exception-action", "restart", "revert"});

@@ -15,7 +15,9 @@ set(CML_AGENT_PORTABLE_SOURCES
     src/hook/length_decoder.cpp
     src/hook/hook_plan.cpp
     # WP-17: application hooks (record parsing and selection)
-    src/hook/user_hooks.cpp)
+    src/hook/user_hooks.cpp
+    # WP-28: failure injection (ArmFault, the per-stage counters; lock-free so the installer's window may ask)
+    src/fault/fault_injection.cpp)
 set(CML_AGENT_WINDOWS_SOURCES
     src/agent.cpp
     src/agent_log.cpp

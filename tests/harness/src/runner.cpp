@@ -22,6 +22,7 @@
 #include "fixture_builder.h"
 #include "perf_runtime.h"
 #include "restart_step.h"
+#include "fault_step.h"
 #include "revert_step.h"
 #include "subscription.h"
 #include "rx.h"
@@ -255,6 +256,7 @@ private:
             case StepKind::ExpectReloadResult: return expect_reload_result(step);
             case StepKind::Restart: return restart_process(step);
             case StepKind::Revert: return revert(step);
+            case StepKind::InjectFailure: return inject_failure(step);
             case StepKind::WatchExceptions: return from_exception(exception_steps_.watch(*control_, kControlTimeoutMs));
             case StepKind::ExpectException: {
                 const std::uint32_t limit_ms = std::min<std::uint32_t>(static_cast<std::uint32_t>(step.within_s) * 1000u, remaining_ms());
@@ -684,6 +686,12 @@ private:
             return StepOutcome::pass(result.detail);
         }
         return StepOutcome::fail(*result.diag);
+    }
+
+    // WP-28: arm a failure-injection stage (the body is in fault_step.cpp).
+    StepOutcome inject_failure(const Step& step) {
+        const InjectStepOutcome result = run_inject_step(*control_, step, kControlTimeoutMs);
+        return result.ok ? StepOutcome::pass(result.detail) : StepOutcome::fail(result.diag_code, result.detail);
     }
 
     // WP-27 (bodies in perf_runtime.cpp): the broker's CPU while idle, and the statistics of the recorded reloads.

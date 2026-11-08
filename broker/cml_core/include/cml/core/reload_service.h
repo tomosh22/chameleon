@@ -29,6 +29,7 @@
 
 #include "cml/core/agent_link.h"
 #include "cml/core/event_bus.h"
+#include "cml/core/fault_injection.h"
 #include "cml/core/module_state.h"
 #include "cml/core/pipeline.h"
 #include "cml/core/save_watcher.h"
@@ -109,6 +110,8 @@ public:
     void set_option_observer(OptionObserver observer);
     // Aborts running compiles and links (shutdown); sticky.
     void cancel() { cancel_.cancel(); }
+    // WP-28: the broker-side failure injection state (control command `inject-failure`).
+    FaultInjector& faults() noexcept { return faults_; }
 
     // The state of a module (tests, diagnostics); null when it is not enabled.
     std::shared_ptr<ModuleState> module_state(std::uint64_t agent_id, const std::string& module_path) const;
@@ -160,6 +163,7 @@ private:
     bool keep_session_dir_ = false;
     std::shared_ptr<ExportCache> exports_ = std::make_shared<ExportCache>();
     toolchain::CancelToken cancel_;
+    FaultInjector faults_;  // WP-28
 
     mutable std::mutex mutex_;  // agents_, options_
     std::map<std::uint64_t, AgentEntry> agents_;

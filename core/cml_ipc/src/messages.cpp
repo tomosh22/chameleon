@@ -397,6 +397,11 @@ void encode(Writer& w, const ExceptionAction& m) {
     w.u32(m.exception_id);
     w.u32(static_cast<std::uint32_t>(m.action));
 }
+void encode(Writer& w, const ArmFault& m) {
+    w.u64(m.request_id);
+    w.str(m.stage);
+    w.u32(m.count);
+}
 void encode(Writer& w, const ExceptionConfig& m) {
     w.u64(m.request_id);
     w.u32(m.flags);
@@ -720,6 +725,16 @@ Message decode_exception_action(Reader& r) {
     m.action = static_cast<ExceptionActionKind>(action);
     return m;
 }
+Message decode_arm_fault(Reader& r) {
+    ArmFault m;
+    m.request_id = r.u64();
+    m.stage = r.str();
+    m.count = r.u32();
+    if (r.ok() && m.stage.size() > kMaxFaultStageBytes) {
+        r.fail("ArmFault stage name too long");
+    }
+    return m;
+}
 Message decode_exception_config(Reader& r) {
     ExceptionConfig m;
     m.request_id = r.u64();
@@ -949,6 +964,7 @@ const char* to_string(MessageType type) noexcept {
         case MessageType::ReenableModules: return "ReenableModules";
         case MessageType::RestartCancel: return "RestartCancel";
         case MessageType::CompileEvent: return "CompileEvent";
+        case MessageType::ArmFault: return "ArmFault";
     }
     return "Unknown";
 }
@@ -982,6 +998,7 @@ bool is_implemented(MessageType type) noexcept {
         case MessageType::PatchLoaded:
         case MessageType::ApplyFixups:
         case MessageType::RunInitializers:
+        case MessageType::ArmFault:
             return true;
         default:
             return false;
@@ -1007,6 +1024,7 @@ MessageType type_of(const Message& message) noexcept {
         MessageType operator()(const Exception&) const noexcept { return MessageType::Exception; }
         MessageType operator()(const ExceptionAction&) const noexcept { return MessageType::ExceptionAction; }
         MessageType operator()(const ExceptionConfig&) const noexcept { return MessageType::ExceptionConfig; }
+        MessageType operator()(const ArmFault&) const noexcept { return MessageType::ArmFault; }
         MessageType operator()(const Reexecute&) const noexcept { return MessageType::Reexecute; }
         MessageType operator()(const InstallHooks&) const noexcept { return MessageType::InstallHooks; }
         MessageType operator()(const HooksInstalled&) const noexcept { return MessageType::HooksInstalled; }
@@ -1195,6 +1213,7 @@ Result<Message> decode_message(std::uint16_t type, std::uint16_t version, const 
         case MessageType::Exception: message = decode_exception(reader); break;
         case MessageType::ExceptionAction: message = decode_exception_action(reader); break;
         case MessageType::ExceptionConfig: message = decode_exception_config(reader); break;
+        case MessageType::ArmFault: message = decode_arm_fault(reader); break;
         case MessageType::Reexecute: message = decode_reexecute(reader); break;
         case MessageType::InstallHooks: message = decode_install_hooks(reader); break;
         case MessageType::HooksInstalled: message = decode_hooks_installed(reader); break;
@@ -1243,6 +1262,7 @@ bool is_request_type(std::uint16_t type) noexcept {
         case MessageType::ReenableModules:
         case MessageType::ExceptionAction:
         case MessageType::ExceptionConfig:
+        case MessageType::ArmFault:
         case MessageType::Reexecute:
         case MessageType::ReserveRange:
         case MessageType::ReleaseRange:
@@ -1271,6 +1291,7 @@ std::optional<std::uint64_t> peek_request_id(std::uint16_t type, const std::uint
         case MessageType::ReenableModules:
         case MessageType::ExceptionAction:
         case MessageType::ExceptionConfig:
+        case MessageType::ArmFault:
         case MessageType::Reexecute:
         case MessageType::ReserveRange:
         case MessageType::ReserveRangeResult:
@@ -1364,6 +1385,9 @@ std::string describe(const Message& message) {
         std::string operator()(const ExceptionAction& m) const {
             return "ExceptionAction request=" + std::to_string(m.request_id) + " id=" + std::to_string(m.exception_id) +
                    (m.action == ExceptionActionKind::Continue ? " continue" : m.action == ExceptionActionKind::Leave ? " leave" : " ignore");
+        }
+        std::string operator()(const ArmFault& m) const {
+            return "ArmFault request=" + std::to_string(m.request_id) + " stage=\"" + m.stage + "\" count=" + std::to_string(m.count);
         }
         std::string operator()(const Reexecute& m) const {
             return "Reexecute request=" + std::to_string(m.request_id) + " id=" + std::to_string(m.exception_id) + " frame=" + std::to_string(m.frame_index) +

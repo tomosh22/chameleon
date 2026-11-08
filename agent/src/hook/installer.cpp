@@ -12,6 +12,7 @@
 
 #include "cml/util/log.h"
 #include "diag_ids.h"
+#include "fault/fault_injection.h"
 #include "heap.h"
 
 namespace cml::agent::hook {
@@ -284,6 +285,9 @@ Diag batch_diag(std::uint32_t code, ThreadSet::Result result, std::uint32_t thre
                                      "abandoned and they run again.",
                                      options.window_budget_ms),
                               "Reduce the number of functions per reload or report this as a bug.");
+        case ipc::fault::ids::kAgentHookInstall:  // WP-28: built after the threads run again
+            return Diag::make(code, "injected failure at the stage 'hook-install' (inside the window with the application's threads suspended); nothing was written",
+                              "This failure was requested with the control command inject-failure. Reload again: without it the hooks install.");
         default:
             return Diag::make(code, format("hook installation failed (internal code %u).", code), "Report this as a bug.");
     }
@@ -368,12 +372,12 @@ bool Installer::find(const void* target, HookInfo* info) const {
     return true;
 }
 
-BatchResult Installer::install(const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes) {
-    return apply(false, requests, count, outcomes);
+BatchResult Installer::install(const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes, bool injectable) {
+    return apply(false, requests, count, outcomes, injectable);
 }
 
 BatchResult Installer::revert(const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes) {
-    return apply(true, requests, count, outcomes);
+    return apply(true, requests, count, outcomes, false);
 }
 
 // ---- the stopped-world part ---------------------------------------------------------------------
@@ -399,7 +403,7 @@ bool Installer::find_conflict(const Job* jobs, std::size_t count, std::size_t* t
 // Runs with the application's threads stopped. No allocation, no logging, no locks, no CRT: see
 // thread_set.h for the system calls used and why each is safe. The code that touches memory is
 // bracketed by heap::set_alloc_forbidden so that a stray allocation aborts in tests.
-void Installer::attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, Report* report) noexcept {
+void Installer::attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, Report* report, bool injectable) noexcept {
     if (options_.test_before_stop != nullptr) {
         options_.test_before_stop(options_.test_context);
     }
@@ -417,6 +421,12 @@ void Installer::attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, 
         std::size_t thread_index = 0;
         std::size_t job_index = 0;
         if (!find_conflict(jobs, count, &thread_index, &job_index)) {
+            // WP-28: failure injection (stage hook-install). One lock-free atomic decrement: nothing here allocates or takes a
+            // lock. Nothing was written; the threads are resumed below and the batch fails with the stage's diagnostic.
+            if (injectable && fault::consume(ipc::fault::Stage::HookInstall)) {
+                report->diag = ipc::fault::ids::kAgentHookInstall;
+                break;
+            }
             // Nobody is inside any window. Verify, then write.
             bool intact = true;
             for (std::size_t j = 0; j < count && intact; ++j) {
@@ -549,7 +559,7 @@ struct Interval {
 }  // namespace
 
 BatchResult Installer::apply(bool reverting, const HookRequest* requests, std::size_t count,
-                             std::vector<HookOutcome>& outcomes) {
+                             std::vector<HookOutcome>& outcomes, bool injectable) {
     std::lock_guard<std::mutex> lock(mutex_);
     BatchResult result;
     outcomes.assign(count, HookOutcome{});
@@ -926,7 +936,7 @@ BatchResult Installer::apply(bool reverting, const HookRequest* requests, std::s
     if (any_write) {
         for (;;) {
             report = Report{};
-            attempt(jobs.data(), count, &conflicts, &report);
+            attempt(jobs.data(), count, &conflicts, &report, injectable);
             ++result.stats.attempts;
             result.stats.threads = std::max(result.stats.threads, report.threads);
             result.stats.passes = std::max(result.stats.passes, report.passes);

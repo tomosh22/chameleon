@@ -128,6 +128,8 @@ struct Rig {
     std::uint32_t uncommit_status = 0;          // WP-22: status of the answer to ReleaseRange mode Uncommit (an older agent refuses it)
     bool answer_hooks = true;
     bool close_on_load = false;
+    std::uint32_t arm_status = 0;               // WP-28: status of the Reply to ArmFault (failure injection)
+    std::uint32_t arm_status2 = 0;              // WP-28: the same for the second process
 
     std::mutex mutex;
     std::vector<ipc::Message> requests;         // what the agent received, in order (requests only)
@@ -326,6 +328,9 @@ struct Rig {
                 r.threads = 3;
                 l.deliver(r);
             }
+        } else if (std::holds_alternative<ipc::ArmFault>(m)) {
+            const std::uint32_t arm_result = (link2 && &l == link2.get()) ? arm_status2 : arm_status;
+            reply(arm_result, arm_result != 0 ? "not an injection stage of the agent" : "armed");
         } else if (const auto* release = std::get_if<ipc::ReleaseRange>(&m)) {
             if (release->mode == ipc::ReleaseMode::Uncommit && uncommit_status != 0) {
                 reply(uncommit_status, "unknown release mode");  // an older agent
@@ -449,6 +454,8 @@ struct Rig {
         Result<Value> r = service->set_option(args);
         REQUIRE_MESSAGE(r.has_value(), r.error().format());
     }
+
+    std::uint32_t faults_left(const std::string& stage) { return service->faults().armed(ipc::fault::find_stage(stage)->stage); }
 
     template <class T>
     std::vector<T> seen() {
@@ -1411,6 +1418,395 @@ TEST_CASE("the PDB index can be released and mapped again (ADR-0017)") {
     CHECK(rig.reload().has_value());
     CHECK(rig.module->index->pdb() == nullptr);
 }
+
+// ---- failure injection (WP-28, ADR-0035) -----------------------------------------------------------------------
+
+#if defined(CML_FAULT_INJECTION)
+
+namespace {
+
+Value inject_args(const std::string& stage, int count = 0, int pid = 0) {
+    Value args = Value::object();
+    args.set("stage", Value::string(stage));
+    if (count != 0) {
+        args.set("count", Value::integer(count));
+    }
+    if (pid != 0) {
+        args.set("pid", Value::integer(pid));
+    }
+    return args;
+}
+
+}  // namespace
+
+TEST_CASE("fault injection: each stage of the broker fails with its own id, undoes nothing it did not do, and the next reload succeeds") {
+    QuietLogs quiet;
+    struct Case {
+        const char* stage;
+        const char* id;
+        int link_calls;     // linker runs of the failed reload
+        bool sent_load;     // LoadPatch reached the agent
+    };
+    const Case cases[] = {
+        {"pdb-load", "CML5963", 0, false},          {"change-detection", "CML5964", 0, false}, {"compile", "CML5965", 0, false},
+        {"bind-plan", "CML5966", 0, false},         {"link", "CML5967", 0, false},             {"pre-apply", "CML5968", 1, false},
+        {"send-patch", "CML5969", 1, false},
+    };
+    for (const Case& c : cases) {
+        CAPTURE(c.stage);
+        Rig rig;
+        rig.enable();
+        rig.changed();
+        Result<Value> armed = inject_failure(*rig.service, inject_args(c.stage));
+        REQUIRE_MESSAGE(armed.has_value(), armed.error().format());
+        CHECK(armed->get_bool("armed"));
+        CHECK(armed->get_string("stage") == c.stage);
+        CHECK(armed->get_string("side") == "broker");
+
+        Result<Value> r = rig.reload();
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().id() == c.id);
+        CHECK(r.error().message.find(c.stage) != std::string::npos);
+        CHECK_FALSE(r.error().what_to_do.empty());
+        CHECK(rig.events->diag_ids() == std::vector<std::string>{c.id});
+        CHECK(rig.link_calls == c.link_calls);
+        CHECK(rig.seen<ipc::LoadPatch>().empty());  // nothing was loaded, so nothing is left in the application
+        CHECK(rig.seen<ipc::InstallHooks>().empty());
+        CHECK_FALSE(rig.module->is_hooked(kModuleBase + 0x1010));
+        CHECK(rig.module->generation == 0);
+        CHECK(rig.events->count("patch_applied") == 0);
+        CHECK(rig.faults_left(c.stage) == 0);  // used up
+
+        // Without injection the very same reload succeeds.
+        Result<Value> again = rig.reload();
+        REQUIRE_MESSAGE(again.has_value(), again.error().format());
+        CHECK(again->get_integer("patched") == 1);
+        CHECK(rig.module->is_hooked(kModuleBase + 0x1010));
+        CHECK(rig.module->generation == 1);
+        CHECK(rig.events->count("patch_applied") == 1);
+    }
+}
+
+TEST_CASE("fault injection: the compile stage tells the application's compile-error hook; send-patch leaves the linked DLL unused") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    REQUIRE(inject_failure(*rig.service, inject_args("compile")).has_value());
+    REQUIRE_FALSE(rig.reload().has_value());
+    REQUIRE(rig.compile_events.size() == 2);
+    CHECK(rig.compile_events[0].phase == ipc::CompilePhase::Start);
+    CHECK(rig.compile_events[1].phase == ipc::CompilePhase::Error);
+    CHECK(rig.compile_events[1].diag == 5965);
+    CHECK(rig.compile_calls == 0);  // the failure comes before the compiler runs
+}
+
+TEST_CASE("fault injection: count passes fail, then the stage disarms itself; none disarms at once; re-arming replaces") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    Result<Value> armed = inject_failure(*rig.service, inject_args("link", 2));
+    REQUIRE(armed.has_value());
+    CHECK(armed->get_integer("count") == 2);
+    CHECK(rig.service->faults().armed(ipc::fault::Stage::Link) == 2);
+    CHECK(rig.reload().error().id() == "CML5967");
+    CHECK(rig.service->faults().armed(ipc::fault::Stage::Link) == 1);
+    CHECK(rig.reload().error().id() == "CML5967");
+    CHECK(rig.reload().has_value());  // used up
+
+    rig.changed();
+    REQUIRE(inject_failure(*rig.service, inject_args("compile")).has_value());
+    Result<Value> none = inject_failure(*rig.service, inject_args("none"));
+    REQUIRE(none.has_value());
+    CHECK_FALSE(none->get_bool("armed"));
+    CHECK(rig.service->faults().armed(ipc::fault::Stage::Compile) == 0);
+    CHECK(rig.reload().has_value());
+
+    REQUIRE(inject_failure(*rig.service, inject_args("link", 5)).has_value());
+    REQUIRE(inject_failure(*rig.service, inject_args("link", 1)).has_value());
+    CHECK(rig.service->faults().armed(ipc::fault::Stage::Link) == 1);
+}
+
+TEST_CASE("fault injection: pid selects the process whose reloads fail") {
+    QuietLogs quiet;
+    {
+        Rig rig;
+        rig.enable();
+        rig.changed();
+        REQUIRE(inject_failure(*rig.service, inject_args("link", 1, static_cast<int>(kPid) + 99)).error().id() == "CML5961");  // no such process
+        // Armed for another pid than the one that reloads: no effect on this process.
+        REQUIRE(rig.service->faults().arm(ipc::fault::Stage::Link, 1, kPid + 99).has_value());
+        CHECK(rig.reload().has_value());
+        CHECK(rig.service->faults().armed(ipc::fault::Stage::Link) == 1);  // still armed for the other process
+    }
+    {
+        Rig rig;
+        rig.enable();
+        rig.changed();
+        REQUIRE(inject_failure(*rig.service, inject_args("link", 1, static_cast<int>(kPid))).has_value());
+        Result<Value> r = rig.reload();
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().id() == "CML5967");
+    }
+}
+
+TEST_CASE("fault injection: a stage of the agent is armed through ArmFault in every connected agent; a refusal is CML5962") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    for (const char* stage : {"reservation", "patch-load", "hook-install", "post-patch-hooks"}) {
+        CAPTURE(stage);
+        rig.requests.clear();
+        Result<Value> r = inject_failure(*rig.service, inject_args(stage, 3));
+        REQUIRE_MESSAGE(r.has_value(), r.error().format());
+        CHECK(r->get_string("side") == "agent");
+        CHECK(r->find("processes")->items().size() == 1);
+        const auto arms = rig.seen<ipc::ArmFault>();
+        REQUIRE(arms.size() == 1);
+        CHECK(arms[0].stage == stage);
+        CHECK(arms[0].count == 3);
+    }
+    rig.requests.clear();
+    REQUIRE(inject_failure(*rig.service, inject_args("none")).has_value());
+    const auto disarm = rig.seen<ipc::ArmFault>();
+    REQUIRE(disarm.size() == 1);
+    CHECK(disarm[0].stage == "none");
+
+    rig.arm_status = 4654;
+    Result<Value> refused = inject_failure(*rig.service, inject_args("patch-load"));
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().id() == "CML5962");
+    CHECK(refused.error().message.find("CML4654") != std::string::npos);
+    rig.arm_status = 0;
+    CHECK(inject_failure(*rig.service, inject_args("patch-load", 1, static_cast<int>(kPid) + 1)).error().id() == "CML5961");
+}
+
+TEST_CASE("fault injection: a bad request is CML5960 and says what the stages are") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    const auto bad = [&](Value args) {
+        Result<Value> r = inject_failure(*rig.service, args);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().id() == "CML5960");
+        return r.error();
+    };
+    CHECK(bad(Value::object()).message.find("stage") != std::string::npos);
+    CHECK(bad(inject_args("no-such-stage")).what_to_do.find("link") != std::string::npos);
+    Value count0 = inject_args("link");
+    count0.set("count", Value::integer(0));
+    bad(count0);
+    Value huge = inject_args("link");
+    huge.set("count", Value::integer(100000));
+    bad(huge);
+    Value pid_text = inject_args("link");
+    pid_text.set("pid", Value::string("1"));
+    bad(pid_text);
+    Value stage_number = Value::object();
+    stage_number.set("stage", Value::integer(3));
+    bad(stage_number);
+    CHECK(rig.service->faults().armed(ipc::fault::Stage::Link) == 0);
+    CHECK(rig.requests.empty());  // nothing was sent to the agent
+}
+
+TEST_CASE("fault injection: the control capability, fault-stages and inject-failure over the line protocol") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    ControlContext context;
+    context.version = "0.1.0";
+    context.service = rig.service.get();
+    const std::vector<std::string> caps = broker_capabilities(context);
+    CHECK(std::find(caps.begin(), caps.end(), "fault-injection") != caps.end());
+    ControlContext bare;
+    const std::vector<std::string> bare_caps = broker_capabilities(bare);
+    CHECK(std::find(bare_caps.begin(), bare_caps.end(), "fault-injection") == bare_caps.end());
+
+    const auto call = [&](const std::string& line) {
+        Result<Value> parsed = ipc::json::parse(handle_control_line(line, context));
+        REQUIRE(parsed.has_value());
+        return *parsed;
+    };
+    const Value stages = call(R"({"id":1,"cmd":"fault-stages"})");
+    REQUIRE_MESSAGE(stages.get_bool("ok"), ipc::json::serialize(stages));
+    const Value* list = stages.find("result")->find("stages");
+    REQUIRE(list != nullptr);
+    std::vector<std::string> names;
+    for (const Value& v : list->items()) {
+        names.push_back(v.as_string());
+    }
+    CHECK(names == std::vector<std::string>{"pdb-load", "change-detection", "compile", "bind-plan", "reservation", "link", "pre-apply", "send-patch",
+                                            "patch-load", "hook-install", "post-patch-hooks"});
+    CHECK(stages.find("result")->find("details")->items().size() == names.size());
+
+    const Value armed = call(R"({"id":2,"cmd":"inject-failure","args":{"stage":"bind-plan"}})");
+    REQUIRE_MESSAGE(armed.get_bool("ok"), ipc::json::serialize(armed));
+    CHECK(armed.find("result")->get_string("stage") == "bind-plan");
+    CHECK(armed.find("result")->get_bool("armed"));
+    const Value disarmed = call(R"({"id":3,"cmd":"inject-failure","args":{"stage":"none"}})");
+    REQUIRE(disarmed.get_bool("ok"));
+    CHECK_FALSE(disarmed.find("result")->get_bool("armed"));
+    const Value bad = call(R"({"id":4,"cmd":"inject-failure","args":{"stage":"nope"}})");
+    CHECK_FALSE(bad.get_bool("ok"));
+    CHECK(bad.find("diag")->get_string("id") == "CML5960");
+    // Without a service neither command exists.
+    ControlContext without;
+    Result<Value> none = ipc::json::parse(handle_control_line(R"({"id":5,"cmd":"inject-failure","args":{"stage":"link"}})", without));
+    REQUIRE(none.has_value());
+    CHECK(none->find("diag")->get_string("id") == "CML5402");
+}
+
+TEST_CASE("fault injection: arming several agents is all or nothing and a refusal names the pid") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.enable2();
+    rig.requests.clear();
+    rig.arm_status2 = 4654;
+    Result<Value> r = inject_failure(*rig.service, inject_args("patch-load", 2));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML5962");
+    CHECK(r.error().message.find(std::to_string(kPid + 1)) != std::string::npos);
+    // The first agent was armed and then disarmed again (count 0 = this stage only).
+    const auto arms = rig.seen<ipc::ArmFault>();
+    REQUIRE(arms.size() == 3);
+    CHECK(arms[0].count == 2);
+    CHECK(arms[1].count == 2);  // the refusing agent
+    CHECK(arms[2].stage == "patch-load");
+    CHECK(arms[2].count == 0);
+    rig.arm_status2 = 0;
+}
+
+TEST_CASE("fault injection: 'none' with an unknown pid changes nothing; it disarms what it can and reports the agents it could not reach") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    REQUIRE(inject_failure(*rig.service, inject_args("link", 3)).has_value());
+    Result<Value> unknown = inject_failure(*rig.service, inject_args("none", 0, static_cast<int>(kPid) + 99));
+    REQUIRE_FALSE(unknown.has_value());
+    CHECK(unknown.error().id() == "CML5961");
+    CHECK(rig.service->faults().armed(ipc::fault::Stage::Link) == 3);  // untouched
+    CHECK(rig.seen<ipc::ArmFault>().empty());
+
+    rig.enable2();
+    rig.arm_status2 = 4654;  // the second agent cannot be disarmed
+    Result<Value> partial = inject_failure(*rig.service, inject_args("none"));
+    REQUIRE_FALSE(partial.has_value());
+    CHECK(partial.error().id() == "CML5971");
+    CHECK(partial.error().message.find(std::to_string(kPid + 1)) != std::string::npos);
+    CHECK(rig.service->faults().armed(ipc::fault::Stage::Link) == 0);  // the broker's stages and the first agent were disarmed
+    std::size_t nones = 0;
+    for (const ipc::ArmFault& a : rig.seen<ipc::ArmFault>()) {
+        nones += a.stage == "none" ? 1 : 0;
+    }
+    CHECK(nones == 2);  // both agents were tried
+}
+
+TEST_CASE("fault injection: the reservation stage is refused for a module that reserved already (CML5970)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    REQUIRE(inject_failure(*rig.service, inject_args("reservation")).has_value());  // first patch still ahead
+    REQUIRE(inject_failure(*rig.service, inject_args("none")).has_value());
+    REQUIRE(rig.reload().has_value());  // reserves
+    rig.requests.clear();
+    Result<Value> late = inject_failure(*rig.service, inject_args("reservation"));
+    REQUIRE_FALSE(late.has_value());
+    CHECK(late.error().id() == "CML5970");
+    CHECK(late.error().message.find("first patch") != std::string::npos);
+    CHECK(rig.seen<ipc::ArmFault>().empty());  // nothing was armed anywhere
+}
+
+TEST_CASE("fault injection: a failure after the link gives the address space back (a count that would exhaust the reservation)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    constexpr int kFailures = 250;  // each linked image takes 256 KiB of the 64 MiB block; 4 MiB must stay free: 250 would not fit
+    REQUIRE(inject_failure(*rig.service, inject_args("send-patch", kFailures)).has_value());
+    for (int i = 0; i < kFailures; ++i) {
+        Result<Value> r = rig.reload();
+        REQUIRE_FALSE(r.has_value());
+        REQUIRE(r.error().id() == "CML5969");
+    }
+    REQUIRE(rig.link_bases.size() == static_cast<std::size_t>(kFailures));
+    for (const std::uint64_t base : rig.link_bases) {
+        CHECK(base == rig.link_bases.front());  // the same slice every time
+    }
+    Result<Value> ok = rig.reload();
+    REQUIRE_MESSAGE(ok.has_value(), ok.error().format());
+    CHECK(rig.seen<ipc::LoadPatch>().front().candidates[0].image_base == rig.link_bases.front());
+}
+
+TEST_CASE("fault injection: pre-apply and a refused LoadPatch give the address space back as well; an image that is loaded keeps its slice") {
+    QuietLogs quiet;
+    {
+        Rig rig;
+        rig.enable();
+        rig.changed();
+        REQUIRE(inject_failure(*rig.service, inject_args("pre-apply", 2)).has_value());
+        CHECK_FALSE(rig.reload().has_value());
+        CHECK_FALSE(rig.reload().has_value());
+        REQUIRE(rig.link_bases.size() == 2);
+        CHECK(rig.link_bases[0] == rig.link_bases[1]);
+    }
+    {
+        Rig rig;
+        rig.enable();
+        rig.changed();
+        rig.load_status = 4204;  // the agent refuses to load
+        CHECK_FALSE(rig.reload().has_value());
+        CHECK_FALSE(rig.reload().has_value());
+        REQUIRE(rig.link_bases.size() == 2);
+        CHECK(rig.link_bases[0] == rig.link_bases[1]);
+    }
+    {
+        Rig rig;
+        rig.enable();
+        rig.changed();
+        REQUIRE(rig.reload().has_value());  // loaded: its slice stays used
+        rig.changed();
+        rig.object = make_object("", true);  // new code, so the second reload really links
+        REQUIRE(rig.reload().has_value());
+        REQUIRE(rig.link_bases.size() == 2);
+        CHECK(rig.link_bases[1] > rig.link_bases[0]);
+    }
+}
+
+TEST_CASE("fault injection: when the agent could not take its hooks out again (CML4656) the patch image stays mapped") {
+    QuietLogs quiet;
+    {
+        // The contrast: an ordinary agent failure of InstallHooks unloads the patch.
+        Rig rig;
+        rig.enable();
+        rig.changed();
+        rig.hooks_status = ipc::fault::ids::kAgentPostPatchHooks;
+        Result<Value> r = rig.reload();
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().id() == "CML4653");
+        const auto releases = rig.seen<ipc::ReleaseRange>();
+        REQUIRE(releases.size() == 1);
+        CHECK(releases[0].mode == ipc::ReleaseMode::UnloadPatch);
+        CHECK_FALSE(rig.module->is_hooked(kModuleBase + 0x1010));
+    }
+    {
+        Rig rig;
+        rig.enable();
+        rig.changed();
+        rig.hooks_status = ipc::fault::ids::kAgentRollbackIncomplete;
+        Result<Value> r = rig.reload();
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().id() == "CML4656");
+        CHECK(rig.events->diag_ids() == std::vector<std::string>{"CML4656"});
+        CHECK(rig.seen<ipc::ReleaseRange>().empty());               // never freed: a live hook may still target it
+        CHECK(rig.module->is_hooked(kModuleBase + 0x1010));          // remembered as hooked, like after a timeout
+        CHECK(rig.module->batches.size() == 1);                      // recorded as live, like after a timeout, so that a revert knows it
+    }
+}
+
+#endif  // CML_FAULT_INJECTION
 
 // ---- the control pipe's view (handle_control_line with a service) -----------------------------------------
 

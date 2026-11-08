@@ -40,6 +40,8 @@ add_library(cml_core STATIC
     src/exception_service.cpp
     src/reexecute.cpp  # WP-23: re-execute function after a crash
     src/reload_service.cpp
+    # WP-28: failure injection (control commands inject-failure, fault-stages)
+    src/fault_injection.cpp
     # WP-21: hot-restart (portable orchestration; restart_win.cpp is the Windows ProcessHost)
     src/restart.cpp
     src/restart_win.cpp)
