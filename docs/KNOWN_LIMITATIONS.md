@@ -62,6 +62,15 @@ diagnostic is planned, not live.
   changed on disk, so the next reload recompiles them. A module freed and reloaded at the same base and path is not detected as a
   different instance. A partial multi-module revert answers ok with `partial`/`failed` and a CML5854 diag event. Session reset
   (unloading patch DLLs) is not implemented.
+- Hot-restart (WP-21) restores the command line, working directory, environment and the three standard handles; other inherited
+  handles, the parent process, the console title and window state are not restored. With no console of its own, the broker
+  borrows the old process's console during the relaunch. Reloads are refused (CML5304) while a restart runs. `timeout_ms` bounds
+  the preparation (the pre-restart hooks); after the old process is terminated, `registration_timeout_ms` (default 30 s) bounds
+  registration, re-enabling and re-applying the edits. Modules the application loads lazily after start-up are reported (CML5809)
+  and not enabled again. `CML_RESTART_TOKEN` stays in the new process's environment (ADR-0034). `Agent::ScheduleRestart` still
+  returns `CML_STATUS_NOT_IMPLEMENTED`. A broker started with a short `--exit-when-idle` can exit during the restart gap.
+- Broker UI (WP-19): enable/disable of modules is shown but not switchable (the control protocol has no such command); a relative
+  path in compiler output is resolved best-effort against the modules' directories.
 - `unload_patch` (WP-17) waits up to 10 s for a hook that is still running and then refuses (CML4212, patch stays hidden); in
   synchronised mode that stalls the agent thread meanwhile.
 - A thread that runs an application hook (the agent thread, or an application thread at `cml_sync_point`) gets a 64 KB stack
