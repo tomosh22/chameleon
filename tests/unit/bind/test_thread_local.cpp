@@ -24,7 +24,12 @@ bool contains(const std::string& hay, const std::string& needle) { return hay.fi
 SynthWorld tls_world() {
     SynthWorld w = basic_world(false);
     w.spec.sections.push_back({".tls", 0x100, 0x4000, 0x100, 0xC0000040});
-    w.pub_data("?g_tls_counter@@3HA", 0x8, kTlsSec);
+    // The public of a thread-local carries a different offset than its S_GTHREAD32 (as in real MSVC PDBs): the
+    // planner must use the S_GTHREAD32 record.
+    w.pub_data("?g_tls_counter@@3HA", 0x60, kTlsSec);
+    w.spec.symrec.data(0x1113, "g_tls_counter", kTlsSec, 0x8);
+    w.pub_data("_Init_thread_epoch", 0x70, kTlsSec);
+    w.spec.symrec.data(0x1113, "_Init_thread_epoch", kTlsSec, 0x4);
     w.pub_data("_tls_index", 0x120);
     w.tu().symbols.proc(0x1110, "f", SynthWorld::kTextSec, 0x50, 0x30);
     w.tu().symbols.data(0x1112, "calls", kTlsSec, 0x10);
@@ -61,6 +66,21 @@ TEST_CASE("tls: an existing external thread_local binds to the old storage; SECR
     }
     CHECK(saw);
     CHECK(r->warnings.empty());
+}
+
+TEST_CASE("tls: an undefined thread_local of the module (the CRT's epoch) is placed by its S_GTHREAD32, not its public") {
+    SynthWorld w = tls_world();
+    SynthObj o;
+    auto f = o.function("?compute_value@@YAHXZ", true, 0x20);
+    const std::uint32_t ep = o.undefined("_Init_thread_epoch", false);
+    o.reloc(f.section, 4, ep, coff::RelocType::SecRel);
+    Built b = o.build();
+    auto r = plan_bind(w.input(b));
+    REQUIRE_MESSAGE(r.has_value(), err(r));
+    REQUIRE(r->fixups.size() == 1);
+    CHECK(r->fixups[0].kind == FixupKind::SecRel32);
+    CHECK(r->fixups[0].target_section_offset == 0x4);
+    CHECK(r->fixups[0].target_rva == 0x4004);  // .tls is the 4th section, rva 0x4000: not the first
 }
 
 TEST_CASE("tls: a function-local static thread_local matches the old S_LTHREAD32 record") {

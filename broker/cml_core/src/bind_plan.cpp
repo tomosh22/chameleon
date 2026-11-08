@@ -358,6 +358,7 @@ private:
     // ---- lookups ----
     std::optional<OldRef> lookup_registry(const std::string& name, SymbolType want);
     std::optional<OldRef> lookup_public(const std::string& name, SymbolType want);
+    std::optional<OldRef> lookup_thread_global(const Sym& sy);
     bool ensure_compiland_symbols();
     std::vector<const pdb::SymbolView*> static_candidates(const std::string& base, const std::string& encl, bool want_function,
                                                           const std::string& display = {});
@@ -651,6 +652,39 @@ std::optional<OldRef> Planner::lookup_public(const std::string& name, SymbolType
     return std::nullopt;
 }
 
+// An external thread_local of the old image by its recorded display name: S_GTHREAD32 (segment = the .tls
+// section, offset = offset inside it). The S_PUB32 of a thread-local does NOT carry that offset (CI evidence,
+// WP-24: the public's RVA of a namespace-scope thread_local was ~0x10d54 past its neighbour's S_LTHREAD32 offset
+// of 0x8 in the same object), so publics must not be used to place a SECREL.
+std::optional<OldRef> Planner::lookup_thread_global(const Sym& sy) {
+    const std::string& disp = sy.dec.display.empty() ? sy.name : sy.dec.display;
+    Result<std::vector<pdb::SymbolView>> globals = pdb_.find_global_data(disp);
+    if (!globals) {
+        fatal(globals.error());
+        return std::nullopt;
+    }
+    const pdb::SymbolView* found = nullptr;
+    for (const pdb::SymbolView& v : *globals) {
+        if (v.kind != pdb::SymbolKind::GlobalThread || v.rva == pdb::kNoRva) {
+            continue;
+        }
+        if (found != nullptr) {
+            CML_LOG(Trace, "bind: thread_local '%s' has several S_GTHREAD32 records: not used", disp.c_str());
+            return std::nullopt;
+        }
+        found = &v;
+    }
+    if (found == nullptr) {
+        return std::nullopt;
+    }
+    OldRef r;
+    r.addr = module_address(found->rva);
+    r.source = BindSource::PdbGlobal;
+    r.type = SymbolType::Data;
+    r.note = "S_GTHREAD32 at rva " + hex(found->rva) + " (section " + std::to_string(found->section) + " offset " + hex(found->offset) + ")";
+    return r;
+}
+
 bool Planner::ensure_compiland_symbols() {
     if (comp_loaded_) {
         return true;
@@ -823,7 +857,9 @@ void Planner::decide_defined() {
 
         // External (or COMMON): registry, then the module's publics.
         std::optional<OldRef> old = lookup_registry(sy.name, type);
-        if (!old) {
+        if (si != nullptr && si->tls) {
+            old = lookup_thread_global(sy);  // never the public: its offset is not the TLS offset
+        } else if (!old) {
             old = lookup_public(sy.name, type);
         }
         if (type == SymbolType::Function) {
@@ -1141,6 +1177,13 @@ std::optional<OldRef> Planner::resolve_name(Sym& sy) {
                 return r;
             }
         }
+    }
+    if (fatal_) {
+        return std::nullopt;
+    }
+    // (3a) an external thread_local of the module: S_GTHREAD32 (its public does not carry the TLS offset)
+    if (std::optional<OldRef> t = lookup_thread_global(sy)) {
+        return t;
     }
     if (fatal_) {
         return std::nullopt;
