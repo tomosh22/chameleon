@@ -1,0 +1,460 @@
+# Scenario `inject_stages` (WP-28, ADR-0035): failure injection at every stage of the reload pipeline.
+#
+# For each stage the broker's `fault-stages` lists (broker side: pdb-load, change-detection, compile, bind-plan, link,
+# pre-apply, send-patch; agent side: reservation, patch-load, hook-install, post-patch-hooks) the scenario
+#
+#   1. applies the next edit (compute_value() returns one more than before),
+#   2. arms the stage with `inject-failure` (control capability `fault-injection`),
+#   3. reloads: the reload must be refused with the stage's own diagnostic, and a `diag` event with that id must arrive,
+#   4. checks that the application kept running its PREVIOUS code (the old value is still printed, the counter still counts),
+#   5. reloads again without injection: the same edit now applies and the new value appears.
+#
+# The agent's stages end in the agent's own diagnostics (CML4650-4653); hook-install fails inside the window in which the
+# application's threads are suspended, post-patch-hooks fails after the hooks were installed (before they are committed and before the
+# application's post-patch hooks run) and rolls them back, patch-load
+# fails after the DLL was mapped and unloads it again. Ids of the broker's stages are CML5963-5969.
+#
+# The reservation goes first: a module's address space is reserved once, on its first patch, so only the first reload
+# asks the agent for it. The stacked edits live in edits/stacked/ (each applies on top of the one before).
+name = "inject_stages"
+description = "fixture inject: every pipeline stage fails once with its own diagnostic, the application keeps its previous code, the next reload succeeds"
+fixture = "inject"
+timeout_s = 1500
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1 calls=\\d+"
+within_s = 20
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_inject.exe"
+within_s = 20
+
+# The command itself: a stage that does not exist is refused.
+[[step]]
+kind = "inject_failure"
+stage = "no-such-stage"
+expect_error = "CML5960"
+
+# ---- stage 1: reservation -> CML4650 ----
+[[step]]
+kind = "edit"
+patch = "edits/value_2.edit"
+
+[[step]]
+kind = "inject_failure"
+stage = "reservation"
+
+[[step]]
+kind = "reload"
+within_s = 180
+expect_error = "CML4650"
+
+[[step]]
+kind = "expect_diag"
+id = "CML4650"
+within_s = 10
+
+# Still the previous code.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1 calls=\\d+"
+within_s = 10
+
+# The next reload, without injection, applies the same edit.
+[[step]]
+kind = "reload"
+within_s = 180
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2 calls=\\d+"
+within_s = 10
+
+# The module has its reservation now: arming that stage again would fire on an unrelated later reload, so it is refused.
+[[step]]
+kind = "inject_failure"
+stage = "reservation"
+expect_error = "CML5970"
+
+# ---- stage 2: pdb-load -> CML5963 ----
+[[step]]
+kind = "edit"
+patch = "edits/stacked/value_3.edit"
+
+[[step]]
+kind = "inject_failure"
+stage = "pdb-load"
+
+[[step]]
+kind = "reload"
+within_s = 180
+expect_error = "CML5963"
+
+[[step]]
+kind = "expect_diag"
+id = "CML5963"
+within_s = 10
+
+# Still the previous code.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2 calls=\\d+"
+within_s = 10
+
+# The next reload, without injection, applies the same edit.
+[[step]]
+kind = "reload"
+within_s = 180
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=3 calls=\\d+"
+within_s = 10
+
+# ---- stage 3: change-detection -> CML5964 ----
+[[step]]
+kind = "edit"
+patch = "edits/stacked/value_4.edit"
+
+[[step]]
+kind = "inject_failure"
+stage = "change-detection"
+
+[[step]]
+kind = "reload"
+within_s = 180
+expect_error = "CML5964"
+
+[[step]]
+kind = "expect_diag"
+id = "CML5964"
+within_s = 10
+
+# Still the previous code.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=3 calls=\\d+"
+within_s = 10
+
+# The next reload, without injection, applies the same edit.
+[[step]]
+kind = "reload"
+within_s = 180
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=4 calls=\\d+"
+within_s = 10
+
+# ---- stage 4: compile -> CML5965 ----
+[[step]]
+kind = "edit"
+patch = "edits/stacked/value_5.edit"
+
+[[step]]
+kind = "inject_failure"
+stage = "compile"
+
+[[step]]
+kind = "reload"
+within_s = 180
+expect_error = "CML5965"
+
+[[step]]
+kind = "expect_diag"
+id = "CML5965"
+within_s = 10
+
+# Still the previous code.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=4 calls=\\d+"
+within_s = 10
+
+# The next reload, without injection, applies the same edit.
+[[step]]
+kind = "reload"
+within_s = 180
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=5 calls=\\d+"
+within_s = 10
+
+# ---- stage 5: bind-plan -> CML5966 ----
+[[step]]
+kind = "edit"
+patch = "edits/stacked/value_6.edit"
+
+[[step]]
+kind = "inject_failure"
+stage = "bind-plan"
+
+[[step]]
+kind = "reload"
+within_s = 180
+expect_error = "CML5966"
+
+[[step]]
+kind = "expect_diag"
+id = "CML5966"
+within_s = 10
+
+# Still the previous code.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=5 calls=\\d+"
+within_s = 10
+
+# The next reload, without injection, applies the same edit.
+[[step]]
+kind = "reload"
+within_s = 180
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=6 calls=\\d+"
+within_s = 10
+
+# ---- stage 6: link -> CML5967 ----
+[[step]]
+kind = "edit"
+patch = "edits/stacked/value_7.edit"
+
+[[step]]
+kind = "inject_failure"
+stage = "link"
+
+[[step]]
+kind = "reload"
+within_s = 180
+expect_error = "CML5967"
+
+[[step]]
+kind = "expect_diag"
+id = "CML5967"
+within_s = 10
+
+# Still the previous code.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=6 calls=\\d+"
+within_s = 10
+
+# The next reload, without injection, applies the same edit.
+[[step]]
+kind = "reload"
+within_s = 180
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=7 calls=\\d+"
+within_s = 10
+
+# ---- stage 7: pre-apply -> CML5968 ----
+[[step]]
+kind = "edit"
+patch = "edits/stacked/value_8.edit"
+
+[[step]]
+kind = "inject_failure"
+stage = "pre-apply"
+
+[[step]]
+kind = "reload"
+within_s = 180
+expect_error = "CML5968"
+
+[[step]]
+kind = "expect_diag"
+id = "CML5968"
+within_s = 10
+
+# Still the previous code.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=7 calls=\\d+"
+within_s = 10
+
+# The next reload, without injection, applies the same edit.
+[[step]]
+kind = "reload"
+within_s = 180
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=8 calls=\\d+"
+within_s = 10
+
+# ---- stage 8: send-patch -> CML5969 ----
+[[step]]
+kind = "edit"
+patch = "edits/stacked/value_9.edit"
+
+[[step]]
+kind = "inject_failure"
+stage = "send-patch"
+
+[[step]]
+kind = "reload"
+within_s = 180
+expect_error = "CML5969"
+
+[[step]]
+kind = "expect_diag"
+id = "CML5969"
+within_s = 10
+
+# Still the previous code.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=8 calls=\\d+"
+within_s = 10
+
+# The next reload, without injection, applies the same edit.
+[[step]]
+kind = "reload"
+within_s = 180
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=9 calls=\\d+"
+within_s = 10
+
+# ---- stage 9: patch-load -> CML4651 ----
+[[step]]
+kind = "edit"
+patch = "edits/stacked/value_10.edit"
+
+[[step]]
+kind = "inject_failure"
+stage = "patch-load"
+
+[[step]]
+kind = "reload"
+within_s = 180
+expect_error = "CML4651"
+
+[[step]]
+kind = "expect_diag"
+id = "CML4651"
+within_s = 10
+
+# Still the previous code.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=9 calls=\\d+"
+within_s = 10
+
+# The next reload, without injection, applies the same edit.
+[[step]]
+kind = "reload"
+within_s = 180
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=10 calls=\\d+"
+within_s = 10
+
+# ---- stage 10: hook-install -> CML4652 ----
+[[step]]
+kind = "edit"
+patch = "edits/stacked/value_11.edit"
+
+[[step]]
+kind = "inject_failure"
+stage = "hook-install"
+
+[[step]]
+kind = "reload"
+within_s = 180
+expect_error = "CML4652"
+
+[[step]]
+kind = "expect_diag"
+id = "CML4652"
+within_s = 10
+
+# Still the previous code.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=10 calls=\\d+"
+within_s = 10
+
+# The next reload, without injection, applies the same edit.
+[[step]]
+kind = "reload"
+within_s = 180
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=11 calls=\\d+"
+within_s = 10
+
+# ---- stage 11: post-patch-hooks -> CML4653 ----
+[[step]]
+kind = "edit"
+patch = "edits/stacked/value_12.edit"
+
+[[step]]
+kind = "inject_failure"
+stage = "post-patch-hooks"
+
+[[step]]
+kind = "reload"
+within_s = 180
+expect_error = "CML4653"
+
+[[step]]
+kind = "expect_diag"
+id = "CML4653"
+within_s = 10
+
+# Still the previous code.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=11 calls=\\d+"
+within_s = 10
+
+# The next reload, without injection, applies the same edit.
+[[step]]
+kind = "reload"
+within_s = 180
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=12 calls=\\d+"
+within_s = 10
+
+# ---- disarming: an armed stage that is disarmed again does not fire ----
+[[step]]
+kind = "edit"
+patch = "edits/stacked/value_13.edit"
+
+[[step]]
+kind = "inject_failure"
+stage = "link"
+
+[[step]]
+kind = "inject_failure"
+stage = "none"
+
+[[step]]
+kind = "reload"
+within_s = 180
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=13 calls=\\d+"
+within_s = 10
+
+# The application never stopped and never lost its state: the call counter (in storage no patch replaced) only grew.
+[[step]]
+kind = "expect_monotonic"
+key = "calls"
+min_samples = 20

@@ -21,6 +21,7 @@
 #include "alloc_guard.h"
 #include "crash_report.h"
 #include "doctest.h"
+#include "fault/fault_injection.h"
 #include "heap.h"
 #include "hook/diag_ids.h"
 #include "hook/installer.h"
@@ -589,6 +590,46 @@ TEST_CASE("functions compiled by this cell's compiler: hook, re-point, revert") 
     CHECK(call(5) == 1005);
     CHECK(protection_of(entry) == PAGE_EXECUTE_READ);
 }
+
+#if defined(CML_FAULT_INJECTION)
+TEST_CASE("failure injection (WP-28): hook-install fails only an injectable install, never a revert or a plain install, and writes nothing") {
+    namespace fi = cml::agent::fault;
+    struct Disarm {
+        ~Disarm() { fi::disarm_all(); }
+    } disarm;
+    NaturalFn volatile call = natural_orig;
+    const std::uint8_t* const entry = static_cast<const std::uint8_t*>(address_of(&natural_orig));
+    const Bytes before = snapshot(entry - kBefore, kBefore + kAfter);
+    Installer installer;
+
+    fi::arm(cml::ipc::fault::Stage::HookInstall, 1);
+    // A plain install (a quiet re-point, a rollback) and a revert leave the armed stage alone.
+    REQUIRE(install_one(installer, address_of(&natural_orig), address_of(&natural_new_1), "natural_orig", nullptr).ok());
+    CHECK(fi::armed(cml::ipc::fault::Stage::HookInstall) == 1);
+    CHECK(call(5) == 1006);
+    REQUIRE(revert_one(installer, address_of(&natural_orig), "natural_orig", nullptr).ok());
+    CHECK(fi::armed(cml::ipc::fault::Stage::HookInstall) == 1);
+    CHECK(call(5) == 1005);
+
+    // The reload's own InstallHooks is the one that fails: inside the window, nothing written, threads running again.
+    std::vector<HookOutcome> out;
+    const HookRequest request{address_of(&natural_orig), address_of(&natural_new_1), "natural_orig"};
+    const BatchResult failed = installer.install(&request, 1, out, true);
+    CHECK_FALSE(failed.ok());
+    CHECK(failed.diag.code == cml::ipc::fault::ids::kAgentHookInstall);
+    CHECK(fi::armed(cml::ipc::fault::Stage::HookInstall) == 0);
+    CHECK(call(5) == 1005);
+    CHECK(snapshot(entry - kBefore, kBefore + kAfter) == before);
+    CHECK(protection_of(entry) == PAGE_EXECUTE_READ);
+
+    // Used up: the next injectable install works.
+    const BatchResult ok = installer.install(&request, 1, out, true);
+    REQUIRE_MESSAGE(ok.ok(), ok.diag.format());
+    CHECK(call(5) == 1006);
+    REQUIRE(revert_one(installer, address_of(&natural_orig), "natural_orig", nullptr).ok());
+    CHECK(snapshot(entry - kBefore, kBefore + kAfter) == before);
+}
+#endif
 
 TEST_CASE("300 hooks are applied in a single stop of the world") {
     Arena arena(16);

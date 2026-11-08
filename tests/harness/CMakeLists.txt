@@ -20,6 +20,7 @@ add_library(cmltest_core STATIC
     src/run_dirs.cpp
     src/ticks.cpp
     src/restart_step.cpp  # WP-21
+    src/fault_step.cpp    # WP-28
     src/perf_steps.cpp    # WP-27
     src/subscription.cpp)
 target_include_directories(cmltest_core PUBLIC src)
@@ -81,6 +82,7 @@ cml_add_unit_test(harness
         tests/test_wp16_scenarios.cpp
         tests/test_wp21_scenarios.cpp
         tests/test_wp22_scenarios.cpp
+        tests/test_wp28_scenarios.cpp
         tests/test_subscription.cpp
         tests/test_wp20_scenarios.cpp
         tests/test_wp23_scenarios.cpp

@@ -1,0 +1,9 @@
+--- a/logic.cpp
++++ b/logic.cpp
+@@ -6,5 +6,5 @@
+ int compute_value()
+ {
+     ++g_calls;
+-    return 8;
++    return 9;
+ }
