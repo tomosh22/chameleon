@@ -2,6 +2,7 @@
 // itself (PDB records, hooks) is replaced by a test double here and covered by test_recipe.cpp and test_fixture_pdb.cpp. Portable.
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -75,6 +76,7 @@ reexecute::Offer offered_step() {
     o.entry_rsp = 0x1100;
     o.target = 0x7FF6DEAD0000ull;
     o.function = "step";
+    o.note = "Re-execute runs step again from its entry with the parameter values it has now in memory.";
     o.params.push_back(ipc::ReexecuteParam{0, 0, 8, 335, 0x30});
     o.params.push_back(ipc::ReexecuteParam{2, 1, 8, 335, 0x40});
     return o;
@@ -236,6 +238,59 @@ TEST_CASE("reexecute: a patch that replaces the function turns the action on - e
     REQUIRE(after_revert.size() == 2);
     CHECK_FALSE(contains(names_of(*after_revert[1].find("actions")), "reexecute"));
     CHECK(after_revert[1].find("reasons")->get_string("reexecute").find("revert") != std::string::npos);
+    CHECK(after_revert[1].find("reexecute_function") == nullptr);
+    CHECK(after_revert[1].find("notes") == nullptr);
+
+    // patch -> revert -> `exceptions`: nothing of the withdrawn offer is left in the pending list.
+    Result<Value> after = rig.exceptions.pending(Value::object());
+    REQUIRE(after.has_value());
+    const Value& listed = after->find("pending")->items()[0];
+    CHECK_FALSE(contains(names_of(*listed.find("actions")), "reexecute"));
+    CHECK(listed.find("reexecute_function") == nullptr);
+    CHECK(listed.find("reexecute_frame") == nullptr);
+    CHECK(listed.find("notes") == nullptr);
+    CHECK(listed.find("reasons")->get_string("reexecute").find("revert") != std::string::npos);
+    CHECK(listed.get_string("code") == "0xC0000005");  // the rest of the body is untouched
+}
+
+TEST_CASE("reexecute: an offer carries a note about parameters assigned before the fault and repeated side effects") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.set_verdict(offered_step());
+    rig.exceptions.on_exception(rig.link, 4242, Rig::fault(5));
+    const std::vector<Value> events = rig.collector->bodies("exception");
+    REQUIRE(events.size() == 1);
+    CHECK(contains(names_of(*events[0].find("actions")), "reexecute"));
+    REQUIRE(events[0].find("notes") != nullptr);
+    CHECK(events[0].find("notes")->get_string("reexecute").find("parameter") != std::string::npos);
+}
+
+// A patch that lands while the Exception is being evaluated is not lost: the entry is registered first and the patch event waits for
+// the evaluation, then re-evaluates.
+TEST_CASE("reexecute: a patch that lands during the first evaluation is found by the re-evaluation") {
+    QuietLogs quiet;
+    Rig rig;
+    std::atomic<int> calls{0};
+    std::thread patcher;
+    rig.exceptions.set_evaluator_for_testing([&](const std::vector<std::shared_ptr<ModuleState>>&, const ipc::Exception&, const reexecute::HookMap&) {
+        if (calls.fetch_add(1) == 0) {
+            patcher = std::thread([&] { rig.patch_applied(); });  // the pipeline thread; blocks until the evaluation is over
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            return refused(reexecute::diag::kNoReplacement, "the evaluation saw no patch yet");
+        }
+        return offered_step();
+    });
+    rig.exceptions.on_exception(rig.link, 4242, Rig::fault(9));
+    patcher.join();
+    CHECK(calls.load() == 2);
+    const std::vector<Value> updates = rig.collector->bodies("exception_updated");
+    REQUIRE(updates.size() == 1);
+    CHECK(contains(names_of(*updates[0].find("actions")), "reexecute"));
+    // The `exception` event came first.
+    std::lock_guard<std::mutex> lock(rig.collector->mutex);
+    REQUIRE(rig.collector->events.size() == 2);
+    CHECK(rig.collector->events[0].body.get_string("event") == "exception");
+    CHECK(rig.collector->events[1].body.get_string("event") == "exception_updated");
 }
 
 TEST_CASE("reexecute: a changed reason is news too (a patch replaced an optimised function and re-execute is still not offered)") {

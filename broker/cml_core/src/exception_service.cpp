@@ -56,12 +56,28 @@ Value actions_array(const reexecute::Offer& offer) {
     return actions;
 }
 
+// Everything in the event body that depends on what is offered. The stored body is always rebuilt from the base body, so nothing of an
+// earlier offer (the function and frame of a re-execute that was withdrawn since) survives.
+void apply_offer(Value& body, const reexecute::Offer& offer);
+
 Value reasons_object(const reexecute::Offer& offer) {
     Value reasons = Value::object();
     if (!offer.offered) {
         reasons.set("reexecute", Value::string(offer.reason));
     }
     return reasons;
+}
+
+void apply_offer(Value& body, const reexecute::Offer& offer) {
+    body.set("actions", actions_array(offer));
+    body.set("reasons", reasons_object(offer));  // why an action is not offered
+    if (offer.offered) {
+        body.set("reexecute_function", Value::string(offer.function));
+        body.set("reexecute_frame", Value::integer(static_cast<std::int64_t>(offer.frame_index)));
+        Value notes = Value::object();
+        notes.set("reexecute", Value::string(offer.note));  // what to know before choosing it
+        body.set("notes", std::move(notes));
+    }
 }
 
 }  // namespace
@@ -172,7 +188,7 @@ void ExceptionService::send_ignore(const std::shared_ptr<AgentLink>& link, std::
     (void)link->send(action);  // the answer finds no waiter and is dropped
 }
 
-Value ExceptionService::describe(const std::shared_ptr<AgentLink>& link, std::uint32_t pid, const ipc::Exception& exception, const reexecute::Offer& offer) const {
+Value ExceptionService::describe(const std::shared_ptr<AgentLink>& link, std::uint32_t pid, const ipc::Exception& exception) const {
     const bool in_patch = (exception.flags & ipc::kExceptionFlagInPatch) != 0;
     std::string function;
     std::uint64_t offset = exception.address - exception.module_base;
@@ -203,12 +219,6 @@ Value ExceptionService::describe(const std::shared_ptr<AgentLink>& link, std::ui
     body.set("module", Value::string(in_patch ? std::string("(patch)") : file_name_of(exception.module_path)));
     body.set("function", Value::string(function));
     body.set("offset", Value::integer(static_cast<std::int64_t>(offset)));
-    body.set("actions", actions_array(offer));
-    body.set("reasons", reasons_object(offer));  // WP-23: why an action is not offered
-    if (offer.offered) {
-        body.set("reexecute_function", Value::string(offer.function));
-        body.set("reexecute_frame", Value::integer(static_cast<std::int64_t>(offer.frame_index)));
-    }
     // Additions (ADR-0032 allows fields to be added).
     body.set("module_path", Value::string(exception.module_path));
     body.set("in_patch", Value::boolean(in_patch));
@@ -219,14 +229,16 @@ Value ExceptionService::describe(const std::shared_ptr<AgentLink>& link, std::ui
 }
 
 void ExceptionService::on_exception(const std::shared_ptr<AgentLink>& link, std::uint32_t pid, const ipc::Exception& exception) {
-    Event event;
-    event.name = "exception";
-    // WP-23: what re-execute would do, judged from the stack the agent reported and the PDB (evaluated before the lock: it reads PDBs).
+    // WP-23. What a person may do with the thread depends on the hook table. The snapshot is taken at receipt (a patch that landed between
+    // the fault and now counts as present at the fault: the agent does not report its patch generation, see docs/wp/WP-23.md). The entry
+    // is registered BEFORE the slow evaluation, and evaluations are serialised with the re-evaluations a patch event triggers
+    // (eval_mutex_), so a patch that lands while we evaluate is found by on_patch_event, which runs right after we published.
     const std::vector<std::shared_ptr<ModuleState>> modules = modules_of(link);
-    reexecute::HookMap hooks_at_fault = reexecute::snapshot_hooks(modules);
-    reexecute::Offer offer = evaluate(modules, exception, hooks_at_fault);
-    CML_LOG(Info, "process %u: exception %u: re-execute %s", pid, exception.exception_id, offer.offered ? "offered" : offer.reason.c_str());
-    event.body = describe(link, pid, exception, offer);
+    const reexecute::HookMap hooks_at_fault = reexecute::snapshot_hooks(modules);
+    Value base = describe(link, pid, exception);
+    const Key key{link->agent_id(), exception.exception_id};
+
+    std::lock_guard<std::mutex> evaluation(eval_mutex_);
     bool release = false;
     {
         // Check and insert under the mutex refresh() clears the list under: an entry can never survive a switch-off.
@@ -235,11 +247,14 @@ void ExceptionService::on_exception(const std::shared_ptr<AgentLink>& link, std:
             Pending pending;
             pending.pid = pid;
             pending.link = link;
-            pending.body = event.body;
+            pending.base = base;
             pending.raw = exception;
-            pending.hooks_at_fault = std::move(hooks_at_fault);
-            pending.offer = std::move(offer);
-            pending_[Key{link->agent_id(), exception.exception_id}] = std::move(pending);
+            pending.hooks_at_fault = hooks_at_fault;
+            pending.offer.diag = reexecute::diag::kNoReplacement;
+            pending.offer.reason = "CML" + std::to_string(reexecute::diag::kNoReplacement) + ": the offer is being evaluated";
+            pending.body = base;
+            apply_offer(pending.body, pending.offer);
+            pending_[key] = std::move(pending);
         } else {
             release = true;
         }
@@ -251,6 +266,23 @@ void ExceptionService::on_exception(const std::shared_ptr<AgentLink>& link, std:
                 exception.exception_id, pid);
         send_ignore(link, exception.exception_id);
         return;
+    }
+    // Slow: reads the PDB. Not under mutex_ (the control commands use it).
+    reexecute::Offer offer = evaluate(modules, exception, hooks_at_fault);
+    CML_LOG(Info, "process %u: exception %u: re-execute %s", pid, exception.exception_id, offer.offered ? "offered" : offer.reason.c_str());
+    Event event;
+    event.name = "exception";
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = pending_.find(key);
+        if (it == pending_.end()) {
+            return;  // holding was switched off meanwhile: the agent released the thread
+        }
+        it->second.offer = std::move(offer);
+        it->second.body = it->second.base;
+        apply_offer(it->second.body, it->second.offer);
+        event.body = it->second.body;
+        event.body.set("event", Value::string("exception"));
     }
     CML_LOG(Info, "process %u: thread %u faulted with %s at %s (%s); waiting for a decision", pid, exception.thread_id,
             event.body.get_string("code").c_str(), event.body.get_string("address").c_str(), event.body.get_string("function").c_str());
@@ -370,6 +402,7 @@ Result<Value> ExceptionService::action(const Value& args) {
 
 void ExceptionService::on_patch_event(const Event& event) {
     const std::int64_t pid = event.body.get_integer("pid");
+    std::lock_guard<std::mutex> evaluation(eval_mutex_);  // after any evaluation that was running when the patch landed
     struct Work {
         Key key;
         std::shared_ptr<AgentLink> link;
@@ -392,8 +425,7 @@ void ExceptionService::on_patch_event(const Event& event) {
         if (now.same_as(w.old_offer)) {
             continue;
         }
-        Event updated;
-        updated.name = "exception_updated";  // the wire "event" is the name; a subscription to `exception` includes it (control_server.cpp)
+        Value body = Value::object();
         {
             std::lock_guard<std::mutex> lock(mutex_);
             const auto it = pending_.find(w.key);
@@ -401,23 +433,15 @@ void ExceptionService::on_patch_event(const Event& event) {
                 continue;  // answered meanwhile
             }
             it->second.offer = now;
-            it->second.body.set("actions", actions_array(now));
-            it->second.body.set("reasons", reasons_object(now));
-            if (now.offered) {
-                it->second.body.set("reexecute_function", Value::string(now.function));
-                it->second.body.set("reexecute_frame", Value::integer(static_cast<std::int64_t>(now.frame_index)));
-            }
+            it->second.body = it->second.base;  // rebuilt, not patched: nothing of the old offer stays
+            apply_offer(it->second.body, now);
         }
-        Value body = Value::object();
         body.set("event", Value::string("exception_updated"));
         body.set("pid", Value::integer(static_cast<std::int64_t>(w.pid)));
         body.set("exception_id", Value::integer(static_cast<std::int64_t>(w.key.exception_id)));
-        body.set("actions", actions_array(now));
-        body.set("reasons", reasons_object(now));
-        if (now.offered) {
-            body.set("reexecute_function", Value::string(now.function));
-            body.set("reexecute_frame", Value::integer(static_cast<std::int64_t>(now.frame_index)));
-        }
+        apply_offer(body, now);
+        Event updated;
+        updated.name = "exception_updated";  // the wire "event" is the name; a subscription to `exception` includes it (control_server.cpp)
         updated.body = std::move(body);
         CML_LOG(Info, "process %u: exception %u: re-execute is now %s", w.pid, w.key.exception_id, now.offered ? ("offered for " + now.function).c_str() : now.reason.c_str());
         if (events_ != nullptr) {

@@ -52,9 +52,10 @@ struct Offer {
     std::uint64_t entry_rsp = 0;    // offered: the RSP the agent reported for that frame
     std::uint64_t target = 0;       // offered: entry of the replacement function
     std::string function;           // offered: its display name
+    std::string note;               // offered: what the person should know before choosing it (reasons are for "not offered")
     std::vector<ipc::ReexecuteParam> params;
 
-    bool same_as(const Offer& other) const { return offered == other.offered && reason == other.reason && frame_index == other.frame_index && target == other.target; }
+    bool same_as(const Offer& other) const { return offered == other.offered && reason == other.reason && frame_index == other.frame_index && target == other.target && note == other.note; }
 };
 
 // Evaluates the thread `exception` describes. `at_fault` is snapshot_hooks() taken when the fault was reported; `modules` are the

@@ -92,7 +92,8 @@ private:
     struct Pending {
         std::uint32_t pid = 0;
         std::shared_ptr<AgentLink> link;
-        ipc::json::Value body;  // the event body
+        ipc::json::Value body;  // the event body as published (base + what is offered now)
+        ipc::json::Value base;  // WP-23: the body without actions / reasons / notes / reexecute_*: rebuilt into `body` whenever the offer changes
         // WP-23
         ipc::Exception raw;                 // what the agent reported (the stack)
         reexecute::HookMap hooks_at_fault;  // the hook table when the fault was reported
@@ -101,7 +102,7 @@ private:
     class PatchListener;
 
     ipc::ExceptionConfig make_config() const;
-    ipc::json::Value describe(const std::shared_ptr<AgentLink>& link, std::uint32_t pid, const ipc::Exception& exception, const reexecute::Offer& offer) const;
+    ipc::json::Value describe(const std::shared_ptr<AgentLink>& link, std::uint32_t pid, const ipc::Exception& exception) const;
     // WP-23: the enabled modules of the agent's process.
     std::vector<std::shared_ptr<ModuleState>> modules_of(const std::shared_ptr<AgentLink>& link) const;
     // WP-23: a patch was applied or reverted in process `pid`: re-evaluate what is offered for its held threads.
@@ -117,6 +118,10 @@ private:
     std::map<std::uint64_t, std::shared_ptr<AgentLink>> links_;
     std::map<Key, Pending> pending_;
     reexecute::Offer evaluate(const std::vector<std::shared_ptr<ModuleState>>& modules, const ipc::Exception& exception, const reexecute::HookMap& at_fault) const;
+    // WP-23: evaluations (the first one of a thread and the re-evaluations after a patch) run one at a time, so the last one to finish
+    // is the one that saw the newest hook table, and no `exception_updated` can overtake the `exception` event it refers to.
+    // Taken before mutex_.
+    std::mutex eval_mutex_;
     mutable std::mutex evaluator_mutex_;
     Evaluator evaluator_;
     std::shared_ptr<PatchListener> patch_listener_;

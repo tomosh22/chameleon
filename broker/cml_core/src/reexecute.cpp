@@ -227,11 +227,20 @@ Offer evaluate(const std::vector<std::shared_ptr<ModuleState>>& modules, const i
         const auto before = at_fault.find(entry_va);
         const bool replaced = current != now.end() && (before == at_fault.end() || before->second != current->second);
 
+        const bool innermost_examined = !examined_one;
+        examined_one = true;
+        if (!replaced && !innermost_examined) {
+            continue;  // nothing to offer or explain for this frame: the PDB records are not even read
+        }
+        const std::string function_name = bind::display_name((*proc)->name);
         RecipeResult recipe;
-        {
+        if (frame.entry_rsp == 0) {
+            // The agent could not unwind this frame: say so before looking at the PDB.
+            recipe = refuse(diag::kNoStack, "the agent could not unwind frame " + std::to_string(i) + " (" + function_name + ") of the held thread");
+        } else {
             Result<pdb::ProcInfo> info = index->proc_info(**proc);
             if (!info) {
-                recipe = refuse(diag::kSignatureUnsupported, bind::display_name((*proc)->name) + ": " + info.error().message);
+                recipe = refuse(diag::kSignatureUnsupported, function_name + ": " + info.error().message);
             } else {
                 pdb::OptimizationHint hint = pdb::OptimizationHint::Unknown;
                 Result<pdb::BuildEnv> env = index->build_env((*proc)->compiland);
@@ -241,12 +250,10 @@ Offer evaluate(const std::vector<std::shared_ptr<ModuleState>>& modules, const i
                 recipe = build_recipe(*info, hint, static_cast<std::uint32_t>(rva), frame);
             }
         }
-        const bool innermost_examined = !examined_one;
-        examined_one = true;
         if (!replaced) {
             // Only the innermost function says why re-execute is not available before any patch: the frames above it (the
             // application's loop, templates around it) are not what a person would re-execute.
-            if (innermost_examined && !recipe.ok) {
+            if (!recipe.ok) {
                 static_reason = recipe.reason;
                 static_diag = recipe.diag;
             }
@@ -254,18 +261,17 @@ Offer evaluate(const std::vector<std::shared_ptr<ModuleState>>& modules, const i
         }
         if (!recipe.ok) {
             // The patch arrived (that is news to the client, whose event said "no patch yet"), but the verdict is the same as before.
-            return not_offered(recipe.diag, recipe.reason + "; a patch has replaced " + bind::display_name((*proc)->name) + ", but it cannot be re-executed");
+            return not_offered(recipe.diag, recipe.reason + "; a patch has replaced " + function_name + ", but it cannot be re-executed");
         }
         Offer o;
         o.offered = true;
         o.frame_index = static_cast<std::uint32_t>(i);
         o.entry_rsp = frame.entry_rsp;
         o.target = current->second;
-        o.function = bind::display_name((*proc)->name);
+        o.function = function_name;
         o.params = std::move(recipe.params);
-        if (frame.entry_rsp == 0) {
-            return not_offered(diag::kNoStack, with_id(diag::kNoStack, "the agent could not unwind frame " + std::to_string(i) + " of the held thread"));
-        }
+        o.note = "Re-execute runs " + function_name + " again from its entry with the parameter values it has now in memory; they equal the call arguments only if " +
+                 function_name + " did not assign to a parameter before the fault. Side effects before the fault happen again; destructors of the discarded frames do not run.";
         return o;
     }
     if (!frame0_note.empty()) {

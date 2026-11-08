@@ -17,6 +17,7 @@ inline constexpr std::uint32_t kNoSlotEvent = 4405;        // the handler's wait
 inline constexpr std::uint32_t kReexecuteBadFrame = 4600;        // the stack of the held thread cannot be unwound to the chosen frame
 inline constexpr std::uint32_t kReexecuteStackMismatch = 4601;   // the chosen frame was entered with another RSP than the broker saw
 inline constexpr std::uint32_t kReexecuteBadTarget = 4602;       // the replacement function is not executable code
+inline constexpr std::uint32_t kReexecuteBadReturn = 4604;       // the chosen frame's return address is not executable code (damaged stack)
 inline constexpr std::uint32_t kReexecuteBadLocation = 4603;     // a parameter's location cannot be read (register not supported, memory unreadable)
 
 }  // namespace cml::agent::crash::ids

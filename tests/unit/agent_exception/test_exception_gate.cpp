@@ -517,6 +517,96 @@ void scenario_unwind_frames() {
     CHECK(frames[1].entry_rsp > frames[1].rsp);
 }
 
+CML_TEST_NOINLINE CONTEXT capture_context() {
+    CONTEXT context;
+    RtlCaptureContext(&context);
+    return context;
+}
+
+// WP-23: the held thread's stack is untrusted. Unwinding must neither fault the agent thread nor run away, whatever the stack holds.
+void scenario_unwind_survives_a_damaged_stack() {
+    const auto* tib = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+    const std::uint64_t low = reinterpret_cast<std::uint64_t>(tib->StackLimit);
+    const std::uint64_t high = reinterpret_cast<std::uint64_t>(tib->StackBase);
+    unsigned char* code = make_reexecute_stubs();  // a leaf function: no unwind data, so the return address is at [RSP]
+    cml::agent::crash::Frame frames[cml::agent::crash::kMaxFrames];
+
+    // A saved return address that points nowhere.
+    alignas(16) volatile std::uint64_t fake[16] = {0x1234, 0x5678, 0x9ABC, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    CONTEXT context = {};
+    context.ContextFlags = CONTEXT_FULL;
+    context.Rip = reinterpret_cast<std::uint64_t>(code);
+    context.Rsp = reinterpret_cast<std::uint64_t>(&fake[0]);
+    std::size_t n = ExceptionGate::unwind_frames(context, frames, cml::agent::crash::kMaxFrames, low, high);
+    CHECK(n == 1);
+    CHECK(frames[0].rip == reinterpret_cast<std::uint64_t>(code));
+    CHECK(frames[0].entry_rsp == reinterpret_cast<std::uint64_t>(&fake[0]));  // the frame itself is fine; the walk stops at the bad return address
+
+    // RSP outside the thread's stack, or misaligned.
+    context.Rsp = 0x10;
+    n = ExceptionGate::unwind_frames(context, frames, cml::agent::crash::kMaxFrames, low, high);
+    CHECK(n == 1);
+    CHECK(frames[0].entry_rsp == 0);
+    context.Rsp = reinterpret_cast<std::uint64_t>(&fake[0]) + 3;
+    n = ExceptionGate::unwind_frames(context, frames, cml::agent::crash::kMaxFrames, low, high);
+    CHECK(n == 1);
+    CHECK(frames[0].entry_rsp == 0);
+
+    // A real function (with unwind data) whose RSP and RBP are damaged: the unwinder reads garbage. It must come back (possibly early).
+    alignas(16) volatile std::uint64_t garbage[64];
+    for (volatile std::uint64_t& g : garbage) {
+        g = 0xFFFFFFFFFFFFFFF0ull;
+    }
+    CONTEXT real = capture_context();
+    real.Rsp = reinterpret_cast<std::uint64_t>(&garbage[0]);
+    real.Rbp = 0xFFFFFFFFFFFFFFF8ull;
+    n = ExceptionGate::unwind_frames(real, frames, cml::agent::crash::kMaxFrames, low, high);
+    CHECK(n >= 1);
+    CHECK(n <= cml::agent::crash::kMaxFrames);
+    real = capture_context();
+    real.Rsp = 0xFFFFFFFFFFFFFFF0ull;  // unbounded walk (no limits): SEH must catch whatever the unwinder reads
+    n = ExceptionGate::unwind_frames(real, frames, cml::agent::crash::kMaxFrames);
+    CHECK(n >= 1);
+
+    // Re-execute refuses a frame whose return address is not code (CML4604), also with the damaged stack bounded.
+    ReexecutePlan plan;
+    plan.frame_index = 0;
+    plan.entry_rsp = reinterpret_cast<std::uint64_t>(&fake[0]);
+    plan.target = reinterpret_cast<std::uint64_t>(code + kReexecuteNewOffset);
+    plan.param_count = 0;
+    context.Rsp = reinterpret_cast<std::uint64_t>(&fake[0]);
+    CONTEXT out = {};
+    const cml::Result<void> refused = ExceptionGate::compute_reexecute(context, plan, &out, low, high);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().code == 4604);
+    // ... and Leave refuses it with the existing id.
+    const cml::Result<void> leave = ExceptionGate::compute_leave(context, &out, low, high);
+    REQUIRE_FALSE(leave.has_value());
+    CHECK(leave.error().code == 4402);
+}
+
+// A fault whose answer is computed while another thread releases the gate: the slot is never given a context it was not computed for.
+void scenario_resolve_races_with_release() {
+    ChildProcess process;
+    char* page = make_noaccess_page();
+    unsigned char* code = make_reexecute_stubs();
+    g_repair_page.store(page);
+    std::atomic<int> handled{0};
+    Decider decider([&](const Held& held) {
+        // Switch the gate off (the last subscriber left) while Leave is being resolved: either the resolve wins (Leave) or the
+        // release wins (Ignore, the next handler repairs the page); in both cases the thread continues and nothing crashes.
+        std::thread off([] { ExceptionGate::shared().configure(false, false); });
+        (void)ExceptionGate::shared().resolve(held.id, Action::Leave);
+        off.join();
+        handled.fetch_add(1);
+    });
+    (void)code;
+    write_page(page, 11);
+    CHECK(decider.wait_for_handled(1));
+    CHECK(handled.load() == 1);
+    CHECK(ExceptionGate::shared().held_count() == 0);
+}
+
 struct Scenario {
     const char* name;
     void (*run)();
@@ -540,6 +630,8 @@ const Scenario kScenarios[] = {
     {"reexecute_refused_stack_mismatch", &scenario_reexecute_refused_stack_mismatch},
     {"reexecute_refused_bad_target", &scenario_reexecute_refused_bad_target},
     {"unwind_frames", &scenario_unwind_frames},
+    {"unwind_damaged_stack", &scenario_unwind_survives_a_damaged_stack},
+    {"resolve_races_release", &scenario_resolve_races_with_release},
 };
 
 // ---- the parent side -------------------------------------------------------------------------------------------------------

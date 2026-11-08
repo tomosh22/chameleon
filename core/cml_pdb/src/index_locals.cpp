@@ -56,78 +56,23 @@ std::string hex32(std::uint32_t v) {
     return text;
 }
 
-// ---- type streams ----------------------------------------------------------------------------------------------------
+// ---- type streams (the shared IpiTable of index_symbols.cpp: TPI and IPI are loaded once each) -------------------------------
 
-const TypeTable* type_table(const PdbIndex::Impl& impl, int which, std::string* why) {
-    std::lock_guard<std::mutex> lock(impl.types_mutex);
-    if (!impl.types_tried[which]) {
-        impl.types_tried[which] = true;
-        const std::uint32_t stream = which == 0 ? 2u : 4u;
-        const char* name = which == 0 ? "TPI" : "IPI";
-        auto fail = [&](const char* what) {
-            impl.types_error[which] = Diag::make(diag::kBadBuildInfo, std::string("The ") + name + " stream of '" + impl.path + "' is invalid (" + what + ").",
-                                                 "Rebuild the module so the linker regenerates the PDB.");
-        };
-        auto table = std::make_unique<TypeTable>();
-        table->data = impl.msf->read_stream(stream);
-        const std::uint8_t* d = table->data.data();
-        const std::size_t size = table->data.size();
-        if (size < 56) {
-            fail("stream missing or shorter than its header");
-        } else {
-            const std::uint32_t header_size = rd32(d + 4);
-            table->type_begin = rd32(d + 8);
-            const std::uint32_t record_bytes = rd32(d + 16);
-            if (header_size < 56 || header_size > size || record_bytes > size - header_size) {
-                fail("header sizes exceed the stream");
-            } else {
-                table->records_begin = header_size;
-                table->records_end = static_cast<std::uint64_t>(header_size) + record_bytes;
-                table->offsets.reserve(record_bytes / 24 + 8);
-                const bool ok = cv::for_each_record(d + header_size, 0, record_bytes, [&](const cv::Record& r) {
-                    table->offsets.push_back(static_cast<std::uint32_t>(r.offset));
-                });
-                if (!ok) {
-                    fail("a record leaves the stream");
-                } else {
-                    impl.type_tables[which] = std::move(table);
-                }
-            }
-        }
-    }
-    if (impl.type_tables[which] == nullptr) {
-        if (why != nullptr && impl.types_error[which]) {
-            *why = impl.types_error[which]->message;
+const IpiTable* type_table(const PdbIndex::Impl& impl, bool tpi, std::string* why) {
+    const Result<void> loaded = ensure_type_stream(impl, tpi);
+    if (!loaded) {
+        if (why != nullptr) {
+            *why = loaded.error().message;
         }
         return nullptr;
     }
-    return impl.type_tables[which].get();
+    return (tpi ? impl.tpi : impl.ipi).get();
 }
 
-struct TypeRec {
-    std::uint16_t kind = 0;
-    const std::uint8_t* body = nullptr;
-    std::uint32_t body_len = 0;
-};
+using TypeRec = IpiRecord;
 
-bool find_type(const TypeTable& t, std::uint32_t id, TypeRec& out) {
-    if (id < t.type_begin || id - t.type_begin >= t.offsets.size()) {
-        return false;
-    }
-    const std::uint8_t* base = t.data.data() + t.records_begin;
-    const std::uint64_t region = t.records_end - t.records_begin;
-    const std::uint64_t off = t.offsets[id - t.type_begin];
-    if (off + 4 > region) {
-        return false;
-    }
-    const std::uint32_t reclen = rd16(base + off);
-    if (reclen < 2 || off + 2 + reclen > region) {
-        return false;
-    }
-    out.kind = rd16(base + off + 2);
-    out.body = base + off + 4;
-    out.body_len = reclen - 2;
-    return true;
+bool find_type(const IpiTable& t, std::uint32_t id, TypeRec& out) {
+    return ipi_find(t, id, out);
 }
 
 ParamType make_int(std::uint32_t type_index, std::uint8_t size) {
@@ -179,7 +124,7 @@ ParamType classify_simple(std::uint32_t idx) {
     return unsupported(idx, "built-in type " + hex32(idx) + " is not an integer, pointer, float or double");
 }
 
-ParamType classify_type(const TypeTable* tpi, std::uint32_t idx, int depth) {
+ParamType classify_type(const IpiTable* tpi, std::uint32_t idx, int depth) {
     if (idx < 0x1000) {
         return classify_simple(idx);
     }
@@ -224,7 +169,7 @@ ParamType classify_type(const TypeTable* tpi, std::uint32_t idx, int depth) {
     return unsupported(idx, "type " + hex32(idx) + " has an unsupported record kind 0x" + hex32(rec.kind).substr(2));
 }
 
-bool is_aggregate_type(const TypeTable* tpi, std::uint32_t idx, int depth) {
+bool is_aggregate_type(const IpiTable* tpi, std::uint32_t idx, int depth) {
     if (idx < 0x1000 || tpi == nullptr || depth > kMaxTypeDepth) {
         return false;
     }
@@ -241,7 +186,7 @@ bool is_aggregate_type(const TypeTable* tpi, std::uint32_t idx, int depth) {
 // Fills info.params / params_known / params_error from the function's type.
 void resolve_params(const PdbIndex::Impl& impl, std::uint32_t type_index, bool id_proc, ProcInfo& info) {
     std::string why;
-    const TypeTable* tpi = type_table(impl, 0, &why);
+    const IpiTable* tpi = type_table(impl, true, &why);
     if (tpi == nullptr) {
         info.params_error = "the TPI stream is unreadable: " + why;
         return;
@@ -249,7 +194,7 @@ void resolve_params(const PdbIndex::Impl& impl, std::uint32_t type_index, bool i
     std::uint32_t function_type = type_index;
     TypeRec rec;
     if (id_proc) {
-        const TypeTable* ipi = type_table(impl, 1, &why);
+        const IpiTable* ipi = type_table(impl, false, &why);
         if (ipi == nullptr) {
             info.params_error = "the IPI stream is unreadable: " + why;
             return;
@@ -364,10 +309,8 @@ Result<ProcInfo> PdbIndex::proc_info(const SymbolView& proc) const {
         info.variables[static_cast<std::size_t>(current_local)].locations.push_back(location);
     };
 
-    const bool walked = cv::for_each_record(data, 4, c.symbol_bytes, [&](const cv::Record& r) {
-        if (state == State::Done) {
-            return;
-        }
+    // The same walk as cv::for_each_record, but it stops at the end of the function instead of reading the rest of the compiland.
+    const auto visit = [&](const cv::Record& r) {
         const std::uint16_t k = r.kind;
         const std::uint8_t* b = r.body;
         const std::uint32_t n = r.body_len;
@@ -460,17 +403,42 @@ Result<ProcInfo> PdbIndex::proc_info(const SymbolView& proc) const {
                 }
                 break;
             case S_DEFRANGE_REGISTER:
-            case S_DEFRANGE_SUBFIELD_REGISTER:
                 if (n >= 4) {
                     VarLocation loc;
                     loc.kind = VarLocationKind::Register;
                     loc.reg = rd16(b);
-                    add_range(4, b, n, loc);
+                    add_range(4, b, n, loc);  // reg u16, MayHaveNoName u16, then the range
+                }
+                break;
+            case S_DEFRANGE_SUBFIELD_REGISTER:
+                if (n >= 8) {
+                    VarLocation loc;
+                    loc.kind = VarLocationKind::Register;
+                    loc.reg = rd16(b);
+                    add_range(8, b, n, loc);  // reg u16, MayHaveNoName u16, OffsetParent:12 + padding u32, then the range
                 }
                 break;
             default: break;
         }
-    });
+    };
+    bool walked = true;
+    for (std::uint64_t off = 4; off < c.symbol_bytes && state != State::Done;) {
+        if (c.symbol_bytes - off < 4) {
+            break;
+        }
+        const std::uint32_t reclen = rd16(data + off);
+        if (reclen < 2 || reclen > c.symbol_bytes - off - 2) {
+            walked = false;
+            break;
+        }
+        cv::Record rec;
+        rec.kind = rd16(data + off + 2);
+        rec.body = data + off + 4;
+        rec.body_len = reclen - 2;
+        rec.offset = off;
+        visit(rec);
+        off += 2 + reclen;
+    }
     if (!walked) {
         return Diag::make(diag::kBadModuleSymbols, "The symbols of module '" + std::string(c.object_name) + "' in '" + impl.path + "' are corrupt (a record leaves the symbol area).",
                           "Rebuild the module so the linker regenerates the PDB.");

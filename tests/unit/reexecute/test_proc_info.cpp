@@ -475,3 +475,38 @@ TEST_CASE("proc_info: only the direct children of the function count, and only u
     REQUIRE(second.variables.size() == 1);
     CHECK(second.variables[0].name == "b");
 }
+
+TEST_CASE("proc_info: S_DEFRANGE_SUBFIELD_REGISTER keeps its range after OffsetParent (body offset 8), S_DEFRANGE_REGISTER after the attributes (offset 4)") {
+    TempDir dir;
+    Types t;
+    const std::uint32_t proc_type = t.procedure(T_VOID, t.arglist({T_INT4}), 1);
+    const std::uint32_t id = t.func_id(proc_type, "sub");
+    const auto index = make_index(dir, t, [&](Records& r) {
+        add_proc(r, 0x1147, "sub", 0x100, 0x60, id);
+        add_local(r, "a", T_INT4, 1);
+        {
+            Bytes b;  // reg 18, MayHaveNoName, OffsetParent 4 (+ padding), range {0x1120, section 1, 0x30}
+            put16(b, 18);
+            put16(b, 0);
+            put32(b, 4);
+            put32(b, 0x1120);
+            put16(b, 1);
+            put16(b, 0x30);
+            r.add(0x1143, b);
+        }
+        add_reg_range(r, 19, 0x1150, 0x10);
+        r.add(0x114F, Bytes());
+    });
+    const pdb::ProcInfo info = info_of(*index, "sub");
+    REQUIRE(info.variables.size() == 1);
+    REQUIRE(info.variables[0].locations.size() == 2);
+    const pdb::VarLocation& sub = info.variables[0].locations[0];
+    CHECK(sub.kind == pdb::VarLocationKind::Register);
+    CHECK(sub.reg == 18);
+    CHECK(sub.start_rva == 0x2120);
+    CHECK(sub.length == 0x30);
+    const pdb::VarLocation& plain = info.variables[0].locations[1];
+    CHECK(plain.reg == 19);
+    CHECK(plain.start_rva == 0x2150);
+    CHECK(plain.length == 0x10);
+}
