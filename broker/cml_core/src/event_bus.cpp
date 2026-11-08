@@ -24,7 +24,7 @@ Event make_diag_event(const Diag& diag, const char* severity, const std::string&
 }
 
 Event make_patch_applied_event(std::uint32_t pid, const std::string& module, std::uint64_t generation, std::size_t hooks,
-                               std::size_t new_functions, std::size_t new_globals) {
+                               std::size_t new_functions, std::size_t new_globals, std::size_t hooks_planned, std::size_t hooks_dropped) {
     Event e;
     e.name = "patch_applied";
     e.body = ipc::json::Value::object();
@@ -35,6 +35,8 @@ Event make_patch_applied_event(std::uint32_t pid, const std::string& module, std
     e.body.set("hooks", ipc::json::Value::integer(static_cast<std::int64_t>(hooks)));
     e.body.set("new_functions", ipc::json::Value::integer(static_cast<std::int64_t>(new_functions)));
     e.body.set("new_globals", ipc::json::Value::integer(static_cast<std::int64_t>(new_globals)));
+    e.body.set("hooks_planned", ipc::json::Value::integer(static_cast<std::int64_t>(hooks_planned)));
+    e.body.set("hooks_dropped", ipc::json::Value::integer(static_cast<std::int64_t>(hooks_dropped)));
     return e;
 }
 

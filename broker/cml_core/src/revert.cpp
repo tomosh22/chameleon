@@ -95,6 +95,7 @@ Result<RevertReport> revert_module(AgentLink& link, ModuleState& module, RevertS
             const std::size_t dropped = module.batches.size();
             module.batches.clear();
             module.hooked.clear();
+            module.code.clear();  // WP-25: the records of the forgotten patches
             return Diag::make(rd::kModuleGone,
                               "the module '" + module.path + "' is no longer loaded in process " + std::to_string(snapshot.pid) + "; its " + std::to_string(dropped) +
                                   " applied reload(s) can no longer be reverted and were forgotten",
@@ -255,6 +256,7 @@ Result<RevertReport> revert_module(AgentLink& link, ModuleState& module, RevertS
                 module.index->restore_baseline(b->baseline_before);
             }
         }
+        module.prune_code_locked();  // WP-25: the records of the reverted patches
         module.generation = reverted.front().generation_before;
         report.generation = module.generation;
     }
