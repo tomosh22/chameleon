@@ -19,6 +19,7 @@ add_library(cmltest_core STATIC
     src/report.cpp
     src/run_dirs.cpp
     src/ticks.cpp
+    src/restart_step.cpp  # WP-21
     src/subscription.cpp)
 target_include_directories(cmltest_core PUBLIC src)
 target_link_libraries(cmltest_core PUBLIC cml_ipc cml_util)
@@ -76,6 +77,7 @@ cml_add_unit_test(harness
         tests/test_wp17_scenarios.cpp
         tests/test_wp14_scenarios.cpp
         tests/test_wp16_scenarios.cpp
+        tests/test_wp21_scenarios.cpp
         tests/test_wp22_scenarios.cpp
         tests/test_subscription.cpp
         tests/test_wp20_scenarios.cpp

@@ -117,13 +117,14 @@ void SourceBaseline::take(const std::vector<std::string>& files, const BaselineO
     stamps_ = std::move(taken);
 }
 
-SourceBaseline::SweepResult SourceBaseline::sweep() const {
+SourceBaseline::SweepResult SourceBaseline::sweep() {
     std::map<std::string, FileStamp> snapshot;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         snapshot = stamps_;
     }
     SweepResult out;
+    std::vector<std::pair<std::string, FileStamp>> refreshed;
     for (const auto& entry : snapshot) {
         ++out.checked;
         std::uint64_t size = 0;
@@ -144,6 +145,19 @@ SourceBaseline::SweepResult SourceBaseline::sweep() const {
         if (hash != entry.second.hash) {
             out.changed.push_back(entry.first);
             out.stamps[entry.first] = FileStamp{hash, size, mtime};
+        } else if (entry.second.size == kRestoredSize) {
+            refreshed.emplace_back(entry.first, FileStamp{hash, size, mtime});
+        }
+    }
+    if (!refreshed.empty()) {
+        // A restored original (see restore()) whose content is the original after all: from now on its real size and time let the cheap
+        // test skip it, instead of reading it on every sweep.
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& r : refreshed) {
+            const auto mine = stamps_.find(r.first);
+            if (mine != stamps_.end() && mine->second.size == kRestoredSize && mine->second.hash == r.second.hash) {
+                mine->second = r.second;
+            }
         }
     }
     return out;
@@ -152,8 +166,42 @@ SourceBaseline::SweepResult SourceBaseline::sweep() const {
 void SourceBaseline::accept(const std::map<std::string, FileStamp>& stamps) {
     std::lock_guard<std::mutex> lock(mutex_);
     for (const auto& entry : stamps) {
+        const auto previous = stamps_.find(entry.first);
+        if (previous != stamps_.end() && originals_.count(entry.first) == 0) {
+            originals_[entry.first] = previous->second;
+        }
         stamps_[entry.first] = entry.second;
     }
+}
+
+BaselineSnapshot SourceBaseline::session_snapshot() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    BaselineSnapshot out;
+    out.stamps = stamps_;
+    out.originals = originals_;
+    return out;
+}
+
+std::size_t SourceBaseline::restore(const BaselineSnapshot& snapshot) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& entry : snapshot.stamps) {
+        const auto mine = stamps_.find(entry.first);
+        if (mine != stamps_.end()) {
+            mine->second = entry.second;
+        }
+    }
+    std::size_t restored = 0;
+    for (const auto& entry : snapshot.originals) {
+        const auto mine = stamps_.find(entry.first);
+        if (mine == stamps_.end()) {
+            continue;
+        }
+        originals_[entry.first] = entry.second;
+        // Size and time that no file can have: the next sweep must read the file and compare its hash with the original.
+        mine->second = FileStamp{entry.second.hash, kRestoredSize, -1};
+        ++restored;
+    }
+    return restored;
 }
 
 std::map<std::string, FileStamp> SourceBaseline::stamps_of(const std::vector<std::string>& files) const {

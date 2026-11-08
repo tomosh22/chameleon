@@ -90,7 +90,7 @@ void on_compile_start() {
 }
 void on_compile_success() { note("compile-success"); }
 void on_compile_error(const char* text) { note(std::string("compile-error:") + (text != nullptr ? text : "(null)")); }
-void on_pre_restart() { note("pre-restart"); }  // never called: restart is not implemented
+void on_pre_restart() { note("pre-restart"); }  // WP-21: runs when the broker asks the agent to prepare a hot-restart
 
 CML_PREPATCH_HOOK(on_pre);
 CML_POSTPATCH_HOOK(on_post_a);

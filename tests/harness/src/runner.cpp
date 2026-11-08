@@ -20,6 +20,7 @@
 #include "cml/proc/proc.h"
 #include "exception_steps.h"
 #include "fixture_builder.h"
+#include "restart_step.h"
 #include "revert_step.h"
 #include "subscription.h"
 #include "rx.h"
@@ -251,6 +252,7 @@ private:
             case StepKind::ExpectEvent: return expect_event(step);
             case StepKind::SignalFixture: return signal_fixture();
             case StepKind::ExpectReloadResult: return expect_reload_result(step);
+            case StepKind::Restart: return restart_process(step);
             case StepKind::Revert: return revert(step);
             case StepKind::WatchExceptions: return from_exception(exception_steps_.watch(*control_, kControlTimeoutMs));
             case StepKind::ExpectException: {
@@ -633,6 +635,31 @@ private:
                               " hooks_installed=" + std::to_string(response->result.get_integer("hooks_installed")) +
                               " initializers_run=" + std::to_string(response->result.get_integer("initializers_run"));
         return StepOutcome::pass("reload ok " + summary + (timing.empty() ? std::string() : "; " + timing));
+    }
+
+    // WP-21: the broker replaces the process by a relaunched one (restart_step.cpp does the talking). The relaunched process
+    // writes into the same output file (the broker hands its standard handles on), so expect_stdout keeps reading one
+    // stream; the supervisor follows the pid.
+    StepOutcome restart_process(const Step& step) {
+        Proc* proc = find_proc(step.process);
+        if (proc == nullptr) {
+            return StepOutcome::fail(cml::ids::kScenarioFailed, "no process '" + step.process + "' was launched");
+        }
+        const std::uint32_t limit_ms = std::min<std::uint32_t>(static_cast<std::uint32_t>(step.within_s) * 1000u, remaining_ms());
+        if (limit_ms == 0) {
+            return scenario_timeout();
+        }
+        proc->cursor = read_whole_file(proc->stdout_file).size();  // what the hooks and the new process print belongs to the restart
+        const std::uint32_t old_pid = supervisor_.pid(proc->id);
+        const RestartStepOutcome restarted = run_restart_step(*control_, capabilities_, old_pid, step, limit_ms);
+        if (!restarted.ok) {
+            return StepOutcome::fail(restarted.diag_code, restarted.detail);
+        }
+        cml::Result<void> followed = supervisor_.adopt(proc->id, restarted.new_pid);
+        if (!followed) {
+            return StepOutcome::fail(followed.error());
+        }
+        return StepOutcome::pass(restarted.detail);
     }
 
     // WP-22: control command `revert` (the body is in revert_step.cpp).
