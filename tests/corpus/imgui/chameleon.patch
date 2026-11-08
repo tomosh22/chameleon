@@ -1,5 +1,5 @@
 diff --git a/examples/example_win32_directx11/main.cpp b/examples/example_win32_directx11/main.cpp
-index 5285df1..5522c47 100644
+index 5285df1..0c77e42 100644
 --- a/examples/example_win32_directx11/main.cpp
 +++ b/examples/example_win32_directx11/main.cpp
 @@ -11,6 +11,7 @@
@@ -10,7 +10,15 @@ index 5285df1..5522c47 100644
  
  // Data
  static ID3D11Device*            g_pd3dDevice = nullptr;
-@@ -30,6 +31,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+@@ -27,9 +28,15 @@ void CreateRenderTarget();
+ void CleanupRenderTarget();
+ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+ 
++// Chameleon corpus (WP-26): a function of the example's own translation unit that runs once per frame (an edit target)
++void CmlCorpusExampleFrame()
++{
++}
++
  // Main code
  int main(int, char**)
  {
@@ -18,15 +26,16 @@ index 5285df1..5522c47 100644
      // Create application window
      //ImGui_ImplWin32_EnableDpiAwareness();
      WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"ImGui Example", nullptr };
-@@ -169,6 +171,7 @@ int main(int, char**)
+@@ -169,6 +176,8 @@ int main(int, char**)
  
          // Present
          HRESULT hr = g_pSwapChain->Present(1, 0);   // Present with vsync
 +        cml_corpus_frame();   // Chameleon corpus (WP-26)
++        CmlCorpusExampleFrame();   // Chameleon corpus (WP-26)
          //HRESULT hr = g_pSwapChain->Present(0, 0); // Present without vsync
          g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
      }
-@@ -211,7 +214,7 @@ bool CreateDeviceD3D(HWND hWnd)
+@@ -211,7 +220,7 @@ bool CreateDeviceD3D(HWND hWnd)
      D3D_FEATURE_LEVEL featureLevel;
      const D3D_FEATURE_LEVEL featureLevelArray[2] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0, };
      HRESULT res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext);

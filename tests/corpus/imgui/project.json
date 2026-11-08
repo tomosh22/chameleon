@@ -10,63 +10,39 @@
   "env": {},
   "edits": [
     {
-      "id": "library-newframe",
-      "file": "imgui.cpp",
+      "id": "backend-dx11",
+      "file": "backends/imgui_impl_dx11.cpp",
       "replace": [
         {
-          "find": "void ImGui::NewFrame()\n{\n",
-          "with": "void ImGui::NewFrame()\n{\n    cml_corpus_marker(\"imgui_newframe_v2\");\n"
+          "find": "void ImGui_ImplDX11_NewFrame()\n{\n",
+          "with": "void ImGui_ImplDX11_NewFrame()\n{\n    cml_corpus_marker(\"imgui_dx11_newframe_v2\");\n"
         }
       ],
       "include": "chameleon_corpus.h",
-      "expect": "markers=\\S*imgui_newframe_v2:\\d+"
+      "expect": "markers=\\S*imgui_dx11_newframe_v2:\\d+"
     },
     {
-      "id": "library-checkbox",
-      "file": "imgui_widgets.cpp",
+      "id": "backend-win32",
+      "file": "backends/imgui_impl_win32.cpp",
       "replace": [
         {
-          "find": "bool ImGui::Checkbox(const char* label, bool* v)\n{\n",
-          "with": "bool ImGui::Checkbox(const char* label, bool* v)\n{\n    cml_corpus_marker(\"imgui_checkbox_v2\");\n"
+          "find": "void    ImGui_ImplWin32_NewFrame()\n{\n",
+          "with": "void    ImGui_ImplWin32_NewFrame()\n{\n    cml_corpus_marker(\"imgui_win32_newframe_v2\");\n"
         }
       ],
       "include": "chameleon_corpus.h",
-      "expect": "markers=\\S*imgui_checkbox_v2:\\d+"
+      "expect": "markers=\\S*imgui_win32_newframe_v2:\\d+"
     },
     {
-      "id": "library-demo",
-      "file": "imgui_demo.cpp",
+      "id": "example-main-tu",
+      "file": "examples/example_win32_directx11/main.cpp",
       "replace": [
         {
-          "find": "void ImGui::ShowDemoWindow(bool* p_open)\n{\n",
-          "with": "void ImGui::ShowDemoWindow(bool* p_open)\n{\n    cml_corpus_marker(\"imgui_demo_v2\");\n"
+          "find": "void CmlCorpusExampleFrame()\n{\n}",
+          "with": "void CmlCorpusExampleFrame()\n{\n    cml_corpus_marker(\"imgui_example_frame_v2\");\n}"
         }
       ],
-      "include": "chameleon_corpus.h",
-      "expect": "markers=\\S*imgui_demo_v2:\\d+"
-    },
-    {
-      "id": "header-inline-imgui-internal",
-      "file": "imgui_internal.h",
-      "replace": [
-        {
-          "find": "static inline float  ImFloor(float f)                                           { return (float)((f >= 0 || (float)(int)f == f) ? (int)f : (int)f - 1); } // Decent replacement for floorf()",
-          "with": "static inline float  ImFloor(float f)                                           { cml_corpus_marker(\"imgui_floor_v2\"); return (float)((f >= 0 || (float)(int)f == f) ? (int)f : (int)f - 1); } // Decent replacement for floorf()"
-        }
-      ],
-      "include": "chameleon_corpus.h",
-      "expect": "markers=\\S*imgui_floor_v2:\\d+"
-    },
-    {
-      "id": "template-imgui-internal",
-      "file": "imgui_internal.h",
-      "replace": [
-        {
-          "find": "template<typename T> static inline T ImClamp(T v, T mn, T mx)                   { return (v < mn) ? mn : (v > mx) ? mx : v; }",
-          "with": "template<typename T> static inline T ImClamp(T v, T mn, T mx)                   { cml_corpus_marker(\"imgui_clamp_v2\"); return (v < mn) ? mn : (v > mx) ? mx : v; }"
-        }
-      ],
-      "expect": "markers=\\S*imgui_clamp_v2:\\d+"
+      "expect": "markers=\\S*imgui_example_frame_v2:\\d+"
     },
     {
       "id": "header-inline-support",
@@ -91,12 +67,37 @@
       "expect": "tmpl=64 "
     },
     {
-      "id": "unsupported-new-thread-local",
-      "file": "imgui_draw.cpp",
+      "id": "unsupported-static-overloads-library-tu",
+      "file": "imgui.cpp",
       "replace": [
         {
-          "find": "void ImDrawList::AddLine(const ImVec2& p1, const ImVec2& p2, ImU32 col, float thickness)\n{\n",
-          "with": "void ImDrawList::AddLine(const ImVec2& p1, const ImVec2& p2, ImU32 col, float thickness)\n{\n    static thread_local int cml_corpus_tls = 0;\n    cml_corpus_tls++;\n"
+          "find": "void ImGui::NewFrame()\n{\n",
+          "with": "void ImGui::NewFrame()\n{\n    cml_corpus_marker(\"imgui_newframe_v2\");\n"
+        }
+      ],
+      "include": "chameleon_corpus.h",
+      "expect_error": "CML3214"
+    },
+    {
+      "id": "unsupported-static-overloads-header",
+      "file": "imgui_internal.h",
+      "replace": [
+        {
+          "find": "static inline float  ImFloor(float f)                                           { return (float)((f >= 0 || (float)(int)f == f) ? (int)f : (int)f - 1); } // Decent replacement for floorf()",
+          "with": "static inline float  ImFloor(float f)                                           { cml_corpus_marker(\"imgui_floor_v2\"); return (float)((f >= 0 || (float)(int)f == f) ? (int)f : (int)f - 1); } // Decent replacement for floorf()"
+        }
+      ],
+      "include": "chameleon_corpus.h",
+      "expect_error": "CML3214",
+      "include_anchor": "#include <stdio.h>"
+    },
+    {
+      "id": "unsupported-new-thread-local",
+      "file": "backends/imgui_impl_dx11.cpp",
+      "replace": [
+        {
+          "find": "void ImGui_ImplDX11_Shutdown()\n{\n",
+          "with": "void ImGui_ImplDX11_Shutdown()\n{\n    static thread_local int cml_corpus_tls = 0;\n    cml_corpus_tls++;\n"
         }
       ],
       "expect_error": "CML3400"

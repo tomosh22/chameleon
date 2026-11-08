@@ -37,6 +37,7 @@ if ($Project -eq 'godot') { $src = Join-Path $WorkDir "src-godot" }   # one chec
 $latin1 = [System.Text.Encoding]::GetEncoding(28591)
 $script:Matrix = New-Object System.Collections.Generic.List[object]
 $script:Originals = @{}
+$script:Prev = @{}
 $script:ExePath = $null
 $script:Broker = $null
 $script:App = $null
@@ -204,23 +205,35 @@ function Restore-Originals {
     $script:Originals = @{}
 }
 
+function Restore-File([string]$Path) {
+    if ($script:Prev.ContainsKey($Path)) {   # the content before the last edit of this file
+        [System.IO.File]::WriteAllBytes($Path, $latin1.GetBytes($script:Prev[$Path]))
+    }
+}
+
 function Apply-Edit($edit) {
     $path = Join-Path $src $edit.file
     if (-not (Test-Path $path)) { throw "edit $($edit.id): $($edit.file) does not exist" }
     $text = $latin1.GetString([System.IO.File]::ReadAllBytes($path))
     if (-not $script:Originals.ContainsKey($path)) { $script:Originals[$path] = $text }
-    # Some projects are checked out with CRLF line endings (.gitattributes); the edits are written with LF.
-    $eol = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $script:Prev[$path] = $text
+    # Some projects are checked out with CRLF line endings (.gitattributes) and a patch applied with --ignore-whitespace can
+    # leave LF lines in them: the edits are written with LF and matched against either.
     foreach ($r in @($edit.replace)) {
-        $find = ([string]$r.find).Replace("`r`n", "`n").Replace("`n", $eol)
+        $findLf = ([string]$r.find).Replace("`r`n", "`n")
+        $pattern = [regex]::Escape($findLf).Replace('\n', '\r?\n')
+        $found = [regex]::Matches($text, $pattern)
+        if ($found.Count -ne 1) { throw "edit $($edit.id): '$($r.find)' occurs $($found.Count) times in $($edit.file), expected once" }
+        $m = $found[0]
+        $eol = if ($m.Value.Contains("`r`n")) { "`r`n" } else { "`n" }
         $with = ([string]$r.with).Replace("`r`n", "`n").Replace("`n", $eol)
-        $count = ([regex]::Matches($text, [regex]::Escape($find))).Count
-        if ($count -ne 1) { throw "edit $($edit.id): '$($r.find)' occurs $count times in $($edit.file), expected once" }
-        $text = $text.Replace($find, $with)
+        $text = $text.Substring(0, $m.Index) + $with + $text.Substring($m.Index + $m.Length)
     }
     if ($edit.include) {
-        $m = [regex]::Match($text, '(?m)^#\s*include')
-        if (-not $m.Success) { throw "edit $($edit.id): no #include line in $($edit.file)" }
+        $anchor = if ($edit.include_anchor) { [regex]::Escape([string]$edit.include_anchor) } else { '^#\s*include' }
+        $m = [regex]::Match($text, "(?m)$anchor")
+        if (-not $m.Success) { throw "edit $($edit.id): no include anchor /$anchor/ in $($edit.file)" }
+        $eol = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
         $text = $text.Insert($m.Index, "#include `"$($edit.include)`"$eol")
     }
     [System.IO.File]::WriteAllBytes($path, $latin1.GetBytes($text))
@@ -288,6 +301,9 @@ if ($built) {
                     if ($null -eq $resp) { throw "no reply to reload within $($cfg.reload_timeout_s + 30)s" }
                     $script:Ctl.Pump(1500)
                     Add-Content -Path (Join-Path $out 'reloads.jsonl') -Value ($resp)
+                    $show = if ($resp.Length -gt 3000) { $resp.Substring(0, 3000) + '...' } else { $resp }
+                    Write-Host "reload response: $show"
+                    Write-Host "events: $(@($script:Ctl.Events | ForEach-Object { if ($_.Length -gt 400) { $_.Substring(0, 400) } else { $_ } }) -join ' || ')"
                     $r = $resp | ConvertFrom-Json
                     if ($refused) {
                         $seen = ($resp -match $edit.expect_error) -or (@($script:Ctl.Events | Where-Object { $_ -match $edit.expect_error }).Count -gt 0)
@@ -295,6 +311,7 @@ if ($built) {
                         if (-not $seen) { throw "the reload failed, but not with $($edit.expect_error): $resp" }
                         $before = (Get-CorpusLines).Count
                         Wait-Corpus 'CORPUS frame=' $before 20 | Out-Null     # still running, still producing frames
+                        Restore-File (Join-Path $src $edit.file)                # a refused change would be retried by every later reload
                         "refused with $($edit.expect_error) as expected; application keeps running"
                     } else {
                         if (-not $r.ok) { throw "reload failed: $resp" }
