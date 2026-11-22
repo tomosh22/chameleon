@@ -58,6 +58,12 @@ function Invoke-Step([string]$Name, [scriptblock]$Body) {
     Write-Host "::group::$Project/$Compiler/$Name"
     try {
         $detail = & $Body
+        $stale = $cfg.expected_failures | Where-Object { $_.step -eq $Name -and ($_.compiler -eq $Compiler -or $_.compiler -eq '*') } | Select-Object -First 1
+        if ($stale) {
+            # The documented failure did not happen: the finding was fixed (flip the entry in project.json) or the step changed.
+            Add-Result $Name 'fail' ("unexpected pass: {0}" -f $stale.reason) $watch.Elapsed.TotalSeconds
+            return $false
+        }
         Add-Result $Name 'pass' ([string]($detail | Select-Object -Last 1)) $watch.Elapsed.TotalSeconds
         return $true
     } catch {
@@ -119,8 +125,12 @@ $fetched = Invoke-Step 'fetch' {
     $patchFile = Join-Path $here "$Project/$($cfg.patch)"
     $patchHash = (Get-FileHash $patchFile -Algorithm SHA256).Hash
     $support = Join-Path $src $cfg.support_dir
-    if ((Test-Path $marker) -and ((Get-Content $marker -Raw) -match $patchHash)) {
-        # A restored cache: the patched checkout and its build tree. The support files are refreshed (they are ours).
+    $wantMarker = "$($cfg.tag) $($cfg.commit) patch=$patchHash"
+    if ((Test-Path $marker) -and ((Get-Content $marker -Raw).Trim() -eq $wantMarker)) {
+        # A restored cache: the patched checkout and its build tree. A cancelled run may have left edits in the sources:
+        # go back to the commit made right after the patch (tracked files only, the build outputs stay), then refresh the
+        # support files (they are ours).
+        Invoke-Native 'git checkout' 'git' @('-C', $src, 'checkout', '-q', '--', '.')
         Copy-Item (Join-Path $here 'common/chameleon_corpus.h') $support -Force
         Copy-Item (Join-Path $here 'common/chameleon_corpus.cpp') $support -Force
         Copy-Item (Join-Path $repo 'agent/include/Chameleon_API.h') $support -Force
@@ -136,7 +146,9 @@ $fetched = Invoke-Step 'fetch' {
     Copy-Item (Join-Path $here 'common/chameleon_corpus.cpp') $support
     Copy-Item (Join-Path $repo 'agent/include/Chameleon_API.h') $support
     Invoke-Native 'git apply' 'git' @('-C', $src, '-c', 'core.autocrlf=false', 'apply', '--whitespace=nowarn', '--ignore-whitespace', $patchFile)
-    Set-Content -Path $marker -Value "$($cfg.tag) $head patch=$patchHash"
+    Invoke-Native 'git add' 'git' @('-C', $src, 'add', '-A')
+    Invoke-Native 'git commit' 'git' @('-C', $src, '-c', 'user.name=corpus', '-c', 'user.email=corpus@example.invalid', 'commit', '-q', '-m', 'Chameleon corpus patch')
+    Set-Content -Path $marker -Value $wantMarker
     "$($cfg.repo) $($cfg.tag) $head"
 }
 
@@ -308,14 +320,18 @@ if ($built) {
             $sp = @{ FilePath = $script:ExePath; PassThru = $true; WorkingDirectory = (Split-Path $script:ExePath); RedirectStandardOutput = (Join-Path $out 'app.stdout.txt'); RedirectStandardError = (Join-Path $out 'app.stderr.txt') }
             if ($appArgs.Count -gt 0) { $sp.ArgumentList = $appArgs }
             $script:App = Start-Process @sp
-            Wait-Corpus 'AGENT enabled=1' 0 $cfg.start_timeout_s | Out-Null
+            $agentLine = Wait-Corpus 'AGENT (enabled=\d|create failed)' 0 $cfg.start_timeout_s
+            if ($agentLine -notmatch 'enabled=1') { throw "the agent did not enable the module: $agentLine" }
             $idx = $script:Ctl.Call('wait', ('{"for":"index","timeout_ms":' + ($cfg.index_timeout_s * 1000) + '}'), (($cfg.index_timeout_s + 30) * 1000)) | ConvertFrom-Json
             if (-not $idx.ok) { throw "the PDB index did not become ready: $($idx | ConvertTo-Json -Compress -Depth 6)" }
             $first = Wait-Corpus 'CORPUS frame=' 0 $cfg.start_timeout_s
             "module enabled and indexed in the running process (pid $($script:App.Id)); first line: $first"
         }
         if (-not $ran) {
-            foreach ($e in $cfg.edits) { if (-not $e.compiler -or $e.compiler -eq $Compiler) { Skip-Step "edit:$($e.id)" 'enable failed' } }
+            $skipped = @($cfg.edits | Where-Object { -not $_.compiler -or $_.compiler -eq $Compiler })
+            foreach ($e in $skipped) { Skip-Step $(if ($e.expect_error) { "refused:$($e.id)" } else { "edit:$($e.id)" }) 'enable failed' }
+            Skip-Step 'still-running' 'enable failed'
+            if (@($skipped | Where-Object { $_.final }).Count -gt 0) { Skip-Step 'still-running-final' 'enable failed' }
         } else {
             $doEdit = {
                 param($edit)
@@ -323,7 +339,10 @@ if ($built) {
                 $name = if ($refused) { "refused:$($edit.id)" } else { "edit:$($edit.id)" }
                 Invoke-Step $name {
                     if ($script:App.HasExited) { throw "the application had already exited (code $($script:App.ExitCode))" }
+                    $editPath = Join-Path $src $edit.file
+                    $keep = $false   # a refused or failed edit is undone, or every later reload would retry it
                     Apply-Edit $edit
+                    try {
                     $from = (Get-CorpusLines).Count
                     $script:Ctl.Events.Clear()
                     $watch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -342,14 +361,17 @@ if ($built) {
                         if (-not $seen) { throw "the reload failed, but not with $($edit.expect_error): $resp" }
                         $before = (Get-CorpusLines).Count
                         Wait-Corpus 'CORPUS frame=' $before 20 | Out-Null     # still running, still producing frames
-                        Restore-File (Join-Path $src $edit.file)                # a refused change would be retried by every later reload
                         "refused with $($edit.expect_error) as expected; application keeps running"
                     } else {
                         if (-not $r.ok) { throw "reload failed: $resp" }
                         if ([int]$r.result.patched -eq 0) { throw "the reload patched nothing (changed_files: $(@($r.result.changed_files).Count)): $($edit.file) maps to no source compiland of the module" }
+                        $keep = $true   # the patch is live and the baseline accepted: the file stays as edited
                         $line = Wait-Corpus $edit.expect $from $cfg.observe_timeout_s
                         $t = $r.result.timing_ms
                         "reload {0:N1}s wall, total {1} ms (compile {2}, link {3}, load {4}, hooks {5}); patched={6} hooks={7}; observed: {8}" -f $wall, $t.total, $t.compile, $t.link, $t.load, $t.hooks, $r.result.patched, $r.result.hooks_installed, $line
+                    }
+                    } finally {
+                        if (-not $keep) { Restore-File $editPath }
                     }
                 } | Out-Null
             }

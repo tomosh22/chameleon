@@ -116,9 +116,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: corpus-work/src-godot
-          key: corpus-godot-4.5.1-msvc-${{ hashFiles('tests/corpus/godot/chameleon.patch', 'tests/corpus/godot/build.ps1') }}-${{ github.run_id }}
+          key: corpus-godot-${{ hashFiles('tests/corpus/godot/project.json', 'tests/corpus/godot/chameleon.patch', 'tests/corpus/godot/build.ps1') }}-${{ github.run_id }}
           restore-keys: |
-            corpus-godot-4.5.1-msvc-${{ hashFiles('tests/corpus/godot/chameleon.patch', 'tests/corpus/godot/build.ps1') }}-
+            corpus-godot-${{ hashFiles('tests/corpus/godot/project.json', 'tests/corpus/godot/chameleon.patch', 'tests/corpus/godot/build.ps1') }}-
 
       - name: Restore the software OpenGL (raylib)
         if: matrix.project == 'raylib'
@@ -152,7 +152,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: corpus-work/src-godot
-          key: corpus-godot-4.5.1-msvc-${{ hashFiles('tests/corpus/godot/chameleon.patch', 'tests/corpus/godot/build.ps1') }}-${{ github.run_id }}
+          key: corpus-godot-${{ hashFiles('tests/corpus/godot/project.json', 'tests/corpus/godot/chameleon.patch', 'tests/corpus/godot/build.ps1') }}-${{ github.run_id }}
 
       - name: Upload logs and the matrix
         if: always()

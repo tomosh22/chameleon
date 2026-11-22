@@ -46,16 +46,13 @@ std::wstring env_w(const wchar_t* name) {
     return std::wstring(buffer, n);
 }
 
-// A fatal first-chance exception is described in the log before the process dies (the corpus driver quotes it):
+// An UNHANDLED fatal exception (the top-level filter runs only when no handler took it, so a handled access violation never
+// shows up here) is described in the log before the process dies (the corpus driver quotes it):
 // code, address as module+offset, the access address of an access violation, and the registers that matter.
-LONG CALLBACK fatal_exception_logger(EXCEPTION_POINTERS* ep) {
+LONG WINAPI fatal_exception_logger(EXCEPTION_POINTERS* ep) {
     const DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_STACK_OVERFLOW &&
         code != EXCEPTION_PRIV_INSTRUCTION && code != EXCEPTION_INT_DIVIDE_BY_ZERO) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    static volatile long reported = 0;
-    if (InterlockedExchange(&reported, 1) != 0) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     const void* at = ep->ExceptionRecord->ExceptionAddress;
@@ -113,7 +110,7 @@ extern "C" void cml_corpus_init(void) {
     if (env_w(L"CML_CORPUS_AGENT") != L"1") {
         return;
     }
-    AddVectoredExceptionHandler(1, fatal_exception_logger);
+    SetUnhandledExceptionFilter(fatal_exception_logger);
     const std::wstring dir = env_w(L"CML_CORPUS_AGENT_DIR");
     cml_status status = CML_STATUS_OK;
     g_agent = cml::CreateDefaultAgent(dir.c_str(), &status);

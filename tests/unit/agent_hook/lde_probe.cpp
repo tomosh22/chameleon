@@ -155,11 +155,13 @@ int main(int argc, char** argv) {
     std::map<std::string, std::size_t> unknown_bytes;
     std::size_t outcome_padding = 0, outcome_five_byte = 0, outcome_refused = 0, refused_unknown_opcode = 0, refused_vex = 0;
     std::size_t refused_listed = 0;
+    std::size_t examined = 0;  // functions whose bytes could be read (the others are not counted anywhere)
     for (const auto& [rva, name] : by_rva) {
         const std::vector<std::uint8_t> head = read_clamped(owned->image, rva, 16);
         if (head.empty()) {
             continue;  // not backed by file bytes (e.g. in a section without raw data)
         }
+        ++examined;
         std::string lens;
         bool unknown = false;
         std::size_t at = 0;
@@ -234,13 +236,13 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::printf("LDE-SUMMARY functions=%zu decoded=%zu unknown=%zu ended_by_ret_or_jmp=%zu\n", by_rva.size(), decoded_ok,
+    std::printf("LDE-SUMMARY functions=%zu decoded=%zu unknown=%zu ended_by_ret_or_jmp=%zu\n", examined, decoded_ok,
                 unknown_count, with_flow_end);
     for (const auto& [text, count] : plans) {
         std::printf("LDE-PLAN %s %zu\n", text.c_str(), count);
     }
     std::printf("LDE-OUTCOME functions=%zu padding=%zu five_byte=%zu refused=%zu refused_vex=%zu refused_unknown_opcode=%zu refused_other=%zu\n",
-                by_rva.size(), outcome_padding, outcome_five_byte, outcome_refused, refused_vex, refused_unknown_opcode,
+                examined, outcome_padding, outcome_five_byte, outcome_refused, refused_vex, refused_unknown_opcode,
                 outcome_refused - refused_vex - refused_unknown_opcode);
     std::vector<std::pair<std::size_t, std::string>> ranked;
     for (const auto& [bytes, count] : unknown_bytes) {
@@ -254,8 +256,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "cml_lde_probe: %zu function(s) refused for an unknown opcode (CML4300)\n", refused_unknown_opcode);
         return 3;
     }
-    if (by_rva.size() < min_functions) {
-        std::fprintf(stderr, "cml_lde_probe: %zu function(s) examined, fewer than the required %zu\n", by_rva.size(), min_functions);
+    if (examined < min_functions) {
+        std::fprintf(stderr, "cml_lde_probe: %zu function(s) examined, fewer than the required %zu\n", examined, min_functions);
         return 4;
     }
     return 0;

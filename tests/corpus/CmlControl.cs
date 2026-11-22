@@ -79,7 +79,12 @@ public sealed class CmlControl : IDisposable
             }
             if (IsResponse(line))
             {
-                return line;
+                // The answer to this request, not a late one of an earlier request that timed out: those are dropped.
+                if (line.StartsWith("{\"id\":" + id + ",", StringComparison.Ordinal))
+                {
+                    return line;
+                }
+                continue;
             }
             Events.Add(line);
         }

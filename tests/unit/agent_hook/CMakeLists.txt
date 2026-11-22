@@ -70,6 +70,7 @@ if(MSVC)
                 COMMAND cml_lde_probe $<TARGET_FILE:fixture_${_cml_lde_fx}> --quiet --fail-on-unknown-opcode --min-functions 5)
             set_tests_properties(tool.lde_corpus_${_cml_lde_fx} PROPERTIES
                 PASS_REGULAR_EXPRESSION "LDE-OUTCOME functions=[1-9][0-9]* padding=[0-9]+ five_byte=[0-9]+ refused=[0-9]+ refused_vex=[0-9]+ refused_unknown_opcode=0 "
+                FAIL_REGULAR_EXPRESSION "cml_lde_probe: [0-9]+ function|LDE-REFUSED"
                 TIMEOUT 300)
         endif()
     endforeach()
