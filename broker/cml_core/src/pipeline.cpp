@@ -19,6 +19,7 @@
 #include "cml/core/header_diag_ids.h"
 #include "cml/core/patch_image.h"
 #include "cml/core/pipeline_diag_ids.h"
+#include "cml/core/static_lib_diag_ids.h"
 #include "cml/toolchain/rewrite.h"
 #include "cml/util/hash.h"
 #include "cml/util/format.h"
@@ -356,6 +357,13 @@ private:
                  Diag::make(pd::kChangedFileUnmapped, "the changed file '" + f + "' is not part of any compiland of " + module_.name,
                             "No compiland lists the file and no scanned #include chain of the module reaches it (ADR-0013). Edit a source file that includes the header, or rebuild the project if the include path changed."));
         }
+        for (const ModuleIndex::Sweep::NotOwned& n : swept->not_owned) {
+            // WP-26b: the file is some compiland's source, but no compiland that can be reloaded owns it: say so instead of a silent `patched: 0`.
+            warn(report, "sweep",
+                 Diag::make(staticlib::diag::kChangedFileNotOwned,
+                            "the changed file '" + n.file + "' is only owned by compilands of " + module_.name + " that cannot be reloaded: " + n.detail,
+                            "Rebuild the project (and the library it belongs to) with /Z7 so its PDB records the compile command, then restart; or rebuild and hot-restart now."));
+        }
         for (const std::string& f : swept->missing) {
             warn(report, "sweep", Diag::make(pd::kBaselineFile, "the tracked file '" + f + "' is gone", "Restore it or ignore this warning."));
         }
@@ -457,7 +465,7 @@ private:
             }
             toolchain::CompileRequest cr;
             cr.record = *record;
-            cr.output_object = toolchain::patch_object_path(*workdir + "/obj", module_.name, hash64(u.object_name), record->source);
+            cr.output_object = toolchain::patch_object_path(*workdir + "/obj", module_.name, hash64(u.object_name + "|" + std::string(pdb->compiland(ci).library_name)), record->source);
             cr.timeout_ms = static_cast<unsigned>(std::max<std::int64_t>(1000, remaining_ms()));
             cr.cancel = ctx_.cancel;
             if (!record->compiler.empty()) {
@@ -566,6 +574,12 @@ private:
             const auto st = swept->stamps.find(f);
             if (st != swept->stamps.end()) {
                 accepted[f] = st->second;
+            }
+        }
+        for (const ModuleIndex::Sweep::NotOwned& n : swept->not_owned) {
+            const auto st = swept->stamps.find(n.file);
+            if (st != swept->stamps.end()) {
+                accepted[n.file] = st->second;
             }
         }
         // WP-22: the patches of this reload are one batch a `revert` can undo, together with the baseline they replaced.

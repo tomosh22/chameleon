@@ -286,9 +286,7 @@ Prepared prepare(const std::string& fixture, const fs::path& edit_file, const cm
         std::uint32_t found = cml::pdb::kNoCompiland;
         cml::pdb::BuildEnv env;
         for (std::uint32_t ci = 0; ci < module_pdb.compiland_count(); ++ci) {
-            if (!module_pdb.compiland(ci).library_name.empty()) {
-                continue;
-            }
+            // (library members count: fixture static_lib's source is linked from an archive, ADR-0036)
             auto e = module_pdb.build_env(ci);
             if (!e || !e->source_file()) {
                 continue;
