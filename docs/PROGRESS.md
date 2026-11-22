@@ -30,7 +30,9 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-24 | Thread-local variables | 6 | done | wp/24-thread-local | #39 | — |
 | WP-25 | Unchanged-function elision (scope narrowed, ADR-0034) | 6 | done | wp/25-unchanged-elision | #37 | — |
 | WP-23 | Re-execute function after crash (ADR-0035) | 7 | done | wp/23-crash-reexecute | #43 (3230b6f) | CI 14/14 x2 at bff09cb verified (crash_reexecute 25/25 incl. windows-2025 msvc RelWithDebInfo, clang-cl Debug; agent_hook 25/25); 10 high findings fixed, delta checked |
-| WP-26 | Real-project corpus (raylib, Dear ImGui, Godot; ADR-0035) | 7 | paused (open, #46) | wp/26-corpus | — | — |
+| WP-26 | Real-project corpus (raylib, Dear ImGui, Godot; ADR-0035) | 7 | in review (fixes) | wp/26-corpus | #46 | main merged in (d5d937c); medium review: 6 important harness findings sent; F-1/F-3 rulings in ADR-0036 |
+| WP-26b | Static-library members reloadable (F-1; ADR-0036) | 7 | in progress | wp/26b-static-lib | — | — |
+| WP-26c | clang-cl C-statics crash after reload (F-3; ADR-0036) | 7 | in progress | wp/26c-c-statics | — | — |
 | WP-27 | Performance budgets | 7 | done | wp/27-perf-budgets | #42 (f39dc19) | CI 14/14 push 42460887634 + PR 42460890741 at 00e0ac6; pdb index 328 ms/544 MiB (budget 4352), reload excl. compile median 40.9 ms, idle CPU 0.000 %, large-PDB broker 219 MiB = 0.40x PDB, session broker peak 11.0 MiB (limit 1.5x PDB + 32 MiB baseline). Test-coverage gap: no reload measured inside the large PDB (benchmark has no agent). |
 | WP-28 | Fuzzing and failure injection | 7 | done | wp/28-fuzz-injection | #44 (5b6dffb) | CI 14/14 x2 + fuzz 6/6 (incl. OFF build) at e41c1f5 verified; inject_stages 89/89, crash_reexecute 25/25, agent_hook 25/25 (windows-2025 clang-cl RelWithDebInfo); 8 high findings fixed, post-patch-hooks fires before commit; delta checked |
 
@@ -97,4 +99,6 @@ Wave 6 complete. Wave 7 is paused at the user's request: WP-23, WP-27 and WP-28 
   5. Fold F-2 and F-4 into KNOWN_LIMITATIONS.
 - VEX opcodes are counted as refused, not decoded; whether to decode them is a separate decision (it reverses a WP-10 limitation).
 
-**Next:** finish WP-26, then wave 8 (WP-29..32).
+**Resumed 2026-11-22.** Main is green through 5b6dffb. #47 merged as 12d198a. ADR-0036 is in #48. WP-26 fixes, WP-26b and WP-26c are running.
+
+**Next:** finish WP-26, WP-26b and WP-26c, then wave 8 (WP-29..32).
