@@ -20,6 +20,7 @@
 #include "cml/util/path.h"
 #include "crash/diag_ids.h"
 #include "crash/exception_gate.h"
+#include "fault/fault_injection.h"
 #include "hook/installer.h"
 #include "hook/user_hook_ids.h"
 #include "loader/patch_loader.h"
@@ -1035,6 +1036,10 @@ void Agent::handle_message(const ipc::Message& message) {
         handle_exception_action(*action);
         return;
     }
+    if (const auto* reexecute = std::get_if<ipc::Reexecute>(&message)) {
+        handle_reexecute(*reexecute);  // WP-23
+        return;
+    }
     CML_LOG(Warn, "ignoring unexpected %s from the broker", ipc::to_string(ipc::type_of(message)));
 }
 
@@ -1054,6 +1059,12 @@ void Agent::serve(ipc::PipeConnection& connection) {
         }
         switch (received->status) {
             case ipc::IoStatus::Ok:
+                if (fault::is_arm_request(received->message)) {  // WP-28: ArmFault (failure injection)
+                    if (!send_message(connection, fault::handle_arm_request(received->message))) {
+                        return;
+                    }
+                    break;
+                }
                 if (loader::PatchLoader::is_loader_request(received->message)) {
                     // WP-08: address space and patch loading. Runs on the agent thread; the answer
                     // (PatchLoaded / ReserveRange / Reply) is sent when the work is done.

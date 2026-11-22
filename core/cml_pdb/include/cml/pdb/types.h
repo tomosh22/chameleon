@@ -201,6 +201,75 @@ struct BuildEnv {
     OptimizationHint optimization() const noexcept;
 };
 
+// ---- WP-23: what the PDB records about the parameters of one function ------------------------------------------------
+
+// How an argument travels in the x64 calling convention, derived from the CodeView type of the parameter.
+enum class ParamClass : std::uint8_t {
+    Int,          // passed in RCX/RDX/R8/R9 (integers, pointers, references, enums, booleans)
+    Float,        // passed in XMM0..XMM3 (float, double)
+    Unsupported,  // by-value aggregates, 80/128-bit types, member pointers, anything not understood: see `why`
+};
+
+struct ParamType {
+    ParamClass cls = ParamClass::Unsupported;
+    std::uint8_t size = 0;       // bytes of the value (1, 2, 4, 8); 0 when Unsupported
+    std::uint32_t type_index = 0;
+    std::string why;             // Unsupported: one line naming the reason
+};
+
+enum class VarLocationKind : std::uint8_t {
+    RegisterRelative,      // [reg + offset]   (S_REGREL32, S_DEFRANGE_REGISTER_REL)
+    FramePointerRelative,  // [frame pointer + offset]; the register is ProcInfo::param_base_register (S_DEFRANGE_FRAMEPOINTER_REL*)
+    Register,              // the value lives in a register (S_DEFRANGE_REGISTER, S_DEFRANGE_SUBFIELD_REGISTER)
+};
+
+// Where a variable lives over a code range. `length == kWholeFunction` covers the whole function.
+struct VarLocation {
+    static constexpr std::uint32_t kWholeFunction = 0xFFFFFFFFu;
+    VarLocationKind kind = VarLocationKind::RegisterRelative;
+    std::uint16_t reg = 0;         // CV_AMD64 register number (RegisterRelative, Register)
+    std::int32_t offset = 0;
+    std::uint32_t start_rva = 0;   // first byte of the range
+    std::uint32_t length = kWholeFunction;
+    bool covers(std::uint32_t rva) const noexcept {
+        return length == kWholeFunction || (rva >= start_rva && rva - start_rva < length);
+    }
+};
+
+// A direct child of the function (S_LOCAL + S_DEFRANGE_*, or S_REGREL32). `is_param` is the S_LOCAL parameter flag; MSVC's
+// S_REGREL32 has none (`from_regrel` is set), so the caller identifies parameters by their home-space address.
+struct ProcVariable {
+    std::string name;
+    std::uint32_t type_index = 0;
+    bool is_param = false;
+    bool from_regrel = false;
+    bool optimized_out = false;    // S_LOCAL says the variable has no location at all
+    std::vector<VarLocation> locations;
+};
+
+// CV_AMD64 register numbers used by the locations.
+inline constexpr std::uint16_t kCvRegRbp = 334;
+inline constexpr std::uint16_t kCvRegRsp = 335;
+inline constexpr std::uint16_t kCvRegR13 = 341;
+
+struct ProcInfo {
+    std::string name;
+    std::uint32_t rva = kNoRva;
+    std::uint32_t size = 0;
+    std::uint32_t compiland = kNoCompiland;
+    bool has_frameproc = false;
+    std::uint32_t frame_flags = 0;          // S_FRAMEPROC flags
+    std::uint32_t frame_bytes = 0;          // S_FRAMEPROC cbFrame
+    std::uint16_t local_base_register = 0;  // the register FramePointerRelative locations of locals are relative to; 0 = unknown
+    std::uint16_t param_base_register = 0;  // ... of parameters
+    bool opt_for_speed = false;             // S_FRAMEPROC "optimised for speed"
+    // The parameters in declaration order (`this` first for a non-static member function), from the function type.
+    bool params_known = false;
+    std::string params_error;               // params_known == false: why
+    std::vector<ParamType> params;
+    std::vector<ProcVariable> variables;    // direct children of the function, in record order
+};
+
 // Memory accounting for the index (see docs/wp/WP-04.md). `tracked_*` counts every allocation made
 // by cml_pdb's own containers and stream copies; `mapped_*` counts bytes of PDB files currently
 // mapped (resident pages are only those actually touched, but the budget counts the whole file).

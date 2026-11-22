@@ -1,0 +1,139 @@
+# Scenario `crash_reexecute` (WP-23, plan section 4.11, ADR-0035): crash -> patch -> "Re-execute function".
+#
+# Stage 1. The fixture's main loop calls step(nullptr, 13, 2.75) once. step() is built WITHOUT optimisation (/Od in every
+# configuration) and dereferences its first parameter: an access violation. The agent holds the thread and the broker reports
+# it. The `exception` event does not offer `reexecute` (no patch has replaced anything yet; reasons.reexecute says CML5900). The
+# patch edits/fix_step.edit makes step() survive a null pointer and adds 100000 to its result. When it is applied the broker
+# sends `exception_updated`: `reexecute` is now offered. The action `reexecute` runs the NEW step() from its entry with the
+# register arguments (RCX = p, EDX = k, XMM2 = scale) reloaded from the places the PDB records for the parameters (MSVC: the home
+# space; clang-cl: its own locals). The frame's caller prints the result: -7 + 13 + 2750 + 100000 = 102756, and step() saw k=13 and
+# scale=2.750 - the original argument values, the double included.
+#
+# Stage 3. Four frames later the fixture calls opt_step(nullptr, 21): the same fault in a TU built with /O2. After the fixing patch
+# (edits/fix_opt.edit) `reexecute` is NOT offered and the reason says why (CML5901, optimised); Leave function resolves it (the
+# caller sees opt=0) and the application carries on (stage 4: opt = 7 + n + 5000).
+name = "crash_reexecute"
+description = "fixture crash_reexecute: re-execute the fixed step() with its original arguments (int*, int, double); not offered for an optimised function"
+fixture = "crash_reexecute"
+timeout_s = 420
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ stage=0 result=\\d+ seen_k=\\d+ seen_scale=0\\.500 opt=-1"
+within_s = 20
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_crash_reexecute.exe"
+within_s = 30
+
+# From here on the agents hold faulting threads.
+[[step]]
+kind = "watch_exceptions"
+
+[[step]]
+kind = "signal_fixture"
+
+[[step]]
+kind = "expect_stdout"
+regex = "ARMED"
+within_s = 10
+
+# The crash in the unoptimised function: re-execute is not offered yet, and the event says why.
+[[step]]
+kind = "expect_exception"
+code = "0xC0000005"
+function = "step"
+lacks = "reexecute"
+reason = "CML5900"
+within_s = 30
+
+[[step]]
+kind = "expect_pending_exceptions"
+count = 1
+
+[[step]]
+kind = "edit"
+patch = "edits/fix_step.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+
+# The patch replaced step(): re-execute is offered now.
+[[step]]
+kind = "expect_exception_updated"
+offers = "reexecute"
+within_s = 30
+
+[[step]]
+kind = "exception_action"
+action = "reexecute"
+
+[[step]]
+kind = "expect_pending_exceptions"
+count = 0
+
+# The new body ran with the ORIGINAL arguments: k=13, scale=2.750 (the double came back through XMM2), p was null and survived.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ stage=1 result=102756 seen_k=13 seen_scale=2\\.750 opt=-1"
+within_s = 15
+
+# The application keeps running, through the fixed function.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ stage=2 result=10\\d{4} seen_k=\\d+ seen_scale=0\\.500 opt=-1"
+within_s = 15
+
+# Stage 3: the optimised function crashes the same way.
+[[step]]
+kind = "expect_exception"
+code = "0xC0000005"
+function = "opt_step"
+lacks = "reexecute"
+reason = "CML5901"
+within_s = 30
+
+[[step]]
+kind = "edit"
+patch = "edits/fix_opt.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+
+# The patch replaced opt_step(), and the broker still does not offer re-execute: the compiland is optimised.
+[[step]]
+kind = "expect_exception_updated"
+lacks = "reexecute"
+reason = "optimi"
+within_s = 30
+
+# Asking anyway is refused.
+[[step]]
+kind = "exception_action"
+action = "reexecute"
+expect_error = "CML5908"
+
+[[step]]
+kind = "exception_action"
+action = "leave"
+
+[[step]]
+kind = "expect_pending_exceptions"
+count = 0
+
+# The caller of opt_step() saw 0 and carries on; the patched opt_step() runs from now on.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ stage=3 result=\\d+ seen_k=\\d+ seen_scale=0\\.500 opt=0"
+within_s = 15
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ stage=4 result=\\d+ seen_k=\\d+ seen_scale=0\\.500 opt=5\\d{3}"
+within_s = 15

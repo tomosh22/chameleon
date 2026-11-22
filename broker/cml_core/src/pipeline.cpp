@@ -240,6 +240,10 @@ private:
         emit(d, "error", stage);
         return d;
     }
+    // WP-28: an armed failure-injection stage of the broker (cml/ipc/fault_stages.h) turns into its diagnostic here.
+    std::optional<Diag> injected(ipc::fault::Stage stage) {
+        return ctx_.faults != nullptr ? ctx_.faults->hit(stage, pid_) : std::nullopt;
+    }
     void warn(PatchReport& report, const char* stage, Diag d) {
         emit(d, "warning", stage);
         report.warnings.push_back(std::move(d));
@@ -320,6 +324,10 @@ private:
                 return fail("sweep", why);
             }
         }
+        if (const std::optional<Diag> f = injected(ipc::fault::Stage::PdbLoad)) {
+            module_.index->release_pdb();  // the mapping is gone: the next reload maps the PDB again
+            return fail("sweep", *f);
+        }
         Result<std::shared_ptr<const pdb::PdbIndex>> pdb_result = module_.index->acquire_pdb();
         if (!pdb_result) {
             return fail("sweep", pdb_result.error());
@@ -335,6 +343,9 @@ private:
                 }
             }
         } release_guard{*module_.index, options_.release_pdb_after_reload};
+        if (const std::optional<Diag> f = injected(ipc::fault::Stage::ChangeDetection)) {
+            return fail("sweep", *f);
+        }
         Result<ModuleIndex::Sweep> swept = module_.index->sweep();
         if (!swept) {
             return fail("sweep", swept.error());
@@ -403,6 +414,11 @@ private:
         std::vector<std::size_t> fresh;  // index in `units` of requests[k]
         std::optional<Diag> first_error;
         notify_compile(ipc::CompilePhase::Start);
+        if (const std::optional<Diag> f = injected(ipc::fault::Stage::Compile)) {
+            const Diag d = fail("compile", *f);
+            notify_compile(ipc::CompilePhase::Error, &d);
+            return d;
+        }
         for (const std::uint32_t ci : swept->compilands) {
             Unit u;
             u.compiland = ci;
@@ -635,6 +651,9 @@ private:
         in.compiland_index = u.compiland;
         in.registry = &module_.registry;
         in.modules = &process_modules;
+        if (const std::optional<Diag> f = injected(ipc::fault::Stage::BindPlan)) {
+            return fail("plan", *f);
+        }
         std::vector<Diag> errors;
         Result<bind::BindPlan> planned = bind::plan_bind(in, &errors);
         for (const Diag& skipped : process_modules.skipped()) {
@@ -828,6 +847,9 @@ private:
             if (!env_.link_patch) {
                 return fail("link", Diag::make(pd::kStageFailed, "this broker has no linker driver", "Run the broker on Windows."));
             }
+            if (const std::optional<Diag> f = injected(ipc::fault::Stage::Link)) {
+                return fail("link", *f);
+            }
             toolchain::LinkTrace trace;
             Result<toolchain::LinkedPatch> lp = env_.link_patch(lr, &trace);
             if (!lp) {
@@ -848,6 +870,7 @@ private:
             Result<void> prepared = prepare_fixups(plan, linked, report, &fixups, &init_rvas, &triples);
             report.times.fixups += lap.lap();
             if (!prepared) {
+                give_back_range(linked.base, linked.image_size);  // nothing was loaded: the address space is free again
                 return prepared;
             }
 
@@ -863,6 +886,10 @@ private:
             candidate.image_base = linked.base;
             candidate.image_size = linked.image_size;
             load.candidates.push_back(std::move(candidate));
+            if (const std::optional<Diag> f = injected(ipc::fault::Stage::SendPatch)) {
+                give_back_range(linked.base, linked.image_size);
+                return fail("load", *f);  // LoadPatch is never sent: nothing is loaded in the application
+            }
             Result<ipc::Message> answer = ask(std::move(load), options_.agent_timeout_ms, "load");
             if (!answer) {
                 if (answer.error().code == pd::kAgentRequestTimeout) {
@@ -895,6 +922,7 @@ private:
                     CML_LOG(Warn, "reload: the address range at %s was taken (CML%u); relinking at another base", hex(linked.base).c_str(), status);
                     continue;
                 }
+                give_back_range(linked.base, linked.image_size);  // the agent refused: the image is not mapped
                 return fail("load", agent_refusal("LoadPatch", status, message, pd::kLoadFailed));
             }
         }
@@ -1024,6 +1052,20 @@ private:
                 const auto* rep = std::get_if<ipc::Reply>(&*answer);
                 return fail("hooks", agent_refusal("InstallHooks", rep != nullptr ? rep->status : 5306, rep != nullptr ? rep->message : "unexpected answer",
                                                    pd::kHooksFailed));
+            }
+            if (done->status == ipc::fault::ids::kAgentRollbackIncomplete) {
+                // WP-28: the agent could not take every hook of this request out again; a live hook may still jump into the patch.
+                // The image must stay mapped (never free an image a live hook can target): leak it, remember the hooks as installed
+                // like after a timeout, and report the failure.
+                {
+                    std::lock_guard<std::mutex> lock(module_.mutex);
+                    for (const AppliedHook& h : applied.hooks) {
+                        module_.hooked[h.old_entry] = h.new_entry;
+                    }
+                }
+                record_code();
+                applied_.push_back(std::move(applied));
+                return fail("hooks", agent_refusal("InstallHooks", done->status, done->message, pd::kHooksFailed));
             }
             if (done->status != 0) {
                 abandon();
@@ -1223,6 +1265,9 @@ private:
             return fail("fixups", converted.error());
         }
         *fixups = std::move(*converted);
+        if (const std::optional<Diag> f = injected(ipc::fault::Stage::PreApply)) {
+            return fail("fixups", *f);
+        }
         if (Result<void> pre = preapply_write32(linked.dll_path, fixups->pre_applied); !pre) {
             return fail("fixups", pre.error());
         }
@@ -1238,6 +1283,12 @@ private:
         }
         (void)report;
         return Result<void>();
+    }
+
+    // The patch at [base, base + size) was linked but never loaded: its slice of the reserved address space is free again.
+    void give_back_range(std::uint64_t base, std::uint32_t size) {
+        std::lock_guard<std::mutex> lock(module_.mutex);
+        module_.reservation.release_tail(base, size);
     }
 
     void unload(std::uint64_t base) {

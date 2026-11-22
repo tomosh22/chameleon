@@ -430,32 +430,34 @@ Result<void> PdbIndex::Impl::ensure_compiland(std::uint32_t index) const {
 
 // ---- IPI / S_BUILDINFO ------------------------------------------------------------------------
 
-namespace {
+namespace detail {
 
-constexpr std::uint32_t kIpiStream = 4;
-
-Result<void> ensure_ipi(const PdbIndex::Impl& impl) {
-    if (impl.ipi_state.load(std::memory_order_acquire) == static_cast<std::uint8_t>(LazyState::Ready)) {
+Result<void> ensure_type_stream(const PdbIndex::Impl& impl, bool tpi) {
+    std::atomic<std::uint8_t>& state_ref = tpi ? impl.tpi_state : impl.ipi_state;
+    std::optional<Diag>& error = tpi ? impl.tpi_error : impl.ipi_error;
+    std::unique_ptr<IpiTable>& slot = tpi ? impl.tpi : impl.ipi;
+    if (state_ref.load(std::memory_order_acquire) == static_cast<std::uint8_t>(LazyState::Ready)) {
         return Result<void>();
     }
     std::lock_guard<std::mutex> lock(impl.mutex);
-    const std::uint8_t state = impl.ipi_state.load(std::memory_order_acquire);
+    const std::uint8_t state = state_ref.load(std::memory_order_acquire);
     if (state == static_cast<std::uint8_t>(LazyState::Ready)) {
         return Result<void>();
     }
     if (state == static_cast<std::uint8_t>(LazyState::Failed)) {
-        return *impl.ipi_error;
+        return *error;
     }
     const auto t0 = Clock::now();
     auto fail = [&](const char* why) -> Result<void> {
-        impl.ipi_error = Diag::make(diag::kBadBuildInfo,
-                                    "The IPI stream of '" + impl.path + "' is invalid (" + why + "); build information is unavailable.",
-                                    "Rebuild the module so the linker regenerates the PDB.");
-        impl.ipi_state.store(static_cast<std::uint8_t>(LazyState::Failed), std::memory_order_release);
-        return *impl.ipi_error;
+        error = Diag::make(diag::kBadBuildInfo,
+                           std::string("The ") + (tpi ? "TPI" : "IPI") + " stream of '" + impl.path + "' is invalid (" + why + "); " +
+                               (tpi ? "function types are unavailable." : "build information is unavailable."),
+                           "Rebuild the module so the linker regenerates the PDB.");
+        state_ref.store(static_cast<std::uint8_t>(LazyState::Failed), std::memory_order_release);
+        return *error;
     };
     auto table = std::make_unique<IpiTable>();
-    table->data = impl.msf->read_stream(kIpiStream);
+    table->data = impl.msf->read_stream(tpi ? 2u : 4u);
     const std::uint8_t* d = table->data.data();
     const std::size_t size = table->data.size();
     if (size < 56) {
@@ -477,17 +479,13 @@ Result<void> ensure_ipi(const PdbIndex::Impl& impl) {
     if (!ok) {
         return fail("a record leaves the stream");
     }
-    impl.ipi = std::move(table);
-    impl.ipi_ns.fetch_add(ns_since(t0), std::memory_order_relaxed);
-    impl.ipi_state.store(static_cast<std::uint8_t>(LazyState::Ready), std::memory_order_release);
+    slot = std::move(table);
+    if (!tpi) {
+        impl.ipi_ns.fetch_add(ns_since(t0), std::memory_order_relaxed);
+    }
+    state_ref.store(static_cast<std::uint8_t>(LazyState::Ready), std::memory_order_release);
     return Result<void>();
 }
-
-struct IpiRecord {
-    std::uint16_t kind = 0;
-    const std::uint8_t* body = nullptr;
-    std::uint32_t body_len = 0;
-};
 
 bool ipi_find(const IpiTable& t, std::uint32_t id, IpiRecord& out) {
     if (id < t.type_begin || id - t.type_begin >= t.offsets.size()) {
@@ -507,6 +505,14 @@ bool ipi_find(const IpiTable& t, std::uint32_t id, IpiRecord& out) {
     out.body = base + off + 4;
     out.body_len = reclen - 2;
     return true;
+}
+
+}  // namespace detail
+
+namespace {
+
+Result<void> ensure_ipi(const PdbIndex::Impl& impl) {
+    return ensure_type_stream(impl, false);
 }
 
 constexpr std::size_t kMaxBuildString = 4u << 20;

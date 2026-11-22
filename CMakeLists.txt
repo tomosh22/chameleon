@@ -10,6 +10,11 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 option(CML_ALLOW_NON_WINDOWS "Allow configuring on non-Windows / non-x64 hosts (portable syntax checks only)" OFF)
 option(CML_BUILD_TESTS "Build the unit tests and register them with ctest" ON)
 option(CML_BUILD_GUI "Build the Dear ImGui + D3D11 front-end (broker/cml_gui)" OFF)
+# WP-28 (ADR-0035): failure injection (control capability `fault-injection`, agent message ArmFault). The release packaging turns it off.
+option(CML_FAULT_INJECTION "Compile failure injection into the broker and the agent" ON)
+if(CML_FAULT_INJECTION)
+    add_compile_definitions(CML_FAULT_INJECTION=1)
+endif()
 
 # ---------------------------------------------------------------------------
 # Platform guard: Chameleon targets Windows x64 only.

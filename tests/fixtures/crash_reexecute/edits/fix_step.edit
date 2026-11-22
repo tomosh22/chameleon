@@ -1,0 +1,11 @@
+--- a/step.cpp
++++ b/step.cpp
+@@ -5,6 +5,6 @@
+ {
+     g_seen_k = k;
+     g_seen_scale = scale;
+-    int v = *p;
+-    return v + k + static_cast<int>(scale * 1000.0);
++    int v = (p != nullptr) ? *p : -7;
++    return v + k + static_cast<int>(scale * 1000.0) + 100000;
+ }

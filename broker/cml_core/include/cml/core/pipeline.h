@@ -32,6 +32,7 @@
 
 #include "cml/core/agent_link.h"
 #include "cml/core/event_bus.h"
+#include "cml/core/fault_injection.h"
 #include "cml/core/hook_narrowing.h"
 #include "cml/core/module_state.h"
 #include "cml/core/module_symbols.h"
@@ -153,6 +154,7 @@ struct PipelineContext {
     std::uint64_t reload_id = 0;                  // WP-22: the reload command this run belongs to (a revert of `last` undoes one id)
     bool confirm = false;                         // WP-15: the request accepted a reload above max_affected_compilands
     std::shared_ptr<CompileCache> compile_cache;  // may be null: every compile runs
+    FaultInjector* faults = nullptr;              // WP-28: failure injection (null or nothing armed: no effect)
 };
 
 class PatchPipeline {

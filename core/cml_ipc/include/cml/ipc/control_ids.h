@@ -47,4 +47,7 @@ inline constexpr std::uint32_t kWaitFailed = 5512;              // wait: the bro
 inline constexpr std::uint32_t kRestartStepFailed = 5840;       // restart: the broker refused or the step could not complete
 inline constexpr std::uint32_t kRestartStepMismatch = 5841;     // restart: the result or event differs from what the scenario expects
 
+// --- cmltest harness step added by WP-28 (failure injection; ADR-0035 range CML5960-5989, ids 5960-5969 are in cml/ipc/fault_stages.h) ---
+inline constexpr std::uint32_t kFaultStepFailed = 5985;         // inject_failure: the stage is not listed, the command was refused or answered wrongly
+
 }  // namespace cml::ids

@@ -483,6 +483,7 @@ Result<Value> ReloadService::run_reload(const Value& args, bool automatic, bool 
     ctx.exports = exports_;
     ctx.deadline = start + std::chrono::milliseconds(timeout_ms);
     ctx.cancel = &cancel_;
+    ctx.faults = &faults_;  // WP-28
     ctx.confirm = confirm;
     ctx.reload_id = ++reload_counter_;  // WP-22: `revert last` undoes the batches of one reload id
     // WP-16: one compile per distinct command line for the whole reload; every process still links and loads its own patch.

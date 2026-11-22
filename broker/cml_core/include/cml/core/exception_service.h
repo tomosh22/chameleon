@@ -6,7 +6,10 @@
 //   * turns that into the control-pipe event
 //       {"event":"exception","pid","tid","exception_id","code":"0xC0000005","address","module","function","offset",
 //        "actions":["continue","leave","ignore"], ...}            (function name resolved from the module's PDB index)
-//     and remembers the held thread as pending;
+//     and remembers the held thread as pending. WP-23: `actions` holds "reexecute" only while it is offered; `reasons.reexecute`
+//     says why not otherwise (CML59xx). When a patch (or a revert) changes what is offered, the event
+//       {"event":"exception_updated","pid","exception_id","actions":[...],"reasons":{...}}
+//     follows (published under the subscription name `exception`);
 //   * answers the control commands `exception-action` {pid, exception_id, action} (sends ExceptionAction to the agent and waits for
 //     its verdict; a refusal such as "cannot unwind" keeps the thread pending so the client can choose another action) and
 //     `exceptions` (the pending threads, each in the event's shape);
@@ -19,6 +22,7 @@
 // action / pending / refresh run on control connection threads (refresh may wait for the agents' answers).
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -28,6 +32,7 @@
 
 #include "cml/core/agent_link.h"
 #include "cml/core/event_bus.h"
+#include "cml/core/reexecute.h"
 #include "cml/core/reload_service.h"
 #include "cml/ipc/json.h"
 #include "cml/ipc/messages.h"
@@ -39,6 +44,9 @@ class ExceptionService {
 public:
     // `service` and `events` must outlive this object.
     ExceptionService(ReloadService* service, EventBus* events);
+    ~ExceptionService();
+    ExceptionService(const ExceptionService&) = delete;
+    ExceptionService& operator=(const ExceptionService&) = delete;
 
     // ---- agent connections (connection thread) ----
     // The agent finished its handshake: remember its link; if holding is on, tell the agent so (fire and forget).
@@ -49,7 +57,8 @@ public:
     void on_exception(const std::shared_ptr<AgentLink>& link, std::uint32_t pid, const ipc::Exception& exception);
 
     // ---- control commands (control thread) ----
-    // {"pid"?:N, "exception_id":N, "action":"continue"|"leave"|"ignore"}  ->  {pid, exception_id, action}
+    // {"pid"?:N, "exception_id":N, "action":"continue"|"leave"|"ignore"|"reexecute"}  ->  {pid, exception_id, action}
+    // (WP-23: "reexecute" is refused with CML5908 while it is not offered.)
     Result<ipc::json::Value> action(const ipc::json::Value& args);
     // {"pid"?:N}  ->  {"pending":[<exception event bodies>]}
     Result<ipc::json::Value> pending(const ipc::json::Value& args) const;
@@ -68,6 +77,10 @@ public:
 
     std::size_t pending_count() const;
 
+    // WP-23 test seam: replaces reexecute::evaluate (which reads PDBs of enabled modules).
+    using Evaluator = std::function<reexecute::Offer(const std::vector<std::shared_ptr<ModuleState>>&, const ipc::Exception&, const reexecute::HookMap&)>;
+    void set_evaluator_for_testing(Evaluator evaluator);
+
 private:
     struct Key {
         std::uint64_t agent_id = 0;
@@ -79,11 +92,21 @@ private:
     struct Pending {
         std::uint32_t pid = 0;
         std::shared_ptr<AgentLink> link;
-        ipc::json::Value body;  // the event body
+        ipc::json::Value body;  // the event body as published (base + what is offered now)
+        ipc::json::Value base;  // WP-23: the body without actions / reasons / notes / reexecute_*: rebuilt into `body` whenever the offer changes
+        // WP-23
+        ipc::Exception raw;                 // what the agent reported (the stack)
+        reexecute::HookMap hooks_at_fault;  // the hook table when the fault was reported
+        reexecute::Offer offer;             // what is offered now
     };
+    class PatchListener;
 
     ipc::ExceptionConfig make_config() const;
     ipc::json::Value describe(const std::shared_ptr<AgentLink>& link, std::uint32_t pid, const ipc::Exception& exception) const;
+    // WP-23: the enabled modules of the agent's process.
+    std::vector<std::shared_ptr<ModuleState>> modules_of(const std::shared_ptr<AgentLink>& link) const;
+    // WP-23: a patch was applied or reverted in process `pid`: re-evaluate what is offered for its held threads.
+    void on_patch_event(const Event& event);
     static void send_ignore(const std::shared_ptr<AgentLink>& link, std::uint32_t exception_id);
 
     ReloadService* service_;
@@ -94,6 +117,15 @@ private:
     bool holding_ = false;      // the agents may hold threads; set together with clearing pending_ (under mutex_)
     std::map<std::uint64_t, std::shared_ptr<AgentLink>> links_;
     std::map<Key, Pending> pending_;
+    reexecute::Offer evaluate(const std::vector<std::shared_ptr<ModuleState>>& modules, const ipc::Exception& exception, const reexecute::HookMap& at_fault) const;
+    // WP-23: evaluations (the first one of a thread and the re-evaluations after a patch) run one at a time, so the last one to finish
+    // is the one that saw the newest hook table, and no `exception_updated` can overtake the `exception` event it refers to.
+    // Taken before mutex_.
+    std::mutex eval_mutex_;
+    mutable std::mutex evaluator_mutex_;
+    Evaluator evaluator_;
+    std::shared_ptr<PatchListener> patch_listener_;
+    EventBus::Id patch_subscription_ = 0;
 };
 
 }  // namespace cml::core

@@ -66,6 +66,17 @@ void Reservation::consume(std::uint64_t base, std::uint64_t size) {
     }
 }
 
+void Reservation::release_tail(std::uint64_t base, std::uint64_t size) {
+    for (std::size_t i = 0; i < blocks_.size(); ++i) {
+        if (base >= blocks_[i].base && base < blocks_[i].base + blocks_[i].size) {
+            if (next_[i] == align_up(base + size) + kGranule) {
+                next_[i] = base;
+            }
+            return;
+        }
+    }
+}
+
 std::uint64_t Reservation::remaining() const {
     std::uint64_t total = 0;
     for (std::size_t i = 0; i < blocks_.size(); ++i) {

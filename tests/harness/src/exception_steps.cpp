@@ -35,6 +35,40 @@ ExceptionStepResult fail(const cml::Diag& diag) {
     return fail(diag.code, diag.format());
 }
 
+// WP-23: does the event's `actions` / `reasons` satisfy the step's offers / lacks / reason? Empty string = satisfied.
+std::string offer_mismatch(const ipc::json::Value& body, const Step& step) {
+    if (step.exception_offers.empty() && step.exception_lacks.empty() && step.exception_reason.empty()) {
+        return {};
+    }
+    const ipc::json::Value* actions = body.find("actions");
+    const auto has = [&](const std::string& name) {
+        if (actions == nullptr || !actions->is_array()) {
+            return false;
+        }
+        for (const ipc::json::Value& a : actions->items()) {
+            if (a.is_string() && a.as_string() == name) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (!step.exception_offers.empty() && !has(step.exception_offers)) {
+        return "actions lack '" + step.exception_offers + "'";
+    }
+    if (!step.exception_lacks.empty() && has(step.exception_lacks)) {
+        return "actions still offer '" + step.exception_lacks + "'";
+    }
+    if (!step.exception_reason.empty()) {
+        const std::string key = step.exception_lacks.empty() ? "reexecute" : step.exception_lacks;
+        const ipc::json::Value* reasons = body.find("reasons");
+        const std::string text = reasons != nullptr ? reasons->get_string(key) : std::string();
+        if (text.find(step.exception_reason) == std::string::npos) {
+            return "reasons." + key + " is '" + text + "', expected it to contain '" + step.exception_reason + "'";
+        }
+    }
+    return {};
+}
+
 }  // namespace
 
 ExceptionStepResult ExceptionSteps::watch(ipc::ControlClient& control, std::uint32_t timeout_ms) {
@@ -83,6 +117,10 @@ ExceptionStepResult ExceptionSteps::expect(ipc::ControlClient& control, const St
                 return fail(cml::ids::kExpectEventTimeout, "an exception event arrived in function '" + function + "', expected one containing '" +
                                                                step.exception_function + "': " + ipc::json::serialize(e.body));
             }
+            const std::string mismatch = offer_mismatch(e.body, step);
+            if (!mismatch.empty()) {
+                return fail(cml::ids::kExpectEventTimeout, "an exception event arrived but " + mismatch + ": " + ipc::json::serialize(e.body));
+            }
             have_current_ = true;
             current_pid_ = e.body.get_integer("pid");
             current_id_ = e.body.get_integer("exception_id");
@@ -94,6 +132,42 @@ ExceptionStepResult ExceptionSteps::expect(ipc::ControlClient& control, const St
             }
             return fail(cml::ids::kExpectEventTimeout, "no 'exception' event within " + std::to_string(step.within_s) + " s (events seen: " +
                                                            (seen.empty() ? "none" : seen) + ")");
+        }
+    }
+}
+
+ExceptionStepResult ExceptionSteps::updated(ipc::ControlClient& control, const Step& step, std::uint32_t limit_ms, bool limited_by_scenario) {
+    if (!have_current_) {
+        return fail(cml::ids::kScenarioInvalid, "expect_exception_updated needs an expect_exception step before it");
+    }
+    if (limit_ms == 0) {
+        return fail(cml::ids::kScenarioFailed, "the scenario's time ran out");
+    }
+    const Clock::time_point until = Clock::now() + std::chrono::milliseconds(limit_ms);
+    std::string last_mismatch = "no exception_updated event arrived";
+    for (;;) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(until - Clock::now()).count();
+        const std::uint32_t slice = left <= 0 ? 0u : static_cast<std::uint32_t>(std::min<long long>(left, 250));
+        cml::Result<std::optional<ipc::ControlEvent>> event = control.next_event(slice);
+        if (!event) {
+            return fail(event.error());
+        }
+        if (*event) {
+            const ipc::ControlEvent& e = **event;
+            if (e.name == "exception_updated" && e.body.get_integer("pid") == current_pid_ && e.body.get_integer("exception_id") == current_id_) {
+                const std::string mismatch = offer_mismatch(e.body, step);
+                if (mismatch.empty()) {
+                    return pass("event " + ipc::json::serialize(e.body));
+                }
+                last_mismatch = mismatch + ": " + ipc::json::serialize(e.body);
+            }
+            continue;
+        }
+        if (left <= 0) {
+            if (limited_by_scenario) {
+                return fail(cml::ids::kScenarioFailed, "the scenario's timeout ran out while waiting for an exception_updated event (" + last_mismatch + ")");
+            }
+            return fail(cml::ids::kExpectEventTimeout, "no matching 'exception_updated' event within " + std::to_string(step.within_s) + " s (" + last_mismatch + ")");
         }
     }
 }

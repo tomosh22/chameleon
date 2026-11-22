@@ -1,0 +1,1 @@
+{"id":1,"ok":true,"result":{"version":"0.1.0","capabilities":["status","reload","wait","set-option","subscribe","diag-events"],"processes":[{"pid":4242,"modules":[{"path":"C:\\app\\app.exe","enabled":true,"index":{"state":"ready","percent":100,"message":""}}]}],"truncated":false,"generation":3,"reload_running":false}}

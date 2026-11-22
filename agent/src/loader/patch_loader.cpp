@@ -14,6 +14,7 @@
 #include "cml/proc/proc.h"
 #include "cml/util/format.h"
 #include "cml/util/log.h"
+#include "fault/fault_injection.h"
 #include "image_writer.h"
 
 namespace cml::agent::loader {
@@ -885,6 +886,12 @@ ipc::PatchLoaded PatchLoader::load_patch(const ipc::LoadPatch& request) {
         busy_hook(busy_context, chosen.image_base);
     }
 
+    if (fault::consume(ipc::fault::Stage::PatchLoad)) {  // WP-28: the DLL is mapped; take the real failure path (unload) after it
+        unload_after_failure(chosen.image_base);
+        return fail(make(ipc::fault::ids::kAgentPatchLoad,
+                         "injected failure at the stage 'patch-load' (after the DLL was mapped at " + hex(chosen.image_base) + "); the patch was unloaded again",
+                         "This failure was requested with the control command inject-failure. Reload again: without it the patch loads."));
+    }
     Result<std::uint32_t> fixed = loader::apply_fixups(image, chosen.fixups);
     if (!fixed) {
         unload_after_failure(chosen.image_base);
@@ -1002,6 +1009,14 @@ ipc::Message PatchLoader::handle_request(const ipc::Message& request) {
         params.block_count = reserve->block_count;
         ipc::ReserveRangeResult answer;
         answer.request_id = reserve->request_id;
+        if (fault::consume(ipc::fault::Stage::Reservation)) {  // WP-28
+            const Diag injected = make(ipc::fault::ids::kAgentReservation,
+                                       "injected failure at the stage 'reservation' (the reservation of address space near the module); nothing was reserved",
+                                       "This failure was requested with the control command inject-failure. Reload again: without it the reservation succeeds.");
+            answer.status = injected.code;
+            answer.message = failure_text(injected);
+            return answer;
+        }
         Result<std::vector<AddressRange>> blocks = reserve_ranges(params);
         if (!blocks) {
             answer.status = blocks.error().code;

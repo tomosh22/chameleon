@@ -131,6 +131,21 @@ checks of `expect_stdout` refer to the relaunched process. The relaunched proces
 broker hands the standard handles on), so `expect_stdout` keeps reading one stream; the cursor of the restarted process is
 set to the end of the output when the step starts, so what the pre-restart hooks and the new process print comes after it.
 
+Step added by WP-28 (failure injection, needs the broker capability `fault-injection`):
+
+```toml
+[[step]]
+kind = "inject_failure"        # control command `inject-failure`; first checks that `fault-stages` lists the stage
+stage = "link"                 # a stage name (pdb-load, change-detection, compile, bind-plan, reservation, link, pre-apply,
+                               # send-patch, patch-load, hook-install, post-patch-hooks) or "none" (disarm everything)
+count = 1                      # optional, 1..1000: how many passes of the stage fail (default 1)
+expect_error = "CML5960"       # optional: the command itself must be refused with this id
+```
+
+The failing reload, its diagnostic and the clean reload afterwards are ordinary steps: `reload` with `expect_error` = the
+stage's id, `expect_diag`, `expect_stdout` for the previous value, a `reload` without injection and `expect_stdout` for the new
+one (scenario `inject_stages`, fixture `inject`).
+
 Unknown keys, unknown kinds, missing fields, bad values and steps that need a running process before `launch`
 are rejected with `CML5411` before anything runs; a pattern that does not compile is `CML5420`.
 

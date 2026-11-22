@@ -131,3 +131,24 @@ diagnostic is planned, not live.
   its old namesake (the PDB carries no signatures for the planner yet; ADR-0029). Callers inside
   the patched TU are recompiled and are fine; an old function pointer to it held elsewhere would
   be called with the old signature. Rename the function when changing its signature, or hot-restart.
+- **Re-execute after a crash (WP-23)** is offered only for an unoptimised frame of an enabled module with a loaded PDB. The recorded
+  build command must end in `/Od`/`-O0`. Frames in patch code are never offered (patch PDBs are not indexed).
+  - It reloads the parameters' values *at the fault*. They equal the call arguments only if the function did not assign to a
+    parameter first. Nothing detects this; every offer carries `notes.reexecute`.
+  - Side effects before the fault happen again.
+  - Destructors and `__finally`/`__except` of the discarded frames do not run, so locks and handles held there stay held.
+  - Never offered for: by-value aggregates among the first four parameters, member pointers, 80/128-bit floats, variadic
+    functions, and functions returning a class by value (CML5900-5907).
+  - A patch committed between the fault and the broker receiving the report counts as present at the fault. Re-execute is then not
+    offered for that function until a later patch.
+- **Failure injection (WP-28)** is compiled in by default (`CML_FAULT_INJECTION=ON`). Release packaging must configure with
+  `-DCML_FAULT_INJECTION=OFF`; a fuzz.yml job proves that configuration builds.
+  - Covered: the reload pipeline's 11 stages.
+  - Not covered: `revert`, `restart`, the crash handler and the compile-on-save watcher.
+  - Arming is not persistent: a broker restart forgets it.
+  - The reservation stage fires only on a module's first patch; arming it later is refused (CML5970).
+  - If an injected post-patch-hooks rollback is incomplete (CML4656), the patch image stays mapped with some hooks possibly live;
+    restart the application. A later revert of that batch may report hooks it cannot find.
+- **Fuzzing (WP-28)** covers the COFF, PE, PDB, IPC and control-JSON readers.
+  - Not fuzzed: the hook decoder, the user-hook scanner, the bind planner and the toolchain parser.
+  - Only RelWithDebInfo is fuzzed (ASan needs the release CRT).

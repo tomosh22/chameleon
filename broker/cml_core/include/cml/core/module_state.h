@@ -48,6 +48,9 @@ public:
     std::uint64_t next_base(std::uint64_t max_size) const;
     // Marks [base, base + size) used (plus a 64 KiB gap).
     void consume(std::uint64_t base, std::uint64_t size);
+    // Undoes consume(base, size) when it was the newest one of its block (nothing was placed after it): the patch was never
+    // loaded, so its address space is free again. Anything else is left alone.
+    void release_tail(std::uint64_t base, std::uint64_t size);
     const std::vector<ipc::AddressBlock>& blocks() const noexcept { return blocks_; }
     std::uint64_t remaining() const;
 
