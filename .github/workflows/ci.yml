@@ -56,8 +56,25 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
           if ('${{ matrix.compiler }}' -eq 'clang-cl') {
-            $llvm = 'C:\Program Files\LLVM\bin\clang-cl.exe'
-            if (Test-Path $llvm) { $cxx = $llvm } else { $cxx = (Get-Command clang-cl).Source }
+            # The clang-cl that ships with the active Visual Studio toolset ($env:llvmX64, set by msvc-dev-cmd) is the
+            # pairing Microsoft supports with that STL. The standalone LLVM install can be older than the STL accepts (the
+            # windows-2025-vs2026 image pairs STL 14.52, which requires Clang 22, with LLVM 20.1.8: error STL1000). Take the
+            # first candidate that compiles a translation unit against the active STL (ADR-0037).
+            $candidates = @()
+            if ($env:llvmX64) { $candidates += (Join-Path $env:llvmX64 'clang-cl.exe') }
+            $candidates += 'C:\Program Files\LLVM\bin\clang-cl.exe'
+            $gc = Get-Command clang-cl -ErrorAction SilentlyContinue
+            if ($gc) { $candidates += $gc.Source }
+            $probe = Join-Path $env:RUNNER_TEMP 'stl_probe.cpp'
+            Set-Content -Path $probe -Value "#include <vector>`n#include <string>`nint main() { std::vector<std::string> v{""a""}; return (int)v.size() - 1; }"
+            $cxx = $null
+            foreach ($c in ($candidates | Select-Object -Unique)) {
+              if (-not (Test-Path $c)) { continue }
+              & $c /nologo /std:c++20 /EHsc /c $probe "/Fo$env:RUNNER_TEMP\stl_probe.obj" *>&1 | Out-Null
+              if ($LASTEXITCODE -eq 0) { $cxx = $c; break }
+              Write-Host "clang-cl candidate rejected by the active STL: $c"
+            }
+            if (-not $cxx) { throw 'no clang-cl candidate compiles against the active MSVC STL' }
           } else {
             $cxx = (Get-Command cl).Source
           }

@@ -784,3 +784,21 @@ turns it off) and is reachable only through the `fault-injection` control capabi
    The corpus runner records an expected failure that passes as a failure, so the flip is required.
 5. WP-26b and WP-26c are wave-7 packages and run in parallel; they touch different files (module index, sweep and audit vs. the
    bind planner). Review: high for WP-26c (bind planner), medium for WP-26b.
+## ADR-0037 CI selects the clang-cl that the active MSVC STL accepts
+
+**Context.** The `windows-2025` runner image became `windows-2025-vs2026`: Visual Studio 18 with MSVC STL 14.52, which
+requires Clang 22 (`error STL1000`). Its standalone LLVM in `C:\Program Files\LLVM` is still 20.1.8. Both clang-cl cells on
+windows-2025 failed to compile anything (PR #46 at d5d937c, 2026-11-22).
+
+**Decision.** The matrix cells pick clang-cl in this order:
+1. The one bundled with the active Visual Studio toolset (`$env:llvmX64` from msvc-dev-cmd), which is the pairing Microsoft
+   supports.
+2. The standalone install.
+3. Whatever is on PATH.
+
+The first candidate that compiles a small STL translation unit wins. Each rejected candidate is logged, and `toolchain.txt`
+records the chosen compiler and its version. The cells therefore test the clang-cl a user of that Visual Studio gets.
+- **Older clang versions:** the explicit clang-cl 17–20 probe jobs still cover them.
+- **`_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH`:** not used; it builds a combination Microsoft does not support.
+- **Other workflows:** `corpus.yml` (WP-26) and `fuzz.yml` (WP-28) select clang-cl the same old way. Each owner applies this rule
+  when its workflow runs on an image where the standalone LLVM is too old.
