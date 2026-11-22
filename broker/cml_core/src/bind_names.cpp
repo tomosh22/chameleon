@@ -407,6 +407,75 @@ std::string base_identifier(std::string_view d) {
     return std::string(body.substr(0, e));
 }
 
+namespace {
+bool is_c_identifier(std::string_view s) noexcept {
+    if (s.empty() || is_digit(s[0])) {
+        return false;
+    }
+    for (const char c : s) {
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+bool all_digits(std::string_view s) noexcept {
+    if (s.empty()) {
+        return false;
+    }
+    for (const char c : s) {
+        if (!is_digit(c)) {
+            return false;
+        }
+    }
+    return true;
+}
+}  // namespace
+
+CStaticName c_static_name(std::string_view n) {
+    CStaticName out;
+    if (n.empty() || n[0] == '?') {
+        return out;
+    }
+    if (is_c_identifier(n)) {
+        out.base = std::string(n);
+        return out;
+    }
+    // cl: "counter$1"
+    const std::size_t dollar = n.find('$');
+    if (dollar != std::string_view::npos) {
+        if (is_c_identifier(n.substr(0, dollar)) && all_digits(n.substr(dollar + 1))) {
+            out.base = std::string(n.substr(0, dollar));
+            out.any_function = true;
+        }
+        return out;
+    }
+    // clang: "a", "a.b", with an optional trailing ".<n>" uniquifier.
+    std::vector<std::string_view> parts;
+    std::size_t start = 0;
+    for (std::size_t k = 0; k <= n.size(); ++k) {
+        if (k == n.size() || n[k] == '.') {
+            parts.push_back(n.substr(start, k - start));
+            start = k + 1;
+        }
+    }
+    if (parts.size() >= 2 && all_digits(parts.back())) {
+        parts.pop_back();
+    }
+    for (const std::string_view part : parts) {
+        if (!is_c_identifier(part)) {
+            return out;
+        }
+    }
+    if (parts.size() == 1) {
+        out.base = std::string(parts[0]);
+    } else if (parts.size() == 2 && parts[0] != "__const" && parts[0] != "__func__") {
+        out.encl = std::string(parts[0]);
+        out.base = std::string(parts[1]);
+    }
+    return out;
+}
+
 std::string enclosing_function(std::string_view decorated) {
     if (decorated.empty() || decorated[0] != '?') {
         return {};

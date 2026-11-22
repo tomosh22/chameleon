@@ -1,0 +1,75 @@
+# WP-26c: the clang-cl C-statics crash after an accepted reload (ADR-0036 decision 2)
+
+## What the trace showed
+
+The corpus run `raylib / clang-cl` (workflow run 42474760896, commit 752b253 of PR #46, `log_level trace`) printed the planner's
+`bind:` decisions for statics when the crash was logged. Every static *function* and every named static datum of `rcore.c`
+was bound to the running process. The only static datum that was **not** bound:
+
+```
+bind: sym=platform.0 display=platform.0 type=data defined=1 static=1 decision=patch-new-data source=none addr=-
+      reason=static without a source-level name: treated as new
+```
+
+`platform.0` is `static PlatformData platform` of the `#include`d `rcore_desktop_glfw.c`. The patched `WindowShouldClose` read
+`platform.handle` from the patch image's own zero-filled copy, passed a null `GLFWwindow*` to `glfwWindowShouldClose`, and faulted
+reading `0x20` at `glfwWindowShouldClose+0x10`. The hypothesis in the brief was right about the symbol and the effect.
+
+## Root cause
+
+The planner took the symbol for new because it could not read a name from it, not because the static was missing from the old
+image. `bind_names.cpp::base_identifier` accepts a plain identifier (clang's spelling of an internal-linkage C++ datum) or a
+Microsoft-decorated name. A C translation unit gives neither:
+
+| Shape | clang-cl (C) | cl (C) |
+|---|---|---|
+| file-scope static | `platform` | `platform` |
+| the same name taken (LLVM's uniquifier) | `platform.0`, `platform.1` | - |
+| function-local static | `next.counter` (`next.counter.1`) | `counter$1` (the function is not in the name) |
+| private constant copy of a local initialiser | `__const.f.x` (read-only) | - |
+
+`.` and `$` are not identifier characters, so `base_identifier` returned an empty string and `bridge_statics` decided "static
+without a source-level name: treated as new". The PDB side was fine: its S_LDATA32 records carry the source names (`platform`,
+`counter`), function-local ones inside their proc. The same hole applies to function-local statics of C under both compilers (the
+cl shape is **inferred** from the name syntax of cl's C output; no cl C object was inspected here, which is why the matching is
+defensive, see below).
+
+Every matched static is bound; every one that fell into this hole silently became a fresh zero-initialised copy. An accepted
+reload with silent state loss, or a crash when the state is a pointer.
+
+## The fix
+
+* `c_static_name()` (`bind_names.cpp`) reads `(base, enclosing function)` out of the C spellings above: a trailing `.<digits>` is
+  the uniquifier, `a.b` is function `a`, static `b`, `name$<digits>` is a function-local static of unknown function.
+  `__const.*`, `__func__.*`, `.str` and anything else stay unnamed.
+* `bridge_statics` uses it for non-decorated data names. The group key of such a name ignores its spelling, so `platform` and
+  `platform.0` cannot both be bound to the one PDB record. A function-local static with an unknown function (`counter$1`) matches
+  the function-local records called `counter` in the compiland; when that is not unique, the existing passes decide (the RVA the
+  unchanged section layout predicts), and what is left is **CML3207** (refuse), as before.
+* **CML3500** (new, planner range): writable static data (a section with `IMAGE_SCN_MEM_WRITE`, not a runtime table) whose name
+  yields no source identity is refused with a diagnostic naming the symbol and the object, before anything is applied. Read-only
+  constants (`__const.*`, `.rdata`) are still `patch-fresh`: a fresh copy is correct for them.
+
+## Tests
+
+* `unit.bind` (`tests/unit/bind/test_c_statics.cpp`, synthetic COFF + PDB, no compiler): the name reader for both shapes; clang-cl
+  `platform.0` / `next.counter` / `next.counter.1` bound to the old records (including a file-scope record of the same name); cl
+  `counter$1` bound when unique, told apart by layout when two functions have a `counter`, refused (CML3207) when it cannot be
+  told; CML3500 for an unnameable writable static; a genuinely new static and another function's local are new.
+* Fixture `c_statics` + scenario `c_statics` (every matrix cell, both compilers, Debug and RelWithDebInfo): a C program with three
+  zero-initialised `static struct { int* p; }`, one in an `#include`d `.c` file, one in the edited TU, one function-local, read
+  through the pointer on every TICK. The edit adds 1000 to what `cs_read()` returns. After the reload each value must be
+  `1000 + count` with `count` between 20 and 999 (regex bounds), and `expect_monotonic` on all three catches a restart.
+
+## Corpus
+
+The F-3 `expected_failures` flip in `tests/corpus/raylib/project.json` waits for PR #46 to land on main (see the PR description for
+its status).
+
+## Deferred / limitations
+
+* The cl C shape (`counter$1`) is derived from the compiler's documented name mangling for C, and was not observed in an object;
+  the scenario's cl cells and the corpus will show whether it is right. The matching is defensive: whatever does not match
+  one-to-one is refused, never bound as new.
+* A C static whose name is genuinely unreadable is now refused (CML3500) instead of silently reset. Previously accepted reloads of
+  TUs with such statics are refused; no case is known in the fixtures.

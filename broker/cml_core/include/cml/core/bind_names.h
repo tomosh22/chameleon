@@ -27,6 +27,20 @@ std::string base_identifier(std::string_view decorated);
 // The function a function-local static lives in ("statics_value"); empty otherwise.
 std::string enclosing_function(std::string_view decorated);
 
+// WP-26c: the identity of a C static (a name that does not start with '?'), as the two compilers spell it for a
+// translation unit compiled as C. Names in the PDB are the source names ("platform", "counter"); the object's are:
+//   clang-cl   file scope "platform"; a function-local static "next.counter"; LLVM's uniquifier appends ".<n>" when
+//              the name is taken ("platform.0", "next.counter.1")
+//   cl         file scope "platform"; a function-local static "counter$1" (the enclosing function is NOT in the name)
+// `base` is empty when no source name can be read ("__const.f.x", ".str", "$SG1"); `any_function` is true when the
+// static is function-local but the name does not say which function.
+struct CStaticName {
+    std::string base;
+    std::string encl;
+    bool any_function = false;
+};
+CStaticName c_static_name(std::string_view object_name);
+
 // True when the name contains a scope that only exists inside one TU: an anonymous namespace
 // ("?A0x<hash>") or a function scope ("?<digit>??"). Only such names can denote a TU-private
 // entity, which is what resolution step (2) looks up.
