@@ -4,7 +4,7 @@
     <Identity Id="Chameleon.VisualStudio.4f7a2c19-8d3e-4b65-a0f1-6c92e5d7b348" Version="0.1.0" Language="en-US" Publisher="Chameleon" />
     <DisplayName>Chameleon for Visual Studio</DisplayName>
     <Description xml:space="preserve">Commands for the Chameleon native hot-reload tool (reload, hot-restart, revert), a Chameleon pane in the Output window, and automatic debugger re-attach after a hot-restart.</Description>
-    <License>LICENSE.txt</License>
+    <License>LICENSE</License>
   </Metadata>
   <Installation>
     <!-- Visual Studio 2022 (17.x) and 2026 (18.x): one extension, the version range covers both. -->
