@@ -2865,3 +2865,10 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 - **Message:** `Could not attach the debugger to the restarted process (pid <new>, it replaced pid <old>): <reason>.`  
 - **What to do:** Attach by hand with Debug > Attach to Process (pid <new>); to stop Chameleon re-attaching, clear Tools > Chameleon > Re-attach debugger after hot-restart (or the same setting in Tools > Options > Chameleon > General).  
 - **Raised by:** Visual Studio extension
+
+### CML1708
+
+- **Cause:** `chameleon_enable()` was called on an IMPORTED target; its flags were fixed when it was built elsewhere.  
+- **Message:** `chameleon_enable(<target>): <target> is an IMPORTED target; its flags were fixed when it was built elsewhere.`  
+- **What to do:** Call chameleon_enable on the targets this project builds (add_executable/add_library), not on imported ones.  
+- **Raised by:** `chameleon_enable()` (CMake)
