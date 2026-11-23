@@ -1,0 +1,109 @@
+{
+  "name": "raylib",
+  "repo": "https://github.com/raysan5/raylib.git",
+  "tag": "5.5",
+  "commit": "c1ab645ca298a2801097931d1079b10ff7eb9df8",
+  "license": "zlib",
+  "support_dir": "src",
+  "patch": "chameleon.patch",
+  "args": [],
+  "env": {
+    "GALLIUM_DRIVER": "llvmpipe",
+    "MESA_GL_VERSION_OVERRIDE": "3.3",
+    "LIBGL_ALWAYS_SOFTWARE": "1"
+  },
+  "edits": [
+    {
+      "id": "game-function",
+      "file": "examples/core/core_2d_camera_platformer.c",
+      "replace": [
+        {
+          "find": "float delta)\n{\n    if (IsKeyDown(KEY_LEFT)) player->position.x -= PLAYER_HOR_SPD*delta;",
+          "with": "float delta)\n{\n    cml_corpus_marker(\"plat_update_v2\");\n    if (IsKeyDown(KEY_LEFT)) player->position.x -= PLAYER_HOR_SPD*delta;"
+        }
+      ],
+      "expect": "markers=\\S*plat_update_v2:\\d+"
+    },
+    {
+      "id": "library-shapes",
+      "file": "src/rshapes.c",
+      "replace": [
+        {
+          "find": "void DrawRectangleRec(Rectangle rec, Color color)\n{\n",
+          "with": "void DrawRectangleRec(Rectangle rec, Color color)\n{\n    cml_corpus_marker(\"rshapes_rect_v2\");\n"
+        }
+      ],
+      "include": "chameleon_corpus.h",
+      "expect": "markers=\\S*rshapes_rect_v2:\\d+"
+    },
+    {
+      "id": "header-inline-support",
+      "file": "src/chameleon_corpus.h",
+      "replace": [
+        {
+          "find": "    return 1;",
+          "with": "    return 2;"
+        }
+      ],
+      "expect": "inline=2 "
+    },
+    {
+      "id": "template-support",
+      "file": "src/chameleon_corpus.h",
+      "replace": [
+        {
+          "find": "static_cast<T>(2)",
+          "with": "static_cast<T>(3)"
+        }
+      ],
+      "expect": "tmpl=64 "
+    },
+    {
+      "id": "unsupported-new-thread-local",
+      "file": "examples/core/core_2d_camera_platformer.c",
+      "replace": [
+        {
+          "find": "void UpdateCameraCenter(Camera2D *camera, Player *player, EnvItem *envItems, int envItemsLength, float delta, int width, int height)\n{\n",
+          "with": "void UpdateCameraCenter(Camera2D *camera, Player *player, EnvItem *envItems, int envItemsLength, float delta, int width, int height)\n{\n    static __declspec(thread) int cml_corpus_tls = 0;\n    cml_corpus_tls++;\n"
+        }
+      ],
+      "expect_error": "CML3400"
+    },
+    {
+      "id": "header-inline-raymath",
+      "file": "src/raymath.h",
+      "replace": [
+        {
+          "find": "RMAPI float Clamp(float value, float min, float max)\n{\n    float result",
+          "with": "RMAPI float Clamp(float value, float min, float max)\n{\n    cml_corpus_marker(\"raymath_clamp_v2\");\n    float result"
+        }
+      ],
+      "include": "chameleon_corpus.h",
+      "expect": "markers=\\S*raymath_clamp_v2:\\d+",
+      "final": true
+    }
+  ],
+  "reload_timeout_s": 120,
+  "observe_timeout_s": 30,
+  "start_timeout_s": 90,
+  "index_timeout_s": 300,
+  "min_functions": 500,
+  "expected_failures": [
+    {
+      "step": "edit:header-inline-raymath",
+      "compiler": "msvc",
+      "reason": "F-2: rcore.c indexes global arrays through image-relative addressing; the reload is refused with CML3101"
+    },
+    {
+      "step": "edit:header-inline-raymath",
+      "compiler": "clang-cl",
+      "reason": "F-3: the reload of rcore.c is accepted and the process then crashes (access violation)"
+    },
+    {
+      "step": "still-running-final",
+      "compiler": "clang-cl",
+      "reason": "F-3: the process crashed after the rcore.c reload"
+    }
+  ],
+  "trace": true
+}
