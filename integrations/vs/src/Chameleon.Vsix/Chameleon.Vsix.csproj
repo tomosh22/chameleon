@@ -64,6 +64,11 @@
     <None Include="source.extension.vsixmanifest">
       <SubType>Designer</SubType>
     </None>
+    <!-- The proprietary licence (repository root), shown by the VSIX installer (ADR-0039). -->
+    <Content Include="..\..\..\..\LICENSE">
+      <Link>LICENSE.txt</Link>
+      <IncludeInVSIX>true</IncludeInVSIX>
+    </Content>
   </ItemGroup>
   <ItemGroup>
     <Reference Include="System" />

@@ -151,7 +151,7 @@ foreach ($d in 'QUICKSTART.md', 'TROUBLESHOOTING.md', 'BUILD_REQUIREMENTS.md', '
     Copy-Item $p $docs
 }
 if (Test-Path (Join-Path $repo 'LICENSE')) { Copy-Item (Join-Path $repo 'LICENSE') (Join-Path $stage 'LICENSE') }
-else { Pending 'LICENSE' 'the repository has no LICENSE file; the licence of Chameleon itself has to be chosen' }
+else { Pending 'LICENSE' 'the repository has no LICENSE file; Chameleon is proprietary (ADR-0039); restore the LICENSE file at the repository root' }
 
 $tp = Join-Path $stage 'licenses\third_party'
 New-Item -ItemType Directory -Force -Path $tp | Out-Null

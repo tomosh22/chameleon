@@ -15,6 +15,7 @@ on:
       - 'docs/TROUBLESHOOTING.md'
       - 'docs/BUILD_REQUIREMENTS.md'
       - 'README.md'
+      - 'LICENSE'
       - '.github/workflows/package.yml'
       - 'integrations/**'
       - 'cmake/**'
@@ -62,7 +63,7 @@ jobs:
       - name: Build the package
         run: |
           New-Item -ItemType Directory -Force -Path package-logs | Out-Null
-          ./tools/package/package.ps1 -OutDir build/package *>&1 | Tee-Object -FilePath package-logs/package.log
+          ./tools/package/package.ps1 -OutDir build/package -Strict *>&1 | Tee-Object -FilePath package-logs/package.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $zip = Get-ChildItem build/package -Filter 'chameleon-*-win64.zip' | Select-Object -First 1
           if (-not $zip) { throw 'package.ps1 produced no chameleon-*-win64.zip' }
