@@ -1,0 +1,102 @@
+{
+  "name": "chameleon-hot-reload",
+  "displayName": "Chameleon Hot Reload",
+  "description": "Reload, hot-restart and revert native C/C++ code with Chameleon, from VS Code.",
+  "version": "0.1.0",
+  "publisher": "chameleon",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/src/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      { "command": "chameleon.reload", "title": "Reload", "category": "Chameleon" },
+      { "command": "chameleon.restart", "title": "Hot-Restart", "category": "Chameleon" },
+      { "command": "chameleon.revertLast", "title": "Revert Last", "category": "Chameleon" },
+      { "command": "chameleon.revertAll", "title": "Revert All", "category": "Chameleon" },
+      { "command": "chameleon.showOutput", "title": "Show Output", "category": "Chameleon" },
+      { "command": "chameleon.connect", "title": "Connect", "category": "Chameleon" },
+      { "command": "chameleon.disconnect", "title": "Disconnect", "category": "Chameleon" }
+    ],
+    "keybindings": [
+      { "command": "chameleon.reload", "key": "ctrl+alt+f9" }
+    ],
+    "configuration": {
+      "title": "Chameleon",
+      "properties": {
+        "chameleon.controlPipe": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Name of the broker's control pipe, for example `\\\\.\\pipe\\cml_control_test`. Empty means the broker's default: the `CML_CONTROL_PIPE` environment variable if set, else `\\\\.\\pipe\\cml_control_<logon-session SID>`."
+        },
+        "chameleon.autoConnect": {
+          "type": "boolean",
+          "default": true,
+          "description": "Connect to the broker when VS Code starts and keep reconnecting until Disconnect is run."
+        },
+        "chameleon.reloadTimeoutMs": {
+          "type": "number",
+          "default": 60000,
+          "minimum": 1000,
+          "description": "Time limit passed to the broker for a reload, in milliseconds."
+        },
+        "chameleon.watchExceptions": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Subscribe to `exception` events (needs the broker capability `exceptions`). **While subscribed the broker holds a thread that faults in application code until you choose** Continue, Leave function or Ignore in the notification that appears; leave this off unless you want that."
+        }
+      }
+    },
+    "problemMatchers": [
+      {
+        "name": "chameleon",
+        "owner": "chameleon",
+        "fileLocation": [ "relative", "${workspaceFolder}" ],
+        "severity": "error",
+        "pattern": {
+          "regexp": "^\\s*(.+?)\\((\\d+)(?:,(\\d+))?\\)\\s*:\\s+(?:fatal\\s+)?(error|warning|note)\\s+([A-Za-z]+\\d+)\\s*:\\s*(.*)$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "severity": 4,
+          "code": 5,
+          "message": 6
+        }
+      },
+      {
+        "name": "chameleon-clang",
+        "owner": "chameleon",
+        "fileLocation": [ "relative", "${workspaceFolder}" ],
+        "severity": "error",
+        "pattern": {
+          "regexp": "^\\s*((?:[A-Za-z]:)?[^:\\n]+?):(\\d+):(?:(\\d+):)?\\s+(?:fatal\\s+)?(error|warning|note):\\s*(.*)$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "severity": 4,
+          "message": 5
+        }
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "lint": "tsc -p . --noEmit",
+    "test": "npm run compile && node --test --test-reporter=spec \"out/test/unit/*.test.js\"",
+    "test:integration": "npm run compile && node out/test/integration/run.js",
+    "package": "vsce package --skip-license --allow-missing-repository --no-dependencies",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "20.17.6",
+    "@types/vscode": "1.85.0",
+    "@vscode/vsce": "3.2.1",
+    "typescript": "5.6.3"
+  }
+}
