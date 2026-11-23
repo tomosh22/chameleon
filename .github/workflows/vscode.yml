@@ -1,0 +1,132 @@
+name: vscode
+
+# WP-30: the VS Code extension (integrations/vscode). Triggers follow ADR-0038: workflow_dispatch, push to main, and pull_request
+# filtered to the extension's own paths. Pushes (to main and to wp/30-* branches, so the branch can be tested before its PR exists)
+# use the same paths filter.
+
+on:
+  push:
+    branches: [main, 'wp/30-*']
+    paths:
+      - 'integrations/vscode/**'
+      - '.github/workflows/vscode.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'integrations/vscode/**'
+      - '.github/workflows/vscode.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vscode-${{ github.event_name }}-${{ github.ref == 'refs/heads/main' && github.sha || github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  extension:
+    name: vscode extension / windows-2022
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      EXT_DIR: integrations/vscode
+      WORK_DIR: ${{ github.workspace }}\wp30-work
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Set up MSVC developer environment (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install, lint, compile and unit-test the extension
+        working-directory: ${{ env.EXT_DIR }}
+        run: |
+          node --version; npm --version
+          npm ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run lint
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build cml_broker and cml_agent
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
+          $cxx = (Get-Command cl).Source
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug "-DCMAKE_CXX_COMPILER=$cxx" -DCML_BUILD_TESTS=OFF -DCML_BUILD_GUI=OFF
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --parallel --target cml_broker cml_agent
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem build\bin | Format-Table Name, Length
+
+      # The same way cmltest builds a fixture: a scratch copy of tests/fixtures/basic through the standalone wrapper project, with the
+      # agent DLL copied next to the exe. The scripted edit changes the scratch copy, never the repository.
+      - name: Build the basic fixture in a scratch directory
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:WORK_DIR | Out-Null
+          Copy-Item -Recurse tests\fixtures\basic "$env:WORK_DIR\fixture"
+          $cxx = (Get-Command cl).Source -replace '\\','/'
+          $repo = $PWD.Path -replace '\\','/'
+          $src = "$env:WORK_DIR\fixture" -replace '\\','/'
+          cmake -S tests/harness/fixture_wrapper -B "$env:WORK_DIR\build" -G Ninja -DCMAKE_BUILD_TYPE=Debug "-DCMAKE_CXX_COMPILER=$cxx" "-DCML_REPO_ROOT=$repo" "-DCML_FIXTURE_DIR=$src"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build "$env:WORK_DIR\build" --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item build\bin\cml_agent.dll "$env:WORK_DIR\build\bin\"
+
+      - name: Show the identity the pipe name is derived from
+        run: |
+          whoami /logonid
+          whoami /user /fo csv /nh
+          $ps = '[System.Security.Principal.WindowsIdentity]::GetCurrent().Groups | ForEach-Object { $_.Value }'
+          powershell -NoProfile -Command $ps | Select-String 'S-1-5-5-'
+
+      - name: Integration test (control client against a real broker and fixture)
+        working-directory: ${{ env.EXT_DIR }}
+        run: |
+          $broker = Resolve-Path ..\..\build\bin\cml_broker.exe
+          node out/test/integration/run.js `
+            --broker $broker `
+            --fixture "$env:WORK_DIR\build\bin\fixture_basic.exe" `
+            --edit-file "$env:WORK_DIR\fixture\logic.cpp" `
+            --work-dir "$env:WORK_DIR\it" 2>&1 | Tee-Object -FilePath "$env:WORK_DIR\integration.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Select-String -Path "$env:WORK_DIR\integration.log" -SimpleMatch 'WP30-IT reload=ok revert=ok' -Quiet)) { throw 'the integration test did not print WP30-IT reload=ok revert=ok' }
+
+      - name: Package the extension
+        working-directory: ${{ env.EXT_DIR }}
+        run: |
+          npm run package
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $vsix = @(Get-ChildItem -Filter *.vsix)
+          if ($vsix.Count -ne 1) { throw "expected exactly one .vsix, found $($vsix.Count)" }
+          Write-Host "WP30-VSIX $($vsix[0].Name) bytes=$($vsix[0].Length)"
+          # List the package content: only the manifest, the readme and the compiled extension may be inside.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [IO.Compression.ZipFile]::OpenRead($vsix[0].FullName).Entries | ForEach-Object { Write-Host "  $($_.FullName)" }
+
+      - name: Upload the .vsix
+        uses: actions/upload-artifact@v4
+        with:
+          name: chameleon-vscode-vsix
+          path: integrations/vscode/*.vsix
+          if-no-files-found: error
+
+      - name: Upload test logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vscode-integration-logs
+          path: |
+            ${{ env.WORK_DIR }}\integration.log
+            ${{ env.WORK_DIR }}\it\**
+          if-no-files-found: ignore
