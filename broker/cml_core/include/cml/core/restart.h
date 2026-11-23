@@ -92,6 +92,12 @@ public:
 // The real thing on Windows; null elsewhere.
 std::shared_ptr<ProcessHost> native_process_host();
 
+#if defined(_WIN32)
+// WP-34: the hidden mode `cml_broker.exe --hold-watchdog <broker> <thread> <ended> <done> <max_ms>` (handle values inherited from the broker).
+// Resumes the held process's thread when the broker dies while holding it; see restart_win.cpp. `args` are the arguments after the flag.
+int run_hold_watchdog(const std::vector<std::string>& args);
+#endif
+
 // `block` with any CML_RESTART_TOKEN entry removed and CML_RESTART_TOKEN=<token> added in sorted position.
 std::u16string environment_with_token(const std::u16string& block, const std::string& token);
 

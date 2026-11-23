@@ -2,7 +2,7 @@
 // and the control pipe, all real processes.
 //
 //   cml_it_restart_hold --broker <cml_broker.exe> --fixture <fixture_hot_restart.exe> --workdir <dir>
-//                       --scenario resume|timeout|disconnect|not-held [--timeout-ms N]
+//                       --scenario resume|timeout|disconnect|not-held|broker-killed [--timeout-ms N]
 //
 // resume      restart {hold_new}: `restarting` arrives, the new process (created suspended) prints nothing and is alive; after
 //             `restart-resume` (sent on the same connection) it runs, registers, and `restarted` arrives.
@@ -10,6 +10,8 @@
 //             and a late `restart-resume` is the clean diagnostic CML5814.
 // disconnect  the client that asked for the restart disconnects while the process is held (hold_ms 30 s): the process runs within
 //             seconds anyway (CML5816), registers, and `restarted` reaches another client.
+// broker-killed  the broker itself is killed (TerminateProcess) while the process is held (hold_ms 60 s): the watchdog the broker started
+//             (`cml_broker.exe --hold-watchdog`) resumes the process within seconds.
 // not-held    `restart-resume` for a pid that is not held (CML5814) and without a pid (CML5818) are diagnostics; the broker is still
 //             fine; a plain `restart` (no hold_new) behaves as before (no `restarting` event).
 //
@@ -147,7 +149,7 @@ bool parse_args(int argc, wchar_t** argv, Options* options) {
     std::replace(options->fixture.begin(), options->fixture.end(), L'/', L'\\');
     options->workdir.make_preferred();
     const bool known = options->scenario == "resume" || options->scenario == "timeout" || options->scenario == "disconnect" ||
-                       options->scenario == "not-held";
+                       options->scenario == "not-held" || options->scenario == "broker-killed";
     return known && !options->broker.empty() && !options->fixture.empty() && !options->workdir.empty();
 }
 
@@ -602,6 +604,30 @@ void scenario_disconnect(Rig& rig, Report& report) {
                 kHoldMs, lines_before, first_tick.value_or(-1), first_tick ? 0 : 1, gone_diag ? "CML5816" : "none", restarted ? 1 : 0, registered ? 1 : 0, new_pid);
 }
 
+void scenario_broker_killed(Rig& rig, Report& report) {
+    constexpr int kHoldMs = 60000;
+    std::optional<Raw> client = Raw::connect(rig.control_pipe, 10000);
+    report.require(client.has_value(), "cannot connect");
+    report.require(client->call("subscribe", subscribe_args({"restarting"}), 10000).has_value(), "subscribe failed");
+    (void)client->send("restart", restart_args(rig.old_pid, kHoldMs));
+    std::optional<cml::ipc::ControlEvent> restarting = client->wait_event("restarting", 90000);
+    report.require(restarting.has_value(), "no `restarting` event\n" + read_file(rig.broker_log));
+    const std::uint32_t new_pid = pid_of(*restarting, "new_pid");
+    sleep_ms(1500);
+    const int lines_before = count_new_process_lines(read_file(rig.out));
+    report.check(lines_before == 0, "the new process printed " + std::to_string(lines_before) + " line(s) while held");
+    report.check(process_alive(new_pid), "the held process is not alive");
+
+    TerminateProcess(rig.broker.process.get(), 1);  // the broker dies outright: no shutdown path, nothing runs in it
+    WaitForSingleObject(rig.broker.process.get(), 10000);
+    const Clock::time_point killed = Clock::now();
+    const std::optional<long long> first_tick = wait_new_process_output(rig, killed, 20000);
+    report.check(first_tick.has_value(), "the held process stayed suspended after the broker was killed (hold_ms was 60 s)");
+    report.check(process_alive(new_pid), "the process is not alive after the broker was killed");
+    std::printf("WP34-HOLD broker_killed: hold_ms=%d new_process_lines_while_held=%d broker_killed=1 first_tick_after_kill_ms=%lld stranded=%d new_pid=%u\n",
+                kHoldMs, lines_before, first_tick.value_or(-1), first_tick ? 0 : 1, new_pid);
+}
+
 void scenario_not_held(Rig& rig, Report& report) {
     std::optional<Raw> client = Raw::connect(rig.control_pipe, 10000);
     report.require(client.has_value(), "cannot connect");
@@ -637,7 +663,7 @@ void scenario_not_held(Rig& rig, Report& report) {
 int wmain(int argc, wchar_t** argv) {
     Options options;
     if (!parse_args(argc, argv, &options)) {
-        std::fputs("usage: cml_it_restart_hold --broker EXE --fixture EXE --workdir DIR --scenario resume|timeout|disconnect|not-held [--timeout-ms N]\n", stderr);
+        std::fputs("usage: cml_it_restart_hold --broker EXE --fixture EXE --workdir DIR --scenario resume|timeout|disconnect|not-held|broker-killed [--timeout-ms N]\n", stderr);
         return 2;
     }
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -659,6 +685,8 @@ int wmain(int argc, wchar_t** argv) {
             scenario_timeout(rig, report);
         } else if (options.scenario == "disconnect") {
             scenario_disconnect(rig, report);
+        } else if (options.scenario == "broker-killed") {
+            scenario_broker_killed(rig, report);
         } else {
             scenario_not_held(rig, report);
         }
