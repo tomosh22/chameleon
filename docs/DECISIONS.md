@@ -878,3 +878,71 @@ The user decided that Chameleon will be sold commercially and that its licence m
 - Licence enforcement itself (keys, activation) is out of scope for now. It plugs in behind the `core/cml_license`
   hook (no-op provider, CML5998/5999) without changing the callers.
 
+
+## ADR-0040 Wave 9: the wave-8 follow-ups (WP-33, WP-34, WP-35)
+
+**Date:** 2026-11-23 · **Status:** Accepted
+
+The user asked for every follow-up logged at the end of wave 8 (KNOWN_LIMITATIONS) to be addressed. Wave 9 runs three
+packages in parallel. The order of merging is WP-33, WP-35, WP-34 (WP-34 merges main last and resolves the one-line
+overlaps in the capability and event lists).
+
+**WP-33: `chameleon_enable` without compiler warnings** (medium review).
+- Problem: with MSVC on x64 every TU of an enabled target prints `D9002 ignoring unknown option '/hotpatch'`, and in
+  RelWithDebInfo `D9025 overriding '/Ob1' with '/Ob0'`.
+- Change: pass `/hotpatch` only where it means something (x86 cl; clang-cl wherever it accepts it). On x64 the padding
+  comes from `/FUNCTIONPADMIN`. Remove `/Ob1` (and `/Ob2`) from the target's effective flags for the configurations where
+  `/Ob0` is applied, rather than appending an override. Apply the same to the test-fixture style in
+  `cmake/CmlTargets.cmake`, so fixtures and users build alike.
+- `cml_broker check` must still report 0 FAIL / 0 WARN on enabled targets under cl and clang-cl. If a check rule
+  demanded `/hotpatch` on x64, fix the rule to match the real requirement (padding before functions) and say why in
+  `docs/BUILD_REQUIREMENTS.md`.
+- Acceptance: in every ci matrix cell, the build logs of the WP-29 examples and the fixtures show no D9002 and no D9025
+  for enabled targets, as a greppable `WP33-WARN d9002=0 d9025=0` line per cell. `cml_broker check` stays at 0 WARN.
+- Directories: `integrations/cmake/`, `cmake/CmlTargets.cmake`, `docs/BUILD_REQUIREMENTS.md`, broker check rules only if
+  needed. The only package that may edit `.github/workflows/ci.yml` (steps only; job count stays 14). No new ids are
+  expected; if one is needed, it is in CML1712–1719.
+
+**WP-34: early debugger re-attach after a hot-restart** (high review: restart and process start-up).
+- Broker:
+  - `restart` takes an optional `hold_new: true`. The new process is then created suspended.
+  - The broker publishes `restarting {old_pid, new_pid}` and keeps the process suspended until either a
+    `restart-resume {pid}` arrives or `hold_ms` passes (default 10000, maximum 60000). Then it resumes the process and
+    the restart continues as today. The time held does not count against the registration budget.
+  - The capability `restart-hold` gates all of this. Without `hold_new`, behaviour is byte-for-byte as now.
+  - A broker or client that disappears while holding must never leave the process suspended forever.
+  - Restart-hold diagnostics use CML5813–5819 and are documented in `docs/TROUBLESHOOTING.md`.
+- Visual Studio extension: when re-attach is on and the broker has `restart-hold`, it sends `restart {hold_new:true}`. On
+  `restarting` it attaches the debugger to `new_pid`, then sends `restart-resume`. Its diagnostic ids stay in
+  CML5994–5997 (ADR-0038). Otherwise it keeps today's late re-attach on `restarted`.
+- Acceptance:
+  - ci: a broker test with the fixture `hot_restart` shows that with `hold_new` the new process does not run until
+    `restart-resume` (no TICK before it), that it runs after resume, and that it is resumed after `hold_ms` with nobody
+    resuming it.
+  - ci also shows that a client disconnecting while holding does not strand the process.
+  - vs workflow: the extension's integration test drives `restart {hold_new}`, sees `restarting`, resumes, and gets
+    `restarted`. It also unit-tests the decision against the debugger interface.
+- Directories: `broker/cml_core` (restart, control server), `core/cml_ipc` (command and event names), the restart host in
+  `core/cml_proc` or wherever `relaunch` lives, `integrations/vs/`, `docs/TROUBLESHOOTING.md` (its ids only).
+
+**WP-35: structured file and line on `diag` events** (medium review).
+- Broker:
+  - A compile failure's `diag` event (and the `reload` result's diagnostic) carries `file` (absolute path), `line` and,
+    when the compiler gives one, `column`, taken from the first compiler error the pipeline already parses
+    (`toolchain::ToolDiagnostic`).
+  - Fields are added only when known. No existing field changes.
+  - The capability `diag-locations` advertises them.
+- VS Code and Visual Studio extensions: when a `diag` has `file` and `line`, the Problems or Error List entry uses them
+  exactly. The current regex parse stays as the fallback for older brokers.
+- Acceptance:
+  - ci: a broker test with the fixture `bad_builds` (or `basic` with a syntax-error edit) shows the event fields for cl
+    and clang-cl.
+  - vscode and vs workflows: the integration tests check that a compile error yields an entry at the right file and line.
+- Directories: `core/cml_util` (Diag, only if a location is added there), `core/cml_toolchain`, `broker/cml_core`
+  (pipeline, event bus), `integrations/vscode/`, `integrations/vs/` (Error List sink only), `docs/wp/WP-35.md`.
+- No new ids.
+
+**Shared files.** `broker/cml_core/src/control_server.cpp` capability and event lists: WP-34 adds `restart-hold` and
+`restarting`; WP-35 adds `diag-locations`. In `integrations/vs/`, WP-34 owns `ChameleonController.cs`, the re-attach code
+and `VsDebuggerAttach.cs`, and WP-35 owns `ErrorListSink.cs` and the diag parsing in `Chameleon.Control`. Both may add
+tests in their own files.

@@ -19,7 +19,7 @@ on:
 
 permissions:
   contents: read
-  actions: read
+  actions: write   # dispatches package.yml when no package run exists for this commit
 
 jobs:
   quickstart:
@@ -44,9 +44,17 @@ jobs:
           $id = (Get-Content tests/acceptance/quickstart/package-run-id.txt -Raw).Trim()
           if ($id -eq 'same-commit') {
             # Wait for the `package` run of this commit (pull_request or push) and use its zip.
-            $deadline = (Get-Date).AddMinutes(40); $id = $null
+            # A push to a ccr branch can change package inputs (e.g. a merge from main) while the PR's own diff does not, so
+            # package.yml's pull_request paths filter starts no run. If none exists after 5 minutes, dispatch one on this branch.
+            $deadline = (Get-Date).AddMinutes(40); $dispatchAt = (Get-Date).AddMinutes(5); $dispatched = $false; $id = $null
             while (-not $id -and (Get-Date) -lt $deadline) {
               $runs = gh run list -R $env:GITHUB_REPOSITORY --workflow package.yml --commit $env:GITHUB_SHA --json databaseId,status,conclusion | ConvertFrom-Json
+              if (-not $runs -and -not $dispatched -and (Get-Date) -gt $dispatchAt) {
+                gh workflow run package.yml -R $env:GITHUB_REPOSITORY --ref $env:GITHUB_REF_NAME
+                if ($LASTEXITCODE -ne 0) { throw "could not dispatch package.yml on $env:GITHUB_REF_NAME" }
+                "QS-PACKAGE dispatched package.yml on $env:GITHUB_REF_NAME for $env:GITHUB_SHA"
+                $dispatched = $true; Start-Sleep -Seconds 30; continue
+              }
               $done = @($runs | Where-Object { $_.status -eq 'completed' })
               if ($done | Where-Object { $_.conclusion -eq 'success' }) { $id = ($done | Where-Object { $_.conclusion -eq 'success' } | Select-Object -First 1).databaseId }
               elseif ($done -and -not ($runs | Where-Object { $_.status -ne 'completed' })) { throw "the package run(s) of $env:GITHUB_SHA failed" }
