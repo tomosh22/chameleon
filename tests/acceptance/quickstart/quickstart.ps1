@@ -20,7 +20,14 @@ function Step($n, $name, $ok, $detail) {
 function New-Prompt($lines) {
     $script:seq++
     $in = Join-Path $work "prompt$($script:seq).in"
-    [IO.File]::WriteAllText($in, (($lines -join "`r`n") + "`r`n"), [Text.Encoding]::ASCII)
+    # Orchestration only: the prompt is fed on stdin, so a command that reads stdin (xcopy, powershell, ...) would swallow
+    # the following lines. Give every guide command an empty stdin (<nul); cd/for/exit lines are left untouched.
+    $fed = foreach ($l in $lines) {
+        if ($l -match '^(cd |for |exit )') { $l }
+        elseif ($l -match '^(.*?) \|\| exit /b 1$') { "$($Matches[1]) <nul || exit /b 1" }
+        else { "$l <nul" }
+    }
+    [IO.File]::WriteAllText($in, (($fed -join "`r`n") + "`r`n"), [Text.Encoding]::ASCII)
     return $in
 }
 # Foreground prompt: returns @{Code; Text}
@@ -111,7 +118,9 @@ try {
         'cd /d C:\chameleon-demo\hello',
         'cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_PREFIX_PATH=%CML% || exit /b 1',
         'exit /b 0') 600
-    Step 5 configure ($r.Code -eq 0) "exit=$($r.Code) tail=$(($r.Text -split "`n" | Select-Object -Last 4) -join ' | ')"
+    $h = 'C:\chameleon-demo\hello'
+    $cfg = (Test-Path "$h\CMakeLists.txt") -and (Test-Path "$h\logic.cpp") -and (Test-Path "$h\build\CMakeCache.txt") -and (Test-Path "$h\build\build.ninja") -and ($r.Text -match 'Build files have been written to')
+    Step 5 configure (($r.Code -eq 0) -and $cfg) "exit=$($r.Code) copied+configured=$cfg tail=$(($r.Text -split "`n" | Select-Object -Last 4) -join ' | ')"
     $r = Run-Prompt @('cd /d C:\chameleon-demo\hello', $setCml, 'cmake --build build || exit /b 1', 'exit /b 0') 600
     Step 6 build (($r.Code -eq 0) -and (Test-Path 'C:\chameleon-demo\hello\build\smoke_app.exe')) "exit=$($r.Code) exe=$(Test-Path 'C:\chameleon-demo\hello\build\smoke_app.exe') tail=$(($r.Text -split "`n" | Select-Object -Last 4) -join ' | ')"
 
