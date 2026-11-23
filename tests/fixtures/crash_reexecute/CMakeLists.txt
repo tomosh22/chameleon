@@ -11,15 +11,23 @@
 #
 # Flags: the project's Debug flags carry /RTC1 (incompatible with /O2: D8016) and /JMC; they are removed for this directory so one
 # fixture can mix /Od and /O2 sources. The per-source options below decide the optimisation level of each TU; the later option wins
-# over the configuration's own /Od or /O2 (cl reports D9025, a note-level warning /WX does not escalate; clang-cl takes the last).
+# over the configuration's own /Od or /O2 (the configuration's own level is removed above so cl reports no D9025).
 if(MSVC)
     foreach(_cml_flag /RTC1 /JMC)
         string(REPLACE "${_cml_flag}" "" CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
+    endforeach()
+    # The configuration's own /Od or /O1 /O2 /Ox is removed too: every TU gets an explicit level below, so cl has no level to
+    # override (D9025).
+    foreach(_cml_cfg DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+        string(REGEX REPLACE "(^| )[/-]O[dx12]( |$)" " " CMAKE_CXX_FLAGS_${_cml_cfg} "${CMAKE_CXX_FLAGS_${_cml_cfg}}")
+        string(REGEX REPLACE "(^| )[/-]O[dx12]( |$)" " " CMAKE_CXX_FLAGS_${_cml_cfg} "${CMAKE_CXX_FLAGS_${_cml_cfg}}")
     endforeach()
 endif()
 cml_add_fixture(crash_reexecute SOURCES main.cpp step.cpp opt.cpp)
 if(MSVC)
     set_source_files_properties(step.cpp PROPERTIES COMPILE_OPTIONS "/Od")
+    # main.cpp keeps the level its configuration would give it (/Od in Debug, /O1 in MinSizeRel, /O2 otherwise)
+    set_source_files_properties(main.cpp PROPERTIES COMPILE_OPTIONS "$<$<CONFIG:Debug>:/Od>$<$<CONFIG:MinSizeRel>:/O1>$<$<CONFIG:Release,RelWithDebInfo>:/O2>")
     set_source_files_properties(opt.cpp PROPERTIES COMPILE_OPTIONS "/O2")
 endif()
 

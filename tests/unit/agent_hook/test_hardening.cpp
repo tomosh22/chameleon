@@ -527,14 +527,47 @@ TEST_CASE("an offender that leaves while only it runs is handled inside ONE stop
 
     std::atomic<bool> started{false};
     std::atomic<int> result{-1};
-    std::thread runner([&] {
-        started = true;
-        result = slow.as_int()(600000000);  // a few hundred milliseconds of looping
-    });
-    while (!started.load()) {
-        std::this_thread::yield();
+    std::thread runner;
+    // `started` is set before the call: wait (bounded) until the runner is really inside the 5-byte window, so that the
+    // installer finds an offender even on a loaded machine. The loop runs for a few hundred milliseconds. If the runner has
+    // already finished (a very slow wait), it is started again, up to three times.
+    bool inside = false;
+    for (int attempt = 0; attempt < 3 && !inside; ++attempt) {
+        started = false;
+        result = -1;
+        runner = std::thread([&] {
+            started = true;
+            result = slow.as_int()(600000000);
+        });
+        while (!started.load()) {
+            std::this_thread::yield();
+        }
+        const HANDLE th = static_cast<HANDLE>(runner.native_handle());
+        const auto lo = reinterpret_cast<std::uintptr_t>(slow.entry);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!inside && result.load() == -1 && std::chrono::steady_clock::now() < deadline) {
+            if (SuspendThread(th) != static_cast<DWORD>(-1)) {
+                CONTEXT ctx{};
+                ctx.ContextFlags = CONTEXT_CONTROL;
+                if (GetThreadContext(th, &ctx)) {
+                    inside = ctx.Rip >= lo && ctx.Rip < lo + 5;
+                }
+                ResumeThread(th);
+            }
+            if (!inside) {
+                Sleep(1);
+            }
+        }
+        if (inside && result.load() != -1) {
+            inside = false;  // it left the window before the installer could stop it
+        }
+        if (!inside) {
+            runner.join();
+        }
     }
-    Sleep(10);
+    if (!inside) {
+        FAIL("the runner thread never stayed inside the 5-byte window of slow_const (three attempts)");
+    }
 
     InstallerOptions options;
     options.max_attempts = 1;           // no second stop: only stepping can succeed
