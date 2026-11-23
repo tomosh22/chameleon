@@ -65,6 +65,10 @@ with the "no recorded command line" error); its own source change is reported wi
 
 - Flag problems of archive members (`/GL`, no `/Gy`) are not audited at enable time (see above).
 - Headers included only by skipped compilands are not tracked.
-- Corpus: the two F-1 `expected_failures` of the Godot cell (`edit:static-lib-main`, `edit:static-lib-scene-tree`, the latter an edit of
-  `scene/main/scene_tree.cpp`) are removed, so those edits must now reload. `corpus F-1` in `test_audit.cpp` now asserts the new rule.
+- Corpus: the two F-1 `expected_failures` of the Godot cell are removed. `edit:static-lib-main` (`main/main.cpp`, a member of `main.lib`)
+  now reloads (`patched=1 hooks=57` in the corpus run of c6968bf). The second edit was `scene/main/scene_tree.cpp`; with F-1 fixed it
+  gets past the sweep and is refused by the planner (CML3207 / CML3214: SceneTree's `SNAME` lambdas define several function-local
+  statics with the same name, `$TSS0` and `sname`, which the planner cannot tell apart; the same family as F-4). That is a separate planner
+  limitation, so the step became `edit:static-lib-core-message-queue` (`CallQueue::flush()` in `core/object/message_queue.cpp`, which
+  every frame runs and which has no such statics). The scene/ refusal is reported in the PR. `corpus F-1` in `test_audit.cpp` now asserts the new rule.
   (The raylib and imgui projects carry no F-1 entry.)
