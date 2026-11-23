@@ -64,7 +64,10 @@ if (-not (Get-Command cl -ErrorAction SilentlyContinue)) {
 if (-not (Get-Command cl -ErrorAction SilentlyContinue)) { Fail 'cl.exe is still not on PATH' }
 $cxx = if ($Compiler -eq 'clang-cl') { 'clang-cl' } else { 'cl' }
 
-$out = [IO.Path]::GetFullPath((Join-Path $repo $OutDir))
+# A relative -OutDir is resolved from the caller's current directory (from the repository root when it is left at its default).
+if ([IO.Path]::IsPathRooted($OutDir)) { $out = [IO.Path]::GetFullPath($OutDir) }
+elseif ($PSBoundParameters.ContainsKey('OutDir')) { $out = [IO.Path]::GetFullPath((Join-Path (Get-Location).Path $OutDir)) }
+else { $out = [IO.Path]::GetFullPath((Join-Path $repo $OutDir)) }
 $build = Join-Path $out 'build'
 $stage = Join-Path $out $name
 $zip = Join-Path $out "$name.zip"
@@ -73,9 +76,15 @@ if (Test-Path $zip) { Remove-Item -Force $zip }
 New-Item -ItemType Directory -Force -Path $out | Out-Null
 
 # ---- 1. release build ----------------------------------------------------------------------------------------------
-$generator = if (Get-Command ninja -ErrorAction SilentlyContinue) { @('-G', 'Ninja') } else { @('-G', 'Visual Studio 17 2022', '-A', 'x64') }
+if (Get-Command ninja -ErrorAction SilentlyContinue) {
+    $generator = @('-G', 'Ninja'); $compilerArgs = @("-DCMAKE_CXX_COMPILER=$cxx")
+} elseif ($Compiler -eq 'clang-cl') {
+    $generator = @('-G', 'Visual Studio 17 2022', '-A', 'x64', '-T', 'ClangCL'); $compilerArgs = @()
+} else {
+    $generator = @('-G', 'Visual Studio 17 2022', '-A', 'x64'); $compilerArgs = @()
+}
 Invoke-Native 'cmake configure' {
-    cmake -S $repo -B $build @generator -DCMAKE_BUILD_TYPE=RelWithDebInfo "-DCMAKE_CXX_COMPILER=$cxx" `
+    cmake -S $repo -B $build @generator -DCMAKE_BUILD_TYPE=RelWithDebInfo @compilerArgs `
         -DCML_FAULT_INJECTION=OFF -DCML_BUILD_TESTS=OFF -DCML_BUILD_GUI=OFF
 }
 Invoke-Native 'cmake build' { cmake --build $build --config RelWithDebInfo --parallel }
@@ -102,6 +111,7 @@ if ($SkipExtensions) {
 } else {
     $vscodeDir = Join-Path $repo 'integrations\vscode'
     if (Test-Path (Join-Path $vscodeDir 'package.json')) {
+        Get-ChildItem -Path $vscodeDir -Filter '*.vsix' -File | Remove-Item -Force  # no stale package from an earlier build
         Push-Location $vscodeDir
         try {
             Invoke-Native 'npm ci' { npm ci }
@@ -115,6 +125,7 @@ if ($SkipExtensions) {
     }
     $vsDir = Join-Path $repo 'integrations\vs'
     if (Test-Path (Join-Path $vsDir 'build.ps1')) {
+        Get-ChildItem -Path (Join-Path $vsDir 'out') -Filter '*.vsix' -File -ErrorAction SilentlyContinue | Remove-Item -Force
         Invoke-Native 'integrations/vs/build.ps1' { & (Join-Path $vsDir 'build.ps1') -Configuration Release }
         $vsix = @(Get-ChildItem -Path (Join-Path $vsDir 'out') -Filter '*.vsix' -File -ErrorAction SilentlyContinue)
         if ($vsix.Count -lt 1) { Fail 'integrations/vs/out has no .vsix after build.ps1 -Configuration Release' }
@@ -153,8 +164,8 @@ foreach ($dir in Get-ChildItem -Directory (Join-Path $repo 'third_party')) {
     foreach ($f in $files) { Copy-Item $f.FullName $target }
 }
 
-$readme = @"
-Chameleon $Version (Windows x64)
+$readme = @'
+Chameleon @VERSION@ (Windows x64)
 
 Native C/C++ hot reload. Start with docs\QUICKSTART.md.
 
@@ -168,7 +179,8 @@ Native C/C++ hot reload. Start with docs\QUICKSTART.md.
   docs\                   quickstart, build requirements, troubleshooting by diagnostic id, known limitations
   licenses\               licence texts of the bundled third-party code
   MANIFEST.txt            every file with its SHA-256
-"@
+'@
+$readme = $readme.Replace('@VERSION@', $Version)
 Set-Content -Path (Join-Path $stage 'README.txt') -Value $readme -Encoding utf8
 
 # ---- 4. checks -----------------------------------------------------------------------------------------------------

@@ -37,8 +37,7 @@ echo %CML%
 dir %CML%
 ```
 
-`dir` shows `bin`, `docs`, `include`, `integrations`, `lib`, `licenses`, `MANIFEST.txt`, `README.txt` and, depending on the
-version, `examples`. Check the program runs:
+`dir` shows `bin`, `docs`, `examples`, `include`, `integrations`, `lib`, `licenses`, `scripts`, `MANIFEST.txt` and `README.txt`. Check the program runs:
 
 ```bat
 %CML%\bin\cml_broker.exe --version

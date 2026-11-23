@@ -1,8 +1,10 @@
 // Smoke application: prints `SMOKE tick=<n> value=<smoke_value()>` every 100 ms and enables its own module with the
 // Chameleon agent. `--agent-dir DIR` names the directory with cml_agent.dll (default: the directory of this exe).
+// `--seconds N` is how long it runs (default 120); a forgotten smoke run still ends by itself.
 #include <windows.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -12,7 +14,11 @@
 int main(int argc, char** argv)
 {
     std::wstring agent_dir;
+    int seconds = 120;
     for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--seconds") == 0) {
+            seconds = std::atoi(argv[i + 1]);
+        }
         if (std::strcmp(argv[i], "--agent-dir") == 0) {
             const int n = MultiByteToWideChar(CP_UTF8, 0, argv[i + 1], -1, nullptr, 0);
             if (n > 1) {
@@ -40,7 +46,7 @@ int main(int argc, char** argv)
         reported = false;
     }
 
-    for (int tick = 0; tick < 1200; ++tick) {  // 120 s at most: a forgotten smoke run ends by itself
+    for (int tick = 0; tick < seconds * 10; ++tick) {
         std::printf("SMOKE tick=%d value=%d\n", tick, smoke_value());
         if (!reported) {
             cml::Reply reply;

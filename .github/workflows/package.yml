@@ -18,6 +18,10 @@ on:
       - '.github/workflows/package.yml'
       - 'integrations/**'
       - 'cmake/**'
+      - 'broker/**'
+      - 'agent/**'
+      - 'core/**'
+      - 'third_party/**'
       - 'CMakeLists.txt'
 
 permissions:

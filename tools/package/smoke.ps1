@@ -83,6 +83,7 @@ if ($usePackage -and $warn -ne 0) { Fail "cml_broker check reports $warn WARN on
 $tag = [Guid]::NewGuid().ToString('N').Substring(0, 12)
 $agentPipe = "\\.\pipe\cml_smoke_agent_$tag"
 $controlName = "cml_smoke_control_$tag"
+$savedPipe = $env:CML_PIPE_NAME; $savedControl = $env:CML_CONTROL_PIPE
 $env:CML_PIPE_NAME = $agentPipe
 $env:CML_CONTROL_PIPE = "\\.\pipe\$controlName"
 $brokerLog = Join-Path $Work 'broker.log'
@@ -93,6 +94,12 @@ function Stop-All {
     foreach ($p in @($script:appProc, $script:brokerProc)) {
         if ($p -and -not $p.HasExited) { try { $p.Kill() } catch { } }
     }
+    # A broker the agent started on its own (nobody tracks it) must not survive the step either.
+    Get-Process -Name cml_broker -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($script:Root, [StringComparison]::OrdinalIgnoreCase) } |
+        ForEach-Object { try { $_.Kill() } catch { } }
+}
+function Assert-AppAlive([string]$when) {
+    if ($script:appProc.HasExited) { Show-Logs; Fail "the application exited (code $($script:appProc.ExitCode)) $when" }
 }
 function Show-Logs {
     foreach ($f in @($brokerLog, $appOut, $appErr)) {
@@ -120,9 +127,6 @@ function Invoke-Control([string]$cmd, $arguments, [int]$timeoutMs) {
 try {
     $brokerProc = Start-Process -FilePath $broker -PassThru -WindowStyle Hidden -ArgumentList @(
         '--headless', '--verbose', '--log', $brokerLog, '--session-dir', (Join-Path $Work 'session'), '--exit-when-idle', '60000')
-    $appProc = Start-Process -FilePath $app -PassThru -WindowStyle Hidden -WorkingDirectory $build `
-        -RedirectStandardOutput $appOut -RedirectStandardError $appErr -ArgumentList @('--agent-dir', (Join-Path $Root 'bin'))
-
     # The broker answers `status` as soon as its control pipe is up.
     $status = $null
     for ($i = 0; $i -lt 60 -and -not $status; $i++) {
@@ -132,12 +136,18 @@ try {
     Note ("broker-status=ok version=" + $status.result.version + " capabilities=" + ($status.result.capabilities -join ','))
     if ($status.result.capabilities -notcontains 'reload') { Fail 'the broker does not provide the reload capability' }
 
+    # Only now start the application: with no broker answering, its agent would start a broker of its own.
+    $appProc = Start-Process -FilePath $app -PassThru -WindowStyle Hidden -WorkingDirectory $build `
+        -RedirectStandardOutput $appOut -RedirectStandardError $appErr -ArgumentList @('--agent-dir', (Join-Path $Root 'bin'), '--seconds', '900')
+
     # The application enabled its module (its PDB index is loaded when `wait` for the index returns).
     $deadline = (Get-Date).AddSeconds(60)
-    while ((Get-Date) -lt $deadline -and -not ((Test-Path $appOut) -and (Select-String -Path $appOut -Pattern 'SMOKE enabled=1' -Quiet))) { Start-Sleep -Milliseconds 300 }
+    while ((Get-Date) -lt $deadline -and -not ((Test-Path $appOut) -and (Select-String -Path $appOut -Pattern 'SMOKE enabled=1' -Quiet))) { Start-Sleep -Milliseconds 300; if ($appProc.HasExited) { break } }
+    Assert-AppAlive 'before it reported SMOKE enabled=1'
     if (-not ((Test-Path $appOut) -and (Select-String -Path $appOut -Pattern 'SMOKE enabled=1' -Quiet))) { Show-Logs; Fail 'the application never reported SMOKE enabled=1' }
     $wait = Invoke-Control 'wait' @{ for = 'index'; timeout_ms = 60000 } 70000
     if (-not $wait.ok) { Show-Logs; Fail ("wait for the index failed: " + ($wait.diag | ConvertTo-Json -Compress)) }
+    Assert-AppAlive 'before the reload'
     if (-not (Select-String -Path $appOut -Pattern 'SMOKE tick=\d+ value=1' -Quiet)) { Fail 'the application did not print value=1' }
     Note 'before=value1'
 
@@ -157,13 +167,14 @@ try {
     $seen = $false
     while ((Get-Date) -lt $deadline -and -not $seen) {
         $seen = Select-String -Path $appOut -Pattern 'SMOKE tick=\d+ value=2' -Quiet
-        if (-not $seen) { Start-Sleep -Milliseconds 200 }
+        if (-not $seen) { Start-Sleep -Milliseconds 200; if ($appProc.HasExited) { break } }
     }
-    if (-not $seen) { Show-Logs; Fail 'the application never printed value=2 after the reload' }
+    if (-not $seen) { Assert-AppAlive 'after the reload'; Show-Logs; Fail 'the application never printed value=2 after the reload' }
     Note ("after=value2 reload_ms=" + $watch.ElapsedMilliseconds)
     Note 'reload=ok'
 } finally {
     Stop-All
+    $env:CML_PIPE_NAME = $savedPipe; $env:CML_CONTROL_PIPE = $savedControl
     Show-Logs
 }
 Note 'RESULT=PASS'
