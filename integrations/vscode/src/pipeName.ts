@@ -64,9 +64,16 @@ export async function resolveControlPipe(explicitName: string, deps: PipeNameDep
   if (name === "") {
     let sid: string | undefined;
     try {
-      sid = parseLogonSid(await deps.run("whoami", ["/groups", "/fo", "csv", "/nh"]));
+      sid = parseLogonSid(await deps.run("whoami", ["/logonid"]));
     } catch {
       sid = undefined;
+    }
+    if (!sid) {
+      try {
+        sid = parseLogonSid(await deps.run("whoami", ["/groups", "/fo", "csv", "/nh"]));
+      } catch {
+        sid = undefined;
+      }
     }
     if (!sid) {
       // `whoami /groups` does not always list the logon-id group (it is missing on the GitHub runners); .NET's token view does.

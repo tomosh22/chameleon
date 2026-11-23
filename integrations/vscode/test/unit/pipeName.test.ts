@@ -16,6 +16,10 @@ describe("resolveControlPipe", () => {
     assert.equal(await resolveControlPipe("\\\\.\\pipe\\mine", deps({ env: { CML_CONTROL_PIPE: "\\\\.\\pipe\\env" } })), "\\\\.\\pipe\\mine");
     assert.equal(await resolveControlPipe("  ", deps({ env: { CML_CONTROL_PIPE: "\\\\.\\pipe\\env" } })), "\\\\.\\pipe\\env");
   });
+  it("uses whoami /logonid first", async () => {
+    const run = async (_f: string, args: string[]): Promise<string> => (args[0] === "/logonid" ? "S-1-5-5-0-4242\r\n" : "");
+    assert.equal(await resolveControlPipe("", deps({ run })), "\\\\.\\pipe\\cml_control_S-1-5-5-0-4242");
+  });
   it("derives cml_control_<logon SID> from whoami", async () => {
     assert.equal(await resolveControlPipe("", deps()), "\\\\.\\pipe\\cml_control_S-1-5-5-0-123456");
   });

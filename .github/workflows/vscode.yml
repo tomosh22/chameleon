@@ -85,9 +85,10 @@ jobs:
 
       - name: Show the identity the pipe name is derived from
         run: |
-          whoami /groups /fo csv /nh
+          whoami /logonid
           whoami /user /fo csv /nh
-          powershell -NoProfile -Command "[System.Security.Principal.WindowsIdentity]::GetCurrent().Groups | ForEach-Object { $_.Value }"
+          $ps = '[System.Security.Principal.WindowsIdentity]::GetCurrent().Groups | ForEach-Object { $_.Value }'
+          powershell -NoProfile -Command $ps | Select-String 'S-1-5-5-'
 
       - name: Integration test (control client against a real broker and fixture)
         working-directory: ${{ env.EXT_DIR }}
