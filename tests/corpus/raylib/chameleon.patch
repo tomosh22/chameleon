@@ -1,0 +1,36 @@
+diff --git a/examples/core/core_2d_camera_platformer.c b/examples/core/core_2d_camera_platformer.c
+index 3743de8..5e151f4 100644
+--- a/examples/core/core_2d_camera_platformer.c
++++ b/examples/core/core_2d_camera_platformer.c
+@@ -15,6 +15,7 @@
+ 
+ #include "raylib.h"
+ #include "raymath.h"
++#include "chameleon_corpus.h"   // Chameleon corpus (WP-26)
+ 
+ #define G 400
+ #define PLAYER_JUMP_SPD 350.0f
+@@ -52,6 +53,7 @@ int main(void)
+     const int screenWidth = 800;
+     const int screenHeight = 450;
+ 
++    cml_corpus_init();   // Chameleon corpus (WP-26)
+     InitWindow(screenWidth, screenHeight, "raylib [core] example - 2d camera");
+ 
+     Player player = { 0 };
+@@ -149,6 +151,7 @@ int main(void)
+             DrawText(cameraDescriptions[cameraOption], 40, 140, 10, DARKGRAY);
+ 
+         EndDrawing();
++        cml_corpus_frame();   // Chameleon corpus (WP-26)
+         //----------------------------------------------------------------------------------
+     }
+ 
+@@ -195,6 +198,7 @@ void UpdatePlayer(Player *player, EnvItem *envItems, int envItemsLength, float d
+         player->canJump = false;
+     }
+     else player->canJump = true;
++    player->position.x = Clamp(player->position.x, -100000.0f, 100000.0f);   // Chameleon corpus (WP-26): a call into raymath.h
+ }
+ 
+ void UpdateCameraCenter(Camera2D *camera, Player *player, EnvItem *envItems, int envItemsLength, float delta, int width, int height)
