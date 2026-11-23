@@ -1,4 +1,4 @@
-# chameleon_enable(<target> [NO_AGENT] [ALLOW_INLINING] [NO_COPY_AGENT])
+# chameleon_enable(<target> [NO_AGENT] [ALLOW_INLINING] [NO_COPY_AGENT] [NO_BUILD_TYPE_CHECK])
 #
 # Applies the build flags Chameleon needs (docs/BUILD_REQUIREMENTS.md) to a target and links the agent.
 # This one file works in two places:
@@ -18,8 +18,9 @@
 #   NO_AGENT         do not link Chameleon::agent and do not look for it (the target still gets the flags)
 #   ALLOW_INLINING   leave the optimiser's inlining alone (a target you iterate on should keep it off: CML1603 / CML3104)
 #   NO_COPY_AGENT    link the agent but do not copy cml_agent.dll beside the executable
+#   NO_BUILD_TYPE_CHECK  skip the CMAKE_BUILD_TYPE warning (CML1704); for the repository's own fixtures, which are not user projects
 #
-# Configure-time diagnostics: CML1700-CML1719, each message ends with "What to do: ...". See integrations/cmake/README.md.
+# Configure-time diagnostics: CML1700-CML1749, each message ends with "What to do: ...". See integrations/cmake/README.md.
 
 include_guard(GLOBAL)
 
@@ -29,11 +30,11 @@ function(_cml_enable_message severity id what todo)
 endfunction()
 
 function(chameleon_enable target)
-    cmake_parse_arguments(PARSE_ARGV 1 E "NO_AGENT;ALLOW_INLINING;NO_COPY_AGENT" "" "")
+    cmake_parse_arguments(PARSE_ARGV 1 E "NO_AGENT;ALLOW_INLINING;NO_COPY_AGENT;NO_BUILD_TYPE_CHECK" "" "")
     if(E_UNPARSED_ARGUMENTS)
         _cml_enable_message(FATAL_ERROR CML1709
             "chameleon_enable(${target}) got unknown arguments '${E_UNPARSED_ARGUMENTS}'."
-            "use only NO_AGENT, ALLOW_INLINING and NO_COPY_AGENT.")
+            "use only NO_AGENT, ALLOW_INLINING, NO_COPY_AGENT and NO_BUILD_TYPE_CHECK.")
         return()
     endif()
     if(NOT TARGET ${target})
@@ -47,21 +48,38 @@ function(chameleon_enable target)
         set(target ${_aliased})
     endif()
 
+    get_target_property(_imported ${target} IMPORTED)
+    if(_imported)
+        _cml_enable_message(FATAL_ERROR CML1708
+            "chameleon_enable(${target}): ${target} is an IMPORTED target; its flags were fixed when it was built elsewhere."
+            "call chameleon_enable on the targets this project builds (add_executable/add_library), not on imported ones.")
+        return()
+    endif()
+
     # ---- the target platform: Windows x64 ----------------------------------------------------------------------------
     set(_in_tree_portable FALSE)
     if(CML_ALLOW_NON_WINDOWS)
         set(_in_tree_portable TRUE)  # the Chameleon source tree configured only for syntax checks (not supported)
     endif()
+    # The target architecture comes from the generator platform (Visual Studio) or the compiler (Ninja); the host's
+    # CMAKE_SYSTEM_PROCESSOR is only the last resort, when neither is known.
+    if(CMAKE_VS_PLATFORM_NAME)
+        set(_arch "${CMAKE_VS_PLATFORM_NAME}")
+    elseif(CMAKE_GENERATOR_PLATFORM)
+        set(_arch "${CMAKE_GENERATOR_PLATFORM}")
+    elseif(CMAKE_CXX_COMPILER_ARCHITECTURE_ID)
+        set(_arch "${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}")
+    else()
+        set(_arch "${CMAKE_SYSTEM_PROCESSOR}")
+    endif()
     if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows" OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8
-       OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64|x64|X64)$")
+       OR NOT _arch MATCHES "^([Aa][Mm][Dd]64|[Xx]64|[Xx]86_64)$")
         if(_in_tree_portable)
-            if(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
-                target_compile_options(${target} PRIVATE -fno-inline)
-            endif()
+            target_compile_options(${target} PRIVATE "$<$<CONFIG:RelWithDebInfo>:-fno-inline>")
             return()
         endif()
         _cml_enable_message(FATAL_ERROR CML1700
-            "chameleon_enable(${target}): the target is '${CMAKE_SYSTEM_NAME}' / '${CMAKE_SYSTEM_PROCESSOR}' with ${CMAKE_SIZEOF_VOID_P}-byte pointers; Chameleon supports Windows x64 only."
+            "chameleon_enable(${target}): the target is '${CMAKE_SYSTEM_NAME}' / '${_arch}' with ${CMAKE_SIZEOF_VOID_P}-byte pointers; Chameleon supports Windows x64 only."
             "configure with an x64 MSVC or clang-cl toolchain (Visual Studio generator: -A x64; Ninja: run from an x64 developer prompt).")
         return()
     endif()
@@ -99,7 +117,8 @@ function(chameleon_enable target)
 
     # ---- the build type (single-configuration generators) ------------------------------------------------------------
     get_property(_multi GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
-    if(NOT _multi AND NOT CMAKE_BUILD_TYPE MATCHES "^(Debug|RelWithDebInfo)$")
+    string(TOLOWER "${CMAKE_BUILD_TYPE}" _build_type)
+    if(NOT E_NO_BUILD_TYPE_CHECK AND NOT _multi AND NOT _build_type MATCHES "^(debug|relwithdebinfo)$")
         _cml_enable_message(WARNING CML1704
             "chameleon_enable(${target}): CMAKE_BUILD_TYPE is '${CMAKE_BUILD_TYPE}'. Release and MinSizeRel record no debug information for the compiler, and their inlining defeats patching."
             "configure with -DCMAKE_BUILD_TYPE=Debug or RelWithDebInfo for the build you iterate on.")
@@ -113,10 +132,17 @@ function(chameleon_enable target)
             "do not set INTERPROCEDURAL_OPTIMIZATION or CMAKE_INTERPROCEDURAL_OPTIMIZATION for the targets you reload.")
         set_property(TARGET ${target} PROPERTY INTERPROCEDURAL_OPTIMIZATION OFF)
     endif()
-    set(_seen "${CMAKE_CXX_FLAGS} ${CMAKE_C_FLAGS} ${CMAKE_CXX_FLAGS_DEBUG} ${CMAKE_CXX_FLAGS_RELWITHDEBINFO}")
-    string(APPEND _seen " ${CMAKE_EXE_LINKER_FLAGS} ${CMAKE_SHARED_LINKER_FLAGS} ${CMAKE_EXE_LINKER_FLAGS_DEBUG} ${CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO}")
+    set(_seen "${CMAKE_CXX_FLAGS} ${CMAKE_C_FLAGS}")
+    foreach(_cfg DEBUG RELWITHDEBINFO)
+        string(APPEND _seen " ${CMAKE_CXX_FLAGS_${_cfg}} ${CMAKE_C_FLAGS_${_cfg}} ${CMAKE_EXE_LINKER_FLAGS_${_cfg}} ${CMAKE_SHARED_LINKER_FLAGS_${_cfg}} ${CMAKE_MODULE_LINKER_FLAGS_${_cfg}}")
+    endforeach()
+    string(APPEND _seen " ${CMAKE_EXE_LINKER_FLAGS} ${CMAKE_SHARED_LINKER_FLAGS} ${CMAKE_MODULE_LINKER_FLAGS}")
     foreach(_prop COMPILE_OPTIONS LINK_OPTIONS)
         get_target_property(_val ${target} ${_prop})
+        if(_val)
+            string(APPEND _seen " ${_val}")
+        endif()
+        get_directory_property(_val ${_prop})  # add_compile_options / add_link_options
         if(_val)
             string(APPEND _seen " ${_val}")
         endif()
