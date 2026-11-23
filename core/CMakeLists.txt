@@ -6,3 +6,4 @@ add_subdirectory(cml_ipc)
 add_subdirectory(cml_proc)
 add_subdirectory(cml_toolchain)
 add_subdirectory(cml_watch)
+add_subdirectory(cml_license)  # WP-32

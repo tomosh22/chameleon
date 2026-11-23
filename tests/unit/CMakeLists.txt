@@ -36,6 +36,7 @@ if(NOT MSVC)
     target_link_libraries(cml_test_util PRIVATE Threads::Threads)
 endif()
 add_subdirectory(coff)  # WP-02: unit.coff
+add_subdirectory(license)  # WP-32: unit.license
 add_subdirectory(pe)    # WP-02: unit.pe
 cml_add_unit_test(pdb
     SOURCES

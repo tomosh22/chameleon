@@ -1,0 +1,2739 @@
+# Troubleshooting by diagnostic id
+
+Every failure Chameleon reports carries a stable id such as `CML5300`. The id is printed with the message and a
+"What to do" sentence by `cml_broker`, by `cml_ui`, in the editor extensions and by `cml_broker check`. Look the id up
+below: each entry gives the cause, a typical message and what to do. Messages name the file, module or symbol involved;
+the entries show them with `<...>` where the real text varies.
+
+The first digit is the stage: `CML1xxx` parse and PDB (including the build-requirements audit), `CML2xxx` compile,
+`CML3xxx` link and bind, `CML4xxx` load and hook (agent side), `CML5xxx` runtime (reload pipeline, control pipe, UI,
+revert, restart).
+
+## First steps for any problem
+
+1. Check the module against the build requirements: `cml_broker check <module.exe|module.dll>`. Every `FAIL` and `WARN`
+   line names its id; most "it does not reload" reports end here (see `docs/BUILD_REQUIREMENTS.md`).
+2. Run the broker with `--verbose --log broker.log` and read the lines before the diagnostic. Every decision of the bind
+   planner is logged at `trace`.
+3. Look for the diagnostic in the `diag` events or the reload response: the `id`, `message` and `action` fields are the
+   text shown below.
+4. Hot-restart (`restart`) is the way out when a change cannot be patched in place (`docs/KNOWN_LIMITATIONS.md`).
+
+## Ids owned by the integrations and the licensing hook
+
+These are raised outside the C++ code base that this document is checked against, or are reserved.
+
+| Range | Raised by | Meaning |
+|---|---|---|
+| CML1700 to CML1749 | `chameleon_enable()` in `ChameleonConfig.cmake` | Configure-time messages: the CMake helper could not apply a recommended flag to a target. The message names the target and the flag; fix the target's flags or call `chameleon_enable()` after the target is defined. |
+| CML5990 to CML5993 | VS Code extension | Client-side failures: no broker found, the control pipe was lost, the broker is too old for a feature. Start `cml_broker --headless` and reload the window; the Output channel "Chameleon" has the details. |
+| CML5994 to CML5997 | Visual Studio extension | Same as above, plus a failed debugger re-attach after a hot-restart. Attach the debugger by hand (Debug, Attach to Process). |
+| CML5998 to CML5999 | licensing hook | See the two entries at the end of this document. The shipped build never raises them. |
+
+## The entries
+
+## CML1100 to CML1199
+
+### CML1101
+
+- **Cause:** /DEBUG:FASTLINK (or a PDB without function symbols).  
+- **Message:** `The PDB of <...> holds no function symbols for its compilands (a /DEBUG:FASTLINK or stripped PDB); Chameleon needs /DEBUG:FULL.`  
+- **What to do:** Relink the module with /DEBUG:FULL.  
+- **Raised by:** `broker/cml_core/include/cml/core/module_audit.h`
+
+### CML1102
+
+- **Cause:** Compilands without a recorded command line.  
+- **Message:** `The PDB of <...> has no compilands that Chameleon can recompile (no S_COMPILE3 records of C/C++ objects).`  
+- **What to do:** Build the module with MSVC /Zi, /ZI or /Z7 (clang-cl: /Z7), and link with /DEBUG:FULL.  
+  Other variants of the advice: Build with MSVC /Zi or /Z7 (clang-cl: -gcodeview-command-line) or provide compile_commands.json. / Build them with MSVC /Zi or /Z7 (clang-cl: -gcodeview-command-line) or provide compile_commands.json.  
+- **Raised by:** `broker/cml_core/include/cml/core/module_audit.h`
+
+### CML1103
+
+- **Cause:** /GL.  
+- **Message:** `Compiland <...> in <...> was built with /GL (LTCG); its objects are IL, not COFF<...> (<...> compilands: <...>).<...>.`  
+- **What to do:** Disable /GL for modules you want to hot-reload.  
+- **Raised by:** `broker/cml_core/include/cml/core/module_audit.h`
+
+### CML1104
+
+- **Cause:** /guard:cf.  
+- **Message:** `Module <...> is built with /guard:cf; patched code would not be a valid CFG call target.`  
+- **What to do:** Build with /guard:cf- for development configurations.  
+- **Raised by:** `broker/cml_core/include/cml/core/module_audit.h`
+
+### CML1105
+
+- **Cause:** /Gy absent or unknown.  
+- **Message:** `Compiland <...> of <...> was not built with /Gy; functions cannot be patched individually<...> (<...> compilands: <...>).<...>.`  
+- **What to do:** Add /Gy to the compile flags.  
+- **Raised by:** `broker/cml_core/include/cml/core/module_audit.h`
+
+### CML1106
+
+- **Cause:** x86, ARM64, ... (and the PE reader's CML1303).  
+- **Message:** `The PDB of <...> is for machine <...>; only x64 is supported in v1.`  
+- **What to do:** Use an x64 build.  
+- **Raised by:** `broker/cml_core/include/cml/core/module_audit.h`
+
+
+## CML1200 to CML1299
+
+### CML1200
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `cannot open '%s' for reading`  
+- **What to do:** Check that the file exists and is readable.  
+  Other variants of the advice: Check that the path names a regular file. / Check that the file is not locked or truncated.  
+- **Raised by:** `core/cml_coff/src/coff.cpp`
+
+### CML1201
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `COFF object is %zu bytes, too small for the 20-byte COFF header`  
+- **What to do:** Check that the file is a complete .obj produced by the compiler.  
+- **Raised by:** `core/cml_coff/src/coff.cpp`
+
+### CML1202
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `section table (%u sections at offset %zu) extends past the end of the %zu-byte object`  
+- **What to do:** The object is truncated or corrupt; rebuild it.  
+- **Raised by:** `core/cml_coff/src/coff.cpp`
+
+### CML1203
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `anonymous COFF header has version %u; only /bigobj version 2 is supported`  
+- **What to do:** The file is not a /bigobj object (version 0 is a short import object); pass the compiler's .obj, not an import library member.  
+- **Raised by:** `core/cml_coff/src/coff.cpp`
+
+### CML1204
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `anonymous COFF header has an unrecognised class id (not ANON_OBJECT_HEADER_BIGOBJ)`  
+- **What to do:** Only regular COFF and /bigobj objects are supported; LTCG/bitcode objects are not.  
+- **Raised by:** `core/cml_coff/src/coff.cpp`
+
+### CML1205
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `section %u '%.*s' raw data (offset %u, size %u) extends past the end of the %zu-byte object`  
+- **What to do:** The object is truncated or corrupt; rebuild it.  
+- **Raised by:** `core/cml_coff/src/coff.cpp`
+
+### CML1206
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `section %u '%.*s' declares %llu relocation records at offset %u which extend past the end of the %zu-byte object`  
+- **What to do:** The object is truncated or corrupt; rebuild it.  
+- **Raised by:** `core/cml_coff/src/coff.cpp`
+
+### CML1207
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `object declares %u symbols but its symbol table offset is 0`  
+- **What to do:** The object is corrupt; rebuild it.  
+  Other variants of the advice: The object is truncated or corrupt; rebuild it.  
+- **Raised by:** `core/cml_coff/src/coff.cpp`
+
+### CML1208
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `string table at offset %llu is only %llu bytes; its size field needs 4`  
+- **What to do:** The object is truncated or corrupt; rebuild it.  
+- **Raised by:** `core/cml_coff/src/coff.cpp`
+
+### CML1209
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `symbol %u has string-table offset %u which is outside the %zu-byte string table or unterminated`  
+- **What to do:** The object is corrupt; rebuild it.  
+- **Raised by:** `core/cml_coff/src/coff.cpp`
+
+### CML1210
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `symbol %u declares %u aux records but only %u records remain in the symbol table`  
+- **What to do:** The object is truncated or corrupt; rebuild it.  
+- **Raised by:** `core/cml_coff/src/coff.cpp`
+
+### CML1211
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `section %u has a long-name reference '%.8s' that does not resolve to a string-table entry`  
+- **What to do:** The object is corrupt; rebuild it.  
+- **Raised by:** `core/cml_coff/src/coff.cpp`
+
+### CML1212
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `section %u '%.*s' is flagged LNK_NRELOC_OVFL but its overflow relocation record is outside the object`  
+- **What to do:** The object is truncated or corrupt; rebuild it.  
+  Other variants of the advice: The object is corrupt; rebuild it.  
+- **Raised by:** `core/cml_coff/src/coff.cpp`
+
+### CML1213
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `symbol %u refers to section %d but the object has only %u sections`  
+- **What to do:** The object is corrupt; rebuild it.  
+- **Raised by:** `core/cml_coff/src/coff.cpp`
+
+### CML1214
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `relocation %zu of section %u '%.*s' targets symbol index %u but the object has %u symbol records`  
+- **What to do:** The object is corrupt; rebuild it.  
+- **Raised by:** `core/cml_coff/src/coff.cpp`
+
+### CML1215
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `relocation %zu of section %u '%.*s' targets symbol index %u which is an auxiliary record, not a symbol`  
+- **What to do:** The object is corrupt; rebuild it.  
+- **Raised by:** `core/cml_coff/src/coff.cpp`
+
+### CML1216
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `regular COFF object declares %u sections; the limit is 65279 (larger objects need the /bigobj format)`  
+- **What to do:** The object is corrupt; rebuild it (compile with /bigobj if it genuinely needs this many sections).  
+- **Raised by:** `core/cml_coff/src/coff.cpp`
+
+
+## CML1300 to CML1399
+
+### CML1300
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `cannot open '%s' for reading`  
+- **What to do:** Check that the file exists and is readable.  
+  Other variants of the advice: Check that the path names a regular file. / Check that the file is not locked or truncated.  
+- **Raised by:** `core/cml_pe/src/pe.cpp`
+
+### CML1301
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `not a PE image: missing 'MZ' DOS header in %zu bytes`  
+- **What to do:** Pass a .exe or .dll produced by the linker.  
+- **Raised by:** `core/cml_pe/src/pe.cpp`
+
+### CML1302
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `e_lfanew 0x%X puts the NT headers outside the %zu-byte image`  
+- **What to do:** The image is truncated or corrupt.  
+  Other variants of the advice: The module is not a normally mapped PE image.  
+- **Raised by:** `core/cml_pe/src/pe.cpp`
+
+### CML1303
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `image is PE32 (32-bit); only PE32+ (64-bit) images are supported`  
+- **What to do:** Chameleon targets 64-bit processes; build the target for x64.  
+- **Raised by:** `core/cml_pe/src/pe.cpp`
+
+### CML1304
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `unknown optional header magic 0x%X`  
+- **What to do:** The image is corrupt or is not a PE32+ executable.  
+- **Raised by:** `core/cml_pe/src/pe.cpp`
+
+### CML1305
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `optional header (size %u at offset 0x%zX) is smaller than the 112-byte PE32+ header or extends past the %zu-byte image`  
+- **What to do:** The image is truncated or corrupt.  
+  Other variants of the advice: The module is not a normally mapped PE image.  
+- **Raised by:** `core/cml_pe/src/pe.cpp`
+
+### CML1306
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `section table (%u sections at offset 0x%zX) extends past the end of the %zu-byte image`  
+- **What to do:** The image is truncated or corrupt.  
+- **Raised by:** `core/cml_pe/src/pe.cpp`
+
+### CML1307
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `RVA 0x%X is outside the %zu-byte mapped image`  
+- **What to do:** The image is corrupt.  
+  Other variants of the advice: The image is truncated.  
+- **Raised by:** `core/cml_pe/src/pe.cpp`
+
+### CML1308
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `%llu bytes at RVA 0x%X extend past the end of the containing section or image`  
+- **What to do:** The image is corrupt or truncated.  
+- **Raised by:** `core/cml_pe/src/pe.cpp`
+
+### CML1309
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `string at RVA 0x%X is not NUL-terminated within its section`  
+- **What to do:** The image is corrupt or truncated.  
+- **Raised by:** `core/cml_pe/src/pe.cpp`
+
+### CML1310
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `export name #%u uses ordinal index %u but the export address table has only %u entries`  
+- **What to do:** The image is corrupt.  
+- **Raised by:** `core/cml_pe/src/pe.cpp`
+
+### CML1311
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `import directory has more than 65536 descriptors`  
+- **What to do:** The image is corrupt.  
+  Other variants of the advice: Relink without /BIND (or unbind the image) so the import name table is present.  
+- **Raised by:** `core/cml_pe/src/pe.cpp`
+
+### CML1312
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `CodeView debug entry has no readable data (no mapped RVA and no valid file pointer)`  
+- **What to do:** The image is corrupt or its debug data was stripped.  
+  Other variants of the advice: The image is corrupt.  
+- **Raised by:** `core/cml_pe/src/pe.cpp`
+
+### CML1313
+
+- **Cause:** Cml_pe: debug directory present but no RSDS CodeView record.  
+- **Message:** `no RSDS CodeView record found; the only CodeView record has signature 0x%08X (only RSDS / PDB 7.0 is supported)`  
+- **What to do:** Link with /DEBUG so the linker emits an RSDS record (MSVC link and lld-link both do).  
+- **Raised by:** `core/cml_pdb/src/detail/pe_codeview.cpp`
+
+### CML1314
+
+- **Cause:** See the message printed with the id.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_pe/src/pe.cpp`
+
+### CML1315
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `load config directory has fewer than 4 readable bytes`  
+- **What to do:** The image is corrupt or truncated.  
+  Other variants of the advice: The image is corrupt.  
+- **Raised by:** `core/cml_pe/src/pe.cpp`
+
+### CML1316
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `TLS directory is %u bytes; IMAGE_TLS_DIRECTORY64 needs 40`  
+- **What to do:** The image is corrupt.  
+- **Raised by:** `core/cml_pe/src/pe.cpp`
+
+### CML1318
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `module base address is null`  
+- **What to do:** Pass the handle of a loaded module.  
+- **Raised by:** `core/cml_pe/src/pe.cpp`
+
+
+## CML1400 to CML1499
+
+### CML1400
+
+- **Cause:** File missing, unreadable or cannot be mapped.  
+- **Message:** `Cannot open '<...>': <...> (os error <...>).`  
+- **What to do:** Check that the file exists, is readable and is not locked exclusively by another process.  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
+### CML1401
+
+- **Cause:** Too small / wrong magic.  
+- **Message:** `'<...>' is empty.`  
+- **What to do:** Point Chameleon at the .pdb the linker produced.  
+  Other variants of the advice: Point Chameleon at the .pdb file the linker produced.  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
+### CML1402
+
+- **Cause:** Old MSF 2.00 or invalid super block.  
+- **Message:** `is an old MSF 2.00 PDB (Visual C++ 6 or earlier).`  
+- **What to do:** Only MSF 7.00 PDBs (Visual Studio 2002 and later, clang-cl) are supported.  
+  Other variants of the advice: The file is damaged; rebuild the module so the linker regenerates the PDB.  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
+### CML1403
+
+- **Cause:** File shorter than the super block claims.  
+- **Message:** `is truncated: the super block describes <...> bytes but the file has <...>.`  
+- **What to do:** Copy the PDB again or rebuild the module; the file was cut short.  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
+### CML1404
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `The PDB stream directory of <...> is corrupt (<...>).`  
+- **What to do:** Rebuild the module so the linker regenerates the PDB; if it was copied, copy it again.  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
+### CML1405
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `The DBI stream of <...> is invalid (<...>).`  
+- **What to do:** Rebuild the module so the linker regenerates the PDB. /DEBUG:FASTLINK PDBs are not supported.  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
+### CML1406
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `The module table of <...> ends inside a module record.`  
+- **What to do:** Rebuild the module so the linker regenerates the PDB.  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
+### CML1407
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `The PDB info stream of '<...>' is missing or too short.`  
+- **What to do:** Rebuild the module so the linker regenerates the PDB.  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
+### CML1408
+
+- **Cause:** PE has no RSDS debug record.  
+- **Message:** `The PE image has no CodeView (RSDS) debug record.`  
+- **What to do:** Link with /DEBUG so the image records its PDB; PDB 2.0 (NB10) records are not supported.  
+  Other variants of the advice: Link with /DEBUG so the image records its PDB.  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
+### CML1409
+
+- **Cause:** PE headers malformed / out of bounds.  
+- **Message:** `The PE image is malformed: <...>.`  
+- **What to do:** Check that the file is a complete, unmodified .exe or .dll.  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
+### CML1410
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `No usable PDB for '<...>' (recorded path '<...>'; tried <...>).`  
+- **What to do:** Put the PDB next to the image, or add its directory to the PDB search paths.  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
+### CML1411
+
+- **Cause:** GUID / age differ from the PE.  
+- **Message:** `'<...>' is <...> but '<...>' was linked against <...> (GUID/age mismatch).`  
+- **What to do:** Use the PDB produced by the same link as the image; rebuild if the image and PDB are out of sync.  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
+### CML1413
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `The symbols of module '<...>' in '<...>' are unreadable.`  
+- **What to do:** Rebuild the module so the linker regenerates the PDB.  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
+### CML1414
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `The section contribution table of <...> has unknown version <...>.`  
+- **What to do:** Rebuild the module with a supported linker (MSVC link.exe or lld-link).  
+  Other variants of the advice: Rebuild the module so the linker regenerates the PDB.  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
+### CML1415
+
+- **Cause:** Publics / globals record stream.  
+- **Message:** `The global symbol record stream of '<...>' is corrupt (a record leaves the stream).`  
+- **What to do:** Rebuild the module so the linker regenerates the PDB.  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
+### CML1416
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `The source-info table of <...> lists more modules than the module table.`  
+- **What to do:** Rebuild the module so the linker regenerates the PDB.  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
+### CML1417
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `proc_info needs a proc symbol of a compiland of this index.`  
+- **What to do:** Pass a symbol returned by find_proc_by_rva.  
+  Other variants of the advice: Use an index below PdbIndex::compiland_count().  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
+### CML1418
+
+- **Cause:** a 32-bit offset / count would overflow.  
+- **Message:** `The module names of <...> exceed 4 GiB.`  
+- **What to do:** This PDB is too large for the index; split the module.  
+  Other variants of the advice: This PDB is too large for the index.  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
+### CML1419
+
+- **Cause:** IPI stream (S_BUILDINFO fallback) malformed.  
+- **Message:** `The <...>TPI<...>IPI<...> stream of '<...>' is invalid (<...>); <...>function types are unavailable.<...>build information is unavailable.`  
+- **What to do:** Rebuild the module so the linker regenerates the PDB.  
+  Other variants of the advice: Rebuild the module so the compiler and linker regenerate the debug info.  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
+
+## CML1500 to CML1599
+
+### CML1500
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `cannot read response file '<...>'`  
+- **What to do:** Check that the response file recorded in the build still exists.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/diag_ids.h`
+
+### CML1501
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `the command line expands to more than <...> tokens`  
+- **What to do:** Remove the runaway @file reference from the recorded command line.  
+  Other variants of the advice: Remove the deeply nested @file reference from the recorded command line. / Remove the runaway @file references from the recorded command line.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/diag_ids.h`
+
+### CML1502
+
+- **Cause:** Not cl, clang-cl or a cc1 invocation.  
+- **Message:** `compiler '<...>' is neither cl, clang-cl nor a clang -cc1 command`  
+- **What to do:** Chameleon can recompile code built by MSVC cl or clang-cl; rebuild with one of them.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/diag_ids.h`
+
+### CML1503
+
+- **Cause:** The command names no source file.  
+- **Message:** `the recorded command line names no source file`  
+- **What to do:** Provide the source path (compile_commands.json entry or a PDB with a source record).  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/diag_ids.h`
+
+### CML1504
+
+- **Cause:** /clr, /ZW compilands.  
+- **Message:** `Compiland <...> is built with /clr or /ZW; managed and WinRT code cannot be hot-reloaded.`  
+- **What to do:** Hot-reload only native compilands.  
+- **Raised by:** `broker/cml_core/include/cml/core/module_audit.h`
+
+### CML1505
+
+- **Cause:** Compile_commands.json malformed.  
+- **Message:** `compile_commands.json is malformed at byte <...>`  
+- **What to do:** Regenerate compile_commands.json (CMake: -DCMAKE_EXPORT_COMPILE_COMMANDS=ON).  
+  Other variants of the advice: Split the project or generate a smaller compilation database.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/diag_ids.h`
+
+### CML1506
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `cannot read '<...>'`  
+- **What to do:** Check the compile_commands.json path (CMake: -DCMAKE_EXPORT_COMPILE_COMMANDS=ON).  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/diag_ids.h`
+
+### CML1507
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `compile_commands.json entry for '<...>' has no command`  
+- **What to do:** Regenerate compile_commands.json.  
+  Other variants of the advice: Add the file to the build so that compile_commands.json lists it, then regenerate it.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/diag_ids.h`
+
+### CML1510
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `'<...>' was not found in the given directories or on PATH`  
+- **What to do:** Run from a developer command prompt (vcvars64.bat) or add the toolchain's bin directory to PATH.  
+  Other variants of the advice: Pass the full path of the tool. / Check the path of the tool.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/diag_ids.h`
+
+### CML1511
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `'<...>' has no version resource`  
+- **What to do:** Check that the path names the compiler or linker binary.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/diag_ids.h`
+
+### CML1520
+
+- **Cause:** Build-flag detection: object file not usable.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/diag_ids.h`
+
+
+## CML1600 to CML1699
+
+### CML1601
+
+- **Cause:** Functions without 6 bytes of padding before them.  
+- **Message:** `Could not check whether the functions of <...> have hot-patch padding (no function could be sampled); /FUNCTIONPADMIN and /hotpatch are recommended.`  
+- **What to do:** Compile with /hotpatch and link with /FUNCTIONPADMIN.  
+- **Raised by:** `broker/cml_core/include/cml/core/module_audit.h`
+
+### CML1602
+
+- **Cause:** /OPT:REF or /OPT:ICF in effect.  
+- **Message:** `Could not determine whether <...> was linked with /OPT:NOREF /OPT:NOICF (the PDB records no linker command line); they are recommended.`  
+- **What to do:** Link with /OPT:NOREF /OPT:NOICF.  
+- **Raised by:** `broker/cml_core/include/cml/core/module_audit.h`
+
+### CML1603
+
+- **Cause:** Optimised compilands with inlining on.  
+- **Message:** `of <...> compilands of <...> are optimised with inlining (<...>); copies of a changed function inlined elsewhere keep the old code (CML3104).`  
+- **What to do:** Build iterated modules with /Ob0 or /Od.  
+- **Raised by:** `broker/cml_core/include/cml/core/module_audit.h`
+
+
+## CML2100 to CML2199
+
+### CML2102
+
+- **Cause:** /Yc TU (clang: -emit-pch / -building-pch-with-obj) changed.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/diag_ids.h`
+
+
+## CML2200 to CML2299
+
+### CML2200
+
+- **Cause:** The compiler ran and reported errors.  
+- **Message:** `compiling '<...>' failed with exit code <...>`  
+- **What to do:** Fix the errors shown in the compile output and save again.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/diag_ids.h`
+
+### CML2201
+
+- **Cause:** Warning: recorded compiler missing, using another.  
+- **Message:** `the recorded compiler '<...>' does not exist; using '<...>'`  
+- **What to do:** Rebuild the project with the installed toolchain to remove this warning.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/diag_ids.h`
+
+### CML2202
+
+- **Cause:** CreateProcess failed / no compiler anywhere.  
+- **Message:** `the recorded compiler '<...>' does not exist`  
+- **What to do:** Reinstall the toolchain the project was built with.  
+  Other variants of the advice: Run the broker from a developer command prompt or reinstall the toolchain. / Close other programs or retry.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/diag_ids.h`
+
+### CML2203
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `compiling '<...>' was cancelled`  
+- **What to do:** Save the file again to restart the compile.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/diag_ids.h`
+
+### CML2204
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `compiling '<...>' did not finish within <...> ms`  
+- **What to do:** Raise the compile timeout or check for a stuck compiler process.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/diag_ids.h`
+
+### CML2205
+
+- **Cause:** Exit code 0 but the object is missing.  
+- **Message:** `the compiler succeeded for '<...>' but '<...>' does not exist`  
+- **What to do:** Check the compile output; the command line may redirect the object elsewhere.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/diag_ids.h`
+
+### CML2206
+
+- **Cause:** Output directory / response file failed.  
+- **Message:** `cannot create the output directory for '<...>'`  
+- **What to do:** Check the session temp directory is writable.  
+  Other variants of the advice: Check that the temp directory is writable. / Check that the disk is not full.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/diag_ids.h`
+
+### CML2210
+
+- **Cause:** Warning: /GL (or -flto) removed for the patch compile.  
+- **Message:** `/GL objects are IL, not COFF; the patch object is compiled without whole-program optimisation (/GL-)`  
+- **What to do:** clr.  
+  Other variants of the advice: clang:-flto(=.*)? / clang:-gcodeview-command-line  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/diag_ids.h`
+
+### CML2211
+
+- **Cause:** Warning: private compiler PDB copy could not be made.  
+- **Message:** `cannot copy the compiler PDB '<...>' for the PCH-using TU`  
+- **What to do:** Build with /Z7 so no compiler PDB is shared with the patch compile.  
+  Other variants of the advice: If the compile fails with C2859, build the project with /Z7 or set PchDebugMode::DropPch.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/diag_ids.h`
+
+
+## CML3100 to CML3199
+
+### CML3101
+
+- **Cause:** Image-relative reference to old-module data.  
+- **Message:** `references <...> in <...> image-relatively (ADDR32NB); this cannot be retargeted`  
+- **What to do:** Move the reference behind a function or pointer, or hot-restart.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3102
+
+- **Cause:** Thread-local reference shape that cannot be retargeted (WP-24 narrowed it).  
+- **Message:** `'<...>' is a thread_local in the old image but <...> defines it as ordinary data; storage of a different kind cannot be bound`  
+- **What to do:** Keep the thread_local keyword, or hot-restart.  
+  Other variants of the advice: Move the thread_local to an unchanged source file, or hot-restart.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3104
+
+- **Cause:** Per function, raised at reload time.  
+- **Message:** `Compiland <...> of <...> is optimised with inlining and <...> small changed function(s) (<...>) may be inlined into their callers: a caller that is still executing, or whose own code did not change, keeps the old code.`  
+- **What to do:** Build iterated modules with /Ob0 or /Od, or hot-restart.  
+- **Raised by:** `broker/cml_core/include/cml/core/module_audit.h`
+
+
+## CML3200 to CML3299
+
+### CML3200
+
+- **Cause:** Undefined symbol found nowhere.  
+- **Message:** `unresolved external symbol <...> referenced from <...> in`  
+- **What to do:** Define it in a module of the process (or link the library that provides it into the patched module), or hot-restart.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3201
+
+- **Cause:** no compiland of the module matches the TU.  
+- **Message:** `compiland index <...> is out of range in`  
+- **What to do:** Pass the index of the compiland that was compiled from the patched source file.  
+  Other variants of the advice: Check that the module was built from this source file with debug info (/Zi or /Z7), or hot-restart.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3202
+
+- **Cause:** Relocation kind that cannot be retargeted.  
+- **Message:** `unsupported relocation <...> against <...> from <...> in`  
+- **What to do:** Compile with /MD-compatible 64-bit code models (no 32-bit absolute addresses), or hot-restart.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3203
+
+- **Cause:** Not an x64 object / malformed for planning.  
+- **Message:** `object <...> is not an x64 object`  
+- **What to do:** Compile the patch for x64.  
+  Other variants of the advice: This is a programming error in the caller.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3204
+
+- **Cause:** Fix-up needed in a section without locator.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3205
+
+- **Cause:** REL32 displacement does not fit 32 bits.  
+- **Message:** `the <...> displacement to '<...>' does not fit 32 bits: site <...>, target <...> (section '<...>' + <...>)`  
+- **What to do:** Reserve the patch within +-2 GiB of the module (the loader does this), or hot-restart.  
+  Other variants of the advice: Hot-restart; this is not expected for a real module. / Access the data through a function or pointer in the module, or hot-restart.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3206
+
+- **Cause:** Patch layout lacks a section or symbol.  
+- **Message:** `the patch layout has no RVA for the slot symbol '<...>'`  
+- **What to do:** Look the symbol up as a public in the patch PDB (it is defined by binding.obj).  
+  Other variants of the advice: This is a bug in the bind planner; report it with the plan JSON. / Link the patch with /OPT:NOREF /OPT:NOICF /DEBUG:FULL (WP-09 does this).  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3207
+
+- **Cause:** Static matches several old symbols.  
+- **Message:** `static data '<...>' (<...>) matches <...> records named '<...>' in compiland <...> but the patch object defines <...> of them`  
+- **What to do:** Rename one of the statics, keep their number unchanged, or hot-restart.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3208
+
+- **Cause:** Relocation site outside its section.  
+- **Message:** `relocation at offset <...> of section '<...>' in <...> lies outside the section data`  
+- **What to do:** Rebuild the object with the compiler; the file is damaged.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3209
+
+- **Cause:** Several compilands match the TU name.  
+- **Message:** `translation unit '<...>' matches several compilands of <...>`  
+- **What to do:** Pass the full object path or the compiland index.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3210
+
+- **Cause:** TU-wide initialiser may re-run initialisers of bound globals.  
+- **Message:** `initialiser '<...>' initialises every global of <...>, including ones bound to the old image; running it may re-initialise them`  
+- **What to do:** Put new globals with dynamic initialisation into a separate source file, or hot-restart.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3211
+
+- **Cause:** Function-local static guard not found in the old image.  
+- **Message:** `guard variable '<...>' of a function-local static was not found in the old image; the patch gets a fresh guard`  
+- **What to do:** Keep the layout of the statics in this source file unchanged, or hot-restart if the static must not be initialised again.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3212
+
+- **Cause:** Reference through a section symbol into bound data.  
+- **Message:** `object section <...> ('<...>') holds data bound to the old image and is also referenced through its section symbol (first from <...>); those references stay on the patch's dead copy`  
+- **What to do:** Give the data external linkage or avoid private (section-relative) references to it.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3214
+
+- **Cause:** Same-scope static overloads cannot be told apart.  
+- **Message:** `ambiguous overloads of static '<...>' (<...>) in <...>; cannot tell which old function each new one replaces (<...> in the patch, <...> records named '<...>' in compiland <...>)`  
+- **What to do:** Rename one overload, or hot-restart.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3215
+
+- **Cause:** Dynamic initialiser without a global of the TU.  
+- **Message:** `dynamic initialiser '<...>' (<...>) in <...> could not be matched to a new global`  
+- **What to do:** Report the symbol names; as a workaround move the global with dynamic initialisation to an unchanged source file, or hot-restart.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+
+## CML3300 to CML3399
+
+### CML3300
+
+- **Cause:** a count, offset or size does not fit its COFF field.  
+- **Message:** `adding anchors would push the symbol table past 2^32 records`  
+- **What to do:** Split the module into smaller objects.  
+- **Raised by:** `core/cml_coff/include/cml/coff/diag_ids.h`
+
+### CML3301
+
+- **Cause:** Regular object with more than 65279 sections.  
+- **Message:** `object already has %zu sections; a %s object cannot hold more<...>bigobj<...>regular`  
+- **What to do:** Use the /bigobj format or split the module.  
+  Other variants of the advice: Write the object in the /bigobj format.  
+- **Raised by:** `core/cml_coff/include/cml/coff/diag_ids.h`
+
+### CML3302
+
+- **Cause:** Symbol refers to a missing section / bad aux data.  
+- **Message:** `symbol name is empty`  
+- **What to do:** Give the symbol a non-empty name (an all-zero name field means string-table offset 0, which is invalid).  
+  Other variants of the advice: Give the symbol a non-empty name. / Fix the symbol's aux records.  
+- **Raised by:** `core/cml_coff/include/cml/coff/diag_ids.h`
+
+### CML3303
+
+- **Cause:** Relocation names a symbol index that does not exist.  
+- **Message:** `section %zu '%s' has a relocation at offset %u naming symbol index %u but the table has %llu records`  
+- **What to do:** Relocations must name existing symbol indices; never remove or reorder symbols.  
+- **Raised by:** `core/cml_coff/include/cml/coff/diag_ids.h`
+
+### CML3304
+
+- **Cause:** Object cannot be reproduced losslessly (overlapping regions ...).  
+- **Message:** `section %u '%.*s' has %u line numbers but line-number pointer %u (one of them is zero): no table to reproduce`  
+- **What to do:** The object is corrupt; rebuild it.  
+  Other variants of the advice: The object cannot be rewritten losslessly; rebuild it with the compiler.  
+- **Raised by:** `core/cml_coff/include/cml/coff/diag_ids.h`
+
+### CML3305
+
+- **Cause:** Section name cannot be encoded.  
+- **Message:** `section name is empty or contains a NUL byte`  
+- **What to do:** Give the section a non-empty name.  
+  Other variants of the advice: Add fewer long-named sections or shorten symbol names.  
+- **Raised by:** `core/cml_coff/include/cml/coff/diag_ids.h`
+
+### CML3306
+
+- **Cause:** Object already has a __cml_anchor_<n> symbol.  
+- **Message:** `object already contains the symbol '<...>'; it looks anchored already`  
+- **What to do:** Anchor the compiler's original object, not an already anchored one.  
+- **Raised by:** `core/cml_coff/include/cml/coff/diag_ids.h`
+
+### CML3307
+
+- **Cause:** Anchor tag with other characters than [A-Za-z0-9_].  
+- **Message:** `anchor tag '<...>' contains a character other than letters, digits and '_'`  
+- **What to do:** Use only letters, digits and '_' in the tag.  
+- **Raised by:** `core/cml_coff/include/cml/coff/diag_ids.h`
+
+### CML3308
+
+- **Cause:** Two objects of one link got the same anchor tag.  
+- **Message:** `anchor tag '<...>' is used by two objects of one link`  
+- **What to do:** Give every object of a link its own tag (for example its compiland index).  
+  Other variants of the advice: Give every object of a link its own tag (for example its compiland index); identical objects cannot be linked twice.  
+- **Raised by:** `core/cml_coff/include/cml/coff/diag_ids.h`
+
+### CML3309
+
+- **Cause:** a section without locator was asked for one.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_coff/include/cml/coff/diag_ids.h`
+
+### CML3310
+
+- **Cause:** Empty / NUL-containing / linker-provided bind symbol name.  
+- **Message:** `bind symbol name is empty or contains a NUL byte`  
+- **What to do:** Pass the decorated linker name of the symbol to bind.  
+  Other variants of the advice: Leave __ImageBase out of the bind list; the linker resolves it itself.  
+- **Raised by:** `core/cml_coff/include/cml/coff/diag_ids.h`
+
+### CML3311
+
+- **Cause:** The same name (or a derived slot name) twice.  
+- **Message:** `symbol '<...>' is listed twice for binding`  
+- **What to do:** List each symbol once.  
+  Other variants of the advice: Do not bind symbols whose names start with __cml_slot_.  
+- **Raised by:** `core/cml_coff/include/cml/coff/diag_ids.h`
+
+### CML3312
+
+- **Cause:** Binding object would exceed a COFF limit.  
+- **Message:** `binding object would exceed the COFF size limits (<...> functions, <...> data symbols)`  
+- **What to do:** Bind fewer symbols per patch.  
+- **Raised by:** `core/cml_coff/include/cml/coff/diag_ids.h`
+
+### CML3350
+
+- **Cause:** The linker ran and reported errors.  
+- **Message:** `linking '<...>' failed (exit code <...>)<...>`  
+- **What to do:** See the linker output in the log.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/link_diag_ids.h`
+
+### CML3351
+
+- **Cause:** no usable link.exe / lld-link.  
+- **Message:** `'<...>' is not a linker`  
+- **What to do:** Use link or lld-link.  
+  Other variants of the advice: Check the linker path in the configuration. / Run from a Visual Studio developer environment or set the linker path.<...>Install LLVM (lld-link.exe) or set the linker path.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/link_diag_ids.h`
+
+### CML3352
+
+- **Cause:** CreateProcess failed.  
+- **Message:** `cannot start the linker '<...>'`  
+- **What to do:** Check that the linker exists and can be run.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/link_diag_ids.h`
+
+### CML3353
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `linking '<...>' was cancelled`  
+- **What to do:** Save the file again to restart the patch.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/link_diag_ids.h`
+
+### CML3354
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `linking '<...>' did not finish within <...> ms`  
+- **What to do:** Check the linker output and for a hung mspdbsrv.exe.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/link_diag_ids.h`
+
+### CML3355
+
+- **Cause:** Exit code 0 but the DLL or PDB is missing.  
+- **Message:** `the linker succeeded but '<...>' or '<...>' was not written`  
+- **What to do:** Check the linker output in the log.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/link_diag_ids.h`
+
+### CML3356
+
+- **Cause:** LNK2001 / LNK2019 / lld "undefined symbol".  
+- **Message:** `unresolved symbol '<...>' while linking '<...>'<...> (+<...> more)<...>`  
+- **What to do:** The bind list is missing this symbol, or the patch references something that is neither defined nor bound.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/link_diag_ids.h`
+
+### CML3357
+
+- **Cause:** Warning: the linker printed a warning.  
+- **Message:** `the linker warned`  
+- **What to do:** Usually harmless; see the linker output in the log.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/link_diag_ids.h`
+
+### CML3358
+
+- **Cause:** Output directory / response file failed.  
+- **Message:** `cannot create the output directory '<...>'`  
+- **What to do:** Check that the session temp directory is writable.  
+  Other variants of the advice: Check that the session temp directory is writable and not full.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/link_diag_ids.h`
+
+### CML3360
+
+- **Cause:** /OPT:REF, /OPT:ICF, /FORCE, /INCREMENTAL, ...  
+- **Message:** `the linker option '<...>' is not allowed for a patch`  
+- **What to do:** Remove it; section locators need /OPT:NOREF /OPT:NOICF and a complete, fixed-address link (ADR-0024).  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/link_diag_ids.h`
+
+### CML3361
+
+- **Cause:** an option the driver owns (/OUT, /BASE, /PDB, /DLL, ...).  
+- **Message:** `the linker option '<...>' is set by the patch linker driver`  
+- **What to do:** Remove it; use the patch request's fields (output name, base) instead.  
+  Other variants of the advice: Remove it; the driver always passes /NODEFAULTLIB.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/link_diag_ids.h`
+
+### CML3362
+
+- **Cause:** no objects, empty output name, base not aligned, ...  
+- **Message:** `cannot expand a response file in the extra linker arguments`  
+- **What to do:** Check that the response file exists and is readable.  
+  Other variants of the advice: Use link or lld-link. / Pass the patch objects.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/link_diag_ids.h`
+
+### CML3365
+
+- **Cause:** Neither PE nor PDB tells which linker built the module.  
+- **Message:** `the linker override '<...>' is not a linker`  
+- **What to do:** Use 'link' or 'lld-link'.  
+  Other variants of the advice: Choose the linker explicitly (link or lld-link).  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/link_diag_ids.h`
+
+### CML3366
+
+- **Cause:** Warning: the PE and the PDB disagree.  
+- **Message:** `the PDB says the module was linked by <...> but the PE says <...>; using the PDB`  
+- **What to do:** If the PDB belongs to another build, rebuild the module; or choose the linker explicitly.  
+  Other variants of the advice: Provide the module's PDB or choose the linker explicitly.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/link_diag_ids.h`
+
+### CML3367
+
+- **Cause:** PE or PDB of the module unreadable.  
+- **Message:** `the PDB of '<...>' could not be opened`  
+- **What to do:** The linker is detected from the PE alone; check that the PDB is next to the module.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/link_diag_ids.h`
+
+### CML3370
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `cannot open the patch PDB '<...>'`  
+- **What to do:** Check that the linker wrote the PDB (/DEBUG:FULL /PDB:...).  
+  Other variants of the advice: Check that the linker wrote a complete PDB.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/link_diag_ids.h`
+
+### CML3371
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `cannot read the patch DLL '<...>'`  
+- **What to do:** Check that the linker produced the DLL and that it is a valid x64 image.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/link_diag_ids.h`
+
+### CML3372
+
+- **Cause:** a section locator is not a public of the patch PDB.  
+- **Message:** `the locator '<...>' of section <...> of '<...>' is not a public of the patch PDB`  
+- **What to do:** Link with /OPT:NOREF /OPT:NOICF and pass the anchored object (coff::add_anchors).  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/link_diag_ids.h`
+
+### CML3373
+
+- **Cause:** a __cml_slot_<name> / data placeholder is not a public.  
+- **Message:** `the <...>slot '<...>thunk '<...>' is not a public of the patch PDB '<...>'`  
+- **What to do:** Link binding.obj with the patch and make sure the symbol is in the bind list.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/link_diag_ids.h`
+
+### CML3374
+
+- **Cause:** a new function is not a public of the patch PDB.  
+- **Message:** `the function '<...>' is not a public of the patch PDB '<...>'`  
+- **What to do:** Check that the patch object defines it with external linkage.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/link_diag_ids.h`
+
+### CML3375
+
+- **Cause:** The DLL's ImageBase is not the requested /BASE.  
+- **Message:** `the patch DLL '<...>' has ImageBase <...> instead of the requested`  
+- **What to do:** Link with /FIXED /BASE at a free address; do not pass options that change the base.  
+- **Raised by:** `core/cml_toolchain/include/cml/toolchain/link_diag_ids.h`
+
+
+## CML3400 to CML3499
+
+### CML3400
+
+- **Cause:** Thread_local the old image does not have (error).  
+- **Message:** `the initialisation guard '<...>' of a function-local thread_local in <...> was not found in the old image (the thread_local is new, or the layout of the thread-locals of this source file changed); patch-local thread-local storage is not supported`  
+- **What to do:** Hot-restart, or keep the thread_locals of this source file unchanged.  
+  Other variants of the advice: Hot-restart, or move the new thread_local to an unchanged source file (and rebuild).  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3401
+
+- **Cause:** Dynamic initialiser/destructor of a thread_local stays the old one (warning).  
+- **Message:** `has thread_local variables with dynamic initialisation or a destructor (<...>); the old image's initialiser and destructor stay in effect (existing threads keep their values, new threads run the OLD initialiser), a changed initialiser is not run`  
+- **What to do:** Hot-restart if the changed initialiser must take effect.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3402
+
+- **Cause:** Several S_GTHREAD32 records for one name (error).  
+- **Message:** `thread_local '<...>' (<...>) matches several S_GTHREAD32 records of the old image; cannot tell which one it is`  
+- **What to do:** Rename one of the thread_locals, or hot-restart.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3450
+
+- **Cause:** (warning) the edit compiled to identical code: nothing was loaded.  
+- **Message:** `the edit compiled to identical code (<...> of <...> planned hooks are identical to the running code, nothing new): no patch was loaded for`  
+- **What to do:** Nothing to do. Change code or data that reaches the generated code, or set-option narrow_hooks false to hook everything.  
+- **Raised by:** `broker/cml_core/include/cml/core/pipeline_diag_ids.h`
+
+### CML3451
+
+- **Cause:** (warning) identical code, but the initial value of data in the running image changed: nothing was loaded.  
+- **Message:** `the edit only changes the initial value of data that lives in the running image (<...>): the code is identical, so no patch was loaded for <...> and the running program keeps its current values (initialisers of existing globals do not run again)`  
+- **What to do:** Restart the application to pick the new initial value up, or assign the value from code that runs again (a function the patch can hook).  
+- **Raised by:** `broker/cml_core/include/cml/core/pipeline_diag_ids.h`
+
+
+## CML3500 to CML3599
+
+### CML3500
+
+- **Cause:** Writable static data whose identity cannot be established (error).  
+- **Message:** `static data <...> in <...> has no source-level name the planner can match to the old image (object section '<...>'), so it cannot be bound to the running process's copy`  
+- **What to do:** Give the variable an ordinary name, or hot-restart.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+
+## CML4200 to CML4299
+
+### CML4200
+
+- **Cause:** Parameters unusable (zero/misaligned size, ...).  
+- **Message:** `ReserveRange needs a module with a non-zero base and size`  
+- **What to do:** Pass the base and size of the module being enabled.  
+  Other variants of the advice: Use the defaults (4 blocks of 64 MiB) or a smaller block size. / Align the base and size to 64 KiB.  
+- **Raised by:** `core/cml_proc/include/cml/proc/loader_diag_ids.h`
+
+### CML4201
+
+- **Cause:** no free address space near the module.  
+- **Message:** `module <...>+<...> leaves no address window that every REL32 can reach`  
+- **What to do:** The module is too large for patching with 32-bit relative calls; see KNOWN_LIMITATIONS.  
+  Other variants of the advice: Free address space near the module (fewer or smaller blocks) or reduce the block size. / Choose another range.  
+- **Raised by:** `core/cml_proc/include/cml/proc/loader_diag_ids.h`
+
+### CML4202
+
+- **Cause:** DLL loaded at a base other than the requested one.  
+- **Message:** `loaded at <...> instead of`  
+- **What to do:** The patch must be linked with /FIXED /BASE:<the reserved address>; relink it.  
+- **Raised by:** `core/cml_proc/include/cml/proc/loader_diag_ids.h`
+
+### CML4203
+
+- **Cause:** Range grabbed by someone else on every attempt.  
+- **Message:** `attempt <...>: <...> could not be mapped at <...> (OS error <...>, the range was taken by another allocation<...>)`  
+- **What to do:** The agent retries with the next reserved block; if every attempt fails, retry the reload.  
+  Other variants of the advice: Retry the reload; if it keeps failing something in the process allocates aggressively near the module.  
+- **Raised by:** `core/cml_proc/include/cml/proc/loader_diag_ids.h`
+
+### CML4204
+
+- **Cause:** LoadLibraryExW failed for a reason other than a collision.  
+- **Message:** `cannot open <...> (OS error <...>)`  
+- **What to do:** Check that the patch DLL exists and can be read.  
+  Other variants of the advice: Pass the linked patch DLL.  
+- **Raised by:** `core/cml_proc/include/cml/proc/loader_diag_ids.h`
+
+### CML4205
+
+- **Cause:** Image range not inside a block the agent reserved.  
+- **Message:** `address <...> is not reserved address space (state <...>, type <...>)`  
+- **What to do:** Reserve a block with ReserveRange first and place the patch inside it.  
+  Other variants of the advice: Only blocks reserved through ReserveRange can be released for a patch. / Reserve a block with ReserveRange and link the patch at a base inside it.  
+- **Raised by:** `core/cml_proc/include/cml/proc/loader_diag_ids.h`
+
+### CML4206
+
+- **Cause:** Loaded image is not what the request described.  
+- **Message:** `has ImageBase <...> and SizeOfImage <...> but the request announced base <...> and size`  
+- **What to do:** Send the /BASE and the SizeOfImage of the DLL that was actually linked.  
+- **Raised by:** `core/cml_proc/include/cml/proc/loader_diag_ids.h`
+
+### CML4207
+
+- **Cause:** REL32 displacement does not fit 32 bits.  
+- **Message:** `REL32 fix-up <...> at RVA <...> (site <...>) cannot reach target <...>: distance <...> does not fit 32 bits`  
+- **What to do:** The patch was placed too far from the code it refers to; reserve address space nearer the module (or reload) so the patch lands within 2 GiB.  
+- **Raised by:** `core/cml_proc/include/cml/proc/loader_diag_ids.h`
+
+### CML4208
+
+- **Cause:** Fix-up site outside the image / misaligned / unwritable.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_proc/include/cml/proc/loader_diag_ids.h`
+
+### CML4209
+
+- **Cause:** Initializer entry invalid or it faulted.  
+- **Message:** `initializer <...> (table entry at RVA <...>) <...> after <...> initializer(s) had run`  
+- **What to do:** Fix the crash in the new global's constructor; a patch whose load failed is unloaded and the old code keeps running, a live patch stays loaded.  
+- **Raised by:** `core/cml_proc/include/cml/proc/loader_diag_ids.h`
+
+### CML4210
+
+- **Cause:** no patch loaded at that base.  
+- **Message:** `no patch is loaded at`  
+- **What to do:** Only patches loaded by LoadPatch can be uncommitted.  
+  Other variants of the advice: Send LoadPatch first; ApplyFixups and RunInitializers address a patch by its load base. / Send LoadPatch again; ApplyFixups and RunInitializers address a patch by its load base.  
+- **Raised by:** `core/cml_proc/include/cml/proc/loader_diag_ids.h`
+
+### CML4211
+
+- **Cause:** ReleaseRange: range not owned / OS refused.  
+- **Message:** `VirtualQuery failed at <...> (error <...>)`  
+- **What to do:** Report this with the agent log.  
+- **Raised by:** `core/cml_proc/include/cml/proc/loader_diag_ids.h`
+
+### CML4212
+
+- **Cause:** Another operation is using that patch.  
+- **Message:** `the patch at <...> is being used by another request`  
+- **What to do:** Wait for the previous request on this patch to be answered.  
+  Other variants of the advice: The patch stays loaded; unload it again after the hook returned.  
+- **Raised by:** `core/cml_proc/include/cml/proc/loader_diag_ids.h`
+
+### CML4213
+
+- **Cause:** FreeLibrary failed; the image stays mapped.  
+- **Message:** `FreeLibrary of the patch at <...> failed (OS error <...>)`  
+- **What to do:** The patch stays mapped and its address range is lost; report this with the agent log.  
+  Other variants of the advice: Something else loaded the same DLL; once it frees its reference, unload the patch again.  
+- **Raised by:** `core/cml_proc/include/cml/proc/loader_diag_ids.h`
+
+### CML4214
+
+- **Cause:** VirtualQuery failed while scanning.  
+- **Message:** `VirtualQuery failed at 0x<...> with error <...> while scanning the address space`  
+- **What to do:** Retry; if it persists the process is in an unusual state - report it with the agent log.  
+- **Raised by:** `core/cml_proc/include/cml/proc/loader_diag_ids.h`
+
+
+## CML4300 to CML4399
+
+### CML4300
+
+- **Cause:** an instruction in the overwritten region is not understood.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/hook/diag_ids.h`
+
+### CML4301
+
+- **Cause:** < 5 bytes and no trailing padding.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/hook/diag_ids.h`
+
+### CML4302
+
+- **Cause:** The jump target is not within +-2 GB.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/hook/diag_ids.h`
+
+### CML4303
+
+- **Cause:** The function's bytes cannot be read.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/hook/diag_ids.h`
+
+### CML4304
+
+- **Cause:** a call ends inside the overwritten region.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/hook/diag_ids.h`
+
+### CML4305
+
+- **Cause:** a thread stayed inside the region for all retries.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/hook/diag_ids.h`
+
+### CML4306
+
+- **Cause:** Cannot enumerate threads / too many threads.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/hook/diag_ids.h`
+
+### CML4307
+
+- **Cause:** New threads kept appearing.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/hook/diag_ids.h`
+
+### CML4308
+
+- **Cause:** VirtualProtect failed.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/hook/diag_ids.h`
+
+### CML4309
+
+- **Cause:** Threads were stopped longer than the budget.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/hook/diag_ids.h`
+
+### CML4310
+
+- **Cause:** Null / equal / duplicate addresses in the request.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/hook/diag_ids.h`
+
+### CML4311
+
+- **Cause:** Revert of a function that has no hook.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/hook/diag_ids.h`
+
+### CML4312
+
+- **Cause:** The bytes are not the ones recorded or planned.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/hook/diag_ids.h`
+
+### CML4313
+
+- **Cause:** Not attempted: another hook of the request failed.  
+- **Message:** `%s was not changed: another hook of the same request failed (%s).`  
+- **What to do:** Fix the failing hook and send the request again.  
+- **Raised by:** `agent/src/hook/diag_ids.h`
+
+### CML4314
+
+- **Cause:** a thread could not be suspended or inspected.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/hook/diag_ids.h`
+
+### CML4315
+
+- **Cause:** Request above the per-request limit.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/hook/diag_ids.h`
+
+### CML4316
+
+- **Cause:** The bytes of two hooks overlap.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/hook/diag_ids.h`
+
+
+## CML4400 to CML4499
+
+### CML4400
+
+- **Cause:** ExceptionAction for a thread that is not held (answered already, or never held).  
+- **Message:** `no thread is held for exception`  
+- **What to do:** It was answered already, or its process went through a reconnect; query 'exceptions' for the open ones.  
+- **Raised by:** `agent/src/crash/diag_ids.h`
+
+### CML4401
+
+- **Cause:** Leave function: the frame cannot be unwound (no unwind info and no readable return address).  
+- **Message:** `cannot leave the function at <...>: it cannot be unwound (no unwind information and an unreadable stack top, or a damaged stack)`  
+- **What to do:** Use Ignore, or Continue after a patch fixed the cause.  
+- **Raised by:** `agent/src/crash/diag_ids.h`
+
+### CML4402
+
+- **Cause:** Leave function: the unwound frame does not look like a caller.  
+- **Message:** `unwinding the faulting function did not lead to a caller (return address <...>)`  
+- **What to do:** The stack looks damaged or the frame is not described by unwind data; use Ignore, or Continue after a patch.  
+- **Raised by:** `agent/src/crash/diag_ids.h`
+
+### CML4403
+
+- **Cause:** More threads faulted at once than the handler has slots: the extra faults were passed on.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/crash/diag_ids.h`
+
+### CML4404
+
+- **Cause:** AddVectoredExceptionHandler failed: crash handling is off.  
+- **Message:** `AddVectoredExceptionHandler failed (error <...>)`  
+- **What to do:** Crash handling stays off; the application's faults are unaffected.  
+- **Raised by:** `agent/src/crash/diag_ids.h`
+
+### CML4405
+
+- **Cause:** The handler's wait events could not be created: crash handling is off.  
+- **Message:** `cannot create the events the crash handler waits on (error <...>)`  
+- **What to do:** Close other programs to free system resources; crash handling stays off.  
+- **Raised by:** `agent/src/crash/diag_ids.h`
+
+### CML4450
+
+- **Cause:** The command line, directory or environment could not be captured at start-up.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/restart_ids.h`
+
+### CML4451
+
+- **Cause:** Command line + environment do not fit one message.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/restart_ids.h`
+
+### CML4452
+
+- **Cause:** no memory to prepare the restart.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/restart_ids.h`
+
+### CML4453
+
+- **Cause:** a module could not be queued for enabling again after a restart.  
+- **Message:** `queued <...> of <...> modules<...>queued <...> modules`  
+- **What to do:** restart: %s to enable again.  
+- **Raised by:** `agent/src/restart_ids.h`
+
+
+## CML4600 to CML4699
+
+### CML4600
+
+- **Cause:** The stack of the held thread cannot be unwound to the chosen frame.  
+- **Message:** `the re-execute recipe names frame <...> with <...> parameters`  
+- **What to do:** Use Leave function or Ignore instead.  
+- **Raised by:** `agent/src/crash/diag_ids.h`
+
+### CML4601
+
+- **Cause:** The chosen frame was entered with another RSP than the broker saw.  
+- **Message:** `frame <...> was entered with RSP <...>, the recipe expected`  
+- **What to do:** The stack changed since the fault was reported; use Leave function or Ignore instead.  
+- **Raised by:** `agent/src/crash/diag_ids.h`
+
+### CML4602
+
+- **Cause:** The replacement function is not executable code.  
+- **Message:** `the replacement function address <...> is not executable code`  
+- **What to do:** Use Leave function or Ignore instead.  
+- **Raised by:** `agent/src/crash/diag_ids.h`
+
+### CML4603
+
+- **Cause:** a parameter's location cannot be read (register not supported, memory unreadable).  
+- **Message:** `parameter <...> is addressed from register <...>, which re-execute cannot read`  
+- **What to do:** Use Leave function or Ignore instead.  
+- **Raised by:** `agent/src/crash/diag_ids.h`
+
+### CML4604
+
+- **Cause:** The chosen frame's return address is not executable code (damaged stack).  
+- **Message:** `the return address of frame <...> (<...>) is not executable code`  
+- **What to do:** The stack looks damaged; use Ignore, or Continue after a patch.  
+- **Raised by:** `agent/src/crash/diag_ids.h`
+
+### CML4650
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `the agent's reservation of address space near the module`  
+- **What to do:** link.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML4651
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `the agent's load of the patch (after the DLL is mapped: it is unloaded again)`  
+- **What to do:** hook-install.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML4652
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `hook installation, inside the window with the application's threads suspended`  
+- **What to do:** post-patch-hooks.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML4653
+
+- **Cause:** See the message printed with the id.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML4654
+
+- **Cause:** ArmFault names an unknown stage / a stage of the broker.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML4655
+
+- **Cause:** The agent was built without CML_FAULT_INJECTION.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML4656
+
+- **Cause:** See the message printed with the id.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+
+## CML5200 to CML5299
+
+### CML5200
+
+- **Cause:** Bad length / oversized frame.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5201
+
+- **Cause:** Truncated, trailing bytes, bad count, bad UTF-8.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5202
+
+- **Cause:** See the message printed with the id.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5203
+
+- **Cause:** Unknown id or not implemented yet.  
+- **Message:** `is not a loader request`  
+- **What to do:** Use an agent and a broker from the same build.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5204
+
+- **Cause:** Encoder: payload or string over the limit.  
+- **Message:** `cannot send <...>: a string or the whole payload exceeds the protocol limit`  
+- **What to do:** Shorten the path or text, or report it if this is a real-world size.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5205
+
+- **Cause:** Connect failed (no pipe, access denied).  
+- **Message:** `cannot connect to broker pipe '<...>': <...> (<...>)`  
+- **What to do:** Start cml_broker, or set CML_PIPE_NAME to the pipe the broker listens on.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5206
+
+- **Cause:** Read/write failed with an OS error.  
+- **Message:** `accepting a control client failed (injected failure)`  
+- **What to do:** Test hook: ControlServer::set_accept_failures_for_testing.  
+  Other variants of the advice: Restart the application and the broker; if it persists, report it with the broker log. / Close other programs to free system resources and retry.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5207
+
+- **Cause:** Server side: cannot create the pipe.  
+- **Message:** `cannot create the broker's stop event`  
+- **What to do:** Close other programs to free system resources and retry.  
+  Other variants of the advice: Test hook: set_instance_create_failures_for_testing. / Stop the other broker or pass a different --pipe name.<...>Check the pipe name and that the process may create pipes.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5208
+
+- **Cause:** Pipe name lacks the pipe-namespace prefix.  
+- **Message:** `control pipe name '<...>' does not start with \\.\pipe\ or has no name part`  
+- **What to do:** Set CML_CONTROL_PIPE (or --control-pipe) to a full name such as \\.\pipe\cml_control_test.  
+  Other variants of the advice: Set CML_PIPE_NAME (or --pipe) to a full name such as \\.\pipe\cml_test_1.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5209
+
+- **Cause:** Pipe is owned by a different user.  
+- **Message:** `cannot identify the process serving '<...>' (<...>)`  
+- **What to do:** Make sure the broker runs on this machine as your user.  
+  Other variants of the advice: Stop that process or choose another pipe name with CML_PIPE_NAME.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5210
+
+- **Cause:** Hello/Welcome mismatch or timeout.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5211
+
+- **Cause:** Auto-start of cml_broker.exe failed.  
+- **Message:** `cannot start the broker '<...>'`  
+- **What to do:** Set CML_BROKER_PATH to cml_broker.exe, or start the broker yourself with 'cml_broker --headless'.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5212
+
+- **Cause:** EnableModule: module not in the process.  
+- **Message:** `module '<...>' is not loaded in process`  
+- **What to do:** Load the module (or pass its full path) before calling EnableModule.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5213
+
+- **Cause:** DisableModule: module was not enabled.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5214
+
+- **Cause:** Message not allowed in this state.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5215
+
+- **Cause:** Agent destroyed with the request open.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5216
+
+- **Cause:** Connection dropped before the reply.  
+- **Message:** `the connection to the agent was closed while sending`  
+- **What to do:** The application may have exited; wait for its agent to reconnect.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5217
+
+- **Cause:** Too many outstanding requests.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5218
+
+- **Cause:** Agent thread/event could not be created.  
+- **Message:** `cannot create the agent's synchronisation events`  
+- **What to do:** Close other programs to free system resources and retry.  
+  Other variants of the advice: hooks: request %llu: %s %llu function(s)  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5220
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `module enumeration failed (injected failure)`  
+- **What to do:** Test hook: set_enumeration_failures_for_testing.  
+  Other variants of the advice: Check that the process still exists and that you may inspect it.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5221
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `cannot query <...> (<...>)`  
+- **What to do:** Check that the process can open its own token and run Chameleon as the same user as the application.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5290
+
+- **Cause:** See the message printed with the id.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5291
+
+- **Cause:** See the message printed with the id.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5292
+
+- **Cause:** See the message printed with the id.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5293
+
+- **Cause:** See the message printed with the id.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5294
+
+- **Cause:** See the message printed with the id.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5295
+
+- **Cause:** Reserved.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5296
+
+- **Cause:** See the message printed with the id.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+### CML5297
+
+- **Cause:** See the message printed with the id.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_proc/include/cml/proc/diag_ids.h`
+
+
+## CML5300 to CML5399
+
+### CML5300
+
+- **Cause:** Reload: no process / enabled module to patch.  
+- **Message:** `the module '<...>' is no longer loaded in process`  
+- **What to do:** Enable it again after it was reloaded.  
+  Other variants of the advice: Enable a module with cml::Agent::EnableModule (see 'status'), then reload.  
+- **Raised by:** `broker/cml_core/include/cml/core/pipeline_diag_ids.h`
+
+### CML5301
+
+- **Cause:** The module's PDB index is not ready / failed to load.  
+- **Message:** `the PDB index of '<...>' failed to load`  
+- **What to do:** See the broker log.  
+  Other variants of the advice: Wait for the module's index (control command 'wait') and try again.  
+- **Raised by:** `broker/cml_core/include/cml/core/pipeline_diag_ids.h`
+
+### CML5302
+
+- **Cause:** The reload did not finish within its time limit.  
+- **Message:** `the reload ran out of time before the stage '<...>'`  
+- **What to do:** Raise 'timeout_ms' of the reload command, or reduce the number of changed files.  
+  Other variants of the advice: Raise 'timeout_ms'; a large PDB can take a few seconds. / Raise 'timeout_ms'.  
+- **Raised by:** `broker/cml_core/include/cml/core/pipeline_diag_ids.h`
+
+### CML5303
+
+- **Cause:** (warning) a changed file belongs to no compiland.  
+- **Message:** `the changed file '<...>' is not part of any compiland of`  
+- **What to do:** No compiland lists the file and no scanned #include chain of the module reaches it (ADR-0013). Edit a source file that includes the header, or rebuild the project if the include path changed.  
+- **Raised by:** `broker/cml_core/include/cml/core/pipeline_diag_ids.h`
+
+### CML5304
+
+- **Cause:** Another reload is running.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_core/include/cml/core/pipeline_diag_ids.h`
+
+### CML5305
+
+- **Cause:** The agent could not reserve address space near the module.  
+- **Message:** `the reserved address space near <...> has no room left for a patch`  
+- **What to do:** Restart the application, or free address space near the module.  
+- **Raised by:** `broker/cml_core/include/cml/core/pipeline_diag_ids.h`
+
+### CML5306
+
+- **Cause:** Transport: request not sent / no answer / connection lost.  
+- **Message:** `carries no request id`  
+- **What to do:** This is a broker bug; report it.  
+  Other variants of the advice: Check that the application is still running.  
+- **Raised by:** `broker/cml_core/include/cml/core/pipeline_diag_ids.h`
+
+### CML5307
+
+- **Cause:** LoadPatch / ApplyFixups / RunInitializers refused (agent id inside).  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_core/include/cml/core/pipeline_diag_ids.h`
+
+### CML5308
+
+- **Cause:** InstallHooks refused (agent id inside).  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_core/include/cml/core/pipeline_diag_ids.h`
+
+### CML5309
+
+- **Cause:** no HooksInstalled in time (synchronised mode: SyncPoint not reached).  
+- **Message:** `the agent did not confirm the hooks in time`  
+- **What to do:** In synchronised mode the application must call SyncPoint(); the patch stays loaded and the hooks may still apply.  
+- **Raised by:** `broker/cml_core/include/cml/core/pipeline_diag_ids.h`
+
+### CML5310
+
+- **Cause:** The patch DLL could not be prepared (pre-applied fix-ups).  
+- **Message:** `cannot read the patch DLL '<...>'`  
+- **What to do:** Check that the linker produced the DLL.  
+  Other variants of the advice: Report this with the bind plan; the patch cannot be prepared. / Check that no other process holds the file.  
+- **Raised by:** `broker/cml_core/include/cml/core/pipeline_diag_ids.h`
+
+### CML5311
+
+- **Cause:** Control command arguments invalid / unknown option.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_core/include/cml/core/pipeline_diag_ids.h`
+
+### CML5312
+
+- **Cause:** (warning) a source file could not be hashed.  
+- **Message:** `the tracked file '<...>' is gone`  
+- **What to do:** Restore it or ignore this warning.  
+  Other variants of the advice: Changes to this file will not be detected; check its permissions.  
+- **Raised by:** `broker/cml_core/include/cml/core/pipeline_diag_ids.h`
+
+### CML5313
+
+- **Cause:** The module's file cannot be read (exports, imports, old code bytes).  
+- **Message:** `cannot read the module '<...>' to find its import slots`  
+- **What to do:** Check that the module file still exists and is a valid x64 image.  
+  Other variants of the advice: The module is skipped when resolving symbols; check that the file exists. / All functions of the patched object are hooked this time.  
+- **Raised by:** `broker/cml_core/include/cml/core/pipeline_diag_ids.h`
+
+### CML5314
+
+- **Cause:** (warning) old code bytes unavailable: the function is hooked.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_core/include/cml/core/pipeline_diag_ids.h`
+
+### CML5315
+
+- **Cause:** The session's temporary directory cannot be created.  
+- **Message:** `cannot create the session directory '<...>'`  
+- **What to do:** Check the TEMP directory (free space, permissions).  
+  Other variants of the advice: Check the TEMP directory. / Check free disk space and the TEMP directory.  
+- **Raised by:** `broker/cml_core/include/cml/core/pipeline_diag_ids.h`
+
+### CML5316
+
+- **Cause:** The module's PDB cannot be opened (cml_pdb's own id inside).  
+- **Message:** `the PDB of '<...>' could not be opened`  
+- **What to do:** See the broker log.  
+- **Raised by:** `broker/cml_core/include/cml/core/pipeline_diag_ids.h`
+
+### CML5317
+
+- **Cause:** The agent disconnected while the reload ran.  
+- **Message:** `the agent is no longer connected`  
+- **What to do:** Restart the application, or wait for its agent to reconnect.  
+- **Raised by:** `broker/cml_core/include/cml/core/pipeline_diag_ids.h`
+
+### CML5318
+
+- **Cause:** Generic wrapper: a stage failed (message names stage and cause).  
+- **Message:** `this broker has no compiler driver`  
+- **What to do:** Run the broker on Windows.  
+  Other variants of the advice: This is a bug in the compiler driver; see the broker log.  
+- **Raised by:** `broker/cml_core/include/cml/core/pipeline_diag_ids.h`
+
+### CML5319
+
+- **Cause:** (info) the sweep found no changed source.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_core/include/cml/core/pipeline_diag_ids.h`
+
+### CML5320
+
+- **Cause:** no answer within the time limit (the agent may still act on the request).  
+- **Message:** `no answer to <...> within <...> ms`  
+- **What to do:** The application may be stopped in a debugger or not reaching its sync point; try again.  
+- **Raised by:** `broker/cml_core/include/cml/core/pipeline_diag_ids.h`
+
+
+## CML5400 to CML5499
+
+### CML5400
+
+- **Cause:** Line is not valid JSON (offset given).  
+- **Message:** `malformed JSON at byte <...>`  
+- **What to do:** Send one complete JSON object per line (see docs/wp/WP-13.md, Control protocol).  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5401
+
+- **Cause:** JSON ok, but not a valid request/response.  
+- **Message:** `invalid control request`  
+- **What to do:** Send {"id":N,"cmd":"<name>","args":{...}} with an integer id and a lowercase command name.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5402
+
+- **Cause:** Command not known / not provided by this broker.  
+- **Message:** `control command '<...>' is not provided by this broker (it provides: <...>)`  
+- **What to do:** Query 'status' for the broker's capabilities and only send commands it lists.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5403
+
+- **Cause:** Message above 1 MiB without newline / too big to send.  
+- **Message:** `exceeds the 1 MiB control message limit`  
+- **What to do:** Send less data per message.  
+  Other variants of the advice: Send one JSON object per line, each under 1 MiB.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5404
+
+- **Cause:** Cannot connect to the control pipe.  
+- **Message:** `cannot connect to the broker control pipe '<...>'`  
+- **What to do:** Start cml_broker with --control-pipe, or set CML_CONTROL_PIPE to the pipe it serves.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5405
+
+- **Cause:** Control pipe closed or failed mid-conversation.  
+- **Message:** `the control pipe failed`  
+- **What to do:** Check that the broker is still running and reconnect.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5406
+
+- **Cause:** Broker lacks a required capability.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5407
+
+- **Cause:** Response does not match the request / bad shape.  
+- **Message:** `the broker answered '<...>' with an error and no diagnostic`  
+- **What to do:** Use matching versions of cml_ui and cml_broker.  
+  Other variants of the advice: Use a cmltest/client and broker from the same build; report this as a bug otherwise. / Report this as a bug.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5408
+
+- **Cause:** no answer within the timeout.  
+- **Message:** `no answer to control command '<...>' within <...> ms`  
+- **What to do:** Check that the broker is responsive (see its log).  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5410
+
+- **Cause:** Scenario.toml is not in the supported TOML subset.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5411
+
+- **Cause:** Unknown key/kind, missing field, bad value.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5412
+
+- **Cause:** Unified diff cannot be parsed.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5413
+
+- **Cause:** a hunk does not match the target file.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5414
+
+- **Cause:** Cmake configure/build of the fixture failed.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5415
+
+- **Cause:** a child process could not be started.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5416
+
+- **Cause:** Expect_stdout: no match in time.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5417
+
+- **Cause:** Expect_diag: diagnostic not seen in time.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5418
+
+- **Cause:** Expect_module_enabled: not reported in time.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5419
+
+- **Cause:** Process died early / scenario timeout.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5420
+
+- **Cause:** Expect_stdout pattern cannot be compiled.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5421
+
+- **Cause:** Bad command line / missing tool or file.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5422
+
+- **Cause:** Edit step: file could not be read/written.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5423
+
+- **Cause:** Crash dump could not be written.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5424
+
+- **Cause:** Reload command answered with an error.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5425
+
+- **Cause:** Steps skipped for a missing capability (failure under --require-all-capabilities).  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5426
+
+- **Cause:** Report file could not be written.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5427
+
+- **Cause:** Expect_monotonic: counter reset, constant or too few samples (WP-12).  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5428
+
+- **Cause:** Reload result field differs from the scenario's expectation (WP-12).  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+
+## CML5500 to CML5599
+
+### CML5500
+
+- **Cause:** (warning) a directory cannot be watched.  
+- **Message:** `the directory '<...>' stopped delivering change events`  
+- **What to do:** Saves there are picked up by the next 'reload'; the watch is being rebuilt.  
+  Other variants of the advice: Saves in that directory are picked up by the next 'reload' instead.  
+- **Raised by:** `core/cml_watch/include/cml/watch/watch_diag_ids.h`
+
+### CML5501
+
+- **Cause:** (warning) events were lost; every tracked file is re-checked.  
+- **Message:** `the directory watcher lost events (buffer overflow)`  
+- **What to do:** Nothing to do: every tracked source is re-checked by content hash.  
+- **Raised by:** `core/cml_watch/include/cml/watch/watch_diag_ids.h`
+
+### CML5502
+
+- **Cause:** Directory watching is not available on this host.  
+- **Message:** `directory watching (ReadDirectoryChangesW) is only available on Windows`  
+- **What to do:** Use the 'reload' command to pick up edits on this host.  
+- **Raised by:** `core/cml_watch/include/cml/watch/watch_diag_ids.h`
+
+### CML5503
+
+- **Cause:** The watcher stopped working (the directory went away, I/O error).  
+- **Message:** `none of the <...> source directories could be watched`  
+- **What to do:** Check that the source directories exist; use the 'reload' command meanwhile.  
+  Other variants of the advice: Use the 'reload' command meanwhile.  
+- **Raised by:** `core/cml_watch/include/cml/watch/watch_diag_ids.h`
+
+### CML5504
+
+- **Cause:** (info) compile-on-save is on but no source directory is known yet.  
+- **Message:** `compile-on-save is on but no source directory is known yet`  
+- **What to do:** Enable a module; the directories are watched as soon as its PDB index is ready.  
+- **Raised by:** `core/cml_watch/include/cml/watch/watch_diag_ids.h`
+
+### CML5505
+
+- **Cause:** (warning) the reload started by a save failed (its own diag was published).  
+- **Message:** `the reload started by a save failed`  
+- **What to do:** Fix the error reported just before this and save again, or run 'reload'.  
+- **Raised by:** `core/cml_watch/include/cml/watch/watch_diag_ids.h`
+
+### CML5510
+
+- **Cause:** Expect_event: no event of that name in time.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5511
+
+- **Cause:** Set_option: the broker refused the option.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5512
+
+- **Cause:** Wait: the broker's `wait` failed or timed out.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5550
+
+- **Cause:** a changed file belongs to a precompiled header: cannot be hot-reloaded.  
+- **Message:** `the changed <...>file <...>files <...> belong to the precompiled header of <...>; a precompiled header cannot be hot-reloaded`  
+- **What to do:** Revert the change, or rebuild and restart the application. Edit the translation units that use the precompiled header instead.  
+- **Raised by:** `broker/cml_core/include/cml/core/header_diag_ids.h`
+
+### CML5551
+
+- **Cause:** More compilands affected than `max_affected_compilands`: needs confirmation.  
+- **Message:** `the change affects <...> compilands of <...> (<...> changed files), more than the limit of`  
+- **What to do:** Repeat the reload with "confirm": true to recompile them all, or raise the option max_affected_compilands.  
+- **Raised by:** `broker/cml_core/include/cml/core/header_diag_ids.h`
+
+### CML5552
+
+- **Cause:** a compiland to recompile uses a precompiled header whose files cannot be determined.  
+- **Message:** `cannot tell which files make up the precompiled header used by <...>; a recompile could use a stale .pch`  
+- **What to do:** Rebuild the project and hot-restart, or build with /Yu<header> naming the precompiled header.  
+- **Raised by:** `broker/cml_core/include/cml/core/header_diag_ids.h`
+
+
+## CML5600 to CML5699
+
+### CML5650
+
+- **Cause:** a hook record points outside its image: skipped.  
+- **Message:** `hook record(s) of <...> point outside the image or have an unknown kind`  
+- **What to do:** Build the module and the hooks with the same Chameleon_API.h; the records are skipped.  
+- **Raised by:** `agent/src/hook/user_hook_ids.h`
+
+### CML5651
+
+- **Cause:** The hook section of an image cannot be read: skipped.  
+- **Message:** `the hook section of <...> cannot be read`  
+- **What to do:** The module may have been unloaded; its hooks are skipped.  
+- **Raised by:** `agent/src/hook/user_hook_ids.h`
+
+### CML5652
+
+- **Cause:** an application hook raised a processor exception.  
+- **Message:** `the <...> hook <...> raised exception 0x`  
+- **What to do:** Fix the hook; the next hook of this event runs and the application continues.  
+- **Raised by:** `agent/src/hook/user_hook_ids.h`
+
+### CML5653
+
+- **Cause:** More hook records than the per-image limit: the rest are skipped.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/hook/user_hook_ids.h`
+
+### CML5654
+
+- **Cause:** no memory to prepare the hook run: the hooks of this event are skipped.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/hook/user_hook_ids.h`
+
+### CML5655
+
+- **Cause:** DestroyAgent called from inside an application hook: refused.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/hook/user_hook_ids.h`
+
+### CML5656
+
+- **Cause:** a blocking wait called from a hook on the agent thread: refused.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `agent/src/hook/user_hook_ids.h`
+
+### CML5657
+
+- **Cause:** a hook overflowed the stack and the guard page could not be restored.  
+- **Message:** `no application hook runs on this thread any more`  
+- **What to do:** An earlier hook overflowed the stack and the guard page could not be restored; restart the application.  
+  Other variants of the advice: No further hook runs on this thread; fix the recursion in the hook and restart the application.  
+- **Raised by:** `agent/src/hook/user_hook_ids.h`
+
+
+## CML5700 to CML5799
+
+### CML5700
+
+- **Cause:** ui.json cannot be read or is not valid JSON.  
+- **Message:** `cannot read the settings file '<...>'`  
+- **What to do:** Check the file permissions; delete the file to go back to the defaults.  
+  Other variants of the advice: Fix the file by hand or delete it to go back to the defaults.  
+- **Raised by:** `broker/cml_ui/include/cml/ui/ui_diag_ids.h`
+
+### CML5701
+
+- **Cause:** ui.json cannot be written.  
+- **Message:** `cannot write the settings file '<...>'`  
+- **What to do:** Check that the folder exists and is writable; the settings stay in effect until the UI closes.  
+- **Raised by:** `broker/cml_ui/include/cml/ui/ui_diag_ids.h`
+
+### CML5702
+
+- **Cause:** The broker does not provide the command (capability missing / CML5402).  
+- **Message:** `this broker does not provide '<...>'`  
+- **What to do:** Use a broker build that advertises the '<...>' capability; the matching UI stays disabled.  
+- **Raised by:** `broker/cml_ui/include/cml/ui/ui_diag_ids.h`
+
+### CML5703
+
+- **Cause:** The editor command template is invalid.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_ui/include/cml/ui/ui_diag_ids.h`
+
+### CML5704
+
+- **Cause:** The editor could not be started.  
+- **Message:** `cannot find the editor program '<...>'`  
+- **What to do:** Install the editor, put it on PATH, or set its full path in the settings (the 'program' field).  
+  Other variants of the advice: Check the editor command in the settings.  
+- **Raised by:** `broker/cml_ui/include/cml/ui/ui_diag_ids.h`
+
+### CML5705
+
+- **Cause:** Cml_broker.exe could not be started.  
+- **Message:** `cannot start the broker '<...>'`  
+- **What to do:** Put cml_broker.exe next to cml_ui.exe, set the broker path in the settings, or start 'cml_broker --headless' yourself.  
+- **Raised by:** `broker/cml_ui/include/cml/ui/ui_diag_ids.h`
+
+### CML5706
+
+- **Cause:** The global hotkey could not be registered.  
+- **Message:** `the global hotkey <...> could not be registered (error <...>)`  
+- **What to do:** Another program uses this key combination; choose another one in the settings.<...>Choose another key combination in the settings.  
+- **Raised by:** `broker/cml_ui/include/cml/ui/ui_diag_ids.h`
+
+### CML5707
+
+- **Cause:** a --self-test check failed.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_ui/include/cml/ui/ui_diag_ids.h`
+
+### CML5708
+
+- **Cause:** The control connection to the broker was lost.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_ui/include/cml/ui/ui_diag_ids.h`
+
+### CML5709
+
+- **Cause:** The tray icon could not be created (warning).  
+- **Message:** `the tray icon could not be created`  
+- **What to do:** Closing the window exits the UI; the window stays reachable from the taskbar.  
+- **Raised by:** `broker/cml_ui/include/cml/ui/ui_diag_ids.h`
+
+### CML5710
+
+- **Cause:** a hotkey string cannot be parsed.  
+- **Message:** `hotkey '<...>' is not valid`  
+- **What to do:** Write modifiers and one key joined by '+', for example Ctrl+Alt+F11.  
+- **Raised by:** `broker/cml_ui/include/cml/ui/ui_diag_ids.h`
+
+### CML5711
+
+- **Cause:** Window or Direct3D 11 device could not be created.  
+- **Message:** `no Direct3D 11 device could be created`  
+- **What to do:** Update the graphics driver, or run on a machine with Direct3D 11 (WARP is tried too).  
+- **Raised by:** `broker/cml_ui/include/cml/ui/ui_diag_ids.h`
+
+### CML5712
+
+- **Cause:** The editor resolves to a batch file, which is never started.  
+- **Message:** `the editor '<...>' resolves to the batch file '<...>'`  
+- **What to do:** Batch files are never started (file names could inject commands). Point the 'program' setting at the editor's .exe.  
+- **Raised by:** `broker/cml_ui/include/cml/ui/ui_diag_ids.h`
+
+### CML5713
+
+- **Cause:** Bad command line.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_ui/include/cml/ui/ui_diag_ids.h`
+
+### CML5750
+
+- **Cause:** Exception-action / exceptions: a missing or mistyped argument.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_core/include/cml/core/exception_diag_ids.h`
+
+### CML5751
+
+- **Cause:** Exception-action: no such thread is held (answered already, or its process is gone).  
+- **Message:** `no held thread with exception_id <...> in process`  
+- **What to do:** Query 'exceptions' for the threads that wait for a decision; one that was answered or whose process exited is gone.  
+- **Raised by:** `broker/cml_core/include/cml/core/exception_diag_ids.h`
+
+### CML5752
+
+- **Cause:** Exception-action: the agent did not answer / the connection is gone.  
+- **Message:** `the agent of process <...> did not answer`  
+- **What to do:** The application may have exited; the thread was dropped from the pending list.  
+  Other variants of the advice: This is a bug; report it.  
+- **Raised by:** `broker/cml_core/include/cml/core/exception_diag_ids.h`
+
+### CML5753
+
+- **Cause:** The agent refused (or did not answer) the crash-handler configuration.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_core/include/cml/core/exception_diag_ids.h`
+
+### CML5754
+
+- **Cause:** (info) a held thread was released as Ignore because no client listens for exception events.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_core/include/cml/core/exception_diag_ids.h`
+
+### CML5755
+
+- **Cause:** Exception-action without `pid`: several processes hold a thread with that exception_id.  
+- **Message:** `exception_id <...> is held in more than one process`  
+- **What to do:** Add "pid" to the request; 'exceptions' lists the processes.  
+- **Raised by:** `broker/cml_core/include/cml/core/exception_diag_ids.h`
+
+
+## CML5800 to CML5899
+
+### CML5800
+
+- **Cause:** This broker cannot restart processes (no process host on this system).  
+- **Message:** `this broker cannot restart processes on this system`  
+- **What to do:** Restart the application yourself; hot-restart needs the Windows broker.  
+- **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
+
+### CML5801
+
+- **Cause:** `restart` arguments invalid, or no pid given and not exactly one process.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
+
+### CML5802
+
+- **Cause:** no connected process with that pid.  
+- **Message:** `no connected process with pid`  
+- **What to do:** Query 'status' for the processes whose agent is connected.  
+- **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
+
+### CML5803
+
+- **Cause:** Another restart or a reload is running.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
+
+### CML5804
+
+- **Cause:** The agent refused or did not answer: the process was not touched.  
+- **Message:** `process <...> did not prepare for the restart: <...> (the process was not touched)`  
+- **What to do:** In synchronised mode the application must reach SyncPoint() for the pre-restart hooks to run; try again.  
+  Other variants of the advice: Use an agent from the same Chameleon build as the broker. / See the agent's diagnostic for what to change.  
+- **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
+
+### CML5805
+
+- **Cause:** The process cannot be opened for termination / handle duplication: not touched.  
+- **Message:** `OpenProcess(<...>) failed (<...>)`  
+- **What to do:** Run the broker as the same user as the application.  
+- **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
+
+### CML5806
+
+- **Cause:** The old process could not be terminated.  
+- **Message:** `process <...> could not be terminated`  
+- **What to do:** Close it yourself and start the application again.  
+  Other variants of the advice: Close the process yourself.  
+- **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
+
+### CML5807
+
+- **Cause:** The old process is gone, the new one could not be started.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
+
+### CML5808
+
+- **Cause:** The new process did not register in time (left running).  
+- **Message:** `the new process (pid <...>) did not register within <...> ms; it was left running`  
+- **What to do:** Check that the application creates its agent at start-up (and that it can reach the broker); raise 'registration_timeout_ms' if it starts slowly.  
+- **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
+
+### CML5809
+
+- **Cause:** (warning) a module of the old process is not enabled in the new one.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
+
+### CML5810
+
+- **Cause:** (warning) the session's edits could not be re-applied to the new process.  
+- **Message:** `the PDB index of '<...>' in the new process is not ready, so its edits cannot be re-applied`  
+- **What to do:** Run 'reload' once its index is ready.  
+  Other variants of the advice: Fix the error and run 'reload'.  
+- **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
+
+### CML5811
+
+- **Cause:** (warning) a standard handle could not be handed on; the new process has none for it.  
+- **Message:** `the <...> handle of process <...> could not be copied (<...>); the new process starts without it`  
+- **What to do:** Redirect the output to a file or a pipe the application owns, or restart it from its launcher.  
+- **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
+
+### CML5812
+
+- **Cause:** The new process exited before it registered.  
+- **Message:** `the new process (pid <...>) exited with code <...> before its agent registered`  
+- **What to do:** Run the application by hand to see why it stops; the old process is already gone.  
+- **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
+
+### CML5840
+
+- **Cause:** Restart: the broker refused or the step could not complete.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5841
+
+- **Cause:** Restart: the result or event differs from what the scenario expects.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+### CML5850
+
+- **Cause:** no live patch in the targeted modules.  
+- **Message:** `no patch to revert<...>: no enabled module<...> in process <...><...> matching '<...>'`  
+- **What to do:** A revert undoes patches that a 'reload' applied in this session; reload first.  
+- **Raised by:** `broker/cml_core/include/cml/core/revert_diag_ids.h`
+
+### CML5851
+
+- **Cause:** The agent refused the hook changes (its id inside); nothing changed.  
+- **Message:** `the agent refused the <...>: <...>unexpected answer`  
+- **What to do:** Nothing was changed. See the agent log, then try again.  
+  Other variants of the advice: Nothing was changed. If a thread keeps running inside the function, wait until the application leaves it and try again.  
+- **Raised by:** `broker/cml_core/include/cml/core/revert_diag_ids.h`
+
+### CML5852
+
+- **Cause:** (warning) no HooksInstalled in time; the agent may still apply the change.  
+- **Message:** `the agent did not confirm the <...> of <...> function(s) in time`  
+- **What to do:** In synchronised mode the application must call SyncPoint(); the change may still be applied there.  
+- **Raised by:** `broker/cml_core/include/cml/core/revert_diag_ids.h`
+
+### CML5853
+
+- **Cause:** `scope` is neither "last" nor "all".  
+- **Message:** `argument 'scope' must be "last" or "all"`  
+- **What to do:** Send {"scope":"last"} to undo the newest reload, {"scope":"all"} to undo every reload.  
+- **Raised by:** `broker/cml_core/include/cml/core/revert_diag_ids.h`
+
+### CML5854
+
+- **Cause:** Several modules: some were reverted, others failed (n of m).  
+- **Message:** `of <...> modules could not be reverted`  
+- **What to do:** The modules in 'reverted' are done; fix the cause for those in 'failed' and send 'revert' again (it only touches what is still applied).  
+- **Raised by:** `broker/cml_core/include/cml/core/revert_diag_ids.h`
+
+### CML5855
+
+- **Cause:** (warning) the agent did not un-commit a reverted patch (older agent?): its application hooks may keep running.  
+- **Message:** `the agent did not un-commit <...> of <...> reverted patch(es): <...>. Application hooks (CML_PREPATCH_HOOK, ...) defined in them may keep running`  
+- **What to do:** Use an agent from the same build as the broker; reloading again replaces the hooks of the same functions.  
+- **Raised by:** `broker/cml_core/include/cml/core/revert_diag_ids.h`
+
+### CML5856
+
+- **Cause:** The module is no longer loaded where the patches were made; the stale patch list was dropped.  
+- **Message:** `the module '<...>' is no longer loaded in process <...>; its <...> applied reload(s) can no longer be reverted and were forgotten`  
+- **What to do:** Enable the module again, then reload.  
+- **Raised by:** `broker/cml_core/include/cml/core/revert_diag_ids.h`
+
+### CML5857
+
+- **Cause:** The second half of a revert failed and the first could not be undone.  
+- **Message:** `the revert failed (<...>) and the functions it had already re-pointed could not be put back`  
+- **What to do:** The process runs a mix of patches. Restart the application, or reload again.  
+- **Raised by:** `broker/cml_core/include/cml/core/revert_diag_ids.h`
+
+### CML5858
+
+- **Cause:** The revert ran out of time before a step.  
+- **Message:** `the revert ran out of time before`  
+- **What to do:** Raise 'timeout_ms' of the revert command, then try again.  
+- **Raised by:** `broker/cml_core/include/cml/core/revert_diag_ids.h`
+
+
+## CML5900 to CML5999
+
+### CML5900
+
+- **Cause:** no patch applied since the fault replaced a function on the thread's stack.  
+- **Message:** `CML<...>: the offer is being evaluated`  
+- **What to do:** CML%u: exception %u of process %u released as Ignore: no client listens for exception events.  
+- **Raised by:** `broker/cml_core/include/cml/core/reexecute_diag_ids.h`
+
+### CML5901
+
+- **Cause:** The function's compiland was built with optimisation.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_core/include/cml/core/reexecute_diag_ids.h`
+
+### CML5902
+
+- **Cause:** The recorded build command does not say whether optimisation was off.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_core/include/cml/core/reexecute_diag_ids.h`
+
+### CML5903
+
+- **Cause:** The frame's function cannot be identified (patch code, module not enabled, PDB not loaded).  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_core/include/cml/core/reexecute_diag_ids.h`
+
+### CML5904
+
+- **Cause:** The function type cannot be read, or its shape shifts the arguments (variadic, returns a class).  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_core/include/cml/core/reexecute_diag_ids.h`
+
+### CML5905
+
+- **Cause:** a register parameter has a type that is not an integer, pointer, float or double.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_core/include/cml/core/reexecute_diag_ids.h`
+
+### CML5906
+
+- **Cause:** The PDB does not tell where a register parameter lives (or it lives in a register).  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_core/include/cml/core/reexecute_diag_ids.h`
+
+### CML5907
+
+- **Cause:** The agent did not report the stack of the held thread.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `broker/cml_core/include/cml/core/reexecute_diag_ids.h`
+
+### CML5908
+
+- **Cause:** Exception-action "reexecute" while re-execute is not offered.  
+- **Message:** `re-execute is not offered for exception <...>`  
+- **What to do:** Apply a patch that replaces the faulting function (the event 'exception_updated' announces it), or choose continue, leave or ignore.  
+- **Raised by:** `broker/cml_core/include/cml/core/reexecute_diag_ids.h`
+
+### CML5920
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `object(s) linked into <...> from static libraries cannot be hot-reloaded: <...>, and <...> more<...>.`  
+- **What to do:** Build those libraries with /Z7 (or /Zi) so the PDB records how each object was compiled (clang-cl: -gcodeview-command-line), and keep their sources on disk; edits to the other members of the same libraries are reloaded normally.  
+- **Raised by:** `broker/cml_core/include/cml/core/static_lib_diag_ids.h`
+
+### CML5921
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `the changed file '<...>' is only owned by compilands of <...> that cannot be reloaded`  
+- **What to do:** Rebuild the project (and the library it belongs to) with /Z7 so its PDB records the compile command, then restart; or rebuild and hot-restart now.  
+- **Raised by:** `broker/cml_core/include/cml/core/static_lib_diag_ids.h`
+
+### CML5960
+
+- **Cause:** Inject-failure: missing/unknown stage, bad count or pid.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5961
+
+- **Cause:** Inject-failure: no agent with that pid.  
+- **Message:** `no agent is connected for process`  
+- **What to do:** Query 'status' for the connected processes.  
+  Other variants of the advice: Start the application with the agent and wait for 'status' to list it.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5962
+
+- **Cause:** The agent did not arm the stage.  
+- **Message:** `the agent of process <...> did not answer ArmFault`  
+- **What to do:** Check that the process is still running.  
+  Other variants of the advice: Use an agent built with CML_FAULT_INJECTION from the same build as the broker.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5963
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `the broker's mapping of the module's PDB (dropped, then fails to open)`  
+- **What to do:** change-detection.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5964
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `the sweep that hashes the tracked sources`  
+- **What to do:** compile.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5965
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `the compile stage (the application's compile-error hook runs)`  
+- **What to do:** bind-plan.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5966
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `the bind planner of the first recompiled compiland`  
+- **What to do:** reservation.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5967
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `the link of the patch DLL`  
+- **What to do:** pre-apply.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5968
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `the broker's pre-applied relocations in the patch DLL`  
+- **What to do:** send-patch.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5969
+
+- **Cause:** See the message printed with the id.  
+- **Message:** `sending LoadPatch to the agent`  
+- **What to do:** patch-load.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5970
+
+- **Cause:** Inject-failure: the stage cannot fire for that process (reservation already made).  
+- **Message:** `the stage 'reservation' fires only on a module's first patch, and every enabled module of process <...> has reserved its address space already (or none is enabled)`  
+- **What to do:** Arm it right after the module is enabled and before its first reload, or start a new process.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5971
+
+- **Cause:** Inject-failure "none": some agents could not be disarmed.  
+- **Message:** `the broker's stages are disarmed, but the agents of process(es) <...> could not be disarmed`  
+- **What to do:** Check that those processes are still running, then send {"stage":"none"} again.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5985
+
+- **Cause:** Inject_failure: the stage is not listed, the command was refused or answered wrongly.  
+- **Message:** see the diagnostic text printed with the id  
+- **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/control_ids.h`
+
+
+### CML5998
+
+- **Cause:** The licence check completed and refused this installation. The open build of Chameleon ships a no-op provider that always allows, so this id is only raised by a build that installs its own `cml::license::Provider`.  
+- **Message:** `the licence check refused this installation: <reason>`  
+- **What to do:** Install a valid licence for this version of Chameleon, or contact the vendor. The broker exits with code 1 after logging this diagnostic.  
+- **Raised by:** `core/cml_license/include/cml/license/license_diag_ids.h`
+
+### CML5999
+
+- **Cause:** The licence check could not be completed (no answer from the licence service, unreadable licence file). Same condition as CML5998: only a build with a non-default provider raises it.  
+- **Message:** `the licence check could not be completed: <reason>`  
+- **What to do:** Check that the licence file or service is reachable and run the broker again. The broker logs this as a warning and keeps running.  
+- **Raised by:** `core/cml_license/include/cml/license/license_diag_ids.h`
