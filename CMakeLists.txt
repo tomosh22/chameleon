@@ -50,6 +50,8 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 include(CmlToolchain)
 include(CmlWarnings)
 include(CmlTargets)
+# WP-29: chameleon_enable(), the same function a user project gets from find_package(Chameleon).
+include("${CMAKE_CURRENT_SOURCE_DIR}/integrations/cmake/ChameleonEnable.cmake")
 
 if(CML_BUILD_TESTS)
     enable_testing()
@@ -62,6 +64,11 @@ add_subdirectory(broker)
 # WP-03 throwaway end-to-end spike (see spike/README.md).
 add_subdirectory(spike)
 
+# WP-29: install and export rules (the install tree WP-32 packages), Chameleon::agent and Chameleon::broker.
+include(CmlInstall)
+
 if(CML_BUILD_TESTS)
     add_subdirectory(tests)
+    # WP-29: configure-time tests of chameleon_enable().
+    add_subdirectory(integrations/cmake)
 endif()

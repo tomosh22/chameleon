@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Windows-only end-to-end check of the control client against a real cml_broker and the `basic` fixture (see Program.cs). -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>Chameleon.IntegrationTest</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Chameleon.Control\Chameleon.Control.csproj" />
+  </ItemGroup>
+</Project>
