@@ -169,6 +169,12 @@ diagnostic is planned, not live.
   - **Static-library members (F-1)** are fixed (WP-26b, #49), and the clang-cl C-statics crash (F-3) is fixed (WP-26c, #50). Members
     without a recorded build environment (a prebuilt library not built with /Z7) stay unreloadable: CML5920 at enable,
     CML5921 when one of their files changes. Toolchain archives (CRT, STL, SDK, compiler runtime) are never reloadable.
+  - **Compiler warnings from `chameleon_enable` (wave 8).** With MSVC on x64, every TU of an enabled target prints
+    `D9002 ignoring unknown option '/hotpatch'` (cl accepts `/hotpatch` on x86 only; on x64 `/FUNCTIONPADMIN` provides
+    the padding) and, in RelWithDebInfo, `D9025 overriding '/Ob1' with '/Ob0'`. Both are harmless (`cml_broker check`
+    reports PASS, warn=0) but noisy in user builds; seen in the WP-32 quickstart acceptance run. Follow-up: add
+    `/hotpatch` only for x86 (or clang-cl) and strip `/Ob1` from the target's RelWithDebInfo flags instead of
+    overriding it.
   - **IDE integrations (wave 8).** The VS Code and Visual Studio extensions are tested against a real broker in CI. The editor
     UI itself (menus, status bar, Output pane, Error List, the debugger `Attach2` call) is covered only by the manual
     checklists in `docs/wp/WP-30.md` and `docs/wp/WP-31.md`. Two follow-ups need broker changes:

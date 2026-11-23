@@ -120,18 +120,21 @@ try {
         'exit /b 0') 600
     $h = 'C:\chameleon-demo\hello'
     $cfg = (Test-Path "$h\CMakeLists.txt") -and (Test-Path "$h\logic.cpp") -and (Test-Path "$h\build\CMakeCache.txt") -and (Test-Path "$h\build\build.ninja") -and ($r.Text -match 'Build files have been written to')
-    Step 5 configure (($r.Code -eq 0) -and $cfg) "exit=$($r.Code) copied+configured=$cfg tail=$(($r.Text -split "`n" | Select-Object -Last 4) -join ' | ')"
-    $r = Run-Prompt @('cd /d C:\chameleon-demo\hello', $setCml, 'cmake --build build || exit /b 1', 'exit /b 0') 600
+    $cache = Get-Content "$h\build\CMakeCache.txt" -Raw -ErrorAction SilentlyContinue
+    $dirOk = ($cache -match '(?m)^Chameleon_DIR:[A-Z]+=(.*)$') -and ($Matches[1].Replace('/','\').ToLower().StartsWith($cmlDir.ToLower()))
+    $cfg = $cfg -and $dirOk
+    Step 5 configure (($r.Code -eq 0) -and $cfg) "exit=$($r.Code) copied+configured=$cfg Chameleon_DIR-under-package=$dirOk tail=$(($r.Text -split "`n" | Select-Object -Last 4) -join ' | ')"
+    $r = Run-Prompt @('cd /d C:\chameleon-demo', $setCml, 'cd /d C:\chameleon-demo\hello', 'cmake --build build || exit /b 1', 'exit /b 0') 600
     Step 6 build (($r.Code -eq 0) -and (Test-Path 'C:\chameleon-demo\hello\build\smoke_app.exe')) "exit=$($r.Code) exe=$(Test-Path 'C:\chameleon-demo\hello\build\smoke_app.exe') tail=$(($r.Text -split "`n" | Select-Object -Last 4) -join ' | ')"
 
-    $r = Run-Prompt @('cd /d C:\chameleon-demo\hello', $setCml, 'echo QS-BEGIN', '%CML%\bin\cml_broker.exe check build\smoke_app.exe', 'echo QS-END')
+    $r = Run-Prompt @('cd /d C:\chameleon-demo', $setCml, 'cd /d C:\chameleon-demo\hello', 'echo QS-BEGIN', '%CML%\bin\cml_broker.exe check build\smoke_app.exe', 'echo QS-END')
     $body = [regex]::Match($r.Text, '(?s)QS-BEGIN\s*\n(.*?)\n?QS-END').Groups[1].Value
     $lines = $body -split "`r?`n" | Where-Object { $_.Trim() }
     $fails = $lines | Where-Object { $_ -match '^\s*FAIL' -or $_ -match '\bFAIL\b' }
     $passes = $lines | Where-Object { $_ -match '^\s*PASS' }
     $other = $lines | Where-Object { $_ -notmatch '^\s*(PASS|WARN)' }
     if ($other) { Say "QS-NOTE check output has lines not starting with PASS/WARN: $($other -join ' | ')" }
-    Step 7 check (-not $fails -and $passes) "exit=$($r.Code) pass=$(@($passes).Count) fail=$(@($fails).Count) failing: $($fails -join ' | ')"
+    Step 7 check (-not $fails -and $passes) "exit=$($r.Code) pass=$(@($passes).Count) fail=$(@($fails).Count) failing: $($fails -join ' | ') output: $($r.Text)"
 
     # ---- Step 3: broker (second prompt, left running) -------------------------------------------------------
     $broker = Start-BgPrompt 'broker' @('cd /d C:\chameleon-demo', $setCml, '%CML%\bin\cml_broker.exe --headless --verbose')
@@ -140,7 +143,7 @@ try {
     Step 8 broker-banner ($ok1 -and $ok2) "banner=$ok1 licence=$ok2 exited=$($broker.Proc.HasExited) log=$(Log-Text $broker)"
 
     # ---- Step 4: program (first prompt, left running) -------------------------------------------------------
-    $app = Start-BgPrompt 'smoke_app' @('cd /d C:\chameleon-demo\hello', $setCml, 'build\smoke_app.exe --agent-dir %CML%\bin')
+    $app = Start-BgPrompt 'smoke_app' @('cd /d C:\chameleon-demo', $setCml, 'cd /d C:\chameleon-demo\hello', 'build\smoke_app.exe --agent-dir %CML%\bin')
     $e1 = Wait-Log $app 'SMOKE enabled=1' 60
     $v1 = Wait-Log $app 'SMOKE tick=\d+ value=1' 30
     Step 9 program-start ($e1 -and $v1) "enabled=$e1 value1=$v1 exited=$($app.Proc.HasExited) log=$(Log-Text $app)"
@@ -157,7 +160,7 @@ try {
     Step 11 edit-source (($r.Code -eq 0) -and $changed) "exit=$($r.Code) logic.cpp contains 'return 2;'=$changed"
 
     $r = Run-Prompt @(
-        'cd /d C:\chameleon-demo\hello', $setCml,
+        'cd /d C:\chameleon-demo', $setCml, 'cd /d C:\chameleon-demo\hello',
         'powershell -NoProfile -ExecutionPolicy Bypass -File %CML%\scripts\cml-reload.ps1',
         'exit /b %errorlevel%') 300
     Step 12 reload-json (($r.Code -eq 0) -and ($r.Text -match '"ok"\s*:\s*true')) "exit=$($r.Code) output=$($r.Text.Trim())"
