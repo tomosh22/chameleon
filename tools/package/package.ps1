@@ -190,30 +190,41 @@ if (@(Get-ChildItem -Path $integrations -Filter '*.vsix' -File).Count -lt 2 -and
 }
 
 # Debug-only and fault-injection content must not be in the shipped binaries. Plain ASCII scan of every exe and dll.
-#  - debug CRT: the import names of the debug runtime (a Debug build, or a dependency built in Debug)
-#  - fault injection: the control commands and the capability name exist only when CML_FAULT_INJECTION is on
+#  - debug CRT (every binary): the import names of the debug runtime, or debug heap reporting
+#  - fault injection (the broker): the capability name and the `fault-stages` command exist only when CML_FAULT_INJECTION
+#    is on. (Some diagnostic texts that mention the control command `inject-failure` are not compiled out, so that
+#    text is not a usable marker.)
+#  - positive evidence (broker and agent): the "built without CML_FAULT_INJECTION" answers exist only in a build with it OFF
 $banned = @(
-    @{ Text = 'ucrtbased.dll';        Why = 'debug C runtime import' },
-    @{ Text = 'vcruntime140d.dll';    Why = 'debug C runtime import' },
-    @{ Text = 'vcruntime140_1d.dll';  Why = 'debug C runtime import' },
-    @{ Text = 'msvcp140d.dll';        Why = 'debug C++ runtime import' },
-    @{ Text = '_CrtDbgReport';        Why = 'debug heap reporting' },
-    @{ Text = 'inject-failure';       Why = 'fault injection control command' },
-    @{ Text = 'fault-injection';      Why = 'fault injection capability name' },
-    @{ Text = 'fault-stages';         Why = 'fault injection control command' },
-    @{ Text = 'injected failure at the stage'; Why = 'fault injection diagnostic text' }
+    @{ Text = 'ucrtbased.dll';        Why = 'debug C runtime import';  Only = $null },
+    @{ Text = 'vcruntime140d.dll';    Why = 'debug C runtime import';  Only = $null },
+    @{ Text = 'vcruntime140_1d.dll';  Why = 'debug C runtime import';  Only = $null },
+    @{ Text = 'msvcp140d.dll';        Why = 'debug C++ runtime import'; Only = $null },
+    @{ Text = '_CrtDbgReport';        Why = 'debug heap reporting';    Only = $null },
+    @{ Text = 'fault-stages';         Why = 'fault injection control command'; Only = 'cml_broker.exe' },
+    @{ Text = 'fault-injection';      Why = 'fault injection capability name'; Only = 'cml_broker.exe' }
+)
+$expected = @(
+    @{ Text = 'built without CML_FAULT_INJECTION'; Why = 'proves CML_FAULT_INJECTION=OFF'; File = 'cml_broker.exe' },
+    @{ Text = 'built without CML_FAULT_INJECTION'; Why = 'proves CML_FAULT_INJECTION=OFF'; File = 'cml_agent.dll' }
 )
 $latin1 = [Text.Encoding]::GetEncoding(28591)
 $binaries = @(Get-ChildItem -Recurse -File -Path $stage | Where-Object { $_.Extension -in '.exe', '.dll' })
 foreach ($b in $binaries) {
     $text = $latin1.GetString([IO.File]::ReadAllBytes($b.FullName))
     foreach ($entry in $banned) {
+        if ($entry.Only -and $entry.Only -ne $b.Name) { continue }
         if ($text.IndexOf($entry.Text, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
             Fail "$($b.FullName.Substring($stage.Length + 1)) contains '$($entry.Text)' ($($entry.Why))"
         }
     }
+    foreach ($entry in $expected) {
+        if ($entry.File -eq $b.Name -and $text.IndexOf($entry.Text, [StringComparison]::Ordinal) -lt 0) {
+            Fail "$($b.FullName.Substring($stage.Length + 1)) lacks '$($entry.Text)' ($($entry.Why))"
+        }
+    }
 }
-Write-Host "WP32-CHECK banned-strings=ok binaries=$($binaries.Count) patterns=$($banned.Count)"
+Write-Host "WP32-CHECK banned-strings=ok binaries=$($binaries.Count) patterns=$($banned.Count + $expected.Count)"
 
 # The release build itself must have been configured as promised.
 $cache = Join-Path $build 'CMakeCache.txt'
