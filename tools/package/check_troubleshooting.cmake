@@ -9,8 +9,10 @@
 #     module_audit.h, fault_stages.h or pe_codeview.cpp (names ending in Ms or Budget, or starting with kMax / kMin,
 #     are limits, not ids), or
 #   * the first argument of make_diag( / rewrap( in core/cml_pe/src or core/cml_coff/src (the readers use bare numbers).
+#   * on top of that, the ids of the integrations when they are present: `CMLnnnn` in the messages of integrations/cmake/*.cmake and
+#     the quoted ids in integrations/vscode/src/diagIds.ts and integrations/vs/src/Chameleon.Control/Diagnostics.cs.
 # An entry is a heading `### CMLNNNN` in the document. Ids in the document that no code defines are only reported
-# (the integrations and the CMake helper own ids that are not defined in C++).
+# (stale).
 #
 # The check fails when an id lacks an entry, when the scan finds suspiciously few ids (the patterns rotted), or when an
 # entry is listed twice.
@@ -58,6 +60,30 @@ foreach(_f IN LISTS _headers)
         endforeach()
     endif()
 endforeach()
+# The integrations: CMake configure-time messages (`CMLnnnn` followed by space, colon or end of line in integrations/cmake/*.cmake),
+# and the id tables of the editor extensions (quoted "CMLnnnn" in their diagnostics file). Absent integrations are skipped.
+file(GLOB _cmake_files "${CML_SOURCE_DIR}/integrations/cmake/*.cmake")
+foreach(_f IN LISTS _cmake_files)
+    file(STRINGS "${_f}" _lines REGEX "CML[1-5][0-9][0-9][0-9]( |:|$)")
+    foreach(_line IN LISTS _lines)
+        string(REGEX MATCHALL "CML[1-5][0-9][0-9][0-9]( |:|$)" _hits "${_line}")
+        foreach(_hit IN LISTS _hits)
+            string(REGEX MATCH "[1-5][0-9][0-9][0-9]" _num "${_hit}")
+            list(APPEND _code_ids "${_num}")
+            list(APPEND _where_ids "${_num}=${_f}")
+        endforeach()
+    endforeach()
+endforeach()
+foreach(_f "integrations/vscode/src/diagIds.ts" "integrations/vs/src/Chameleon.Control/Diagnostics.cs")
+    if(EXISTS "${CML_SOURCE_DIR}/${_f}")
+        file(STRINGS "${CML_SOURCE_DIR}/${_f}" _lines REGEX "\"CML[1-5][0-9][0-9][0-9]\"")
+        foreach(_line IN LISTS _lines)
+            string(REGEX MATCH "\"CML([1-5][0-9][0-9][0-9])\"" _m "${_line}")
+            list(APPEND _code_ids "${CMAKE_MATCH_1}")
+            list(APPEND _where_ids "${CMAKE_MATCH_1}=${_f}")
+        endforeach()
+    endif()
+endforeach()
 list(REMOVE_DUPLICATES _code_ids)
 list(SORT _code_ids)
 list(LENGTH _code_ids _n_code)
@@ -98,7 +124,7 @@ endforeach()
 message(STATUS "docs.troubleshooting: ${_n_code} diagnostic ids defined in code, ${_n_doc} entries in docs/TROUBLESHOOTING.md")
 if(_stale)
     list(JOIN _stale " " _s)
-    message(STATUS "docs.troubleshooting: entries without a definition in C++ (owned by an integration or the CMake helper, or stale): ${_s}")
+    message(STATUS "docs.troubleshooting: entries without a definition in code (stale, or the integration is not in this tree): ${_s}")
 endif()
 
 set(_failed FALSE)

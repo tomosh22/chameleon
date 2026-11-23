@@ -19,16 +19,11 @@ revert, restart).
    text shown below.
 4. Hot-restart (`restart`) is the way out when a change cannot be patched in place (`docs/KNOWN_LIMITATIONS.md`).
 
-## Ids owned by the integrations and the licensing hook
+## Ids raised by the integrations
 
-These are raised outside the C++ code base that this document is checked against, or are reserved.
-
-| Range | Raised by | Meaning |
-|---|---|---|
-| CML1700 to CML1749 | `chameleon_enable()` in `ChameleonConfig.cmake` | Configure-time messages: the CMake helper could not apply a recommended flag to a target. The message names the target and the flag; fix the target's flags or call `chameleon_enable()` after the target is defined. |
-| CML5990 to CML5993 | VS Code extension | Client-side failures: no broker found, the control pipe was lost, the broker is too old for a feature. Start `cml_broker --headless` and reload the window; the Output channel "Chameleon" has the details. |
-| CML5994 to CML5997 | Visual Studio extension | Same as above, plus a failed debugger re-attach after a hot-restart. Attach the debugger by hand (Debug, Attach to Process). |
-| CML5998 to CML5999 | licensing hook | See the two entries at the end of this document. The shipped build never raises them. |
+The CMake helper (`CML1700` to `CML1749`), the VS Code extension (`CML5990` to `CML5993`) and the Visual Studio extension
+(`CML5994` to `CML5997`) raise their own ids outside the C++ code; their entries are at the end of this document. The
+licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 
 ## The entries
 
@@ -2737,3 +2732,136 @@ These are raised outside the C++ code base that this document is checked against
 - **Message:** `the licence check could not be completed: <reason>`  
 - **What to do:** Check that the licence file or service is reachable and run the broker again. The broker logs this as a warning and keeps running.  
 - **Raised by:** `core/cml_license/include/cml/license/license_diag_ids.h`
+
+### CML1700
+
+- **Cause:** Chameleon supports Windows x64 only; the target is configured for another system or processor. Also raised by `find_package(Chameleon)` for a non-64-bit project.  
+- **Message:** `chameleon_enable(<target>): the target is '<system>' / '<processor>' with <n>-byte pointers; Chameleon supports Windows x64 only.`  
+- **What to do:** Configure with an x64 MSVC or clang-cl toolchain (Visual Studio generator: -A x64; Ninja: run from an x64 developer prompt).  
+- **Raised by:** `chameleon_enable()` (CMake)
+
+### CML1701
+
+- **Cause:** The C++ compiler is a GNU-style one (gcc, clang++); Chameleon needs the CodeView PDBs and MSVC link of cl or clang-cl.  
+- **Message:** `chameleon_enable(<target>): the C++ compiler is <id> with the GNU-style command line; Chameleon needs cl or clang-cl.`  
+- **What to do:** Configure with cl or clang-cl (clang-cl: -DCMAKE_CXX_COMPILER=clang-cl, not clang++).  
+- **Raised by:** `chameleon_enable()` (CMake)
+
+### CML1702
+
+- **Cause:** The target is an INTERFACE or utility target without compiled code; no flags were applied.  
+- **Message:** `chameleon_enable(<target>): a <type> target has no compiled code of its own; no flags were applied.`  
+- **What to do:** Call chameleon_enable on the executables and libraries that contain the code you reload.  
+- **Raised by:** `chameleon_enable()` (CMake, warning)
+
+### CML1703
+
+- **Cause:** No target of that name exists at the point of the call.  
+- **Message:** `chameleon_enable(<target>): there is no target of that name.`  
+- **What to do:** Call chameleon_enable after add_executable/add_library for the target.  
+- **Raised by:** `chameleon_enable()` (CMake)
+
+### CML1704
+
+- **Cause:** The single-configuration build type is Release or MinSizeRel: no debug information for the compiler, and inlining defeats patching.  
+- **Message:** `chameleon_enable(<target>): CMAKE_BUILD_TYPE is '<type>'. Release and MinSizeRel record no debug information for the compiler, and their inlining defeats patching.`  
+- **What to do:** Configure with -DCMAKE_BUILD_TYPE=Debug or RelWithDebInfo for the build you iterate on.  
+- **Raised by:** `chameleon_enable()` (CMake, warning)
+
+### CML1705
+
+- **Cause:** Interprocedural optimisation (/GL, LTCG) is on for the target; it is switched off for it because `cml_broker check` fails /GL builds (CML1103).  
+- **Message:** `chameleon_enable(<target>): interprocedural optimisation (/GL, LTCG) is on; it is switched off for this target.`  
+- **What to do:** Do not set INTERPROCEDURAL_OPTIMIZATION or CMAKE_INTERPROCEDURAL_OPTIMIZATION for the targets you reload.  
+- **Raised by:** `chameleon_enable()` (CMake, warning)
+
+### CML1706
+
+- **Cause:** Flags in effect contain options that `cml_broker check` rejects: /guard:cf, /GL, /LTCG, /clr, /ZW, /DEBUG:FASTLINK.  
+- **Message:** `chameleon_enable(<target>): the flags in effect contain options `cml_broker check` rejects: <flags>.`  
+- **What to do:** Remove them from CMAKE_*_FLAGS, CMAKE_*_LINKER_FLAGS and the target's options for the targets you reload.  
+- **Raised by:** `chameleon_enable()` (CMake, warning)
+
+### CML1707
+
+- **Cause:** The compiler is older than Visual Studio 2022 (cl 19.30) or LLVM 15 (clang-cl); it is not tested with Chameleon.  
+- **Message:** `cl <version> is older than Visual Studio 2022 (19.30); it is not tested with Chameleon. (clang-cl: older than LLVM 15.)`  
+- **What to do:** Use Visual Studio 2022 (MSVC v143) or newer, or clang-cl 15 or newer.  
+- **Raised by:** `chameleon_enable()` (CMake, warning)
+
+### CML1709
+
+- **Cause:** An argument other than NO_AGENT, ALLOW_INLINING or NO_COPY_AGENT was passed.  
+- **Message:** `chameleon_enable(<target>) got unknown arguments '<args>'.`  
+- **What to do:** Use only NO_AGENT, ALLOW_INLINING and NO_COPY_AGENT.  
+- **Raised by:** `chameleon_enable()` (CMake)
+
+### CML1710
+
+- **Cause:** The imported target Chameleon::agent does not exist: find_package(Chameleon) was not called.  
+- **Message:** `chameleon_enable(<target>): the target Chameleon::agent does not exist.`  
+- **What to do:** Call find_package(Chameleon CONFIG REQUIRED) (with CMAKE_PREFIX_PATH or Chameleon_DIR at the install tree) before chameleon_enable, or pass NO_AGENT.  
+- **Raised by:** `chameleon_enable()` (CMake)
+
+### CML1711
+
+- **Cause:** chameleon_enable was called from a different directory than the one that created the target, so cml_agent.dll is not copied next to the executable.  
+- **Message:** `chameleon_enable(<target>) was called from a different directory than the one that created the target; cml_agent.dll is not copied next to it.`  
+- **What to do:** Call chameleon_enable in the directory of the add_executable call, or copy cml_agent.dll yourself (or pass NO_COPY_AGENT).  
+- **Raised by:** `chameleon_enable()` (CMake, warning)
+
+### CML5990
+
+- **Cause:** No broker answers on the control pipe (not started, wrong pipe name, other user).  
+- **Message:** `cannot reach the Chameleon broker on <pipe>: <detail>`  
+- **What to do:** Start cml_broker (or cml_ui) as the same user, or set the 'chameleon.controlPipe' setting to the pipe the broker was started with (--control-pipe).  
+- **Raised by:** VS Code extension
+
+### CML5991
+
+- **Cause:** The control connection closed or failed after it was established.  
+- **Message:** `the control pipe <pipe> was lost: <detail>`  
+- **What to do:** Check that the broker is still running; the extension reconnects by itself while 'chameleon.autoConnect' is on, or run 'Chameleon: Connect'.  
+- **Raised by:** VS Code extension
+
+### CML5992
+
+- **Cause:** The broker lacks a capability or does not know a command (unsupported broker version). The feature is disabled, nothing else is affected.  
+- **Message:** `this broker (version <v>) does not provide <what>`  
+- **What to do:** Use a Chameleon broker that advertises this capability (build the broker and the extension from the same release).  
+- **Raised by:** VS Code extension
+
+### CML5993
+
+- **Cause:** The broker's answer is unusable (malformed line, wrong shape, no answer in time).  
+- **Message:** `the broker's answer cannot be used: <detail>`  
+- **What to do:** Check the broker log; make sure the broker and the extension come from the same release.  
+- **Raised by:** VS Code extension
+
+### CML5994
+
+- **Cause:** The control pipe cannot be reached: no broker is running, or it serves another pipe name.  
+- **Message:** `Cannot reach the Chameleon broker on the control pipe '<pipe>': <detail>.`  
+- **What to do:** Start the application with the Chameleon agent (it starts the broker) or run 'cml_broker.exe --headless', then choose Tools > Chameleon > Connect; if the broker serves another pipe name, enter it in Tools > Options > Chameleon > General.  
+- **Raised by:** Visual Studio extension
+
+### CML5995
+
+- **Cause:** The connection to the broker was lost, or a request got no answer.  
+- **Message:** `The connection to the Chameleon broker on '<pipe>' was lost: <detail>.`  
+- **What to do:** Chameleon reconnects by itself while 'Reconnect automatically' is on in Tools > Options > Chameleon > General; otherwise choose Tools > Chameleon > Connect once the broker runs again.  
+- **Raised by:** Visual Studio extension
+
+### CML5996
+
+- **Cause:** The broker lacks a capability the extension needs for a feature, or is not a Chameleon broker.  
+- **Message:** `The broker <reason>.`  
+- **What to do:** Use cml_broker.exe and cml_agent.dll from one Chameleon release; the Visual Studio features that need the missing capability stay disabled.  
+- **Raised by:** Visual Studio extension
+
+### CML5997
+
+- **Cause:** The debugger could not be re-attached to the restarted process after a hot-restart.  
+- **Message:** `Could not attach the debugger to the restarted process (pid <new>, it replaced pid <old>): <reason>.`  
+- **What to do:** Attach by hand with Debug > Attach to Process (pid <new>); to stop Chameleon re-attaching, clear Tools > Chameleon > Re-attach debugger after hot-restart (or the same setting in Tools > Options > Chameleon > General).  
+- **Raised by:** Visual Studio extension
