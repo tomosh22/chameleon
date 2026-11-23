@@ -4,6 +4,9 @@
 //   node out/test/integration/run.js --broker <cml_broker.exe> --fixture <fixture_basic.exe> --edit-file <logic.cpp of the fixture's
 //        source copy> --work-dir <dir>
 //
+// WP-35 (after the revert): a syntax error is written into the source, `reload` is refused with CML2200, and the `diag` event, turned
+// into a Problems entry by `problemsOfDiag` (the function the extension uses), must name that file and line exactly (WP35-VSCODE lines).
+//
 // Steps: start the broker on its DEFAULT control pipe (so the derivation of the pipe name is checked, no CML_CONTROL_PIPE, no
 // --control-pipe), connect through Session (status + subscribe), start the fixture with the agent, wait until the module is
 // enabled and indexed, edit the source, `reload` (expect patch_applied and value=2 on the fixture's stdout), `revert` (expect
@@ -14,6 +17,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { ControlEvent, JsonObject } from "../../src/controlClient";
 import { DiagError, formatDiag } from "../../src/diagIds";
+import { problemsOfDiag } from "../../src/format";
 import { realDeps, resolveControlPipe } from "../../src/pipeName";
 import { Session } from "../../src/session";
 
@@ -179,6 +183,45 @@ async function main(): Promise<void> {
       30000,
     );
     console.log(`WP30-IT revert=ok reverted=${Array.isArray(revert.reverted) ? revert.reverted.length : 0} event=patch_reverted value=1`);
+
+    // WP-35: a compile error is a Problems entry at the exact file and line, from the broker's structured fields.
+    if (!session.capabilities.has("diag-locations")) {
+      throw new Error(`the broker does not advertise 'diag-locations' (has: ${caps.join(", ")})`);
+    }
+    const goodSource = fs.readFileSync(editFile, "utf8");
+    const brokenSource = goodSource.replace(/return 2;/, "return 2 +;").replace(/return 1;/, "return 1 +;");
+    const expectedLine = brokenSource.split(/\r?\n/).findIndex((l) => l.includes(" +;")) + 1;
+    if (expectedLine <= 0 || brokenSource === goodSource) {
+      throw new Error(`the syntax error was not applied to ${editFile}`);
+    }
+    fs.writeFileSync(editFile, brokenSource);
+    const mark3 = events.length;
+    let refusal: DiagError | undefined;
+    try {
+      await session.call("reload", { timeout_ms: 90000 }, 120000);
+    } catch (e) {
+      refusal = e instanceof DiagError ? e : undefined;
+    }
+    if (!refusal || refusal.diag.id !== "CML2200") {
+      throw new Error(`the reload of a syntax error was not refused with CML2200 (${refusal ? refusal.diag.id : "no DiagError"})`);
+    }
+    await waitFor("diag event CML2200", () => events.slice(mark3).some((e) => e.event === "diag" && e.id === "CML2200"), 10000);
+    const diagEvent = events.slice(mark3).find((e) => e.event === "diag" && e.id === "CML2200") as ControlEvent;
+    const entries = problemsOfDiag(diagEvent);
+    const norm = (f: string): string => path.normalize(f).toLowerCase();
+    const entry = entries[0];
+    if (entries.length !== 1 || !entry || norm(entry.file) !== norm(editFile) || entry.line !== expectedLine) {
+      throw new Error(`the Problems entry is ${JSON.stringify(entries)}, expected ${editFile}:${expectedLine}`);
+    }
+    if (diagEvent.file !== entry.file || diagEvent.line !== entry.line || (diagEvent.column ?? undefined) !== entry.column) {
+      throw new Error(`the entry does not equal the event's file/line/column fields: ${JSON.stringify(diagEvent)}`);
+    }
+    if (refusal.diag.file !== entry.file || refusal.diag.line !== entry.line) {
+      throw new Error(`the reload answer's diag has ${String(refusal.diag.file)}:${String(refusal.diag.line)}, expected ${entry.file}:${entry.line}`);
+    }
+    console.log(`WP35-VSCODE problem file=${entry.file} line=${entry.line} col=${entry.column ?? 0} code=${entry.code ?? "-"}`);
+    console.log("WP35-VSCODE result=ok diag_event=1 answer=1");
+    fs.writeFileSync(editFile, goodSource);
 
     // A command the broker does not know is CML5402 for the raw client; through the Session it is CML5992 (feature unavailable).
     try {

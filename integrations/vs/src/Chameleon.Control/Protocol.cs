@@ -53,6 +53,15 @@ namespace Chameleon.Control
         public string Message { get; set; }
         public string Action { get; set; }
 
+        /// <summary>WP-35: where the first compiler error is (absolute path), when the broker says so; null otherwise.</summary>
+        public string File { get; set; }
+
+        /// <summary>1-based, or null.</summary>
+        public long? Line { get; set; }
+
+        /// <summary>1-based, or null (cl prints no column unless asked to).</summary>
+        public long? Column { get; set; }
+
         public override string ToString()
         {
             return Id + ": " + Message + (string.IsNullOrEmpty(Action) ? "" : " What to do: " + Action);
@@ -81,6 +90,9 @@ namespace Chameleon.Control
                     Id = Json.Str(diag["id"]) ?? "",
                     Message = Json.Str(diag["message"]) ?? "",
                     Action = Json.Str(diag["action"]) ?? "",
+                    File = Json.Str(diag["file"]),
+                    Line = Json.Long(diag["line"]),
+                    Column = Json.Long(diag["column"]),
                 };
             }
             else if (!response.Ok)

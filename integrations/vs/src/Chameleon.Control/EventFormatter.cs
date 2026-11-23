@@ -129,7 +129,11 @@ namespace Chameleon.Control
         {
             string text = "error " + error.Id + ": " + error.Message + (string.IsNullOrEmpty(error.Action) ? "" : " What to do: " + error.Action);
             DiagnosticLocation location;
-            DiagnosticLocation.TryParse(error.Message, out location);
+            if (!DiagnosticLocation.TryFromFields(error.File, error.Line, error.Column, out location))
+            {
+                DiagnosticLocation.TryParse(error.Message, out location);  // an older broker: the text is all there is
+            }
+
             return new OutputLine(Navigable(location, text), OutputSeverity.Error, location, error.Id, error.Message, error.Action);
         }
 
@@ -140,7 +144,11 @@ namespace Chameleon.Control
             string action = Str(ev, "action");
             bool warning = string.Equals(Str(ev, "severity"), "warning", StringComparison.OrdinalIgnoreCase);
             DiagnosticLocation location;
-            DiagnosticLocation.TryParse(message, out location);
+            if (!DiagnosticLocation.TryFromFields(ev.Str("file"), ev.Int("line"), ev.Int("column"), out location))
+            {
+                DiagnosticLocation.TryParse(message, out location);  // a broker without "diag-locations": the regex parse stays
+            }
+
             string text = (warning ? "warning " : "error ") + id + ": " + message + (string.IsNullOrEmpty(action) ? "" : " What to do: " + action);
             string stage = Str(ev, "stage");
             if (!string.IsNullOrEmpty(stage) && stage != "?")

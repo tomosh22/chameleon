@@ -109,6 +109,8 @@ struct Rig {
 
     // knobs of the fake compiler / linker / agent
     bool fail_compile = false;
+    std::string compile_cwd = "C:\\proj\\build";               // WP-35: the directory the fake compiler "ran in"
+    std::vector<toolchain::ToolDiagnostic> compile_errors;  // WP-35: what the failing fake compiler printed (parsed)
     bool short_results = false;                 // compile_all returns one result too few
     bool compile_warning = false;               // the fake compiler reports a warning
     std::vector<std::string> compile_outputs;   // output_object of every compile request
@@ -192,6 +194,8 @@ struct Rig {
                     outcomes[i].warnings.push_back(Diag::make(2201, "the compiler warned about logic.cpp", "Fix it."));
                 }
                 if (fail_compile) {
+                    outcomes[i].diagnostics = compile_errors;
+                    outcomes[i].cwd = compile_cwd;
                     results.emplace_back(Diag::make(2200, "the compiler reported errors in logic.cpp", "Fix the errors."));
                     continue;
                 }
@@ -1173,6 +1177,127 @@ TEST_CASE("reload: failures surface as diag events with the stage's own stable i
         Result<Value> r = rig.reload();
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error().id() == "CML5307");
+    }
+}
+
+// WP-35: the first compiler error's position comes from the parsed ToolDiagnostic.
+TEST_CASE("reload: a compile error carries file, line and column on the diag event and in the control answer (WP-35)") {
+    QuietLogs quiet;
+    const auto error_at = [](const char* file, int line, int column, toolchain::Severity severity = toolchain::Severity::Error) {
+        toolchain::ToolDiagnostic d;
+        d.severity = severity;
+        d.file = file;
+        d.line = line;
+        d.column = column;
+        d.code = "C2059";
+        d.message = "syntax error: ';'";
+        return d;
+    };
+    const auto find_diag = [](Rig& rig) -> Value {
+        for (const Event& e : rig.events->events) {
+            if (e.name == "diag" && e.body.get_string("id") == "CML2200") {
+                return e.body;
+            }
+        }
+        return Value();
+    };
+    SUBCASE("file, line and column of the FIRST error (a warning before it is skipped)") {
+        Rig rig;
+        rig.enable();
+        rig.changed();
+        rig.fail_compile = true;
+        rig.compile_errors = {error_at("C:\\proj\\logic.cpp", 3, 1, toolchain::Severity::Warning), error_at("C:\\proj\\logic.cpp", 12, 15),
+                              error_at("C:\\proj\\other.cpp", 99, 2)};
+        Result<Value> r = rig.reload();
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().file == "C:\\proj\\logic.cpp");
+        CHECK(r.error().line == 12);
+        CHECK(r.error().column == 15);
+        const Value event = find_diag(rig);
+        REQUIRE(event.is_object());
+        CHECK(event.get_string("file") == "C:\\proj\\logic.cpp");
+        CHECK(event.get_integer("line") == 12);
+        CHECK(event.get_integer("column") == 15);
+        // Nothing that existed changed: the text is the same one-line message with the compiler's line appended.
+        CHECK(event.get_string("message").find("First error: C:\\proj\\logic.cpp(12,15): error C2059") != std::string::npos);
+        // The control answer carries the same fields in `diag`, and the broker advertises the capability.
+        ProcessRegistry registry;
+        registry.update(rig.session);
+        ControlContext context;
+        context.version = "0.1.0";
+        context.registry = &registry;
+        context.service = rig.service.get();
+        const std::vector<std::string> caps = broker_capabilities(context);
+        CHECK(std::find(caps.begin(), caps.end(), "diag-locations") != caps.end());
+        rig.changed();
+        Result<Value> answer = ipc::json::parse(handle_control_line(R"({"id":1,"cmd":"reload","args":{"timeout_ms":30000}})", context));
+        REQUIRE(answer.has_value());
+        REQUIRE_FALSE(answer->get_bool("ok"));
+        const Value* diag = answer->find("diag");
+        REQUIRE(diag != nullptr);
+        CHECK(diag->get_string("id") == "CML2200");
+        CHECK(diag->get_string("file") == "C:\\proj\\logic.cpp");
+        CHECK(diag->get_integer("line") == 12);
+        CHECK(diag->get_integer("column") == 15);
+    }
+    SUBCASE("cl prints no column: `file` and `line` only") {
+        Rig rig;
+        rig.enable();
+        rig.changed();
+        rig.fail_compile = true;
+        rig.compile_errors = {error_at("C:\\proj\\logic.cpp", 12, 0)};
+        REQUIRE_FALSE(rig.reload().has_value());
+        const Value event = find_diag(rig);
+        CHECK(event.get_integer("line") == 12);
+        CHECK(event.find("column") == nullptr);
+    }
+    SUBCASE("a relative file name is resolved against the directory the compiler ran in, and normalised") {
+        Rig rig;
+        rig.enable();
+        rig.changed();
+        rig.fail_compile = true;
+        rig.compile_errors = {error_at("..\\src\\logic.cpp", 7, 0)};
+        REQUIRE_FALSE(rig.reload().has_value());
+        const Value event = find_diag(rig);
+        CHECK(event.get_string("file") == "C:\\proj\\src\\logic.cpp");
+        CHECK(event.get_integer("line") == 7);
+    }
+    SUBCASE("no absolute path can be formed: no location, so the clients parse the text") {
+        Rig rig;
+        rig.enable();
+        rig.changed();
+        rig.fail_compile = true;
+        rig.compile_cwd.clear();  // the compiler's directory is unknown
+        rig.compile_errors = {error_at("src\\logic.cpp", 7, 0)};
+        REQUIRE_FALSE(rig.reload().has_value());
+        const Value event = find_diag(rig);
+        REQUIRE(event.is_object());
+        CHECK(event.find("file") == nullptr);
+        CHECK(event.find("line") == nullptr);
+    }
+    SUBCASE("no location when the compiler named none (a command-line error), or no error was parsed") {
+        for (int variant = 0; variant < 2; ++variant) {
+            Rig rig;
+            rig.enable();
+            rig.changed();
+            rig.fail_compile = true;
+            if (variant == 0) {
+                toolchain::ToolDiagnostic d;
+                d.tool = "cl";
+                d.code = "D8003";
+                d.message = "missing source filename";
+                rig.compile_errors = {d};
+            }
+            Result<Value> r = rig.reload();
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error().file.empty());
+            CHECK(r.error().line == 0);
+            const Value event = find_diag(rig);
+            REQUIRE(event.is_object());
+            CHECK(event.find("file") == nullptr);
+            CHECK(event.find("line") == nullptr);
+            CHECK(event.find("column") == nullptr);
+        }
     }
 }
 
