@@ -18,14 +18,16 @@ if(MSVC)
     endforeach()
     # The configuration's own /Od or /O1 /O2 /Ox is removed too: every TU gets an explicit level below, so cl has no level to
     # override (D9025).
-    foreach(_cml_cfg DEBUG RELWITHDEBINFO)
+    foreach(_cml_cfg DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
         string(REGEX REPLACE "(^| )[/-]O[dx12]( |$)" " " CMAKE_CXX_FLAGS_${_cml_cfg} "${CMAKE_CXX_FLAGS_${_cml_cfg}}")
         string(REGEX REPLACE "(^| )[/-]O[dx12]( |$)" " " CMAKE_CXX_FLAGS_${_cml_cfg} "${CMAKE_CXX_FLAGS_${_cml_cfg}}")
     endforeach()
 endif()
 cml_add_fixture(crash_reexecute SOURCES main.cpp step.cpp opt.cpp)
 if(MSVC)
-    set_source_files_properties(main.cpp step.cpp PROPERTIES COMPILE_OPTIONS "/Od")
+    set_source_files_properties(step.cpp PROPERTIES COMPILE_OPTIONS "/Od")
+    # main.cpp keeps the level its configuration would give it (/Od in Debug, /O2 otherwise)
+    set_source_files_properties(main.cpp PROPERTIES COMPILE_OPTIONS "$<IF:$<CONFIG:Debug>,/Od,/O2>")
     set_source_files_properties(opt.cpp PROPERTIES COMPILE_OPTIONS "/O2")
 endif()
 

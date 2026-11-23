@@ -10,7 +10,7 @@
 # folds most of the constructs extras.cpp exists to produce (clang-cl /O2 /Ob0 drops the inline and
 # template COMDATs, static data, string literal and EH personality), so the strict object-format
 # assertions run on this object while the fixture's own objects are checked for what survives.
-# Same source, includes and compile flags as the fixture otherwise (/Gy /hotpatch, exceptions on).
+# Same source, includes and compile flags as the fixture otherwise (/Gy, exceptions on; /hotpatch for clang-cl only, as chameleon_enable does).
 # Own directory: its flag variables are adjusted there (no /O2 /Ob1 for the /Od /Ob0 below, so cl prints no D9025).
 add_subdirectory(extras)
 

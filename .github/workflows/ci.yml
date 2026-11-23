@@ -148,10 +148,9 @@ jobs:
         run: |
           $d2 = 0; $d25 = 0
           foreach ($f in "$env:LOG_DIR/build.log", "$env:LOG_DIR/wp29-examples.txt") {
-            if (Test-Path $f) {
-              $d2 += @(Select-String -Path $f -Pattern 'D9002').Count
-              $d25 += @(Select-String -Path $f -Pattern 'D9025').Count
-            }
+            if (-not (Test-Path $f)) { "WP33-WARN missing log $f"; exit 1 }
+            $d2 += @(Select-String -Path $f -Pattern 'D9002').Count
+            $d25 += @(Select-String -Path $f -Pattern 'D9025').Count
           }
           "WP33-WARN d9002=$d2 d9025=$d25"
           if ($d2 -ne 0 -or $d25 -ne 0) { exit 1 }

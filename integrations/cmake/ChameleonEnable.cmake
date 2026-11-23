@@ -7,11 +7,13 @@
 #
 # Flags (cl and clang-cl, Ninja and Visual Studio generators, every configuration):
 #   compile   /Gy                          function-level linking (CML1105)
-#             /hotpatch                    clang-cl only; cl on x64 does not know it (D9002), its padding comes from
-#                                          /FUNCTIONPADMIN at link time (CML1601)
+#             /hotpatch                    clang-cl only (decided per language); cl on x64 does not know it (D9002), its
+#                                          padding comes from /FUNCTIONPADMIN at link time (CML1601)
 #             /Ob0                         every configuration but Debug (Debug is /Od): no inlining (CML1603). CMake's
-#                                          own /Ob1 /Ob2 are removed from CMAKE_<LANG>_FLAGS_<CONFIG> first (see below),
-#                                          because cl prints D9025 when two /Ob options meet.
+#                                          own /Ob1 /Ob2 are removed from CMAKE_<LANG>_FLAGS_<CONFIG> of the target's
+#                                          directory at the end of that directory's processing (see _cml_defer_inline_strip),
+#                                          because cl prints D9025 when two /Ob options meet. That removal covers every
+#                                          target of the directory, also one that passed ALLOW_INLINING.
 #   link      /DEBUG:FULL /INCREMENTAL:NO  full PDB (CML1101)
 #             /OPT:NOREF /OPT:NOICF /FUNCTIONPADMIN                                              (CML1602, CML1601)
 # Link flags go to executables, shared libraries and modules; static and object libraries get the compile flags only.
@@ -20,7 +22,9 @@
 #
 # Options:
 #   NO_AGENT         do not link Chameleon::agent and do not look for it (the target still gets the flags)
-#   ALLOW_INLINING   leave the optimiser's inlining alone (a target you iterate on should keep it off: CML1603 / CML3104)
+#   ALLOW_INLINING   leave the optimiser's inlining alone (a target you iterate on should keep it off: CML1603 / CML3104).
+#                    Caveat: /Ob1 /Ob2 are removed per directory, so a target with ALLOW_INLINING shares the removal with any
+#                    other chameleon_enable target of its directory; give it its own /Ob2 (target_compile_options) if needed.
 #   NO_COPY_AGENT    link the agent but do not copy cml_agent.dll beside the executable
 #   NO_BUILD_TYPE_CHECK  skip the CMAKE_BUILD_TYPE warning (CML1704); for the repository's own fixtures, which are not user projects
 #
@@ -31,6 +35,46 @@ include_guard(GLOBAL)
 # _cml_enable_message(<FATAL_ERROR|WARNING> <id> <what> <what to do>)
 function(_cml_enable_message severity id what todo)
     message(${severity} "${id}: ${what} What to do: ${todo}")
+endfunction()
+
+# _cml_strip_inline_flags: a macro, so that it runs in the directory scope when deferred. Removes CMake's default /Ob1 and
+# /Ob2 from the non-Debug configuration flags (cl prints D9025 "overriding /Ob1 with /Ob0" for every TU otherwise).
+macro(_cml_strip_inline_flags)
+    foreach(_cml_lang C CXX)
+        foreach(_cml_cfg RELEASE RELWITHDEBINFO MINSIZEREL)
+            if(DEFINED CMAKE_${_cml_lang}_FLAGS_${_cml_cfg})
+                string(REGEX REPLACE "(^| )[/-]Ob[12]( |$)" "\\1" _cml_new "${CMAKE_${_cml_lang}_FLAGS_${_cml_cfg}}")
+                string(REGEX REPLACE "(^| )[/-]Ob[12]( |$)" "\\1" _cml_new "${_cml_new}")
+                string(STRIP "${_cml_new}" _cml_new)
+                set(CMAKE_${_cml_lang}_FLAGS_${_cml_cfg} "${_cml_new}")
+            endif()
+        endforeach()
+    endforeach()
+endmacro()
+
+# _cml_defer_inline_strip(<target>): CMake has no per-target way to drop a configuration flag, and the flags come from the
+# directory that defined the target. So the removal is deferred to the end of that directory (cmake_language(DEFER DIRECTORY),
+# which runs in directory scope whatever the function depth of the caller), once per directory. If that directory has already
+# been processed (the target belongs to a subdirectory and chameleon_enable was called from its parent), nothing can be done
+# any more: CML1712.
+function(_cml_defer_inline_strip target)
+    get_target_property(_dir ${target} SOURCE_DIR)
+    if(NOT _dir)
+        return()
+    endif()
+    set(_cur "${CMAKE_CURRENT_SOURCE_DIR}")
+    string(FIND "${_cur}/" "${_dir}/" _pos)
+    if(NOT _pos EQUAL 0)  # the current directory is neither the target's nor inside it: the target's directory is finished
+        _cml_enable_message(WARNING CML1712
+            "chameleon_enable(${target}): ${target} was created in ${_dir}, which has already been processed, so CMake's default /Ob1 /Ob2 cannot be removed from its flags and cl will print D9025 \"overriding '/Ob1' with '/Ob0'\" for every TU in RelWithDebInfo and Release."
+            "call chameleon_enable in the directory that creates ${target} (at the end of its CMakeLists.txt or in a function it calls).")
+        return()
+    endif()
+    get_property(_done DIRECTORY "${_dir}" PROPERTY CML_INLINE_STRIP_DEFERRED)
+    if(NOT _done)
+        set_property(DIRECTORY "${_dir}" PROPERTY CML_INLINE_STRIP_DEFERRED TRUE)
+        cmake_language(DEFER DIRECTORY "${_dir}" CALL _cml_strip_inline_flags)
+    endif()
 endfunction()
 
 function(chameleon_enable target)
@@ -177,41 +221,23 @@ function(chameleon_enable target)
     # are restricted to C and C++ with single-language genexes. The Visual Studio generators put compile options into
     # the ClCompile item only (and restrict $<COMPILE_LANGUAGE> to single-language targets), so they get plain options.
     # /hotpatch: cl accepts it on x86 only (x64: D9002 "ignoring unknown option"); clang-cl accepts it. Only x64 is
-    # supported here (CML1700), so cl gets none and relies on /FUNCTIONPADMIN for the padding.
-    set(_hotpatch "")
-    if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-        set(_hotpatch /hotpatch)
-    endif()
-    # /Ob1 and /Ob2 come from CMake's default CMAKE_<LANG>_FLAGS_<CONFIG>; cl prints D9025 "overriding /Ob1 with /Ob0"
-    # for every TU when /Ob0 follows. CMake has no per-target way to drop a configuration flag, so they are removed
-    # from the variables in the caller's directory scope (PARENT_SCOPE; nothing outside the directory and its
-    # subdirectories, and the user's cache is untouched). Other targets of that directory lose the default /Ob1 or /Ob2
-    # of the non-Debug configurations too (the compiler's default inlining applies instead of the /O2 level).
-    # The Visual Studio generators turn /Ob into a project property and never print D9025, but the removal is harmless.
+    # supported here (CML1700), so cl gets none and relies on /FUNCTIONPADMIN for the padding. clang-cl's compiler id is
+    # "Clang". The choice is per language (a C-only project has no CMAKE_CXX_COMPILER_ID).
     if(NOT E_ALLOW_INLINING)
-        foreach(_lang C CXX)
-            foreach(_cfg RELEASE RELWITHDEBINFO MINSIZEREL)
-                set(_var CMAKE_${_lang}_FLAGS_${_cfg})
-                if(DEFINED ${_var} AND "${${_var}}" MATCHES "[/-]Ob[12]")
-                    string(REGEX REPLACE "(^| )[/-]Ob[12]( |$)" "\\1" _new "${${_var}}")
-                    string(REGEX REPLACE "(^| )[/-]Ob[12]( |$)" "\\1" _new "${_new}")
-                    string(STRIP "${_new}" _new)
-                    set(${_var} "${_new}" PARENT_SCOPE)
-                endif()
-            endforeach()
-        endforeach()
+        _cml_defer_inline_strip(${target})
     endif()
     if(CMAKE_GENERATOR MATCHES "Visual Studio")
-        target_compile_options(${target} PRIVATE /Gy ${_hotpatch})
+        target_compile_options(${target} PRIVATE /Gy)
+        if(CMAKE_C_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")  # the ClangCL toolset
+            target_compile_options(${target} PRIVATE /hotpatch)
+        endif()
         if(NOT E_ALLOW_INLINING)
             target_compile_options(${target} PRIVATE "$<$<NOT:$<CONFIG:Debug>>:/Ob0>")
         endif()
     else()
         foreach(_lang C CXX)
-            target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:${_lang}>:/Gy>")
-            if(_hotpatch)
-                target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:${_lang}>:/hotpatch>")
-            endif()
+            target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:${_lang}>:/Gy>"
+                "$<$<COMPILE_LANG_AND_ID:${_lang},Clang>:/hotpatch>")
             if(NOT E_ALLOW_INLINING)
                 target_compile_options(${target} PRIVATE "$<$<AND:$<COMPILE_LANGUAGE:${_lang}>,$<NOT:$<CONFIG:Debug>>>:/Ob0>")
             endif()

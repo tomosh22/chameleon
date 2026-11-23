@@ -34,6 +34,8 @@ function(cml_add_enable_test case)
 endfunction()
 
 cml_add_enable_test(good NOT_ID CML17)
+cml_add_enable_test(helper_function NOT_ID CML17)
+cml_add_enable_test(parent_for_subdir EXPECT_ID CML1712)
 cml_add_enable_test(ipo EXPECT_ID CML1705)
 cml_add_enable_test(guard_cf EXPECT_ID CML1706)
 cml_add_enable_test(guard_cf_dir EXPECT_ID CML1706)

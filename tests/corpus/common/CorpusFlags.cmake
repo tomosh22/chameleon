@@ -4,15 +4,16 @@
 #   link:    /DEBUG:FULL, /INCREMENTAL:NO, /OPT:NOREF /OPT:NOICF (every function stays a real body), /FUNCTIONPADMIN
 # Not used: /GL, /guard:cf. Include this file BEFORE add_subdirectory() of the project.
 if(MSVC)
-    # /hotpatch: clang-cl only (cl on x64 prints D9002; /FUNCTIONPADMIN gives the padding)
-    if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-        add_compile_options(/hotpatch)
-    endif()
-    add_compile_options(/Gy)
+    # /hotpatch: clang-cl only, decided per language (cl on x64 prints D9002; /FUNCTIONPADMIN gives the padding; the corpus
+    # includes C projects, where CMAKE_CXX_COMPILER_ID is not set)
+    add_compile_options(/Gy "$<$<COMPILE_LANG_AND_ID:C,Clang>:/hotpatch>" "$<$<COMPILE_LANG_AND_ID:CXX,Clang>:/hotpatch>")
     # drop CMake's /Ob1 /Ob2 so that /Ob0 does not trigger D9025
     foreach(_cfg RELEASE RELWITHDEBINFO MINSIZEREL)
         foreach(_lang C CXX)
-            string(REGEX REPLACE "(^| )[/-]Ob[12]( |$)" "\\1" CMAKE_${_lang}_FLAGS_${_cfg} "${CMAKE_${_lang}_FLAGS_${_cfg}}")
+            if(DEFINED CMAKE_${_lang}_FLAGS_${_cfg})
+                string(REGEX REPLACE "(^| )[/-]Ob[12]( |$)" "\\1" CMAKE_${_lang}_FLAGS_${_cfg} "${CMAKE_${_lang}_FLAGS_${_cfg}}")
+                string(REGEX REPLACE "(^| )[/-]Ob[12]( |$)" "\\1" CMAKE_${_lang}_FLAGS_${_cfg} "${CMAKE_${_lang}_FLAGS_${_cfg}}")
+            endif()
         endforeach()
     endforeach()
     add_compile_options("$<$<CONFIG:RelWithDebInfo>:/Ob0>")

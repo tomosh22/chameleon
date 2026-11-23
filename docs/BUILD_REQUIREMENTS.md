@@ -57,9 +57,11 @@ flags written out by hand.
 `chameleon_enable` prints no compiler driver warnings (WP-33): `/hotpatch` goes to clang-cl only (cl on x64 ignores it with
 D9002; the padding comes from `/FUNCTIONPADMIN`), and CMake's default `/Ob1` or `/Ob2` is removed from the non-Debug
 `CMAKE_<LANG>_FLAGS_<CONFIG>` before `/Ob0` is added, so cl does not print D9025. CMake cannot drop a configuration flag
-for one target, so the removal is made in the calling directory's scope (the variables, not the cache); other targets of
-that directory lose their default `/Ob1` or `/Ob2` too. `ALLOW_INLINING` skips the removal. If you write the flags by
-hand, drop `/hotpatch` for cl x64 and `/Ob1` from your RelWithDebInfo flags the same way.
+for one target, so the removal runs when the directory that created the target finishes (`cmake_language(DEFER)`, once per
+directory, from any function depth); it changes the variables of that directory, not the cache, and applies to every target
+of the directory, including one that passed `ALLOW_INLINING` (give that target its own `/Ob2` option). Call `chameleon_enable`
+in the directory that creates the target: from a parent directory after `add_subdirectory` the removal is too late and
+CML1712 warns. If you write the flags by hand, drop `/hotpatch` for cl x64 and `/Ob1` from your RelWithDebInfo flags the same way.
 
 `/INCREMENTAL` is fine (the thunks jump to the real entry, which is hooked). `tests/fixtures/CmlFixture.cmake` shows
 the recommended flags in CMake form.

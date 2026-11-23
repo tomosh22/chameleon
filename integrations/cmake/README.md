@@ -54,7 +54,9 @@ Each is `message(WARNING|FATAL_ERROR "CML17xx: <what> What to do: <what to do>")
 | CML1710 | error | `Chameleon::agent` does not exist: call `find_package(Chameleon CONFIG REQUIRED)` first, or pass `NO_AGENT` |
 | CML1711 | warning | `chameleon_enable` was called in another directory than the target's; `cml_agent.dll` is not copied |
 
-CML1712-CML1749 are unused. The ids are exercised by the ctest tests `cmake.enable.*` (`integrations/cmake/tests`).
+| CML1712 | warning | the target belongs to a directory that is already processed (`chameleon_enable` called from a parent after `add_subdirectory`): CMake's default `/Ob1` `/Ob2` cannot be removed there and cl prints D9025 |
+
+CML1713-CML1749 are unused. The ids are exercised by the ctest tests `cmake.enable.*` (`integrations/cmake/tests`).
 
 ## The install tree
 

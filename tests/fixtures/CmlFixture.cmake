@@ -20,16 +20,6 @@
 # The C keyword marks a fixture whose sources are C: C++-only options (/EHsc, /GR) are skipped.
 include("${CMAKE_CURRENT_LIST_DIR}/../../integrations/cmake/ChameleonEnable.cmake")
 
-# chameleon_enable() removes CMake's /Ob1 /Ob2 from CMAKE_<LANG>_FLAGS_<CONFIG> in its caller's scope (the cml_add_fixture*
-# function); this macro, used inside those functions, passes the result on to the directory so /Ob0 does not trigger D9025.
-macro(_cml_fixture_propagate_flags)
-    foreach(_lang C CXX)
-        foreach(_cfg RELEASE RELWITHDEBINFO MINSIZEREL)
-            set(CMAKE_${_lang}_FLAGS_${_cfg} "${CMAKE_${_lang}_FLAGS_${_cfg}}" PARENT_SCOPE)
-        endforeach()
-    endforeach()
-endmacro()
-
 function(cml_add_fixture name)
     cmake_parse_arguments(F "C" "" "SOURCES" ${ARGN})
     set(objs fixture_${name}_objs)
@@ -38,7 +28,6 @@ function(cml_add_fixture name)
         cml_target_exceptions_allowed(${objs})
     endif()
     chameleon_enable(${objs} NO_AGENT NO_BUILD_TYPE_CHECK)
-    _cml_fixture_propagate_flags()
     # CML_AGENT_INCLUDE_DIR (WP-13): set by tests/harness/fixture_wrapper when cmltest builds a fixture
     # standalone; in the main tree it is unset and the agent header comes from this repository.
     if(CML_AGENT_INCLUDE_DIR)
@@ -57,7 +46,6 @@ function(cml_add_fixture name)
         add_dependencies(fixture_${name} cml_agent cml_broker)
     endif()
     chameleon_enable(fixture_${name} NO_AGENT NO_BUILD_TYPE_CHECK)
-    _cml_fixture_propagate_flags()
     set_target_properties(fixture_${name} PROPERTIES FOLDER "tests/fixtures")
 endfunction()
 
@@ -72,6 +60,5 @@ function(cml_add_fixture_dll target)
     add_library(${target} SHARED ${F_SOURCES})
     cml_target_exceptions_allowed(${target})
     chameleon_enable(${target} NO_AGENT NO_BUILD_TYPE_CHECK)
-    _cml_fixture_propagate_flags()
     set_target_properties(${target} PROPERTIES FOLDER "tests/fixtures")
 endfunction()
