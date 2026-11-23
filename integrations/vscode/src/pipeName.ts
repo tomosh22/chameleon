@@ -64,23 +64,27 @@ export async function resolveControlPipe(explicitName: string, deps: PipeNameDep
     let sid: string | undefined;
     try {
       sid = parseLogonSid(await deps.run("whoami", ["/groups", "/fo", "csv", "/nh"]));
-      if (!sid) {
-        sid = parseUserSid(await deps.run("whoami", ["/user", "/fo", "csv", "/nh"]));
-      }
     } catch {
       sid = undefined;
     }
     if (sid) {
       name = `${PIPE_PREFIX}cml_control_${sid}`;
     } else {
-      // Last resort: a broker of this user is serving a default-named pipe; take it when it is unambiguous.
+      // No logon-id group visible: a broker of this user serving a default-named pipe is the better guess when it is unambiguous;
+      // the broker itself falls back to the user SID only when its token has no logon-id group at all.
       const found = deps.listPipes().filter((p) => /^cml_control_S-1-/.test(p));
+      let userSid: string | undefined;
+      try {
+        userSid = parseUserSid(await deps.run("whoami", ["/user", "/fo", "csv", "/nh"]));
+      } catch {
+        userSid = undefined;
+      }
       if (found.length === 1) {
         name = PIPE_PREFIX + found[0];
+      } else if (userSid) {
+        name = `${PIPE_PREFIX}cml_control_${userSid}`;
       } else {
-        throw new PipeNameError(
-          "the default control pipe name could not be derived (whoami gave no logon-session SID)",
-        );
+        throw new PipeNameError("the default control pipe name could not be derived (whoami gave no logon-session SID)");
       }
     }
   }
