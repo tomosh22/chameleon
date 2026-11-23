@@ -36,7 +36,7 @@ try {
     $writer.WriteLine(($request | ConvertTo-Json -Compress -Depth 8))
     $task = $reader.ReadLineAsync()
     if (-not $task.Wait($TimeoutMs)) { Write-Host "cml-reload: no answer within $TimeoutMs ms (CML5408)"; exit 2 }
-    Write-Host $task.Result
+    Write-Output $task.Result
     $answer = $task.Result | ConvertFrom-Json
     if ($answer.ok) { exit 0 }
     Write-Host ("{0}: {1} What to do: {2}" -f $answer.diag.id, $answer.diag.message, $answer.diag.action)
