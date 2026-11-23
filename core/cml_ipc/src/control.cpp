@@ -235,10 +235,10 @@ Result<std::variant<ControlResponse, ControlEvent>> decode_server_message(std::s
         d.id = diag->get_string("id");
         d.message = diag->get_string("message");
         d.action = diag->get_string("action");
-        if (const json::Value* line = diag->find("line"); line != nullptr && line->is_integer() && line->as_integer() > 0 &&
+        if (const json::Value* at_line = diag->find("line"); at_line != nullptr && at_line->is_integer() && at_line->as_integer() > 0 &&
                                                           diag->find("file") != nullptr && diag->find("file")->is_string()) {
             d.file = diag->get_string("file");
-            d.line = static_cast<std::uint32_t>(line->as_integer());
+            d.line = static_cast<std::uint32_t>(at_line->as_integer());
             if (const json::Value* column = diag->find("column"); column != nullptr && column->is_integer() && column->as_integer() > 0) {
                 d.column = static_cast<std::uint32_t>(column->as_integer());
             }
