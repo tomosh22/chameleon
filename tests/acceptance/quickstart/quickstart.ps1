@@ -130,11 +130,11 @@ try {
     $r = Run-Prompt @('cd /d C:\chameleon-demo', $setCml, 'cd /d C:\chameleon-demo\hello', 'echo QS-BEGIN', '%CML%\bin\cml_broker.exe check build\smoke_app.exe', 'echo QS-END')
     $body = [regex]::Match($r.Text, '(?s)QS-BEGIN\s*\n(.*?)\n?QS-END').Groups[1].Value
     $lines = $body -split "`r?`n" | Where-Object { $_.Trim() }
-    $fails = $lines | Where-Object { $_ -match '^\s*FAIL' -or $_ -match '\bFAIL\b' }
+    $fails = $lines | Where-Object { $_ -match '^\s*FAIL' }
     $passes = $lines | Where-Object { $_ -match '^\s*PASS' }
-    $other = $lines | Where-Object { $_ -notmatch '^\s*(PASS|WARN)' }
-    if ($other) { Say "QS-NOTE check output has lines not starting with PASS/WARN: $($other -join ' | ')" }
-    Step 7 check (-not $fails -and $passes) "exit=$($r.Code) pass=$(@($passes).Count) fail=$(@($fails).Count) failing: $($fails -join ' | ') output: $($r.Text)"
+    $summary = $lines | Where-Object { $_ -match '^\s*result:' } | Select-Object -First 1
+    $zeroFail = [bool]($summary -match '\b0 FAIL\b')
+    Step 7 check ((-not $fails) -and $passes -and $zeroFail) "exit=$($r.Code) pass=$(@($passes).Count) fail=$(@($fails).Count) summary=[$summary] zero-fail=$zeroFail failing: $($fails -join ' | ') output: $($r.Text)"
 
     # ---- Step 3: broker (second prompt, left running) -------------------------------------------------------
     $broker = Start-BgPrompt 'broker' @('cd /d C:\chameleon-demo', $setCml, '%CML%\bin\cml_broker.exe --headless --verbose')
