@@ -131,6 +131,17 @@ jobs:
             --output-junit "$PWD/$env:LOG_DIR/ctest-junit.xml" *>&1 | Tee-Object -FilePath "$env:LOG_DIR/ctest.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # WP-29: install the finished build, check the install tree (layout, no absolute paths), move it, and build the
+      # example projects (integrations/cmake/examples) against the moved copy with find_package(Chameleon CONFIG) and
+      # chameleon_enable(). `cml_broker check` must report 0 WARN on every example binary. Evidence lines: WP29-INSTALL,
+      # WP29-EXAMPLE <name> <compiler> <config> check=PASS warn=0.
+      - name: WP-29 install tree and CMake examples (find_package + chameleon_enable)
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          ./integrations/cmake/tests/run_examples.ps1 -BuildDir $env:BUILD_DIR -Work wp29-work -Config ${{ matrix.config }} `
+            -Compiler ${{ matrix.compiler }} -Os ${{ matrix.os }} -Generator Ninja -Cxx $env:CML_CXX *>&1 | Tee-Object -FilePath "$env:LOG_DIR/wp29-examples.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       # WP-10 fix evidence: unit.agent_hook is run repeatedly in every cell, because its hang was
       # intermittent (CI runs 41567946950 and 41569481401, windows-2022 clang-cl Debug). Stops at the
       # first failure and prints its output; the last line is
@@ -443,6 +454,12 @@ jobs:
         run: cmake --build build-vs --config Debug --parallel
       - name: Test (Debug)
         run: ctest --test-dir build-vs -C Debug --output-on-failure
+      # WP-29: the same install + examples check with the Visual Studio generator (the examples are built with it too).
+      - name: WP-29 install tree and CMake examples (Visual Studio generator)
+        run: |
+          ./integrations/cmake/tests/run_examples.ps1 -BuildDir build-vs -Work wp29-work -Config Debug -Compiler msvc `
+            -Os windows-2022 -Generator "Visual Studio 17 2022"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: WP-06 link evidence (anchors, binding object)
         if: always()
         run: |
