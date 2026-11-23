@@ -71,6 +71,12 @@ namespace Chameleon.Control
                 _pending[id] = completion;
                 try
                 {
+                    // Fail() sets _closed before it fails the pending requests: checking again after the add closes the gap.
+                    if (!IsOpen)
+                    {
+                        throw new ControlException(ClientDiagnostics.PipeLost(_pipeName, "the connection is closed"));
+                    }
+
                     var request = new JObject { ["id"] = id, ["cmd"] = command };
                     if (args != null)
                     {

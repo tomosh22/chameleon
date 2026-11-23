@@ -35,7 +35,10 @@ namespace Chameleon.Control
         private StatusInfo _status;
         private ConnectionState _state = ConnectionState.Disconnected;
         private CancellationTokenSource _wanted;   // non-null while the user wants a connection (the keep-trying loop runs)
-        private bool _reportedNoBroker;
+        private readonly HashSet<string> _failuresReported = new HashSet<string>();
+        private bool _autoOnly;     // the keep-trying loop was started by auto-connect alone
+        private int _generation;    // bumped by Disconnect/Dispose: an attempt that started earlier is stale
+        private ConnectionState _lastRaised = ConnectionState.Disconnected;
         private bool _disposed;
 
         public BrokerSession(
@@ -96,9 +99,11 @@ namespace Chameleon.Control
                 {
                     _wanted = new CancellationTokenSource();
                 }
+
+                _autoOnly = false;   // the user chose Connect: switching auto-connect off no longer stops it
             }
 
-            bool connected = await TryConnectOnceAsync(cancellationToken).ConfigureAwait(false);
+            bool connected = await TryConnectOnceAsync(cancellationToken, announce: true).ConfigureAwait(false);
             if (!connected)
             {
                 StartKeepTrying();
@@ -120,10 +125,34 @@ namespace Chameleon.Control
                 if (_wanted == null)
                 {
                     _wanted = new CancellationTokenSource();
+                    _autoOnly = true;
                 }
             }
 
             StartKeepTrying();
+        }
+
+        /// <summary>
+        /// Auto-connect was switched off: stops the keep-trying loop if only auto-connect started it. A connection that exists stays;
+        /// one the user asked for with Connect is untouched.
+        /// </summary>
+        public void StopAutoConnect()
+        {
+            CancellationTokenSource wanted = null;
+            lock (_gate)
+            {
+                if (_autoOnly && _wanted != null)
+                {
+                    wanted = _wanted;
+                    _wanted = null;
+                    _autoOnly = false;
+                }
+            }
+
+            if (wanted != null)
+            {
+                wanted.Cancel();
+            }
         }
 
         public void Disconnect()
@@ -134,9 +163,12 @@ namespace Chameleon.Control
             {
                 wanted = _wanted;
                 _wanted = null;
+                _autoOnly = false;
                 client = _client;
                 _client = null;
                 _status = null;
+                _generation++;   // an attempt in flight is stale from now on
+                _state = ConnectionState.Disconnected;
             }
 
             if (wanted != null)
@@ -149,7 +181,7 @@ namespace Chameleon.Control
                 client.Dispose();
             }
 
-            SetState(ConnectionState.Disconnected);
+            RaiseState(ConnectionState.Disconnected);
         }
 
         private CancellationTokenSource _loopFor;   // the `_wanted` source whose keep-trying loop is running
@@ -176,24 +208,43 @@ namespace Chameleon.Control
                     int attempt = 0;
                     while (!token.IsCancellationRequested)
                     {
-                        if (State == ConnectionState.Connected)
+                        try
                         {
-                            await Task.Delay(500, token).ConfigureAwait(false);
-                            attempt = 0;
-                            continue;
-                        }
+                            if (State == ConnectionState.Connected)
+                            {
+                                await Task.Delay(500, token).ConfigureAwait(false);
+                                attempt = 0;
+                                continue;
+                            }
 
-                        await Task.Delay(_retryDelay(attempt++), token).ConfigureAwait(false);
-                        await TryConnectOnceAsync(token).ConfigureAwait(false);
+                            await Task.Delay(_retryDelay(attempt++), token).ConfigureAwait(false);
+                            await TryConnectOnceAsync(token, announce: false).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            throw;
+                        }
+                        catch (Exception ex)
+                        {
+                            // One bad round must not end reconnection for good.
+                            _log("keep-trying round failed: " + ex.Message);
+                            await Task.Delay(1000, token).ConfigureAwait(false);
+                        }
                     }
                 }
                 catch (OperationCanceledException)
                 {
                     // Disconnect
                 }
-                catch (Exception ex)
+                finally
                 {
-                    _log("keep-trying loop ended: " + ex.Message);
+                    lock (_gate)
+                    {
+                        if (ReferenceEquals(_loopFor, wanted))
+                        {
+                            _loopFor = null;
+                        }
+                    }
                 }
             });
         }
@@ -203,8 +254,13 @@ namespace Chameleon.Control
             return TimeSpan.FromSeconds(attempt < 3 ? 1 : 2);
         }
 
-        private async Task<bool> TryConnectOnceAsync(CancellationToken cancellationToken)
+        /// <param name="announce">
+        /// True for an attempt the user asked for: "connecting" is shown. The keep-trying loop is silent, so a missing broker is one
+        /// CML5994 and no state line every second.
+        /// </param>
+        private async Task<bool> TryConnectOnceAsync(CancellationToken cancellationToken, bool announce)
         {
+            int generation;
             lock (_gate)
             {
                 if (_state != ConnectionState.Disconnected || _disposed)
@@ -213,18 +269,25 @@ namespace Chameleon.Control
                 }
 
                 _state = ConnectionState.Connecting;
+                generation = _generation;
             }
 
-            RaiseState(ConnectionState.Connecting);
+            if (announce)
+            {
+                RaiseState(ConnectionState.Connecting);
+            }
+
             string pipe = null;
             ControlClient client = null;
+            ChameleonDiagnostic failure = null;
             try
             {
                 pipe = PipeNames.Resolve(_settings.PipeName, _getEnvironment, _logonSid);
                 System.IO.Stream stream = await _connector.ConnectAsync(pipe, _settings.ConnectTimeoutMs, cancellationToken).ConfigureAwait(false);
                 client = new ControlClient(stream, pipe);
+                ControlClient mine = client;
                 client.EventReceived += OnClientEvent;
-                client.ConnectionLost += diag => OnClientLost(client, diag);
+                client.ConnectionLost += diag => OnClientLost(mine, diag);
                 client.Start();
 
                 ControlResponse status = await client.CallAsync("status", null, 10000, cancellationToken).ConfigureAwait(false);
@@ -242,91 +305,95 @@ namespace Chameleon.Control
 
                 await SubscribeAsync(client, info, cancellationToken).ConfigureAwait(false);
 
+                bool installed = false;
+                bool stale = false;
                 lock (_gate)
                 {
-                    if (_disposed || _wanted == null)
+                    if (_disposed || _wanted == null || generation != _generation)
                     {
-                        // Disconnect was chosen while we connected.
-                        client.Dispose();
-                        client = null;
+                        stale = true;   // Disconnect was chosen meanwhile: this attempt must not touch the state
+                    }
+                    else if (!client.IsOpen)
+                    {
+                        // The pipe was lost after the answers and before we got here: no connection, whatever the answers said.
+                        throw new ControlException(ClientDiagnostics.PipeLost(pipe, "the broker closed the connection while connecting"));
                     }
                     else
                     {
                         _client = client;
                         _status = info;
                         _state = ConnectionState.Connected;
-                        _reportedNoBroker = false;
+                        _failuresReported.Clear();
+                        installed = true;
                     }
                 }
 
-                if (client == null)
+                if (stale)
                 {
-                    lock (_gate) { _state = ConnectionState.Disconnected; }
-                    RaiseState(ConnectionState.Disconnected);
+                    client.Dispose();
                     return false;
                 }
 
-                _log("connected to " + pipe + ": " + info);
-                RaiseState(ConnectionState.Connected);
-                return true;
+                if (installed)
+                {
+                    _log("connected to " + pipe + ": " + info);
+                    RaiseState(ConnectionState.Connected);
+                }
+
+                return installed;
             }
             catch (OperationCanceledException)
             {
-                if (client != null)
-                {
-                    client.Dispose();
-                }
-
-                lock (_gate) { _state = ConnectionState.Disconnected; }
-                RaiseState(ConnectionState.Disconnected);
-                return false;
+                // Disconnect or dispose; the state was dealt with there.
             }
             catch (ControlException ex)
             {
-                if (client != null)
-                {
-                    client.Dispose();
-                }
-
-                lock (_gate) { _state = ConnectionState.Disconnected; }
-                RaiseState(ConnectionState.Disconnected);
-                ReportConnectFailure(ex.Diagnostic);
-                return false;
+                failure = ex.Diagnostic;
             }
             catch (Exception ex)
             {
-                if (client != null)
-                {
-                    client.Dispose();
-                }
-
-                lock (_gate) { _state = ConnectionState.Disconnected; }
-                RaiseState(ConnectionState.Disconnected);
-                ReportConnectFailure(ClientDiagnostics.NoBroker(pipe ?? "(unresolved)", ex.Message));
-                return false;
+                failure = ClientDiagnostics.NoBroker(pipe ?? "(unresolved)", ex.Message);
             }
+
+            if (client != null)
+            {
+                client.Dispose();
+            }
+
+            bool ours;
+            lock (_gate)
+            {
+                ours = generation == _generation && !_disposed;
+                if (ours)
+                {
+                    _state = ConnectionState.Disconnected;
+                }
+            }
+
+            if (ours)
+            {
+                RaiseState(ConnectionState.Disconnected);
+                if (failure != null)
+                {
+                    ReportConnectFailure(failure);
+                }
+            }
+
+            return false;
         }
 
+        // The keep-trying loop would repeat a failure every second: each diagnostic id is reported once per episode (until a connect works).
         private void ReportConnectFailure(ChameleonDiagnostic diagnostic)
         {
-            // While nobody started a broker yet the keep-trying loop would repeat CML5994 every second: say it once per episode.
-            bool report = true;
-            if (diagnostic.Id == ClientDiagIds.NoBroker)
+            bool report;
+            lock (_gate)
             {
-                lock (_gate)
-                {
-                    report = !_reportedNoBroker;
-                    _reportedNoBroker = true;
-                }
+                report = _failuresReported.Add(diagnostic.Id);
             }
 
             if (report)
             {
-                Action<ChameleonDiagnostic> handler = DiagnosticRaised;
-                if (handler != null)
-                {
-                    handler(diagnostic);
-                }
+                RaiseDiagnostic(diagnostic);
             }
         }
 
@@ -424,18 +491,19 @@ namespace Chameleon.Control
             }
         }
 
-        private void SetState(ConnectionState state)
+        // Only real transitions are announced.
+        private void RaiseState(ConnectionState state)
         {
             lock (_gate)
             {
-                _state = state;
+                if (_lastRaised == state)
+                {
+                    return;
+                }
+
+                _lastRaised = state;
             }
 
-            RaiseState(state);
-        }
-
-        private void RaiseState(ConnectionState state)
-        {
             Action<ConnectionState> handler = StateChanged;
             if (handler != null)
             {
@@ -557,6 +625,7 @@ namespace Chameleon.Control
                 }
 
                 _disposed = true;
+                _generation++;
                 client = _client;
                 _client = null;
                 wanted = _wanted;

@@ -85,9 +85,16 @@ namespace Chameleon.Vsix
 
             bool wasAuto = _settings.AutoConnect;
             options.CopyTo(_settings);
-            if (_settings.AutoConnect && !wasAuto && Controller != null)
+            if (Controller != null)
             {
-                Controller.Session.StartAutoConnect();
+                if (_settings.AutoConnect && !wasAuto)
+                {
+                    Controller.Session.StartAutoConnect();
+                }
+                else if (!_settings.AutoConnect && wasAuto)
+                {
+                    Controller.Session.StopAutoConnect();
+                }
             }
         }
 

@@ -25,7 +25,7 @@ namespace Chameleon.Control
 
         // cl, clang-cl, link: path(line[,col]) :
         private static readonly Regex Msvc = new Regex(
-            @"(?<file>(?:[A-Za-z]:[\\/]|\\\\)[^\r\n():*?""<>|]+?|[^\s():*?""<>|]+\.(?:cpp|cc|cxx|c|hpp|hxx|hh|h|inl|ixx|cppm))\((?<line>\d+)(?:,(?<col>\d+))?\)\s*:",
+            @"(?<file>(?:[A-Za-z]:[\\/]|\\\\)[^\r\n:*?""<>|]+?|[^\s():*?""<>|]+\.(?:cpp|cc|cxx|c|hpp|hxx|hh|h|inl|ixx|cppm))\((?<line>\d+)(?:,(?<col>\d+))?\)\s*:",
             RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
         // clang, gcc style: C:\path:line[:col]:

@@ -14,6 +14,8 @@ namespace Chameleon.Control.Tests
         [InlineData(@"C:\src\a.cpp:40:9: error: use of undeclared identifier 'y'", @"C:\src\a.cpp", 40, 9)]
         [InlineData(@"C:\src\a.cpp:40: error: oops", @"C:\src\a.cpp", 40, 0)]
         [InlineData(@"logic.cpp(8): error C2143: syntax error", "logic.cpp", 8, 0)]
+        [InlineData(@"C:\Program Files (x86)\Microsoft Visual Studio\a.cpp(12,3): error C1", @"C:\Program Files (x86)\Microsoft Visual Studio\a.cpp", 12, 3)]
+        [InlineData(@"C:\src\dir (2)\sub (3)\b.cpp(7): warning C4100", @"C:\src\dir (2)\sub (3)\b.cpp", 7, 0)]
         [InlineData(@"In file included from C:\inc\h.hpp(3,1): note: here", @"C:\inc\h.hpp", 3, 1)]
         public void FindsTheFileLineAndColumnOfACompilerMessage(string text, string file, int line, int column)
         {
@@ -116,6 +118,33 @@ namespace Chameleon.Control.Tests
             Assert.Equal(10, s.Processes[0].Pid);
             Assert.True(s.Processes[0].Modules[0].Enabled);
             Assert.Equal("ready", s.Processes[0].Modules[0].IndexState);
+        }
+
+        [Fact]
+        public void AnErrorAnswerAndTheDiagEventOfOneFailureAreShownOnce()
+        {
+            var dedupe = new DiagnosticDedupe(System.TimeSpan.FromSeconds(10));
+            OutputLine fromEvent = EventFormatter.Format(Event(
+                "{\"event\":\"diag\",\"id\":\"CML2201\",\"message\":\"C:\\\\a\\\\b.cpp(3): error C1\",\"action\":\"fix it\",\"severity\":\"error\",\"stage\":\"compile\"}"));
+            OutputLine fromAnswer = EventFormatter.Format(new BrokerError { Id = "CML2201", Message = @"C:\a\b.cpp(3): error C1", Action = "fix it" });
+            OutputLine other = EventFormatter.Format(new BrokerError { Id = "CML2201", Message = "another failure", Action = "fix it" });
+
+            Assert.Equal(fromEvent.DedupeKey, fromAnswer.DedupeKey);
+            Assert.False(dedupe.SeenRecently(fromAnswer));
+            dedupe.Remember(fromEvent);
+            Assert.True(dedupe.SeenRecently(fromAnswer));
+            Assert.False(dedupe.SeenRecently(other));
+        }
+
+        [Fact]
+        public void TheDedupeWindowExpires()
+        {
+            System.DateTime now = new System.DateTime(2026, 1, 1, 0, 0, 0, System.DateTimeKind.Utc);
+            var dedupe = new DiagnosticDedupe(System.TimeSpan.FromSeconds(10), () => now);
+            OutputLine line = EventFormatter.Format(new BrokerError { Id = "CML1", Message = "m", Action = "a" });
+            dedupe.Remember(line);
+            now += System.TimeSpan.FromSeconds(11);
+            Assert.False(dedupe.SeenRecently(line));
         }
     }
 }

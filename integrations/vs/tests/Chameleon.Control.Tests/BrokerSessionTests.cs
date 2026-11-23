@@ -267,5 +267,125 @@ namespace Chameleon.Control.Tests
             Assert.Null(BrokerSession.ChooseTarget(status, new int[0]));
             Assert.Null(BrokerSession.ChooseTarget(null, new[] { 10 }));
         }
+
+        [Fact]
+        public async Task ARetryingSessionAnnouncesOnlyRealTransitions()
+        {
+            string name = PipeNames.Prefix + "cml_vs_quiet_" + Guid.NewGuid().ToString("N").Substring(0, 10);
+            var settings = new ChameleonSettings { PipeName = name, ConnectTimeoutMs = 50 };
+            var states = new List<ConnectionState>();
+            var diagnostics = new List<ChameleonDiagnostic>();
+            using (var session = new BrokerSession(new NamedPipeConnector(), settings, _ => { }, retryDelay: _ => TimeSpan.FromMilliseconds(20)))
+            {
+                session.StateChanged += s => { lock (states) { states.Add(s); } };
+                session.DiagnosticRaised += d => { lock (diagnostics) { diagnostics.Add(d); } };
+                Assert.False(await session.ConnectAsync());
+                await Task.Delay(400);   // many silent retries
+                lock (states) { Assert.Equal(new[] { ConnectionState.Connecting, ConnectionState.Disconnected }, states.ToArray()); }
+                lock (diagnostics) { Assert.Single(diagnostics); }
+            }
+        }
+
+        [Fact]
+        public async Task EveryFailureIdIsReportedOncePerEpisode()
+        {
+            using (var broker = new FakeBroker())
+            using (var h = new Harness(broker))
+            {
+                broker.StatusError = true;   // not a Chameleon broker: CML5996 on every attempt
+                Assert.False(await h.Session.ConnectAsync());
+                await Task.Delay(400);
+                Assert.Equal(new[] { ClientDiagIds.Unsupported }, h.DiagIds().ToArray());
+                Assert.True(broker.Connections > 2);
+
+                // A successful connect ends the episode: the next failure is reported again.
+                broker.StatusError = false;
+                Assert.True(await WaitAsync(() => h.Session.State == ConnectionState.Connected));
+                broker.StatusError = true;
+                broker.Drop();
+                Assert.True(await WaitAsync(() => h.DiagIds().Count(i => i == ClientDiagIds.Unsupported) == 2));
+            }
+        }
+
+        [Fact]
+        public async Task APipeLostRightAfterTheSubscribeAnswerLeavesTheSessionDisconnected()
+        {
+            using (var broker = new FakeBroker())
+            using (var h = new Harness(broker))
+            {
+                h.Settings.AutoReconnect = false;
+                broker.DropAfter = "subscribe";
+                await h.Session.ConnectAsync();
+                Assert.True(await WaitAsync(() => h.Session.State == ConnectionState.Disconnected && h.DiagIds().Contains(ClientDiagIds.PipeLost)));
+                await Task.Delay(200);
+                Assert.Equal(ConnectionState.Disconnected, h.Session.State);
+                Assert.False(h.Session.Supports("reload"));
+            }
+        }
+
+        private sealed class GatedConnector : IPipeConnector
+        {
+            public readonly TaskCompletionSource<bool> Release = new TaskCompletionSource<bool>();
+            public readonly TaskCompletionSource<bool> Entered = new TaskCompletionSource<bool>();
+            private int _calls;
+
+            public async Task<System.IO.Stream> ConnectAsync(string fullPipeName, int timeoutMs, CancellationToken cancellationToken)
+            {
+                if (Interlocked.Increment(ref _calls) == 1)
+                {
+                    Entered.TrySetResult(true);
+                    await Release.Task;
+                }
+
+                return await new NamedPipeConnector().ConnectAsync(fullPipeName, timeoutMs, cancellationToken);
+            }
+        }
+
+        [Fact]
+        public async Task ADisconnectDuringAnAttemptMakesThatAttemptStaleAndTheNextConnectWorks()
+        {
+            using (var broker = new FakeBroker())
+            {
+                var settings = new ChameleonSettings { PipeName = broker.FullName, ConnectTimeoutMs = 500 };
+                var gate = new GatedConnector();
+                using (var session = new BrokerSession(gate, settings, _ => { }, retryDelay: _ => TimeSpan.FromMilliseconds(20)))
+                {
+                    Task<bool> first = session.ConnectAsync();
+                    await gate.Entered.Task;
+                    session.Disconnect();
+                    Assert.Equal(ConnectionState.Disconnected, session.State);
+
+                    // A new attempt while the stale one is still in flight.
+                    Assert.True(await session.ConnectAsync());
+                    Assert.Equal(ConnectionState.Connected, session.State);
+
+                    gate.Release.SetResult(true);
+                    Assert.False(await first);   // stale: it did not install its client
+                    Assert.Equal(ConnectionState.Connected, session.State);
+                    Assert.True(session.Supports("reload"));
+                    ControlResponse r = await session.ReloadAsync(null, false);
+                    Assert.True(r.Ok);
+                }
+            }
+        }
+
+        [Fact]
+        public async Task StopAutoConnectStopsOnlyWhatAutoConnectStarted()
+        {
+            string name = PipeNames.Prefix + "cml_vs_auto_" + Guid.NewGuid().ToString("N").Substring(0, 10);
+            var settings = new ChameleonSettings { PipeName = name, ConnectTimeoutMs = 50 };
+            using (var session = new BrokerSession(new NamedPipeConnector(), settings, _ => { }, retryDelay: _ => TimeSpan.FromMilliseconds(20)))
+            {
+                session.StartAutoConnect();
+                Assert.True(session.WantsConnection);
+                session.StopAutoConnect();
+                Assert.False(session.WantsConnection);
+
+                session.StartAutoConnect();
+                await session.ConnectAsync();     // the user chose Connect
+                session.StopAutoConnect();
+                Assert.True(session.WantsConnection);
+            }
+        }
     }
 }

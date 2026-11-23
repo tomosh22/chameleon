@@ -45,7 +45,7 @@ namespace Chameleon.Vsix
             {
                 Category = TaskCategory.User,
                 ErrorCategory = line.Severity == OutputSeverity.Error ? TaskErrorCategory.Error : TaskErrorCategory.Warning,
-                Text = line.Id + ": " + line.Message,
+                Text = line.Id + ": " + line.Message + (string.IsNullOrEmpty(line.Action) ? "" : " What to do: " + line.Action),
             };
             if (line.Location != null)
             {

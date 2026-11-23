@@ -23,7 +23,7 @@ namespace Chameleon.Vsix
         private readonly VsDebuggerAttach _debugger;
         private readonly ChameleonSettings _settings;
         private readonly Func<bool> _persistToggle;
-        private readonly Dictionary<string, DateTime> _recentDiagnostics = new Dictionary<string, DateTime>();
+        private readonly DiagnosticDedupe _shown = new DiagnosticDedupe(TimeSpan.FromSeconds(10));
 
         public ChameleonController(
             ChameleonPackage package,
@@ -43,6 +43,7 @@ namespace Chameleon.Vsix
             Session = new BrokerSession(new NamedPipeConnector(), settings, _output.WriteLine);
             Reattach = new ReattachCoordinator(debugger, settings, ReportDiagnostic, _output.WriteLine);
             Session.DiagnosticRaised += ReportDiagnostic;
+            // Only real transitions arrive here (BrokerSession keeps the retry loop silent).
             Session.StateChanged += state => _output.WriteLine("broker: " + state.ToString().ToLowerInvariant());
             Session.EventReceived += OnBrokerEvent;
             debugger.Changed += Reattach.Observe;
@@ -59,10 +60,7 @@ namespace Chameleon.Vsix
             if (line != null)
             {
                 Write(line);
-                if (line.Id != null)
-                {
-                    Remember(line);
-                }
+                _shown.Remember(line);
 
                 if (ev.Name == "diag" || ev.Name == "patch_applied")
                 {
@@ -137,28 +135,10 @@ namespace Chameleon.Vsix
             });
         }
 
-        // An error answer and the diag event for the same failure are one message to the user.
-        private void Remember(OutputLine line)
-        {
-            lock (_recentDiagnostics)
-            {
-                _recentDiagnostics[line.Id + "|" + line.Message] = DateTime.UtcNow;
-            }
-        }
-
-        private bool SeenRecently(OutputLine line)
-        {
-            lock (_recentDiagnostics)
-            {
-                DateTime when;
-                return _recentDiagnostics.TryGetValue(line.Id + "|" + line.Message, out when) && DateTime.UtcNow - when < TimeSpan.FromSeconds(10);
-            }
-        }
-
         private void WriteBrokerError(BrokerError error)
         {
             OutputLine line = EventFormatter.Format(error);
-            if (!SeenRecently(line))
+            if (!_shown.SeenRecently(line))
             {
                 Write(line);
             }
@@ -304,8 +284,8 @@ namespace Chameleon.Vsix
                 return;
             }
 
-            long oldPid = r.Result["old_pid"] != null ? r.Result["old_pid"].Value<long>() : 0;
-            long newPid = r.Result["new_pid"] != null ? r.Result["new_pid"].Value<long>() : 0;
+            long oldPid = Json.Long(r.Result["old_pid"]) ?? 0;
+            long newPid = Json.Long(r.Result["new_pid"]) ?? 0;
             JToken ms = r.Result["restart_ms"];
             _output.WriteLine("hot-restart ok: pid " + oldPid + " is now pid " + newPid + (ms != null ? ", " + ms + " ms" : ""));
             if (oldPid > 0 && newPid > 0)

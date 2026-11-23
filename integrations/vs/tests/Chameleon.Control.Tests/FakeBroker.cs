@@ -48,6 +48,12 @@ namespace Chameleon.Control.Tests
         /// <summary>Make `subscribe` fail when it names this event (older broker).</summary>
         public string RefuseEvent { get; set; }
 
+        /// <summary>Close the connection right after answering this command.</summary>
+        public string DropAfter { get; set; }
+
+        /// <summary>Answer `status` with an error (not a Chameleon broker).</summary>
+        public bool StatusError { get; set; }
+
         public int Connections { get; private set; }
 
         public List<JObject> Requests()
@@ -144,6 +150,11 @@ namespace Chameleon.Control.Tests
                         {
                             Write(server, reply);
                         }
+
+                        if (DropAfter != null && DropAfter == (string)request["cmd"])
+                        {
+                            break;
+                        }
                     }
                 }
                 catch (Exception)
@@ -171,6 +182,11 @@ namespace Chameleon.Control.Tests
         {
             string cmd = (string)request["cmd"];
             long id = (long)request["id"];
+            if (cmd == "status" && StatusError)
+            {
+                return new[] { Error(id, "CML5402", "unknown command") };
+            }
+
             if (cmd == "status")
             {
                 var result = new JObject

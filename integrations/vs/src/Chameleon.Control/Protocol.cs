@@ -10,6 +10,23 @@ namespace Chameleon.Control
     /// <summary>JSON helpers: the broker's text is taken as it is (no date or float conversion).</summary>
     public static class Json
     {
+        /// <summary>The string value of a member, or null when it is missing or not a string.</summary>
+        public static string Str(JToken token)
+        {
+            return token != null && token.Type == JTokenType.String ? token.Value<string>() : null;
+        }
+
+        /// <summary>The integer value of a member, or null when it is missing or not an integer.</summary>
+        public static long? Long(JToken token)
+        {
+            return token != null && token.Type == JTokenType.Integer ? token.Value<long>() : (long?)null;
+        }
+
+        public static bool Bool(JToken token)
+        {
+            return token != null && token.Type == JTokenType.Boolean && token.Value<bool>();
+        }
+
         public static JObject ParseObject(string text)
         {
             using (var reader = new JsonTextReader(new StringReader(text)))
@@ -53,19 +70,17 @@ namespace Chameleon.Control
         public static ControlResponse Parse(JObject obj)
         {
             var response = new ControlResponse();
-            JToken id = obj["id"];
-            response.Id = id != null && id.Type == JTokenType.Integer ? id.Value<long>() : -1;
-            JToken ok = obj["ok"];
-            response.Ok = ok != null && ok.Type == JTokenType.Boolean && ok.Value<bool>();
+            response.Id = Json.Long(obj["id"]) ?? -1;
+            response.Ok = Json.Bool(obj["ok"]);
             response.Result = obj["result"] as JObject ?? new JObject();
             var diag = obj["diag"] as JObject;
             if (diag != null)
             {
                 response.Error = new BrokerError
                 {
-                    Id = (string)diag["id"] ?? "",
-                    Message = (string)diag["message"] ?? "",
-                    Action = (string)diag["action"] ?? "",
+                    Id = Json.Str(diag["id"]) ?? "",
+                    Message = Json.Str(diag["message"]) ?? "",
+                    Action = Json.Str(diag["action"]) ?? "",
                 };
             }
             else if (!response.Ok)
@@ -163,7 +178,7 @@ namespace Chameleon.Control
 
         public static StatusInfo FromResult(JObject result)
         {
-            var info = new StatusInfo { Version = (string)result["version"] ?? "" };
+            var info = new StatusInfo { Version = Json.Str(result["version"]) ?? "" };
             var caps = result["capabilities"] as JArray;
             if (caps != null)
             {
@@ -182,12 +197,13 @@ namespace Chameleon.Control
                 foreach (JToken p in processes)
                 {
                     var po = p as JObject;
-                    if (po == null || po["pid"] == null || po["pid"].Type != JTokenType.Integer)
+                    long? pid = po != null ? Json.Long(po["pid"]) : null;
+                    if (!pid.HasValue || pid.Value <= 0 || pid.Value > int.MaxValue)
                     {
                         continue;
                     }
 
-                    var ps = new ProcessStatus { Pid = (int)po["pid"].Value<long>() };
+                    var ps = new ProcessStatus { Pid = (int)pid.Value };
                     var modules = po["modules"] as JArray;
                     if (modules != null)
                     {
@@ -201,9 +217,9 @@ namespace Chameleon.Control
 
                             ps.Modules.Add(new ModuleStatus
                             {
-                                Path = (string)mo["path"] ?? "",
-                                Enabled = mo["enabled"] != null && mo["enabled"].Type == JTokenType.Boolean && mo["enabled"].Value<bool>(),
-                                IndexState = (mo["index"] as JObject != null ? (string)mo["index"]["state"] : null) ?? "",
+                                Path = Json.Str(mo["path"]) ?? "",
+                                Enabled = Json.Bool(mo["enabled"]),
+                                IndexState = Json.Str((mo["index"] as JObject)?["state"]) ?? "",
                             });
                         }
                     }

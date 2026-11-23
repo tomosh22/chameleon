@@ -16,13 +16,14 @@ namespace Chameleon.Control
     /// <summary>One line for the Output pane, and the source position it names (if any), for the Error List.</summary>
     public sealed class OutputLine
     {
-        public OutputLine(string text, OutputSeverity severity, DiagnosticLocation location = null, string id = null, string message = null)
+        public OutputLine(string text, OutputSeverity severity, DiagnosticLocation location = null, string id = null, string message = null, string action = null)
         {
             Text = text;
             Severity = severity;
             Location = location;
             Id = id;
             Message = message;
+            Action = action;
         }
 
         public string Text { get; }
@@ -32,6 +33,57 @@ namespace Chameleon.Control
         /// <summary>The diagnostic id (diag events) and its text, for the Error List.</summary>
         public string Id { get; }
         public string Message { get; }
+
+        /// <summary>The "what to do" sentence, when there is one.</summary>
+        public string Action { get; }
+
+        /// <summary>The same failure arrives as an error answer and as a diag event; both give the same key.</summary>
+        public string DedupeKey
+        {
+            get { return Id == null ? null : Id + "|" + Message; }
+        }
+    }
+
+    /// <summary>Remembers the diagnostics already shown, so an error answer and the diag event for one failure are printed once.</summary>
+    public sealed class DiagnosticDedupe
+    {
+        private readonly System.Collections.Generic.Dictionary<string, DateTime> _seen = new System.Collections.Generic.Dictionary<string, DateTime>();
+        private readonly TimeSpan _window;
+        private readonly Func<DateTime> _now;
+
+        public DiagnosticDedupe(TimeSpan window, Func<DateTime> now = null)
+        {
+            _window = window;
+            _now = now ?? (() => DateTime.UtcNow);
+        }
+
+        /// <summary>Records the line (diagnostics only).</summary>
+        public void Remember(OutputLine line)
+        {
+            if (line.DedupeKey == null)
+            {
+                return;
+            }
+
+            lock (_seen)
+            {
+                _seen[line.DedupeKey] = _now();
+            }
+        }
+
+        public bool SeenRecently(OutputLine line)
+        {
+            if (line.DedupeKey == null)
+            {
+                return false;
+            }
+
+            lock (_seen)
+            {
+                DateTime when;
+                return _seen.TryGetValue(line.DedupeKey, out when) && _now() - when < _window;
+            }
+        }
     }
 
     /// <summary>Turns the broker's events and the extension's own diagnostics into Output pane text.</summary>
@@ -69,7 +121,8 @@ namespace Chameleon.Control
                 diagnostic.IsError ? OutputSeverity.Error : OutputSeverity.Warning,
                 null,
                 diagnostic.Id,
-                diagnostic.Message + " What to do: " + diagnostic.Action);
+                diagnostic.Message,
+                diagnostic.Action);
         }
 
         public static OutputLine Format(BrokerError error)
@@ -77,7 +130,7 @@ namespace Chameleon.Control
             string text = "error " + error.Id + ": " + error.Message + (string.IsNullOrEmpty(error.Action) ? "" : " What to do: " + error.Action);
             DiagnosticLocation location;
             DiagnosticLocation.TryParse(error.Message, out location);
-            return new OutputLine(Navigable(location, text), OutputSeverity.Error, location, error.Id, error.Message);
+            return new OutputLine(Navigable(location, text), OutputSeverity.Error, location, error.Id, error.Message, error.Action);
         }
 
         private static OutputLine FormatDiag(BrokerEvent ev)
@@ -100,7 +153,8 @@ namespace Chameleon.Control
                 warning ? OutputSeverity.Warning : OutputSeverity.Error,
                 location,
                 id,
-                message + (string.IsNullOrEmpty(action) ? "" : " What to do: " + action));
+                message,
+                action);
         }
 
         // The Output window turns "path(line,col): ..." at the start of a line into a link to the source.
@@ -117,7 +171,7 @@ namespace Chameleon.Control
 
         private static OutputLine FormatException(BrokerEvent ev)
         {
-            string actions = string.Join(", ", (ev.Body["actions"] as JArray ?? new JArray()).Select(a => (string)a));
+            string actions = string.Join(", ", (ev.Body["actions"] as JArray ?? new JArray()).Select(a => Json.Str(a) ?? "?"));
             string text = string.Format(
                 CultureInfo.InvariantCulture,
                 "exception {0} in pid {1} thread {2} at {3}!{4}+{5}; the thread is held until an action is chosen ({6}) with cml_ui or 'exception-action'",
