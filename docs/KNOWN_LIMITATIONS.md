@@ -152,3 +152,12 @@ diagnostic is planned, not live.
 - **Fuzzing (WP-28)** covers the COFF, PE, PDB, IPC and control-JSON readers.
   - Not fuzzed: the hook decoder, the user-hook scanner, the bind planner and the toolchain parser.
   - Only RelWithDebInfo is fuzzed (ASan needs the release CRT).
+- **Real-project findings (WP-26 corpus, ADR-0036).**
+  - **Image-relative array indexing (F-2, cl):** a translation unit that indexes a global array by a variable through
+    `__ImageBase` (`lea rcx, __ImageBase` + `[rcx+rax*4+sym@IMGREL]`, ADDR32NB) is refused with CML3101 for the whole TU,
+    whichever function was edited. This is ordinary code (raylib `rcore.c`), so it excludes many cl TUs.
+  - **Overloaded statics (F-4):** any `static` / `static inline` overload set in a header (Dear ImGui's `ImFloor`) refuses
+    every TU that includes it (CML3214), because the PDB reader has no type information yet.
+  - **VEX prologues:** the hook decoder refuses functions that start with a VEX-encoded (C4/C5) instruction; the STL's AVX
+    helpers and 220 of Godot's 512 467 functions do. Such a function cannot be hooked.
+  - **Static-library members (F-1) and the clang-cl C-statics crash (F-3)** are being fixed in WP-26b and WP-26c.

@@ -510,7 +510,9 @@ void plan_fixture(const std::string& name) {
     {
         PatchLayout layout;
         layout.patch_base = in.module_base + 0x10000000ull;
-        std::uint32_t slot = 0x100000;
+        // Section RVAs are 0x10000 * index (clang 22 objects have 16+ sections: 0x100000 would collide with a slot, which
+        // CML3206 rightly reports); the slots live far above any section.
+        std::uint32_t slot = 0x4000000;
         for (const Fixup& f : p.fixups) {
             if (f.kind == FixupKind::Slot) {
                 if (layout.symbol_rva.emplace(f.symbol, slot).second) {
@@ -641,6 +643,7 @@ void plan_fixture(const std::string& name) {
 TEST_CASE("fixture basic: logic.cpp value_2") { plan_fixture("basic"); }
 TEST_CASE("fixture statics: statics.cpp value_30") { plan_fixture("statics"); }
 TEST_CASE("fixture virtuals: shapes.cpp square_doubled") { plan_fixture("virtuals"); }
+TEST_CASE("fixture c_statics: c_statics.c offset_big") { plan_fixture("c_statics"); }
 TEST_CASE("fixture templates: a.cpp offset_100") { plan_fixture("templates"); }
 TEST_CASE("fixture lambdas: lambdas.cpp lambda_times_10") { plan_fixture("lambdas"); }
 TEST_CASE("fixture new_function: logic.cpp add_helper") { plan_fixture("new_function"); }

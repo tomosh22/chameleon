@@ -93,16 +93,6 @@
       "step": "edit:header-inline-raymath",
       "compiler": "msvc",
       "reason": "F-2: rcore.c indexes global arrays through image-relative addressing; the reload is refused with CML3101"
-    },
-    {
-      "step": "edit:header-inline-raymath",
-      "compiler": "clang-cl",
-      "reason": "F-3: the reload of rcore.c is accepted and the process then crashes (access violation)"
-    },
-    {
-      "step": "still-running-final",
-      "compiler": "clang-cl",
-      "reason": "F-3: the process crashed after the rcore.c reload"
     }
   ],
   "trace": true

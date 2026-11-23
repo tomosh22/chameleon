@@ -238,3 +238,33 @@ TEST_CASE("layout_from_pdb: section start = locator RVA - locator offset; slots 
     CHECK(lm.error().code == diag::kLayoutIncomplete);
     CHECK(lm.error().message.find("__cml_anchor_nothere_2") != std::string::npos);
 }
+
+TEST_CASE("fix-up triples: one site written twice is fine only when kind and value agree (WP-26c, clang 22 objects with 16+ sections)") {
+    PatchLayout pl;
+    pl.patch_base = 0x100000000ull;
+    pl.section_rva[16] = 0x100000;  // section 16 of a clang 22 object, at 0x10000 * 16 in the fixtures' synthetic layout
+    pl.symbol_rva["slot"] = 0x100008;  // a slot at the same RVA as section 16 + 8: two different writes to one site
+    BindPlan p;
+    Fixup a;
+    a.section_index = 16;
+    a.offset = 8;
+    a.kind = FixupKind::Addr64;
+    a.target_va = 0x140001000ull;
+    a.symbol = "x";
+    Fixup b;
+    b.kind = FixupKind::Slot;
+    b.symbol = "slot";
+    b.target_va = 0x140002000ull;
+    p.fixups = {a, b};
+    auto t = make_fixup_triples(p, pl);
+    REQUIRE(!t.has_value());
+    CHECK(t.error().code == diag::kLayoutIncomplete);
+    CHECK(t.error().message.find("same site") != std::string::npos);
+
+    // The same write twice (same kind, same value) merges into one triple.
+    Fixup c = a;
+    p.fixups = {a, c};
+    auto same = make_fixup_triples(p, pl);
+    REQUIRE_MESSAGE(same.has_value(), err(same));
+    CHECK(same->size() == 1);
+}

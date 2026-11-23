@@ -30,6 +30,9 @@ inline constexpr std::uint32_t kNewThreadLocal = 3400;     // thread_local the o
 inline constexpr std::uint32_t kAmbiguousThreadLocal = 3402;  // several S_GTHREAD32 records for one name (error)
 inline constexpr std::uint32_t kThreadLocalInit = 3401;   // dynamic initialiser/destructor of a thread_local stays the old one (warning)
 
+// WP-26c (ADR-0036: CML3500..CML3549, planner).
+inline constexpr std::uint32_t kUnnamedStatic = 3500;     // writable static data whose identity cannot be established (error)
+
 // Warnings (the plan is still produced).
 inline constexpr std::uint32_t kSharedInitialiser = 3210;  // TU-wide initialiser may re-run initialisers of bound globals
 inline constexpr std::uint32_t kGuardUnmatched = 3211;     // function-local static guard not found in the old image

@@ -8,6 +8,7 @@
 cml_add_unit_test(bind
     SOURCES
         test_names.cpp
+        test_c_statics.cpp
         test_plan.cpp
         test_chain.cpp
         test_negative.cpp

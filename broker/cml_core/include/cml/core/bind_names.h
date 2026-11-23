@@ -27,6 +27,26 @@ std::string base_identifier(std::string_view decorated);
 // The function a function-local static lives in ("statics_value"); empty otherwise.
 std::string enclosing_function(std::string_view decorated);
 
+// WP-26c: the identity of a C static whose object name is not Microsoft-decorated, as clang-cl spells it for a
+// translation unit compiled as C. The PDB records carry the source names ("platform", "counter"); the object's are
+//   file scope "platform"; a function-local static "next.counter"; LLVM's uniquifier appends ".<n>" when the name is
+//   taken ("platform.0", "next.counter.1").
+// (cl decorates C statics like C++ ones, "?counter@?1??next@@9@9", observed in CI; that is display_name()'s job.)
+// `base` is empty when no source name can be read ("__const.f.x", ".str", "$SG1").
+struct CStaticName {
+    std::string base;
+    std::string encl;
+};
+CStaticName c_static_name(std::string_view object_name);
+
+// WP-26c: names of compiler-generated data the user never wrote, as an explicit list. The planner treats such data as new
+// (a fresh copy is right for it) and never refuses a reload because it cannot read a source name from it:
+//   clang: ".compoundliteral[.N]", ".str[.N]", "__const.*", "__func__.*", "__profc_*" / "__profd_*" / "__profn_*" (PGO),
+//          "__covrec_*" / "__llvm_*" (coverage), "___asan_*" / "__asan_*" / "__odr_*" / "__sancov*" (sanitizers)
+//   cl/clang decorated names that start with '?' (guards, vtables, RTTI, string literals: they are never user spellings)
+//   "$..." (cl's "$SG", "$LN") and "__real@" / "__xmm@" constants.
+bool is_compiler_generated_data_name(std::string_view name);
+
 // True when the name contains a scope that only exists inside one TU: an anonymous namespace
 // ("?A0x<hash>") or a function scope ("?<digit>??"). Only such names can denote a TU-private
 // entity, which is what resolution step (2) looks up.
