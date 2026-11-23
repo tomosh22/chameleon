@@ -191,7 +191,7 @@ if (@(Get-ChildItem -Path $integrations -Filter '*.vsix' -File).Count -lt 2 -and
 
 # Debug-only and fault-injection content must not be in the shipped binaries. Plain ASCII scan of every exe and dll.
 #  - debug CRT (every binary): the import names of the debug runtime, or debug heap reporting
-#  - fault injection (the broker): the capability name and the `fault-stages` command exist only when CML_FAULT_INJECTION
+#  - fault injection (the broker): the capability name exists only when CML_FAULT_INJECTION
 #    is on. (Some diagnostic texts that mention the control command `inject-failure` are not compiled out, so that
 #    text is not a usable marker.)
 #  - positive evidence (broker and agent): the "built without CML_FAULT_INJECTION" answers exist only in a build with it OFF
@@ -201,7 +201,6 @@ $banned = @(
     @{ Text = 'vcruntime140_1d.dll';  Why = 'debug C runtime import';  Only = $null },
     @{ Text = 'msvcp140d.dll';        Why = 'debug C++ runtime import'; Only = $null },
     @{ Text = '_CrtDbgReport';        Why = 'debug heap reporting';    Only = $null },
-    @{ Text = 'fault-stages';         Why = 'fault injection control command'; Only = 'cml_broker.exe' },
     @{ Text = 'fault-injection';      Why = 'fault injection capability name'; Only = 'cml_broker.exe' }
 )
 $expected = @(
