@@ -38,18 +38,6 @@ std::string lower_slashes(std::string_view s) {
     return out;
 }
 
-bool is_source_extension(std::string_view path) {
-    const std::size_t dot = path.find_last_of('.');
-    if (dot == std::string_view::npos) {
-        return false;
-    }
-    std::string ext(path.substr(dot + 1));
-    for (char& c : ext) {
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    return ext == "c" || ext == "cc" || ext == "cpp" || ext == "cxx" || ext == "c++" || ext == "cp" || ext == "ixx" || ext == "cppm";
-}
-
 std::string base_name_of(std::string_view path) {
     const std::size_t slash = path.find_last_of("/\\");
     return std::string(slash == std::string_view::npos ? path : path.substr(slash + 1));
