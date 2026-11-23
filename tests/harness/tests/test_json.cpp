@@ -253,12 +253,32 @@ TEST_CASE("json: objects are capped at 4096 members and duplicate detection is l
     full.pop_back();
     full += ",\"k0\":1}";
     check_rejected(full);
-    // 65k keys: rejected fast (the cap), never quadratic
+    // Duplicate detection is linear and 65k keys are rejected at the cap, never parsed in full. Checked by ratios
+    // of the fastest of several parses, not by an absolute bound: shared CI runners (Debug, fault injection) made a
+    // fixed 100 ms bound fail at 108 ms on correct code. Linear growth from 1024 to 4096 members is about 4x,
+    // quadratic about 16x; the 65k-key object must cost about as much as a full object, not 16x more.
+    const auto fastest_us = [](const std::string& text) {
+        long long best = std::numeric_limits<long long>::max();
+        for (int i = 0; i < 5; ++i) {
+            const auto start = std::chrono::steady_clock::now();
+            const Result<Value> r = parse(text);
+            const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
+            (void)r;
+            best = us < best ? us : best;
+        }
+        return best;
+    };
+    const std::string quarter = object_with(kMaxMembers / 4);
+    const std::string capped = object_with(kMaxMembers);
     const std::string big = object_with(65000);  // built before the clock starts: only parsing is timed
-    const auto start = std::chrono::steady_clock::now();
+    const long long t_quarter = fastest_us(quarter);
+    const long long t_capped = fastest_us(capped);
+    const long long t_big = fastest_us(big);
+    INFO("fastest parse (us): " << kMaxMembers / 4 << " members " << t_quarter << ", " << kMaxMembers << " members "
+                                << t_capped << ", 65000 members " << t_big);
+    CHECK(t_capped < 8 * t_quarter + 2000);  // linear: ~4x; quadratic: ~16x
+    CHECK(t_big < 3 * t_capped + 5000);      // stops at the cap
     const Result<Value> big_result = parse(big);
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
-    CHECK(ms < 100);
     CHECK_FALSE(big_result.has_value());
     check_rejected(big);
     // many equal keys: the first duplicate is reported at once
