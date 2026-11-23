@@ -2,10 +2,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
+#include <filesystem>
 #include <set>
 
 #include "cml/core/include_scan.h"
 #include "cml/core/pipeline_diag_ids.h"
+#include "cml/core/static_lib_diag_ids.h"
 #include "cml/toolchain/record.h"
 #include "cml/util/log.h"
 
@@ -25,6 +28,24 @@ namespace {
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+}
+
+std::string lower_slashes(std::string_view s) {
+    std::string out(s);
+    for (char& c : out) {
+        c = c == '\\' ? '/' : static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return out;
+}
+
+std::string base_name_of(std::string_view path) {
+    const std::size_t slash = path.find_last_of("/\\");
+    return std::string(slash == std::string_view::npos ? path : path.substr(slash + 1));
+}
+
+bool file_exists(const std::string& path) {
+    std::error_code ec;
+    return std::filesystem::exists(std::filesystem::path(path), ec);
 }
 }  // namespace
 
@@ -116,15 +137,57 @@ Result<std::shared_ptr<const pdb::PdbIndex>> ModuleIndex::acquire_pdb() {
     return pdb_;
 }
 
-bool ModuleIndex::is_source_compiland(const pdb::PdbIndex& index, std::uint32_t compiland) {
+bool ModuleIndex::is_toolchain_archive(std::string_view library) {
+    const std::string l = lower_slashes(library);
+    if (l.find("/vc/tools/msvc/") != std::string::npos || l.find("/windows kits/") != std::string::npos || l.find("/lib/clang/") != std::string::npos) {
+        return true;  // (the clang runtime libraries live in <llvm>/lib/clang/<version>/lib/windows/)
+    }
+    const std::size_t slash = l.find_last_of('/');
+    std::string stem = slash == std::string::npos ? l : l.substr(slash + 1);
+    if (stem.size() > 4 && stem.compare(stem.size() - 4, 4, ".lib") == 0) {
+        stem.resize(stem.size() - 4);
+    }
+    static const char* const kNames[] = {"libcmt", "libcpmt", "libvcruntime", "libucrt", "msvcrt", "msvcprt", "libconcrt", "oldnames", "vcruntime",
+                                         "ucrt", "libclang_rt", "clang_rt", "legacy_stdio_definitions", "msvcmrt"};
+    for (const char* name : kNames) {
+        const std::string n(name);
+        if (stem == n || stem == n + "d") {
+            return true;  // libcmt, libcmtd
+        }
+        if (stem.size() > n.size() && stem.compare(0, n.size(), n) == 0 && (stem[n.size()] == '_' || stem[n.size()] == '.' || stem[n.size()] == '-')) {
+            return true;  // clang_rt.builtins-x86_64, legacy_stdio_definitions_x
+        }
+    }
+    return false;
+}
+
+bool ModuleIndex::is_object_compiland(const pdb::PdbIndex& index, std::uint32_t compiland) {
     if (compiland >= index.compiland_count()) {
         return false;
     }
     const pdb::Compiland& c = index.compiland(compiland);
-    if (!c.library_name.empty() || c.object_name.empty()) {
+    if (c.object_name.empty()) {
         return false;
     }
     return c.object_name.substr(0, 7) != "Import:" && c.object_name.front() != '*';
+}
+
+bool ModuleIndex::is_source_compiland(const pdb::PdbIndex& index, std::uint32_t compiland) {
+    if (!is_object_compiland(index, compiland)) {
+        return false;
+    }
+    // ADR-0036: the recorded build environment decides, not where the object came from.
+    const Result<pdb::BuildEnv> env = index.build_env(compiland);
+    if (!env || env->source == pdb::EnvSource::None) {
+        return false;
+    }
+    const auto src = env->source_file();
+    return src && !src->empty();
+}
+
+std::vector<SkippedCompiland> ModuleIndex::skipped_compilands() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return skipped_;
 }
 
 void ModuleIndex::set_status(IndexState state, std::uint32_t percent, std::string phase, std::optional<Diag> error, bool drop_pdb) {
@@ -207,21 +270,53 @@ void ModuleIndex::run() {
     std::map<std::uint32_t, std::set<std::string>> own_pch;  // what each of them could determine of it
     IncludeScanner scanner;
     const std::uint32_t compiland_total = index->compiland_count();
+    std::vector<SkippedCompiland> skipped;
+    std::set<std::uint32_t> skipped_set;
     for (std::uint32_t ci = 0; ci < compiland_total; ++ci) {
-        if (!is_source_compiland(*index, ci)) {
-            continue;
+        if (!is_object_compiland(*index, ci)) {
+            continue;  // an import stub or a linker record: nothing to recompile, not counted
         }
         if (cancel_.load(std::memory_order_acquire)) {
             return;
+        }
+        // WP-26b: a real object is reloadable when its build environment is recorded, whether or not it came from an archive.
+        // Otherwise it is skipped: counted, and what it lists is still tracked (include scan and PCH detection run for it as
+        // before), so a change to one of its files is reported (CML5921) instead of answering a silent `patched: 0`.
+        const pdb::Compiland& comp = index->compiland(ci);
+        const std::string library(comp.library_name);
+        if (!library.empty() && is_toolchain_archive(library)) {
+            skipped_set.insert(ci);  // never counted or tracked: the CRT, the STL, the SDK
+            continue;
+        }
+        Result<pdb::BuildEnv> env = index->build_env(ci);
+        std::string reason;
+        if (!env || env->source == pdb::EnvSource::None) {
+            reason = "no build environment recorded";
+        } else if (!env->source_file() || env->source_file()->empty()) {
+            reason = "its build environment records no source file";
+        } else if (!library.empty() && !file_exists(pdb::normalize_path(*env->source_file(), env->cwd().value_or(std::string_view{})))) {
+            reason = "its source file does not exist";
         }
         std::set<std::string> listed;
         for (const std::string_view f : index->compiland_files_normalized(ci)) {
             listed.emplace(f);
         }
-        files.insert(listed.begin(), listed.end());
+        if (reason.empty()) {
+            files.insert(listed.begin(), listed.end());
+        } else {
+            skipped.push_back({ci, base_name_of(comp.object_name), library, reason});
+            skipped_set.insert(ci);
+            if (!library.empty() && env && env->source_file() && !env->source_file()->empty()) {
+                continue;  // an archive member whose source is gone: a library built elsewhere, its files are not on this machine
+            }
+            for (const std::string& f : listed) {
+                if (file_exists(f)) {
+                    files.insert(f);
+                }
+            }
+        }
         // The compile command, when it is known, tells whether this compiland builds or uses a precompiled header. That
         // does not depend on scanning includes (WP-15).
-        Result<pdb::BuildEnv> env = index->build_env(ci);
         if (!env) {
             CML_LOG(Debug, "index: compiland %u has no build environment, headers come from the PDB list only: %s", ci, env.error().format().c_str());
             continue;
@@ -271,6 +366,8 @@ void ModuleIndex::run() {
     }
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        skipped_ = skipped;
+        skipped_set_ = std::move(skipped_set);
         header_deps_ = std::move(header_deps);
         pch_files_ = std::move(pch_files);
         pch_unverified_ = std::move(pch_unverified);
@@ -300,6 +397,31 @@ void ModuleIndex::run() {
     }
     CML_LOG(Info, "index: %s ready: %zu compilands, %zu tracked files of %zu listed (pdb %.1f ms, baseline %.1f ms)", spec_.module_path.c_str(),
             static_cast<std::size_t>(index->compiland_count()), baseline_.size(), list.size(), status().pdb_ms, status().baseline_ms);
+    {
+        std::size_t archive_members = 0;
+        for (const SkippedCompiland& k : skipped) {
+            archive_members += k.library.empty() ? 0 : 1;
+        }
+        CML_LOG(Info, "index: %s: %zu real objects skipped (%zu from archives)", spec_.module_path.c_str(), skipped.size(), archive_members);
+        if (archive_members != 0 && spec_.on_skipped_archive_members && !cancel_.load(std::memory_order_acquire)) {
+            std::string names;
+            std::size_t listed_names = 0;
+            for (const SkippedCompiland& k : skipped) {
+                if (k.library.empty() || listed_names >= 5) {
+                    continue;
+                }
+                names += (listed_names == 0 ? "" : ", ") + k.name + " (" + k.reason + ")";
+                ++listed_names;
+            }
+            const std::string module_name = base_name_of(spec_.module_path);
+            spec_.on_skipped_archive_members(Diag::make(
+                staticlib::diag::kSkippedArchiveCompilands,
+                std::to_string(archive_members) + " object(s) linked into " + module_name + " from static libraries cannot be hot-reloaded: " + names +
+                    (archive_members > listed_names ? ", and " + std::to_string(archive_members - listed_names) + " more" : std::string()) + ".",
+                "Build those libraries with /Z7 (or /Zi) so the PDB records how each object was compiled (clang-cl: -gcodeview-command-line), and keep their sources on disk; "
+                "edits to the other members of the same libraries are reloaded normally."));
+        }
+    }
     set_status(IndexState::Ready, 100, "ready");
 }
 
@@ -335,6 +457,14 @@ Result<ModuleIndex::Sweep> ModuleIndex::sweep() {
     out.hashed = raw.hashed;
     out.checked = raw.checked;
     std::set<std::uint32_t> compilands;
+    // One lock for what the per-file loop reads of the skipped compilands.
+    std::set<std::uint32_t> skipped_here;
+    std::vector<SkippedCompiland> skipped_list;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        skipped_here = skipped_set_;
+        skipped_list = skipped_;
+    }
     for (const std::string& file : raw.changed) {
         bool mapped = false;
         std::set<std::uint32_t> seen;
@@ -345,8 +475,14 @@ Result<ModuleIndex::Sweep> ModuleIndex::sweep() {
             }
             mapped = true;
         };
+        std::set<std::uint32_t> skipped_owners;  // the skipped compilands that list or include the file
         for (const std::uint32_t ci : (*index)->compilands_for_file(file)) {
-            if (is_source_compiland(**index, ci)) {
+            if (!is_object_compiland(**index, ci)) {
+                continue;
+            }
+            if (skipped_here.count(ci) != 0) {
+                skipped_owners.insert(ci);
+            } else {
                 map_to(ci);
             }
         }
@@ -362,13 +498,28 @@ Result<ModuleIndex::Sweep> ModuleIndex::sweep() {
             is_pch = pch_files_.count(file) != 0;
         }
         for (const std::uint32_t ci : from_scan) {
-            map_to(ci);
+            if (skipped_here.count(ci) != 0) {
+                skipped_owners.insert(ci);
+            } else {
+                map_to(ci);
+            }
         }
         if (is_pch) {
             out.pch_headers.push_back(file);
         }
         if (!mapped) {
-            out.unmapped.push_back(file);
+            // WP-26b: a file that only skipped compilands own is not "unmapped": say who owns it and why it is not reloadable.
+            std::string detail;
+            for (const SkippedCompiland& k : skipped_list) {
+                if (skipped_owners.count(k.compiland) != 0) {
+                    detail += (detail.empty() ? "" : ", ") + k.name + (k.library.empty() ? "" : " in " + base_name_of(k.library)) + " (" + k.reason + ")";
+                }
+            }
+            if (!detail.empty()) {
+                out.not_owned.push_back({file, detail});
+            } else {
+                out.unmapped.push_back(file);
+            }
         }
     }
     out.compilands.assign(compilands.begin(), compilands.end());

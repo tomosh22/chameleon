@@ -553,10 +553,9 @@ TEST_CASE("enable time: the index of a module that fails the audit fails with th
     CHECK_FALSE(index3->audit().has_value());
 }
 
-// WP-26, finding F-1 (docs/wp/WP-26.md): the real-project corpus showed that code linked in from a static library (raylib built as
-// a CMake library, every directory of Godot) is never a source compiland, so a change to it reloads nothing. This pins the rule
-// as it is today: the PDB names the archive as the module's object, and ModuleIndex::is_source_compiland() says no.
-TEST_CASE("corpus F-1: a member of a static library is not a source compiland") {
+// WP-26, finding F-1 (docs/wp/WP-26.md), fixed by WP-26b (ADR-0036 decision 1): the PDB names the archive as the module's library, and
+// that no longer matters: a member whose build environment is recorded is a source compiland, one without it is not.
+TEST_CASE("corpus F-1 (fixed): a member of a static library with a build environment is a source compiland") {
     QuietLogs quiet;
     Module m;
     pdb::OpenOptions options;
@@ -571,6 +570,47 @@ TEST_CASE("corpus F-1: a member of a static library is not a source compiland") 
     {
         Result<std::shared_ptr<const pdb::PdbIndex>> index = pdb::PdbIndex::open_for_pe(m.exe, options);
         REQUIRE(index);
-        CHECK_FALSE(ModuleIndex::is_source_compiland(**index, 0));
+        CHECK(ModuleIndex::is_source_compiland(**index, 0));  // ADR-0036: the build environment decides, not the archive
     }
+}
+
+// WP-26b: the toolchain's archives (the static CRT, the STL, the SDK, the compiler runtime) are left out of the audit's samplers and are
+// not counted as skipped archive members: one rule, ModuleIndex::is_toolchain_archive(), shared by the index and the audit.
+TEST_CASE("toolchain archives: the shared rule (names match exactly, the clang runtime only under lib/clang)") {
+    CHECK(ModuleIndex::is_toolchain_archive("C:\\VS\\VC\\Tools\\MSVC\\14.44\\lib\\x64\\libcmt.lib"));
+    CHECK(ModuleIndex::is_toolchain_archive("C:\\any\\libcmtd.lib"));
+    CHECK(ModuleIndex::is_toolchain_archive("D:\\any\\LIBVCRUNTIME.LIB"));
+    CHECK(ModuleIndex::is_toolchain_archive("C:\\any\\msvcrt.lib"));
+    CHECK(ModuleIndex::is_toolchain_archive("C:\\any\\legacy_stdio_definitions.lib"));
+    CHECK(ModuleIndex::is_toolchain_archive("C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\ucrt\\x64\\ucrt.lib"));
+    CHECK(ModuleIndex::is_toolchain_archive("C:\\LLVM\\lib\\clang\\20\\lib\\windows\\clang_rt.builtins-x86_64.lib"));
+    // A project's own libraries, also when the name only starts like a toolchain one or sits in a directory called lib/windows.
+    CHECK(ModuleIndex::is_toolchain_archive("C:\\proj\\libcmt_helpers_x.lib"));  // (name + '_' counts as the toolchain's by rule)
+    CHECK_FALSE(ModuleIndex::is_toolchain_archive("C:\\proj\\libcmtx.lib"));
+    CHECK_FALSE(ModuleIndex::is_toolchain_archive("C:\\proj\\lib\\windows\\game.lib"));
+    CHECK_FALSE(ModuleIndex::is_toolchain_archive("C:\\proj\\raylib.lib"));
+    CHECK_FALSE(ModuleIndex::is_toolchain_archive("C:\\proj\\ucrtbase_shim.lib"));
+    CHECK_FALSE(ModuleIndex::is_toolchain_archive(""));
+}
+
+TEST_CASE("audit: the code samplers skip toolchain archive members and sample a project library's") {
+    QuietLogs quiet;
+    const auto sampled = [](const char* library) {
+        Module m;
+        tp::Module member;
+        member.name = "f:\\dd\\obj\\member.obj";
+        member.lib = library;
+        member.symbols.objname(member.name);
+        member.symbols.compile3(1, 0, 0xD0, "Test Compiler 19.44");
+        member.symbols.proc(0x1110, "member_func", 1, 0x200, 0x20);
+        member.symbols.end();
+        m.spec.modules.push_back(std::move(member));
+        // The only code contribution is the library member's.
+        m.spec.contributions = {{1, 0x200, 0x100, static_cast<std::uint16_t>(m.spec.modules.size() - 1)}};
+        tp::write_file(m.pdb, tp::build(m.spec));
+        const ModuleAudit a = audit_module_file(m.exe);
+        return finding(a, "debug-info").evidence;
+    };
+    CHECK(sampled("C:\\VS\\VC\\Tools\\MSVC\\14.44\\lib\\x64\\libcmt.lib").find("found for 0 of 0 sampled") != std::string::npos);
+    CHECK(sampled("C:\\libs\\game.lib").find("found for 1 of 1 sampled") != std::string::npos);
 }

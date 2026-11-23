@@ -1,0 +1,55 @@
+# Scenario `static_lib` (WP-26b, ADR-0036 decision 1): the function the TICK loop calls is linked from a static library
+# (add_library(... STATIC)); its compiland in the exe's PDB names an archive. The edit changes it 7 -> 70. Before WP-26b such a
+# compiland was never tracked and the reload answered `ok`, `patched: 0`. Now it is compiled, linked and patched like any other;
+# `calls=` is a file-static counter of the member and must keep counting through the reload (bound to the old image's storage).
+name = "static_lib"
+description = "fixture static_lib: edit a static-library member -> reload -> value=70, calls= keeps counting"
+fixture = "static_lib"
+timeout_s = 180
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=7 calls=\\d+"
+within_s = 15
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_static_lib.exe"
+within_s = 15
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=7 calls=([2-9][0-9]|[1-9][0-9]{2,})"
+within_s = 15
+
+[[step]]
+kind = "edit"
+patch = "edits/value_70.edit"
+
+[[step]]
+kind = "reload"
+within_s = 90
+
+# Exactly the library member was compiled (before WP-26b: nothing, `patched: 0`).
+[[step]]
+kind = "expect_reload_result"
+key = "compiled"
+value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=70 calls=\\d+"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=70 calls=\\d+"
+within_s = 10
+
+[[step]]
+kind = "expect_monotonic"
+key = "calls"
+min_samples = 20

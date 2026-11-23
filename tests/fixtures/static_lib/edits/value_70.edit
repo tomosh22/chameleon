@@ -1,0 +1,11 @@
+--- a/lib.cpp
++++ b/lib.cpp
+@@ -10,7 +10,7 @@
+ CML_NOINLINE int static_lib_value()
+ {
+     ++s_calls;
+-    return 7;
++    return 70;
+ }
+ 
+ CML_NOINLINE int static_lib_calls()

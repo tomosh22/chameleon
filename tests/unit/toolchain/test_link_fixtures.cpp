@@ -286,9 +286,7 @@ Prepared prepare(const std::string& fixture, const fs::path& edit_file, const cm
         std::uint32_t found = cml::pdb::kNoCompiland;
         cml::pdb::BuildEnv env;
         for (std::uint32_t ci = 0; ci < module_pdb.compiland_count(); ++ci) {
-            if (!module_pdb.compiland(ci).library_name.empty()) {
-                continue;
-            }
+            // (library members count: fixture static_lib's source is linked from an archive, ADR-0036)
             auto e = module_pdb.build_env(ci);
             if (!e || !e->source_file()) {
                 continue;
@@ -566,6 +564,7 @@ TEST_CASE("link patch: fixture lambdas links under the mirrored linker and the o
 TEST_CASE("link patch: fixture new_function links under the mirrored linker and the other one") { run_fixture("new_function"); }
 TEST_CASE("link patch: fixture new_global links under the mirrored linker and the other one") { run_fixture("new_global"); }
 TEST_CASE("link patch: fixture tls links under the mirrored linker and the other one") { run_fixture("tls"); }
+TEST_CASE("link patch: fixture static_lib (code in a static library, WP-26b) links under the mirrored linker and the other one") { run_fixture("static_lib"); }
 
 TEST_CASE("link patch: the user can override the detected linker family") {
     const FixturePaths& paths = FixturePaths::get();

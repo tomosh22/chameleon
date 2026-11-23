@@ -169,9 +169,7 @@ void print_fact(const char* name, const tc::FlagFact& f) {
 }
 
 bool is_source_compiland(const cml::pdb::Compiland& c, const cml::pdb::BuildEnv& env) {
-    if (!c.library_name.empty()) {
-        return false;
-    }
+    (void)c;  // WP-26b (ADR-0036): the recorded build environment decides, not whether the object came from an archive
     const auto src = env.source_file();
     return src && !src->empty();
 }

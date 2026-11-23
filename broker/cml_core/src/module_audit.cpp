@@ -214,6 +214,16 @@ std::optional<Diag> stale_inline_warning(const pdb::PdbIndex& index, std::uint32
 
 namespace {
 
+// WP-26b: the samplers look at the project's own objects and the members of its libraries, not at the toolchain's archives (the static CRT
+// is not built with /hotpatch padding and would skew them). No build-environment lookup per sample.
+bool is_sampled_object(const pdb::PdbIndex& index, std::uint32_t compiland) {
+    if (!ModuleIndex::is_object_compiland(index, compiland)) {
+        return false;
+    }
+    const std::string_view library = index.compiland(compiland).library_name;
+    return library.empty() || !ModuleIndex::is_toolchain_archive(library);
+}
+
 struct CompilandSummary {
     std::vector<std::string> gl, guard_cf, gy_no, gy_unknown, managed, no_command, inlining;
     std::size_t gy_yes = 0;
@@ -224,7 +234,9 @@ struct CompilandSummary {
 void examine_compilands(const pdb::PdbIndex& index, const AuditOptions& options, ModuleAudit& audit, CompilandSummary& s) {
     std::uint64_t object_budget = options.object_budget_bytes;
     for (std::uint32_t ci = 0; ci < index.compiland_count(); ++ci) {
-        if (!ModuleIndex::is_source_compiland(index, ci)) {
+        // WP-26b: the flag checks below can FAIL the whole module (/GL, no /Gy, /clr), so they cover the module's own objects only.
+        // A library member that violates one fails when it is reloaded (a per-compiland diagnostic), not when the module is enabled.
+        if (!ModuleIndex::is_object_compiland(index, ci) || !index.compiland(ci).library_name.empty()) {
             continue;
         }
         const pdb::Compiland& c = index.compiland(ci);
@@ -328,7 +340,7 @@ ProcSample sample_function_symbols(const pdb::PdbIndex& index, const AuditOption
         if ((sections[c.section - 1u].characteristics & 0x20u) == 0) {  // IMAGE_SCN_CNT_CODE
             continue;
         }
-        if (!ModuleIndex::is_source_compiland(index, c.compiland)) {
+        if (!is_sampled_object(index, c.compiland)) {
             continue;
         }
         const pdb::Compiland& comp = index.compiland(c.compiland);
@@ -362,7 +374,7 @@ PaddingSample sample_padding(const pdb::PdbIndex& index, const pe::Image& image,
             continue;
         }
         const std::optional<std::uint32_t> owner = index.compiland_for_rva(s.rva);
-        if (owner && ModuleIndex::is_source_compiland(index, *owner)) {
+        if (owner && is_sampled_object(index, *owner)) {
             rvas.push_back(s.rva);
         }
     }

@@ -103,6 +103,8 @@ cml_add_unit_test(broker_core
         broker/test_reload.cpp
         # WP-18: the module audit (cml_broker check, enable-time build requirements)
         broker/test_audit.cpp
+        # WP-26b: static-library members are reloadable (ADR-0036)
+        broker/test_static_lib.cpp
         # WP-14: compile on save
         broker/test_save_watcher.cpp
         # WP-21: hot-restart
