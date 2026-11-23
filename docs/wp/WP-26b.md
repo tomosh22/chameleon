@@ -67,4 +67,4 @@ with the "no recorded command line" error); its own source change is reported wi
 - Headers included only by skipped compilands are not tracked.
 - Corpus: the two F-1 `expected_failures` of the Godot cell (`edit:static-lib-main`, `edit:static-lib-scene-tree`, the latter an edit of
   `scene/main/scene_tree.cpp`) are removed, so those edits must now reload. `corpus F-1` in `test_audit.cpp` now asserts the new rule.
-  raylib's F-1 entry was never asserted (its reload runs through its own cells).
+  (The raylib and imgui projects carry no F-1 entry.)
