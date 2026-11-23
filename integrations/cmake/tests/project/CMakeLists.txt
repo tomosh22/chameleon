@@ -1,0 +1,38 @@
+# One project, many cases (-DCASE=...): see ../run_case.cmake. Configure only.
+cmake_minimum_required(VERSION 3.24)
+project(EnableCase LANGUAGES CXX)
+include("${CML_MODULE}")
+
+file(WRITE "${CMAKE_BINARY_DIR}/main.cpp" "int main() { return 0; }\n")
+
+if(CASE STREQUAL "interface_library")
+    add_library(hdrs INTERFACE)
+    chameleon_enable(hdrs NO_AGENT)
+    return()
+endif()
+if(CASE STREQUAL "imported_target")
+    add_library(imp SHARED IMPORTED)
+    chameleon_enable(imp NO_AGENT)
+    return()
+endif()
+if(CASE STREQUAL "no_target")
+    chameleon_enable(nothere NO_AGENT)
+    return()
+endif()
+
+add_executable(app "${CMAKE_BINARY_DIR}/main.cpp")
+if(CASE STREQUAL "ipo")
+    set_property(TARGET app PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
+elseif(CASE STREQUAL "guard_cf")
+    target_compile_options(app PRIVATE /guard:cf)
+elseif(CASE STREQUAL "guard_cf_dir")
+    add_compile_options(/guard:cf)  # directory property only: app was created before
+endif()
+
+if(CASE STREQUAL "unknown_option")
+    chameleon_enable(app NO_AGENT BOGUS)
+elseif(CASE STREQUAL "no_agent_target")
+    chameleon_enable(app)
+else()
+    chameleon_enable(app NO_AGENT)
+endif()
