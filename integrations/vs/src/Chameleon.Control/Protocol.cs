@@ -53,6 +53,15 @@ namespace Chameleon.Control
         public string Message { get; set; }
         public string Action { get; set; }
 
+        /// <summary>WP-35: where the first compiler error is (absolute path), when the broker says so; null otherwise.</summary>
+        public string File { get; set; }
+
+        /// <summary>1-based, or null.</summary>
+        public long? Line { get; set; }
+
+        /// <summary>1-based, or null (cl prints no column unless asked to).</summary>
+        public long? Column { get; set; }
+
         public override string ToString()
         {
             return Id + ": " + Message + (string.IsNullOrEmpty(Action) ? "" : " What to do: " + Action);
@@ -81,6 +90,9 @@ namespace Chameleon.Control
                     Id = Json.Str(diag["id"]) ?? "",
                     Message = Json.Str(diag["message"]) ?? "",
                     Action = Json.Str(diag["action"]) ?? "",
+                    File = Json.Str(diag["file"]),
+                    Line = Json.Long(diag["line"]),
+                    Column = Json.Long(diag["column"]),
                 };
             }
             else if (!response.Ok)
@@ -126,12 +138,23 @@ namespace Chameleon.Control
             return t != null && t.Type == JTokenType.String ? t.Value<string>() : null;
         }
 
+        /// <summary>{"event":"restarting","old_pid":N,"new_pid":M} (WP-34): the new process exists and is held suspended until `restart-resume`.</summary>
+        public bool TryGetRestarting(out int oldPid, out int newPid)
+        {
+            return TryGetPids("restarting", out oldPid, out newPid);
+        }
+
         /// <summary>{"event":"restarted","old_pid":N,"new_pid":M}</summary>
         public bool TryGetRestarted(out int oldPid, out int newPid)
         {
+            return TryGetPids("restarted", out oldPid, out newPid);
+        }
+
+        private bool TryGetPids(string eventName, out int oldPid, out int newPid)
+        {
             oldPid = 0;
             newPid = 0;
-            if (Name != "restarted")
+            if (Name != eventName)
             {
                 return false;
             }
@@ -244,6 +267,9 @@ namespace Chameleon.Control
         public const string Reload = "reload";
         public const string Subscribe = "subscribe";
         public const string Restart = "restart";
+
+        /// <summary>WP-34: `restart {hold_new}` creates the new process suspended; `restarting` announces it; `restart-resume` lets it run.</summary>
+        public const string RestartHold = "restart-hold";
         public const string Revert = "revert";
         public const string Exceptions = "exceptions";
     }

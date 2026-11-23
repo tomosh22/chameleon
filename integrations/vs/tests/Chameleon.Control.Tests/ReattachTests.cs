@@ -16,6 +16,14 @@ namespace Chameleon.Control.Tests
             public int FailTimes;
             public string FailMessage = "access is denied";
             public bool ListThrows;
+            public bool Hang;                                       // WP-34: attaching never finishes (a slow debugger)
+            public bool BlockUntilResumed;                          // WP-34: attaching returns only once the held process runs (a real attach to a suspended process)
+            public bool FailWhileHeld;                              // WP-34: every attach fails until the process has been resumed
+            public TaskCompletionSource<bool> ManualRelease;        // WP-34: attaching returns when the test completes this
+            public bool TokenCancelledAtEnd;                        // the attach's token was cancelled when it finished
+            public bool ListEarly;                                  // ... but the debugger lists the pid as soon as the attach starts
+            public readonly TaskCompletionSource<bool> ResumeSignal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            public readonly List<string> Order = new List<string>();   // "attach:<pid>", "resume:<pid>" in the order they happened
 
             public IReadOnlyList<DebuggedProcess> GetDebuggedProcesses()
             {
@@ -27,17 +35,46 @@ namespace Chameleon.Control.Tests
                 return Attached.ToList();
             }
 
-            public Task AttachAsync(int pid, IReadOnlyList<string> engines, CancellationToken cancellationToken)
+            public async Task AttachAsync(int pid, IReadOnlyList<string> engines, CancellationToken cancellationToken)
             {
                 AttachCalls.Add((pid, engines.ToArray()));
+                Order.Add("attach:" + pid);
+                if (BlockUntilResumed)
+                {
+                    if (ListEarly)
+                    {
+                        Attached.Add(new DebuggedProcess(pid, engines));
+                    }
+
+                    await ResumeSignal.Task.ConfigureAwait(false);
+                }
+
+                if (FailWhileHeld && !ResumeSignal.Task.IsCompleted)
+                {
+                    throw new InvalidOperationException("the debugger cannot attach to a process that has not run");
+                }
+
+                if (ManualRelease != null)
+                {
+                    await ManualRelease.Task.ConfigureAwait(false);
+                    TokenCancelledAtEnd = cancellationToken.IsCancellationRequested;
+                }
+
+                if (Hang)
+                {
+                    await new TaskCompletionSource<bool>().Task.ConfigureAwait(false);
+                }
+
                 if (FailTimes > 0)
                 {
                     FailTimes--;
                     throw new InvalidOperationException(FailMessage);
                 }
 
-                Attached.Add(new DebuggedProcess(pid, engines));
-                return Task.CompletedTask;
+                if (!Attached.Any(p => p.Pid == pid))
+                {
+                    Attached.Add(new DebuggedProcess(pid, engines));
+                }
             }
 
             // What the debugger does when the debuggee is terminated.
@@ -55,12 +92,32 @@ namespace Chameleon.Control.Tests
             public readonly List<string> Log = new List<string>();
             public DateTime Now = new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc);
             public int Delays;
+            public bool AttachTimeoutFires;   // WP-34: the wait for a slow attach is over at once
+            public bool GraceFires;           // WP-34: the grace period before the resume is over at once
             public readonly ReattachCoordinator Coordinator;
 
             public Rig()
             {
                 Coordinator = new ReattachCoordinator(
-                    Debugger, Settings, d => Reported.Add(d), m => Log.Add(m), () => Now, (span, ct) => { Delays++; return Task.CompletedTask; });
+                    Debugger, Settings, d => Reported.Add(d), m => Log.Add(m), () => Now, (span, ct) => { Delays++; return Task.CompletedTask; },
+                    (span, ct) => AttachTimeoutFires ? Task.CompletedTask : Task.Delay(Timeout.Infinite, ct),
+                    (span, ct) => GraceFires ? Task.CompletedTask : Task.Delay(Timeout.Infinite, ct));
+            }
+
+            /// <summary>What `restart-resume` does: records the call and answers like the broker.</summary>
+            public Func<Task<ControlResponse>> Resume(ControlResponse answer = null, Exception throws = null)
+            {
+                return () =>
+                {
+                    Debugger.Order.Add("resume:200");
+                    Debugger.ResumeSignal.TrySetResult(true);
+                    if (throws != null)
+                    {
+                        throw throws;
+                    }
+
+                    return Task.FromResult(answer ?? new ControlResponse { Ok = true });
+                };
             }
         }
 
@@ -234,6 +291,320 @@ namespace Chameleon.Control.Tests
             rig.Debugger.Attached.Add(new DebuggedProcess(100, new string[0]));
             Assert.Equal(ReattachOutcome.Attached, await rig.Coordinator.OnRestartedAsync(100, 200));
             Assert.Empty(rig.Debugger.AttachCalls[0].Engines);
+        }
+
+        // ---- WP-34: the debugger attaches to a process the broker holds suspended, and the process is always resumed ----
+
+        [Theory]
+        [InlineData(true, true, true)]
+        [InlineData(true, false, false)]   // the broker cannot hold: today's late re-attach
+        [InlineData(false, true, false)]   // automatic re-attach is off: nothing to hold the process for
+        [InlineData(false, false, false)]
+        public void TheRestartIsHeldOnlyWhenReattachIsOnAndTheBrokerCan(bool reattachOn, bool brokerHasRestartHold, bool expected)
+        {
+            var rig = new Rig();
+            rig.Settings.ReattachOnRestart = reattachOn;
+            Assert.Equal(expected, rig.Coordinator.ShouldHoldNewProcess(brokerHasRestartHold));
+        }
+
+        [Fact]
+        public async Task TheDebuggerAttachesToTheHeldProcessBeforeItIsResumed()
+        {
+            var rig = new Rig();
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native", "Managed" }));
+            rig.Coordinator.Observe();        // seen while it lived (the shell does it before sending the restart)
+            rig.Debugger.ProcessExits(100);   // the broker terminated it before announcing the new one
+            rig.Coordinator.Observe();
+
+            ReattachOutcome outcome = await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume());
+
+            Assert.Equal(ReattachOutcome.Attached, outcome);
+            Assert.Equal(new[] { "attach:200", "resume:200" }, rig.Debugger.Order);   // attach first, then resume
+            Assert.Equal(new[] { "Native", "Managed" }, rig.Debugger.AttachCalls[0].Engines);
+            Assert.Empty(rig.Reported);
+        }
+
+        [Fact]
+        public async Task TheLaterRestartedEventDoesNotAttachASecondTime()
+        {
+            var rig = new Rig();
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
+            await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume());
+
+            Assert.Equal(ReattachOutcome.Duplicate, await rig.Coordinator.OnRestartedAsync(100, 200));
+            Assert.Single(rig.Debugger.AttachCalls);
+        }
+
+        [Fact]
+        public async Task AProcessTheDebuggerWasNotAttachedToIsResumedWithoutAnAttach()
+        {
+            var rig = new Rig();
+            ReattachOutcome outcome = await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume());
+            Assert.Equal(ReattachOutcome.NotDebugged, outcome);
+            Assert.Equal(new[] { "resume:200" }, rig.Debugger.Order);
+            Assert.Empty(rig.Reported);
+        }
+
+        [Fact]
+        public async Task AFailedAttachStillResumesAndIsReportedAsCml5997()
+        {
+            var rig = new Rig();
+            rig.Debugger.FailTimes = 99;
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
+
+            ReattachOutcome outcome = await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume());
+
+            Assert.Equal(ReattachOutcome.Failed, outcome);
+            Assert.Equal("resume:200", rig.Debugger.Order.Last());
+            ChameleonDiagnostic d = Assert.Single(rig.Reported);
+            Assert.Equal("CML5997", d.Id);
+            Assert.Contains("access is denied", d.Message);
+        }
+
+        [Fact]
+        public async Task ASlowAttachIsNotWaitedForForeverTheProcessIsResumedAndCml5997IsReported()
+        {
+            var rig = new Rig();
+            rig.Debugger.Hang = true;
+            rig.AttachTimeoutFires = true;
+            rig.GraceFires = true;
+            rig.Settings.HoldAttachTimeoutMs = 20000;
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
+
+            ReattachOutcome outcome = await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume());
+
+            Assert.Equal(ReattachOutcome.Failed, outcome);
+            Assert.Equal(new[] { "attach:200", "resume:200" }, rig.Debugger.Order);
+            ChameleonDiagnostic d = Assert.Single(rig.Reported);
+            Assert.Equal("CML5997", d.Id);
+            Assert.Contains("did not finish attaching within 20 s", d.Message);
+        }
+
+        [Fact]
+        public async Task ACancelledAttachStillResumes()
+        {
+            var rig = new Rig();
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
+            using (var cts = new CancellationTokenSource())
+            {
+                cts.Cancel();
+                await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume(), cts.Token);
+            }
+
+            Assert.Contains("resume:200", rig.Debugger.Order);
+        }
+
+        [Fact]
+        public async Task ADebuggerThatThrowsStillGetsTheProcessResumed()
+        {
+            var rig = new Rig();
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
+            rig.Debugger.ListThrows = false;
+            rig.Settings.ReattachAttempts = 1;
+            rig.Debugger.FailTimes = 1;
+            await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume());
+            Assert.Equal("resume:200", rig.Debugger.Order.Last());
+        }
+
+        [Fact]
+        public async Task WithReattachOffAHeldProcessIsResumedAtOnceAndNotAttached()
+        {
+            var rig = new Rig();
+            rig.Settings.ReattachOnRestart = false;   // the user switched it off while the restart was under way
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
+
+            ReattachOutcome outcome = await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume());
+
+            Assert.Equal(ReattachOutcome.Disabled, outcome);
+            Assert.Equal(new[] { "resume:200" }, rig.Debugger.Order);
+        }
+
+        [Fact]
+        public async Task AResumeThatDoesNotGetThroughIsReportedAndDoesNotThrow()
+        {
+            var rig = new Rig();
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
+
+            await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume(throws: new InvalidOperationException("the request could not be sent")));
+
+            ChameleonDiagnostic d = Assert.Single(rig.Reported);
+            Assert.Equal("CML5997", d.Id);
+            Assert.Contains("resume the restarted process", d.Message);
+            Assert.Contains("resumes the process by itself", d.Action);
+            Assert.Contains("30 s", d.Action);
+        }
+
+        [Fact]
+        public async Task AConnectionThatDroppedDuringTheResumeIsOnlyLoggedTheBrokerResumesWhenItsClientIsGone()
+        {
+            var rig = new Rig();
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
+
+            await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume(throws: new ControlException(ClientDiagnostics.PipeLost("pipe", "gone"))));
+
+            Assert.Empty(rig.Reported);
+            Assert.Contains(rig.Log, m => m.Contains("connection dropped"));
+        }
+
+        [Fact]
+        public void TheDisplayedHoldTimeIsClampedToTheBrokersMaximum()
+        {
+            ChameleonDiagnostic d = ClientDiagnostics.ResumeFailed(200, "x", 600000);
+            Assert.Contains("60 s", d.Action);
+        }
+
+        [Fact]
+        public async Task AHeldAttachThatFailsStillGetsALateAttachWhenRestartedArrives()
+        {
+            var rig = new Rig();
+            rig.Debugger.FailWhileHeld = true;   // the debugger cannot attach to a process that has not run
+            rig.Settings.ReattachAttempts = 2;
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
+            rig.Coordinator.Observe();
+            rig.Debugger.ProcessExits(100);       // the broker terminated it
+            rig.Coordinator.Observe();
+
+            ReattachOutcome held = await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume());
+
+            Assert.Equal(ReattachOutcome.Failed, held);
+            Assert.Single(rig.Reported);   // one CML5997 for the failed early attach
+            // The process runs now; the `restarted` event gets a normal late attach (not Duplicate).
+            ReattachOutcome late = await rig.Coordinator.OnRestartedAsync(100, 200);
+            Assert.Equal(ReattachOutcome.Attached, late);
+            Assert.Equal(new[] { "Native" }, rig.Debugger.AttachCalls.Last().Engines);
+            Assert.Single(rig.Reported);   // no second report
+        }
+
+        [Fact]
+        public async Task AnAttachThatFinishesAfterTheTimeoutIsNotCancelledAndEndsUpAttached()
+        {
+            var rig = new Rig();
+            rig.AttachTimeoutFires = true;
+            rig.GraceFires = true;
+            rig.Debugger.ManualRelease = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
+
+            ReattachOutcome outcome = await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume());
+
+            Assert.Equal(ReattachOutcome.Failed, outcome);   // we stopped waiting
+            Assert.Contains(rig.Reported, d => d.Message.Contains("did not finish attaching"));
+            rig.Debugger.ManualRelease.SetResult(true);       // the debugger finishes after the timeout
+            Assert.True(await WaitForAsync(() => rig.Debugger.Attached.Any(p => p.Pid == 200)));
+            Assert.False(rig.Debugger.TokenCancelledAtEnd);   // it was not cancelled
+            Assert.Equal(ReattachOutcome.AlreadyAttached, await rig.Coordinator.OnRestartedAsync(100, 200));
+        }
+
+        private static async Task<bool> WaitForAsync(Func<bool> condition, int timeoutMs = 5000)
+        {
+            DateTime until = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+            while (DateTime.UtcNow < until)
+            {
+                if (condition())
+                {
+                    return true;
+                }
+
+                await Task.Delay(10);
+            }
+
+            return condition();
+        }
+
+        [Fact]
+        public async Task ABrokerThatHadResumedTheProcessAlreadyIsNotAnError()
+        {
+            var rig = new Rig();
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
+            var answer = new ControlResponse { Ok = false, Error = new BrokerError { Id = "CML5814", Message = "process 200 is not held any more", Action = "x" } };
+
+            await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume(answer));
+
+            Assert.Empty(rig.Reported);
+            Assert.Contains(rig.Log, m => m.Contains("resumed pid 200 already"));
+        }
+
+        [Fact]
+        public async Task AnyOtherRefusalOfTheResumeIsReported()
+        {
+            var rig = new Rig();
+            var answer = new ControlResponse { Ok = false, Error = new BrokerError { Id = "CML5817", Message = "could not be resumed", Action = "x" } };
+
+            await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume(answer));
+
+            ChameleonDiagnostic d = Assert.Single(rig.Reported);
+            Assert.Equal("CML5997", d.Id);
+            Assert.Contains("CML5817", d.Message);
+        }
+
+        [Fact]
+        public void OnlyARestartThisExtensionAskedToHoldIsClaimedByItsToken()
+        {
+            var rig = new Rig();
+            Assert.False(rig.Coordinator.TryClaimRestarting("anything"));   // nothing expected: another client's held process is not ours
+            Assert.False(rig.Coordinator.TryClaimRestarting(null));
+
+            ReattachCoordinator.HoldTicket ticket = rig.Coordinator.ExpectRestarting();
+            Assert.False(string.IsNullOrEmpty(ticket.Token));
+            Assert.False(rig.Coordinator.TryClaimRestarting("somebody-elses-token"));   // a pending ticket does not claim a foreign event
+            Assert.False(rig.Coordinator.TryClaimRestarting(null));                     // nor one without a token
+            Assert.True(rig.Coordinator.TryClaimRestarting(ticket.Token));
+            Assert.False(rig.Coordinator.TryClaimRestarting(ticket.Token));              // once per restart
+            rig.Coordinator.RestartingNoLongerExpected(ticket);                          // no effect after the claim
+
+            ReattachCoordinator.HoldTicket unanswered = rig.Coordinator.ExpectRestarting();
+            Assert.NotEqual(ticket.Token, unanswered.Token);
+            rig.Coordinator.RestartingNoLongerExpected(unanswered);   // the restart failed before it announced anything
+            Assert.False(rig.Coordinator.TryClaimRestarting(unanswered.Token));
+        }
+
+        [Fact]
+        public async Task AnAttachThatOnlyReturnsOnceTheProcessRunsDoesNotDelayTheResume()
+        {
+            var rig = new Rig();
+            rig.Debugger.BlockUntilResumed = true;   // what a real attach to a suspended process may do
+            rig.GraceFires = true;                    // the debugger never lists the pid: the grace period ends the wait
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
+
+            ReattachOutcome outcome = await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume());
+
+            Assert.Equal(ReattachOutcome.Attached, outcome);   // the attach finished after the resume
+            Assert.Equal(new[] { "attach:200", "resume:200" }, rig.Debugger.Order);
+            Assert.Empty(rig.Reported);                          // no CML5997: nothing failed
+        }
+
+        [Fact]
+        public async Task TheResumeComesAsSoonAsTheDebuggerListsThePidWithoutWaitingForTheGrace()
+        {
+            var rig = new Rig();   // the grace period never ends in this test
+            rig.Debugger.BlockUntilResumed = true;
+            rig.Debugger.ListEarly = true;
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
+
+            ReattachOutcome outcome = await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume());
+
+            Assert.Equal(ReattachOutcome.Attached, outcome);
+            Assert.Equal(new[] { "attach:200", "resume:200" }, rig.Debugger.Order);
+            Assert.Empty(rig.Reported);
+        }
+
+        [Fact]
+        public async Task ARealAttachFailureAfterTheResumeIsStillCml5997()
+        {
+            var rig = new Rig();
+            rig.GraceFires = true;
+            rig.Debugger.BlockUntilResumed = true;
+            rig.Debugger.FailTimes = 99;
+            rig.Settings.ReattachAttempts = 1;
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
+
+            ReattachOutcome outcome = await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume());
+
+            Assert.Equal(ReattachOutcome.Failed, outcome);
+            Assert.Equal("attach:200", rig.Debugger.Order[0]);
+            Assert.Contains("resume:200", rig.Debugger.Order);
+            ChameleonDiagnostic d = Assert.Single(rig.Reported);
+            Assert.Equal("CML5997", d.Id);
+            Assert.Contains("access is denied", d.Message);
         }
     }
 }

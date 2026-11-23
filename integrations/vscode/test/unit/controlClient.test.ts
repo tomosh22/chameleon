@@ -89,6 +89,35 @@ describe("ControlClient", () => {
     }
   });
 
+  it("keeps file, line and column of an error response's diag (WP-35) and none when the broker sent none", async () => {
+    let n = 0;
+    const server = new FakeServer(testPipePath(), () =>
+      n++ === 0
+        ? { diag: { id: "CML2200", message: "compile failed", action: "fix", file: "C:\\p\\logic.cpp", line: 12, column: 15 } }
+        : { diag: { id: "CML2200", message: "compile failed", action: "fix" } },
+    );
+    await server.listen();
+    try {
+      const c = await ControlClient.connect(server.pipe);
+      await assert.rejects(c.request("reload"), (e: unknown) => {
+        assert.ok(e instanceof DiagError);
+        assert.equal(e.diag.file, "C:\\p\\logic.cpp");
+        assert.equal(e.diag.line, 12);
+        assert.equal(e.diag.column, 15);
+        return true;
+      });
+      await assert.rejects(c.request("reload"), (e: unknown) => {
+        assert.ok(e instanceof DiagError);
+        assert.equal(e.diag.file, undefined);
+        assert.equal(e.diag.line, undefined);
+        return true;
+      });
+      c.close();
+    } finally {
+      await server.close();
+    }
+  });
+
   it("turns an error response into a DiagError with the broker's id (unknown command CML5402)", async () => {
     const server = new FakeServer(testPipePath(), () => ({
       diag: { id: "CML5402", message: "unknown command 'nope'", action: "query status" },

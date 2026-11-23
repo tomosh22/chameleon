@@ -40,3 +40,25 @@ cml_add_agent_it(integration.agent_without_broker_runs fixture_basic fixture_bas
 # The C99 fixture through the C API, against a headless broker (and with auto-start).
 cml_add_agent_it(integration.c_only_agent_enable_module fixture_c_only fixture_c_only.exe prestart)
 cml_add_agent_it(integration.c_only_agent_autostarts_broker fixture_c_only fixture_c_only.exe autostart)
+
+# WP-34 (ADR-0040): `restart {hold_new}` against a real broker and the fixture hot_restart: the new process is created suspended
+# (no TICK before restart-resume), runs and registers after it, is resumed by the broker after hold_ms, and is not stranded when the
+# requesting client disconnects. Each scenario prints a greppable `WP34-HOLD <scenario>: ...` line (in ctest -V and in the JUnit output).
+add_executable(cml_it_restart_hold restart_hold_driver.cpp)
+target_link_libraries(cml_it_restart_hold PRIVATE cml_ipc cml_proc)
+cml_apply_warnings(cml_it_restart_hold)
+cml_target_exceptions_allowed(cml_it_restart_hold)
+set_target_properties(cml_it_restart_hold PROPERTIES FOLDER "tests")
+add_dependencies(cml_it_restart_hold cml_broker cml_agent fixture_hot_restart)
+
+foreach(_scenario resume timeout disconnect not-held broker-killed two-holds)
+    string(REPLACE "-" "_" _name "${_scenario}")
+    add_test(NAME integration.restart_hold_${_name}
+        COMMAND cml_it_restart_hold
+            --broker $<TARGET_FILE:cml_broker>
+            --fixture $<TARGET_FILE:fixture_hot_restart>
+            --workdir "${_cml_it_work}"
+            --scenario ${_scenario}
+            --timeout-ms 200000)
+    set_tests_properties(integration.restart_hold_${_name} PROPERTIES TIMEOUT 300)
+endforeach()

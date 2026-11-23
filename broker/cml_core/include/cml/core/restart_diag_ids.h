@@ -20,6 +20,15 @@ inline constexpr std::uint32_t kReapplyFailed = 5810;     // (warning) the sessi
 inline constexpr std::uint32_t kStdHandle = 5811;         // (warning) a standard handle could not be handed on; the new process has none for it
 inline constexpr std::uint32_t kNewProcessExited = 5812;  // the new process exited before it registered
 
+// WP-34 (ADR-0040): `restart {hold_new:true}` holds the new process suspended until `restart-resume` or `hold_ms`. CML5813-5819.
+inline constexpr std::uint32_t kHoldExpired = 5813;       // (warning) nobody resumed the held process within hold_ms: the broker did
+inline constexpr std::uint32_t kNotHeld = 5814;           // `restart-resume` for a pid that is not held (never held, or already resumed)
+inline constexpr std::uint32_t kHoldAborted = 5815;       // the broker shut down while holding: the process was resumed, the restart ended
+inline constexpr std::uint32_t kHoldClientGone = 5816;    // (warning) the client that asked for the restart went away while holding: resumed, the restart goes on
+inline constexpr std::uint32_t kResumeFailed = 5817;      // the held process could not be resumed (it was terminated rather than left suspended)
+inline constexpr std::uint32_t kBadHoldArgs = 5818;       // `hold_new` / `hold_ms` / `restart-resume` arguments invalid
+inline constexpr std::uint32_t kHoldUnavailable = 5819;   // this broker or its process host cannot hold a new process; nothing was touched
+
 // The harness's restart step uses CML5840 and CML5841 (cml_ipc/control_ids.h: kRestartStepFailed, kRestartStepMismatch).
 
 }  // namespace cml::core::restart::diag

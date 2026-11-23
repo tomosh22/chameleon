@@ -24,6 +24,7 @@ namespace Chameleon.Control
         private readonly string _pipeName;
         private readonly LineReader _reader;
         private readonly SemaphoreSlim _callLock = new SemaphoreSlim(1, 1);
+        private readonly SemaphoreSlim _writeLock = new SemaphoreSlim(1, 1);   // one request line is written at a time
         private readonly ConcurrentDictionary<long, TaskCompletionSource<ControlResponse>> _pending =
             new ConcurrentDictionary<long, TaskCompletionSource<ControlResponse>>();
         private readonly CancellationTokenSource _stop = new CancellationTokenSource();
@@ -55,10 +56,21 @@ namespace Chameleon.Control
             Task.Run(ReadLoopAsync);
         }
 
-        /// <summary>Sends one request and waits for its answer. Broker errors come back as a response with Ok = false.</summary>
-        public async Task<ControlResponse> CallAsync(string command, JObject args, int timeoutMs, CancellationToken cancellationToken)
+        /// <summary>
+        /// Sends one request and waits for its answer. Broker errors come back as a response with Ok = false.
+        /// <para>
+        /// Calls are normally one at a time: a call waits for the one in flight. <paramref name="concurrent"/> skips that wait (answers are
+        /// matched by id), for the one command that has to reach the broker while another is unanswered: `restart-resume` while the
+        /// `restart {hold_new}` that holds the process is still waiting for it (WP-34).
+        /// </para>
+        /// </summary>
+        public async Task<ControlResponse> CallAsync(string command, JObject args, int timeoutMs, CancellationToken cancellationToken, bool concurrent = false)
         {
-            await _callLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            if (!concurrent)
+            {
+                await _callLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+
             try
             {
                 if (!IsOpen)
@@ -84,6 +96,7 @@ namespace Chameleon.Control
                     }
 
                     byte[] bytes = new UTF8Encoding(false).GetBytes(request.ToString(Formatting.None) + "\n");
+                    await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
                     try
                     {
                         await _stream.WriteAsync(bytes, 0, bytes.Length, cancellationToken).ConfigureAwait(false);
@@ -92,6 +105,10 @@ namespace Chameleon.Control
                     catch (Exception ex) when (ex is IOException || ex is ObjectDisposedException || ex is InvalidOperationException)
                     {
                         throw new ControlException(ClientDiagnostics.PipeLost(_pipeName, ex.Message));
+                    }
+                    finally
+                    {
+                        _writeLock.Release();
                     }
 
                     using (var delayCancel = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
@@ -116,7 +133,10 @@ namespace Chameleon.Control
             }
             finally
             {
-                _callLock.Release();
+                if (!concurrent)
+                {
+                    _callLock.Release();
+                }
             }
         }
 

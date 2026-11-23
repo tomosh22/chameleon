@@ -41,16 +41,31 @@ inline constexpr const char* kSetOption = "set-option";
 inline constexpr const char* kSubscribe = "subscribe";
 inline constexpr const char* kRevert = "revert";  // WP-22: control command `revert` and the `patch_reverted` event
 inline constexpr const char* kDiagEvents = "diag-events";  // `diag` events are delivered to subscribers
+inline constexpr const char* kDiagLocations = "diag-locations";  // WP-35: `diag` events and failed `reload` answers may carry file, line, column
 inline constexpr const char* kRestart = "restart";  // WP-21: `restart` command, `restarted` event
 inline constexpr const char* kFaultInjection = "fault-injection";  // WP-28: `inject-failure` and `fault-stages` commands (compiled in under CML_FAULT_INJECTION)
 inline constexpr const char* kReexecute = "reexecute";        // WP-23: `exception-action` accepts "reexecute"; `exception_updated` events
 inline constexpr const char* kExceptions = "exceptions";    // WP-20: `exception` events, `exception-action` and `exceptions` commands
+// WP-34 (ADR-0040): `restart {hold_new:true, hold_ms?}` creates the new process suspended, the `restarting {old_pid,new_pid}` event
+// announces it, and the command `restart-resume {pid}` lets it run (otherwise the broker does after `hold_ms`).
+inline constexpr const char* kRestartHold = "restart-hold";
 }  // namespace capability
+
+// Names added by WP-34 (the other commands and events are spelled out where they are served).
+namespace restart_hold {
+inline constexpr const char* kResumeCommand = "restart-resume";
+inline constexpr const char* kRestartingEvent = "restarting";
+inline constexpr std::uint32_t kDefaultHoldMs = 10000;
+inline constexpr std::uint32_t kMaxHoldMs = 60000;
+}  // namespace restart_hold
 
 struct ControlDiag {
     std::string id;       // "CML5402"
     std::string message;  // one line
     std::string action;   // what to do
+    std::string file;     // WP-35: absolute path of the first compiler error; "" = unknown
+    std::uint32_t line = 0;    // 0 = unknown
+    std::uint32_t column = 0;  // 0 = unknown
 };
 
 struct ControlRequest {

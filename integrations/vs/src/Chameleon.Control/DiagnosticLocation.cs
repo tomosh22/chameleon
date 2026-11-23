@@ -33,6 +33,24 @@ namespace Chameleon.Control
             @"(?<file>(?:[A-Za-z]:[\\/]|\\\\)[^\r\n:*?""<>|]+?):(?<line>\d+)(?::(?<col>\d+))?:",
             RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
+        /// <summary>
+        /// WP-35: the position the broker states in structured fields (capability "diag-locations"): <c>file</c> (absolute), <c>line</c>
+        /// and, when the compiler gave one, <c>column</c>. Used exactly as given. False when file or line is missing or unusable, then the
+        /// caller falls back to <see cref="TryParse"/> on the message (older brokers).
+        /// </summary>
+        public static bool TryFromFields(string file, long? line, long? column, out DiagnosticLocation location)
+        {
+            location = null;
+            if (string.IsNullOrEmpty(file) || !line.HasValue || line.Value < 1 || line.Value > int.MaxValue)
+            {
+                return false;
+            }
+
+            int col = column.HasValue && column.Value >= 1 && column.Value <= int.MaxValue ? (int)column.Value : 0;
+            location = new DiagnosticLocation(file, (int)line.Value, col);
+            return true;
+        }
+
         /// <summary>The first "file(line,col):" or "file:line:col:" in the text, or false.</summary>
         public static bool TryParse(string text, out DiagnosticLocation location)
         {

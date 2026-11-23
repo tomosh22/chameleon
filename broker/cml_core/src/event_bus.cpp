@@ -14,6 +14,13 @@ Event make_diag_event(const Diag& diag, const char* severity, const std::string&
     e.body.set("message", ipc::json::Value::string(diag.message));
     e.body.set("action", ipc::json::Value::string(diag.what_to_do));
     e.body.set("severity", ipc::json::Value::string(severity));
+    if (diag.has_location()) {  // WP-35: only when known (capability "diag-locations")
+        e.body.set("file", ipc::json::Value::string(diag.file));
+        e.body.set("line", ipc::json::Value::integer(static_cast<std::int64_t>(diag.line)));
+        if (diag.column != 0) {
+            e.body.set("column", ipc::json::Value::integer(static_cast<std::int64_t>(diag.column)));
+        }
+    }
     if (!stage.empty()) {
         e.body.set("stage", ipc::json::Value::string(stage));
     }

@@ -106,6 +106,88 @@ namespace Chameleon.Control.Tests
             Assert.Equal(3, line.Location.Line);
         }
 
+        // ---- WP-35: structured file, line and column (capability "diag-locations") and the regex fallback ----
+
+        [Fact]
+        public void ADiagEventWithFileAndLineUsesThemExactlyAndNotTheText()
+        {
+            // The text names another place on purpose: the fields win.
+            OutputLine line = EventFormatter.Format(Event(
+                "{\"event\":\"diag\",\"id\":\"CML2200\",\"message\":\"compiling failed. First error: D:\\\\other\\\\x.cpp(99,1): error C2059\",\"action\":\"fix\",\"severity\":\"error\",\"stage\":\"compile\",\"file\":\"C:\\\\proj\\\\logic.cpp\",\"line\":12,\"column\":15}"));
+            Assert.Equal(@"C:\proj\logic.cpp", line.Location.File);
+            Assert.Equal(12, line.Location.Line);
+            Assert.Equal(15, line.Location.Column);
+            Assert.StartsWith(@"C:\proj\logic.cpp(12,15): error CML2200:", line.Text);
+        }
+
+        [Fact]
+        public void ADiagEventWithoutAColumnHasColumnZero()
+        {
+            OutputLine line = EventFormatter.Format(Event(
+                "{\"event\":\"diag\",\"id\":\"CML2200\",\"message\":\"failed\",\"action\":\"fix\",\"severity\":\"error\",\"file\":\"C:\\\\proj\\\\logic.cpp\",\"line\":12}"));
+            Assert.Equal(12, line.Location.Line);
+            Assert.Equal(0, line.Location.Column);
+            Assert.StartsWith(@"C:\proj\logic.cpp(12): error CML2200:", line.Text);
+        }
+
+        [Theory]
+        [InlineData("\"file\":\"\",\"line\":12")]
+        [InlineData("\"file\":\"C:\\\\a.cpp\"")]
+        [InlineData("\"file\":\"C:\\\\a.cpp\",\"line\":0")]
+        [InlineData("\"file\":\"C:\\\\a.cpp\",\"line\":\"12\"")]
+        [InlineData("\"line\":12")]
+        public void UnusableFieldsFallBackToTheRegexParseOfTheMessage(string fields)
+        {
+            OutputLine line = EventFormatter.Format(Event(
+                "{\"event\":\"diag\",\"id\":\"CML2200\",\"message\":\"C:\\\\old\\\\logic.cpp(7,3): error C1: e\",\"action\":\"fix\",\"severity\":\"error\"," + fields + "}"));
+            Assert.Equal(@"C:\old\logic.cpp", line.Location.File);
+            Assert.Equal(7, line.Location.Line);
+            Assert.Equal(3, line.Location.Column);
+        }
+
+        [Fact]
+        public void AnErrorAnswerWithFieldsIsNavigableAtThemAndWithoutThemFallsBack()
+        {
+            JObject answer = Json.ParseObject(
+                "{\"id\":4,\"ok\":false,\"diag\":{\"id\":\"CML2200\",\"message\":\"First error: C:\\\\x\\\\a.cpp(1): error C1\",\"action\":\"fix\",\"file\":\"C:\\\\proj\\\\logic.cpp\",\"line\":12,\"column\":15}}");
+            ControlResponse response = ControlResponse.Parse(answer);
+            Assert.Equal(@"C:\proj\logic.cpp", response.Error.File);
+            Assert.Equal(12, response.Error.Line);
+            Assert.Equal(15, response.Error.Column);
+            OutputLine line = EventFormatter.Format(response.Error);
+            Assert.Equal(@"C:\proj\logic.cpp", line.Location.File);
+            Assert.Equal(12, line.Location.Line);
+            Assert.Equal(15, line.Location.Column);
+
+            ControlResponse old = ControlResponse.Parse(Json.ParseObject(
+                "{\"id\":5,\"ok\":false,\"diag\":{\"id\":\"CML2200\",\"message\":\"First error: C:\\\\x\\\\a.cpp(1): error C1\",\"action\":\"fix\"}}"));
+            Assert.Null(old.Error.File);
+            Assert.Null(old.Error.Line);
+            Assert.Equal(1, EventFormatter.Format(old.Error).Location.Line);
+        }
+
+        [Theory]
+        [InlineData("C:\\p\\a.cpp", 12L, 15L, 12, 15)]
+        [InlineData("C:\\p\\a.cpp", 12L, null, 12, 0)]
+        [InlineData("C:\\p\\a.cpp", 12L, 0L, 12, 0)]
+        public void TryFromFieldsKeepsWhatItIsGiven(string file, long line, long? column, int expectedLine, int expectedColumn)
+        {
+            Assert.True(DiagnosticLocation.TryFromFields(file, line, column, out DiagnosticLocation location));
+            Assert.Equal(file, location.File);
+            Assert.Equal(expectedLine, location.Line);
+            Assert.Equal(expectedColumn, location.Column);
+        }
+
+        [Fact]
+        public void TryFromFieldsRefusesAMissingFileOrLine()
+        {
+            Assert.False(DiagnosticLocation.TryFromFields(null, 12L, 1L, out _));
+            Assert.False(DiagnosticLocation.TryFromFields("", 12L, 1L, out _));
+            Assert.False(DiagnosticLocation.TryFromFields("C:\\a.cpp", null, 1L, out _));
+            Assert.False(DiagnosticLocation.TryFromFields("C:\\a.cpp", 0L, 1L, out _));
+            Assert.False(DiagnosticLocation.TryFromFields("C:\\a.cpp", long.MaxValue, null, out _));
+        }
+
         [Fact]
         public void StatusIsParsedLeniently()
         {
