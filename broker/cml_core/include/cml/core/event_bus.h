@@ -24,7 +24,7 @@ struct Event {
     ipc::json::Value body;  // the whole JSON object, including "event": name
 };
 
-// {"event":"diag","id":"CML3200","message":..,"action":..,"severity":"error|warning|info","stage":..,"pid"?:N}
+// {"event":"diag","id":"CML3200","message":..,"action":..,"severity":"error|warning|info","stage":..,"pid"?:N,"file"?:abs,"line"?:N,"column"?:N}
 Event make_diag_event(const Diag& diag, const char* severity, const std::string& stage, std::uint32_t pid = 0);
 // {"event":"patch_applied","pid":N,"module":..,"generation":N,"hooks":N,"new_functions":N,"new_globals":N,"hooks_planned":N,"hooks_dropped":N}
 // (WP-25 added the last two: the functions of the compiland the planner wanted to hook, and those found identical to the running code.)

@@ -230,6 +230,10 @@ namespace Chameleon.IntegrationTest
                 Check(value1, "the fixture prints value=1 again after the revert");
                 Say("WP31-IT revert=" + (revertOk && revertedEvent && value1 ? "ok" : "FAILED") + " patch_reverted_event=" + (revertedEvent ? 1 : 0) + " value=1");
 
+                // ---- WP-35: a compile error reaches the Error List at the exact file and line (Wp35Check.cs) ------------------------
+                Wp35Result wp35 = await Wp35Check.RunAsync(session, pid, source, File.ReadAllText(source), Say);
+                Check(wp35.Ok, "WP-35 diag location: " + wp35.Problem);
+
                 // ---- reload again, then restart ---------------------------------------------------------------------------------
                 ControlResponse reload2 = await session.ReloadAsync(pid, false);
                 Check(reload2.Ok, "the second reload answered ok (" + (reload2.Error != null ? reload2.Error.ToString() : "") + ")");

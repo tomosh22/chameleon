@@ -28,6 +28,13 @@ struct Diag {
     std::string message;     // one line, names the symbol / file / function
     std::string what_to_do;  // one sentence the user can act on
 
+    // WP-35: where the problem is in a source file, when a compiler named it. Empty `file` = unknown (then `line` and
+    // `column` are 0). `file` is an absolute path. `column` 0 = the compiler gave none. Never part of format().
+    std::string file;
+    std::uint32_t line = 0;
+    std::uint32_t column = 0;
+    bool has_location() const noexcept { return !file.empty() && line != 0; }
+
     static Diag make(std::uint32_t code, std::string message, std::string what_to_do);
 
     // True when `code` lies inside one of the documented CML1xxx..CML5xxx ranges.

@@ -1,6 +1,7 @@
 #include "cml/ipc/control.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <utility>
@@ -52,6 +53,11 @@ ControlDiag to_control_diag(const Diag& diag) {
     out.id = diag.id();
     out.message = diag.message;
     out.action = diag.what_to_do;
+    if (diag.has_location()) {
+        out.file = diag.file;
+        out.line = diag.line;
+        out.column = diag.column;
+    }
     return out;
 }
 
@@ -67,6 +73,11 @@ Diag to_diag(const ControlDiag& diag) {
         return Diag::make(ids::kControlResponseInvalid,
                           "the broker reported an error with an unusable id '" + diag.id + "': " + diag.message,
                           diag.action.empty() ? "Report this as a bug." : diag.action);
+    }
+    if (!diag.file.empty() && diag.line != 0) {
+        candidate.file = diag.file;
+        candidate.line = diag.line;
+        candidate.column = diag.column;
     }
     return candidate;
 }
@@ -95,6 +106,13 @@ Result<std::string> encode_response(const ControlResponse& response) {
         diag.set("id", json::Value::string(response.diag->id));
         diag.set("message", json::Value::string(response.diag->message));
         diag.set("action", json::Value::string(response.diag->action));
+        if (!response.diag->file.empty() && response.diag->line != 0) {  // WP-35
+            diag.set("file", json::Value::string(response.diag->file));
+            diag.set("line", json::Value::integer(static_cast<std::int64_t>(response.diag->line)));
+            if (response.diag->column != 0) {
+                diag.set("column", json::Value::integer(static_cast<std::int64_t>(response.diag->column)));
+            }
+        }
         object.set("diag", std::move(diag));
     }
     std::string line = json::serialize(object);
@@ -218,6 +236,14 @@ Result<std::variant<ControlResponse, ControlEvent>> decode_server_message(std::s
         d.id = diag->get_string("id");
         d.message = diag->get_string("message");
         d.action = diag->get_string("action");
+        if (const json::Value* at_line = diag->find("line"); at_line != nullptr && at_line->is_integer() && at_line->as_integer() > 0 && at_line->as_integer() <= INT32_MAX &&
+                                                          diag->find("file") != nullptr && diag->find("file")->is_string()) {
+            d.file = diag->get_string("file");
+            d.line = static_cast<std::uint32_t>(at_line->as_integer());
+            if (const json::Value* column = diag->find("column"); column != nullptr && column->is_integer() && column->as_integer() > 0 && column->as_integer() <= INT32_MAX) {
+                d.column = static_cast<std::uint32_t>(column->as_integer());
+            }
+        }
         response.diag = std::move(d);
     }
     if (!response.ok && !response.diag) {

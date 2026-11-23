@@ -6,7 +6,7 @@ name: vscode
 
 on:
   push:
-    branches: [main, 'wp/30-*']
+    branches: [main, 'wp/30-*', 'wp/35-*']
     paths:
       - 'integrations/vscode/**'
       - '.github/workflows/vscode.yml'
@@ -101,6 +101,9 @@ jobs:
             --work-dir "$env:WORK_DIR\it" 2>&1 | Tee-Object -FilePath "$env:WORK_DIR\integration.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Select-String -Path "$env:WORK_DIR\integration.log" -SimpleMatch 'WP30-IT reload=ok revert=ok' -Quiet)) { throw 'the integration test did not print WP30-IT reload=ok revert=ok' }
+          # WP-35: a compile error is a Problems entry at the exact file and line (WP35-VSCODE lines).
+          if (-not (Select-String -Path "$env:WORK_DIR\integration.log" -SimpleMatch 'WP35-VSCODE result=ok' -Quiet)) { throw 'the integration test did not print WP35-VSCODE result=ok' }
+          Select-String -Path "$env:WORK_DIR\integration.log" -Pattern '^WP35-VSCODE ' | ForEach-Object { $_.Line }
 
       - name: Package the extension
         working-directory: ${{ env.EXT_DIR }}

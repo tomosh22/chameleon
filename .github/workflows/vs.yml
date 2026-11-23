@@ -86,7 +86,8 @@ jobs:
           Get-Content "$env:LOG_DIR/unit-tests.log" | Where-Object { $_ -match '^(Passed!|Failed!)' }
 
       # The control client against a real cml_broker and the `basic` fixture: status, subscribe, edit + reload (patch_applied),
-      # revert, restart (restarted with a new pid that is running) and the re-attach decision on that real event.
+      # revert, a syntax error (WP-35: the Error List entry at the exact file and line, WP35-VS lines), restart (restarted with a new pid
+      # that is running) and the re-attach decision on that real event.
       - name: Integration test (real broker, fixture basic)
         run: |
           $work = Join-Path $env:RUNNER_TEMP 'vs-it'
@@ -95,10 +96,16 @@ jobs:
           dotnet $exe --bin-dir "$PWD/build/bin" --fixture-source "$PWD/tests/fixtures/basic/logic.cpp" --work-dir $work *>&1 | Tee-Object -FilePath "$env:LOG_DIR/integration.log"
           $code = $LASTEXITCODE
           Copy-Item -Recurse -Force $work "$env:LOG_DIR/it-work" -ErrorAction SilentlyContinue
-          $lines = Get-Content "$env:LOG_DIR/integration.log" | Where-Object { $_ -match '^(WP31-IT|WP34-VS) ' }
+          $lines = Get-Content "$env:LOG_DIR/integration.log" | Where-Object { $_ -match '^(WP31-IT|WP34-VS|WP35-VS) ' }
           $lines | Tee-Object -FilePath "$env:LOG_DIR/wp31-it-summary.txt"
           $lines | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
           if ($code -ne 0) { exit $code }
+          # WP-35: the compile error of the scripted syntax error is an Error List entry at the exact file and line.
+          if (-not ($lines | Where-Object { $_ -match '^WP35-VS result=ok ' })) { throw 'the integration test did not print WP35-VS result=ok' }
+          # WP-34: the held restart with a slow debugger, with a failing attach, and with an attach that only returns once the process runs.
+          foreach ($case in 'hold', 'attach-failure', 'attach-blocks') {
+            if (-not ($lines | Where-Object { $_ -match "^WP34-VS $case=ok " })) { throw "the integration test did not print WP34-VS $case=ok" }
+          }
 
       # WP-34: the broker half of the held restart with real processes (headless cml_broker, fixture hot_restart): no output of the new
       # process before restart-resume, it runs and registers after it, the broker resumes it after hold_ms, a client that disconnects

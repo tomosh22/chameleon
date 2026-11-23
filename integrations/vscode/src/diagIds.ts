@@ -6,6 +6,10 @@ export interface Diag {
   id: string;
   message: string;
   action: string;
+  /** WP-35 (broker capability "diag-locations"): where the first compiler error is. Only set when the broker gave all of file and line. */
+  file?: string;
+  line?: number;
+  column?: number;
 }
 
 export const ids = {

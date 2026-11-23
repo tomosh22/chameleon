@@ -41,6 +41,7 @@ inline constexpr const char* kSetOption = "set-option";
 inline constexpr const char* kSubscribe = "subscribe";
 inline constexpr const char* kRevert = "revert";  // WP-22: control command `revert` and the `patch_reverted` event
 inline constexpr const char* kDiagEvents = "diag-events";  // `diag` events are delivered to subscribers
+inline constexpr const char* kDiagLocations = "diag-locations";  // WP-35: `diag` events and failed `reload` answers may carry file, line, column
 inline constexpr const char* kRestart = "restart";  // WP-21: `restart` command, `restarted` event
 inline constexpr const char* kFaultInjection = "fault-injection";  // WP-28: `inject-failure` and `fault-stages` commands (compiled in under CML_FAULT_INJECTION)
 inline constexpr const char* kReexecute = "reexecute";        // WP-23: `exception-action` accepts "reexecute"; `exception_updated` events
@@ -62,6 +63,9 @@ struct ControlDiag {
     std::string id;       // "CML5402"
     std::string message;  // one line
     std::string action;   // what to do
+    std::string file;     // WP-35: absolute path of the first compiler error; "" = unknown
+    std::uint32_t line = 0;    // 0 = unknown
+    std::uint32_t column = 0;  // 0 = unknown
 };
 
 struct ControlRequest {
