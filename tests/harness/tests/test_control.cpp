@@ -603,3 +603,34 @@ TEST_CASE("broker control: status reports control_pipe_healthy (review fix 8)") 
     REQUIRE(report.has_value());
     CHECK_FALSE(report->control_pipe_healthy);
 }
+
+// WP-35: a failed answer's diag carries file, line and column only when the Diag has a location; nothing else changes.
+TEST_CASE("control codec: an error response carries the diagnostic's location only when it has one (WP-35)") {
+    Diag located = Diag::make(ids::kControlUnknownCommand, "compile failed", "fix it");
+    located.file = "C:\\proj\\logic.cpp";
+    located.line = 12;
+    located.column = 15;
+    Result<std::string> line = encode_response(make_error_response(3, located));
+    REQUIRE(line.has_value());
+    const json::Value object = parsed(*line);
+    CHECK(object.find("diag")->get_string("file") == "C:\\proj\\logic.cpp");
+    CHECK(object.find("diag")->get_integer("line") == 12);
+    CHECK(object.find("diag")->get_integer("column") == 15);
+    Result<std::variant<ControlResponse, ControlEvent>> back = decode_server_message(*line);
+    REQUIRE(back.has_value());
+    const Diag round = to_diag(*std::get<ControlResponse>(*back).diag);
+    CHECK(round.file == "C:\\proj\\logic.cpp");
+    CHECK(round.line == 12);
+    CHECK(round.column == 15);
+
+    located.column = 0;  // cl: no column
+    const json::Value no_column = parsed(*encode_response(make_error_response(3, located)));
+    CHECK(no_column.find("diag")->find("column") == nullptr);
+    CHECK(no_column.find("diag")->find("line") != nullptr);
+
+    const Diag plain = Diag::make(ids::kControlUnknownCommand, "no such command", "use status");
+    const json::Value bare = parsed(*encode_response(make_error_response(3, plain)));
+    CHECK(bare.find("diag")->find("file") == nullptr);
+    CHECK(bare.find("diag")->find("line") == nullptr);
+    CHECK(bare.find("diag")->find("column") == nullptr);
+}

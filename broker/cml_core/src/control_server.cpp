@@ -27,6 +27,7 @@ std::vector<std::string> broker_capabilities(const ControlContext& context) {
             caps.emplace_back(ipc::capability::kRestart);  // WP-21
         }
         caps.emplace_back(ipc::capability::kRevert);  // WP-22
+        caps.emplace_back(ipc::capability::kDiagLocations);  // WP-35
 #if defined(CML_FAULT_INJECTION)
         caps.emplace_back(ipc::capability::kFaultInjection);  // WP-28
 #endif

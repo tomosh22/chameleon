@@ -10,6 +10,7 @@ import {
   formatReloadResult,
   parseDiagnosticLine,
   parseDiagnostics,
+  problemsOfDiag,
   statusBarModel,
   subscriptionEvents,
 } from "../../src/format";
@@ -111,6 +112,47 @@ describe("compiler line parsing (problem matcher)", () => {
     assert.equal(cc?.[1], "logic.cpp");
     assert.equal(cc?.[2], "12");
     assert.equal(cc?.[3], "5");
+  });
+});
+
+describe("problemsOfDiag (WP-35)", () => {
+  const compilerLine = "C:\\p\\logic.cpp(12,15): error C2059: syntax error: ';'";
+  it("uses file, line and column of a diag that has them, exactly (diag-locations path)", () => {
+    // The text names another place on purpose: the fields win and the text is not parsed for the place.
+    const text = "compiling 'logic.cpp' failed with exit code 2. First error: D:\\other\\x.cpp(99,1): error C2059: syntax error: ';'";
+    const got = problemsOfDiag({ event: "diag", id: "CML2200", severity: "error", message: text, file: "C:\\p\\logic.cpp", line: 12, column: 15 });
+    assert.deepEqual(got, [{ file: "C:\\p\\logic.cpp", line: 12, column: 15, severity: "error", code: "C2059", message: "syntax error: ';'" }]);
+  });
+  it("has no column when the compiler gave none (cl without /diagnostics:column)", () => {
+    const got = problemsOfDiag({ event: "diag", severity: "error", message: "failed", file: "C:\\p\\logic.cpp", line: 12 });
+    assert.equal(got.length, 1);
+    assert.equal(got[0].line, 12);
+    assert.equal(got[0].column, undefined);
+    assert.equal(got[0].message, "failed");
+    assert.equal(got[0].code, undefined);
+  });
+  it("maps the severity of the event", () => {
+    const at = { file: "C:\\a.cpp", line: 3, message: "m" };
+    assert.equal(problemsOfDiag({ event: "diag", severity: "warning", ...at })[0].severity, "warning");
+    assert.equal(problemsOfDiag({ event: "diag", severity: "info", ...at })[0].severity, "note");
+    assert.equal(problemsOfDiag({ event: "diag", ...at })[0].severity, "error");
+  });
+  it("falls back to the regular-expression parse without file and line (older broker, or no position)", () => {
+    const got = problemsOfDiag({ event: "diag", id: "CML2200", severity: "error", message: `compile failed\n${compilerLine}` });
+    assert.deepEqual(got, [{ file: "C:\\p\\logic.cpp", line: 12, column: 15, severity: "error", code: "C2059", message: "syntax error: ';'" }]);
+    assert.deepEqual(problemsOfDiag({ event: "diag", message: "no position here" }), []);
+  });
+  it("ignores unusable location fields and falls back", () => {
+    const bads: Record<string, string | number>[] = [{ file: "", line: 12 }, { file: "C:\\a.cpp" }, { file: "C:\\a.cpp", line: 0 }, { file: "C:\\a.cpp", line: "12" }, { file: 5, line: 12 }];
+    for (const bad of bads) {
+      const got = problemsOfDiag({ event: "diag", message: "x.cpp(7): error C1: e", ...bad });
+      assert.deepEqual(
+        got.map((p) => `${p.file}:${p.line}`),
+        ["x.cpp:7"],
+        JSON.stringify(bad),
+      );
+    }
+    assert.equal(problemsOfDiag({ event: "diag", message: "m", file: "C:\\a.cpp", line: 4, column: 0 })[0].column, undefined);
   });
 });
 

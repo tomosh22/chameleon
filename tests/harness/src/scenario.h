@@ -63,6 +63,12 @@ struct Step {
     bool has_result_value = false;
     // Reload (WP-15): the reload must be refused with this diagnostic id (e.g. "CML5550"); empty = it must succeed.
     std::string expect_error;
+    // WP-35 (Reload with `expect_error`, and ExpectDiag): where the compiler error is. `expect_file` is a file name the reported absolute
+    // path must end with, `expect_line` the exact line (0 = the location is not checked), `expect_column` the exact column, checked
+    // only under clang-cl (cl prints none without /diagnostics:column; 0 = not checked).
+    std::string expect_file;
+    int expect_line = 0;
+    int expect_column = 0;
     // WP-16, several processes. Launch: `exe` is a fixture executable of the same build (file name, ".exe" optional; empty =
     // the fixture's primary exe) and `label` names the process (default "fixture" for the primary exe, else the exe's name
     // without extension). `process` selects the process of ExpectStdout / ExpectModuleEnabled / ExpectMonotonic (empty =

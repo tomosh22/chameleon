@@ -84,7 +84,8 @@ jobs:
           Get-Content "$env:LOG_DIR/unit-tests.log" | Where-Object { $_ -match '^(Passed!|Failed!)' }
 
       # The control client against a real cml_broker and the `basic` fixture: status, subscribe, edit + reload (patch_applied),
-      # revert, restart (restarted with a new pid that is running) and the re-attach decision on that real event.
+      # revert, a syntax error (WP-35: the Error List entry at the exact file and line, WP35-VS lines), restart (restarted with a new pid
+      # that is running) and the re-attach decision on that real event.
       - name: Integration test (real broker, fixture basic)
         run: |
           $work = Join-Path $env:RUNNER_TEMP 'vs-it'
@@ -93,10 +94,12 @@ jobs:
           dotnet $exe --bin-dir "$PWD/build/bin" --fixture-source "$PWD/tests/fixtures/basic/logic.cpp" --work-dir $work *>&1 | Tee-Object -FilePath "$env:LOG_DIR/integration.log"
           $code = $LASTEXITCODE
           Copy-Item -Recurse -Force $work "$env:LOG_DIR/it-work" -ErrorAction SilentlyContinue
-          $lines = Get-Content "$env:LOG_DIR/integration.log" | Where-Object { $_ -match '^WP31-IT ' }
+          $lines = Get-Content "$env:LOG_DIR/integration.log" | Where-Object { $_ -match '^(WP31-IT|WP35-VS) ' }
           $lines | Tee-Object -FilePath "$env:LOG_DIR/wp31-it-summary.txt"
           $lines | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
           if ($code -ne 0) { exit $code }
+          # WP-35: the compile error of the scripted syntax error is an Error List entry at the exact file and line.
+          if (-not ($lines | Where-Object { $_ -match '^WP35-VS result=ok ' })) { throw 'the integration test did not print WP35-VS result=ok' }
 
       - name: Upload the .vsix
         if: ${{ !cancelled() }}

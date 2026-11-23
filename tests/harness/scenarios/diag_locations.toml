@@ -1,0 +1,48 @@
+# Scenario `diag_locations` (WP-35, ADR-0040): a compile error carries its position as structured fields.
+#
+# The edit breaks logic.cpp on line 12 (`return 1 +;`). The reload is refused with CML2200; the refusal's diag and the `diag` event
+# carry `file` (absolute), `line` and, where the compiler gives one, `column` (clang-cl: 15; cl prints none without
+# /diagnostics:column). The runner prints `WP35-LOC file=... line=N col=N compiler=...` for each.
+name = "diag_locations"
+description = "fixture basic: a syntax error yields file, line and column on the diag event and in the reload answer"
+fixture = "basic"
+timeout_s = 180
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1"
+within_s = 20
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_basic.exe"
+within_s = 20
+
+[[step]]
+kind = "edit"
+patch = "edits/syntax_error.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_error = "CML2200"
+expect_file = "logic.cpp"
+expect_line = 12
+expect_column = 15
+
+[[step]]
+kind = "expect_diag"
+id = "CML2200"
+within_s = 10
+expect_file = "logic.cpp"
+expect_line = 12
+expect_column = 15
+
+# The application kept running its previous code.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1"
+within_s = 10

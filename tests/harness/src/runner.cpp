@@ -611,6 +611,12 @@ private:
             if (d.id != step.expect_error) {
                 return StepOutcome::fail(cml::ids::kReloadFailed, "the reload was refused with " + d.id + ": " + d.message + ", expected " + step.expect_error);
             }
+            if (step.expect_line != 0) {
+                const std::string wrong = check_location(step, "the reload answer", d.file, d.line, d.column);
+                if (!wrong.empty()) {
+                    return StepOutcome::fail(cml::ids::kResultMismatch, wrong);
+                }
+            }
             return StepOutcome::pass("reload refused as expected: " + d.id + ": " + d.message + " What to do: " + d.action);
         }
         if (!response->ok) {
@@ -825,6 +831,33 @@ private:
         return StepOutcome::pass(step.key + " = " + std::to_string(step.result_value));
     }
 
+    // WP-35: the location of a compiler error (file, line, column) against the step's expectation. Prints the greppable evidence line
+    // `WP35-LOC file=<path> line=N col=N compiler=<cl|clang-cl> from=<reload answer|diag event>`; "" = as expected, else the problem.
+    // The column is checked only under clang-cl (cl prints none without /diagnostics:column).
+    std::string check_location(const Step& step, const char* from, const std::string& file, std::uint32_t line, std::uint32_t column) {
+        std::printf("WP35-LOC file=%s line=%u col=%u compiler=%s from=%s\n", file.c_str(), line, column, report_.compiler.c_str(), from);
+        std::fflush(stdout);
+        std::string lower = file;
+        std::replace(lower.begin(), lower.end(), '\\', '/');
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::string wanted = step.expect_file;
+        std::transform(wanted.begin(), wanted.end(), wanted.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        const bool absolute = lower.size() >= 3 && lower[1] == ':' && lower[2] == '/';
+        const std::string tail = "/" + wanted;
+        const bool name_ok = lower.size() > tail.size() && lower.compare(lower.size() - tail.size(), tail.size(), tail) == 0;
+        if (!absolute || !name_ok) {
+            return std::string(from) + " has file '" + file + "', expected an absolute path ending in " + step.expect_file;
+        }
+        if (line != static_cast<std::uint32_t>(step.expect_line)) {
+            return std::string(from) + " has line " + std::to_string(line) + ", expected " + std::to_string(step.expect_line);
+        }
+        const bool clang = report_.compiler.find("clang") != std::string::npos;
+        if (step.expect_column != 0 && clang && column != static_cast<std::uint32_t>(step.expect_column)) {
+            return std::string(from) + " has column " + std::to_string(column) + ", expected " + std::to_string(step.expect_column);
+        }
+        return {};
+    }
+
     StepOutcome expect_diag(const Step& step) {
         const std::uint32_t limit_ms = std::min<std::uint32_t>(static_cast<std::uint32_t>(step.within_s) * 1000u, remaining_ms());
         const Clock::time_point until = Clock::now() + std::chrono::milliseconds(limit_ms);
@@ -842,6 +875,14 @@ private:
                     const std::string id = e.body.get_string("id");
                     seen += (seen.empty() ? "" : ", ") + id;
                     if (id == step.id) {
+                        if (step.expect_line != 0) {
+                            const std::string wrong = check_location(step, "the diag event", e.body.get_string("file"),
+                                                                     static_cast<std::uint32_t>(e.body.get_integer("line")),
+                                                                     static_cast<std::uint32_t>(e.body.get_integer("column")));
+                            if (!wrong.empty()) {
+                                return StepOutcome::fail(cml::ids::kResultMismatch, wrong);
+                            }
+                        }
                         return StepOutcome::pass("diag " + id + ": " + e.body.get_string("message"));
                     }
                 }

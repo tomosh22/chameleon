@@ -143,6 +143,9 @@ std::string Step::describe() const {
 }
 
 const char* Step::required_capability() const {
+    if (expect_line != 0 && (kind == StepKind::Reload || kind == StepKind::ExpectDiag)) {
+        return cml::ipc::capability::kDiagLocations;  // WP-35 (a broker with it also has `reload` and `diag-events`)
+    }
     switch (kind) {
         case StepKind::Reload: return cml::ipc::capability::kReload;
         case StepKind::Revert: return cml::ipc::capability::kRevert;
@@ -175,6 +178,34 @@ bool name_chars_ok(const std::string& s, bool allow_dot) {
                return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' ||
                       (allow_dot && c == '.');
            });
+}
+
+cml::Result<int> int_in_range(const toml::Table& table, const char* key, int fallback, int lo, int hi);
+
+// WP-35: 'expect_file' (file name), 'expect_line' and 'expect_column' of a reload (with expect_error) or expect_diag step.
+cml::Result<void> parse_location(const toml::Table& table, Step& step) {
+    const toml::Value* file = table.find("expect_file");
+    const toml::Value* line = table.find("expect_line");
+    const toml::Value* column = table.find("expect_column");
+    if (file == nullptr && line == nullptr && column == nullptr) {
+        return {};
+    }
+    if (file == nullptr || line == nullptr) {
+        return invalid(table.line, "'expect_file' and 'expect_line' go together ('expect_column' is optional)");
+    }
+    if (file->kind != toml::Value::Kind::String || file->text.empty() || file->text.find_first_of("\\/:") != std::string::npos) {
+        return invalid(file->line, "'expect_file' must be a file name without a directory");
+    }
+    cml::Result<int> l = int_in_range(table, "expect_line", 0, 1, 10000000);
+    if (!l) return l.error();
+    step.expect_file = file->text;
+    step.expect_line = *l;
+    if (column != nullptr) {
+        cml::Result<int> c = int_in_range(table, "expect_column", 0, 1, 100000);
+        if (!c) return c.error();
+        step.expect_column = *c;
+    }
+    return {};
 }
 
 // WP-23: the keys 'offers', 'lacks' and 'reason' of expect_exception / expect_exception_updated (an action name, an action name, a substring).
@@ -340,7 +371,7 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
     }
     if (*kind == "reload") {
         step.kind = StepKind::Reload;
-        cml::Result<void> keys = only_keys(table, {"kind", "within_s", "expect_result_key", "expect_result_value", "expect_error"}, "a reload step");
+        cml::Result<void> keys = only_keys(table, {"kind", "within_s", "expect_result_key", "expect_result_value", "expect_error", "expect_file", "expect_line", "expect_column"}, "a reload step");
         if (!keys) return keys.error();
         cml::Result<int> within = int_in_range(table, "within_s", 60, 1, 3600);
         if (!within) return within.error();
@@ -368,11 +399,16 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
             if (rk != nullptr) return invalid(ee->line, "'expect_error' and 'expect_result_key' exclude each other");
             step.expect_error = ee->text;
         }
+        cml::Result<void> where = parse_location(table, step);
+        if (!where) return where.error();
+        if (step.expect_line != 0 && step.expect_error.empty()) {
+            return invalid(table.line, "'expect_file', 'expect_line' and 'expect_column' need 'expect_error' in a reload step");
+        }
         return step;
     }
     if (*kind == "expect_diag") {
         step.kind = StepKind::ExpectDiag;
-        cml::Result<void> keys = only_keys(table, {"kind", "id", "within_s"}, "an expect_diag step");
+        cml::Result<void> keys = only_keys(table, {"kind", "id", "within_s", "expect_file", "expect_line", "expect_column"}, "an expect_diag step");
         if (!keys) return keys.error();
         cml::Result<std::string> id = require_string(table, "id", "an expect_diag step");
         if (!id) return id.error();
@@ -383,6 +419,8 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
         cml::Result<int> within = int_in_range(table, "within_s", 10, 1, 3600);
         if (!within) return within.error();
         step.within_s = *within;
+        cml::Result<void> where = parse_location(table, step);
+        if (!where) return where.error();
         return step;
     }
     if (*kind == "expect_monotonic") {

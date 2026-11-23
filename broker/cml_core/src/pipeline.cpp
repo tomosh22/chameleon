@@ -155,6 +155,21 @@ void CompileCache::put(const std::string& key, Entry entry) {
 
 namespace {
 
+// WP-35: the first compiler error's position, from the parsed ToolDiagnostic. A relative file name is the compiler's own
+// spelling (relative to the directory it ran in), so it is resolved against `cwd`. Nothing is set when the compiler named no
+// file or no line (for example "cl : Command line error D8003").
+void locate(Diag& d, const toolchain::ToolDiagnostic& td, const std::string& cwd) {
+    if (td.file.empty() || td.line <= 0) {
+        return;
+    }
+    const std::string& f = td.file;
+    const bool absolute = (f.size() >= 3 && f[1] == ':' && (f[2] == '\\' || f[2] == '/')) || (f.size() >= 2 && path::is_separator(f[0]) && path::is_separator(f[1])) ||
+                          (!f.empty() && f[0] == '/');
+    d.file = (absolute || cwd.empty()) ? f : cwd + (path::is_separator(cwd.back()) ? "" : "\\") + f;
+    d.line = static_cast<std::uint32_t>(td.line);
+    d.column = td.column > 0 ? static_cast<std::uint32_t>(td.column) : 0;
+}
+
 double ms_between(Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
 }
@@ -519,6 +534,7 @@ private:
                 for (const toolchain::ToolDiagnostic& td : outcomes[k].diagnostics) {
                     if (td.severity == toolchain::Severity::Error || td.severity == toolchain::Severity::FatalError) {
                         d.message += " First error: " + td.format();
+                        locate(d, td, requests[k].record.cwd);  // WP-35: from the parsed diagnostic, not from the text
                         break;
                     }
                 }

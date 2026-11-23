@@ -66,6 +66,21 @@ if(WIN32)
             "-DCML_EXPECT_RC=1"
             -P "${PROJECT_SOURCE_DIR}/tests/cmake/run_and_check.cmake")
     set_tests_properties(harness.cmltest_help harness.cmltest_usage_error harness.cmltest_bad_scenario_fails PROPERTIES TIMEOUT 60)
+
+    # WP-35: a compile error carries file, line and column on the `diag` event and in the reload answer. Builds fixture `basic` with this
+    # build's compiler (cl or clang-cl), applies a syntax-error edit and prints `WP35-LOC file=... line=N col=N compiler=...`.
+    add_test(NAME harness.wp35_diag_locations
+        COMMAND cmltest
+            --scenario "${CMAKE_CURRENT_SOURCE_DIR}/scenarios/diag_locations.toml"
+            --repo-root "${PROJECT_SOURCE_DIR}"
+            --build-dir "${CMAKE_BINARY_DIR}"
+            --generator ninja
+            --config $<CONFIG>
+            --cxx "${CMAKE_CXX_COMPILER}"
+            --require-all-capabilities
+            --work-dir "${CMAKE_BINARY_DIR}/test_work/wp35_scratch"
+            --artifacts "${CMAKE_BINARY_DIR}/test_work/wp35_artifacts")
+    set_tests_properties(harness.wp35_diag_locations PROPERTIES TIMEOUT 600)
 endif()
 
 cml_add_unit_test(harness

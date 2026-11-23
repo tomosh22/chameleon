@@ -4,7 +4,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { ControlEvent, JsonObject } from "./controlClient";
 import { Diag, DiagError, badAnswer, formatDiag, ids } from "./diagIds";
-import { StatusBarInput, formatEvent, formatReloadResult, parseDiagnostics, stampLine, statusBarModel } from "./format";
+import { StatusBarInput, formatEvent, formatReloadResult, problemsOfDiag, stampLine, statusBarModel } from "./format";
 import { PipeNameError, resolveControlPipe } from "./pipeName";
 import { ProcessInfo, Session } from "./session";
 
@@ -83,7 +83,7 @@ export function activate(context: vscode.ExtensionContext): void {
   session.on("event", (ev: ControlEvent) => {
     log(formatEvent(ev, new Date()));
     if (ev.event === "diag" && typeof ev.message === "string") {
-      addProblems(ev.message);
+      addProblems(ev);
     }
     if (ev.event === "exception") {
       void offerExceptionActions(ev);
@@ -110,9 +110,9 @@ export function activate(context: vscode.ExtensionContext): void {
   });
   session.on("status", refreshBar);
 
-  function addProblems(text: string): void {
+  function addProblems(ev: ControlEvent): void {
     const byFile = new Map<string, vscode.Diagnostic[]>();
-    for (const p of parseDiagnostics(text)) {
+    for (const p of problemsOfDiag(ev)) {
       const file = resolveFile(p.file);
       const line = Math.max(0, p.line - 1);
       const col = Math.max(0, (p.column ?? 1) - 1);

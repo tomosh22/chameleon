@@ -132,6 +132,28 @@ export function parseDiagnosticLine(line: string): ParsedDiagnostic | undefined 
   return undefined;
 }
 
+/**
+ * The Problems entries of one `diag` event.
+ *
+ * With a broker that has the capability "diag-locations", a compile failure's event carries `file` (absolute), `line` and, when the
+ * compiler gave one, `column` (WP-35). They are used exactly as they are: one entry, at that place. The compiler's code and text are
+ * taken from the message's first compiler line when it has one (only for the wording, never for the place).
+ *
+ * Without those fields (an older broker, or a diag that is not about a source position) the compiler lines in the message are parsed
+ * with the regular expressions above, as before WP-35.
+ */
+export function problemsOfDiag(ev: ControlEvent): ParsedDiagnostic[] {
+  const message = typeof ev.message === "string" ? ev.message : "";
+  const line = ev.line;
+  if (typeof ev.file === "string" && ev.file !== "" && typeof line === "number" && Number.isInteger(line) && line >= 1) {
+    const column = typeof ev.column === "number" && Number.isInteger(ev.column) && ev.column >= 1 ? ev.column : undefined;
+    const compiler = parseDiagnostics(message)[0];
+    const severity = ev.severity === "warning" ? "warning" : ev.severity === "error" || ev.severity === undefined ? "error" : "note";
+    return [{ file: ev.file, line, column, severity, code: compiler?.code, message: compiler?.message ?? message }];
+  }
+  return parseDiagnostics(message);
+}
+
 export function parseDiagnostics(text: string): ParsedDiagnostic[] {
   const out: ParsedDiagnostic[] = [];
   for (const line of text.split(/\r?\n/)) {
