@@ -1,5 +1,5 @@
 add_executable(cml_broker src/main.cpp)
-target_link_libraries(cml_broker PRIVATE cml_core cml_util)
+target_link_libraries(cml_broker PRIVATE cml_core cml_license cml_util)
 if(WIN32)
     target_link_libraries(cml_broker PRIVATE shell32)  # CommandLineToArgvW
 endif()
