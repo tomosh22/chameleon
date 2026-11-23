@@ -534,7 +534,31 @@ TEST_CASE("an offender that leaves while only it runs is handled inside ONE stop
     while (!started.load()) {
         std::this_thread::yield();
     }
-    Sleep(10);
+    // `started` is set before the call: wait (bounded) until the runner is really inside the 5-byte window, so that the
+    // installer finds an offender even on a loaded machine. The loop below runs for a few hundred milliseconds.
+    {
+        const HANDLE th = static_cast<HANDLE>(runner.native_handle());
+        const auto lo = reinterpret_cast<std::uintptr_t>(slow.entry);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        bool inside = false;
+        while (!inside && std::chrono::steady_clock::now() < deadline) {
+            if (SuspendThread(th) != static_cast<DWORD>(-1)) {
+                CONTEXT ctx{};
+                ctx.ContextFlags = CONTEXT_CONTROL;
+                if (GetThreadContext(th, &ctx)) {
+                    inside = ctx.Rip >= lo && ctx.Rip < lo + 5;
+                }
+                ResumeThread(th);
+            }
+            if (!inside) {
+                Sleep(1);
+            }
+        }
+        if (!inside) {
+            runner.join();
+            FAIL("the runner thread never entered the 5-byte window of slow_const within 5 s");
+        }
+    }
 
     InstallerOptions options;
     options.max_attempts = 1;           // no second stop: only stepping can succeed
