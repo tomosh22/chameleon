@@ -23,7 +23,7 @@ within_s = 20
 
 [[step]]
 kind = "edit"
-patch = "edits/syntax_error.edit"
+patch = "edits/stacked/syntax_error.edit"
 
 [[step]]
 kind = "reload"
