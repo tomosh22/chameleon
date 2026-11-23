@@ -965,22 +965,41 @@ void Planner::bridge_statics() {
                    "static function template instantiation: not matched to the old image, not hooked");
             continue;
         }
-        const std::string base = base_identifier(sy.name);
+        // C statics (WP-26c): the object's name is not a Microsoft-decorated one ("platform.0", "next.counter" under
+        // clang-cl); read the source identity from it.
+        const bool c_data = !is_func && !sy.name.empty() && sy.name[0] != '?';
+        const CStaticName cname = c_data ? c_static_name(sy.name) : CStaticName();
+        const std::string base = c_data ? cname.base : base_identifier(sy.name);
+        if (base.empty() && !is_func && sy.dec.section != 0 && !secs_[sy.dec.section - 1].runtime_table &&
+            (secs_[sy.dec.section - 1].sec->characteristics & coff::scn::MemWrite) != 0 && !is_fresh_data_name(sy.name) &&
+            !is_compiler_generated_data_name(sy.name)) {
+            // Writable data that looks like a user's static (not a name on the explicit compiler-generated list) whose identity
+            // cannot be established: binding it as new would give the patch a zero-filled
+            // copy of live state (WP-26c: the raylib crash). Refuse before anything is applied.
+            error(diag::kUnnamedStatic,
+                  "static data " + describe(sy) + " in " + in_.object_name + " has no source-level name the planner can match to the old image (object section '" +
+                      secs_[sy.dec.section - 1].name + "'), so it cannot be bound to the running process's copy",
+                  "Give the variable an ordinary name, or hot-restart.");
+            sy.diagnosed = true;
+            decide(sy, DecisionKind::PatchNewData, BindSource::None, sy.dec.type, {}, "writable static without a source-level name (CML3500)");
+            continue;
+        }
         if (base.empty()) {
-            // Nothing to match by: a static without a source-level name (compiler temporary).
+            // Nothing to match by: a static without a source-level name (compiler temporary, read-only).
             decide(sy, is_func ? DecisionKind::PatchNewFunction : DecisionKind::PatchNewData, BindSource::None, sy.dec.type, {},
                    "static without a source-level name: treated as new");
             continue;
         }
-        const std::string encl = enclosing_function(sy.name);
+        const std::string encl = c_data ? cname.encl : enclosing_function(sy.name);
         const bool is_tls = !is_func && sy.dec.section != 0 && secs_[sy.dec.section - 1].tls;
-        const std::string key = std::string(is_func ? "F|" : (is_tls ? "T|" : "D|")) + canonical_lambda_names(sy.dec.display) + "|" + base + "|" + encl;
+        // The spelling ("platform.0" vs "platform") is not part of a C static's identity: one group per (name, scope).
+        const std::string key = std::string(is_func ? "F|" : (is_tls ? "T|" : "D|")) + (c_data ? std::string() : canonical_lambda_names(sy.dec.display)) + "|" + base + "|" + encl;
         Group& g = groups[key];
         g.is_func = is_func;
         g.is_tls = is_tls;
         g.base = base;
         g.encl = encl;
-        g.display = sy.dec.display == sy.name ? std::string() : sy.dec.display;
+        g.display = (sy.dec.display == sy.name || c_data) ? std::string() : sy.dec.display;
         g.members.push_back(static_cast<std::uint32_t>(pos));
     }
     for (auto& [key, g] : groups) {
