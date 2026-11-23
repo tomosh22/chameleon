@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- The Visual Studio extension's logic, with no Visual Studio SDK dependency: the control-pipe client, the broker
+       session (connect, capabilities, subscribe, reconnect) and the debugger re-attach decision. -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <RootNamespace>Chameleon.Control</RootNamespace>
+    <AssemblyName>Chameleon.Control</AssemblyName>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- MIT. Visual Studio itself ships Newtonsoft.Json 13, so the extension binds to the same assembly. -->
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <!-- MIT. WindowsIdentity for the logon-session SID that names the default control pipe (inside the .NET Framework it is part of mscorlib). -->
+    <PackageReference Include="System.Security.Principal.Windows" Version="5.0.0" />
+  </ItemGroup>
+</Project>

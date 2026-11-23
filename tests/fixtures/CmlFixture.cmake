@@ -1,10 +1,14 @@
 # cml_add_fixture(<name> [C] SOURCES ...)
 #
 # Creates an OBJECT library fixture_<name>_objs (so tests can read the per-TU .obj files) and an
-# executable fixture_<name> linked from it. Flags follow docs/BUILD_REQUIREMENTS.md: full PDBs,
-# function-level linking, hot-patchable entries with padding, no COMDAT folding or dead-stripping.
+# executable fixture_<name> linked from it. The Chameleon build flags (docs/BUILD_REQUIREMENTS.md: full PDBs,
+# function-level linking, hot-patchable entries with padding, no COMDAT folding or dead-stripping, /Ob0 outside
+# Debug) come from chameleon_enable() (integrations/cmake/ChameleonEnable.cmake, WP-29), the same function a user
+# project calls. Fixtures pass NO_AGENT: they load cml_agent.dll at run time and take the header from
+# CML_AGENT_INCLUDE_DIR below (cmltest builds them standalone, where there is no Chameleon::agent target).
 # Fixtures deliberately use the compiler's ordinary Debug/RelWithDebInfo flags otherwise (/RTC1,
-# /GS, ...) because that is what real user projects look like.
+# /GS, ...) because that is what real user projects look like. A fixture that needs other flags
+# (optimised, bad_builds) adjusts the target after this call or does not use it.
 #
 # "Linked with the agent" (plan section 10) means: every fixture can use agent/include/Chameleon_API.h
 # and finds cml_agent.dll and cml_broker.exe next to its own exe. The fixture never links the agent
@@ -14,6 +18,8 @@
 # CMakeLists.txt, which is also used for DLLs).
 #
 # The C keyword marks a fixture whose sources are C: C++-only options (/EHsc, /GR) are skipped.
+include("${CMAKE_CURRENT_LIST_DIR}/../../integrations/cmake/ChameleonEnable.cmake")
+
 function(cml_add_fixture name)
     cmake_parse_arguments(F "C" "" "SOURCES" ${ARGN})
     set(objs fixture_${name}_objs)
@@ -21,7 +27,7 @@ function(cml_add_fixture name)
     if(NOT F_C)
         cml_target_exceptions_allowed(${objs})
     endif()
-    cml_target_fixture_style(${objs})
+    chameleon_enable(${objs} NO_AGENT NO_BUILD_TYPE_CHECK)
     # CML_AGENT_INCLUDE_DIR (WP-13): set by tests/harness/fixture_wrapper when cmltest builds a fixture
     # standalone; in the main tree it is unset and the agent header comes from this repository.
     if(CML_AGENT_INCLUDE_DIR)
@@ -31,9 +37,6 @@ function(cml_add_fixture name)
     endif()
     # common/fixture_runtime.h: the shared TICK loop used by fixtures newer than `basic`.
     target_include_directories(${objs} PRIVATE "${_cml_agent_include}" "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/common")
-    if(MSVC)
-        target_compile_options(${objs} PRIVATE /Gy /hotpatch)
-    endif()
     set_target_properties(${objs} PROPERTIES FOLDER "tests/fixtures")
 
     add_executable(fixture_${name} $<TARGET_OBJECTS:${objs}>)
@@ -42,16 +45,13 @@ function(cml_add_fixture name)
     if(TARGET cml_agent AND TARGET cml_broker)
         add_dependencies(fixture_${name} cml_agent cml_broker)
     endif()
-    if(MSVC)
-        target_link_options(fixture_${name} PRIVATE
-            /DEBUG:FULL /INCREMENTAL:NO /OPT:NOREF /OPT:NOICF /FUNCTIONPADMIN)
-    endif()
+    chameleon_enable(fixture_${name} NO_AGENT NO_BUILD_TYPE_CHECK)
     set_target_properties(fixture_${name} PROPERTIES FOLDER "tests/fixtures")
 endfunction()
 
 # cml_add_fixture_dll(<target> SOURCES ...)   (WP-16)
 #
-# A DLL of a multi-module fixture, built like the fixture exe: /Gy /hotpatch, full PDB, no ICF / dead stripping,
+# A DLL of a multi-module fixture, built like the fixture exe (chameleon_enable): /Gy /hotpatch, full PDB, no ICF / dead stripping,
 # padded function entries. It lands beside the exe (the whole project builds into one runtime output directory,
 # DLLs included), so the exe finds it through the normal DLL search and the fixture enables it by file name
 # (cml_fixture::extra_modules()). The exe links its import library: `target_link_libraries(fixture_x PRIVATE <target>)`.
@@ -59,10 +59,6 @@ function(cml_add_fixture_dll target)
     cmake_parse_arguments(F "" "" "SOURCES" ${ARGN})
     add_library(${target} SHARED ${F_SOURCES})
     cml_target_exceptions_allowed(${target})
-    cml_target_fixture_style(${target})
-    if(MSVC)
-        target_compile_options(${target} PRIVATE /Gy /hotpatch)
-        target_link_options(${target} PRIVATE /DEBUG:FULL /INCREMENTAL:NO /OPT:NOREF /OPT:NOICF /FUNCTIONPADMIN)
-    endif()
+    chameleon_enable(${target} NO_AGENT NO_BUILD_TYPE_CHECK)
     set_target_properties(${target} PROPERTIES FOLDER "tests/fixtures")
 endfunction()
