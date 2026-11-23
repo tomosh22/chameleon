@@ -748,3 +748,57 @@ one is available; only absolute budgets fail the job.
 target builds as a replay executable registered with ctest over its checked-in seed corpus, so every cell exercises
 it. Failure injection is compiled in under CMake option `CML_FAULT_INJECTION` (default ON; the release packaging WP
 turns it off) and is reachable only through the `fault-injection` control capability.
+
+## ADR-0036 WP-26 findings: static-library members are reloadable; the C-statics crash is its own package (extends ADR-0035)
+
+**Context.** The real-project corpus (WP-26, PR #46) found the following.
+
+- **F-1:** `ModuleIndex::is_source_compiland` rejects every compiland whose PDB module names an archive. Code linked from a
+  static library is therefore never tracked, so a reload after editing it answers `ok`, `patched: 0`, with no diagnostic. Most of
+  Godot is built this way.
+- **F-3:** under clang-cl, an accepted reload of raylib `rcore.c` crashes the process 3 ms later. The suspected cause is that a
+  `static` variable of a C translation unit is bound as a new global, so the patch reads a zero-filled copy.
+- **F-2:** `__ImageBase`-relative array indexing under cl gives CML3101 for the whole TU.
+- **F-4:** an overloaded `static` function set in a header gives CML3214 for every TU that includes it.
+- **VEX:** the hook decoder refuses VEX-encoded (C4/C5) prologues.
+
+**Decision.**
+
+1. **Library members (F-1) are reloadable.** A compiland is a source compiland when its object name is a real object (not
+   `Import:` or `*`) and the PDB records its build environment (S_ENVBLOCK: cwd, compiler, command, source), whether or not
+   it came from an archive. Its sources are tracked and swept like any other. A compiland that is skipped (no build
+   environment, missing source, import stub) is counted.
+   - At enable time the broker warns once with the number of skipped compiland objects that come from archives, naming up to
+     five.
+   - When a reload finds a changed file that no reloadable compiland owns, it warns instead of answering a silent `patched: 0`.
+   - Package **WP-26b**: ranges CML5920–5939 (broker) and CML1470–1479 (PDB reader).
+2. **The F-3 crash is package WP-26c** (range CML3500–3549, planner).
+   - Root-cause it from the corpus trace. Then either fix the static matching for C translation units in `bind_plan.cpp`, or
+     refuse the reload with a planner diagnostic before anything is applied.
+   - An accepted reload that crashes the target is never an acceptable end state.
+   - WP-26c adds a fixture/scenario reproduction (a C TU with a `static` struct read through a pointer after the reload) in
+     every matrix cell. The corpus alone is not enough, because it runs nightly and only on its own path filter.
+3. **F-2, F-4 and VEX stay documented limitations** (KNOWN_LIMITATIONS) and become follow-ups FU-26..28. Decoding VEX
+   reverses a WP-10 limitation and is not wave-7 work.
+4. **The corpus lands first** (PR #46), with F-1 and F-3 asserted as expected failures. WP-26b and WP-26c each flip their entries.
+   The corpus runner records an expected failure that passes as a failure, so the flip is required.
+5. WP-26b and WP-26c are wave-7 packages and run in parallel; they touch different files (module index, sweep and audit vs. the
+   bind planner). Review: high for WP-26c (bind planner), medium for WP-26b.
+## ADR-0037 CI selects the clang-cl that the active MSVC STL accepts
+
+**Context.** The `windows-2025` runner image became `windows-2025-vs2026`: Visual Studio 18 with MSVC STL 14.52, which
+requires Clang 22 (`error STL1000`). Its standalone LLVM in `C:\Program Files\LLVM` is still 20.1.8. Both clang-cl cells on
+windows-2025 failed to compile anything (PR #46 at d5d937c, 2026-11-22).
+
+**Decision.** The matrix cells pick clang-cl in this order:
+1. The one bundled with the active Visual Studio toolset (`$env:llvmX64` from msvc-dev-cmd), which is the pairing Microsoft
+   supports.
+2. The standalone install.
+3. Whatever is on PATH.
+
+The first candidate that compiles a small STL translation unit wins. Each rejected candidate is logged, and `toolchain.txt`
+records the chosen compiler and its version. The cells therefore test the clang-cl a user of that Visual Studio gets.
+- **Older clang versions:** the explicit clang-cl 17–20 probe jobs still cover them.
+- **`_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH`:** not used; it builds a combination Microsoft does not support.
+- **Other workflows:** `corpus.yml` (WP-26) and `fuzz.yml` (WP-28) select clang-cl the same old way. Each owner applies this rule
+  when its workflow runs on an image where the standalone LLVM is too old.
