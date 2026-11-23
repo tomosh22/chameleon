@@ -64,7 +64,7 @@ function(cml_bind_edited_fixture fx)
     cml_target_fixture_style(${objs})
     target_include_directories(${objs} PRIVATE "${PROJECT_SOURCE_DIR}/agent/include" "${PROJECT_SOURCE_DIR}/tests/fixtures/common")
     if(MSVC)
-        target_compile_options(${objs} PRIVATE /Gy /hotpatch)
+        target_compile_options(${objs} PRIVATE /Gy ${CML_HOTPATCH_FLAGS})
     endif()
     set_target_properties(${objs} PROPERTIES FOLDER "tests/fixtures")
 

@@ -8,6 +8,12 @@
 #
 # Exceptions: Chameleon core code reports failure through cml::Result<T>, never by throwing.
 
+# CML_HOTPATCH_FLAGS: /hotpatch where the compiler knows it (clang-cl; cl accepts it on x86 only and prints D9002 on x64).
+set(CML_HOTPATCH_FLAGS "")
+if(MSVC AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    set(CML_HOTPATCH_FLAGS /hotpatch)
+endif()
+
 function(cml_target_exceptions_allowed target)
     if(MSVC)
         target_compile_options(${target} PRIVATE /EHsc /GR)

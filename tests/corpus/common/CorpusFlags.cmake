@@ -4,6 +4,17 @@
 #   link:    /DEBUG:FULL, /INCREMENTAL:NO, /OPT:NOREF /OPT:NOICF (every function stays a real body), /FUNCTIONPADMIN
 # Not used: /GL, /guard:cf. Include this file BEFORE add_subdirectory() of the project.
 if(MSVC)
-    add_compile_options(/Gy /hotpatch "$<$<CONFIG:RelWithDebInfo>:/Ob0>")
+    # /hotpatch: clang-cl only (cl on x64 prints D9002; /FUNCTIONPADMIN gives the padding)
+    if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+        add_compile_options(/hotpatch)
+    endif()
+    add_compile_options(/Gy)
+    # drop CMake's /Ob1 /Ob2 so that /Ob0 does not trigger D9025
+    foreach(_cfg RELEASE RELWITHDEBINFO MINSIZEREL)
+        foreach(_lang C CXX)
+            string(REGEX REPLACE "(^| )[/-]Ob[12]( |$)" "\\1" CMAKE_${_lang}_FLAGS_${_cfg} "${CMAKE_${_lang}_FLAGS_${_cfg}}")
+        endforeach()
+    endforeach()
+    add_compile_options("$<$<CONFIG:RelWithDebInfo>:/Ob0>")
     add_link_options(/DEBUG:FULL /INCREMENTAL:NO /OPT:NOREF /OPT:NOICF /FUNCTIONPADMIN)
 endif()
