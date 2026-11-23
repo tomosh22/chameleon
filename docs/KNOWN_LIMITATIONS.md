@@ -4,6 +4,9 @@ Every by-design limitation is diagnosed, never silently wrong. Ids are stable (A
 "Implemented by" names the WP that must emit the diagnostic; until that WP merges, the
 diagnostic is planned, not live.
 
+Follow-on work for these limitations (and the product gaps that are not diagnostics) is prioritised in
+`docs/ROADMAP.md` under stable ids `R-nn`.
+
 | Id | Limitation | User-facing message | What to do | Implemented by | Status |
 |---|---|---|---|---|---|
 | CML1101 | PDB built with `/DEBUG:FASTLINK` | Module `<module>` uses a /DEBUG:FASTLINK PDB; Chameleon needs /DEBUG:FULL. | Relink the module with /DEBUG:FULL. | WP-18 | **live** (`cml_broker check`, enable time) |
