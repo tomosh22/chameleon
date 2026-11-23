@@ -111,7 +111,7 @@ namespace Chameleon.IntegrationTest
                 }
 
                 say("WP35-VS result=ok file=" + answerLine.Location.File + " line=" + answerLine.Location.Line + " col=" + answerLine.Location.Column +
-                    " diag_event=1 answer=1 compiler=cl");
+                    " diag_event=1 answer=1");
                 return result;
             }
             finally

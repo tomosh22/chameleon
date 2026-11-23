@@ -109,6 +109,7 @@ struct Rig {
 
     // knobs of the fake compiler / linker / agent
     bool fail_compile = false;
+    std::string compile_cwd = "C:\\proj\\build";               // WP-35: the directory the fake compiler "ran in"
     std::vector<toolchain::ToolDiagnostic> compile_errors;  // WP-35: what the failing fake compiler printed (parsed)
     bool short_results = false;                 // compile_all returns one result too few
     bool compile_warning = false;               // the fake compiler reports a warning
@@ -194,6 +195,7 @@ struct Rig {
                 }
                 if (fail_compile) {
                     outcomes[i].diagnostics = compile_errors;
+                    outcomes[i].cwd = compile_cwd;
                     results.emplace_back(Diag::make(2200, "the compiler reported errors in logic.cpp", "Fix the errors."));
                     continue;
                 }
@@ -1249,17 +1251,29 @@ TEST_CASE("reload: a compile error carries file, line and column on the diag eve
         CHECK(event.get_integer("line") == 12);
         CHECK(event.find("column") == nullptr);
     }
-    SUBCASE("a relative file name is resolved against the compiler's working directory") {
+    SUBCASE("a relative file name is resolved against the directory the compiler ran in, and normalised") {
         Rig rig;
         rig.enable();
         rig.changed();
         rig.fail_compile = true;
+        rig.compile_errors = {error_at("..\\src\\logic.cpp", 7, 0)};
+        REQUIRE_FALSE(rig.reload().has_value());
+        const Value event = find_diag(rig);
+        CHECK(event.get_string("file") == "C:\\proj\\src\\logic.cpp");
+        CHECK(event.get_integer("line") == 7);
+    }
+    SUBCASE("no absolute path can be formed: no location, so the clients parse the text") {
+        Rig rig;
+        rig.enable();
+        rig.changed();
+        rig.fail_compile = true;
+        rig.compile_cwd.clear();  // the compiler's directory is unknown
         rig.compile_errors = {error_at("src\\logic.cpp", 7, 0)};
         REQUIRE_FALSE(rig.reload().has_value());
         const Value event = find_diag(rig);
-        const std::string file = event.get_string("file");
-        CHECK(file.size() > std::string("src\\logic.cpp").size());
-        CHECK(file.find("src\\logic.cpp") == file.size() - std::string("src\\logic.cpp").size());
+        REQUIRE(event.is_object());
+        CHECK(event.find("file") == nullptr);
+        CHECK(event.find("line") == nullptr);
     }
     SUBCASE("no location when the compiler named none (a command-line error), or no error was parsed") {
         for (int variant = 0; variant < 2; ++variant) {

@@ -219,7 +219,7 @@ async function main(): Promise<void> {
     if (refusal.diag.file !== entry.file || refusal.diag.line !== entry.line) {
       throw new Error(`the reload answer's diag has ${String(refusal.diag.file)}:${String(refusal.diag.line)}, expected ${entry.file}:${entry.line}`);
     }
-    console.log(`WP35-VSCODE problem file=${entry.file} line=${entry.line} col=${entry.column ?? 0} code=${entry.code ?? "-"} compiler=cl`);
+    console.log(`WP35-VSCODE problem file=${entry.file} line=${entry.line} col=${entry.column ?? 0} code=${entry.code ?? "-"}`);
     console.log("WP35-VSCODE result=ok diag_event=1 answer=1");
     fs.writeFileSync(editFile, goodSource);
 

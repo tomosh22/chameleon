@@ -842,7 +842,7 @@ private:
         std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         std::string wanted = step.expect_file;
         std::transform(wanted.begin(), wanted.end(), wanted.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        const bool absolute = lower.size() >= 3 && lower[1] == ':' && lower[2] == '/';
+        const bool absolute = (lower.size() >= 3 && lower[1] == ':' && lower[2] == '/') || (lower.size() > 2 && lower[0] == '/' && lower[1] == '/' && lower[2] != '/');  // drive or UNC
         const std::string tail = "/" + wanted;
         const bool name_ok = lower.size() > tail.size() && lower.compare(lower.size() - tail.size(), tail.size(), tail) == 0;
         if (!absolute || !name_ok) {

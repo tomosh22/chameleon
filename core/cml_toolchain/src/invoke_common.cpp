@@ -341,6 +341,123 @@ void for_each_line(std::string_view text, Fn&& fn) {
 
 }  // namespace
 
+namespace {
+
+bool is_sep(char c) noexcept {
+    return c == '\\' || c == '/';
+}
+
+bool has_drive(std::string_view s) noexcept {
+    return s.size() >= 2 && std::isalpha(static_cast<unsigned char>(s[0])) != 0 && s[1] == ':';
+}
+
+void split_components(std::string_view s, std::vector<std::string>& out) {
+    std::size_t i = 0;
+    while (i <= s.size()) {
+        std::size_t j = i;
+        while (j < s.size() && !is_sep(s[j])) {
+            ++j;
+        }
+        if (j > i) {
+            out.emplace_back(s.substr(i, j - i));
+        }
+        i = j + 1;
+    }
+}
+
+struct AbsPath {
+    std::string root;                  // "C:", "\\\\server\\share" or "/" (portable tests)
+    std::vector<std::string> parts;
+};
+
+// An absolute path in one of the three roots; false for anything else.
+bool parse_absolute(std::string_view s, AbsPath& out) {
+    out = AbsPath();
+    if (s.size() >= 2 && is_sep(s[0]) && is_sep(s[1])) {
+        std::vector<std::string> comps;
+        split_components(s, comps);
+        if (comps.empty()) {
+            return false;
+        }
+        out.root = "\\\\" + comps[0] + (comps.size() > 1 ? "\\" + comps[1] : std::string());
+        out.parts.assign(comps.begin() + static_cast<std::ptrdiff_t>(std::min<std::size_t>(2, comps.size())), comps.end());
+        return true;
+    }
+    if (s.size() >= 3 && has_drive(s) && is_sep(s[2])) {
+        out.root = std::string(1, s[0]) + ":";
+        split_components(s.substr(2), out.parts);
+        return true;
+    }
+    if (!s.empty() && is_sep(s[0])) {
+        out.root = "/";
+        split_components(s, out.parts);
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+std::string resolve_tool_path(std::string_view file, std::string_view cwd) {
+    if (file.empty()) {
+        return {};
+    }
+    AbsPath base;
+    std::vector<std::string> add;
+    const bool unc = file.size() >= 2 && is_sep(file[0]) && is_sep(file[1]);
+    const bool drive_abs = file.size() >= 3 && has_drive(file) && is_sep(file[2]);
+    AbsPath cwd_abs;
+    const bool have_cwd = parse_absolute(cwd, cwd_abs);
+    if (unc || drive_abs) {
+        parse_absolute(file, base);
+    } else if (has_drive(file)) {  // "C:logic.cpp": relative to the current directory of drive C
+        if (!have_cwd || cwd_abs.root.size() != 2 || cwd_abs.root[1] != ':' ||
+            std::tolower(static_cast<unsigned char>(cwd_abs.root[0])) != std::tolower(static_cast<unsigned char>(file[0]))) {
+            return {};
+        }
+        base = cwd_abs;
+        split_components(file.substr(2), add);
+    } else if (is_sep(file[0])) {  // "\src\a.cpp": the root of cwd's drive or share
+        if (have_cwd && cwd_abs.root != "/") {
+            base.root = cwd_abs.root;
+            split_components(file, add);
+        } else {
+            parse_absolute(file, base);  // no drive to take: a portable "/p" path
+        }
+    } else {
+        if (!have_cwd) {
+            return {};
+        }
+        base = cwd_abs;
+        split_components(file, add);
+    }
+    std::vector<std::string> parts;
+    for (const std::vector<std::string>* list : {&base.parts, &add}) {
+        for (const std::string& c : *list) {
+            if (c == ".") {
+                continue;
+            }
+            if (c == "..") {
+                if (!parts.empty()) {
+                    parts.pop_back();
+                }
+                continue;
+            }
+            parts.push_back(c);
+        }
+    }
+    const char separator = base.root == "/" ? '/' : '\\';
+    std::string out = base.root == "/" ? std::string() : base.root;
+    for (const std::string& c : parts) {
+        out.push_back(separator);
+        out += c;
+    }
+    if (parts.empty()) {
+        out.push_back(separator);
+    }
+    return out;
+}
+
 std::vector<ToolDiagnostic> parse_tool_output(std::string_view output) {
     std::vector<ToolDiagnostic> out;
     for_each_line(output, [&](std::string_view line, bool) {

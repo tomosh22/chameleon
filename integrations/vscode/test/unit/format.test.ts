@@ -123,6 +123,18 @@ describe("problemsOfDiag (WP-35)", () => {
     const got = problemsOfDiag({ event: "diag", id: "CML2200", severity: "error", message: text, file: "C:\\p\\logic.cpp", line: 12, column: 15 });
     assert.deepEqual(got, [{ file: "C:\\p\\logic.cpp", line: 12, column: 15, severity: "error", code: "C2059", message: "syntax error: ';'" }]);
   });
+  it("does not repeat the error: the real CML2200 text carries it twice (after the exit code and after 'First error:')", () => {
+    const text =
+      "compiling 'C:\\p\\logic.cpp' failed with exit code 2: C:\\p\\logic.cpp(12): error C2059: syntax error: ';' First error: C:\\p\\logic.cpp(12): error C2059: syntax error: ';'";
+    const got = problemsOfDiag({ event: "diag", id: "CML2200", severity: "error", message: text, file: "C:\\p\\logic.cpp", line: 12 });
+    assert.equal(got.length, 1);
+    assert.equal(got[0].message, "syntax error: ';'");
+    assert.equal(got[0].code, "C2059");
+    // The fallback parse (no fields) gives the same wording.
+    const old = problemsOfDiag({ event: "diag", id: "CML2200", severity: "error", message: text });
+    assert.equal(old.length, 1);
+    assert.equal(old[0].message, "syntax error: ';'");
+  });
   it("has no column when the compiler gave none (cl without /diagnostics:column)", () => {
     const got = problemsOfDiag({ event: "diag", severity: "error", message: "failed", file: "C:\\p\\logic.cpp", line: 12 });
     assert.equal(got.length, 1);

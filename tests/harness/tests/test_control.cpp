@@ -634,3 +634,18 @@ TEST_CASE("control codec: an error response carries the diagnostic's location on
     CHECK(bare.find("diag")->find("line") == nullptr);
     CHECK(bare.find("diag")->find("column") == nullptr);
 }
+
+TEST_CASE("control codec: a location beyond INT32_MAX is dropped, not wrapped (WP-35)") {
+    const std::string big = R"({"id":1,"ok":false,"diag":{"id":"CML2200","message":"m","action":"a","file":"C:\\a.cpp","line":4294967297,"column":5}})";
+    Result<std::variant<ControlResponse, ControlEvent>> back = decode_server_message(big);
+    REQUIRE(back.has_value());
+    const ControlDiag& d = *std::get<ControlResponse>(*back).diag;
+    CHECK(d.file.empty());
+    CHECK(d.line == 0);
+    const std::string big_column = R"({"id":1,"ok":false,"diag":{"id":"CML2200","message":"m","action":"a","file":"C:\\a.cpp","line":3,"column":4294967297}})";
+    Result<std::variant<ControlResponse, ControlEvent>> second = decode_server_message(big_column);
+    REQUIRE(second.has_value());
+    const ControlDiag& e = *std::get<ControlResponse>(*second).diag;
+    CHECK(e.line == 3);
+    CHECK(e.column == 0);
+}

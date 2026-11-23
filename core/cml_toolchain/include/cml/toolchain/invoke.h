@@ -76,6 +76,11 @@ struct ToolDiagnostic {
 // `LINK : fatal error LNK1104: ...`) and clang GCC-style (`file:12:5: error: ...`) lines.
 // Other lines are ignored. Windows drive letters are handled.
 std::vector<ToolDiagnostic> parse_tool_output(std::string_view output);
+// WP-35: the absolute, normalised ("." and ".." folded, backslashes) spelling of a file name the compiler printed, which it ran in
+// `cwd` (absolute). Handles `X:\p`, `\\server\share\p`, `\p` (root of cwd's drive or share), `X:p` (relative to cwd, only when cwd is on
+// drive X), plain relative names and, for portable tests, `/p`. "" when no absolute path can be formed (cwd empty or relative, or `X:p`
+// with cwd on another drive).
+std::string resolve_tool_path(std::string_view file, std::string_view cwd);
 // Lines of `output` that are `Note: including file:` (cl, clang-cl): the included paths.
 std::vector<std::string> parse_show_includes(std::string_view output);
 // Output with every recognised diagnostic line rewritten to its clickable form, others verbatim.
@@ -131,6 +136,7 @@ struct CompileOutcome {
     std::string object_path;
     std::string compiler_used;
     std::string command_line;             // program + arguments as run
+    std::string cwd;                      // WP-35: the directory the compiler actually ran in (absolute); "" when unknown
     int exit_code = -1;
     double seconds = 0.0;
     std::string output;                   // the compiler's output, diagnostics rewritten to clickable form

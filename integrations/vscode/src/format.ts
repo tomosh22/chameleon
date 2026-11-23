@@ -105,6 +105,12 @@ export interface ParsedDiagnostic {
 export const CL_PATTERN = /^\s*(.+?)\((\d+)(?:,(\d+))?\)\s*:\s+(?:fatal\s+)?(error|warning|note)\s+([A-Za-z]+\d+)\s*:\s*(.*)$/;
 export const CLANG_PATTERN = /^\s*((?:[A-Za-z]:)?[^:\n]+?):(\d+):(?:(\d+):)?\s+(?:fatal\s+)?(error|warning|note):\s*(.*)$/;
 
+/** The broker's CML2200 text repeats the error ("... : <error> First error: <error>"); the wording of a Problems entry stops before that. */
+function withoutFirstErrorTail(text: string): string {
+  const i = text.indexOf(" First error:");
+  return (i >= 0 ? text.slice(0, i) : text).trim();
+}
+
 /** `file(line[,col]): error C2065: text` (cl, clang-cl) or `file:line[:col]: error: text` (clang). undefined for any other line. */
 export function parseDiagnosticLine(line: string): ParsedDiagnostic | undefined {
   const cl = CL_PATTERN.exec(line);
@@ -115,7 +121,7 @@ export function parseDiagnosticLine(line: string): ParsedDiagnostic | undefined 
       column: cl[3] !== undefined ? Number(cl[3]) : undefined,
       severity: cl[4] as ParsedDiagnostic["severity"],
       code: cl[5],
-      message: cl[6],
+      message: withoutFirstErrorTail(cl[6]),
     };
   }
   const cc = CLANG_PATTERN.exec(line);
@@ -126,7 +132,7 @@ export function parseDiagnosticLine(line: string): ParsedDiagnostic | undefined 
       column: cc[3] !== undefined ? Number(cc[3]) : undefined,
       severity: cc[4] as ParsedDiagnostic["severity"],
       code: undefined,
-      message: cc[5],
+      message: withoutFirstErrorTail(cc[5]),
     };
   }
   return undefined;
