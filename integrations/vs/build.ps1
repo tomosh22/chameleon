@@ -18,6 +18,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# A developer prompt (vcvars, msvc-dev-cmd) sets Platform=x64, which moves managed outputs to bin/x64/ and breaks the VSIX project.
+$env:Platform = 'AnyCPU'
 $root = $PSScriptRoot
 $out = Join-Path $root 'out'
 

@@ -66,6 +66,10 @@ jobs:
           cmake --build build --parallel --target cml_broker cml_agent fixture_basic *>&1 | Tee-Object -FilePath "$env:LOG_DIR/build.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # The developer environment sets Platform=x64; the managed projects are AnyCPU (outputs in bin/<config>/).
+      - name: Managed builds are AnyCPU
+        run: '"Platform=AnyCPU" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV'
+
       - name: Build the extension (integrations/vs/build.ps1 -Configuration Release)
         run: |
           ./integrations/vs/build.ps1 -Configuration Release *>&1 | Tee-Object -FilePath "$env:LOG_DIR/build-vsix.log"
