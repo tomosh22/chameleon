@@ -69,18 +69,23 @@ if(WIN32)
 
     # WP-35: a compile error carries file, line and column on the `diag` event and in the reload answer. Builds fixture `basic` with this
     # build's compiler (cl or clang-cl), applies a syntax-error edit and prints `WP35-LOC file=... line=N col=N compiler=...`.
-    add_test(NAME harness.wp35_diag_locations
-        COMMAND cmltest
-            --scenario "${CMAKE_CURRENT_SOURCE_DIR}/scenarios/diag_locations.toml"
-            --repo-root "${PROJECT_SOURCE_DIR}"
-            --build-dir "${CMAKE_BINARY_DIR}"
-            --generator ninja
-            --config $<CONFIG>
-            --cxx "${CMAKE_CXX_COMPILER}"
-            --require-all-capabilities
-            --work-dir "${CMAKE_BINARY_DIR}/test_work/wp35_scratch"
-            --artifacts "${CMAKE_BINARY_DIR}/test_work/wp35_artifacts")
-    set_tests_properties(harness.wp35_diag_locations PROPERTIES TIMEOUT 600)
+    # cmltest builds the fixture with Ninja and the broker recompiles it, which needs the compiler's environment (rc, INCLUDE, LIB) as the
+    # Ninja matrix cells have it from the developer-environment step. A Visual Studio generator tree is configured without one, so the
+    # test is registered for Ninja trees only (the same scenario also runs in the ci `cmltest scenarios` step of every matrix cell).
+    if(NOT CMAKE_GENERATOR MATCHES "Visual Studio")
+        add_test(NAME harness.wp35_diag_locations
+            COMMAND cmltest
+                --scenario "${CMAKE_CURRENT_SOURCE_DIR}/scenarios/diag_locations.toml"
+                --repo-root "${PROJECT_SOURCE_DIR}"
+                --build-dir "${CMAKE_BINARY_DIR}"
+                --generator ninja
+                --config $<CONFIG>
+                --cxx "${CMAKE_CXX_COMPILER}"
+                --require-all-capabilities
+                --work-dir "${CMAKE_BINARY_DIR}/test_work/wp35_scratch"
+                --artifacts "${CMAKE_BINARY_DIR}/test_work/wp35_artifacts")
+        set_tests_properties(harness.wp35_diag_locations PROPERTIES TIMEOUT 600)
+    endif()
 endif()
 
 cml_add_unit_test(harness
