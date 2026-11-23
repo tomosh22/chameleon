@@ -464,15 +464,29 @@ jobs:
       - name: Configure
         run: cmake -S . -B build-vs -G "Visual Studio 17 2022" -A x64 -DCML_BUILD_GUI=ON
       - name: Build (Debug)
-        run: cmake --build build-vs --config Debug --parallel
+        run: |
+          New-Item -ItemType Directory -Force -Path ci-logs | Out-Null
+          cmake --build build-vs --config Debug --parallel *>&1 | Tee-Object -FilePath ci-logs/build-vs.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test (Debug)
         run: ctest --test-dir build-vs -C Debug --output-on-failure
       # WP-29: the same install + examples check with the Visual Studio generator (the examples are built with it too).
       - name: WP-29 install tree and CMake examples (Visual Studio generator)
         run: |
           ./integrations/cmake/tests/run_examples.ps1 -BuildDir build-vs -Work wp29-work -Config Debug -Compiler msvc `
-            -Os windows-2022 -Generator "Visual Studio 17 2022"
+            -Os windows-2022 -Generator "Visual Studio 17 2022" *>&1 | Tee-Object -FilePath ci-logs/wp29-vs.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # WP-33: the same count for the MSBuild output (the in-tree build and the examples built with the Visual Studio generator).
+      - name: WP-33 no D9002 or D9025 (Visual Studio generator)
+        run: |
+          $d2 = 0; $d25 = 0
+          foreach ($f in "ci-logs/build-vs.log", "ci-logs/wp29-vs.txt") {
+            if (-not (Test-Path $f)) { "WP33-WARN-VS missing log $f"; exit 1 }
+            $d2 += @(Select-String -Path $f -Pattern 'D9002').Count
+            $d25 += @(Select-String -Path $f -Pattern 'D9025').Count
+          }
+          "WP33-WARN-VS d9002=$d2 d9025=$d25"
+          if ($d2 -ne 0 -or $d25 -ne 0) { exit 1 }
       - name: WP-06 link evidence (anchors, binding object)
         if: always()
         run: |

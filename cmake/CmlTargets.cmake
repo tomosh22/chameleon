@@ -53,7 +53,8 @@ function(cml_target_fixture_style target)
     # from the target's directory flags (deferred, as chameleon_enable does) so that cl does not print
     # D9025 "overriding /Ob1 with /Ob0" for every TU.
     if(MSVC)
-        _cml_defer_inline_strip(${target})
+        _cml_defer_inline_strip(${target} cml_target_fixture_style)
+        set_property(TARGET ${target} APPEND PROPERTY CML_INLINE_OFF_CONFIGS RELWITHDEBINFO)
         target_compile_options(${target} PRIVATE "$<$<CONFIG:RelWithDebInfo>:/Ob0>")
     else()
         target_compile_options(${target} PRIVATE "$<$<CONFIG:RelWithDebInfo>:-fno-inline>")

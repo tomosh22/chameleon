@@ -1,7 +1,8 @@
 # coff_cov_extras_objs: see ../CMakeLists.txt. Lives in its own directory so that the optimisation flags of the configuration can be
 # dropped for it alone (it is built /Od /Ob0 in every configuration).
 if(MSVC)
-    foreach(_cfg RELEASE RELWITHDEBINFO MINSIZEREL)
+    _cml_non_debug_configs(_cml_cfgs)
+    foreach(_cfg IN LISTS _cml_cfgs)
         string(REGEX REPLACE "(^| )[/-]O[12xbs]?[0-9]?( |$)" " " CMAKE_CXX_FLAGS_${_cfg} "${CMAKE_CXX_FLAGS_${_cfg}}")
         string(REGEX REPLACE "(^| )[/-]O[12xbs]?[0-9]?( |$)" " " CMAKE_CXX_FLAGS_${_cfg} "${CMAKE_CXX_FLAGS_${_cfg}}")
     endforeach()

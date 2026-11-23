@@ -12,8 +12,9 @@
 #             /Ob0                         every configuration but Debug (Debug is /Od): no inlining (CML1603). CMake's
 #                                          own /Ob1 /Ob2 are removed from CMAKE_<LANG>_FLAGS_<CONFIG> of the target's
 #                                          directory at the end of that directory's processing (see _cml_defer_inline_strip),
-#                                          because cl prints D9025 when two /Ob options meet. That removal covers every
-#                                          target of the directory, also one that passed ALLOW_INLINING.
+#                                          because cl prints D9025 when two /Ob options meet. The other targets of the
+#                                          directory (not enabled, or ALLOW_INLINING) get their original level back as a
+#                                          target option, so their code does not change.
 #   link      /DEBUG:FULL /INCREMENTAL:NO  full PDB (CML1101)
 #             /OPT:NOREF /OPT:NOICF /FUNCTIONPADMIN                                              (CML1602, CML1601)
 # Link flags go to executables, shared libraries and modules; static and object libraries get the compile flags only.
@@ -23,8 +24,8 @@
 # Options:
 #   NO_AGENT         do not link Chameleon::agent and do not look for it (the target still gets the flags)
 #   ALLOW_INLINING   leave the optimiser's inlining alone (a target you iterate on should keep it off: CML1603 / CML3104).
-#                    Caveat: /Ob1 /Ob2 are removed per directory, so a target with ALLOW_INLINING shares the removal with any
-#                    other chameleon_enable target of its directory; give it its own /Ob2 (target_compile_options) if needed.
+#                    The configuration's own /Ob level stays on it (re-added as a target option when the directory's flags are
+#                    stripped for another target).
 #   NO_COPY_AGENT    link the agent but do not copy cml_agent.dll beside the executable
 #   NO_BUILD_TYPE_CHECK  skip the CMAKE_BUILD_TYPE warning (CML1704); for the repository's own fixtures, which are not user projects
 #
@@ -37,37 +38,114 @@ function(_cml_enable_message severity id what todo)
     message(${severity} "${id}: ${what} What to do: ${todo}")
 endfunction()
 
-# _cml_strip_inline_flags: a macro, so that it runs in the directory scope when deferred. Removes CMake's default /Ob1 and
-# /Ob2 from the non-Debug configuration flags (cl prints D9025 "overriding /Ob1 with /Ob0" for every TU otherwise).
+# _cml_non_debug_configs(<out>): the configurations whose flags carry CMake's default /Ob1 /Ob2 (upper case): Release,
+# RelWithDebInfo, MinSizeRel and every other non-Debug configuration of this build.
+function(_cml_non_debug_configs out)
+    set(_c RELEASE RELWITHDEBINFO MINSIZEREL)
+    if(CMAKE_CONFIGURATION_TYPES)
+        list(APPEND _c ${CMAKE_CONFIGURATION_TYPES})
+    endif()
+    if(CMAKE_BUILD_TYPE)
+        list(APPEND _c "${CMAKE_BUILD_TYPE}")
+    endif()
+    string(TOUPPER "${_c}" _c)
+    list(REMOVE_DUPLICATES _c)
+    list(REMOVE_ITEM _c DEBUG)
+    set(${out} "${_c}" PARENT_SCOPE)
+endfunction()
+
+# _cml_strip_inline_flags: a macro, so that it runs in the directory scope when deferred (at the end of the directory, when
+# every target of it exists). Removes CMake's default /Ob1 /Ob2 /Ob3 from the non-Debug configuration flags (cl prints D9025
+# "overriding /Ob1 with /Ob0" for every TU otherwise), after recording them. Then every compiled target of the directory that
+# does not get /Ob0 in a configuration (not enabled, enabled with ALLOW_INLINING, or a fixture style target outside
+# RelWithDebInfo) gets the recorded level back as its own option, so its code is exactly what the configuration gave it and
+# every TU has one /Ob. The targets that get /Ob0 are marked by CML_INLINE_OFF_CONFIGS.
 macro(_cml_strip_inline_flags)
-    foreach(_cml_lang C CXX)
-        foreach(_cml_cfg RELEASE RELWITHDEBINFO MINSIZEREL)
+    _cml_non_debug_configs(_cml_cfgs)
+    foreach(_cml_cfg IN LISTS _cml_cfgs)
+        foreach(_cml_lang C CXX)
+            set(_cml_ob_${_cml_lang}_${_cml_cfg} "")
             if(DEFINED CMAKE_${_cml_lang}_FLAGS_${_cml_cfg})
-                string(REGEX REPLACE "(^| )[/-]Ob[12]( |$)" "\\1" _cml_new "${CMAKE_${_cml_lang}_FLAGS_${_cml_cfg}}")
-                string(REGEX REPLACE "(^| )[/-]Ob[12]( |$)" "\\1" _cml_new "${_cml_new}")
+                if("${CMAKE_${_cml_lang}_FLAGS_${_cml_cfg}}" MATCHES "(^| )[/-]Ob([1-3])( |$)")
+                    set(_cml_ob_${_cml_lang}_${_cml_cfg} "${CMAKE_MATCH_2}")
+                endif()
+                string(REGEX REPLACE "(^| )[/-]Ob[1-3]( |$)" "\\1" _cml_new "${CMAKE_${_cml_lang}_FLAGS_${_cml_cfg}}")
+                string(REGEX REPLACE "(^| )[/-]Ob[1-3]( |$)" "\\1" _cml_new "${_cml_new}")
                 string(STRIP "${_cml_new}" _cml_new)
                 set(CMAKE_${_cml_lang}_FLAGS_${_cml_cfg} "${_cml_new}")
             endif()
         endforeach()
     endforeach()
+    get_property(_cml_langs GLOBAL PROPERTY ENABLED_LANGUAGES)
+    foreach(_cml_cfg IN LISTS _cml_cfgs)  # a language that is not enabled takes the level of the other
+        if(NOT "C" IN_LIST _cml_langs)
+            set(_cml_ob_C_${_cml_cfg} "${_cml_ob_CXX_${_cml_cfg}}")
+        elseif(NOT "CXX" IN_LIST _cml_langs)
+            set(_cml_ob_CXX_${_cml_cfg} "${_cml_ob_C_${_cml_cfg}}")
+        endif()
+    endforeach()
+    get_property(_cml_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(_cml_t IN LISTS _cml_targets)
+        get_target_property(_cml_type ${_cml_t} TYPE)
+        if(NOT _cml_type MATCHES "^(EXECUTABLE|SHARED_LIBRARY|MODULE_LIBRARY|STATIC_LIBRARY|OBJECT_LIBRARY)$")
+            continue()
+        endif()
+        get_target_property(_cml_opts ${_cml_t} COMPILE_OPTIONS)
+        if(_cml_opts MATCHES "Ob[1-3]")  # the target sets its own level
+            continue()
+        endif()
+        get_target_property(_cml_off ${_cml_t} CML_INLINE_OFF_CONFIGS)
+        foreach(_cml_cfg IN LISTS _cml_cfgs)
+            if(_cml_off AND "${_cml_cfg}" IN_LIST _cml_off)
+                continue()
+            endif()
+            set(_cml_c "${_cml_ob_C_${_cml_cfg}}")
+            set(_cml_x "${_cml_ob_CXX_${_cml_cfg}}")
+            if(_cml_c STREQUAL _cml_x)
+                if(_cml_c)
+                    target_compile_options(${_cml_t} PRIVATE "$<$<CONFIG:${_cml_cfg}>:/Ob${_cml_c}>")
+                endif()
+            else()
+                if(_cml_c)
+                    target_compile_options(${_cml_t} PRIVATE "$<$<AND:$<CONFIG:${_cml_cfg}>,$<COMPILE_LANGUAGE:C>>:/Ob${_cml_c}>")
+                endif()
+                if(_cml_x)
+                    target_compile_options(${_cml_t} PRIVATE "$<$<AND:$<CONFIG:${_cml_cfg}>,$<COMPILE_LANGUAGE:CXX>>:/Ob${_cml_x}>")
+                endif()
+            endif()
+        endforeach()
+    endforeach()
 endmacro()
 
-# _cml_defer_inline_strip(<target>): CMake has no per-target way to drop a configuration flag, and the flags come from the
-# directory that defined the target. So the removal is deferred to the end of that directory (cmake_language(DEFER DIRECTORY),
-# which runs in directory scope whatever the function depth of the caller), once per directory. If that directory has already
-# been processed (the target belongs to a subdirectory and chameleon_enable was called from its parent), nothing can be done
-# any more: CML1712.
-function(_cml_defer_inline_strip target)
+# _cml_defer_inline_strip(<target> <caller>): CMake has no per-target way to drop a configuration flag, and the flags come from
+# the directory that defined the target. So the removal is deferred to the end of that directory (cmake_language(DEFER
+# DIRECTORY), which runs in directory scope whatever the function depth of the caller), once per directory. The target's
+# directory is still open when it is the current directory or one of its ancestors (PARENT_DIRECTORY chain; a source-path
+# prefix would be wrong for add_subdirectory(../x bin)). Otherwise it has been processed (the call is in a parent, after
+# add_subdirectory) and nothing can be done any more: CML1712. <caller> names the command in that message.
+function(_cml_defer_inline_strip target caller)
     get_target_property(_dir ${target} SOURCE_DIR)
     if(NOT _dir)
         return()
     endif()
-    set(_cur "${CMAKE_CURRENT_SOURCE_DIR}")
-    string(FIND "${_cur}/" "${_dir}/" _pos)
-    if(NOT _pos EQUAL 0)  # the current directory is neither the target's nor inside it: the target's directory is finished
+    set(_d "${CMAKE_CURRENT_SOURCE_DIR}")
+    set(_open FALSE)
+    while(_d)
+        if(_d STREQUAL _dir)
+            set(_open TRUE)
+            break()
+        endif()
+        get_property(_d DIRECTORY "${_d}" PROPERTY PARENT_DIRECTORY)
+    endwhile()
+    if(NOT _open)
+        if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC" OR CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+            set(_effect "cl will print D9025 \"overriding '/Ob1' with '/Ob0'\" for every TU in RelWithDebInfo and Release")
+        else()
+            set(_effect "the configuration's /Ob1 /Ob2 stay in its flags next to /Ob0")
+        endif()
         _cml_enable_message(WARNING CML1712
-            "chameleon_enable(${target}): ${target} was created in ${_dir}, which has already been processed, so CMake's default /Ob1 /Ob2 cannot be removed from its flags and cl will print D9025 \"overriding '/Ob1' with '/Ob0'\" for every TU in RelWithDebInfo and Release."
-            "call chameleon_enable in the directory that creates ${target} (at the end of its CMakeLists.txt or in a function it calls).")
+            "${caller}(${target}): ${target} was created in ${_dir}, which has already been processed, so CMake's default /Ob1 /Ob2 cannot be removed from its flags and ${_effect}."
+            "call ${caller} in the directory that creates ${target} (at the end of its CMakeLists.txt or in a function it calls).")
         return()
     endif()
     get_property(_done DIRECTORY "${_dir}" PROPERTY CML_INLINE_STRIP_DEFERRED)
@@ -224,7 +302,9 @@ function(chameleon_enable target)
     # supported here (CML1700), so cl gets none and relies on /FUNCTIONPADMIN for the padding. clang-cl's compiler id is
     # "Clang". The choice is per language (a C-only project has no CMAKE_CXX_COMPILER_ID).
     if(NOT E_ALLOW_INLINING)
-        _cml_defer_inline_strip(${target})
+        _cml_non_debug_configs(_cfgs)
+        set_property(TARGET ${target} APPEND PROPERTY CML_INLINE_OFF_CONFIGS ${_cfgs})
+        _cml_defer_inline_strip(${target} chameleon_enable)
     endif()
     if(CMAKE_GENERATOR MATCHES "Visual Studio")
         target_compile_options(${target} PRIVATE /Gy)
