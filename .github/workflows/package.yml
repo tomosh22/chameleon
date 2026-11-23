@@ -1,0 +1,103 @@
+name: package
+
+# WP-32 (ADR-0038): builds the release zip, then smoke-tests it from the UNZIPPED tree only:
+# find_package(Chameleon) example build, cml_broker check, one reload. Greppable lines: WP32-PACKAGE, WP32-CHECK, WP32-SMOKE.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'tools/package/**'
+      - 'core/cml_license/**'
+      - 'tests/unit/license/**'
+      - 'docs/QUICKSTART.md'
+      - 'docs/TROUBLESHOOTING.md'
+      - 'docs/BUILD_REQUIREMENTS.md'
+      - 'README.md'
+      - '.github/workflows/package.yml'
+      - 'integrations/**'
+      - 'cmake/**'
+      - 'CMakeLists.txt'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-${{ github.event_name }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: windows-2022 / release zip + smoke
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC developer environment (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Ninja
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
+          ninja --version
+
+      - name: TROUBLESHOOTING.md covers every diagnostic id
+        run: cmake -DCML_SOURCE_DIR="$env:GITHUB_WORKSPACE" -P tools/package/check_troubleshooting.cmake
+
+      - name: Build the package
+        run: |
+          New-Item -ItemType Directory -Force -Path package-logs | Out-Null
+          ./tools/package/package.ps1 -OutDir build/package *>&1 | Tee-Object -FilePath package-logs/package.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $zip = Get-ChildItem build/package -Filter 'chameleon-*-win64.zip' | Select-Object -First 1
+          if (-not $zip) { throw 'package.ps1 produced no chameleon-*-win64.zip' }
+          "CML_ZIP=$($zip.FullName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          Select-String -Path package-logs/package.log -Pattern 'WP32-'
+
+      - name: Upload the zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: chameleon-win64
+          path: ${{ env.CML_ZIP }}
+          if-no-files-found: error
+
+      # From here on only the unzipped tree is used: the build directory is not touched, not on PATH, and removed.
+      - name: Unzip into a clean directory and remove the build tree
+        run: |
+          $dest = Join-Path $env:RUNNER_TEMP 'unzipped'
+          if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+          Expand-Archive -Path $env:CML_ZIP -DestinationPath $dest
+          $root = (Get-ChildItem $dest -Directory | Select-Object -First 1).FullName
+          "CML_ROOT=$root" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          Get-ChildItem -Recurse -File $root | ForEach-Object { $_.FullName.Substring($root.Length + 1) } | Sort-Object
+          Remove-Item -Recurse -Force build
+
+      - name: Smoke test the unzipped package (build example, check, one reload)
+        run: |
+          ./tools/package/smoke.ps1 -Root $env:CML_ROOT -Work (Join-Path $env:RUNNER_TEMP 'smoke') *>&1 | Tee-Object -FilePath package-logs/smoke.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Select-String -Path package-logs/smoke.log -Pattern 'WP32-SMOKE'
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-logs
+          path: |
+            package-logs/
+            ${{ runner.temp }}/smoke/*.log
+            ${{ runner.temp }}/smoke/*.out
+            ${{ runner.temp }}/smoke/*.err
+            ${{ runner.temp }}/smoke/check.json
+          if-no-files-found: warn
