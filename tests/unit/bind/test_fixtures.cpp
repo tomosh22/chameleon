@@ -510,7 +510,9 @@ void plan_fixture(const std::string& name) {
     {
         PatchLayout layout;
         layout.patch_base = in.module_base + 0x10000000ull;
-        std::uint32_t slot = 0x100000;
+        // Section RVAs are 0x10000 * index (clang 22 objects have 16+ sections: 0x100000 would collide with a slot, which
+        // CML3206 rightly reports); the slots live far above any section.
+        std::uint32_t slot = 0x4000000;
         for (const Fixup& f : p.fixups) {
             if (f.kind == FixupKind::Slot) {
                 if (layout.symbol_rva.emplace(f.symbol, slot).second) {
