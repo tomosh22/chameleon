@@ -27,17 +27,15 @@ std::string base_identifier(std::string_view decorated);
 // The function a function-local static lives in ("statics_value"); empty otherwise.
 std::string enclosing_function(std::string_view decorated);
 
-// WP-26c: the identity of a C static (a name that does not start with '?'), as the two compilers spell it for a
-// translation unit compiled as C. Names in the PDB are the source names ("platform", "counter"); the object's are:
-//   clang-cl   file scope "platform"; a function-local static "next.counter"; LLVM's uniquifier appends ".<n>" when
-//              the name is taken ("platform.0", "next.counter.1")
-//   cl         file scope "platform"; a function-local static "counter$1" (the enclosing function is NOT in the name)
-// `base` is empty when no source name can be read ("__const.f.x", ".str", "$SG1"); `any_function` is true when the
-// static is function-local but the name does not say which function.
+// WP-26c: the identity of a C static whose object name is not Microsoft-decorated, as clang-cl spells it for a
+// translation unit compiled as C. The PDB records carry the source names ("platform", "counter"); the object's are
+//   file scope "platform"; a function-local static "next.counter"; LLVM's uniquifier appends ".<n>" when the name is
+//   taken ("platform.0", "next.counter.1").
+// (cl decorates C statics like C++ ones, "?counter@?1??next@@9@9", observed in CI; that is display_name()'s job.)
+// `base` is empty when no source name can be read ("__const.f.x", ".str", "$SG1").
 struct CStaticName {
     std::string base;
     std::string encl;
-    bool any_function = false;
 };
 CStaticName c_static_name(std::string_view object_name);
 

@@ -25,14 +25,15 @@ Microsoft-decorated name. A C translation unit gives neither:
 |---|---|---|
 | file-scope static | `platform` | `platform` |
 | the same name taken (LLVM's uniquifier) | `platform.0`, `platform.1` | - |
-| function-local static | `next.counter` (`next.counter.1`) | `counter$1` (the function is not in the name) |
+| function-local static | `next.counter` (`next.counter.1`) | `?counter@?1??next@@9@9` (decorated even in C) |
 | private constant copy of a local initialiser | `__const.f.x` (read-only) | - |
 
 `.` and `$` are not identifier characters, so `base_identifier` returned an empty string and `bridge_statics` decided "static
 without a source-level name: treated as new". The PDB side was fine: its S_LDATA32 records carry the source names (`platform`,
-`counter`), function-local ones inside their proc. The same hole applies to function-local statics of C under both compilers (the
-cl shape is **inferred** from the name syntax of cl's C output; no cl C object was inspected here, which is why the matching is
-defensive, see below).
+`counter`), function-local ones inside their proc. The same hole applies to function-local statics of C under clang-cl. **cl is not affected**: its C objects use the
+decorated names the planner already reads (observed in the CI plan dump of the `c_statics` fixture: `inc_state`, `main_state`
+plain; `?local_cell@?1??cs_read@@9@9`, all `bind-old-data` / `compiland-static`). The `counter$1` shape I first assumed for cl does
+not exist and has been removed again.
 
 Every matched static is bound; every one that fell into this hole silently became a fresh zero-initialised copy. An accepted
 reload with silent state loss, or a crash when the state is a pointer.
@@ -43,28 +44,36 @@ reload with silent state loss, or a crash when the state is a pointer.
   the uniquifier, `a.b` is function `a`, static `b`, `name$<digits>` is a function-local static of unknown function.
   `__const.*`, `__func__.*`, `.str` and anything else stay unnamed.
 * `bridge_statics` uses it for non-decorated data names. The group key of such a name ignores its spelling, so `platform` and
-  `platform.0` cannot both be bound to the one PDB record. A function-local static with an unknown function (`counter$1`) matches
-  the function-local records called `counter` in the compiland; when that is not unique, the existing passes decide (the RVA the
-  unchanged section layout predicts), and what is left is **CML3207** (refuse), as before.
+  `platform.0` cannot both be bound to the one PDB record. Ambiguity is decided by the existing passes (the RVA the unchanged
+  section layout predicts); what is left is **CML3207** (refuse), as before.
 * **CML3500** (new, planner range): writable static data (a section with `IMAGE_SCN_MEM_WRITE`, not a runtime table) whose name
   yields no source identity is refused with a diagnostic naming the symbol and the object, before anything is applied. Read-only
   constants (`__const.*`, `.rdata`) are still `patch-fresh`: a fresh copy is correct for them.
 
 ## Tests
 
-* `unit.bind` (`tests/unit/bind/test_c_statics.cpp`, synthetic COFF + PDB, no compiler): the name reader for both shapes; clang-cl
-  `platform.0` / `next.counter` / `next.counter.1` bound to the old records (including a file-scope record of the same name); cl
-  `counter$1` bound when unique, told apart by layout when two functions have a `counter`, refused (CML3207) when it cannot be
-  told; CML3500 for an unnameable writable static; a genuinely new static and another function's local are new.
+* `unit.bind` (`tests/unit/bind/test_c_statics.cpp`, synthetic COFF + PDB, no compiler): the name reader; clang-cl
+  `platform.0` / `next.counter` / `next.counter.1` bound to the old records (including a file-scope record of the same name); the
+  cl shapes; CML3500 for an unnameable writable static; a genuinely new static and another function's local are new.
+* `unit.bind_fixtures`: the edited `c_statics.c` is planned against the real fixture PDB in every cell (golden
+  `golden/fixtures/c_statics.json`); the decisions of every cell are printed (`STATIC c_statics ...`). clang 22 names the two
+  structs `inc_state.0` / `main_state.0` and the local `cs_read.local_state.0`; all six statics are `bind-old-data`.
 * Fixture `c_statics` + scenario `c_statics` (every matrix cell, both compilers, Debug and RelWithDebInfo): a C program with three
   zero-initialised `static struct { int* p; }`, one in an `#include`d `.c` file, one in the edited TU, one function-local, read
   through the pointer on every TICK. The edit adds 1000 to what `cs_read()` returns. After the reload each value must be
   `1000 + count` with `count` between 20 and 999 (regex bounds), and `expect_monotonic` on all three catches a restart.
 
+## clang 22 and CML3206 (ADR-0037)
+
+With the VS-bundled clang-cl 22.1.3, `unit.bind_fixtures` failed for `virtuals` with CML3206 ("two different fix-ups write the
+same site at rva 0x100008"). Cause: the test's synthetic layout puts section `n` at `0x10000 * n` and the slot symbols from
+`0x100000` up, and a clang 22 object has 16+ sections, so section 16 + 8 collided with the first slot. That is a test-layout
+artefact, not a planner defect (the planner and `make_fixup_triples` were right to refuse two different writes to one site). The
+slots now start at `0x4000000`; `test_triples.cpp` pins both halves (identical writes merge, different ones are refused).
+
 ## Corpus
 
-The F-3 `expected_failures` flip in `tests/corpus/raylib/project.json` waits for PR #46 to land on main (see the PR description for
-its status).
+The two raylib clang-cl F-3 `expected_failures` entries are removed (corpus #46 is on main). The corpus run is listed in the PR.
 
 ## Deferred / limitations
 

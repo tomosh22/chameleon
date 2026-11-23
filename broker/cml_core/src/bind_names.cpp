@@ -441,15 +441,6 @@ CStaticName c_static_name(std::string_view n) {
         out.base = std::string(n);
         return out;
     }
-    // cl: "counter$1"
-    const std::size_t dollar = n.find('$');
-    if (dollar != std::string_view::npos) {
-        if (is_c_identifier(n.substr(0, dollar)) && all_digits(n.substr(dollar + 1))) {
-            out.base = std::string(n.substr(0, dollar));
-            out.any_function = true;
-        }
-        return out;
-    }
     // clang: "a", "a.b", with an optional trailing ".<n>" uniquifier.
     std::vector<std::string_view> parts;
     std::size_t start = 0;

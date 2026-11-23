@@ -125,8 +125,6 @@ bool starts_with(std::string_view s, std::string_view prefix) noexcept {
 }
 
 constexpr std::uint32_t kNone32 = 0xFFFFFFFFu;
-// A function-local C static whose object name does not say which function it is in (cl: "counter$1").
-constexpr std::string_view kAnyFunction = "\x01*";
 
 // ---------------------------------------------------------------------------------------------
 // The planner
@@ -795,7 +793,7 @@ std::vector<const pdb::SymbolView*> Planner::static_candidates(const std::string
     } else {
         for (const pdb::SymbolView* v : all) {
             const bool local = v->parent_proc != pdb::kNoSymbol;
-            if (encl == kAnyFunction ? local : (encl.empty() ? !local : (local && last_component(v->parent_name) == encl))) {
+            if (encl.empty() ? !local : (local && last_component(v->parent_name) == encl)) {
                 out.push_back(v);
             }
         }
@@ -968,7 +966,7 @@ void Planner::bridge_statics() {
             continue;
         }
         // C statics (WP-26c): the object's name is not a Microsoft-decorated one ("platform.0", "next.counter" under
-        // clang-cl, "counter$1" under cl); read the source identity from it.
+        // clang-cl); read the source identity from it.
         const bool c_data = !is_func && !sy.name.empty() && sy.name[0] != '?';
         const CStaticName cname = c_data ? c_static_name(sy.name) : CStaticName();
         const std::string base = c_data ? cname.base : base_identifier(sy.name);
@@ -990,7 +988,7 @@ void Planner::bridge_statics() {
                    "static without a source-level name: treated as new");
             continue;
         }
-        const std::string encl = c_data ? (cname.any_function ? std::string(kAnyFunction) : cname.encl) : enclosing_function(sy.name);
+        const std::string encl = c_data ? cname.encl : enclosing_function(sy.name);
         const bool is_tls = !is_func && sy.dec.section != 0 && secs_[sy.dec.section - 1].tls;
         // The spelling ("platform.0" vs "platform") is not part of a C static's identity: one group per (name, scope).
         const std::string key = std::string(is_func ? "F|" : (is_tls ? "T|" : "D|")) + (c_data ? std::string() : canonical_lambda_names(sy.dec.display)) + "|" + base + "|" + encl;

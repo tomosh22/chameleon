@@ -1,6 +1,6 @@
 // WP-26c: statics of a translation unit compiled as C. The object's names are not Microsoft-decorated:
 //   clang-cl  "platform", "platform.0" (LLVM's uniquifier), "next.counter" (function-local), "next.counter.1"
-//   cl        "platform", "counter$1" (function-local, the enclosing function is not in the name)
+//   cl        "platform"; function-local "?counter@?1??next@@9@9" (decorated even in C: seen in CI, not "counter$1")
 // The PDB records carry the source names ("platform", "counter"); a function-local one is inside its proc.
 // F-3 (raylib, clang-cl): `static PlatformData platform` of an #included .c file is "platform.0"; it was bound as a new
 // global and the patched code read a zero-filled copy.
@@ -26,9 +26,7 @@ TEST_CASE("c statics: names of both compilers are read to (base, enclosing funct
     CHECK(c_static_name("next.counter").encl == "next");
     CHECK(c_static_name("next.counter.12").base == "counter");
     CHECK(c_static_name("next.counter.12").encl == "next");
-    const CStaticName cl = c_static_name("counter$1");
-    CHECK(cl.base == "counter");
-    CHECK(cl.any_function);
+    CHECK(c_static_name("counter$1").base.empty());  // not a shape any compiler emits: unreadable, so refused when writable
     CHECK(c_static_name("__const.main.table").base.empty());  // private constant copy of a local initialiser
     CHECK(c_static_name(".str.1").base.empty());
     CHECK(c_static_name("a.b.c").base.empty());
@@ -81,7 +79,7 @@ TEST_CASE("c statics (clang-cl): a uniquified local 'next.counter.1' binds to th
     CHECK(r->new_globals.empty());
 }
 
-TEST_CASE("c statics (cl): 'counter$1' is a function-local static of unknown function: unique record binds") {
+TEST_CASE("c statics (cl): a plain file static and a decorated function-local static bind to the old records") {
     SynthWorld w = basic_world(false);
     w.data(w.tu(), "platform", 0x20);
     w.proc_with_statics(w.tu(), "next", 0x50, {{"counter", 0x30}});
@@ -89,50 +87,30 @@ TEST_CASE("c statics (cl): 'counter$1' is a function-local static of unknown fun
     SynthObj o;
     const std::int32_t sec = static_cast<std::int32_t>(o.section(".data", kData, 0x40));
     o.symbol("platform", 0x20, sec, false, false);
-    o.symbol("counter$1", 0x30, sec, false, false);
+    o.symbol("?counter@?1??next@@9@9", 0x30, sec, false, false);
     Built b = o.build();
     auto r = plan_bind(w.input(b));
     REQUIRE_MESSAGE(r.has_value(), err(r));
     CHECK(find(*r, "platform")->decision == DecisionKind::BindOldData);
-    const SymbolDecision* c = find(*r, "counter$1");
+    const SymbolDecision* c = find(*r, "?counter@?1??next@@9@9");
     CHECK(c->decision == DecisionKind::BindOldData);
     CHECK(c->old_address.rva == 0x3030);
     CHECK(r->new_globals.empty());
 }
 
-TEST_CASE("c statics (cl): two locals called counter in different functions are told apart by the unchanged layout") {
+TEST_CASE("c statics: a file-scope name never takes over a function-local record of the old compiland") {
     SynthWorld w = basic_world(false);
-    w.data(w.tu(), "anchor", 0x10);
     w.proc_with_statics(w.tu(), "first", 0x50, {{"counter", 0x30}});
     w.proc_with_statics(w.tu(), "second", 0x90, {{"counter", 0x34}});
     w.open();
-    SynthObj o;
+    SynthObj o;  // "counter" is file scope in the object, local twice in the old compiland: no record of that scope
     const std::int32_t sec = static_cast<std::int32_t>(o.section(".data", kData, 0x40));
-    o.symbol("anchor", 0x10, sec, false, false);
-    o.symbol("counter$1", 0x30, sec, false, false);
-    o.symbol("counter$2", 0x34, sec, false, false);
+    o.symbol("counter", 0x30, sec, false, false);
     Built b = o.build();
     auto r = plan_bind(w.input(b));
     REQUIRE_MESSAGE(r.has_value(), err(r));
-    CHECK(find(*r, "counter$1")->old_address.rva == 0x3030);
-    CHECK(find(*r, "counter$1")->source == BindSource::CompilandRva);
-    CHECK(find(*r, "counter$2")->old_address.rva == 0x3034);
-}
-
-TEST_CASE("c statics (cl): identity that cannot be established is refused (CML3207), never bound as new") {
-    SynthWorld w = basic_world(false);
-    w.proc_with_statics(w.tu(), "first", 0x50, {{"counter", 0x30}});
-    w.proc_with_statics(w.tu(), "second", 0x90, {{"counter", 0x34}});
-    w.open();
-    SynthObj o;  // no unique static to fix the layout
-    const std::int32_t sec = static_cast<std::int32_t>(o.section(".data", kData, 0x40));
-    o.symbol("counter$1", 0x30, sec, false, false);
-    Built b = o.build();
-    std::vector<cml::Diag> errors;
-    auto r = plan_bind(w.input(b), &errors);
-    REQUIRE(!r.has_value());
-    REQUIRE(errors.size() == 1);
-    CHECK(errors[0].code == diag::kAmbiguousStatic);
+    // A file-scope name never takes over a function-local record: it is a new static.
+    CHECK(find(*r, "counter")->decision == DecisionKind::PatchNewData);
 }
 
 TEST_CASE("c statics: writable static data without a source-level name is refused (CML3500)") {

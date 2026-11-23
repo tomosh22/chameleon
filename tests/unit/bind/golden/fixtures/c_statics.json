@@ -5,16 +5,16 @@
   "min_bind_old_data": 5,
   "expect": [
     { "symbol": "cs_read", "decision": "patch-hooked" },
-    { "symbol": "inc_state", "decision": "bind-old-data", "source": "compiland-static" },
+    { "symbol_contains": "inc_state", "decision": "bind-old-data", "source": "compiland-static" },
     { "symbol": "inc_cell", "decision": "bind-old-data", "source": "compiland-static" },
-    { "symbol": "main_state", "decision": "bind-old-data", "source": "compiland-static" },
+    { "symbol_contains": "main_state", "decision": "bind-old-data", "source": "compiland-static" },
     { "symbol": "main_cell", "decision": "bind-old-data", "source": "compiland-static" },
     { "symbol_contains": "local_state", "decision": "bind-old-data" },
     { "symbol_contains": "local_cell", "decision": "bind-old-data" }
   ],
   "absent": [
-    { "symbol": "inc_state", "decision": "patch-new-data" },
-    { "symbol": "main_state", "decision": "patch-new-data" },
+    { "symbol_contains": "inc_state", "decision": "patch-new-data" },
+    { "symbol_contains": "main_state", "decision": "patch-new-data" },
     { "symbol_contains": "local_state", "decision": "patch-new-data" },
     { "symbol_contains": "local_cell", "decision": "patch-new-data" }
   ]
