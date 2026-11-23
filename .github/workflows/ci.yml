@@ -476,17 +476,17 @@ jobs:
           ./integrations/cmake/tests/run_examples.ps1 -BuildDir build-vs -Work wp29-work -Config Debug -Compiler msvc `
             -Os windows-2022 -Generator "Visual Studio 17 2022" *>&1 | Tee-Object -FilePath ci-logs/wp29-vs.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      # WP-33: the same count for the MSBuild output (the in-tree build and the examples built with the Visual Studio generator).
+      # WP-33: D9002 in the MSBuild output (the in-tree build and the examples built with the Visual Studio generator). Only Debug
+      # is built here, so D9025 (which needs /Ob1 from a non-Debug configuration) cannot appear; the Ninja cells cover it.
       - name: WP-33 no D9002 or D9025 (Visual Studio generator)
         run: |
-          $d2 = 0; $d25 = 0
+          $d2 = 0
           foreach ($f in "ci-logs/build-vs.log", "ci-logs/wp29-vs.txt") {
             if (-not (Test-Path $f)) { "WP33-WARN-VS missing log $f"; exit 1 }
             $d2 += @(Select-String -Path $f -Pattern 'D9002').Count
-            $d25 += @(Select-String -Path $f -Pattern 'D9025').Count
           }
-          "WP33-WARN-VS d9002=$d2 d9025=$d25"
-          if ($d2 -ne 0 -or $d25 -ne 0) { exit 1 }
+          "WP33-WARN-VS d9002=$d2"
+          if ($d2 -ne 0) { exit 1 }
       - name: WP-06 link evidence (anchors, binding object)
         if: always()
         run: |

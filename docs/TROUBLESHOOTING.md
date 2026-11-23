@@ -2864,7 +2864,7 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 - **Cause:** chameleon_enable (or cml_target_fixture_style) was called for a target created in a directory that has already been processed (the call is in a parent directory, after add_subdirectory), so CMake's default /Ob1 /Ob2 cannot be removed from that directory's flags.  
 - **Message:** `<caller>(<target>): <target> was created in <dir>, which has already been processed, so CMake's default /Ob1 /Ob2 cannot be removed from its flags and cl will print D9025 "overriding '/Ob1' with '/Ob0'" for every TU in RelWithDebInfo and Release.` (with clang-cl: "... and the configuration's /Ob1 /Ob2 stay in its flags next to /Ob0.")  
 - **What to do:** Call chameleon_enable in the directory that creates the target (at the end of its CMakeLists.txt or in a function it calls).  
-- **Raised by:** `chameleon_enable()` (CMake, warning)
+- **Raised by:** `chameleon_enable()` and `cml_target_fixture_style()` (CMake, warning)
 
 ### CML5990
 
