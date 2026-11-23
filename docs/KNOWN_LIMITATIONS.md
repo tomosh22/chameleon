@@ -169,3 +169,13 @@ diagnostic is planned, not live.
   - **Static-library members (F-1)** are fixed (WP-26b, #49), and the clang-cl C-statics crash (F-3) is fixed (WP-26c, #50). Members
     without a recorded build environment (a prebuilt library not built with /Z7) stay unreloadable: CML5920 at enable,
     CML5921 when one of their files changes. Toolchain archives (CRT, STL, SDK, compiler runtime) are never reloadable.
+  - **IDE integrations (wave 8).** The VS Code and Visual Studio extensions are tested against a real broker in CI. The editor
+    UI itself (menus, status bar, Output pane, Error List, the debugger `Attach2` call) is covered only by the manual
+    checklists in `docs/wp/WP-30.md` and `docs/wp/WP-31.md`. Two follow-ups need broker changes:
+    - *Early re-attach after hot-restart (WP-31):* the new pid reaches clients only in the `restarted` event, after enable,
+      indexing and re-applying edits, so the Visual Studio debugger re-attaches late. A breakpoint in start-up code can be
+      missed. The proposed additive contract is `restart {hold_new}`, a `restarting {old_pid,new_pid}` event and
+      `restart-resume`.
+    - *Structured diag locations (WP-30):* `diag` events carry the compiler output as text. The extensions find file and
+      line with the same regexes as the problem matchers. A `file`/`line` field on `diag` would make Problems and Error List
+      entries exact.
