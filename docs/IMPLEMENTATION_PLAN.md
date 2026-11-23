@@ -448,6 +448,7 @@ Wave 5 : WP-14, WP-15, WP-16, WP-17, WP-18           (parallel)
 Wave 6 : WP-19, WP-20, WP-21, WP-22, WP-24, WP-25    (parallel; WP-20 after WP-19 has a crash dialog or uses CLI first)
 Wave 7 : WP-23, WP-26, WP-27, WP-28
 Wave 8 : WP-29, WP-30, WP-31, WP-32
+Wave 9 : WP-33, WP-34, WP-35                        (wave-8 follow-ups; ADR-0040)
 ```
 
 Rules: at most four implementation subagents concurrently; each wave merges into `main` before the next starts; you run the full `ctest` suite after every merge. Any WP that fails acceptance twice gets split or spiked by you personally before re-delegation.
