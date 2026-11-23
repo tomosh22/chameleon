@@ -134,18 +134,21 @@ Result<Value> RestartCoordinator::restart(const Value& args, const std::function
         }
         hold_new = held->as_bool();
     }
-    if (!read_uint_arg(args, "hold_ms", ipc::restart_hold::kMaxHoldMs, &hold_ms, &arg_error, bad_hold)) {
-        return *arg_error;
-    }
     std::string hold_token;  // echoed in `restarting`
-    if (const Value* token = args.find("token"); token != nullptr && !token->is_null()) {
-        if (!token->is_string() || token->as_string().size() > 64) {
-            return bad_hold("argument 'token' must be a string of at most 64 characters");
+    if (hold_new) {
+        // `hold_ms` and `token` mean something only with hold_new (without it they are not looked at, as before WP-34).
+        if (!read_uint_arg(args, "hold_ms", ipc::restart_hold::kMaxHoldMs, &hold_ms, &arg_error, bad_hold)) {
+            return *arg_error;
         }
-        hold_token = token->as_string();
-    }
-    if (hold_ms == 0) {
-        hold_ms = ipc::restart_hold::kDefaultHoldMs;
+        if (const Value* given = args.find("hold_ms"); given != nullptr && !given->is_null() && hold_ms == 0) {
+            return bad_hold("argument 'hold_ms' must be an integer from 1 to " + std::to_string(ipc::restart_hold::kMaxHoldMs));
+        }
+        if (const Value* token = args.find("token"); token != nullptr && !token->is_null()) {
+            if (!token->is_string() || token->as_string().size() > 64) {
+                return bad_hold("argument 'token' must be a string of at most 64 characters");
+            }
+            hold_token = token->as_string();
+        }
     }
     if (timeout_ms == 0) {
         timeout_ms = kDefaultTimeoutMs;
@@ -436,8 +439,21 @@ Result<Value> RestartCoordinator::restart(const Value& args, const std::function
                 break;
             }
         }
+        // A `restart-resume` that races with the end of the hold: whichever got the hold's mutex first decides. If the release was requested in
+        // time it counts (the answer `resumed:true` is then true); otherwise the reason is recorded *before* the resume, so `restart-resume`
+        // answers CML5814 with it instead of claiming it resumed the process.
+        {
+            std::lock_guard<std::mutex> lock(hold->mutex);
+            if (end != End::Requested && hold->release_requested) {
+                end = End::Requested;
+            }
+        }
         const char* how = end == End::Requested ? "restart-resume" : end == End::Expired ? "hold_ms expired" : end == End::ClientGone ? "client disconnected"
                           : end == End::Shutdown ? "broker shutdown" : "process exited";
+        if (end != End::Requested) {
+            std::lock_guard<std::mutex> lock(hold->mutex);
+            hold->ended_by = how;
+        }
         Result<void> resumed = end_hold(how);
         if (end == End::Exited) {
             return fail(Diag::make(rd::kNewProcessExited,
@@ -657,6 +673,10 @@ Result<Value> RestartCoordinator::resume(const Value& args) {
                           "Send `restart-resume` with the new_pid of a `restarting` event, while its restart is waiting; a process resumed by the broker needs nothing more.");
     }
     std::unique_lock<std::mutex> lock(hold->mutex);
+    if (!hold->ended_by.empty()) {
+        return Diag::make(rd::kNotHeld, "process " + std::to_string(pid) + " is not held any more (it was resumed: " + hold->ended_by + ")",
+                          "A process resumed by the broker needs nothing more; this answer is harmless.");
+    }
     hold->release_requested = true;
     hold->changed.notify_all();
     if (!hold->changed.wait_for(lock, kResumeConfirmWait, [&] { return hold->resumed; })) {

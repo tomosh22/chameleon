@@ -28,7 +28,8 @@ namespace Chameleon.Control
 
         /// <summary>
         /// WP-34: how long the broker holds the new process suspended while the debugger attaches (`hold_ms` of `restart`, at most 60000).
-        /// It must be longer than <see cref="HoldAttachTimeoutMs"/> so that this extension resumes the process before the broker does.
+        /// It must be longer than <see cref="HoldResumeGraceMs"/> plus the round trip of `restart-resume`, so that this extension resumes the
+        /// process before the broker does. (<see cref="HoldAttachTimeoutMs"/> is the wait for the attach after the resume.)
         /// </summary>
         public int RestartHoldMs { get; set; } = 30000;
 

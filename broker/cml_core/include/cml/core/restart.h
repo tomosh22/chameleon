@@ -150,6 +150,7 @@ private:
         std::mutex mutex;
         std::condition_variable changed;
         bool release_requested = false;
+        std::string ended_by;                 // set (under `mutex`) when the hold ended for a reason other than a requested release
         bool resumed = false;                 // the restart thread resumed the process (or tried to)
         std::optional<Diag> resume_error;
         std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();

@@ -88,7 +88,7 @@ namespace Chameleon.Control
             return new ChameleonDiagnostic(
                 ClientDiagIds.ReattachFailed,
                 "Could not tell the broker to resume the restarted process (pid " + newPid + "): " + reason + ".",
-                "Nothing else to do: the broker resumes the process by itself when the hold time (" + (holdMs / 1000) + " s) has passed. " +
+                "Nothing else to do: the broker resumes the process by itself when the hold time (" + (Math.Min(60000, holdMs) / 1000) + " s) has passed. " +
                 "If the application stays frozen, run Tools > Chameleon > Hot-restart again.");
         }
 

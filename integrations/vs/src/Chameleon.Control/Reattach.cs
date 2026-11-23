@@ -191,17 +191,27 @@ namespace Chameleon.Control
             Func<Task<ControlResponse>> resume,
             CancellationToken cancellationToken = default(CancellationToken))
         {
-            var attachCancel = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            Observe();
+            string[] oldEngines = null;
+            lock (_gate)
+            {
+                if (_known.TryGetValue(oldPid, out Known oldKnown))
+                {
+                    oldEngines = oldKnown.Engines;
+                }
+            }
+
             Task<ReattachOutcome> attach = null;
             try
             {
-                attach = OnRestartedAsync(oldPid, newPid, attachCancel.Token);
+                attach = OnRestartedAsync(oldPid, newPid, cancellationToken);
                 await WaitForDebuggerOrGraceAsync(attach, newPid).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
                 _log("reattach: the attach to the held pid " + newPid + " failed: " + ex.Message);
                 _report(ClientDiagnostics.ReattachFailed(oldPid, newPid, ex.Message));
+                AllowLateAttach(oldPid, newPid, oldEngines);
                 attach = null;
             }
             finally
@@ -223,27 +233,50 @@ namespace Chameleon.Control
                 if (first == attach)
                 {
                     stopWaiting.Cancel();
-                    return await attach.ConfigureAwait(false);
+                    ReattachOutcome result = await attach.ConfigureAwait(false);
+                    if (result == ReattachOutcome.Failed)
+                    {
+                        AllowLateAttach(oldPid, newPid, oldEngines);
+                    }
+
+                    return result;
                 }
 
-                // The process runs; the debugger still has not finished. Stop waiting (it may finish later).
-                attachCancel.Cancel();
+                // The process runs; the debugger still has not finished. Stop *waiting* only: the attach itself is not cancelled (it may finish
+                // later, and then the process is attached after all). `restarted` may still try a normal late attach, queued behind it.
                 _log("reattach: the debugger did not finish attaching to pid " + newPid + " within " + waitMs + " ms");
                 _report(ClientDiagnostics.AttachTooSlow(oldPid, newPid, waitMs));
+                AllowLateAttach(oldPid, newPid, oldEngines);
                 var ignored = attach.ContinueWith(t => { var unobserved = t.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
             }
             catch (OperationCanceledException)
             {
                 _log("reattach: the attach to pid " + newPid + " was cancelled");
                 _report(ClientDiagnostics.ReattachFailed(oldPid, newPid, "the attach was cancelled"));
+                AllowLateAttach(oldPid, newPid, oldEngines);
             }
             catch (Exception ex)
             {
                 _log("reattach: the attach to pid " + newPid + " failed: " + ex.Message);
                 _report(ClientDiagnostics.ReattachFailed(oldPid, newPid, ex.Message));
+                AllowLateAttach(oldPid, newPid, oldEngines);
             }
 
             return ReattachOutcome.Failed;
+        }
+
+        // The early attach did not work (failed, or has not finished in time): the `restarted` event must still get a normal late attach.
+        // OnRestartedAsync marked the pair handled and forgot the old pid before it tried; take both back.
+        private void AllowLateAttach(int oldPid, int newPid, string[] oldEngines)
+        {
+            lock (_gate)
+            {
+                _handled.Remove(oldPid + ">" + newPid);
+                if (oldEngines != null && !_known.ContainsKey(oldPid))
+                {
+                    _known[oldPid] = new Known { Engines = oldEngines, GoneAt = _now() };
+                }
+            }
         }
 
         // Returns when the attach task finished (either way), the debugger lists the pid, or the grace period is over.
@@ -306,6 +339,11 @@ namespace Chameleon.Control
                     _log("reattach: restart-resume for pid " + newPid + " was refused: " + (answer.Error != null ? answer.Error.ToString() : "no detail"));
                     _report(ClientDiagnostics.ResumeFailed(newPid, answer.Error != null ? answer.Error.Id + " " + answer.Error.Message : "the broker refused", _settings.RestartHoldMs));
                 }
+            }
+            catch (ControlException ex) when (ex.Diagnostic.Id == ClientDiagIds.PipeLost)
+            {
+                // The connection dropped: the broker notices at once and resumes the process (CML5816). Nothing to tell the user.
+                _log("reattach: the connection dropped while resuming pid " + newPid + " (the broker resumes a held process when its client disconnects): " + ex.Message);
             }
             catch (Exception ex)
             {

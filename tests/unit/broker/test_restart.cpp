@@ -1090,6 +1090,22 @@ TEST_CASE("restart hold: bad arguments and restart-resume for a pid that is not 
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error().code == restart::diag::kBadHoldArgs);
     }
+    {
+        Value zero = hold_args(1000);
+        zero.set("hold_ms", Value::integer(0));  // documented range 1..60000: 0 is refused, not defaulted
+        r = rig.service.restart(zero);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().code == restart::diag::kBadHoldArgs);
+        // Without hold_new the hold arguments are not looked at at all.
+    }
+    {
+        Rig plain;
+        plain.hold_supported = true;
+        Value ignored = args_for(100, 10000);
+        ignored.set("hold_ms", Value::integer(99999));
+        ignored.set("token", Value::integer(1));
+        CHECK(plain.service.restart(ignored).has_value());
+    }
     for (const bool as_text : {false, true}) {
         Value args = hold_args(1000);
         args.set("token", as_text ? Value::string(std::string(65, 'x')) : Value::integer(7));  // not a string / too long

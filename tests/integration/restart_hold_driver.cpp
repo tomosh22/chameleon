@@ -682,7 +682,7 @@ void scenario_not_held(Rig& rig, Report& report) {
     std::optional<cml::ipc::ControlResponse> bare = client->call("restart-resume", Value::object(), 10000);
     report.require(bare.has_value(), "no answer to restart-resume without pid");
     report.check(!bare->ok && diag_id_of(*bare) == "CML5818", "restart-resume without a pid is not CML5818 (" + diag_id_of(*bare) + ")");
-    std::optional<cml::ipc::ControlResponse> bad_args = client->call("restart", object_of({{"pid", Value::integer(rig.old_pid)}, {"hold_ms", Value::integer(60001)}}), 10000);
+    std::optional<cml::ipc::ControlResponse> bad_args = client->call("restart", object_of({{"pid", Value::integer(rig.old_pid)}, {"hold_new", Value::boolean(true)}, {"hold_ms", Value::integer(60001)}}), 10000);
     report.require(bad_args.has_value(), "no answer to restart with a bad hold_ms");
     report.check(!bad_args->ok && diag_id_of(*bad_args) == "CML5818", "restart with hold_ms 60001 is not CML5818 (" + diag_id_of(*bad_args) + ")");
     report.check(process_alive(rig.old_pid), "the old process was touched by a refused restart");

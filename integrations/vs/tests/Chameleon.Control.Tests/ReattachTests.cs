@@ -18,6 +18,9 @@ namespace Chameleon.Control.Tests
             public bool ListThrows;
             public bool Hang;                                       // WP-34: attaching never finishes (a slow debugger)
             public bool BlockUntilResumed;                          // WP-34: attaching returns only once the held process runs (a real attach to a suspended process)
+            public bool FailWhileHeld;                              // WP-34: every attach fails until the process has been resumed
+            public TaskCompletionSource<bool> ManualRelease;        // WP-34: attaching returns when the test completes this
+            public bool TokenCancelledAtEnd;                        // the attach's token was cancelled when it finished
             public bool ListEarly;                                  // ... but the debugger lists the pid as soon as the attach starts
             public readonly TaskCompletionSource<bool> ResumeSignal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             public readonly List<string> Order = new List<string>();   // "attach:<pid>", "resume:<pid>" in the order they happened
@@ -44,6 +47,17 @@ namespace Chameleon.Control.Tests
                     }
 
                     await ResumeSignal.Task.ConfigureAwait(false);
+                }
+
+                if (FailWhileHeld && !ResumeSignal.Task.IsCompleted)
+                {
+                    throw new InvalidOperationException("the debugger cannot attach to a process that has not run");
+                }
+
+                if (ManualRelease != null)
+                {
+                    await ManualRelease.Task.ConfigureAwait(false);
+                    TokenCancelledAtEnd = cancellationToken.IsCancellationRequested;
                 }
 
                 if (Hang)
@@ -411,12 +425,89 @@ namespace Chameleon.Control.Tests
             var rig = new Rig();
             rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
 
-            await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume(throws: new ControlException(ClientDiagnostics.PipeLost("pipe", "gone"))));
+            await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume(throws: new InvalidOperationException("the request could not be sent")));
 
             ChameleonDiagnostic d = Assert.Single(rig.Reported);
             Assert.Equal("CML5997", d.Id);
             Assert.Contains("resume the restarted process", d.Message);
             Assert.Contains("resumes the process by itself", d.Action);
+            Assert.Contains("30 s", d.Action);
+        }
+
+        [Fact]
+        public async Task AConnectionThatDroppedDuringTheResumeIsOnlyLoggedTheBrokerResumesWhenItsClientIsGone()
+        {
+            var rig = new Rig();
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
+
+            await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume(throws: new ControlException(ClientDiagnostics.PipeLost("pipe", "gone"))));
+
+            Assert.Empty(rig.Reported);
+            Assert.Contains(rig.Log, m => m.Contains("connection dropped"));
+        }
+
+        [Fact]
+        public void TheDisplayedHoldTimeIsClampedToTheBrokersMaximum()
+        {
+            ChameleonDiagnostic d = ClientDiagnostics.ResumeFailed(200, "x", 600000);
+            Assert.Contains("60 s", d.Action);
+        }
+
+        [Fact]
+        public async Task AHeldAttachThatFailsStillGetsALateAttachWhenRestartedArrives()
+        {
+            var rig = new Rig();
+            rig.Debugger.FailWhileHeld = true;   // the debugger cannot attach to a process that has not run
+            rig.Settings.ReattachAttempts = 2;
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
+            rig.Coordinator.Observe();
+            rig.Debugger.ProcessExits(100);       // the broker terminated it
+            rig.Coordinator.Observe();
+
+            ReattachOutcome held = await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume());
+
+            Assert.Equal(ReattachOutcome.Failed, held);
+            Assert.Single(rig.Reported);   // one CML5997 for the failed early attach
+            // The process runs now; the `restarted` event gets a normal late attach (not Duplicate).
+            ReattachOutcome late = await rig.Coordinator.OnRestartedAsync(100, 200);
+            Assert.Equal(ReattachOutcome.Attached, late);
+            Assert.Equal(new[] { "Native" }, rig.Debugger.AttachCalls.Last().Engines);
+            Assert.Single(rig.Reported);   // no second report
+        }
+
+        [Fact]
+        public async Task AnAttachThatFinishesAfterTheTimeoutIsNotCancelledAndEndsUpAttached()
+        {
+            var rig = new Rig();
+            rig.AttachTimeoutFires = true;
+            rig.GraceFires = true;
+            rig.Debugger.ManualRelease = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
+
+            ReattachOutcome outcome = await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume());
+
+            Assert.Equal(ReattachOutcome.Failed, outcome);   // we stopped waiting
+            Assert.Contains(rig.Reported, d => d.Message.Contains("did not finish attaching"));
+            rig.Debugger.ManualRelease.SetResult(true);       // the debugger finishes after the timeout
+            Assert.True(await WaitForAsync(() => rig.Debugger.Attached.Any(p => p.Pid == 200)));
+            Assert.False(rig.Debugger.TokenCancelledAtEnd);   // it was not cancelled
+            Assert.Equal(ReattachOutcome.AlreadyAttached, await rig.Coordinator.OnRestartedAsync(100, 200));
+        }
+
+        private static async Task<bool> WaitForAsync(Func<bool> condition, int timeoutMs = 5000)
+        {
+            DateTime until = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+            while (DateTime.UtcNow < until)
+            {
+                if (condition())
+                {
+                    return true;
+                }
+
+                await Task.Delay(10);
+            }
+
+            return condition();
         }
 
         [Fact]

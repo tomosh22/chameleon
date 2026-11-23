@@ -255,14 +255,27 @@ private:
         ZeroMemory(&inheritable, sizeof(inheritable));
         inheritable.nLength = sizeof(inheritable);
         inheritable.bInheritHandle = TRUE;
+        DWORD last_error = 0;  // taken right after the call that failed, before any cleanup can change it
         HANDLE ended = CreateEventW(&inheritable, TRUE, FALSE, nullptr);
-        HANDLE done = CreateEventW(&inheritable, TRUE, FALSE, nullptr);
+        if (ended == nullptr) {
+            last_error = GetLastError();
+        }
+        HANDLE done = ended != nullptr ? CreateEventW(&inheritable, TRUE, FALSE, nullptr) : nullptr;
+        if (ended != nullptr && done == nullptr) {
+            last_error = GetLastError();
+        }
         HANDLE broker_copy = nullptr;
         HANDLE thread_copy = nullptr;
         const HANDLE self = GetCurrentProcess();
-        const bool ok = ended != nullptr && done != nullptr &&
-                        DuplicateHandle(self, self, self, &broker_copy, SYNCHRONIZE, TRUE, 0) &&
-                        DuplicateHandle(self, main_thread_, self, &thread_copy, THREAD_SUSPEND_RESUME | SYNCHRONIZE, TRUE, 0);
+        bool ok = ended != nullptr && done != nullptr;
+        if (ok && !DuplicateHandle(self, self, self, &broker_copy, SYNCHRONIZE, TRUE, 0)) {
+            last_error = GetLastError();
+            ok = false;
+        }
+        if (ok && !DuplicateHandle(self, main_thread_, self, &thread_copy, THREAD_SUSPEND_RESUME | SYNCHRONIZE, TRUE, 0)) {
+            last_error = GetLastError();
+            ok = false;
+        }
         (void)new_process;
         bool started = false;
         if (ok) {
@@ -271,8 +284,12 @@ private:
             InitializeProcThreadAttributeList(nullptr, 1, 0, &bytes);
             std::vector<char> storage(bytes);
             auto* attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage.data());
-            if (InitializeProcThreadAttributeList(attributes, 1, 0, &bytes)) {
-                if (UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, list, sizeof(list), nullptr, nullptr)) {
+            if (!InitializeProcThreadAttributeList(attributes, 1, 0, &bytes)) {
+                last_error = GetLastError();
+            } else {
+                if (!UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, list, sizeof(list), nullptr, nullptr)) {
+                    last_error = GetLastError();
+                } else {
                     const auto text = [](HANDLE h) { return std::to_wstring(static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(h))); };
                     std::wstring command = L"\"" + path + L"\" --hold-watchdog " + text(broker_copy) + L" " + text(thread_copy) + L" " + text(ended) + L" " +
                                            text(done) + L" 75000";
@@ -289,6 +306,8 @@ private:
                         CloseHandle(info.hThread);
                         watchdog_ = info.hProcess;
                         started = true;
+                    } else {
+                        last_error = GetLastError();
                     }
                 }
                 DeleteProcThreadAttributeList(attributes);
@@ -312,7 +331,7 @@ private:
                 CloseHandle(done);
             }
             CML_LOG(Warn, "restart: could not start the hold watchdog (Win32 error %lu); a broker that is killed while holding would leave the process suspended",
-                    GetLastError());
+                    last_error);
         }
     }
 

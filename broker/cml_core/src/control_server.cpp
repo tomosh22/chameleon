@@ -135,7 +135,7 @@ ipc::ControlResponse subscribe_response(const ipc::ControlRequest& request, cons
             if (std::string(k) != "progress" && std::string(k) != "exception" && std::string(k) != "exception_updated" && std::string(k) != "restarted" && std::string(k) != "restarting") names.insert(k);
         }
     } else if (!events->is_array()) {
-        return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "argument 'events' must be an array of event names", "Use [\"diag\", \"patch_applied\", \"patch_reverted\", \"progress\", \"log\", \"exception\", \"restarted\"] or a subset."));
+        return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "argument 'events' must be an array of event names", "Use [\"diag\", \"patch_applied\", \"patch_reverted\", \"progress\", \"log\", \"exception\", \"restarted\", \"restarting\"] or a subset."));
     } else {
         for (const ipc::json::Value& e : events->items()) {
             bool known = false;

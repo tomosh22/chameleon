@@ -2505,8 +2505,8 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 ### CML5818
 
 - **Cause:** `restart` got an invalid `hold_new` or `hold_ms`, or `restart-resume` got no usable `pid`.  
-- **Message:** `argument 'hold_new' must be true or false`, `argument 'hold_ms' must be an integer from 0 to 60000` or `` `restart-resume` needs the integer argument 'pid' ``  
-- **What to do:** Send `{"hold_new":true,"hold_ms":N}` with hold_ms from 1 to 60000 (0 or absent: 10000), and `{"pid":N}` with the `new_pid` of the `restarting` event.  
+- **Message:** `argument 'hold_new' must be true or false`, `argument 'hold_ms' must be an integer from 1 to 60000` or `` `restart-resume` needs the integer argument 'pid' ``  
+- **What to do:** Send `{"hold_new":true,"hold_ms":N}` with hold_ms from 1 to 60000 (absent: 10000), and `{"pid":N}` with the `new_pid` of the `restarting` event.  
 - **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
 
 ### CML5819
