@@ -12,6 +12,10 @@ on:
     paths:
       - 'tests/acceptance/quickstart/**'
       - '.github/workflows/quickstart-acceptance.yml'
+      - 'docs/QUICKSTART.md'
+      - 'tools/package/**'
+      - 'integrations/**'
+      - 'LICENSE'
 
 permissions:
   contents: read
