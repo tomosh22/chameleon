@@ -160,4 +160,10 @@ diagnostic is planned, not live.
     every TU that includes it (CML3214), because the PDB reader has no type information yet.
   - **VEX prologues:** the hook decoder refuses functions that start with a VEX-encoded (C4/C5) instruction; the STL's AVX
     helpers and 220 of Godot's 512 467 functions do. Such a function cannot be hooked.
-  - **Static-library members (F-1) and the clang-cl C-statics crash (F-3)** are being fixed in WP-26b and WP-26c.
+  - **Same-named function-local statics in one function (F-4 family):** several lambdas in one function each defining
+    a local static of the same name (Godot's `SNAME` in `scene/main/scene_tree.cpp`: `$TSS0`, `sname`) cannot be told
+    apart; the planner refuses the TU with CML3207/CML3214 (found by WP-26b).
+  - **Unreadable C static names (WP-26c):** a writable static whose name is neither a plain identifier, an MS-decorated
+    name, a clang-cl C spelling (`a`, `a.N`, `f.x`, `f.x.N`) nor on the compiler-generated list is refused with CML3500
+    rather than reset. No fixture or corpus case hits it.
+  - **Static-library members (F-1)** are being fixed in WP-26b. The clang-cl C-statics crash (F-3) is fixed (WP-26c, #50).
