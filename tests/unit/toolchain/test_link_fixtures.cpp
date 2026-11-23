@@ -564,6 +564,7 @@ TEST_CASE("link patch: fixture lambdas links under the mirrored linker and the o
 TEST_CASE("link patch: fixture new_function links under the mirrored linker and the other one") { run_fixture("new_function"); }
 TEST_CASE("link patch: fixture new_global links under the mirrored linker and the other one") { run_fixture("new_global"); }
 TEST_CASE("link patch: fixture tls links under the mirrored linker and the other one") { run_fixture("tls"); }
+TEST_CASE("link patch: fixture static_lib (code in a static library, WP-26b) links under the mirrored linker and the other one") { run_fixture("static_lib"); }
 
 TEST_CASE("link patch: the user can override the detected linker family") {
     const FixturePaths& paths = FixturePaths::get();
