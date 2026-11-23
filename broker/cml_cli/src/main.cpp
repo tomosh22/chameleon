@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "cml/core/check_command.h"
+#include "cml/core/restart.h"
 #include "cml/core/version.h"
 #include "cml/license/license.h"
 #include "cml/util/log.h"
@@ -293,6 +294,12 @@ int main(int argc, char** argv) {
     // WP-18: `cml_broker check <module>` is an offline command with its own arguments.
     {
         std::vector<std::string> all = collect_args(argc, argv);
+#if defined(_WIN32)
+        // WP-34: the watchdog the broker starts while it holds a restarted process suspended (hidden; not for users).
+        if (all.size() >= 2 && all[1] == "--hold-watchdog") {
+            return cml::core::run_hold_watchdog(std::vector<std::string>(all.begin() + 2, all.end()));
+        }
+#endif
         if (all.size() >= 2 && all[1] == "check") {
             return cml::core::run_check_command(std::vector<std::string>(all.begin() + 2, all.end()), stdout, stderr);
         }

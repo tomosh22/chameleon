@@ -415,3 +415,28 @@ TEST_CASE("run_parallel: min(jobs, hardware_concurrency) workers, every index on
     CHECK(ran.load() == 5);
     run_parallel(0, 4, [&](std::size_t) { FAIL("no work expected"); });
 }
+
+// WP-35: file names as the compiler printed them, made absolute against the directory it ran in.
+TEST_CASE("resolve_tool_path: absolute, relative, root-relative, drive-relative and UNC names") {
+    const std::string cwd = "C:\\proj\\build";
+    CHECK(resolve_tool_path("C:\\proj\\src\\logic.cpp", cwd) == "C:\\proj\\src\\logic.cpp");
+    CHECK(resolve_tool_path("C:/proj/src/logic.cpp", cwd) == "C:\\proj\\src\\logic.cpp");   // slashes become backslashes
+    CHECK(resolve_tool_path("logic.cpp", cwd) == "C:\\proj\\build\\logic.cpp");
+    CHECK(resolve_tool_path("..\\src\\logic.cpp", cwd) == "C:\\proj\\src\\logic.cpp");
+    CHECK(resolve_tool_path(".\\sub\\..\\a.cpp", cwd) == "C:\\proj\\build\\a.cpp");
+    CHECK(resolve_tool_path("C:\\proj\\build\\..\\..\\..\\x.cpp", cwd) == "C:\\x.cpp");     // ".." stops at the root
+    CHECK(resolve_tool_path("\\src\\logic.cpp", cwd) == "C:\\src\\logic.cpp");             // root of cwd's drive
+    CHECK(resolve_tool_path("/src/logic.cpp", cwd) == "C:\\src\\logic.cpp");
+    CHECK(resolve_tool_path("C:logic.cpp", cwd) == "C:\\proj\\build\\logic.cpp");           // drive-relative, same drive
+    CHECK(resolve_tool_path("c:logic.cpp", cwd) == "C:\\proj\\build\\logic.cpp");
+    CHECK(resolve_tool_path("D:logic.cpp", cwd).empty());                                   // another drive: unknown
+    CHECK(resolve_tool_path("\\\\server\\share\\src\\a.cpp", cwd) == "\\\\server\\share\\src\\a.cpp");
+    CHECK(resolve_tool_path("\\\\server\\share\\src\\..\\a.cpp", cwd) == "\\\\server\\share\\a.cpp");
+    CHECK(resolve_tool_path("a.cpp", "\\\\server\\share\\work") == "\\\\server\\share\\work\\a.cpp");
+    CHECK(resolve_tool_path("\\a.cpp", "\\\\server\\share\\work") == "\\\\server\\share\\a.cpp");
+    CHECK(resolve_tool_path("a.cpp", "").empty());                                          // no directory: no path
+    CHECK(resolve_tool_path("a.cpp", "work").empty());
+    CHECK(resolve_tool_path("", cwd).empty());
+    CHECK(resolve_tool_path("C:\\a.cpp", "") == "C:\\a.cpp");                               // absolute needs no directory
+    CHECK(resolve_tool_path("/p/a/../b.cpp", "") == "/p/b.cpp");                            // portable form
+}

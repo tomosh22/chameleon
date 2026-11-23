@@ -14,7 +14,7 @@ if(NOT MSVC)
     return()
 endif()
 
-set(_cml_bad_good_compile /Gy /hotpatch)
+set(_cml_bad_good_compile /Gy ${CML_HOTPATCH_FLAGS})
 set(_cml_bad_good_link /INCREMENTAL:NO /OPT:NOREF /OPT:NOICF /FUNCTIONPADMIN)
 set(_cml_check_script "${CMAKE_CURRENT_SOURCE_DIR}/run_check.cmake")
 

@@ -229,6 +229,13 @@ export class ControlClient extends EventEmitter {
         message: typeof d?.message === "string" ? d.message : `'${cur.cmd}' failed`,
         action: typeof d?.action === "string" ? d.action : "",
       };
+      if (typeof d?.file === "string" && d.file !== "" && typeof d.line === "number" && d.line >= 1) {
+        diag.file = d.file;
+        diag.line = d.line;
+        if (typeof d.column === "number" && d.column >= 1) {
+          diag.column = d.column;
+        }
+      }
       cur.reject(new DiagError(diag));
     }
     this.pump();

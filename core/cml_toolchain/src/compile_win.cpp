@@ -108,6 +108,12 @@ Result<void> compile_tu(const CompileRequest& request, CompileOutcome& outcome) 
     spec.args = rw->args;
     if (!rw->cwd.empty() && fs::is_directory(detail::to_path(rw->cwd))) {
         spec.cwd = rw->cwd;
+        outcome.cwd = rw->cwd;
+    } else {
+        // The process inherits the broker's directory; that is where relative names in its output start (WP-35).
+        std::error_code cwd_ec;
+        const fs::path inherited = fs::current_path(cwd_ec);
+        outcome.cwd = cwd_ec ? std::string() : detail::to_utf8(inherited);
     }
     spec.timeout_ms = request.timeout_ms;
     spec.force_response_file = request.force_response_file;

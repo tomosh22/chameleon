@@ -387,5 +387,95 @@ namespace Chameleon.Control.Tests
                 Assert.True(session.WantsConnection);
             }
         }
+
+        // ---- WP-34: restart {hold_new}, `restarting`, `restart-resume` ----
+
+        [Fact]
+        public async Task RestartingIsSubscribedOnlyWhenTheBrokerCanHoldTheProcess()
+        {
+            using (var broker = new FakeBroker("status", "subscribe", "restart", "restart-hold"))
+            using (var h = new Harness(broker))
+            {
+                Assert.True(await h.Session.ConnectAsync());
+                Assert.True(h.Session.Supports(Capabilities.RestartHold));
+                Assert.Contains("restarting", SubscribedEvents(broker));
+                Assert.Contains("restarted", SubscribedEvents(broker));
+            }
+
+            using (var broker = new FakeBroker("status", "subscribe", "restart"))
+            using (var h = new Harness(broker))
+            {
+                Assert.True(await h.Session.ConnectAsync());
+                Assert.False(h.Session.Supports(Capabilities.RestartHold));
+                Assert.DoesNotContain("restarting", SubscribedEvents(broker));
+            }
+        }
+
+        [Fact]
+        public async Task ARestartWithoutAHoldTimeSendsNoHoldArguments()
+        {
+            using (var broker = new FakeBroker("status", "subscribe", "restart", "restart-hold"))
+            using (var h = new Harness(broker))
+            {
+                Assert.True(await h.Session.ConnectAsync());
+                await h.Session.RestartAsync(4242);
+                JObject sent = broker.Requests().Last(r => (string)r["cmd"] == "restart");
+                Assert.Equal(4242, (int)sent["args"]["pid"]);
+                Assert.Null(sent["args"]["hold_new"]);
+                Assert.Null(sent["args"]["hold_ms"]);
+            }
+        }
+
+        [Fact]
+        public async Task ResumeGoesOutWhileTheHeldRestartIsStillUnansweredAndTheHoldTimeIsClamped()
+        {
+            using (var broker = new FakeBroker("status", "subscribe", "restart", "restart-hold"))
+            using (var h = new Harness(broker))
+            {
+                Assert.True(await h.Session.ConnectAsync());
+                // The broker answers `restart` only after the resume (it waits for it), exactly like the real one.
+                broker.Respond = req => (string)req["cmd"] == "restart"
+                    ? new string[0]
+                    : new[] { FakeBroker.Ok((long)req["id"], new JObject { ["pid"] = 200, ["resumed"] = true }) };
+
+                Task<ControlResponse> restart = h.Session.RestartAsync(4242, holdMs: 120000, holdToken: "tok-1");
+                await broker.WaitForRequestAsync("restart");
+                JObject sent = broker.Requests().Last(r => (string)r["cmd"] == "restart");
+                Assert.True((bool)sent["args"]["hold_new"]);
+                Assert.Equal(60000, (int)sent["args"]["hold_ms"]);   // the broker's maximum
+                Assert.Equal(4242, (int)sent["args"]["pid"]);
+                Assert.Equal("tok-1", (string)sent["args"]["token"]);   // echoed in `restarting`
+
+                ControlResponse resumed = await h.Session.ResumeAsync(200);   // does not wait behind the unanswered restart
+                Assert.True(resumed.Ok);
+                Assert.False(restart.IsCompleted);
+                JObject resume = broker.Requests().Last(r => (string)r["cmd"] == "restart-resume");
+                Assert.Equal(200, (int)resume["args"]["pid"]);
+
+                broker.Push(FakeBroker.Ok((long)sent["id"], new JObject { ["old_pid"] = 4242, ["new_pid"] = 200 }));
+                ControlResponse done = await restart;
+                Assert.True(done.Ok);
+                Assert.Equal(200, (int)done.Result["new_pid"]);
+            }
+        }
+
+        [Fact]
+        public async Task TheRestartingEventCarriesBothPids()
+        {
+            using (var broker = new FakeBroker("status", "subscribe", "restart", "restart-hold"))
+            using (var h = new Harness(broker))
+            {
+                Assert.True(await h.Session.ConnectAsync());
+                broker.Push("{\"event\":\"restarting\",\"old_pid\":4242,\"new_pid\":200,\"hold_ms\":30000}");
+                Assert.True(await WaitAsync(() => { lock (h.Events) { return h.Events.Any(e => e.Name == "restarting"); } }));
+                BrokerEvent ev;
+                lock (h.Events) { ev = h.Events.First(e => e.Name == "restarting"); }
+                int oldPid, newPid;
+                Assert.True(ev.TryGetRestarting(out oldPid, out newPid));
+                Assert.Equal(4242, oldPid);
+                Assert.Equal(200, newPid);
+                Assert.False(ev.TryGetRestarted(out oldPid, out newPid));   // not mistaken for `restarted`
+            }
+        }
     }
 }
