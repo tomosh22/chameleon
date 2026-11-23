@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="utf-8"?>
+<CommandTable xmlns="http://schemas.microsoft.com/VisualStudio/2005-10-18/CommandTable" xmlns:xs="http://www.w3.org/2001/XMLSchema">
+
+  <Extern href="stdidcmd.h" />
+  <Extern href="vsshlids.h" />
+
+  <Commands package="guidChameleonPackage">
+
+    <Menus>
+      <!-- Tools > Chameleon -->
+      <Menu guid="guidChameleonCmdSet" id="ChameleonMenu" priority="0x0100" type="Menu">
+        <Parent guid="guidChameleonCmdSet" id="ChameleonToolsGroup" />
+        <Strings>
+          <ButtonText>Chameleon</ButtonText>
+          <CommandName>Chameleon</CommandName>
+        </Strings>
+      </Menu>
+    </Menus>
+
+    <Groups>
+      <Group guid="guidChameleonCmdSet" id="ChameleonToolsGroup" priority="0x0600">
+        <Parent guid="guidSHLMainMenu" id="IDM_VS_MENU_TOOLS" />
+      </Group>
+      <Group guid="guidChameleonCmdSet" id="ChameleonPatchGroup" priority="0x0100">
+        <Parent guid="guidChameleonCmdSet" id="ChameleonMenu" />
+      </Group>
+      <Group guid="guidChameleonCmdSet" id="ChameleonConnectionGroup" priority="0x0200">
+        <Parent guid="guidChameleonCmdSet" id="ChameleonMenu" />
+      </Group>
+    </Groups>
+
+    <Buttons>
+      <Button guid="guidChameleonCmdSet" id="CmdReload" priority="0x0100" type="Button">
+        <Parent guid="guidChameleonCmdSet" id="ChameleonPatchGroup" />
+        <Strings>
+          <ButtonText>&amp;Reload</ButtonText>
+          <CommandName>ChameleonReload</CommandName>
+        </Strings>
+      </Button>
+      <Button guid="guidChameleonCmdSet" id="CmdHotRestart" priority="0x0101" type="Button">
+        <Parent guid="guidChameleonCmdSet" id="ChameleonPatchGroup" />
+        <Strings>
+          <ButtonText>&amp;Hot-Restart</ButtonText>
+          <CommandName>ChameleonHotRestart</CommandName>
+        </Strings>
+      </Button>
+      <Button guid="guidChameleonCmdSet" id="CmdRevertLast" priority="0x0102" type="Button">
+        <Parent guid="guidChameleonCmdSet" id="ChameleonPatchGroup" />
+        <Strings>
+          <ButtonText>Revert &amp;Last</ButtonText>
+          <CommandName>ChameleonRevertLast</CommandName>
+        </Strings>
+      </Button>
+      <Button guid="guidChameleonCmdSet" id="CmdRevertAll" priority="0x0103" type="Button">
+        <Parent guid="guidChameleonCmdSet" id="ChameleonPatchGroup" />
+        <Strings>
+          <ButtonText>Revert &amp;All</ButtonText>
+          <CommandName>ChameleonRevertAll</CommandName>
+        </Strings>
+      </Button>
+
+      <Button guid="guidChameleonCmdSet" id="CmdConnect" priority="0x0100" type="Button">
+        <Parent guid="guidChameleonCmdSet" id="ChameleonConnectionGroup" />
+        <Strings>
+          <ButtonText>&amp;Connect</ButtonText>
+          <CommandName>ChameleonConnect</CommandName>
+        </Strings>
+      </Button>
+      <Button guid="guidChameleonCmdSet" id="CmdDisconnect" priority="0x0101" type="Button">
+        <Parent guid="guidChameleonCmdSet" id="ChameleonConnectionGroup" />
+        <Strings>
+          <ButtonText>&amp;Disconnect</ButtonText>
+          <CommandName>ChameleonDisconnect</CommandName>
+        </Strings>
+      </Button>
+      <Button guid="guidChameleonCmdSet" id="CmdToggleReattach" priority="0x0102" type="Button">
+        <Parent guid="guidChameleonCmdSet" id="ChameleonConnectionGroup" />
+        <Strings>
+          <ButtonText>Re-attach debugger after hot-restart</ButtonText>
+          <CommandName>ChameleonToggleReattach</CommandName>
+        </Strings>
+      </Button>
+      <Button guid="guidChameleonCmdSet" id="CmdShowOutput" priority="0x0103" type="Button">
+        <Parent guid="guidChameleonCmdSet" id="ChameleonConnectionGroup" />
+        <Strings>
+          <ButtonText>Show &amp;Output</ButtonText>
+          <CommandName>ChameleonShowOutput</CommandName>
+        </Strings>
+      </Button>
+    </Buttons>
+  </Commands>
+
+  <Symbols>
+    <GuidSymbol name="guidChameleonPackage" value="{5b1c3f0e-6d2a-4c8e-9a47-31d2f0c8a5b1}" />
+
+    <GuidSymbol name="guidChameleonCmdSet" value="{a3d71c52-8f4e-4b6a-b0c9-7e5d2a914f63}">
+      <IDSymbol name="ChameleonMenu" value="0x1000" />
+      <IDSymbol name="ChameleonToolsGroup" value="0x1010" />
+      <IDSymbol name="ChameleonPatchGroup" value="0x1011" />
+      <IDSymbol name="ChameleonConnectionGroup" value="0x1012" />
+      <IDSymbol name="CmdReload" value="0x0100" />
+      <IDSymbol name="CmdHotRestart" value="0x0101" />
+      <IDSymbol name="CmdRevertLast" value="0x0102" />
+      <IDSymbol name="CmdRevertAll" value="0x0103" />
+      <IDSymbol name="CmdConnect" value="0x0104" />
+      <IDSymbol name="CmdDisconnect" value="0x0105" />
+      <IDSymbol name="CmdToggleReattach" value="0x0106" />
+      <IDSymbol name="CmdShowOutput" value="0x0107" />
+    </GuidSymbol>
+  </Symbols>
+</CommandTable>

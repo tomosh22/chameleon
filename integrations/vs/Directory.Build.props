@@ -1,0 +1,8 @@
+<Project>
+  <PropertyGroup>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <Deterministic>true</Deterministic>
+    <Version>0.1.0</Version>
+  </PropertyGroup>
+</Project>

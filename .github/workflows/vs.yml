@@ -1,0 +1,113 @@
+name: vs
+
+# WP-31: the Visual Studio extension (integrations/vs). ADR-0038: runs on workflow_dispatch, on push to main and on pull
+# requests that touch its own paths, so the PR that changes the extension carries its own acceptance run.
+#
+#   1. build the broker, the agent and the `basic` fixture (the C++ side of the integration test);
+#   2. integrations/vs/build.ps1 -Configuration Release: the logic library, the tests and the .vsix (out/*.vsix);
+#   3. unit tests (fake pipe server, fake debugger: the re-attach decisions);
+#   4. integration test: the control client against a real cml_broker and the fixture (WP31-IT lines);
+#   5. upload the .vsix and the logs.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - 'integrations/vs/**'
+      - '.github/workflows/vs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vs-${{ github.event_name }}-${{ github.ref == 'refs/heads/main' && github.sha || github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  vsix:
+    name: windows-2022 / vsix
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      LOG_DIR: vs-logs
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # cl.exe, the Windows SDK and the VS-bundled CMake/Ninja on PATH: the broker compiles the edited fixture file with the same cl.
+      - name: Set up MSVC developer environment (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Toolchain versions
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
+          $v = @()
+          $v += "== dotnet ==";  $v += (dotnet --info | Out-String)
+          $v += "== cmake ==";   $v += (cmake --version)
+          $v += "== ninja ==";   $v += (ninja --version)
+          $v += "== cl ==";      $v += (cl 2>&1 | Out-String)
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $v += "== Visual Studio =="; $v += (& $vswhere -all -products * -format text | Out-String)
+          $v | Tee-Object -FilePath "$env:LOG_DIR/toolchain.txt"
+
+      - name: Build cml_broker, cml_agent and fixture basic
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug *>&1 | Tee-Object -FilePath "$env:LOG_DIR/configure.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --parallel --target cml_broker cml_agent fixture_basic *>&1 | Tee-Object -FilePath "$env:LOG_DIR/build.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build the extension (integrations/vs/build.ps1 -Configuration Release)
+        run: |
+          ./integrations/vs/build.ps1 -Configuration Release *>&1 | Tee-Object -FilePath "$env:LOG_DIR/build-vsix.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem integrations/vs/out | Format-Table Name, Length
+
+      - name: Unit tests (control client, session, re-attach decisions)
+        run: |
+          dotnet test integrations/vs/tests/Chameleon.Control.Tests/Chameleon.Control.Tests.csproj -c Release --no-build `
+            --logger "trx;LogFileName=$PWD/$env:LOG_DIR/unit-tests.trx" --logger "console;verbosity=normal" *>&1 | Tee-Object -FilePath "$env:LOG_DIR/unit-tests.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Content "$env:LOG_DIR/unit-tests.log" | Where-Object { $_ -match '^(Passed!|Failed!)' }
+
+      # The control client against a real cml_broker and the `basic` fixture: status, subscribe, edit + reload (patch_applied),
+      # revert, restart (restarted with a new pid that is running) and the re-attach decision on that real event.
+      - name: Integration test (real broker, fixture basic)
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'vs-it'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $exe = 'integrations/vs/tests/Chameleon.IntegrationTest/bin/Release/net8.0/Chameleon.IntegrationTest.dll'
+          dotnet $exe --bin-dir "$PWD/build/bin" --fixture-source "$PWD/tests/fixtures/basic/logic.cpp" --work-dir $work *>&1 | Tee-Object -FilePath "$env:LOG_DIR/integration.log"
+          $code = $LASTEXITCODE
+          Copy-Item -Recurse -Force $work "$env:LOG_DIR/it-work" -ErrorAction SilentlyContinue
+          $lines = Get-Content "$env:LOG_DIR/integration.log" | Where-Object { $_ -match '^WP31-IT ' }
+          $lines | Tee-Object -FilePath "$env:LOG_DIR/wp31-it-summary.txt"
+          $lines | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          if ($code -ne 0) { exit $code }
+
+      - name: Upload the .vsix
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: chameleon-vsix
+          path: integrations/vs/out/*.vsix
+          if-no-files-found: error
+
+      - name: Upload logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vs-logs
+          path: |
+            vs-logs/
+            integrations/vs/out/*.binlog
+          if-no-files-found: warn
