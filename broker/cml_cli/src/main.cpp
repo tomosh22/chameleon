@@ -17,6 +17,7 @@
 
 #include "cml/core/check_command.h"
 #include "cml/core/version.h"
+#include "cml/license/license.h"
 #include "cml/util/log.h"
 #include "cml/util/path.h"
 
@@ -221,6 +222,22 @@ int run_headless(const Options& options) {
     }
     CML_LOG(Info, "cml_broker %s pid=%u pipe=%s", cml::core::version_string(),
             cml::proc::current_process_id(), pipe_name->c_str());
+
+    // WP-32: the licensing hook, asked once. The shipped provider always allows; a refusal (CML5998) stops the
+    // broker, a check that could not be completed (CML5999) is logged and does not.
+    {
+        cml::license::Context license_context;
+        license_context.product_version = cml::core::version_string();
+        const cml::license::Status license = cml::license::check(license_context);
+        if (license.allowed()) {
+            CML_LOG(Info, "%s", cml::license::describe(license).c_str());
+        } else if (license.verdict == cml::license::Verdict::Refused) {
+            CML_LOG(Error, "%s", cml::license::describe(license).c_str());
+            return 1;
+        } else {
+            CML_LOG(Warn, "%s", cml::license::describe(license).c_str());
+        }
+    }
 
     cml::core::ServerOptions server_options;
     server_options.pipe_name = *pipe_name;
