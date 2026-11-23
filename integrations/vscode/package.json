@@ -4,6 +4,7 @@
   "description": "Reload, hot-restart and revert native C/C++ code with Chameleon, from VS Code.",
   "version": "0.1.0",
   "publisher": "chameleon",
+  "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -91,7 +92,7 @@
     "lint": "tsc -p . --noEmit",
     "test": "npm run compile && node --test --test-reporter=spec \"out/test/unit/*.test.js\"",
     "test:integration": "npm run compile && node out/test/integration/run.js",
-    "package": "vsce package --skip-license --allow-missing-repository --no-dependencies",
+    "package": "node -e \"require('fs').copyFileSync('../../LICENSE', 'LICENSE')\" && vsce package --allow-missing-repository --no-dependencies",
     "vscode:prepublish": "npm run compile"
   },
   "devDependencies": {

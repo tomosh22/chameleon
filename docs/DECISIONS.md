@@ -855,3 +855,26 @@ its own acceptance run.
   - the `.vsix` is built and uploaded as an artefact.
   - WP-32's quickstart is followed by a fresh agent that has no prior context, as plan WP-32 requires. The orchestrator
     runs that check as a workflow on a clean windows-2022 runner.
+
+## ADR-0039 Chameleon is proprietary, commercial software
+
+**Date:** 2026-11-23 · **Status:** Accepted (user decision)
+
+The user decided that Chameleon will be sold commercially and that its licence must reflect that.
+
+- `LICENSE` at the repository root is a proprietary, all-rights-reserved notice. Use, copying and redistribution
+  need a separate written licence agreement with the copyright holder. The holder is currently named by the repository
+  owner's handle, and the text is a placeholder for counsel. Both are to be replaced by the legal entity and reviewed
+  licence terms (EULA) before the first sale.
+- The release zip carries `LICENSE` (WP-32). The VS Code extension declares `"license": "SEE LICENSE IN LICENSE"`
+  and packages a copy of it, so `vsce --skip-license` is gone. The Visual Studio extension shows it via `<License>`
+  in its manifest.
+- With `LICENSE` present nothing is `WP32-PENDING`, so the package workflow now runs `package.ps1 -Strict`. A
+  pending part is a CI failure from now on.
+- Third-party code stays permissive-only (MIT, BSD-2-Clause today; ADR-0038), with its licence texts shipped in
+  `licenses/`. Copyleft code (GPL, LGPL, AGPL, MPL) must not be vendored or bundled, and a dependency is checked for
+  commercial-use compatibility before it is added. The VS Code extension's build-only dev dependency
+  `@vscode/vsce-sign` (proprietary Microsoft licence) is not shipped in any package.
+- Licence enforcement itself (keys, activation) is out of scope for now. It plugs in behind the `core/cml_license`
+  hook (no-op provider, CML5998/5999) without changing the callers.
+

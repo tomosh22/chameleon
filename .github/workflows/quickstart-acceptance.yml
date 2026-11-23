@@ -1,0 +1,83 @@
+name: quickstart-acceptance
+
+# WP-32 acceptance (ADR-0038): a script written by an agent that read only docs/QUICKSTART.md runs the quickstart,
+# on a clean windows-2022 runner, against the release zip of a `package` run: the id in package-run-id.txt, or `same-commit` to wait
+# for the package run of the commit under test.
+# Nothing else from the repository is checked out. The developer environment stands in for the guide's
+# "x64 Native Tools Command Prompt". Greppable lines: QS-STEP, QS-RESULT.
+on:
+  workflow_dispatch:
+  push:
+    branches: ['ccr-*']
+    paths:
+      - 'tests/acceptance/quickstart/**'
+      - '.github/workflows/quickstart-acceptance.yml'
+      - 'docs/QUICKSTART.md'
+      - 'tools/package/**'
+      - 'integrations/**'
+      - 'LICENSE'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  quickstart:
+    name: windows-2022 / quickstart from the zip
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: tests/acceptance/quickstart
+          sparse-checkout-cone-mode: true
+
+      - name: Package run id
+        id: pkg
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if (-not (Test-Path tests/acceptance/quickstart/quickstart.ps1)) { 'QS-RESULT SKIPPED (no quickstart.ps1 yet)'; exit 0 }
+          $id = (Get-Content tests/acceptance/quickstart/package-run-id.txt -Raw).Trim()
+          if ($id -eq 'same-commit') {
+            # Wait for the `package` run of this commit (pull_request or push) and use its zip.
+            $deadline = (Get-Date).AddMinutes(40); $id = $null
+            while (-not $id -and (Get-Date) -lt $deadline) {
+              $runs = gh run list -R $env:GITHUB_REPOSITORY --workflow package.yml --commit $env:GITHUB_SHA --json databaseId,status,conclusion | ConvertFrom-Json
+              $done = @($runs | Where-Object { $_.status -eq 'completed' })
+              if ($done | Where-Object { $_.conclusion -eq 'success' }) { $id = ($done | Where-Object { $_.conclusion -eq 'success' } | Select-Object -First 1).databaseId }
+              elseif ($done -and -not ($runs | Where-Object { $_.status -ne 'completed' })) { throw "the package run(s) of $env:GITHUB_SHA failed" }
+              else { Start-Sleep -Seconds 30 }
+            }
+            if (-not $id) { throw "no successful package run for $env:GITHUB_SHA within 40 minutes" }
+          }
+          if ("$id" -notmatch '^\d+$') { throw "package-run-id.txt does not hold a run id: '$id'" }
+          "package run: $id"
+          "run_id=$id" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+
+      - name: Download the release zip
+        if: steps.pkg.outputs.run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: chameleon-win64
+          path: ${{ runner.temp }}/zip
+          run-id: ${{ steps.pkg.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Visual Studio x64 developer environment (the guide's x64 Native Tools prompt)
+        if: steps.pkg.outputs.run_id != ''
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Follow the quickstart
+        if: steps.pkg.outputs.run_id != ''
+        run: |
+          $zip = Get-ChildItem "$env:RUNNER_TEMP/zip" -Filter 'chameleon-*-win64.zip' | Select-Object -First 1
+          if (-not $zip) { throw 'no chameleon-*-win64.zip in the artefact' }
+          $env:CML_ZIP_PATH = $zip.FullName
+          ./tests/acceptance/quickstart/quickstart.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

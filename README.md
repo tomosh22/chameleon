@@ -52,6 +52,12 @@ other hosts for syntax checking only (not a supported configuration).
 See section 6 of `docs/IMPLEMENTATION_PLAN.md`. Vendored dependencies and their licences are
 listed in `third_party/README.md`. Per-work-package notes are in `docs/wp/`.
 
+## Licence
+
+Chameleon is proprietary, commercial software: all rights reserved (see `LICENSE`, ADR-0039). Use
+requires a separate written licence agreement. Bundled third-party code is under permissive licences
+only (`third_party/README.md`); copyleft code must not be added.
+
 ## Release package
 
 ```bat

@@ -69,8 +69,9 @@ Check that the program meets Chameleon's build requirements:
 %CML%\bin\cml_broker.exe check build\smoke_app.exe
 ```
 
-Every line starts with `PASS`. A `WARN` line is tolerated, a `FAIL` line names a diagnostic id: look it up in
-`%CML%\docs\TROUBLESHOOTING.md`.
+It prints the module and its PDB, one line per requirement, and a summary such as `result: 0 FAIL, 0 WARN, 11 PASS`.
+Every requirement line should start with `PASS`. A `WARN` line is tolerated; a `FAIL` line names a diagnostic id, which you look up in
+`%CML%\docs\TROUBLESHOOTING.md`. The summary must show `0 FAIL`.
 
 ## 3. Start the broker
 
