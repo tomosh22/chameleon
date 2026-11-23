@@ -85,16 +85,16 @@
       "final": true
     },
     {
-      "id": "static-lib-scene-tree",
-      "file": "scene/main/scene_tree.cpp",
+      "id": "static-lib-core-message-queue",
+      "file": "core/object/message_queue.cpp",
       "replace": [
         {
-          "find": "bool SceneTree::process(double p_time) {\n",
-          "with": "bool SceneTree::process(double p_time) {\n\tcml_corpus_marker(\"godot_scenetree_process_v2\");\n"
+          "find": "Error CallQueue::flush() {\n",
+          "with": "Error CallQueue::flush() {\n\tcml_corpus_marker(\"godot_mq_flush_v2\");\n"
         }
       ],
       "include": "platform/windows/chameleon_corpus.h",
-      "expect": "markers=\\S*godot_scenetree_process_v2:\\d+",
+      "expect": "markers=\\S*godot_mq_flush_v2:\\d+",
       "final": true
     }
   ],
@@ -103,16 +103,5 @@
   "start_timeout_s": 600,
   "index_timeout_s": 1800,
   "min_functions": 50000,
-  "expected_failures": [
-    {
-      "step": "edit:static-lib-main",
-      "compiler": "*",
-      "reason": "F-1: main/ is linked from a static library; its members are not source compilands, the reload patches nothing"
-    },
-    {
-      "step": "edit:static-lib-scene-tree",
-      "compiler": "*",
-      "reason": "F-1: scene/ is linked from a static library; its members are not source compilands, the reload patches nothing"
-    }
-  ]
+  "expected_failures": []
 }

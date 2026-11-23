@@ -2785,3 +2785,70 @@ TEST_CASE("elision: prune_code keeps what the hook table reaches and the canonic
     CHECK(m.code.count(0x6000) == 1);
     CHECK(m.code_running_at(0xA000) != nullptr);
 }
+
+// ---- WP-26b: a changed file that only skipped compilands own (CML5921) -------------------------------------------------------
+
+namespace {
+
+// A sweep that reports `file` as owned only by skipped compilands until the baseline accepted its stamp (what the real baseline does),
+// plus, with `with_compiland`, a change that compiland 0 owns.
+void not_owned_sweep(Rig& rig, const std::string& file, bool with_compiland) {
+    ModuleIndex* index = rig.module->index.get();
+    index->set_sweep_override_for_testing([index, file, with_compiland]() -> Result<ModuleIndex::Sweep> {
+        ModuleIndex::Sweep s;
+        for (const auto& accepted : index->accepted_for_testing()) {
+            if (accepted.count(file) != 0) {
+                return s;  // reported before: not changed any more
+            }
+        }
+        s.changed = {file};
+        s.not_owned.push_back({file, "member.obj in game.lib (no build environment recorded)"});
+        s.stamps[file] = FileStamp{1, 2, 3};
+        if (with_compiland) {
+            const std::string logic = "C:\\proj\\logic.cpp";
+            s.changed.push_back(logic);
+            s.compilands = {0};
+            s.file_compilands[logic] = {0};
+            s.stamps[logic] = FileStamp{4, 5, 6};
+        }
+        s.checked = 1;
+        s.hashed = 1;
+        return s;
+    });
+}
+
+}  // namespace
+
+TEST_CASE("static libraries (WP-26b): CML5921 is raised once for an edit, on every path that ends the reload") {
+    QuietLogs quiet;
+    const std::string file = "C:\\proj\\lib_member.cpp";
+    SUBCASE("a sweep whose only change is the not-owned file: nothing to compile, still reported once") {
+        Rig rig;
+        rig.enable();
+        not_owned_sweep(rig, file, false);
+        Result<Value> first = rig.reload();
+        REQUIRE_MESSAGE(first.has_value(), first.error().format());
+        CHECK(count_diag(rig, "CML5921", "warning") == 1);
+        Result<Value> second = rig.reload();
+        REQUIRE_MESSAGE(second.has_value(), second.error().format());
+        CHECK(count_diag(rig, "CML5921", "warning") == 1);
+    }
+    SUBCASE("a reload that fails after the sweep still accepted the not-owned file: the retry does not repeat the warning") {
+        Rig rig;
+        rig.enable();
+        not_owned_sweep(rig, file, true);
+        rig.fail_compile = true;
+        Result<Value> failed = rig.reload();
+        REQUIRE_FALSE(failed.has_value());
+        CHECK(count_diag(rig, "CML5921", "warning") == 1);
+        // Only the not-owned file was accepted; the compile failure left logic.cpp changed.
+        const auto accepted = rig.module->index->accepted_for_testing();
+        REQUIRE(accepted.size() == 1);
+        CHECK(accepted[0].count(file) == 1);
+        CHECK(accepted[0].count("C:\\proj\\logic.cpp") == 0);
+        rig.fail_compile = false;
+        Result<Value> retry = rig.reload();
+        (void)retry;
+        CHECK(count_diag(rig, "CML5921", "warning") == 1);
+    }
+}

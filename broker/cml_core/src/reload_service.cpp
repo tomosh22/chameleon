@@ -238,6 +238,8 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
         if (events_ != nullptr) {
             EventBus* bus = events_;
             const std::uint32_t pid = snap.pid;
+            // WP-26b: archive members that cannot be reloaded (CML5920), once per module.
+            spec.on_skipped_archive_members = [bus, pid](const Diag& d) { bus->publish(make_diag_event(d, "warning", "enable", pid)); };
             spec.on_audit = [bus, pid](const ModuleAudit& audit) {
                 for (const AuditFinding& f : audit.findings) {
                     if (f.verdict != Verdict::Pass) {

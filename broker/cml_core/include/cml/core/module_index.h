@@ -23,6 +23,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -59,6 +60,16 @@ struct ModuleIndexSpec {
     // the index with that finding's diagnostic (the PDB is released); `on_audit` hears every audit (worker thread).
     bool audit = false;
     std::function<void(const ModuleAudit&)> on_audit;
+    // WP-26b: called once from the worker thread when the index is built and archive members were skipped (CML5920).
+    std::function<void(const Diag&)> on_skipped_archive_members;
+};
+
+// WP-26b: a compiland that cannot be reloaded although its object is real (no build environment, missing source file).
+struct SkippedCompiland {
+    std::uint32_t compiland = 0;
+    std::string name;     // the object's file name
+    std::string library;  // the archive it came from; empty for a plain object
+    std::string reason;
 };
 
 class ModuleIndex {
@@ -94,6 +105,12 @@ public:
         std::vector<std::string> changed;
         std::vector<std::uint32_t> compilands;
         std::vector<std::string> unmapped;
+        // WP-26b: changed source files that only compilands which cannot be reloaded own. `detail` names them and says why.
+        struct NotOwned {
+            std::string file;
+            std::string detail;
+        };
+        std::vector<NotOwned> not_owned;
         std::vector<std::string> missing;
         std::map<std::string, std::vector<std::uint32_t>> file_compilands;  // changed file -> the compilands that list or include it
         // Changed files that belong to a precompiled header (WP-15): the /Yc compiland's headers. A change to one
@@ -121,8 +138,21 @@ public:
     void set_sweep_override_for_testing(std::function<Result<Sweep>()> sweep);
     std::vector<std::map<std::string, FileStamp>> accepted_for_testing() const;
 
-    // True for compilands that can be recompiled at all (not a library member, not an import or linker record).
+    // WP-26b (ADR-0036): a compiland whose object is real (not `Import:`, not `* Linker *`), whether or not it came from an
+    // archive. No build-environment check, so it is cheap.
+    static bool is_object_compiland(const pdb::PdbIndex& index, std::uint32_t compiland);
+    // True for compilands that can be recompiled: a real object whose build environment (cwd, compiler, command, source) is
+    // recorded, whether or not it came from an archive. (The index additionally skips an archive member whose source file is not
+    // on this machine, a library built elsewhere; that needs the file system, so it is not part of this predicate.) Reads the module's build info (lazily), so avoid it in hot loops.
     static bool is_source_compiland(const pdb::PdbIndex& index, std::uint32_t compiland);
+
+    // WP-26b: archives that belong to the toolchain, not to the project (the CRT, the STL, the SDK, the compiler runtime). Their
+    // members never record a build environment, so they are neither counted as skipped (CML5920) nor tracked, and the audit's
+    // samplers leave them out. One rule for the index and the audit.
+    static bool is_toolchain_archive(std::string_view library);
+
+    // WP-26b: the real-object compilands that were skipped (empty until Ready), and the subset that comes from archives.
+    std::vector<SkippedCompiland> skipped_compilands() const;
 
 private:
     explicit ModuleIndex(ModuleIndexSpec spec);
@@ -142,6 +172,8 @@ private:
     std::map<std::string, std::vector<std::uint32_t>> header_deps_;       // guarded by mutex_: scanned header -> compilands
     std::set<std::string> pch_files_;                                     // guarded by mutex_: files of the precompiled header(s)
     std::set<std::uint32_t> pch_unverified_;                              // guarded by mutex_: /Yu compilands with an unknown PCH
+    std::vector<SkippedCompiland> skipped_;                               // guarded by mutex_
+    std::set<std::uint32_t> skipped_set_;                                 // guarded by mutex_: their indices
     std::atomic<bool> cancel_{false};
     std::thread worker_;
 };
