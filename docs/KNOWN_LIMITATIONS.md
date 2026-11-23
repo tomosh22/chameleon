@@ -166,4 +166,6 @@ diagnostic is planned, not live.
   - **Unreadable C static names (WP-26c):** a writable static whose name is neither a plain identifier, an MS-decorated
     name, a clang-cl C spelling (`a`, `a.N`, `f.x`, `f.x.N`) nor on the compiler-generated list is refused with CML3500
     rather than reset. No fixture or corpus case hits it.
-  - **Static-library members (F-1)** are being fixed in WP-26b. The clang-cl C-statics crash (F-3) is fixed (WP-26c, #50).
+  - **Static-library members (F-1)** are fixed (WP-26b, #49), and the clang-cl C-statics crash (F-3) is fixed (WP-26c, #50). Members
+    without a recorded build environment (a prebuilt library not built with /Z7) stay unreloadable: CML5920 at enable,
+    CML5921 when one of their files changes. Toolchain archives (CRT, STL, SDK, compiler runtime) are never reloadable.
