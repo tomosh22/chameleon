@@ -1,6 +1,22 @@
 # Build requirements
 
-Stub, extended by later work packages.
+Two audiences: building Chameleon itself from source (next table), and building *your* program so that it can be hot
+reloaded (the section "What your own project must be built with"). Users of the release zip only need the second part;
+`docs/QUICKSTART.md` walks through it.
+
+## Using the release zip (`chameleon-<version>-win64.zip`)
+
+| Requirement | Notes |
+|---|---|
+| Windows 10/11 x64 or Server 2022 or later | x64 only. |
+| Visual Studio 2022 or Build Tools 2022 (workload "Desktop development with C++": MSVC v143, Windows SDK) | Chameleon recompiles your code with the same compiler and flags your build recorded in the PDB, so the compiler must be installed on the machine where you reload. The same install provides the Microsoft Visual C++ runtime (`VCRUNTIME140.dll`) that `cml_broker.exe` needs; on a machine without Visual Studio install the x64 "Microsoft Visual C++ Redistributable". |
+| LLVM clang-cl 15 or newer | Optional alternative compiler for your program. |
+| CMake 3.24+ and Ninja | Only to use `find_package(Chameleon)` / `chameleon_enable()` and the example; any build system works if you apply the flags below by hand. |
+| An x64 Native Tools prompt | Start `cml_broker` from a prompt where `cl` works (environment variables `INCLUDE`, `LIB`, `PATH`). |
+
+Nothing else is needed: no installer, no registry entries, no admin rights. Unpack the zip anywhere.
+
+## Building Chameleon itself
 
 | Requirement | Version | Notes |
 |---|---|---|
@@ -33,6 +49,10 @@ index (the reload then names the diagnostic), a WARN is published as a warning d
 | `/FUNCTIONPADMIN` and `/hotpatch` (6 bytes of padding before functions) | CML1601 | WARN |
 | `/OPT:NOREF /OPT:NOICF` | CML1602 | WARN (also when the PDB records no linker command line) |
 | `/Ob0` or `/Od` for the modules being iterated | CML1603 (per function at reload: CML3104) | WARN |
+
+`chameleon_enable(<target>)` (CMake package `Chameleon`, shipped in the zip under `lib\cmake\Chameleon`) applies these
+flags to a target. The `examples\hello` project in the zip shows it, and its `SMOKE_USE_PACKAGE=OFF` branch shows the same
+flags written out by hand.
 
 `/INCREMENTAL` is fine (the thunks jump to the real entry, which is hooked). `tests/fixtures/CmlFixture.cmake` shows
 the recommended flags in CMake form.

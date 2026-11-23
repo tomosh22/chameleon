@@ -22,7 +22,6 @@ function Fail([string]$what) { Write-Host "WP32-SMOKE FAIL $what"; exit 1 }
 function Note([string]$what) { Write-Host "WP32-SMOKE $what" }
 
 $Root = (Resolve-Path $Root).Path
-$smokeSrc = Join-Path $PSScriptRoot 'smoke'
 if (-not (Test-Path (Join-Path $Root 'bin\cml_broker.exe'))) { Fail "no bin\cml_broker.exe under $Root" }
 if (Test-Path $Work) { Remove-Item -Recurse -Force $Work }
 New-Item -ItemType Directory -Force -Path $Work | Out-Null
@@ -53,8 +52,9 @@ if (-not (Test-Path (Join-Path $Root 'include\Chameleon_API.h'))) { Fail 'includ
 # 3. Build the example against the package: find_package(Chameleon) when the package has the CMake integration.
 $usePackage = Test-Path (Join-Path $Root 'lib\cmake\Chameleon\ChameleonConfig.cmake')
 if (-not $usePackage) { Write-Host 'WP32-PENDING find_package(Chameleon): the package has no lib\cmake\Chameleon (WP-29); building the example with manual flags' }
-$src = Join-Path $Work 'smoke-src'
-Copy-Item -Recurse $smokeSrc $src
+$src = Join-Path $Work 'hello-src'
+if (-not (Test-Path (Join-Path $Root 'examples\hello\CMakeLists.txt'))) { Fail 'examples\hello is missing from the package' }
+Copy-Item -Recurse (Join-Path $Root 'examples\hello') $src
 $build = Join-Path $Work 'smoke-build'
 $cfg = @('-S', $src, '-B', $build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=RelWithDebInfo')
 if ($usePackage) { $cfg += @("-DCMAKE_PREFIX_PATH=$Root", '-DSMOKE_USE_PACKAGE=ON') }
@@ -147,10 +147,12 @@ try {
     if ($text -notmatch 'return 1;') { Fail 'logic.cpp has no "return 1;" to edit' }
     Set-Content -NoNewline -Path $logic -Value ($text -replace 'return 1;', 'return 2;')
     $watch = [Diagnostics.Stopwatch]::StartNew()
-    $reload = Invoke-Control 'reload' @{ timeout_ms = $ReloadTimeoutMs } ($ReloadTimeoutMs + 10000)
+    # The packaged helper, exactly as docs\QUICKSTART.md uses it.
+    $reloadOut = & (Join-Path $Root 'scripts\cml-reload.ps1') -Pipe $controlName -Arguments "{`"timeout_ms`":$ReloadTimeoutMs}" -TimeoutMs ($ReloadTimeoutMs + 10000)
+    $reloadExit = $LASTEXITCODE
     $watch.Stop()
-    if (-not $reload.ok) { Show-Logs; Fail ("reload failed: " + ($reload.diag | ConvertTo-Json -Compress)) }
-    Note ("reload-result=" + ($reload.result | ConvertTo-Json -Compress -Depth 4))
+    if ($reloadExit -ne 0) { Show-Logs; Fail ("reload failed (exit $reloadExit): " + ($reloadOut -join ' ')) }
+    Note ("reload-result=" + ($reloadOut -join ' '))
     $deadline = (Get-Date).AddSeconds(30)
     $seen = $false
     while ((Get-Date) -lt $deadline -and -not $seen) {

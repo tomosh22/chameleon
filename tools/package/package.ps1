@@ -125,7 +125,10 @@ if ($SkipExtensions) {
 }
 # The CMake examples (find_package(Chameleon)) travel with the package: the smoke test and the user build them from here.
 $examples = Join-Path $repo 'integrations\cmake\examples'
-if (Test-Path $examples) { Copy-Item -Recurse $examples (Join-Path $stage 'examples') }
+New-Item -ItemType Directory -Force -Path (Join-Path $stage 'examples'), (Join-Path $stage 'scripts') | Out-Null
+Copy-Item -Recurse (Join-Path $PSScriptRoot 'smoke') (Join-Path $stage 'examples\hello')  # the quickstart's example program
+Copy-Item (Join-Path $PSScriptRoot 'cml-reload.ps1') (Join-Path $stage 'scripts\cml-reload.ps1')
+if (Test-Path $examples) { Copy-Item -Recurse $examples (Join-Path $stage 'examples\cmake') }
 else { Pending 'cmake-examples' 'integrations/cmake/examples does not exist (WP-29)' }
 
 # ---- docs, licences ------------------------------------------------------------------------------------------------
@@ -159,6 +162,8 @@ Native C/C++ hot reload. Start with docs\QUICKSTART.md.
   bin\cml_agent.dll       the agent your program loads
   include\Chameleon_API.h the header your program includes
   lib\cmake\Chameleon\    find_package(Chameleon) and chameleon_enable(target)
+  examples\hello\        the quickstart's example program
+  scripts\cml-reload.ps1  sends `reload` (or any control command) to the running broker
   integrations\           VS Code and Visual Studio extensions (.vsix)
   docs\                   quickstart, build requirements, troubleshooting by diagnostic id, known limitations
   licenses\               licence texts of the bundled third-party code
@@ -168,7 +173,7 @@ Set-Content -Path (Join-Path $stage 'README.txt') -Value $readme -Encoding utf8
 
 # ---- 4. checks -----------------------------------------------------------------------------------------------------
 $required = @(
-    'bin\cml_broker.exe', 'bin\cml_agent.dll', 'include\Chameleon_API.h',
+    'bin\cml_broker.exe', 'bin\cml_agent.dll', 'include\Chameleon_API.h', 'examples\hello\main.cpp', 'scripts\cml-reload.ps1',
     'docs\QUICKSTART.md', 'docs\TROUBLESHOOTING.md', 'docs\BUILD_REQUIREMENTS.md',
     'licenses\THIRD_PARTY_NOTICES.md', 'licenses\third_party\raw_pdb\LICENSE', 'licenses\third_party\xxhash\LICENSE', 'README.txt'
 )
