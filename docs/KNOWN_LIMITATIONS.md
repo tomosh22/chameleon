@@ -169,18 +169,34 @@ diagnostic is planned, not live.
   - **Static-library members (F-1)** are fixed (WP-26b, #49), and the clang-cl C-statics crash (F-3) is fixed (WP-26c, #50). Members
     without a recorded build environment (a prebuilt library not built with /Z7) stay unreloadable: CML5920 at enable,
     CML5921 when one of their files changes. Toolchain archives (CRT, STL, SDK, compiler runtime) are never reloadable.
-  - **Compiler warnings from `chameleon_enable` (wave 8).** With MSVC on x64, every TU of an enabled target prints
-    `D9002 ignoring unknown option '/hotpatch'` (cl accepts `/hotpatch` on x86 only; on x64 `/FUNCTIONPADMIN` provides
-    the padding) and, in RelWithDebInfo, `D9025 overriding '/Ob1' with '/Ob0'`. Both are harmless (`cml_broker check`
-    reports PASS, warn=0) but noisy in user builds; seen in the WP-32 quickstart acceptance run. Fixed in WP-33
-    (`docs/wp/WP-33.md`): `/hotpatch` only for clang-cl, `/Ob1` and `/Ob2` removed from the directory's flags.
+  - **Compiler warnings from `chameleon_enable` (fixed in WP-33, #57).** `/hotpatch` is passed to clang-cl only, and
+    `/Ob1`..`/Ob3` are stripped from the target directory's non-Debug flags by a deferred call at the end of that
+    directory. Every other compiled target in the directory gets its original level back as a per-target, C/C++-only
+    option. What is left:
+    - Calling `chameleon_enable` from a parent directory on a target defined in a subdirectory that has already been
+      processed cannot strip that directory's flags. CML1712 warns and cl prints D9025 for that target. Call it from the
+      target's own directory.
+    - With a Visual Studio generator, if a directory's C and C++ configuration flags carry different `/Ob` levels, the
+      restored level on mixed C/C++ targets is the C++ one.
+    - The VS-generator CI cell builds Debug only, so only D9002 is checked there. The Ninja cells check D9025.
   - **IDE integrations (wave 8).** The VS Code and Visual Studio extensions are tested against a real broker in CI. The editor
     UI itself (menus, status bar, Output pane, Error List, the debugger `Attach2` call) is covered only by the manual
-    checklists in `docs/wp/WP-30.md` and `docs/wp/WP-31.md`. Two follow-ups need broker changes:
-    - *Early re-attach after hot-restart (WP-31):* the new pid reaches clients only in the `restarted` event, after enable,
-      indexing and re-applying edits, so the Visual Studio debugger re-attaches late. A breakpoint in start-up code can be
-      missed. The proposed additive contract is `restart {hold_new}`, a `restarting {old_pid,new_pid}` event and
-      `restart-resume`.
-    - *Structured diag locations (WP-30):* `diag` events carry the compiler output as text. The extensions find file and
-      line with the same regexes as the problem matchers. A `file`/`line` field on `diag` would make Problems and Error List
-      entries exact.
+    checklists in `docs/wp/WP-30.md` and `docs/wp/WP-31.md`.
+    - *Structured diag locations* are done (WP-35, #58). `diag` events carry an absolute `file`, `line` and `column`,
+      resolved against the directory the compiler actually ran in. When no absolute path can be formed, the fields are
+      left out and the extensions fall back to their regexes.
+    - *Early re-attach after hot-restart* is done (WP-34, #59): `restart {hold_new, hold_ms, token}`, the `restarting`
+      event, `restart-resume` and a watchdog that resumes a held process if the broker dies. CI drives the extension
+      with a fake debugger. **A real Visual Studio attach to a `CREATE_SUSPENDED` process is not verified in CI**;
+      the extension resumes once the debugger lists the pid or after `HoldResumeGraceMs` (3 s), whichever comes first,
+      and falls back to the late attach if the early one fails. The manual checklist in `docs/wp/WP-34.md` is the check.
+    - *WP-34 review follow-ups (not blocking, not fixed):*
+      - a failed early attach can report CML5997 two or three times;
+      - a `restart-resume` that times out (as opposed to a dropped pipe) is logged instead of reported, so the process
+        stays frozen until `hold_ms`;
+      - `restart-resume` racing with hold expiry can still answer `resumed:true` alongside CML5813;
+      - a confirmation timeout is reported as CML5817, which reads as a failed resume;
+      - the extension asks for `hold_new` even when no debugger is attached to the old process;
+      - replacing the process host during a held restart strands the hold in the old coordinator;
+      - the watchdog start logs nothing when `GetModuleFileNameW` fails;
+      - shutdown can wait for a held restart's registration step, which predates WP-34.
