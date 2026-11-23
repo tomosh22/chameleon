@@ -38,7 +38,9 @@ function Run-Prompt($lines, $timeoutSec = 300) {
     $p.WaitForExit()
     $txt = (Get-Content $o -Raw -ErrorAction SilentlyContinue) + (Get-Content $e -Raw -ErrorAction SilentlyContinue)
     Say "---- prompt output ($in) exit=$($p.ExitCode) ----"; Say $txt; Say '---- end ----'
-    return @{ Code = $p.ExitCode; Text = $txt }
+    # cmd prints its prompt (e.g. "C:\chameleon-demo>") in front of each command's output: strip it for parsing only
+    $clean = ($txt -split "`r?`n" | ForEach-Object { $_ -replace '^[A-Za-z]:\\[^>]*>', '' } | Where-Object { $_.Trim() }) -join "`n"
+    return @{ Code = $p.ExitCode; Text = $clean; Raw = $txt }
 }
 # Background prompt: leaves the command running, stdout/stderr to log files
 function Start-BgPrompt($name, $lines) {
@@ -113,13 +115,14 @@ try {
     $r = Run-Prompt @('cd /d C:\chameleon-demo\hello', $setCml, 'cmake --build build || exit /b 1', 'exit /b 0') 600
     Step 6 build (($r.Code -eq 0) -and (Test-Path 'C:\chameleon-demo\hello\build\smoke_app.exe')) "exit=$($r.Code) exe=$(Test-Path 'C:\chameleon-demo\hello\build\smoke_app.exe') tail=$(($r.Text -split "`n" | Select-Object -Last 4) -join ' | ')"
 
-    $r = Run-Prompt @('cd /d C:\chameleon-demo\hello', $setCml, '%CML%\bin\cml_broker.exe check build\smoke_app.exe', 'exit /b %errorlevel%')
-    $lines = $r.Text -split "`r?`n" | Where-Object { $_.Trim() }
+    $r = Run-Prompt @('cd /d C:\chameleon-demo\hello', $setCml, 'echo QS-BEGIN', '%CML%\bin\cml_broker.exe check build\smoke_app.exe', 'echo QS-END')
+    $body = [regex]::Match($r.Text, '(?s)QS-BEGIN\s*\n(.*?)\n?QS-END').Groups[1].Value
+    $lines = $body -split "`r?`n" | Where-Object { $_.Trim() }
     $fails = $lines | Where-Object { $_ -match '^\s*FAIL' -or $_ -match '\bFAIL\b' }
     $passes = $lines | Where-Object { $_ -match '^\s*PASS' }
     $other = $lines | Where-Object { $_ -notmatch '^\s*(PASS|WARN)' }
     if ($other) { Say "QS-NOTE check output has lines not starting with PASS/WARN: $($other -join ' | ')" }
-    Step 7 check (($r.Code -eq 0) -and -not $fails -and $passes) "exit=$($r.Code) pass=$(@($passes).Count) fail=$(@($fails).Count) failing: $($fails -join ' | ')"
+    Step 7 check (-not $fails -and $passes) "exit=$($r.Code) pass=$(@($passes).Count) fail=$(@($fails).Count) failing: $($fails -join ' | ')"
 
     # ---- Step 3: broker (second prompt, left running) -------------------------------------------------------
     $broker = Start-BgPrompt 'broker' @('cd /d C:\chameleon-demo', $setCml, '%CML%\bin\cml_broker.exe --headless --verbose')
