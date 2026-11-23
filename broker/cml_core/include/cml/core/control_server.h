@@ -35,6 +35,9 @@ struct ControlContext {
     // Set per connection by the server: subscribes the connection to the given events (empty = all). Null
     // (handle_control_line used without a connection): `subscribe` is answered with an empty subscription.
     std::function<void(const std::set<std::string>& events)> subscribe;
+    // Set per connection by the server (WP-34): true once the client that sent the request in progress has disconnected (or the broker
+    // is stopping). A `restart` that holds a new process resumes it at once. Null: the client never "goes away" (unit tests set it).
+    std::function<bool()> client_gone;
 };
 
 // The capabilities this broker provides. A command is only available when its capability is here.
@@ -53,6 +56,9 @@ ipc::ControlResponse handle_control_request(const ipc::ControlRequest& request, 
 // or not a valid request is answered with a CML5400 / CML5401 diagnostic response, so the
 // connection stays usable.
 std::string handle_control_line(std::string_view line, const ControlContext& context);
+
+// A response as the one line the connection sends (the answer to an oversized response is a CML5403 diagnostic).
+std::string encode_control_response(const ipc::ControlResponse& response);
 
 }  // namespace cml::core
 

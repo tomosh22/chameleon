@@ -23,6 +23,7 @@ namespace Chameleon.Control
         // The events the Output pane shows. `exception` is added only on request (see ChameleonSettings.ShowExceptionEvents).
         private static readonly string[] BaseEvents = { "diag", "patch_applied", "patch_reverted" };
         private static readonly string[] RestartEvents = { "restarted" };
+        private static readonly string[] RestartHoldEvents = { "restarting" };   // WP-34
 
         private readonly IPipeConnector _connector;
         private readonly ChameleonSettings _settings;
@@ -412,6 +413,11 @@ namespace Chameleon.Control
                 events.AddRange(RestartEvents);
             }
 
+            if (info.Has(Capabilities.RestartHold))
+            {
+                events.AddRange(RestartHoldEvents);
+            }
+
             if (_settings.ShowExceptionEvents && info.Has(Capabilities.Exceptions))
             {
                 events.Add("exception");
@@ -514,7 +520,7 @@ namespace Chameleon.Control
         // ---- commands ----------------------------------------------------------------------------------------------------------
 
         /// <summary>Sends a command. Throws <see cref="ControlException"/> (CML5994/5995) when there is no connection or no answer.</summary>
-        public async Task<ControlResponse> SendAsync(string command, JObject args, int timeoutMs, CancellationToken cancellationToken = default(CancellationToken))
+        public async Task<ControlResponse> SendAsync(string command, JObject args, int timeoutMs, CancellationToken cancellationToken = default(CancellationToken), bool concurrent = false)
         {
             ControlClient client;
             lock (_gate)
@@ -528,7 +534,7 @@ namespace Chameleon.Control
                     PipeNames.Resolve(_settings.PipeName, _getEnvironment, _logonSid), "the extension is not connected"));
             }
 
-            return await client.CallAsync(command, args, timeoutMs, cancellationToken).ConfigureAwait(false);
+            return await client.CallAsync(command, args, timeoutMs, cancellationToken, concurrent).ConfigureAwait(false);
         }
 
         public async Task<StatusInfo> RefreshStatusAsync(CancellationToken cancellationToken = default(CancellationToken))
@@ -567,7 +573,11 @@ namespace Chameleon.Control
             return SendAsync("reload", args, _settings.ReloadTimeoutMs, cancellationToken);
         }
 
-        public Task<ControlResponse> RestartAsync(int? pid, CancellationToken cancellationToken = default(CancellationToken))
+        /// <param name="holdMs">
+        /// WP-34: not null asks the broker to create the new process suspended and keep it so for at most this long
+        /// (`hold_new`, `hold_ms`); the broker then publishes `restarting` and waits for <see cref="ResumeAsync"/>.
+        /// </param>
+        public Task<ControlResponse> RestartAsync(int? pid, CancellationToken cancellationToken = default(CancellationToken), int? holdMs = null, string holdToken = null)
         {
             var args = new JObject();
             if (pid.HasValue)
@@ -575,7 +585,26 @@ namespace Chameleon.Control
                 args["pid"] = pid.Value;
             }
 
+            if (holdMs.HasValue)
+            {
+                args["hold_new"] = true;
+                args["hold_ms"] = Math.Max(1, Math.Min(60000, holdMs.Value));
+                if (!string.IsNullOrEmpty(holdToken))
+                {
+                    args["token"] = holdToken;   // echoed in the `restarting` event: tells our held restart from another client's
+                }
+            }
+
             return SendAsync("restart", args, _settings.RestartTimeoutMs, cancellationToken);
+        }
+
+        /// <summary>
+        /// WP-34: `restart-resume {pid}`: lets the held process run. It does not wait for the `restart` that holds it to answer (that
+        /// answer comes after the resume), so it goes out concurrently on the same connection.
+        /// </summary>
+        public Task<ControlResponse> ResumeAsync(int newPid, CancellationToken cancellationToken = default(CancellationToken))
+        {
+            return SendAsync("restart-resume", new JObject { ["pid"] = newPid }, 20000, cancellationToken, concurrent: true);
         }
 
         /// <param name="scope">"last" or "all"</param>

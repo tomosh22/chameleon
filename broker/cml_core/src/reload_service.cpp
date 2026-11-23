@@ -67,7 +67,7 @@ ReloadService::ReloadService(PipelineEnv env, EventBus* events, std::string sess
 }
 
 ReloadService::~ReloadService() {
-    cancel_.cancel();
+    cancel();
     {
         std::shared_ptr<SaveWatcher> watcher;
         {
@@ -299,7 +299,19 @@ bool ReloadService::restart_available() const {
     return restart_ != nullptr;
 }
 
-Result<Value> ReloadService::restart(const Value& args) {
+void ReloadService::cancel() {
+    cancel_.cancel();
+    std::shared_ptr<RestartCoordinator> coordinator;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        coordinator = restart_;
+    }
+    if (coordinator != nullptr) {
+        coordinator->abort_holds();  // WP-34: a process held suspended is resumed before the broker goes
+    }
+}
+
+Result<Value> ReloadService::restart(const Value& args, const std::function<bool()>& client_gone) {
     std::shared_ptr<RestartCoordinator> coordinator;  // held for the whole call: set_process_host may replace it meanwhile
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -309,7 +321,30 @@ Result<Value> ReloadService::restart(const Value& args) {
         return Diag::make(restart::diag::kUnavailable, "this broker cannot restart processes on this system",
                           "Restart the application yourself; hot-restart needs the Windows broker.");
     }
-    return coordinator->restart(args);
+    return coordinator->restart(args, client_gone);
+}
+
+Result<Value> ReloadService::restart_resume(const Value& args) {
+    std::shared_ptr<RestartCoordinator> coordinator;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        coordinator = restart_;
+    }
+    if (coordinator == nullptr) {
+        return Diag::make(restart::diag::kUnavailable, "this broker cannot restart processes on this system",
+                          "Restart the application yourself; hot-restart needs the Windows broker.");
+    }
+    return coordinator->resume(args);
+}
+
+bool ReloadService::restart_hold_available() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return restart_ != nullptr && restart_->hold_supported();
+}
+
+bool ReloadService::restart_active() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return restart_ != nullptr && restart_->active();
 }
 
 std::vector<std::shared_ptr<AgentLink>> ReloadService::links() const {

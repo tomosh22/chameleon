@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "cml/core/pipeline_diag_ids.h"
+#include "cml/core/restart_diag_ids.h"
 #include "cml/proc/diag_ids.h"
 #include "cml/util/log.h"
 
@@ -25,6 +26,9 @@ std::vector<std::string> broker_capabilities(const ControlContext& context) {
         }
         if (context.service->restart_available()) {
             caps.emplace_back(ipc::capability::kRestart);  // WP-21
+        }
+        if (context.service->restart_hold_available()) {
+            caps.emplace_back(ipc::capability::kRestartHold);  // WP-34
         }
         caps.emplace_back(ipc::capability::kRevert);  // WP-22
         caps.emplace_back(ipc::capability::kDiagLocations);  // WP-35
@@ -119,7 +123,7 @@ ipc::ControlResponse answer(const ipc::ControlRequest& request, Result<ipc::json
 }
 
 ipc::ControlResponse subscribe_response(const ipc::ControlRequest& request, const ControlContext& context) {
-    static const char* const kEvents[] = {"diag", "patch_applied", "patch_reverted", "progress", "log", "exception", "restarted", "exception_updated"};
+    static const char* const kEvents[] = {"diag", "patch_applied", "patch_reverted", "progress", "log", "exception", "restarted", "restarting", "exception_updated"};
     std::set<std::string> names;
     const ipc::json::Value* events = request.args.find("events");
     // An empty array is the same as no argument: the default set. (The bus reads an empty set as "every event", which would switch
@@ -128,10 +132,10 @@ ipc::ControlResponse subscribe_response(const ipc::ControlRequest& request, cons
         // `progress` (WP-15) is opt-in: it can be chatty on a big reload. `exception` (WP-20) is opt-in because listening for it
         // makes the agents hold faulting threads until somebody decides.
         for (const char* k : kEvents) {
-            if (std::string(k) != "progress" && std::string(k) != "exception" && std::string(k) != "exception_updated" && std::string(k) != "restarted") names.insert(k);
+            if (std::string(k) != "progress" && std::string(k) != "exception" && std::string(k) != "exception_updated" && std::string(k) != "restarted" && std::string(k) != "restarting") names.insert(k);
         }
     } else if (!events->is_array()) {
-        return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "argument 'events' must be an array of event names", "Use [\"diag\", \"patch_applied\", \"patch_reverted\", \"progress\", \"log\", \"exception\", \"restarted\"] or a subset."));
+        return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "argument 'events' must be an array of event names", "Use [\"diag\", \"patch_applied\", \"patch_reverted\", \"progress\", \"log\", \"exception\", \"restarted\", \"restarting\"] or a subset."));
     } else {
         for (const ipc::json::Value& e : events->items()) {
             bool known = false;
@@ -139,7 +143,7 @@ ipc::ControlResponse subscribe_response(const ipc::ControlRequest& request, cons
                 known = known || (e.is_string() && e.as_string() == k);
             }
             if (!known) {
-                return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "unknown event name in 'events'", "Known events: diag, patch_applied, patch_reverted, progress, log, exception, restarted."));
+                return ipc::make_error_response(request.id, Diag::make(pipeline::diag::kBadRequest, "unknown event name in 'events'", "Known events: diag, patch_applied, patch_reverted, progress, log, exception, restarted, restarting."));
             }
             names.insert(e.as_string());
         }
@@ -187,7 +191,10 @@ ipc::ControlResponse handle_control_request(const ipc::ControlRequest& request, 
         }
 #endif
         if (request.cmd == "restart" && context.service->restart_available()) {
-            return answer(request, context.service->restart(request.args));  // WP-21
+            return answer(request, context.service->restart(request.args, context.client_gone));  // WP-21, WP-34
+        }
+        if (request.cmd == ipc::restart_hold::kResumeCommand && context.service->restart_hold_available()) {
+            return answer(request, context.service->restart_resume(request.args));  // WP-34
         }
     }
     if (context.exceptions != nullptr) {
@@ -209,15 +216,7 @@ ipc::ControlResponse handle_control_request(const ipc::ControlRequest& request, 
                    "Query `status` for the broker's capabilities and only send commands it lists."));
 }
 
-std::string handle_control_line(std::string_view line, const ControlContext& context) {
-    ipc::ControlResponse response;
-    Result<ipc::ControlRequest> request = ipc::decode_request(line);
-    if (!request) {
-        response = ipc::make_error_response(ipc::peek_control_request_id(line), request.error());
-    } else {
-        CML_LOG(Debug, "control request %lld: %s", static_cast<long long>(request->id), request->cmd.c_str());
-        response = handle_control_request(*request, context);
-    }
+std::string encode_control_response(const ipc::ControlResponse& response) {
     Result<std::string> encoded = ipc::encode_response(response);
     if (!encoded) {
         // Only possible when the answer is above 1 MiB.
@@ -227,6 +226,18 @@ std::string handle_control_line(std::string_view line, const ControlContext& con
         }
     }
     return *encoded;
+}
+
+std::string handle_control_line(std::string_view line, const ControlContext& context) {
+    ipc::ControlResponse response;
+    Result<ipc::ControlRequest> request = ipc::decode_request(line);
+    if (!request) {
+        response = ipc::make_error_response(ipc::peek_control_request_id(line), request.error());
+    } else {
+        CML_LOG(Debug, "control request %lld: %s", static_cast<long long>(request->id), request->cmd.c_str());
+        response = handle_control_request(*request, context);
+    }
+    return encode_control_response(response);
 }
 
 }  // namespace cml::core
@@ -487,6 +498,13 @@ void ControlServer::serve(Connection& connection) {
             context_.exceptions->refresh(true);  // WP-20: the agents hold faulting threads only while somebody listens for `exception`
         }
     };
+    // WP-34: `restart {hold_new:true}` waits for the client (it holds the new process until `restart-resume`), so it runs on a worker
+    // thread while this thread keeps reading: `restart-resume` can arrive on the same connection, and a client that disconnects is
+    // noticed at once (`client_gone`), which resumes the held process. Every other request is served inline, as before.
+    std::atomic<bool> client_gone{false};
+    local.client_gone = [&] { return client_gone.load(std::memory_order_acquire) || stopping_.load(std::memory_order_acquire); };
+    std::thread restart_worker;
+    std::atomic<bool> restart_worker_done{true};
     while (!stopping_.load(std::memory_order_acquire)) {
         Result<ipc::ControlChannel::Line> received = connection.channel.receive_line(ipc::kInfiniteTimeout);
         if (!received) {
@@ -505,11 +523,50 @@ void ControlServer::serve(Connection& connection) {
         if (received->text.empty()) {
             continue;
         }
+        const bool worker_active = !restart_worker_done.load(std::memory_order_acquire);
+        if (worker_active || received->text.find("hold_new") != std::string::npos) {
+            Result<ipc::ControlRequest> parsed = ipc::decode_request(received->text);
+            if (parsed) {
+                const ipc::json::Value* hold_new = parsed->args.find("hold_new");
+                const bool wants_hold = parsed->cmd == "restart" && hold_new != nullptr && hold_new->is_bool() && hold_new->as_bool();
+                if (worker_active && (parsed->cmd == "wait" || parsed->cmd == "restart")) {
+                    // A held restart of this connection is running: `wait` (and a second `restart`) would block this thread, which has to stay free to
+                    // read `restart-resume` and to notice a disconnect. Refused busy at once; every other command is served inline as before.
+                    const std::string busy = encode_control_response(ipc::make_error_response(
+                        parsed->id, Diag::make(restart::diag::kBusy, "a restart that holds a process is running on this connection; `" + parsed->cmd + "` cannot run meanwhile",
+                                               "Send `restart-resume`, wait for the restart's answer, or use another connection.")));
+                    Result<ipc::IoStatus> sent_busy = sender->send_line(busy, kSendTimeoutMs);
+                    if (!sent_busy || *sent_busy != ipc::IoStatus::Ok) {
+                        break;
+                    }
+                    continue;
+                }
+                if (!worker_active && wants_hold) {
+                    if (restart_worker.joinable()) {
+                        restart_worker.join();  // the previous worker has finished its handler (it may still be sending its answer)
+                    }
+                    restart_worker_done.store(false, std::memory_order_release);
+                    restart_worker = std::thread([&, request = std::move(*parsed)] {
+                        CML_LOG(Debug, "control request %lld: restart (hold_new)", static_cast<long long>(request.id));
+                        const std::string reply = encode_control_response(handle_control_request(request, local));
+                        // Done *before* the answer goes out: a client that sends its next held restart as soon as it has this answer must find the
+                        // connection thread ready to hand it to a worker again (never served inline, where restart-resume could not be read).
+                        restart_worker_done.store(true, std::memory_order_release);
+                        (void)sender->send_line(reply, kSendTimeoutMs);
+                    });
+                    continue;
+                }
+            }
+        }
         const std::string answer = handle_control_line(received->text, local);
         Result<ipc::IoStatus> sent = sender->send_line(answer, kSendTimeoutMs);
         if (!sent || *sent != ipc::IoStatus::Ok) {
             break;
         }
+    }
+    client_gone.store(true, std::memory_order_release);  // a held process is resumed now (WP-34)
+    if (restart_worker.joinable()) {
+        restart_worker.join();
     }
     if (bus != nullptr && subscription != 0) {
         bus->unsubscribe(subscription);

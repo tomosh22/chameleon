@@ -11,6 +11,10 @@ A VSIX for Visual Studio 2022 (17.x) and 2026 (18.x). It is a client of the brok
 * **Automatic re-attach**: when the debugger is attached to a process that is hot-restarted, it is attached to the new process with the same debug
   engines (`restarted {old_pid, new_pid}`). Failures are CML5994-5997 (ADR-0038) with a "what to do" sentence. Turn it off in the Tools >
   Chameleon menu or in Tools > Options > Chameleon > General.
+  With a broker that advertises `restart-hold` (WP-34) the attach happens **before the new process runs its first instruction**: the extension
+  sends `restart {hold_new:true, hold_ms:30000}`, the broker creates the process suspended and publishes `restarting {old_pid, new_pid}`, the
+  extension attaches the debugger and then sends `restart-resume {pid}`. A failed or slow (20 s) attach still resumes the process (CML5997). A
+  broker without the capability keeps the late attach after `restarted`. Manual checklist: `docs/wp/WP-34.md`.
 
 Layout: `src/Chameleon.Control` (netstandard2.0, no Visual Studio dependency: control client, broker session, re-attach decision),
 `src/Chameleon.Vsix` (the thin shell), `tests/Chameleon.Control.Tests` (xunit), `tests/Chameleon.IntegrationTest` (real broker).

@@ -2467,6 +2467,55 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 - **What to do:** Run the application by hand to see why it stops; the old process is already gone.  
 - **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
 
+### CML5813
+
+- **Cause:** (warning) nobody sent `restart-resume` within `hold_ms`, so the broker let the held process run (`restart {hold_new:true}`).  
+- **Message:** `nobody resumed process <...> within <...> ms; the broker resumed it`  
+- **What to do:** Send `restart-resume` as soon as the debugger is attached, or raise `hold_ms` (at most 60000). If attaching is slow, the debugger attaches to a process that is already running; breakpoints in start-up code may be missed.  
+- **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
+
+### CML5814
+
+- **Cause:** `restart-resume` named a process that is not held: it never was, or it was resumed already (by an earlier `restart-resume`, by the hold timeout, because the client disconnected, or because the broker was shutting down).  
+- **Message:** `process <...> is not held by a restart` or `process <...> is not held any more (it was resumed: <...>)`  
+- **What to do:** Send `restart-resume` with the `new_pid` of a `restarting` event while its restart is waiting. A process the broker already resumed needs nothing more; this answer is harmless.  
+- **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
+
+### CML5815
+
+- **Cause:** The broker was shutting down while a process was held. The process was resumed and the restart ended before the new agent registered.  
+- **Message:** `the broker is shutting down; process <...> was resumed and the restart ended before its agent registered`  
+- **What to do:** Nothing to do: the process runs without Chameleon. Start a broker; the application's agent connects to it by itself, or restart the application.  
+- **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
+
+### CML5816
+
+- **Cause:** (warning) The client that sent `restart {hold_new:true}` disconnected while the new process was held. The broker resumed the process and finished the restart anyway.  
+- **Message:** `the client that asked for the restart disconnected while process <...> was held; it was resumed and the restart continues`  
+- **What to do:** Reconnect and use `status`. A debugger the client meant to attach has to be attached by hand (Debug > Attach to Process).  
+- **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
+
+### CML5817
+
+- **Cause:** The held process could not be resumed (`ResumeThread` failed). The broker terminated it instead of leaving it suspended.  
+- **Message:** `process <...> could not be resumed: <...>` (also `ResumeThread failed (Win32 error <...>); the process was terminated instead of being left suspended`)  
+- **What to do:** Start the application yourself. If it happens again, check that no tool blocks access to the process and send the broker log with the report.  
+- **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
+
+### CML5818
+
+- **Cause:** `restart` got an invalid `hold_new` or `hold_ms`, or `restart-resume` got no usable `pid`.  
+- **Message:** `argument 'hold_new' must be true or false`, `argument 'hold_ms' must be an integer from 1 to 60000` or `` `restart-resume` needs the integer argument 'pid' ``  
+- **What to do:** Send `{"hold_new":true,"hold_ms":N}` with hold_ms from 1 to 60000 (absent: 10000), and `{"pid":N}` with the `new_pid` of the `restarting` event.  
+- **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
+
+### CML5819
+
+- **Cause:** `restart {hold_new:true}` was sent to a broker whose process host cannot create a process suspended. Nothing was touched.  
+- **Message:** `this broker cannot hold a new process (the process host cannot create it suspended)`  
+- **What to do:** Send `restart` without `hold_new`, or attach the debugger after the `restarted` event. Clients check for the `restart-hold` capability first.  
+- **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
+
 ### CML5840
 
 - **Cause:** Restart: the broker refused or the step could not complete.  
@@ -2864,6 +2913,7 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 - **Cause:** The debugger could not be re-attached to the restarted process after a hot-restart.  
 - **Message:** `Could not attach the debugger to the restarted process (pid <new>, it replaced pid <old>): <reason>.`  
 - **What to do:** Attach by hand with Debug > Attach to Process (pid <new>); to stop Chameleon re-attaching, clear Tools > Chameleon > Re-attach debugger after hot-restart (or the same setting in Tools > Options > Chameleon > General).  
+  Other variants (a restart that held the new process for the debugger, capability `restart-hold`): `the debugger did not finish attaching within <n> s; the process was resumed without waiting` (the process runs; attach by hand), and `Could not tell the broker to resume the restarted process (pid <new>): <reason>` (the broker resumes the process by itself when the hold time (30 s by default) has passed; if the application stays frozen, hot-restart again).  
 - **Raised by:** Visual Studio extension
 
 ### CML1708
