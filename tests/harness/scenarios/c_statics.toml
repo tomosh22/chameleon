@@ -1,12 +1,13 @@
 # Scenario `c_statics` (WP-26c, ADR-0036 decision 2): a C translation unit whose statics are zero-initialised structs holding
 # a pointer (one in an #included .c file, one in the edited TU, one function-local), filled at run time and read through the
-# pointer. The edit changes cs_read(): each reading adds 1000. Every static must stay bound to the running process's storage:
+# pointer. The edit changes cs_read(): each reading adds 1000000. Every static must stay bound to the running process's storage:
 #   - a patch with its own zero-filled copy would dereference a null pointer (the raylib crash, corpus F-3) or restart the
 #     counters (the function-local one),
-#   - so after the reload every value is 1000 + (the count so far), and the count never goes back.
-# The k-th reading of a counter returns k, so before the edit the values are the tick number + 1 (bounded: < 1000), after
-# it 1000 + k (bounded: < 2000). The counters had passed 20 before the edit: a restart would show 1001..1019 and
-# expect_monotonic fails on the drop.
+#   - so after the reload every value is 1000000 + (the count so far), and the count never goes back.
+# The k-th reading of a counter returns k, so before the edit the values are small (the unpatched code cannot reach
+# 1000000 in any run: 100 ms per tick), after it 1000000 + k. A value >= 1000000 therefore proves the PATCHED code runs, whatever
+# the runner's speed. The counters had passed 20 before the edit: a restart would show 1000001..1000019 and expect_monotonic
+# fails on the drop.
 name = "c_statics"
 description = "fixture c_statics: C statics read through pointers keep their values across a reload (inc= main= local=)"
 fixture = "c_statics"
@@ -33,22 +34,22 @@ within_s = 15
 
 [[step]]
 kind = "edit"
-patch = "edits/offset_1000.edit"
+patch = "edits/offset_big.edit"
 
 [[step]]
 kind = "reload"
 within_s = 90
 
-# After the reload: 1000 + a count that is at least 20 (and below 1000), for every one of the three statics.
+# After the reload: 1000000 + a count that is at least 20 (and below 1000), for every one of the three statics.
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ inc=1(0[2-9][0-9]|[1-9][0-9]{2}) main=1(0[2-9][0-9]|[1-9][0-9]{2}) local=1(0[2-9][0-9]|[1-9][0-9]{2})\\s"
+regex = "TICK n=\\d+ inc=1000(0[2-9][0-9]|[1-9][0-9]{2}) main=1000(0[2-9][0-9]|[1-9][0-9]{2}) local=1000(0[2-9][0-9]|[1-9][0-9]{2})\\s"
 within_s = 10
 
 # The patched code keeps running and keeps counting.
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ inc=1(0[2-9][0-9]|[1-9][0-9]{2}) main=1(0[2-9][0-9]|[1-9][0-9]{2}) local=1(0[2-9][0-9]|[1-9][0-9]{2})\\s"
+regex = "TICK n=\\d+ inc=1000(0[2-9][0-9]|[1-9][0-9]{2}) main=1000(0[2-9][0-9]|[1-9][0-9]{2}) local=1000(0[2-9][0-9]|[1-9][0-9]{2})\\s"
 within_s = 10
 
 [[step]]

@@ -32,8 +32,7 @@ Microsoft-decorated name. A C translation unit gives neither:
 without a source-level name: treated as new". The PDB side was fine: its S_LDATA32 records carry the source names (`platform`,
 `counter`), function-local ones inside their proc. The same hole applies to function-local statics of C under clang-cl. **cl is not affected**: its C objects use the
 decorated names the planner already reads (observed in the CI plan dump of the `c_statics` fixture: `inc_state`, `main_state`
-plain; `?local_cell@?1??cs_read@@9@9`, all `bind-old-data` / `compiland-static`). The `counter$1` shape I first assumed for cl does
-not exist and has been removed again.
+plain; `?local_cell@?1??cs_read@@9@9`, all `bind-old-data` / `compiland-static`).
 
 Every matched static is bound; every one that fell into this hole silently became a fresh zero-initialised copy. An accepted
 reload with silent state loss, or a crash when the state is a pointer.
@@ -41,14 +40,18 @@ reload with silent state loss, or a crash when the state is a pointer.
 ## The fix
 
 * `c_static_name()` (`bind_names.cpp`) reads `(base, enclosing function)` out of the C spellings above: a trailing `.<digits>` is
-  the uniquifier, `a.b` is function `a`, static `b`, `name$<digits>` is a function-local static of unknown function.
-  `__const.*`, `__func__.*`, `.str` and anything else stay unnamed.
+  the uniquifier, `a.b` is function `a`, static `b`. Anything else (`__const.*`, `.str`, `a.b.c`) yields no name.
 * `bridge_statics` uses it for non-decorated data names. The group key of such a name ignores its spelling, so `platform` and
   `platform.0` cannot both be bound to the one PDB record. Ambiguity is decided by the existing passes (the RVA the unchanged
   section layout predicts); what is left is **CML3207** (refuse), as before.
 * **CML3500** (new, planner range): writable static data (a section with `IMAGE_SCN_MEM_WRITE`, not a runtime table) whose name
-  yields no source identity is refused with a diagnostic naming the symbol and the object, before anything is applied. Read-only
-  constants (`__const.*`, `.rdata`) are still `patch-fresh`: a fresh copy is correct for them.
+  yields no source identity is refused with a diagnostic naming the symbol and the object, before anything is applied. It is
+  deliberately narrow: an explicit list of compiler-generated shapes stays `patch-new-data` exactly as before this package
+  (`is_compiler_generated_data_name`): names starting with `.` (clang's `.compoundliteral[.N]`, `.str`), `$` or `?`, `__const.*`,
+  `__func__.*`, PGO/coverage (`__profc_`, `__profd_`, `__profn_`, `__covrec_`, `__llvm_`), sanitizer (`___asan_`, `__asan_`,
+  `__odr_`, `__sancov`) and the `__real@`/`__xmm@` constants. Everything else that is writable and unreadable looks like a user's
+  static and is refused: a wrong "new" for those is the crash this package fixes, while a refusal for a generated name would turn a
+  working reload into a failing one. Read-only constants are `patch-fresh`.
 
 ## Tests
 
@@ -60,8 +63,8 @@ reload with silent state loss, or a crash when the state is a pointer.
   structs `inc_state.0` / `main_state.0` and the local `cs_read.local_state.0`; all six statics are `bind-old-data`.
 * Fixture `c_statics` + scenario `c_statics` (every matrix cell, both compilers, Debug and RelWithDebInfo): a C program with three
   zero-initialised `static struct { int* p; }`, one in an `#include`d `.c` file, one in the edited TU, one function-local, read
-  through the pointer on every TICK. The edit adds 1000 to what `cs_read()` returns. After the reload each value must be
-  `1000 + count` with `count` between 20 and 999 (regex bounds), and `expect_monotonic` on all three catches a restart.
+  through the pointer on every TICK. The edit adds 1000000 to what `cs_read()` returns. After the reload each value must be
+  `1000000 + count` with `count` between 20 and 999 (regex bounds; a value >= 1000000 can only come from the patched code), and `expect_monotonic` on all three catches a restart.
 
 ## clang 22 and CML3206 (ADR-0037)
 
@@ -77,8 +80,5 @@ The two raylib clang-cl F-3 `expected_failures` entries are removed (corpus #46 
 
 ## Deferred / limitations
 
-* The cl C shape (`counter$1`) is derived from the compiler's documented name mangling for C, and was not observed in an object;
-  the scenario's cl cells and the corpus will show whether it is right. The matching is defensive: whatever does not match
-  one-to-one is refused, never bound as new.
-* A C static whose name is genuinely unreadable is now refused (CML3500) instead of silently reset. Previously accepted reloads of
-  TUs with such statics are refused; no case is known in the fixtures.
+* A C static whose name is genuinely unreadable is now refused (CML3500) instead of silently reset. Only user-looking names are refused (see the list under CML3500); no
+  case is known in the fixtures or the corpus.

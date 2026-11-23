@@ -5,5 +5,5 @@
      }
      h = which == 0 ? &inc_state : (which == 1 ? &main_state : &local_state);
 -    return ++*h->p;
-+    return ++*h->p + 1000;
++    return ++*h->p + 1000000;
  }

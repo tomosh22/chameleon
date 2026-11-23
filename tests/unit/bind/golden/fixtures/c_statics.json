@@ -1,6 +1,6 @@
 {
   "fixture": "c_statics",
-  "edit": "offset_1000.edit (c_statics.c)",
+  "edit": "offset_big.edit (c_statics.c)",
   "min_hooks": 1,
   "min_bind_old_data": 5,
   "expect": [

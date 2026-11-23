@@ -467,6 +467,21 @@ CStaticName c_static_name(std::string_view n) {
     return out;
 }
 
+bool is_compiler_generated_data_name(std::string_view n) {
+    if (n.empty() || n[0] == '?' || n[0] == '.' || n[0] == '$') {
+        return true;
+    }
+    static constexpr std::string_view kPrefixes[] = {"__const.", "__func__.", "__profc_", "__profd_", "__profn_", "__covrec_",
+                                                     "__llvm_", "___asan_", "__asan_", "__odr_", "__sancov", "__real@",
+                                                     "__xmm@",  "__ymm@",   "__zmm@"};
+    for (const std::string_view p : kPrefixes) {
+        if (starts_with(n, p)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string enclosing_function(std::string_view decorated) {
     if (decorated.empty() || decorated[0] != '?') {
         return {};

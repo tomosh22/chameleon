@@ -971,8 +971,10 @@ void Planner::bridge_statics() {
         const CStaticName cname = c_data ? c_static_name(sy.name) : CStaticName();
         const std::string base = c_data ? cname.base : base_identifier(sy.name);
         if (base.empty() && !is_func && sy.dec.section != 0 && !secs_[sy.dec.section - 1].runtime_table &&
-            (secs_[sy.dec.section - 1].sec->characteristics & coff::scn::MemWrite) != 0 && !is_fresh_data_name(sy.name)) {
-            // Writable data whose identity cannot be established: binding it as new would give the patch a zero-filled
+            (secs_[sy.dec.section - 1].sec->characteristics & coff::scn::MemWrite) != 0 && !is_fresh_data_name(sy.name) &&
+            !is_compiler_generated_data_name(sy.name)) {
+            // Writable data that looks like a user's static (not a name on the explicit compiler-generated list) whose identity
+            // cannot be established: binding it as new would give the patch a zero-filled
             // copy of live state (WP-26c: the raylib crash). Refuse before anything is applied.
             error(diag::kUnnamedStatic,
                   "static data " + describe(sy) + " in " + in_.object_name + " has no source-level name the planner can match to the old image (object section '" +

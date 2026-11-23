@@ -113,8 +113,26 @@ TEST_CASE("c statics: a file-scope name never takes over a function-local record
     CHECK(find(*r, "counter")->decision == DecisionKind::PatchNewData);
 }
 
-TEST_CASE("c statics: writable static data without a source-level name is refused (CML3500)") {
+TEST_CASE("c statics: compiler-generated writable data stays new; a user-looking unreadable writable static is refused (CML3500)") {
     SynthWorld w = basic_world(true);
+    {
+        // clang's file-scope compound literal (`static int* t = (int[]){1, 2, 3};`), ASan and PGO data: never the user's names.
+        SynthObj o;
+        const std::int32_t sec = static_cast<std::int32_t>(o.section(".data", kData, 0x80));
+        o.symbol(".compoundliteral", 0x00, sec, false, false);
+        o.symbol(".compoundliteral.1", 0x10, sec, false, false);
+        o.symbol("___asan_gen_.1", 0x20, sec, false, false);
+        o.symbol("__profc_main", 0x30, sec, false, false);
+        o.symbol("?$S1@?1??f@@9@9", 0x40, sec, false, false);
+        Built b = o.build();
+        auto r = plan_bind(w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        for (const char* n : {".compoundliteral", ".compoundliteral.1", "___asan_gen_.1", "__profc_main"}) {
+            const SymbolDecision* d = find(*r, n);
+            REQUIRE_MESSAGE(d != nullptr, n);
+            CHECK_MESSAGE(d->decision == DecisionKind::PatchNewData, n);
+        }
+    }
     {
         SynthObj o;
         const std::int32_t sec = static_cast<std::int32_t>(o.section(".data", kData, 0x40));

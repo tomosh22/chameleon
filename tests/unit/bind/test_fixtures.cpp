@@ -643,7 +643,7 @@ void plan_fixture(const std::string& name) {
 TEST_CASE("fixture basic: logic.cpp value_2") { plan_fixture("basic"); }
 TEST_CASE("fixture statics: statics.cpp value_30") { plan_fixture("statics"); }
 TEST_CASE("fixture virtuals: shapes.cpp square_doubled") { plan_fixture("virtuals"); }
-TEST_CASE("fixture c_statics: c_statics.c offset_1000") { plan_fixture("c_statics"); }
+TEST_CASE("fixture c_statics: c_statics.c offset_big") { plan_fixture("c_statics"); }
 TEST_CASE("fixture templates: a.cpp offset_100") { plan_fixture("templates"); }
 TEST_CASE("fixture lambdas: lambdas.cpp lambda_times_10") { plan_fixture("lambdas"); }
 TEST_CASE("fixture new_function: logic.cpp add_helper") { plan_fixture("new_function"); }
