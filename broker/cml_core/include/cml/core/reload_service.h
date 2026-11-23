@@ -108,8 +108,8 @@ public:
     // the option's. The exception service re-evaluates whether the agents should hold faulting threads.
     using OptionObserver = std::function<void(const std::string& name)>;
     void set_option_observer(OptionObserver observer);
-    // Aborts running compiles and links (shutdown); sticky.
-    void cancel() { cancel_.cancel(); }
+    // Aborts running compiles and links (shutdown); sticky. Also ends every restart that holds a new process (it is resumed first, WP-34).
+    void cancel();
     // WP-28: the broker-side failure injection state (control command `inject-failure`).
     FaultInjector& faults() noexcept { return faults_; }
 
@@ -122,8 +122,14 @@ public:
     void set_process_host(std::shared_ptr<ProcessHost> host);
     bool restart_available() const;
     void set_restart_trace_for_testing(std::function<void(const std::string&)> trace);
-    // {"pid"?:N, "timeout_ms"?:N}
-    Result<ipc::json::Value> restart(const ipc::json::Value& args);
+    // {"pid"?:N, "timeout_ms"?:N, "hold_new"?:bool, "hold_ms"?:N}. `client_gone` (optional) reports that the requesting client has
+    // disconnected; a restart that holds a process then resumes it at once (WP-34).
+    Result<ipc::json::Value> restart(const ipc::json::Value& args, const std::function<bool()>& client_gone = {});
+    // WP-34: `restart-resume {pid}`, and the capability `restart-hold` (restart is available and its host can create suspended processes).
+    Result<ipc::json::Value> restart_resume(const ipc::json::Value& args);
+    bool restart_hold_available() const;
+    // A restart is running now (the broker's idle exit waits for it: the old process is gone and the new one may be held).
+    bool restart_active() const;
     // The agent connections (handshaken or not), their modules' states, and a lookup by pid / restart token.
     std::vector<std::shared_ptr<AgentLink>> links() const;
     std::shared_ptr<AgentLink> link_for_pid(std::uint32_t pid) const;

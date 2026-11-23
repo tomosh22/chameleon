@@ -27,6 +27,15 @@ namespace Chameleon.Control
         public int ReattachRetryDelayMs { get; set; } = 300;
 
         /// <summary>
+        /// WP-34: how long the broker holds the new process suspended while the debugger attaches (`hold_ms` of `restart`, at most 60000).
+        /// It must be longer than <see cref="HoldAttachTimeoutMs"/> so that this extension resumes the process before the broker does.
+        /// </summary>
+        public int RestartHoldMs { get; set; } = 30000;
+
+        /// <summary>WP-34: how long the extension waits for the debugger to attach to the held process before it resumes it anyway (CML5997).</summary>
+        public int HoldAttachTimeoutMs { get; set; } = 20000;
+
+        /// <summary>
         /// How long a process that left the debugger is still remembered as "was debugged", so that a hot-restart (which terminates the
         /// old process before the new one is announced) still finds it.
         /// </summary>

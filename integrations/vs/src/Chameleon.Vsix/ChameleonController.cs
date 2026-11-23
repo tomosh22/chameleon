@@ -81,10 +81,45 @@ namespace Chameleon.Vsix
             }
 
             int oldPid, newPid;
-            if (ev.TryGetRestarted(out oldPid, out newPid))
+            if (ev.TryGetRestarting(out oldPid, out newPid))
+            {
+                // WP-34: the broker holds the new process suspended for the restart this extension asked for. Attach the debugger before its
+                // first instruction, then let it run. A held process that another client asked for is that client's to resume.
+                if (Reattach.TryClaimRestarting())
+                {
+                    Task.Run(() => RestartingAsync(oldPid, newPid));
+                }
+            }
+            else if (ev.TryGetRestarted(out oldPid, out newPid))
             {
                 // Right away, on the reader's thread pool task: the new process runs while we wait.
                 Task.Run(() => ReattachAsync(oldPid, newPid));
+            }
+        }
+
+        private async Task RestartingAsync(int oldPid, int newPid)
+        {
+            try
+            {
+                _output.WriteLine("hot-restart: pid " + newPid + " is held before its first instruction; attaching the debugger ...");
+                ReattachOutcome outcome = await Reattach.OnRestartingAsync(oldPid, newPid, () => Session.ResumeAsync(newPid)).ConfigureAwait(false);
+                switch (outcome)
+                {
+                    case ReattachOutcome.Attached:
+                        _output.WriteLine("debugger attached to pid " + newPid + " before it ran (it was attached to pid " + oldPid + "); pid " + newPid + " resumed");
+                        break;
+                    case ReattachOutcome.NotDebugged:
+                        _output.WriteLine("the debugger was not attached to pid " + oldPid + "; pid " + newPid + " resumed");
+                        break;
+                    default:
+                        _output.WriteLine("pid " + newPid + " resumed (" + outcome.ToString().ToLowerInvariant() + ")");
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                // OnRestartingAsync resumes the process on every path itself; this is the last net.
+                ReportDiagnostic(ClientDiagnostics.ReattachFailed(oldPid, newPid, ex.Message));
             }
         }
 
@@ -276,8 +311,25 @@ namespace Chameleon.Vsix
             _output.Activate();
             await TaskScheduler.Default;
             int? pid = await TargetPidAsync();   // also remembers the debugged processes while the old one is still alive
-            _output.WriteLine("hot-restart" + (pid.HasValue ? " (pid " + pid.Value + ")" : "") + " ...");
-            ControlResponse r = await Session.RestartAsync(pid);
+            // WP-34: with re-attach on and a broker that can hold the new process, the debugger attaches before the process runs its first
+            // instruction (`restarting`, then `restart-resume`); otherwise it attaches after `restarted`, as before.
+            bool hold = Reattach.ShouldHoldNewProcess(Session.Supports(Capabilities.RestartHold));
+            _output.WriteLine("hot-restart" + (pid.HasValue ? " (pid " + pid.Value + ")" : "") + (hold ? ", holding the new process for the debugger" : "") + " ...");
+            ControlResponse r;
+            object ticket = hold ? Reattach.ExpectRestarting() : null;
+
+            try
+            {
+                r = await Session.RestartAsync(pid, holdMs: hold ? (int?)_settings.RestartHoldMs : null);
+            }
+            finally
+            {
+                if (ticket != null)
+                {
+                    Reattach.RestartingNoLongerExpected(ticket);
+                }
+            }
+
             if (!r.Ok)
             {
                 WriteBrokerError(r.Error);

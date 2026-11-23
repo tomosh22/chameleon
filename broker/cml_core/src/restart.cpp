@@ -11,6 +11,7 @@
 #include "cml/core/pipeline_diag_ids.h"
 #include "cml/core/reload_service.h"
 #include "cml/core/restart_diag_ids.h"
+#include "cml/ipc/control.h"
 #include "cml/ipc/messages.h"
 #include "cml/util/format.h"
 #include "cml/util/hash.h"
@@ -30,6 +31,7 @@ constexpr std::uint32_t kDefaultTimeoutMs = 60000;
 constexpr std::uint32_t kDefaultRegistrationMs = 30000;  // after the old process is gone: registration, modules, indexes, re-applying the edits
 constexpr std::uint32_t kTerminateTimeoutMs = 10000;
 constexpr std::uint32_t kPollMs = 20;
+constexpr std::chrono::seconds kResumeConfirmWait{10};  // how long `restart-resume` waits for the restart thread to confirm that the process runs
 constexpr std::chrono::seconds kEnableWait{3};  // how long enabled modules may take to show up after the broker asked
 
 // ASCII upper case; the environment names this code looks at are ASCII.
@@ -109,7 +111,7 @@ std::u16string environment_with_token(const std::u16string& block, const std::st
 RestartCoordinator::RestartCoordinator(ReloadService& service, EventBus* events, std::shared_ptr<ProcessHost> host)
     : service_(service), events_(events), host_(std::move(host)) {}
 
-Result<Value> RestartCoordinator::restart(const Value& args) {
+Result<Value> RestartCoordinator::restart(const Value& args, const std::function<bool()>& client_gone) {
     std::uint32_t pid = 0;
     std::uint32_t timeout_ms = kDefaultTimeoutMs;
     std::optional<Diag> arg_error;
@@ -119,6 +121,24 @@ Result<Value> RestartCoordinator::restart(const Value& args) {
     std::uint32_t registration_ms = kDefaultRegistrationMs;
     if (!read_uint(args, "registration_timeout_ms", 3600u * 1000u, &registration_ms, &arg_error)) {
         return *arg_error;
+    }
+    // WP-34: hold the new process suspended (docs/wp/WP-34.md). Absent or false: today's behaviour, nothing below changes.
+    bool hold_new = false;
+    std::uint32_t hold_ms = ipc::restart_hold::kDefaultHoldMs;
+    const auto bad_hold = [](const std::string& message) {
+        return Diag::make(rd::kBadHoldArgs, message, "Use `{\"hold_new\":true, \"hold_ms\":N}` with hold_ms from 1 to 60000 (docs/wp/WP-34.md).");
+    };
+    if (const Value* held = args.find("hold_new"); held != nullptr && !held->is_null()) {
+        if (!held->is_bool()) {
+            return bad_hold("argument 'hold_new' must be true or false");
+        }
+        hold_new = held->as_bool();
+    }
+    if (!read_uint_arg(args, "hold_ms", ipc::restart_hold::kMaxHoldMs, &hold_ms, &arg_error, bad_hold)) {
+        return *arg_error;
+    }
+    if (hold_ms == 0) {
+        hold_ms = ipc::restart_hold::kDefaultHoldMs;
     }
     if (timeout_ms == 0) {
         timeout_ms = kDefaultTimeoutMs;
@@ -150,6 +170,12 @@ Result<Value> RestartCoordinator::restart(const Value& args) {
         }
     };
 
+    if (hold_new && !hold_supported()) {
+        return fail(Diag::make(rd::kHoldUnavailable, "this broker cannot hold a new process (the process host cannot create it suspended)",
+                               "Send `restart` without hold_new, or attach the debugger after `restarted`."),
+                    pid);
+    }
+
     // Reloads are held off for the whole restart: a patch applied to the old process after its baseline was taken would be lost in
     // the new one. A reload that is running now makes this restart busy; one that arrives meanwhile is refused busy (CML5304).
     std::unique_lock<std::mutex> only_one(mutex_, std::try_to_lock);
@@ -157,6 +183,12 @@ Result<Value> RestartCoordinator::restart(const Value& args) {
     if (!only_one.owns_lock() || !no_reloads) {
         return fail(Diag::make(rd::kBusy, "another restart or a reload is still running", "Wait for it to finish (control command `wait`) and try again."), pid);
     }
+
+    struct ActiveScope {  // the broker does not exit as idle while a restart runs (the old process is gone, the new one not registered yet)
+        explicit ActiveScope(std::atomic<int>& n) : n_(n) { ++n_; }
+        ~ActiveScope() { --n_; }
+        std::atomic<int>& n_;
+    } active_scope(active_);
 
     // ---- which process ----
     std::shared_ptr<AgentLink> old_link;
@@ -266,6 +298,7 @@ Result<Value> RestartCoordinator::restart(const Value& args) {
     spec.command_line = info->command_line;
     spec.working_directory = info->working_directory;
     spec.environment = environment_with_token(info->environment, token);
+    spec.suspended = hold_new;
 
     // What to carry over: the baselines of the enabled modules (their indexes die with the connection). Taken now, after the
     // preparation and with reloads held off, so every patch applied to the old process is in it.
@@ -305,7 +338,119 @@ Result<Value> RestartCoordinator::restart(const Value& args) {
                                "Start the application yourself; its agent registers again by itself."),
                     old_pid);
     }
-    CML_LOG(Info, "restart: started process %u (token %s), waiting for its agent", *launched, token.c_str());
+    CML_LOG(Info, "restart: started process %u (token %s)%s, waiting for its agent", *launched, token.c_str(), hold_new ? " suspended" : "");
+
+    // ---- 2b. WP-34: the new process is suspended until the client resumes it, hold_ms passes, or something goes wrong ----
+    // It has not run a single instruction, so its agent does not exist yet and cannot register: the registration budget starts at
+    // the resume. Every way out of this block resumes the process first (`end_hold`).
+    if (hold_new) {
+        const std::uint32_t held_pid = *launched;
+        const auto hold = std::make_shared<Hold>();
+        {
+            std::lock_guard<std::mutex> lock(holds_mutex_);
+            holds_[held_pid] = hold;
+            ended_holds_.erase(held_pid);
+        }
+        const auto end_hold = [&](const char* how) -> Result<void> {
+            Result<void> resumed = process->resume();
+            {
+                std::lock_guard<std::mutex> lock(holds_mutex_);
+                holds_.erase(held_pid);
+                ended_holds_[held_pid] = how;
+                while (ended_holds_.size() > 16) {
+                    ended_holds_.erase(ended_holds_.begin());
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(hold->mutex);
+                hold->resumed = true;
+                if (!resumed) {
+                    hold->resume_error = resumed.error();
+                }
+            }
+            hold->changed.notify_all();
+            return resumed;
+        };
+        if (events_ != nullptr) {
+            Value body = Value::object();
+            body.set("event", Value::string(ipc::restart_hold::kRestartingEvent));
+            body.set("old_pid", Value::integer(old_pid));
+            body.set("new_pid", Value::integer(held_pid));
+            body.set("hold_ms", Value::integer(hold_ms));
+            Event event;
+            event.name = ipc::restart_hold::kRestartingEvent;
+            event.body = std::move(body);
+            events_->publish(event);
+        }
+        if (trace_) {
+            trace_("held");
+        }
+        CML_LOG(Info, "restart: process %u is held suspended for at most %u ms", held_pid, hold_ms);
+        enum class End { Requested, Expired, ClientGone, Shutdown, Exited };
+        End end = End::Expired;
+        std::optional<std::uint32_t> exit_code;
+        const Clock::time_point hold_end = Clock::now() + std::chrono::milliseconds(hold_ms);
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lock(hold->mutex);
+                hold->changed.wait_for(lock, std::chrono::milliseconds(kPollMs), [&] { return hold->release_requested; });
+                if (hold->release_requested) {
+                    end = End::Requested;
+                    break;
+                }
+            }
+            if (aborting_.load()) {
+                end = End::Shutdown;
+                break;
+            }
+            if (client_gone && client_gone()) {
+                end = End::ClientGone;
+                break;
+            }
+            exit_code = process->relaunched_exit_code();
+            if (exit_code.has_value()) {
+                end = End::Exited;
+                break;
+            }
+            if (Clock::now() >= hold_end) {
+                end = End::Expired;
+                break;
+            }
+        }
+        const char* how = end == End::Requested ? "restart-resume" : end == End::Expired ? "hold_ms expired" : end == End::ClientGone ? "client disconnected"
+                          : end == End::Shutdown ? "broker shutdown" : "process exited";
+        Result<void> resumed = end_hold(how);
+        if (end == End::Exited) {
+            return fail(Diag::make(rd::kNewProcessExited,
+                                   "the new process (pid " + std::to_string(held_pid) + ") exited with code " + std::to_string(*exit_code) + " while it was held, before its agent registered",
+                                   "A debugger or another tool ended it; run the application by hand to see why it stops. The old process is already gone."),
+                        held_pid);
+        }
+        if (end == End::Shutdown) {
+            return fail(Diag::make(rd::kHoldAborted, "the broker is shutting down; process " + std::to_string(held_pid) + " was resumed and the restart ended before its agent registered",
+                                   "Nothing to do: the process runs without Chameleon until a broker is started and its agent connects."),
+                        held_pid);
+        }
+        if (!resumed) {
+            return fail(Diag::make(rd::kResumeFailed, "process " + std::to_string(held_pid) + " could not be resumed: " + resumed.error().message,
+                                   "The old process is gone and the new one was terminated rather than left suspended; start the application yourself."),
+                        held_pid);
+        }
+        if (end == End::Expired) {
+            warn(Diag::make(rd::kHoldExpired, "nobody resumed process " + std::to_string(held_pid) + " within " + std::to_string(hold_ms) + " ms; the broker resumed it",
+                            "Send `restart-resume` as soon as the debugger is attached, or raise `hold_ms` (at most 60000)."),
+                 held_pid);
+        } else if (end == End::ClientGone) {
+            warn(Diag::make(rd::kHoldClientGone, "the client that asked for the restart disconnected while process " + std::to_string(held_pid) + " was held; it was resumed and the restart continues",
+                            "Nothing to do; reconnect and use `status`. A debugger the client meant to attach has to be attached by hand."),
+                 held_pid);
+        }
+        if (trace_) {
+            trace_("resumed");
+        }
+        CML_LOG(Info, "restart: process %u resumed (%s)", held_pid, how);
+        deadline = Clock::now() + std::chrono::milliseconds(registration_ms);  // the time held does not count against the registration budget
+    }
 
     // ---- 3. the new agent registers ----
     std::shared_ptr<AgentLink> new_link;
@@ -466,6 +611,51 @@ Result<Value> RestartCoordinator::restart(const Value& args) {
     CML_LOG(Info, "restart: process %u is now process %u (%lld ms)", old_pid, new_pid,
             static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count()));
     return result;
+}
+
+Result<Value> RestartCoordinator::resume(const Value& args) {
+    const Value* pid_value = args.find("pid");
+    if (pid_value == nullptr || !pid_value->is_integer() || pid_value->as_integer() <= 0 || pid_value->as_integer() > 0xFFFFFFFFll) {
+        return Diag::make(rd::kBadHoldArgs, "`restart-resume` needs the integer argument 'pid' (the new_pid of the `restarting` event)",
+                          "Send `{\"pid\":N}` with the new_pid of the `restarting` event.");
+    }
+    const auto pid = static_cast<std::uint32_t>(pid_value->as_integer());
+    std::shared_ptr<Hold> hold;
+    std::string ended;
+    {
+        std::lock_guard<std::mutex> lock(holds_mutex_);
+        const auto it = holds_.find(pid);
+        if (it != holds_.end()) {
+            hold = it->second;
+        } else if (const auto done = ended_holds_.find(pid); done != ended_holds_.end()) {
+            ended = done->second;
+        }
+    }
+    if (!hold) {
+        return Diag::make(rd::kNotHeld,
+                          ended.empty() ? "process " + std::to_string(pid) + " is not held by a restart"
+                                        : "process " + std::to_string(pid) + " is not held any more (it was resumed: " + ended + ")",
+                          "Send `restart-resume` with the new_pid of a `restarting` event, while its restart is waiting; a process resumed by the broker needs nothing more.");
+    }
+    std::unique_lock<std::mutex> lock(hold->mutex);
+    hold->release_requested = true;
+    hold->changed.notify_all();
+    if (!hold->changed.wait_for(lock, kResumeConfirmWait, [&] { return hold->resumed; })) {
+        return Diag::make(rd::kResumeFailed, "the restart did not confirm within " + std::to_string(kResumeConfirmWait.count()) + " s that process " + std::to_string(pid) + " runs",
+                          "Query `status`; the broker resumes the process by itself when hold_ms passes.");
+    }
+    if (hold->resume_error) {
+        return *hold->resume_error;
+    }
+    Value result = Value::object();
+    result.set("pid", Value::integer(pid));
+    result.set("resumed", Value::boolean(true));
+    result.set("held_ms", Value::integer(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - hold->since).count()));
+    return result;
+}
+
+void RestartCoordinator::abort_holds() {
+    aborting_.store(true);
 }
 
 #if !defined(_WIN32)

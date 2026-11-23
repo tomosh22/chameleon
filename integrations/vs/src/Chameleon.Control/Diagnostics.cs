@@ -17,7 +17,7 @@ namespace Chameleon.Control
         /// <summary>The broker lacks a capability the extension needs for a feature, or is not a Chameleon broker.</summary>
         public const string Unsupported = "CML5996";
 
-        /// <summary>The debugger could not be re-attached to the restarted process.</summary>
+        /// <summary>The debugger could not be re-attached to the restarted process (or, WP-34, the held process could not be resumed).</summary>
         public const string ReattachFailed = "CML5997";
     }
 
@@ -80,6 +80,22 @@ namespace Chameleon.Control
                 "Could not attach the debugger to the restarted process (pid " + newPid + ", it replaced pid " + oldPid + "): " + reason + ".",
                 "Attach by hand with Debug > Attach to Process (pid " + newPid + "); to stop Chameleon re-attaching, clear Tools > Chameleon > " +
                 "Re-attach debugger after hot-restart (or the same setting in Tools > Options > Chameleon > General).");
+        }
+
+        /// <summary>WP-34: the new process was held for the debugger and `restart-resume` did not get through.</summary>
+        public static ChameleonDiagnostic ResumeFailed(int newPid, string reason)
+        {
+            return new ChameleonDiagnostic(
+                ClientDiagIds.ReattachFailed,
+                "Could not tell the broker to resume the restarted process (pid " + newPid + "): " + reason + ".",
+                "Nothing else to do: the broker resumes the process by itself when the hold time (30 s) has passed. " +
+                "If the application stays frozen, run Tools > Chameleon > Hot-restart again.");
+        }
+
+        /// <summary>WP-34: the debugger attached too slowly (or not at all) to the held process.</summary>
+        public static ChameleonDiagnostic AttachTooSlow(int oldPid, int newPid, int waitedMs)
+        {
+            return ReattachFailed(oldPid, newPid, "the debugger did not finish attaching within " + (waitedMs / 1000) + " s; the process was resumed without waiting");
         }
     }
 

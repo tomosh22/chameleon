@@ -126,12 +126,23 @@ namespace Chameleon.Control
             return t != null && t.Type == JTokenType.String ? t.Value<string>() : null;
         }
 
+        /// <summary>{"event":"restarting","old_pid":N,"new_pid":M} (WP-34): the new process exists and is held suspended until `restart-resume`.</summary>
+        public bool TryGetRestarting(out int oldPid, out int newPid)
+        {
+            return TryGetPids("restarting", out oldPid, out newPid);
+        }
+
         /// <summary>{"event":"restarted","old_pid":N,"new_pid":M}</summary>
         public bool TryGetRestarted(out int oldPid, out int newPid)
         {
+            return TryGetPids("restarted", out oldPid, out newPid);
+        }
+
+        private bool TryGetPids(string eventName, out int oldPid, out int newPid)
+        {
             oldPid = 0;
             newPid = 0;
-            if (Name != "restarted")
+            if (Name != eventName)
             {
                 return false;
             }
@@ -244,6 +255,9 @@ namespace Chameleon.Control
         public const string Reload = "reload";
         public const string Subscribe = "subscribe";
         public const string Restart = "restart";
+
+        /// <summary>WP-34: `restart {hold_new}` creates the new process suspended; `restarting` announces it; `restart-resume` lets it run.</summary>
+        public const string RestartHold = "restart-hold";
         public const string Revert = "revert";
         public const string Exceptions = "exceptions";
     }

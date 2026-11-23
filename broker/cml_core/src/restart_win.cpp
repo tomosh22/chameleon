@@ -58,6 +58,8 @@ public:
     ~WindowsRestartableProcess() override {
         detach_console();
         close_duplicates();
+        // WP-34: a process that is still suspended is never left behind (an error path that returned before resume()).
+        (void)resume();
         if (new_process_ != nullptr) {
             CloseHandle(new_process_);
         }
@@ -143,6 +145,9 @@ public:
         PROCESS_INFORMATION info;
         ZeroMemory(&info, sizeof(info));
         DWORD flags = CREATE_UNICODE_ENVIRONMENT;
+        if (spec.suspended) {
+            flags |= CREATE_SUSPENDED;  // WP-34: no instruction runs (no agent, no broker connection) until resume()
+        }
         if (!had_console_) {
             flags |= DETACHED_PROCESS;  // the old process had no console: a console application must not get a window now
         }
@@ -158,9 +163,37 @@ public:
         if (!created) {
             return fail("CreateProcessW failed for '" + utf8_of(image) + "' (" + win32_error(create_error) + ")");
         }
-        CloseHandle(info.hThread);
+        if (spec.suspended) {
+            main_thread_ = info.hThread;  // kept to resume; closed by resume()
+        } else {
+            CloseHandle(info.hThread);
+        }
         new_process_ = info.hProcess;
         return static_cast<std::uint32_t>(info.dwProcessId);
+    }
+
+    // WP-34. Resumes the initial thread of a process created suspended. A debugger that attached meanwhile keeps its own suspend counts
+    // (ResumeThread takes back only the one this host added). A process that is gone needs nothing. When the thread cannot be resumed
+    // the process is terminated: a process that stays suspended forever is worse than one that is not there.
+    Result<void> resume() override {
+        if (main_thread_ == nullptr) {
+            return Result<void>();
+        }
+        const HANDLE thread = main_thread_;
+        main_thread_ = nullptr;
+        Result<void> outcome;
+        if (new_process_ != nullptr && WaitForSingleObject(new_process_, 0) == WAIT_OBJECT_0) {
+            // already exited (a debugger or the user ended it): nothing to resume
+        } else if (ResumeThread(thread) == static_cast<DWORD>(-1)) {
+            const DWORD error = GetLastError();
+            if (new_process_ != nullptr) {
+                TerminateProcess(new_process_, 1);
+            }
+            outcome = Diag::make(rd::kResumeFailed, "ResumeThread failed (" + win32_error(error) + "); the process was terminated instead of being left suspended",
+                                 "Start the application yourself.");
+        }
+        CloseHandle(thread);
+        return outcome;
     }
 
     std::optional<std::uint32_t> relaunched_exit_code() override {
@@ -201,10 +234,13 @@ private:
     bool console_attached_ = false;
     HANDLE duplicated_[3] = {nullptr, nullptr, nullptr};
     HANDLE new_process_ = nullptr;
+    HANDLE main_thread_ = nullptr;  // WP-34: the suspended initial thread of the new process; null once resumed
 };
 
 class WindowsProcessHost final : public ProcessHost {
 public:
+    bool supports_hold() const override { return true; }
+
     Result<std::unique_ptr<RestartableProcess>> open(std::uint32_t pid, const std::uint64_t std_handles[3], std::uint32_t info_flags,
                                                      std::vector<Diag>* warnings) override {
         HANDLE process = OpenProcess(PROCESS_TERMINATE | PROCESS_DUP_HANDLE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);

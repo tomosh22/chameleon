@@ -170,12 +170,16 @@ struct Rig;
 class FakeProcess final : public RestartableProcess {
 public:
     explicit FakeProcess(Rig& rig) : rig_(rig) {}
+    ~FakeProcess() override;
     Result<void> terminate(std::uint32_t timeout_ms) override;
     Result<std::uint32_t> relaunch(const RelaunchSpec& spec) override;
     std::optional<std::uint32_t> relaunched_exit_code() override;
+    Result<void> resume() override;  // WP-34
 
 private:
     Rig& rig_;
+    bool suspended_ = false;  // created suspended and not resumed yet: the new process has not "run" (it does not register)
+    RelaunchSpec spec_;
 };
 
 class FakeHost final : public ProcessHost {
@@ -183,6 +187,7 @@ public:
     explicit FakeHost(Rig& rig) : rig_(rig) {}
     Result<std::unique_ptr<RestartableProcess>> open(std::uint32_t pid, const std::uint64_t std_handles[3], std::uint32_t info_flags,
                                                      std::vector<Diag>* warnings) override;
+    bool supports_hold() const override;
 
 private:
     Rig& rig_;
@@ -208,6 +213,13 @@ struct Rig {
     std::function<void()> during_prepare;   // runs on the broker's thread while the old agent "prepares"
     std::vector<std::uint64_t> cancels;     // RestartCancel messages the old agent received
     std::uint32_t spoof_pid = 0;            // an unrelated process that registers with the restart token first (0: none)
+    // WP-34 (restart-hold)
+    bool hold_supported = false;            // the fake host can create the new process suspended
+    bool fail_resume = false;               // resume() fails (the real host terminates the process then)
+    bool exits_while_held = false;          // the held process is ended by somebody (a debugger, the user)
+    std::atomic<int> resumes{0};            // resume() calls that did something
+    std::atomic<int> destroyed_suspended{0};  // a process object destroyed while still suspended: the coordinator did not resume it itself
+    std::atomic<bool> agent_started{false};   // the new process "ran" (registered an agent)
     std::vector<ipc::RestartModule> reported_modules{{1, kExe}, {1, kDll}};
 
     // what happened
@@ -361,7 +373,7 @@ Result<void> FakeProcess::terminate(std::uint32_t) {
 }
 
 Result<std::uint32_t> FakeProcess::relaunch(const RelaunchSpec& spec) {
-    rig_.note("relaunch");
+    rig_.note(spec.suspended ? "relaunch suspended" : "relaunch");
     if (rig_.fail_launch) {
         return Diag::make(restart::diag::kLaunchFailed, "CreateProcessW failed", "x");
     }
@@ -369,12 +381,46 @@ Result<std::uint32_t> FakeProcess::relaunch(const RelaunchSpec& spec) {
         std::lock_guard<std::mutex> lock(rig_.mutex);
         rig_.relaunched = spec;
     }
+    if (spec.suspended) {
+        suspended_ = true;  // nothing runs: the process starts (and registers) when it is resumed
+        spec_ = spec;
+        return 200u;
+    }
     rig_.start_new_process(spec, 200);
     return 200u;
 }
 
 std::optional<std::uint32_t> FakeProcess::relaunched_exit_code() {
+    if (suspended_ && rig_.exits_while_held) {
+        return 3u;
+    }
     return rig_.new_exits ? std::optional<std::uint32_t>(3) : std::nullopt;
+}
+
+Result<void> FakeProcess::resume() {
+    if (!suspended_) {
+        return Result<void>();
+    }
+    suspended_ = false;
+    rig_.note("resume");
+    if (rig_.fail_resume) {
+        return Diag::make(restart::diag::kResumeFailed, "ResumeThread failed (Win32 error 5); the process was terminated instead of being left suspended", "x");
+    }
+    ++rig_.resumes;
+    rig_.agent_started = true;
+    rig_.start_new_process(spec_, 200);
+    return Result<void>();
+}
+
+FakeProcess::~FakeProcess() {
+    if (suspended_) {
+        ++rig_.destroyed_suspended;  // the real host resumes here as a last resort; the tests assert it never has to
+        (void)resume();
+    }
+}
+
+bool FakeHost::supports_hold() const {
+    return rig_.hold_supported;
 }
 
 Result<std::unique_ptr<RestartableProcess>> FakeHost::open(std::uint32_t pid, const std::uint64_t std_handles[3], std::uint32_t info_flags,
@@ -757,4 +803,348 @@ TEST_CASE("restart: a process host replaced during a restart does not pull the c
     Result<Value> result = rig.service.restart(args_for(100, 10000));
     REQUIRE(result.has_value());  // the running restart kept its own coordinator
     CHECK(result->get_integer("new_pid") == 200);
+}
+
+// ---- WP-34: restart {hold_new} -------------------------------------------------------------------------------------------------
+// The new process is created suspended; `restarting` announces it; `restart-resume` (or hold_ms, a vanished client, a shutdown, an
+// error) lets it run. The scripted host does not start the new process (no registration) until resume(), like a suspended process.
+
+namespace {
+
+Value hold_args(std::uint32_t hold_ms, std::uint32_t registration_ms = 5000) {
+    Value args = args_for(100, 10000, registration_ms);
+    args.set("hold_new", Value::boolean(true));
+    args.set("hold_ms", Value::integer(hold_ms));
+    return args;
+}
+
+Value pid_args(std::int64_t pid) {
+    Value args = Value::object();
+    args.set("pid", Value::integer(pid));
+    return args;
+}
+
+bool wait_until(const std::function<bool()>& condition, int timeout_ms = 10000) {
+    const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (!condition()) {
+        if (std::chrono::steady_clock::now() >= end) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return true;
+}
+
+// restart(...) on its own thread, as the control server runs it.
+struct HeldRestart {
+    HeldRestart(Rig& rig, Value args, std::function<bool()> gone = {}) {
+        thread = std::thread([this, &rig, args = std::move(args), gone = std::move(gone)] { result.emplace(rig.service.restart(args, gone)); });
+    }
+    ~HeldRestart() {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+    Result<Value>& join() {
+        thread.join();
+        return *result;
+    }
+    std::thread thread;
+    std::optional<Result<Value>> result;
+};
+
+bool is_held(Rig& rig) {
+    return !rig.events->named("restarting").empty();
+}
+
+bool has_warning(Rig& rig, const std::string& id) {
+    const std::vector<std::string> ids = rig.events->diag_ids("warning");
+    return std::find(ids.begin(), ids.end(), id) != ids.end();
+}
+
+bool has_error(Rig& rig, const std::string& id) {
+    const std::vector<std::string> ids = rig.events->diag_ids("error");
+    return std::find(ids.begin(), ids.end(), id) != ids.end();
+}
+
+}  // namespace
+
+TEST_CASE("restart hold: the new process does not run until restart-resume; the time held does not count against registration") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.hold_supported = true;
+    HeldRestart restart(rig, hold_args(30000, 300));  // registration budget 300 ms, held for much longer than that
+    REQUIRE(wait_until([&] { return is_held(rig); }));
+    const Event restarting = rig.events->named("restarting")[0];
+    CHECK(restarting.body.get_integer("old_pid") == 100);
+    CHECK(restarting.body.get_integer("new_pid") == 200);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(700));
+    CHECK_FALSE(rig.agent_started.load());  // nothing ran while held
+    CHECK(rig.events->named("restarted").empty());
+    CHECK(rig.logged() == std::vector<std::string>{"open pid=100 handles=4,8,8", "terminate", "relaunch suspended"});
+    CHECK(rig.service.restart_active());
+    // Reloads stay held off for the whole restart, the held time included.
+    Result<Value> reload = rig.service.reload(Value::object());
+    REQUIRE_FALSE(reload.has_value());
+    CHECK(reload.error().id() == "CML5304");
+
+    Result<Value> resumed = rig.service.restart_resume(pid_args(200));
+    REQUIRE_MESSAGE(resumed.has_value(), resumed.error().format());
+    CHECK(resumed->get_bool("resumed"));
+    CHECK(resumed->get_integer("pid") == 200);
+    CHECK(resumed->get_integer("held_ms") >= 600);
+
+    Result<Value>& result = restart.join();
+    REQUIRE_MESSAGE(result.has_value(), result.error().format());  // registered within 300 ms of the resume
+    CHECK(result->get_integer("new_pid") == 200);
+    CHECK(rig.logged() == std::vector<std::string>{"open pid=100 handles=4,8,8", "terminate", "relaunch suspended", "resume"});
+    CHECK(rig.resumes.load() == 1);
+    CHECK(rig.destroyed_suspended.load() == 0);
+    CHECK(rig.events->named("restarted").size() == 1);
+    for (const std::string& id : rig.events->diag_ids("error")) {
+        CHECK(id == "CML5304");  // only the reload that was refused while the process was held
+    }
+    CHECK_FALSE(rig.service.restart_active());
+    CHECK(rig.relaunched.suspended);
+
+    // A second restart-resume for the same pid is a diagnostic, not a crash.
+    Result<Value> again = rig.service.restart_resume(pid_args(200));
+    REQUIRE_FALSE(again.has_value());
+    CHECK(again.error().code == restart::diag::kNotHeld);
+    CHECK(again.error().message.find("resumed") != std::string::npos);
+}
+
+TEST_CASE("restart hold: nobody resumes, so the broker does after hold_ms") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.hold_supported = true;
+    const auto start = std::chrono::steady_clock::now();
+    Result<Value> result = rig.service.restart(hold_args(250));
+    const auto took = std::chrono::steady_clock::now() - start;
+    REQUIRE_MESSAGE(result.has_value(), result.error().format());
+    CHECK(took >= std::chrono::milliseconds(240));
+    CHECK(rig.resumes.load() == 1);
+    CHECK(rig.destroyed_suspended.load() == 0);
+    CHECK(has_warning(rig, "CML5813"));
+    CHECK(rig.events->named("restarting").size() == 1);
+    CHECK(rig.events->named("restarted").size() == 1);
+    // The client that comes too late gets the clean diagnostic.
+    Result<Value> late = rig.service.restart_resume(pid_args(200));
+    REQUIRE_FALSE(late.has_value());
+    CHECK(late.error().code == restart::diag::kNotHeld);
+    CHECK(late.error().message.find("hold_ms expired") != std::string::npos);
+}
+
+TEST_CASE("restart hold: a client that disconnects while its process is held does not strand it") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.hold_supported = true;
+    std::atomic<bool> gone{false};
+    HeldRestart restart(rig, hold_args(30000), [&] { return gone.load(); });
+    REQUIRE(wait_until([&] { return is_held(rig); }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(rig.resumes.load() == 0);
+    gone = true;
+    Result<Value>& result = restart.join();
+    REQUIRE_MESSAGE(result.has_value(), result.error().format());  // the restart goes on to the end
+    CHECK(rig.resumes.load() == 1);
+    CHECK(rig.destroyed_suspended.load() == 0);
+    CHECK(has_warning(rig, "CML5816"));
+    CHECK(rig.events->named("restarted").size() == 1);
+}
+
+TEST_CASE("restart hold: a broker that shuts down resumes the held process first") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.hold_supported = true;
+    HeldRestart restart(rig, hold_args(30000));
+    REQUIRE(wait_until([&] { return is_held(rig); }));
+    rig.service.cancel();  // what the broker does when it stops
+    Result<Value>& result = restart.join();
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().code == restart::diag::kHoldAborted);
+    CHECK(rig.resumes.load() == 1);
+    CHECK(rig.destroyed_suspended.load() == 0);
+    CHECK(rig.events->named("restarted").empty());
+    CHECK(has_error(rig, "CML5815"));
+}
+
+TEST_CASE("restart hold: a process that cannot be resumed is reported to both the restart and restart-resume") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.hold_supported = true;
+    rig.fail_resume = true;
+    HeldRestart restart(rig, hold_args(30000));
+    REQUIRE(wait_until([&] { return is_held(rig); }));
+    Result<Value> resumed = rig.service.restart_resume(pid_args(200));
+    REQUIRE_FALSE(resumed.has_value());
+    CHECK(resumed.error().code == restart::diag::kResumeFailed);
+    Result<Value>& result = restart.join();
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().code == restart::diag::kResumeFailed);
+    CHECK(rig.destroyed_suspended.load() == 0);
+}
+
+TEST_CASE("restart hold: a held process that is ended by somebody else is reported at once") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.hold_supported = true;
+    rig.exits_while_held = true;
+    Result<Value> result = rig.service.restart(hold_args(30000));
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().code == restart::diag::kNewProcessExited);
+    CHECK(result.error().message.find("held") != std::string::npos);
+    CHECK(rig.destroyed_suspended.load() == 0);
+}
+
+TEST_CASE("restart hold: a process that does not register after the resume is left running and reported") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.hold_supported = true;
+    rig.new_registers = false;
+    HeldRestart restart(rig, hold_args(30000, 300));
+    REQUIRE(wait_until([&] { return is_held(rig); }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));  // longer than the registration budget: it must not have expired
+    CHECK(rig.service.restart_resume(pid_args(200)).has_value());
+    Result<Value>& result = restart.join();
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().code == restart::diag::kNoRegistration);
+    CHECK(rig.destroyed_suspended.load() == 0);
+}
+
+TEST_CASE("restart hold: errors before the process is created leave nothing held") {
+    QuietLogs quiet;
+    {
+        Rig rig;
+        rig.hold_supported = true;
+        rig.fail_launch = true;
+        Result<Value> result = rig.service.restart(hold_args(30000));
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().code == restart::diag::kLaunchFailed);
+        CHECK(rig.events->named("restarting").empty());
+        Result<Value> resume = rig.service.restart_resume(pid_args(200));
+        REQUIRE_FALSE(resume.has_value());
+        CHECK(resume.error().code == restart::diag::kNotHeld);
+    }
+    {
+        Rig rig;
+        rig.hold_supported = true;
+        rig.prepare_status = 1;  // the agent refuses: the process is not touched
+        Result<Value> result = rig.service.restart(hold_args(30000));
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().code == restart::diag::kPrepareFailed);
+        CHECK(rig.logged().empty());
+    }
+}
+
+TEST_CASE("restart hold: without hold_new nothing changes, and without host support the request is refused untouched") {
+    QuietLogs quiet;
+    {
+        Rig rig;
+        rig.hold_supported = true;
+        Result<Value> plain = rig.service.restart(args_for(100, 10000));  // no hold_new
+        REQUIRE(plain.has_value());
+        CHECK(rig.logged() == std::vector<std::string>{"open pid=100 handles=4,8,8", "terminate", "relaunch"});
+        CHECK_FALSE(rig.relaunched.suspended);
+        CHECK(rig.events->named("restarting").empty());
+        Value off = args_for(100, 10000);
+        off.set("hold_new", Value::boolean(false));
+        Result<Value> explicit_off = rig.service.restart(off);
+        REQUIRE(explicit_off.has_value());
+        CHECK(rig.events->named("restarting").empty());
+    }
+    {
+        Rig rig;  // the host cannot hold
+        ControlContext context;
+        context.service = &rig.service;
+        const std::vector<std::string> caps = broker_capabilities(context);
+        CHECK(std::find(caps.begin(), caps.end(), "restart-hold") == caps.end());
+        Result<Value> refused = rig.service.restart(hold_args(1000));
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().code == restart::diag::kHoldUnavailable);
+        CHECK(rig.logged().empty());  // nothing was opened, terminated or started
+        Result<ipc::json::Value> reply = ipc::json::parse(handle_control_line(R"({"id":1,"cmd":"restart-resume","args":{"pid":200}})", context));
+        REQUIRE(reply.has_value());
+        CHECK_FALSE(reply->get_bool("ok"));
+    }
+}
+
+TEST_CASE("restart hold: bad arguments and restart-resume for a pid that is not held are diagnostics") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.hold_supported = true;
+    Value bad_flag = args_for(100, 10000);
+    bad_flag.set("hold_new", Value::string("yes"));
+    Result<Value> r = rig.service.restart(bad_flag);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().code == restart::diag::kBadHoldArgs);
+    for (const std::int64_t bad : {60001, -1}) {
+        Value args = hold_args(1000);
+        args.set("hold_ms", Value::integer(bad));
+        r = rig.service.restart(args);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().code == restart::diag::kBadHoldArgs);
+    }
+    CHECK(rig.logged().empty());
+
+    r = rig.service.restart_resume(Value::object());  // no pid
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().code == restart::diag::kBadHoldArgs);
+    Value text = Value::object();
+    text.set("pid", Value::string("200"));
+    r = rig.service.restart_resume(text);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().code == restart::diag::kBadHoldArgs);
+    r = rig.service.restart_resume(pid_args(0));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().code == restart::diag::kBadHoldArgs);
+    r = rig.service.restart_resume(pid_args(4242));  // never held
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().code == restart::diag::kNotHeld);
+}
+
+TEST_CASE("restart hold: the control commands, the capability and the opt-in event") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.hold_supported = true;
+    ControlContext context;
+    context.version = "0.1.0";
+    context.service = &rig.service;
+    std::atomic<bool> gone{false};
+    context.client_gone = [&] { return gone.load(); };
+    const std::vector<std::string> caps = broker_capabilities(context);
+    CHECK(std::find(caps.begin(), caps.end(), "restart") != caps.end());
+    CHECK(std::find(caps.begin(), caps.end(), "restart-hold") != caps.end());
+
+    std::set<std::string> subscribed;
+    context.subscribe = [&](const std::set<std::string>& names) { subscribed = names; };
+    Result<ipc::json::Value> reply = ipc::json::parse(handle_control_line(R"({"id":1,"cmd":"subscribe"})", context));
+    REQUIRE(reply.has_value());
+    CHECK(subscribed.count("restarting") == 0);  // opt-in, like `restarted`
+    reply = ipc::json::parse(handle_control_line(R"({"id":2,"cmd":"subscribe","args":{"events":["restarting","restarted"]}})", context));
+    REQUIRE(reply.has_value());
+    CHECK(reply->get_bool("ok"));
+    CHECK(subscribed == std::set<std::string>{"restarting", "restarted"});
+
+    std::string line;
+    std::thread requester([&] {
+        line = handle_control_line(R"({"id":3,"cmd":"restart","args":{"pid":100,"timeout_ms":10000,"hold_new":true,"hold_ms":30000}})", context);
+    });
+    REQUIRE(wait_until([&] { return is_held(rig); }));
+    reply = ipc::json::parse(handle_control_line(R"({"id":4,"cmd":"restart-resume","args":{"pid":200}})", context));
+    REQUIRE(reply.has_value());
+    CHECK(reply->get_bool("ok"));
+    CHECK(reply->find("result")->get_bool("resumed"));
+    requester.join();
+    reply = ipc::json::parse(line);
+    REQUIRE(reply.has_value());
+    CHECK(reply->get_integer("id") == 3);
+    CHECK(reply->get_bool("ok"));
+    CHECK(reply->find("result")->get_integer("new_pid") == 200);
+
+    reply = ipc::json::parse(handle_control_line(R"({"id":5,"cmd":"restart-resume","args":{"pid":200}})", context));
+    REQUIRE(reply.has_value());
+    CHECK_FALSE(reply->get_bool("ok"));
+    CHECK(reply->find("diag")->get_string("id") == "CML5814");
 }

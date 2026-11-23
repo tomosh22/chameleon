@@ -6,7 +6,9 @@ name: vs
 #   1. build the broker, the agent and the `basic` fixture (the C++ side of the integration test);
 #   2. integrations/vs/build.ps1 -Configuration Release: the logic library, the tests and the .vsix (out/*.vsix);
 #   3. unit tests (fake pipe server, fake debugger: the re-attach decisions);
-#   4. integration test: the control client against a real cml_broker and the fixture (WP31-IT lines);
+#   4. integration test: the control client against a real cml_broker and the fixture (WP31-IT lines), and, since WP-34, the held
+#      restart `restart {hold_new}` -> `restarting` -> attach -> `restart-resume` -> `restarted` (WP34-VS lines);
+#   4b. WP-34: the broker side of the same, with real processes (ctest integration.restart_hold_*, WP34-HOLD lines);
 #   5. upload the .vsix and the logs.
 
 on:
@@ -63,7 +65,7 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug *>&1 | Tee-Object -FilePath "$env:LOG_DIR/configure.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cmake --build build --parallel --target cml_broker cml_agent fixture_basic *>&1 | Tee-Object -FilePath "$env:LOG_DIR/build.log"
+          cmake --build build --parallel --target cml_broker cml_agent fixture_basic fixture_hot_restart cml_it_restart_hold *>&1 | Tee-Object -FilePath "$env:LOG_DIR/build.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # The developer environment sets Platform=x64; the managed projects are AnyCPU (outputs in bin/<config>/).
@@ -93,8 +95,20 @@ jobs:
           dotnet $exe --bin-dir "$PWD/build/bin" --fixture-source "$PWD/tests/fixtures/basic/logic.cpp" --work-dir $work *>&1 | Tee-Object -FilePath "$env:LOG_DIR/integration.log"
           $code = $LASTEXITCODE
           Copy-Item -Recurse -Force $work "$env:LOG_DIR/it-work" -ErrorAction SilentlyContinue
-          $lines = Get-Content "$env:LOG_DIR/integration.log" | Where-Object { $_ -match '^WP31-IT ' }
+          $lines = Get-Content "$env:LOG_DIR/integration.log" | Where-Object { $_ -match '^(WP31-IT|WP34-VS) ' }
           $lines | Tee-Object -FilePath "$env:LOG_DIR/wp31-it-summary.txt"
+          $lines | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          if ($code -ne 0) { exit $code }
+
+      # WP-34: the broker half of the held restart with real processes (headless cml_broker, fixture hot_restart): no output of the new
+      # process before restart-resume, it runs and registers after it, the broker resumes it after hold_ms, a client that disconnects
+      # while it is held does not strand it. The same tests run in the `ci` workflow (ctest); here their WP34-HOLD lines are the log.
+      - name: WP-34 restart-hold integration (real broker, fixture hot_restart)
+        run: |
+          ctest --test-dir build -R '^integration\.restart_hold_' --no-tests=error --output-on-failure -V *>&1 | Tee-Object -FilePath "$env:LOG_DIR/wp34-hold.log"
+          $code = $LASTEXITCODE
+          $lines = Get-Content "$env:LOG_DIR/wp34-hold.log" | Where-Object { $_ -match 'WP34-HOLD ' } | ForEach-Object { $_ -replace '^\d+: ', '' }
+          $lines | Tee-Object -FilePath "$env:LOG_DIR/wp34-hold-summary.txt"
           $lines | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
           if ($code -ne 0) { exit $code }
 

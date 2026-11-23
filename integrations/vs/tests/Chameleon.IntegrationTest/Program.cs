@@ -21,6 +21,9 @@ namespace Chameleon.IntegrationTest
     ///   revert                  `revert last`, the patch_reverted event, value=1 again
     ///   restart                 the edit again, `reload`, `restart`: the restarted event with a new pid that is running
     ///   reattach                a fake debugger "attached" to the old pid is asked to attach the new pid, with the same engines
+    ///   hold (WP-34)            `restart {hold_new}`: `restarting` arrives while the new process is suspended, the (slow) fake debugger attaches
+    ///                           to it, `restart-resume` follows, `restarted` arrives; no output of the new process before the resume. Then the same
+    ///                           with an attach that fails: the process is resumed anyway and CML5997 is reported. Lines start with WP34-VS.
     ///
     /// Prints greppable lines that start with WP31-IT and ends with "WP31-IT result=ok ..." (exit code 0) or result=FAILED (exit code 1).
     /// </summary>
@@ -28,6 +31,10 @@ namespace Chameleon.IntegrationTest
     {
         private static int _checks;
         private static readonly List<string> Failures = new List<string>();
+        private static Child _fixture;                       // the fixture's output (the relaunched process keeps writing into it)
+        private static DateTime _resumeSentAt;                   // WP-34: when the extension's code sent `restart-resume`
+        private static DateTime _restartingAt;                   // WP-34: when the `restarting` event arrived
+        private static string _outputAtResume;                   // WP-34: what the fixture's output held, since `restarting`, when the resume was sent
 
         private static void Say(string line)
         {
@@ -119,7 +126,23 @@ namespace Chameleon.IntegrationTest
                 session.EventReceived += ev =>
                 {
                     events.Add(ev);
-                    if (ev.TryGetRestarted(out int o, out int n))
+                    if (ev.TryGetRestarting(out int ro, out int rn))
+                    {
+                        // What the extension's controller does (ChameleonController.OnBrokerEvent): only for a restart it asked to hold.
+                        if (coordinator.TryClaimRestarting())
+                        {
+                            _restartingAt = DateTime.UtcNow;
+                            _fixture?.MarkOutput();        // the old process is gone and the new one is held: whatever is printed from now on, ran
+                            debugger.ProcessExits(ro);     // Visual Studio ends the debug session of the process the broker terminated
+                            Task.Run(() => coordinator.OnRestartingAsync(ro, rn, () =>
+                            {
+                                _resumeSentAt = DateTime.UtcNow;
+                                _outputAtResume = _fixture != null ? _fixture.OutputSinceMark() : "";
+                                return session.ResumeAsync(rn);
+                            }));
+                        }
+                    }
+                    else if (ev.TryGetRestarted(out int o, out int n))
                     {
                         Task.Run(() => coordinator.OnRestartedAsync(o, n));
                     }
@@ -133,7 +156,7 @@ namespace Chameleon.IntegrationTest
 
                 StatusInfo status = session.LastStatus;
                 Say("WP31-IT status=ok version=" + status.Version + " capabilities=" + string.Join(",", status.Capabilities));
-                foreach (string cap in new[] { "status", "subscribe", "reload", "restart", "revert" })
+                foreach (string cap in new[] { "status", "subscribe", "reload", "restart", "revert", "restart-hold" })
                 {
                     Check(status.Has(cap), "the broker advertises capability '" + cap + "'");
                 }
@@ -152,6 +175,7 @@ namespace Chameleon.IntegrationTest
                         ["CML_BROKER_PATH"] = Path.Combine(workDir, "no_such_broker.exe"),
                     });
                 children.Add(fixtureProc.Process);
+                _fixture = fixtureProc;
                 int pid = fixtureProc.Process.Id;
 
                 bool ready = await WaitFor(() =>
@@ -250,6 +274,81 @@ namespace Chameleon.IntegrationTest
                 Check(reattachReports.IsEmpty, "no CML5997 was reported");
                 Say("WP31-IT reattach=" + (attached ? "ok" : "FAILED") + " attach_pid=" + newPid + " engines=" + (calls.Count > 0 ? string.Join(",", calls[0].Engines) : "-"));
 
+                // ---- WP-34: restart {hold_new}: attach to the process before it runs, then resume ----------------------------------
+                Check(coordinator.ShouldHoldNewProcess(session.Supports(Capabilities.RestartHold)), "the extension decides to hold the new process (re-attach on, broker has restart-hold)");
+                int heldTarget = newPid;
+                for (int round = 1; round <= 2; round++)
+                {
+                    bool failAttach = round == 2;
+                    string label = failAttach ? "attach-failure" : "hold";
+                    debugger.FailAttach = failAttach;
+                    // A slow debugger: the attach takes 1.5 s, during which the new process must not print anything.
+                    string outputAtAttach = null;
+                    debugger.BeforeAttach = async p =>
+                    {
+                        await Task.Delay(1500);
+                        outputAtAttach = fixtureProc.OutputSinceMark();
+                    };
+                    debugger.Attach(heldTarget, "Native");   // the shell's debugger is attached to the process about to be restarted ...
+                    coordinator.Observe();                   // ... and the extension remembers it before it sends the restart
+                    int attachesBefore = debugger.AttachCalls.Count();
+                    int reportsBefore = reattachReports.Count;
+                    int restartingBefore = events.Count("restarting");
+                    int restartedBefore2 = events.Count("restarted");
+                    _outputAtResume = null;
+                    _resumeSentAt = default(DateTime);
+
+                    object ticket = coordinator.ExpectRestarting();
+                    ControlResponse held = await session.RestartAsync(heldTarget, holdMs: 30000);   // answered after the resume and the registration
+                    coordinator.RestartingNoLongerExpected(ticket);
+                    bool heldOk = Check(held.Ok, label + ": the held restart answered ok (" + (held.Error != null ? held.Error.ToString() : "") + ")");
+                    int heldOld = heldOk && held.Result["old_pid"] != null ? (int)held.Result["old_pid"] : 0;
+                    int heldNew = heldOk && held.Result["new_pid"] != null ? (int)held.Result["new_pid"] : 0;
+                    newPidToKill = heldNew;
+                    Check(heldOld == heldTarget && heldNew > 0 && heldNew != heldOld, label + ": the result names old " + heldOld + " and a new pid " + heldNew);
+
+                    bool restartingEvent = events.Count("restarting") > restartingBefore;
+                    Check(restartingEvent, label + ": the restarting event arrived");
+                    BrokerEvent restartingBody = events.Last("restarting");
+                    int rOld = 0, rNew = 0;
+                    Check(restartingBody != null && restartingBody.TryGetRestarting(out rOld, out rNew) && rOld == heldOld && rNew == heldNew,
+                        label + ": the restarting event carries old_pid and new_pid of the result (" + rOld + " -> " + rNew + ")");
+                    bool restartedEvent2 = await WaitFor(() => events.Count("restarted") > restartedBefore2, 15000);
+                    Check(restartedEvent2, label + ": the restarted event arrived");
+
+                    bool resumeSent = await WaitFor(() => _resumeSentAt != default(DateTime), 10000);
+                    Check(resumeSent, label + ": the extension sent restart-resume");
+                    bool attachCalled = debugger.AttachCalls.Skip(attachesBefore).Any(c => c.Pid == heldNew);
+                    bool beforeResume = _outputAtResume != null && !Regex.IsMatch(_outputAtResume, @"TICK n=");
+                    Check(beforeResume, label + ": the new process printed nothing before restart-resume (output since `restarting`: '" + (_outputAtResume ?? "(no resume)").Replace("\n", "|") + "')");
+                    Check(outputAtAttach != null && !Regex.IsMatch(outputAtAttach, @"TICK n="), label + ": the new process printed nothing while the debugger was attaching");
+                    Check(attachCalled, label + ": the debugger was asked to attach the held pid");
+                    int attachMs = (int)(_resumeSentAt - _restartingAt).TotalMilliseconds;
+                    Check(attachMs >= 1400, label + ": the resume came after the slow attach (" + attachMs + " ms after `restarting`)");
+                    if (failAttach)
+                    {
+                        Check(reattachReports.Count == reportsBefore + 1 && reattachReports.Last().Id == "CML5997", label + ": the failed attach was reported as CML5997 (" + string.Join("; ", reattachReports.Select(d => d.Id)) + ")");
+                    }
+                    else
+                    {
+                        Check(debugger.GetDebuggedProcesses().Any(d => d.Pid == heldNew), label + ": the debugger is attached to the new pid");
+                        Check(reattachReports.Count == reportsBefore, label + ": nothing was reported");
+                    }
+
+                    fixtureProc.MarkOutput();
+                    bool heldTicking = await fixtureProc.WaitForOutput(new Regex(@"TICK n=\d+ value=\d "), 30000);
+                    Check(heldTicking, label + ": the new process runs after the resume");
+                    bool heldAlive = IsAlive(heldNew);
+                    Check(heldAlive, label + ": the new process (pid " + heldNew + ") is running");
+                    Say("WP34-VS " + label + "=" + (heldOk && restartingEvent && restartedEvent2 && beforeResume && attachCalled && heldTicking && heldAlive ? "ok" : "FAILED") +
+                        " old_pid=" + heldOld + " new_pid=" + heldNew + " restarting_event=" + (restartingEvent ? 1 : 0) + " attach_called=" + (attachCalled ? 1 : 0) +
+                        " attach_failed=" + (failAttach ? 1 : 0) + " output_before_resume=" + (beforeResume ? 0 : 1) + " resume_after_ms=" + attachMs + " resume_sent=" + (resumeSent ? 1 : 0) +
+                        " restarted_event=" + (restartedEvent2 ? 1 : 0) + " new_pid_ticking=" + (heldTicking ? 1 : 0) + " reattach_reports=" + (reattachReports.Count - reportsBefore));
+                    heldTarget = heldNew;
+                }
+
+                debugger.BeforeAttach = null;
+                debugger.FailAttach = false;
                 return Finish(brokerProc, fixtureProc);
             }
             finally
@@ -400,11 +499,27 @@ namespace Chameleon.IntegrationTest
                 lock (_gate) { return _attached.ToList(); }
             }
 
-            public Task AttachAsync(int pid, IReadOnlyList<string> engines, CancellationToken cancellationToken)
+            /// <summary>WP-34: runs when an attach starts (a slow debugger).</summary>
+            public Func<int, Task> BeforeAttach;
+
+            /// <summary>WP-34: attaching throws (the debugger refuses).</summary>
+            public bool FailAttach;
+
+            public async Task AttachAsync(int pid, IReadOnlyList<string> engines, CancellationToken cancellationToken)
             {
                 Calls.Enqueue((pid, engines.ToArray()));
+                Func<int, Task> before = BeforeAttach;
+                if (before != null)
+                {
+                    await before(pid).ConfigureAwait(false);
+                }
+
+                if (FailAttach)
+                {
+                    throw new InvalidOperationException("the debugger refused to attach (simulated)");
+                }
+
                 Attach(pid, engines.ToArray());
-                return Task.CompletedTask;
             }
         }
 
@@ -471,6 +586,12 @@ namespace Chameleon.IntegrationTest
             public void MarkOutput()
             {
                 lock (_gate) { _mark = _all.Length; }
+            }
+
+            /// <summary>The output printed since <see cref="MarkOutput"/>.</summary>
+            public string OutputSinceMark()
+            {
+                lock (_gate) { return _all.ToString(_mark, _all.Length - _mark); }
             }
 
             public async Task<bool> WaitForOutput(Regex pattern, int timeoutMs)
