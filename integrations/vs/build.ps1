@@ -51,7 +51,7 @@ $msbuild = Find-MSBuild
 Write-Host "MSBuild: $msbuild"
 $vsixProject = Join-Path $root 'src/Chameleon.Vsix/Chameleon.Vsix.csproj'
 Invoke-Checked 'msbuild Chameleon.Vsix' {
-    & $msbuild $vsixProject -restore "-p:Configuration=$Configuration" '-p:DeployExtension=false' -nologo -v:minimal "-bl:$(Join-Path $out 'vsix.binlog')"
+    & $msbuild $vsixProject -restore "-p:Configuration=$Configuration" '-p:Platform=AnyCPU' '-p:DeployExtension=false' -nologo -v:minimal "-bl:$(Join-Path $out 'vsix.binlog')"
 }
 
 $vsix = Get-ChildItem -Path (Join-Path $root "src/Chameleon.Vsix/bin/$Configuration") -Filter '*.vsix' -File -ErrorAction SilentlyContinue
