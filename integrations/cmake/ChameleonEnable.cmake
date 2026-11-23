@@ -6,8 +6,12 @@
 #   - from an install tree:          find_package(Chameleon CONFIG REQUIRED)  (ChameleonConfig.cmake includes it)
 #
 # Flags (cl and clang-cl, Ninja and Visual Studio generators, every configuration):
-#   compile   /Gy /hotpatch                function-level linking, 6 bytes of padding before functions (CML1105, CML1601)
-#             /Ob0                         every configuration but Debug (Debug is /Od): no inlining (CML1603)
+#   compile   /Gy                          function-level linking (CML1105)
+#             /hotpatch                    clang-cl only; cl on x64 does not know it (D9002), its padding comes from
+#                                          /FUNCTIONPADMIN at link time (CML1601)
+#             /Ob0                         every configuration but Debug (Debug is /Od): no inlining (CML1603). CMake's
+#                                          own /Ob1 /Ob2 are removed from CMAKE_<LANG>_FLAGS_<CONFIG> first (see below),
+#                                          because cl prints D9025 when two /Ob options meet.
 #   link      /DEBUG:FULL /INCREMENTAL:NO  full PDB (CML1101)
 #             /OPT:NOREF /OPT:NOICF /FUNCTIONPADMIN                                              (CML1602, CML1601)
 # Link flags go to executables, shared libraries and modules; static and object libraries get the compile flags only.
@@ -172,14 +176,42 @@ function(chameleon_enable target)
     # Ninja and Makefile generators pass compile options to every language, resource compilers included, so the options
     # are restricted to C and C++ with single-language genexes. The Visual Studio generators put compile options into
     # the ClCompile item only (and restrict $<COMPILE_LANGUAGE> to single-language targets), so they get plain options.
+    # /hotpatch: cl accepts it on x86 only (x64: D9002 "ignoring unknown option"); clang-cl accepts it. Only x64 is
+    # supported here (CML1700), so cl gets none and relies on /FUNCTIONPADMIN for the padding.
+    set(_hotpatch "")
+    if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+        set(_hotpatch /hotpatch)
+    endif()
+    # /Ob1 and /Ob2 come from CMake's default CMAKE_<LANG>_FLAGS_<CONFIG>; cl prints D9025 "overriding /Ob1 with /Ob0"
+    # for every TU when /Ob0 follows. CMake has no per-target way to drop a configuration flag, so they are removed
+    # from the variables in the caller's directory scope (PARENT_SCOPE; nothing outside the directory and its
+    # subdirectories, and the user's cache is untouched). Other targets of that directory lose the default /Ob1 or /Ob2
+    # of the non-Debug configurations too (the compiler's default inlining applies instead of the /O2 level).
+    # The Visual Studio generators turn /Ob into a project property and never print D9025, but the removal is harmless.
+    if(NOT E_ALLOW_INLINING)
+        foreach(_lang C CXX)
+            foreach(_cfg RELEASE RELWITHDEBINFO MINSIZEREL)
+                set(_var CMAKE_${_lang}_FLAGS_${_cfg})
+                if(DEFINED ${_var} AND "${${_var}}" MATCHES "[/-]Ob[12]")
+                    string(REGEX REPLACE "(^| )[/-]Ob[12]( |$)" "\\1" _new "${${_var}}")
+                    string(REGEX REPLACE "(^| )[/-]Ob[12]( |$)" "\\1" _new "${_new}")
+                    string(STRIP "${_new}" _new)
+                    set(${_var} "${_new}" PARENT_SCOPE)
+                endif()
+            endforeach()
+        endforeach()
+    endif()
     if(CMAKE_GENERATOR MATCHES "Visual Studio")
-        target_compile_options(${target} PRIVATE /Gy /hotpatch)
+        target_compile_options(${target} PRIVATE /Gy ${_hotpatch})
         if(NOT E_ALLOW_INLINING)
             target_compile_options(${target} PRIVATE "$<$<NOT:$<CONFIG:Debug>>:/Ob0>")
         endif()
     else()
         foreach(_lang C CXX)
-            target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:${_lang}>:/Gy>" "$<$<COMPILE_LANGUAGE:${_lang}>:/hotpatch>")
+            target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:${_lang}>:/Gy>")
+            if(_hotpatch)
+                target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:${_lang}>:/hotpatch>")
+            endif()
             if(NOT E_ALLOW_INLINING)
                 target_compile_options(${target} PRIVATE "$<$<AND:$<COMPILE_LANGUAGE:${_lang}>,$<NOT:$<CONFIG:Debug>>>:/Ob0>")
             endif()

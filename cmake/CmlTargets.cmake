@@ -34,10 +34,19 @@ endfunction()
 
 function(cml_target_fixture_style target)
     # Fixtures are built with inlining disabled in RelWithDebInfo so that every function stays
-    # a distinct patchable symbol. CMake's default RelWithDebInfo flags contain /Ob1; the later
-    # /Ob0 wins (cl prints D9025 as a note-level warning that /WX does not escalate; fixtures do
-    # not use /WX anyway).
+    # a distinct patchable symbol. CMake's default RelWithDebInfo flags contain /Ob1; it is removed
+    # from the directory's flags (PARENT_SCOPE, as chameleon_enable does) so that cl does not print
+    # D9025 "overriding /Ob1 with /Ob0" for every TU.
     if(MSVC)
+        foreach(_lang C CXX)
+            set(_var CMAKE_${_lang}_FLAGS_RELWITHDEBINFO)
+            if(DEFINED ${_var})
+                string(REGEX REPLACE "(^| )[/-]Ob[12]( |$)" "\\1" _new "${${_var}}")
+                string(REGEX REPLACE "(^| )[/-]Ob[12]( |$)" "\\1" _new "${_new}")
+                string(STRIP "${_new}" _new)
+                set(${_var} "${_new}" PARENT_SCOPE)
+            endif()
+        endforeach()
         target_compile_options(${target} PRIVATE "$<$<CONFIG:RelWithDebInfo>:/Ob0>")
     else()
         target_compile_options(${target} PRIVATE "$<$<CONFIG:RelWithDebInfo>:-fno-inline>")

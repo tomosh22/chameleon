@@ -46,13 +46,20 @@ index (the reload then names the diagnostic), a WARN is published as a warning d
 | No `/guard:cf` | CML1104 | FAIL |
 | `/Gy` (function-level linking; detection method: ADR-0026) | CML1105 | FAIL when absent, WARN when it cannot be told |
 | No `/clr`, `/ZW` | CML1504 | FAIL |
-| `/FUNCTIONPADMIN` and `/hotpatch` (6 bytes of padding before functions) | CML1601 | WARN |
+| 6 bytes of padding before functions: `/FUNCTIONPADMIN` at link time (the check samples the image, it does not require a compile flag); `/hotpatch` adds the 2-byte-entry guarantee on x86 cl and on clang-cl, and cl on x64 rejects it (D9002), so `chameleon_enable` passes it to clang-cl only | CML1601 | WARN |
 | `/OPT:NOREF /OPT:NOICF` | CML1602 | WARN (also when the PDB records no linker command line) |
 | `/Ob0` or `/Od` for the modules being iterated | CML1603 (per function at reload: CML3104) | WARN |
 
 `chameleon_enable(<target>)` (CMake package `Chameleon`, shipped in the zip under `lib\cmake\Chameleon`) applies these
 flags to a target. The `examples\hello` project in the zip shows it, and its `SMOKE_USE_PACKAGE=OFF` branch shows the same
 flags written out by hand.
+
+`chameleon_enable` prints no compiler driver warnings (WP-33): `/hotpatch` goes to clang-cl only (cl on x64 ignores it with
+D9002; the padding comes from `/FUNCTIONPADMIN`), and CMake's default `/Ob1` or `/Ob2` is removed from the non-Debug
+`CMAKE_<LANG>_FLAGS_<CONFIG>` before `/Ob0` is added, so cl does not print D9025. CMake cannot drop a configuration flag
+for one target, so the removal is made in the calling directory's scope (the variables, not the cache); other targets of
+that directory lose their default `/Ob1` or `/Ob2` too. `ALLOW_INLINING` skips the removal. If you write the flags by
+hand, drop `/hotpatch` for cl x64 and `/Ob1` from your RelWithDebInfo flags the same way.
 
 `/INCREMENTAL` is fine (the thunks jump to the real entry, which is hooked). `tests/fixtures/CmlFixture.cmake` shows
 the recommended flags in CMake form.

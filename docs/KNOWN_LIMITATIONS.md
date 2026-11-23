@@ -172,9 +172,8 @@ diagnostic is planned, not live.
   - **Compiler warnings from `chameleon_enable` (wave 8).** With MSVC on x64, every TU of an enabled target prints
     `D9002 ignoring unknown option '/hotpatch'` (cl accepts `/hotpatch` on x86 only; on x64 `/FUNCTIONPADMIN` provides
     the padding) and, in RelWithDebInfo, `D9025 overriding '/Ob1' with '/Ob0'`. Both are harmless (`cml_broker check`
-    reports PASS, warn=0) but noisy in user builds; seen in the WP-32 quickstart acceptance run. Follow-up: add
-    `/hotpatch` only for x86 (or clang-cl) and strip `/Ob1` from the target's RelWithDebInfo flags instead of
-    overriding it.
+    reports PASS, warn=0) but noisy in user builds; seen in the WP-32 quickstart acceptance run. Fixed in WP-33
+    (`docs/wp/WP-33.md`): `/hotpatch` only for clang-cl, `/Ob1` and `/Ob2` removed from the directory's flags.
   - **IDE integrations (wave 8).** The VS Code and Visual Studio extensions are tested against a real broker in CI. The editor
     UI itself (menus, status bar, Output pane, Error List, the debugger `Attach2` call) is covered only by the manual
     checklists in `docs/wp/WP-30.md` and `docs/wp/WP-31.md`. Two follow-ups need broker changes:

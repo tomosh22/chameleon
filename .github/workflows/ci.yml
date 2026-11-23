@@ -142,6 +142,20 @@ jobs:
             -Compiler ${{ matrix.compiler }} -Os ${{ matrix.os }} -Generator Ninja -Cxx $env:CML_CXX *>&1 | Tee-Object -FilePath "$env:LOG_DIR/wp29-examples.txt"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # WP-33: no D9002 (unknown /hotpatch) and no D9025 (/Ob1 overridden by /Ob0) from the enabled targets. Counts them in the
+      # build log (fixtures, tests) and in the output of the WP-29 examples build. Last line: WP33-WARN d9002=<n> d9025=<n>.
+      - name: WP-33 no D9002 or D9025 from chameleon_enable targets
+        run: |
+          $d2 = 0; $d25 = 0
+          foreach ($f in "$env:LOG_DIR/build.log", "$env:LOG_DIR/wp29-examples.txt") {
+            if (Test-Path $f) {
+              $d2 += @(Select-String -Path $f -Pattern 'D9002').Count
+              $d25 += @(Select-String -Path $f -Pattern 'D9025').Count
+            }
+          }
+          "WP33-WARN d9002=$d2 d9025=$d25"
+          if ($d2 -ne 0 -or $d25 -ne 0) { exit 1 }
+
       # WP-10 fix evidence: unit.agent_hook is run repeatedly in every cell, because its hang was
       # intermittent (CI runs 41567946950 and 41569481401, windows-2022 clang-cl Debug). Stops at the
       # first failure and prints its output; the last line is
