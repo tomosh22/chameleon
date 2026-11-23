@@ -553,10 +553,9 @@ TEST_CASE("enable time: the index of a module that fails the audit fails with th
     CHECK_FALSE(index3->audit().has_value());
 }
 
-// WP-26, finding F-1 (docs/wp/WP-26.md): the real-project corpus showed that code linked in from a static library (raylib built as
-// a CMake library, every directory of Godot) is never a source compiland, so a change to it reloads nothing. This pins the rule
-// as it is today: the PDB names the archive as the module's object, and ModuleIndex::is_source_compiland() says no.
-TEST_CASE("corpus F-1: a member of a static library is not a source compiland") {
+// WP-26, finding F-1 (docs/wp/WP-26.md), fixed by WP-26b (ADR-0036 decision 1): the PDB names the archive as the module's library, and
+// that no longer matters: a member whose build environment is recorded is a source compiland, one without it is not.
+TEST_CASE("corpus F-1 (fixed): a member of a static library with a build environment is a source compiland") {
     QuietLogs quiet;
     Module m;
     pdb::OpenOptions options;
@@ -571,6 +570,6 @@ TEST_CASE("corpus F-1: a member of a static library is not a source compiland") 
     {
         Result<std::shared_ptr<const pdb::PdbIndex>> index = pdb::PdbIndex::open_for_pe(m.exe, options);
         REQUIRE(index);
-        CHECK_FALSE(ModuleIndex::is_source_compiland(**index, 0));
+        CHECK(ModuleIndex::is_source_compiland(**index, 0));  // ADR-0036: the build environment decides, not the archive
     }
 }

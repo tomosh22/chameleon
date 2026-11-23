@@ -103,16 +103,5 @@
   "start_timeout_s": 600,
   "index_timeout_s": 1800,
   "min_functions": 50000,
-  "expected_failures": [
-    {
-      "step": "edit:static-lib-main",
-      "compiler": "*",
-      "reason": "F-1: main/ is linked from a static library; its members are not source compilands, the reload patches nothing"
-    },
-    {
-      "step": "edit:static-lib-scene-tree",
-      "compiler": "*",
-      "reason": "F-1: scene/ is linked from a static library; its members are not source compilands, the reload patches nothing"
-    }
-  ]
+  "expected_failures": []
 }

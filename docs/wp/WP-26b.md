@@ -65,4 +65,6 @@ with the "no recorded command line" error); its own source change is reported wi
 
 - Flag problems of archive members (`/GL`, no `/Gy`) are not audited at enable time (see above).
 - Headers included only by skipped compilands are not tracked.
-- The corpus flip (F-1 `expected_failures`) waits for PR #46; see the PR description.
+- Corpus: the two F-1 `expected_failures` of the Godot cell (`edit:static-lib-main`, `edit:static-lib-scene-tree`, the latter an edit of
+  `scene/main/scene_tree.cpp`) are removed, so those edits must now reload. `corpus F-1` in `test_audit.cpp` now asserts the new rule.
+  raylib's F-1 entry was never asserted (its reload runs through its own cells).
