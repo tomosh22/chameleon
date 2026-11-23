@@ -174,6 +174,86 @@ TEST_CASE("static libraries (WP-26b): a changed archive member is swept to its c
     CHECK(second->not_owned[0].detail.find("noenv.cpp.obj") != std::string::npos);
     CHECK(second->not_owned[0].detail.find("foo.lib") != std::string::npos);
     CHECK(second->not_owned[0].detail.find("no build environment") != std::string::npos);
+
+    // Once accepted, the same edit is not reported again.
+    index->accept(second->stamps);
+    Result<ModuleIndex::Sweep> third = index->sweep();
+    REQUIRE(third.has_value());
+    CHECK(third->not_owned.empty());
+    CHECK(third->unmapped.empty());
+    CHECK(third->changed.empty());
+}
+
+// ADR-0036 / WP-26b, review: a plain object without an env block is skipped, but what it lists is still tracked (headers included), and
+// a precompiled header it builds is still found. A change to such a header is CML5921 (or CML5550 for the precompiled header), not `patched: 0`.
+TEST_CASE("static libraries (WP-26b): a skipped plain object keeps its headers tracked and its precompiled header detected") {
+    QuietLogs quiet;
+    tp::TempDir dir;
+    write_text(dir.file("ok.cpp"), "int ok() { return 1; }\n");
+    write_text(dir.file("plain.cpp"), "#include \"plain.h\"\nint plain() { return PLAIN; }\n");
+    write_text(dir.file("plain.h"), "#define PLAIN 1\n");
+    write_text(dir.file("pchmk.cpp"), "#include \"pch.h\"\n");
+    write_text(dir.file("pch.h"), "#pragma once\n");
+    tp::Spec spec;
+    spec.guid = kGuid;
+    spec.age = 1;
+    spec.sections = {{".text", 0x1000, 0x1000, 0x1000, 0x60000020}, {".data", 0x800, 0x2000, 0x800, 0xC0000040}};
+    const auto add = [&](const std::string& obj, const std::vector<std::string>& files, bool env, const std::string& src, const std::string& cmd) {
+        tp::Module m;
+        m.name = obj;
+        m.symbols.objname(obj);
+        m.symbols.compile3(1, 0, 0xD0, "Test Compiler 19.44");
+        if (env) {
+            std::vector<std::pair<std::string, std::string>> pairs = {{"cwd", dir.dir()}, {"cl", "C:\\vc\\bin\\cl.exe"}, {"cmd", cmd}};
+            if (!src.empty()) {
+                pairs.emplace_back("src", src);
+            }
+            m.symbols.envblock(pairs);
+        }
+        m.files = files;
+        spec.modules.push_back(std::move(m));
+    };
+    add("C:\\obj\\ok.cpp.obj", {dir.file("ok.cpp")}, true, dir.file("ok.cpp"), "/c /Z7 /Gy ok.cpp");
+    add("C:\\obj\\plain.cpp.obj", {dir.file("plain.cpp"), dir.file("plain.h")}, false, "", "");  // no env block at all
+    add("C:\\obj\\pchmk.cpp.obj", {dir.file("pchmk.cpp")}, true, "", "/c /Z7 /Ycpch.h pchmk.cpp");  // a command but no source recorded
+    spec.contributions = {{1, 0x000, 0x100, 0}};
+    spec.symrec.pub32("ok_func", 0x3, 1, 0x10);
+    const std::string pdb = dir.file("app.pdb");
+    tp::write_file(pdb, tp::build(spec));
+    const std::string exe = dir.file("app.exe");
+    tp::write_file(exe, tp::build_pe(kGuid, 1, pdb));
+
+    ModuleIndexSpec ispec;
+    ispec.module_path = exe;
+    ispec.scan_includes = false;
+    std::shared_ptr<ModuleIndex> index = ModuleIndex::start(ispec);
+    REQUIRE(index->wait(30000));
+    REQUIRE(index->status().state == IndexState::Ready);
+    REQUIRE(index->skipped_compilands().size() == 2);  // plain.cpp.obj and pchmk.cpp.obj; no archive member, so no CML5920
+
+    const std::vector<std::string> tracked = index->tracked_files();
+    const auto has = [&](const std::string& f) { return std::find(tracked.begin(), tracked.end(), pdb::normalize_path(f)) != tracked.end(); };
+    CHECK(has(dir.file("plain.h")));  // the header only the skipped object lists
+    CHECK(has(dir.file("pch.h")));
+    CHECK(index->is_pch_header(pdb::normalize_path(dir.file("pch.h"))));  // /Yc found without a recorded source
+
+    write_text(dir.file("plain.h"), "#define PLAIN 2\n");
+    bump_mtime(dir.file("plain.h"));
+    Result<ModuleIndex::Sweep> swept = index->sweep();
+    REQUIRE(swept.has_value());
+    CHECK(swept->compilands.empty());
+    CHECK(swept->unmapped.empty());
+    REQUIRE(swept->not_owned.size() == 1);
+    CHECK(swept->not_owned[0].file == pdb::normalize_path(dir.file("plain.h")));
+    CHECK(swept->not_owned[0].detail.find("plain.cpp.obj") != std::string::npos);
+    index->accept(swept->stamps);
+
+    write_text(dir.file("pch.h"), "#pragma once\n// changed\n");
+    bump_mtime(dir.file("pch.h"));
+    Result<ModuleIndex::Sweep> pch = index->sweep();
+    REQUIRE(pch.has_value());
+    REQUIRE(pch->pch_headers.size() == 1);  // the pipeline refuses it with CML5550
+    CHECK(pch->pch_headers[0] == pdb::normalize_path(dir.file("pch.h")));
 }
 
 #endif

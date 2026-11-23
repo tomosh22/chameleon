@@ -214,6 +214,16 @@ std::optional<Diag> stale_inline_warning(const pdb::PdbIndex& index, std::uint32
 
 namespace {
 
+// WP-26b: the samplers look at the project's own objects and the members of its libraries, not at the toolchain's archives (the static CRT
+// is not built with /hotpatch padding and would skew them). No build-environment lookup per sample.
+bool is_sampled_object(const pdb::PdbIndex& index, std::uint32_t compiland) {
+    if (!ModuleIndex::is_object_compiland(index, compiland)) {
+        return false;
+    }
+    const std::string_view library = index.compiland(compiland).library_name;
+    return library.empty() || !ModuleIndex::is_toolchain_archive(library);
+}
+
 struct CompilandSummary {
     std::vector<std::string> gl, guard_cf, gy_no, gy_unknown, managed, no_command, inlining;
     std::size_t gy_yes = 0;
@@ -330,7 +340,7 @@ ProcSample sample_function_symbols(const pdb::PdbIndex& index, const AuditOption
         if ((sections[c.section - 1u].characteristics & 0x20u) == 0) {  // IMAGE_SCN_CNT_CODE
             continue;
         }
-        if (!ModuleIndex::is_object_compiland(index, c.compiland)) {  // WP-26b: archive members count too (no build-environment lookup per sample)
+        if (!is_sampled_object(index, c.compiland)) {
             continue;
         }
         const pdb::Compiland& comp = index.compiland(c.compiland);
@@ -364,7 +374,7 @@ PaddingSample sample_padding(const pdb::PdbIndex& index, const pe::Image& image,
             continue;
         }
         const std::optional<std::uint32_t> owner = index.compiland_for_rva(s.rva);
-        if (owner && ModuleIndex::is_object_compiland(index, *owner)) {
+        if (owner && is_sampled_object(index, *owner)) {
             rvas.push_back(s.rva);
         }
     }

@@ -364,6 +364,18 @@ private:
                             "the changed file '" + n.file + "' is only owned by compilands of " + module_.name + " that cannot be reloaded: " + n.detail,
                             "Rebuild the project (and the library it belongs to) with /Z7 so its PDB records the compile command, then restart; or rebuild and hot-restart now."));
         }
+        if (!swept->not_owned.empty()) {
+            // Reported once: accepted here, before any path that ends the reload (a refusal, a failure, nothing to compile), so the
+            // next reload does not repeat CML5921 for the same edit.
+            std::map<std::string, FileStamp> reported;
+            for (const ModuleIndex::Sweep::NotOwned& n : swept->not_owned) {
+                const auto st = swept->stamps.find(n.file);
+                if (st != swept->stamps.end()) {
+                    reported[n.file] = st->second;
+                }
+            }
+            module_.index->accept(reported);
+        }
         for (const std::string& f : swept->missing) {
             warn(report, "sweep", Diag::make(pd::kBaselineFile, "the tracked file '" + f + "' is gone", "Restore it or ignore this warning."));
         }
@@ -574,12 +586,6 @@ private:
             const auto st = swept->stamps.find(f);
             if (st != swept->stamps.end()) {
                 accepted[f] = st->second;
-            }
-        }
-        for (const ModuleIndex::Sweep::NotOwned& n : swept->not_owned) {
-            const auto st = swept->stamps.find(n.file);
-            if (st != swept->stamps.end()) {
-                accepted[n.file] = st->second;
             }
         }
         // WP-22: the patches of this reload are one batch a `revert` can undo, together with the baseline they replaced.

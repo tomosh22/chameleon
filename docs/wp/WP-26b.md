@@ -33,22 +33,38 @@ The PDB reader range CML1470-1479 is unused.
 
 ### What the broker can know for the "not owned" warning
 
-The sweep only sees tracked files, so a file that no compiland lists is invisible to it. The choice: at index time the broker also
-tracks the *own source files* (C/C++ extensions, existing on disk) of every real object it skipped. When one of them changes and no
-reloadable compiland owns it, the reload says so (CML5921, naming the skipped objects and why) instead of answering a silent
-`patched: 0`; the file is then accepted, so it is reported once. A file that no compiland at all lists stays `CML5303`
-(unmapped), as before. Not covered: a *header* that only skipped compilands include (they are not scanned, so it is not tracked),
-and a source edited that is in no PDB at all.
+The sweep only sees tracked files, so a file that no compiland lists is invisible to it. The choice: a skipped real object keeps
+everything it lists tracked, exactly as before WP-26b (every file the PDB lists for it that exists on disk, headers included), and the
+include scan and the precompiled-header detection still run for it whenever a compile command is recorded. When one of those files
+changes and no reloadable compiland owns it, the reload says so (CML5921, naming the skipped objects and why) instead of answering a
+silent `patched: 0`. A changed precompiled header of a skipped `/Yc` object is still refused (CML5550). The not-owned files are
+accepted into the baseline right after the sweep, before any path that ends the reload (a refusal, a failure, nothing to compile),
+so one edit is reported once. A file that no compiland at all lists stays `CML5303`
+(unmapped), as before. Not covered: a source edited that is in no PDB at all; an archive member whose own sources are not on this machine (a library built
+elsewhere: nothing of it is tracked, it only counts in CML5920).
 
 ### What counts as skipped (and is counted/warned)
 
 Real objects with no build environment, or archive members whose source file is missing. Not counted: import stubs and linker
-records, and members of toolchain archives (CRT/STL/SDK/compiler runtime: libcmt, libvcruntime, msvcrt, ucrt, anything under
-`VC\Tools\MSVC`, `Windows Kits`, `lib\clang`). These never record a build environment, and counting them would make CML5920 fire for
-every module. The warning is a diag event; the log also gets an `index:` line with the totals.
+records, and members of toolchain archives (CRT/STL/SDK/compiler runtime). `ModuleIndex::is_toolchain_archive` is the one rule, shared
+by the index and the audit's samplers: a path under `VC\Tools\MSVC`, `Windows Kits` or `lib\clang`, or a file name that is exactly
+one of libcmt, libcpmt, libvcruntime, libucrt, msvcrt, msvcprt, libconcrt, oldnames, vcruntime, ucrt, clang_rt, legacy_stdio_definitions
+(optionally with a `d` suffix), or such a name followed by `_`, `.` or `-`. These never record a build environment, and counting them
+would make CML5920 fire for every module; the audit's padding and function-symbol samplers would also be skewed by a static CRT that is
+not built with `/hotpatch`. The warning is a diag event; the log also gets an `index:` line with the totals.
 
-A plain (non-archive) object without a build environment is now skipped as well (before, it was tracked and failed at reload
-with the "no recorded command line" error); its own source change is reported with CML5921.
+A plain (non-archive) object without a build environment is skipped as well (before, it was tracked and a reload failed with the "no
+recorded command line" error). Review decision: it keeps its headers tracked and its include scan and PCH detection, and a change is
+reported with CML5921 (not the old compile error, and never a silent `patched: 0`). `is_source_compiland` does not check that an
+archive member's source file exists (that needs the file system); the index does, and skips such a member (documented in
+`module_index.h`).
+
+## Known limitation found by the corpus
+
+The corpus edit of `scene/main/scene_tree.cpp` gets past the sweep with this package and is then refused by the planner (CML3207 /
+CML3214): the `SNAME` lambdas of `SceneTree` define several function-local statics with the same name (`$TSS0`, `sname`) that the
+planner cannot tell apart. It belongs to the F-4 family (several statics of one name in a translation unit); the orchestrator records it
+in KNOWN_LIMITATIONS. The corpus pins a `core/` edit instead (`core/object/message_queue.cpp`, `CallQueue::flush()`).
 
 ## Tests
 

@@ -23,6 +23,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -141,8 +142,14 @@ public:
     // archive. No build-environment check, so it is cheap.
     static bool is_object_compiland(const pdb::PdbIndex& index, std::uint32_t compiland);
     // True for compilands that can be recompiled: a real object whose build environment (cwd, compiler, command, source) is
-    // recorded, whether or not it came from an archive. Reads the module's build info (lazily), so avoid it in hot loops.
+    // recorded, whether or not it came from an archive. (The index additionally skips an archive member whose source file is not
+    // on this machine, a library built elsewhere; that needs the file system, so it is not part of this predicate.) Reads the module's build info (lazily), so avoid it in hot loops.
     static bool is_source_compiland(const pdb::PdbIndex& index, std::uint32_t compiland);
+
+    // WP-26b: archives that belong to the toolchain, not to the project (the CRT, the STL, the SDK, the compiler runtime). Their
+    // members never record a build environment, so they are neither counted as skipped (CML5920) nor tracked, and the audit's
+    // samplers leave them out. One rule for the index and the audit.
+    static bool is_toolchain_archive(std::string_view library);
 
     // WP-26b: the real-object compilands that were skipped (empty until Ready), and the subset that comes from archives.
     std::vector<SkippedCompiland> skipped_compilands() const;
@@ -167,7 +174,6 @@ private:
     std::set<std::uint32_t> pch_unverified_;                              // guarded by mutex_: /Yu compilands with an unknown PCH
     std::vector<SkippedCompiland> skipped_;                               // guarded by mutex_
     std::set<std::uint32_t> skipped_set_;                                 // guarded by mutex_: their indices
-    std::map<std::string, std::vector<std::uint32_t>> orphan_files_;      // guarded by mutex_: tracked source -> skipped compilands
     std::atomic<bool> cancel_{false};
     std::thread worker_;
 };
