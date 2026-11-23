@@ -85,7 +85,7 @@ namespace Chameleon.Vsix
             {
                 // WP-34: the broker holds the new process suspended for the restart this extension asked for. Attach the debugger before its
                 // first instruction, then let it run. A held process that another client asked for is that client's to resume.
-                if (Reattach.TryClaimRestarting())
+                if (Reattach.TryClaimRestarting(ev.Str("token")))
                 {
                     Task.Run(() => RestartingAsync(oldPid, newPid));
                 }
@@ -316,11 +316,11 @@ namespace Chameleon.Vsix
             bool hold = Reattach.ShouldHoldNewProcess(Session.Supports(Capabilities.RestartHold));
             _output.WriteLine("hot-restart" + (pid.HasValue ? " (pid " + pid.Value + ")" : "") + (hold ? ", holding the new process for the debugger" : "") + " ...");
             ControlResponse r;
-            object ticket = hold ? Reattach.ExpectRestarting() : null;
+            ReattachCoordinator.HoldTicket ticket = hold ? Reattach.ExpectRestarting() : null;
 
             try
             {
-                r = await Session.RestartAsync(pid, holdMs: hold ? (int?)_settings.RestartHoldMs : null);
+                r = await Session.RestartAsync(pid, holdMs: hold ? (int?)_settings.RestartHoldMs : null, holdToken: ticket != null ? ticket.Token : null);
             }
             finally
             {

@@ -2,7 +2,7 @@
 // and the control pipe, all real processes.
 //
 //   cml_it_restart_hold --broker <cml_broker.exe> --fixture <fixture_hot_restart.exe> --workdir <dir>
-//                       --scenario resume|timeout|disconnect|not-held|broker-killed [--timeout-ms N]
+//                       --scenario resume|timeout|disconnect|not-held|broker-killed|two-holds [--timeout-ms N]
 //
 // resume      restart {hold_new}: `restarting` arrives, the new process (created suspended) prints nothing and is alive; after
 //             `restart-resume` (sent on the same connection) it runs, registers, and `restarted` arrives.
@@ -12,6 +12,8 @@
 //             seconds anyway (CML5816), registers, and `restarted` reaches another client.
 // broker-killed  the broker itself is killed (TerminateProcess) while the process is held (hold_ms 60 s): the watchdog the broker started
 //             (`cml_broker.exe --hold-watchdog`) resumes the process within seconds.
+// two-holds  `wait` sent on the connection of a held restart is refused busy at once (CML5803: the connection thread must stay free to read
+//             restart-resume); two held restarts back to back on one connection, the second resumed promptly on the same connection.
 // not-held    `restart-resume` for a pid that is not held (CML5814) and without a pid (CML5818) are diagnostics; the broker is still
 //             fine; a plain `restart` (no hold_new) behaves as before (no `restarting` event).
 //
@@ -149,7 +151,8 @@ bool parse_args(int argc, wchar_t** argv, Options* options) {
     std::replace(options->fixture.begin(), options->fixture.end(), L'/', L'\\');
     options->workdir.make_preferred();
     const bool known = options->scenario == "resume" || options->scenario == "timeout" || options->scenario == "disconnect" ||
-                       options->scenario == "not-held" || options->scenario == "broker-killed";
+                       options->scenario == "not-held" || options->scenario == "broker-killed" ||
+                       options->scenario == "two-holds";
     return known && !options->broker.empty() && !options->fixture.empty() && !options->workdir.empty();
 }
 
@@ -628,6 +631,46 @@ void scenario_broker_killed(Rig& rig, Report& report) {
                 kHoldMs, lines_before, first_tick.value_or(-1), first_tick ? 0 : 1, new_pid);
 }
 
+void scenario_two_holds(Rig& rig, Report& report) {
+    std::optional<Raw> client = Raw::connect(rig.control_pipe, 10000);
+    report.require(client.has_value(), "cannot connect");
+    report.require(client->call("subscribe", subscribe_args({"restarting", "restarted"}), 10000).has_value(), "subscribe failed");
+
+    // ---- first held restart; a blocking `wait` during the hold is refused at once ----
+    const std::int64_t first_id = client->send("restart", restart_args(rig.old_pid, 30000));
+    std::optional<cml::ipc::ControlEvent> first = client->wait_event("restarting", 90000);
+    report.require(first.has_value(), "no `restarting` event (first)\n" + read_file(rig.broker_log));
+    const std::uint32_t first_pid = pid_of(*first, "new_pid");
+    const Clock::time_point wait_sent = Clock::now();
+    std::optional<cml::ipc::ControlResponse> busy = client->call("wait", Value::object(), 5000);
+    const long long busy_ms = ms_since(wait_sent);
+    report.require(busy.has_value(), "`wait` during a held restart got no answer (the connection thread is blocked)");
+    report.check(!busy->ok && diag_id_of(*busy) == "CML5803", "`wait` during a held restart is not CML5803 (" + diag_id_of(*busy) + ")");
+    report.check(busy_ms < 3000, "`wait` took " + std::to_string(busy_ms) + " ms to be refused");
+    std::optional<cml::ipc::ControlResponse> resumed = client->call("restart-resume", object_of({{"pid", Value::integer(first_pid)}}), 20000);
+    report.require(resumed.has_value() && resumed->ok, "the first restart-resume failed");
+    std::optional<cml::ipc::ControlResponse> first_done = client->wait_response(first_id, 120000);
+    report.require(first_done.has_value() && first_done->ok, "the first held restart failed: " + (first_done ? diag_id_of(*first_done) : std::string("no answer")));
+
+    // ---- the second one, right behind it on the same connection ----
+    const std::int64_t second_id = client->send("restart", restart_args(first_pid, 30000));
+    std::optional<cml::ipc::ControlEvent> second = client->wait_event(
+        [&](const cml::ipc::ControlEvent& e) { return e.name == "restarting" && pid_of(e, "old_pid") == first_pid; }, 90000);
+    report.require(second.has_value(), "no `restarting` event for the second held restart (it ran inline on the connection thread?)\n" + read_file(rig.broker_log));
+    const std::uint32_t second_pid = pid_of(*second, "new_pid");
+    const Clock::time_point second_held = Clock::now();
+    std::optional<cml::ipc::ControlResponse> resumed2 = client->call("restart-resume", object_of({{"pid", Value::integer(second_pid)}}), 20000);
+    const long long resume_ms = ms_since(second_held);
+    report.require(resumed2.has_value() && resumed2->ok, "the second restart-resume failed (" + (resumed2 ? diag_id_of(*resumed2) : std::string("no answer")) + ")");
+    report.check(resume_ms < 5000, "the second held process was resumed only after " + std::to_string(resume_ms) + " ms");
+    std::optional<cml::ipc::ControlResponse> second_done = client->wait_response(second_id, 120000);
+    report.require(second_done.has_value() && second_done->ok, "the second held restart failed: " + (second_done ? diag_id_of(*second_done) : std::string("no answer")));
+    const std::optional<long long> first_tick = wait_new_process_output(rig, second_held, 30000);
+    report.check(first_tick.has_value(), "the second new process printed nothing");
+    std::printf("WP34-HOLD two_holds: wait_refused=%s wait_refused_ms=%lld first_pid=%u second_pid=%u second_resume_ms=%lld second_resumed_same_connection=1 new_process_ticking=%d\n",
+                diag_id_of(*busy).c_str(), busy_ms, first_pid, second_pid, resume_ms, first_tick ? 1 : 0);
+}
+
 void scenario_not_held(Rig& rig, Report& report) {
     std::optional<Raw> client = Raw::connect(rig.control_pipe, 10000);
     report.require(client.has_value(), "cannot connect");
@@ -663,7 +706,7 @@ void scenario_not_held(Rig& rig, Report& report) {
 int wmain(int argc, wchar_t** argv) {
     Options options;
     if (!parse_args(argc, argv, &options)) {
-        std::fputs("usage: cml_it_restart_hold --broker EXE --fixture EXE --workdir DIR --scenario resume|timeout|disconnect|not-held|broker-killed [--timeout-ms N]\n", stderr);
+        std::fputs("usage: cml_it_restart_hold --broker EXE --fixture EXE --workdir DIR --scenario resume|timeout|disconnect|not-held|broker-killed|two-holds [--timeout-ms N]\n", stderr);
         return 2;
     }
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -685,6 +728,8 @@ int wmain(int argc, wchar_t** argv) {
             scenario_timeout(rig, report);
         } else if (options.scenario == "disconnect") {
             scenario_disconnect(rig, report);
+        } else if (options.scenario == "two-holds") {
+            scenario_two_holds(rig, report);
         } else if (options.scenario == "broker-killed") {
             scenario_broker_killed(rig, report);
         } else {

@@ -873,11 +873,14 @@ TEST_CASE("restart hold: the new process does not run until restart-resume; the 
     QuietLogs quiet;
     Rig rig;
     rig.hold_supported = true;
-    HeldRestart restart(rig, hold_args(30000, 300));  // registration budget 300 ms, held for much longer than that
+    Value first_args = hold_args(30000, 300);  // registration budget 300 ms, held for much longer than that
+    first_args.set("token", Value::string("tok-A"));
+    HeldRestart restart(rig, first_args);
     REQUIRE(wait_until([&] { return is_held(rig); }));
     const Event restarting = rig.events->named("restarting")[0];
     CHECK(restarting.body.get_integer("old_pid") == 100);
     CHECK(restarting.body.get_integer("new_pid") == 200);
+    CHECK(restarting.body.get_string("token") == "tok-A");  // echoed, so a client can tell its own held restart from another's
 
     std::this_thread::sleep_for(std::chrono::milliseconds(700));
     CHECK_FALSE(rig.agent_started.load());  // nothing ran while held
@@ -929,6 +932,7 @@ TEST_CASE("restart hold: nobody resumes, so the broker does after hold_ms") {
     CHECK(has_warning(rig, "CML5813"));
     CHECK(rig.events->named("restarting").size() == 1);
     CHECK(rig.events->named("restarted").size() == 1);
+    CHECK(rig.events->named("restarting")[0].body.find("token") == nullptr);  // none sent, none echoed
     // The client that comes too late gets the clean diagnostic.
     Result<Value> late = rig.service.restart_resume(pid_args(200));
     REQUIRE_FALSE(late.has_value());
@@ -1082,6 +1086,13 @@ TEST_CASE("restart hold: bad arguments and restart-resume for a pid that is not 
     for (const std::int64_t bad : {60001, -1}) {
         Value args = hold_args(1000);
         args.set("hold_ms", Value::integer(bad));
+        r = rig.service.restart(args);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().code == restart::diag::kBadHoldArgs);
+    }
+    for (const bool as_text : {false, true}) {
+        Value args = hold_args(1000);
+        args.set("token", as_text ? Value::string(std::string(65, 'x')) : Value::integer(7));  // not a string / too long
         r = rig.service.restart(args);
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error().code == restart::diag::kBadHoldArgs);

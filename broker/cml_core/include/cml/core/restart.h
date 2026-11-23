@@ -32,6 +32,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -113,7 +114,8 @@ public:
     //
     // WP-34: `hold_new` (bool) and `hold_ms` (1..60000, default 10000) make the new process start suspended; see the top of this
     // file. `client_gone`, polled while a process is held, tells the restart that the client that asked for it has disconnected
-    // (the process is resumed at once and the restart continues). Both are optional.
+    // (the process is resumed at once and the restart continues). Both are optional. `token` (a string of at most 64 characters) in
+    // the arguments is echoed in the `restarting` event, so a client can tell its own held restart from another client's.
     Result<ipc::json::Value> restart(const ipc::json::Value& args, const std::function<bool()>& client_gone = {});
 
     // WP-34, command `restart-resume {pid}` -> {pid, resumed:true, held_ms}. Answers once the process runs. CML5814 when no process
@@ -155,6 +157,7 @@ private:
     std::mutex holds_mutex_;
     std::map<std::uint32_t, std::shared_ptr<Hold>> holds_;
     std::map<std::uint32_t, std::string> ended_holds_;  // pid -> how the hold ended (the last few; for the CML5814 message)
+    std::deque<std::uint32_t> ended_order_;             // the same pids, oldest first (eviction)
 };
 
 }  // namespace cml::core

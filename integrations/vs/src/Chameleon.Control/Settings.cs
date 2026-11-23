@@ -32,6 +32,12 @@ namespace Chameleon.Control
         /// </summary>
         public int RestartHoldMs { get; set; } = 30000;
 
+        /// <summary>
+        /// WP-34: the extension resumes the held process as soon as the debugger lists it, or after this long at the latest, even if the
+        /// debugger's attach call has not returned (a real attach to a process that has not run can block until it runs).
+        /// </summary>
+        public int HoldResumeGraceMs { get; set; } = 3000;
+
         /// <summary>WP-34: how long the extension waits for the debugger to attach to the held process before it resumes it anyway (CML5997).</summary>
         public int HoldAttachTimeoutMs { get; set; } = 20000;
 

@@ -577,7 +577,7 @@ namespace Chameleon.Control
         /// WP-34: not null asks the broker to create the new process suspended and keep it so for at most this long
         /// (`hold_new`, `hold_ms`); the broker then publishes `restarting` and waits for <see cref="ResumeAsync"/>.
         /// </param>
-        public Task<ControlResponse> RestartAsync(int? pid, CancellationToken cancellationToken = default(CancellationToken), int? holdMs = null)
+        public Task<ControlResponse> RestartAsync(int? pid, CancellationToken cancellationToken = default(CancellationToken), int? holdMs = null, string holdToken = null)
         {
             var args = new JObject();
             if (pid.HasValue)
@@ -589,6 +589,10 @@ namespace Chameleon.Control
             {
                 args["hold_new"] = true;
                 args["hold_ms"] = Math.Max(1, Math.Min(60000, holdMs.Value));
+                if (!string.IsNullOrEmpty(holdToken))
+                {
+                    args["token"] = holdToken;   // echoed in the `restarting` event: tells our held restart from another client's
+                }
             }
 
             return SendAsync("restart", args, _settings.RestartTimeoutMs, cancellationToken);

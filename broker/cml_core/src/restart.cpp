@@ -137,6 +137,13 @@ Result<Value> RestartCoordinator::restart(const Value& args, const std::function
     if (!read_uint_arg(args, "hold_ms", ipc::restart_hold::kMaxHoldMs, &hold_ms, &arg_error, bad_hold)) {
         return *arg_error;
     }
+    std::string hold_token;  // echoed in `restarting`
+    if (const Value* token = args.find("token"); token != nullptr && !token->is_null()) {
+        if (!token->is_string() || token->as_string().size() > 64) {
+            return bad_hold("argument 'token' must be a string of at most 64 characters");
+        }
+        hold_token = token->as_string();
+    }
     if (hold_ms == 0) {
         hold_ms = ipc::restart_hold::kDefaultHoldMs;
     }
@@ -349,16 +356,25 @@ Result<Value> RestartCoordinator::restart(const Value& args, const std::function
         {
             std::lock_guard<std::mutex> lock(holds_mutex_);
             holds_[held_pid] = hold;
-            ended_holds_.erase(held_pid);
+            if (ended_holds_.erase(held_pid) != 0) {
+                ended_order_.erase(std::remove(ended_order_.begin(), ended_order_.end(), held_pid), ended_order_.end());
+            }
         }
         const auto end_hold = [&](const char* how) -> Result<void> {
             Result<void> resumed = process->resume();
             {
                 std::lock_guard<std::mutex> lock(holds_mutex_);
                 holds_.erase(held_pid);
+                if (ended_holds_.find(held_pid) == ended_holds_.end()) {
+                    ended_order_.push_back(held_pid);
+                } else {
+                    ended_order_.erase(std::remove(ended_order_.begin(), ended_order_.end(), held_pid), ended_order_.end());
+                    ended_order_.push_back(held_pid);
+                }
                 ended_holds_[held_pid] = how;
-                while (ended_holds_.size() > 16) {
-                    ended_holds_.erase(ended_holds_.begin());
+                while (ended_order_.size() > 16) {  // the oldest goes first, not the lowest pid
+                    ended_holds_.erase(ended_order_.front());
+                    ended_order_.pop_front();
                 }
             }
             {
@@ -377,6 +393,9 @@ Result<Value> RestartCoordinator::restart(const Value& args, const std::function
             body.set("old_pid", Value::integer(old_pid));
             body.set("new_pid", Value::integer(held_pid));
             body.set("hold_ms", Value::integer(hold_ms));
+            if (!hold_token.empty()) {
+                body.set("token", Value::string(hold_token));
+            }
             Event event;
             event.name = ipc::restart_hold::kRestartingEvent;
             event.body = std::move(body);

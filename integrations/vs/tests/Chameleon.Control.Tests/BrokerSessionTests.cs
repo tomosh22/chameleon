@@ -438,12 +438,13 @@ namespace Chameleon.Control.Tests
                     ? new string[0]
                     : new[] { FakeBroker.Ok((long)req["id"], new JObject { ["pid"] = 200, ["resumed"] = true }) };
 
-                Task<ControlResponse> restart = h.Session.RestartAsync(4242, holdMs: 120000);
+                Task<ControlResponse> restart = h.Session.RestartAsync(4242, holdMs: 120000, holdToken: "tok-1");
                 await broker.WaitForRequestAsync("restart");
                 JObject sent = broker.Requests().Last(r => (string)r["cmd"] == "restart");
                 Assert.True((bool)sent["args"]["hold_new"]);
                 Assert.Equal(60000, (int)sent["args"]["hold_ms"]);   // the broker's maximum
                 Assert.Equal(4242, (int)sent["args"]["pid"]);
+                Assert.Equal("tok-1", (string)sent["args"]["token"]);   // echoed in `restarting`
 
                 ControlResponse resumed = await h.Session.ResumeAsync(200);   // does not wait behind the unanswered restart
                 Assert.True(resumed.Ok);

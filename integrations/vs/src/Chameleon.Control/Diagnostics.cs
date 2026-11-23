@@ -83,12 +83,12 @@ namespace Chameleon.Control
         }
 
         /// <summary>WP-34: the new process was held for the debugger and `restart-resume` did not get through.</summary>
-        public static ChameleonDiagnostic ResumeFailed(int newPid, string reason)
+        public static ChameleonDiagnostic ResumeFailed(int newPid, string reason, int holdMs)
         {
             return new ChameleonDiagnostic(
                 ClientDiagIds.ReattachFailed,
                 "Could not tell the broker to resume the restarted process (pid " + newPid + "): " + reason + ".",
-                "Nothing else to do: the broker resumes the process by itself when the hold time (30 s) has passed. " +
+                "Nothing else to do: the broker resumes the process by itself when the hold time (" + (holdMs / 1000) + " s) has passed. " +
                 "If the application stays frozen, run Tools > Chameleon > Hot-restart again.");
         }
 

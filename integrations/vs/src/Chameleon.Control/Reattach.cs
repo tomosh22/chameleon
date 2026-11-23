@@ -77,8 +77,9 @@ namespace Chameleon.Control
         private readonly Func<DateTime> _now;
         private readonly Func<TimeSpan, CancellationToken, Task> _delay;
         private readonly Func<TimeSpan, CancellationToken, Task> _attachTimeout;
+        private readonly Func<TimeSpan, CancellationToken, Task> _resumeGrace;
         private readonly object _gate = new object();
-        private readonly List<object> _expectedHolds = new List<object>();   // restarts this extension asked to hold (WP-34) whose `restarting` event has not arrived yet
+        private readonly List<HoldTicket> _expectedHolds = new List<HoldTicket>();   // restarts this extension asked to hold (WP-34) whose `restarting` event has not arrived yet
         private readonly Dictionary<int, Known> _known = new Dictionary<int, Known>();
         private readonly HashSet<string> _handled = new HashSet<string>();
         private readonly SemaphoreSlim _serial = new SemaphoreSlim(1, 1);
@@ -90,7 +91,8 @@ namespace Chameleon.Control
             Action<string> log,
             Func<DateTime> now = null,
             Func<TimeSpan, CancellationToken, Task> delay = null,
-            Func<TimeSpan, CancellationToken, Task> attachTimeout = null)
+            Func<TimeSpan, CancellationToken, Task> attachTimeout = null,
+            Func<TimeSpan, CancellationToken, Task> resumeGrace = null)
         {
             _debugger = debugger;
             _settings = settings;
@@ -99,6 +101,7 @@ namespace Chameleon.Control
             _now = now ?? (() => DateTime.UtcNow);
             _delay = delay ?? ((span, ct) => Task.Delay(span, ct));
             _attachTimeout = attachTimeout ?? ((span, ct) => Task.Delay(span, ct));
+            _resumeGrace = resumeGrace ?? ((span, ct) => Task.Delay(span, ct));
         }
 
         // ---- WP-34: early attach to a process the broker holds suspended ----------------------------------------------------------
@@ -113,12 +116,21 @@ namespace Chameleon.Control
         }
 
         /// <summary>
-        /// Call right before sending `restart {hold_new}`: the next `restarting` event is ours to answer. Pass the returned ticket to
-        /// <see cref="RestartingNoLongerExpected"/> when that `restart` was answered.
+        /// A restart this extension asked the broker to hold. Its <see cref="Token"/> travels in the request (`token`) and comes back in the
+        /// `restarting` event, so the event is matched to this restart and to no other client's.
         /// </summary>
-        public object ExpectRestarting()
+        public sealed class HoldTicket
         {
-            var ticket = new object();
+            public string Token { get; } = Guid.NewGuid().ToString("N");
+        }
+
+        /// <summary>
+        /// Call right before sending `restart {hold_new, token}`: the `restarting` event that carries the ticket's token is ours to answer.
+        /// Pass the ticket to <see cref="RestartingNoLongerExpected"/> when that `restart` was answered or failed.
+        /// </summary>
+        public HoldTicket ExpectRestarting()
+        {
+            var ticket = new HoldTicket();
             lock (_gate)
             {
                 _expectedHolds.Add(ticket);
@@ -127,8 +139,8 @@ namespace Chameleon.Control
             return ticket;
         }
 
-        /// <summary>The `restart` was answered or failed: an event that never came must not claim a later, foreign restart. No effect when it was claimed.</summary>
-        public void RestartingNoLongerExpected(object ticket)
+        /// <summary>The `restart` was answered or failed: an event that never came must not linger. No effect when it was claimed.</summary>
+        public void RestartingNoLongerExpected(HoldTicket ticket)
         {
             lock (_gate)
             {
@@ -137,29 +149,41 @@ namespace Chameleon.Control
         }
 
         /// <summary>
-        /// True once per <see cref="ExpectRestarting"/>: the `restarting` event belongs to a restart this extension asked for. A held process
-        /// that another client asked for is that client's to resume, never ours.
+        /// True once per ticket: the `restarting` event carries the token of a restart this extension asked for. A held process another
+        /// client asked for (another token, or none) is that client's to resume, never ours.
         /// </summary>
-        public bool TryClaimRestarting()
+        public bool TryClaimRestarting(string token)
         {
+            if (string.IsNullOrEmpty(token))
+            {
+                return false;
+            }
+
             lock (_gate)
             {
-                if (_expectedHolds.Count == 0)
+                int i = _expectedHolds.FindIndex(t => t.Token == token);
+                if (i < 0)
                 {
                     return false;
                 }
 
-                _expectedHolds.RemoveAt(0);
+                _expectedHolds.RemoveAt(i);
                 return true;
             }
         }
 
         /// <summary>
-        /// The broker holds the new process (pid <paramref name="newPid"/>, it replaced <paramref name="oldPid"/>) suspended: attaches the
-        /// debugger to it, then calls <paramref name="resume"/> (`restart-resume`). The process is resumed on every path: the attach
-        /// succeeded, was not needed, failed, was too slow (<see cref="ChameleonSettings.HoldAttachTimeoutMs"/>, CML5997), was cancelled or
-        /// threw. A resume that does not get through is reported (CML5997 text "could not tell the broker to resume"); the broker resumes
-        /// the process by itself when its hold time passes, so nothing stays frozen.
+        /// The broker holds the new process (pid <paramref name="newPid"/>, it replaced <paramref name="oldPid"/>) suspended: starts the
+        /// debugger's attach and calls <paramref name="resume"/> (`restart-resume`) as soon as the debugger has the pid (it is listed among its
+        /// debugged processes), the attach returned, or <see cref="ChameleonSettings.HoldResumeGraceMs"/> passed.
+        /// <para>
+        /// The resume does not wait for the attach call to <em>return</em>: attaching to a process whose first thread has not run can block until
+        /// the process runs (the debugger's break-in thread cannot start before the loader). Once the debug port is set the module-load events
+        /// bind start-up breakpoints after the resume. The process is resumed on every path (attach ok, not needed, failed, slow, cancelled,
+        /// threw). A resume that does not get through is reported (CML5997, "could not tell the broker to resume"); the broker resumes the
+        /// process by itself when its hold time passes. After the resume the attach is awaited up to
+        /// <see cref="ChameleonSettings.HoldAttachTimeoutMs"/>; a real failure (after the usual attempts) is CML5997, a hung attach too.
+        /// </para>
         /// </summary>
         public async Task<ReattachOutcome> OnRestartingAsync(
             int oldPid,
@@ -167,11 +191,31 @@ namespace Chameleon.Control
             Func<Task<ControlResponse>> resume,
             CancellationToken cancellationToken = default(CancellationToken))
         {
-            ReattachOutcome outcome = ReattachOutcome.Failed;
+            var attachCancel = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            Task<ReattachOutcome> attach = null;
             try
             {
-                var attachCancel = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                Task<ReattachOutcome> attach = OnRestartedAsync(oldPid, newPid, attachCancel.Token);
+                attach = OnRestartedAsync(oldPid, newPid, attachCancel.Token);
+                await WaitForDebuggerOrGraceAsync(attach, newPid).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _log("reattach: the attach to the held pid " + newPid + " failed: " + ex.Message);
+                _report(ClientDiagnostics.ReattachFailed(oldPid, newPid, ex.Message));
+                attach = null;
+            }
+            finally
+            {
+                await ResumeAsync(newPid, resume).ConfigureAwait(false);
+            }
+
+            if (attach == null)
+            {
+                return ReattachOutcome.Failed;
+            }
+
+            try
+            {
                 int waitMs = Math.Max(1, _settings.HoldAttachTimeoutMs);
                 var stopWaiting = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 Task timeout = _attachTimeout(TimeSpan.FromMilliseconds(waitMs), stopWaiting.Token);
@@ -179,33 +223,69 @@ namespace Chameleon.Control
                 if (first == attach)
                 {
                     stopWaiting.Cancel();
-                    outcome = await attach.ConfigureAwait(false);
+                    return await attach.ConfigureAwait(false);
                 }
-                else
-                {
-                    // Too slow: stop waiting (the debugger may still finish later; the process is already running by then) and resume.
-                    attachCancel.Cancel();
-                    _log("reattach: the debugger did not attach to the held pid " + newPid + " within " + waitMs + " ms; resuming it");
-                    _report(ClientDiagnostics.AttachTooSlow(oldPid, newPid, waitMs));
-                    var ignored = attach.ContinueWith(t => { var unobserved = t.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
-                }
+
+                // The process runs; the debugger still has not finished. Stop waiting (it may finish later).
+                attachCancel.Cancel();
+                _log("reattach: the debugger did not finish attaching to pid " + newPid + " within " + waitMs + " ms");
+                _report(ClientDiagnostics.AttachTooSlow(oldPid, newPid, waitMs));
+                var ignored = attach.ContinueWith(t => { var unobserved = t.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
             }
             catch (OperationCanceledException)
             {
-                _log("reattach: the attach to the held pid " + newPid + " was cancelled");
+                _log("reattach: the attach to pid " + newPid + " was cancelled");
                 _report(ClientDiagnostics.ReattachFailed(oldPid, newPid, "the attach was cancelled"));
             }
             catch (Exception ex)
             {
-                _log("reattach: the attach to the held pid " + newPid + " failed: " + ex.Message);
+                _log("reattach: the attach to pid " + newPid + " failed: " + ex.Message);
                 _report(ClientDiagnostics.ReattachFailed(oldPid, newPid, ex.Message));
+            }
+
+            return ReattachOutcome.Failed;
+        }
+
+        // Returns when the attach task finished (either way), the debugger lists the pid, or the grace period is over.
+        private async Task WaitForDebuggerOrGraceAsync(Task attach, int newPid)
+        {
+            var stop = new CancellationTokenSource();
+            try
+            {
+                Task grace = _resumeGrace(TimeSpan.FromMilliseconds(Math.Max(0, _settings.HoldResumeGraceMs)), stop.Token);
+                while (!attach.IsCompleted && !grace.IsCompleted)
+                {
+                    if (IsDebugged(newPid))
+                    {
+                        _log("reattach: the debugger has pid " + newPid + "; resuming it");
+                        return;
+                    }
+
+                    await Task.WhenAny(attach, grace, Task.Delay(50)).ConfigureAwait(false);
+                }
+
+                if (!attach.IsCompleted)
+                {
+                    _log("reattach: the debugger's attach to the held pid " + newPid + " has not returned within " + _settings.HoldResumeGraceMs +
+                         " ms (it may wait for the process to run); resuming it");
+                }
             }
             finally
             {
-                await ResumeAsync(newPid, resume).ConfigureAwait(false);
+                stop.Cancel();
             }
+        }
 
-            return outcome;
+        private bool IsDebugged(int pid)
+        {
+            try
+            {
+                return _debugger.GetDebuggedProcesses().Any(p => p.Pid == pid);
+            }
+            catch (Exception)
+            {
+                return false;
+            }
         }
 
         private async Task ResumeAsync(int newPid, Func<Task<ControlResponse>> resume)
@@ -224,13 +304,13 @@ namespace Chameleon.Control
                 else
                 {
                     _log("reattach: restart-resume for pid " + newPid + " was refused: " + (answer.Error != null ? answer.Error.ToString() : "no detail"));
-                    _report(ClientDiagnostics.ResumeFailed(newPid, answer.Error != null ? answer.Error.Id + " " + answer.Error.Message : "the broker refused"));
+                    _report(ClientDiagnostics.ResumeFailed(newPid, answer.Error != null ? answer.Error.Id + " " + answer.Error.Message : "the broker refused", _settings.RestartHoldMs));
                 }
             }
             catch (Exception ex)
             {
                 _log("reattach: restart-resume for pid " + newPid + " failed: " + ex.Message);
-                _report(ClientDiagnostics.ResumeFailed(newPid, ex.Message));
+                _report(ClientDiagnostics.ResumeFailed(newPid, ex.Message, _settings.RestartHoldMs));
             }
         }
 

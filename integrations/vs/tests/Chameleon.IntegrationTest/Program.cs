@@ -129,7 +129,7 @@ namespace Chameleon.IntegrationTest
                     if (ev.TryGetRestarting(out int ro, out int rn))
                     {
                         // What the extension's controller does (ChameleonController.OnBrokerEvent): only for a restart it asked to hold.
-                        if (coordinator.TryClaimRestarting())
+                        if (coordinator.TryClaimRestarting(ev.Str("token")))
                         {
                             _restartingAt = DateTime.UtcNow;
                             _fixture?.MarkOutput();        // the old process is gone and the new one is held: whatever is printed from now on, ran
@@ -138,7 +138,9 @@ namespace Chameleon.IntegrationTest
                             {
                                 _resumeSentAt = DateTime.UtcNow;
                                 _outputAtResume = _fixture != null ? _fixture.OutputSinceMark() : "";
-                                return session.ResumeAsync(rn);
+                                Task<ControlResponse> sent = session.ResumeAsync(rn);
+                                debugger.BlockUntil?.TrySetResult(true);   // a blocking attach returns now that the process runs
+                                return sent;
                             }));
                         }
                     }
@@ -277,17 +279,24 @@ namespace Chameleon.IntegrationTest
                 // ---- WP-34: restart {hold_new}: attach to the process before it runs, then resume ----------------------------------
                 Check(coordinator.ShouldHoldNewProcess(session.Supports(Capabilities.RestartHold)), "the extension decides to hold the new process (re-attach on, broker has restart-hold)");
                 int heldTarget = newPid;
-                for (int round = 1; round <= 2; round++)
+                // Round 1: a slow debugger (attach returns after 1.5 s). Round 2: an attach that fails. Round 3: an attach that only returns once the
+                // process runs (what a real attach to a suspended process may do): the extension resumes after its grace period (1.5 s here).
+                for (int round = 1; round <= 3; round++)
                 {
                     bool failAttach = round == 2;
-                    string label = failAttach ? "attach-failure" : "hold";
+                    bool blocksUntilResumed = round == 3;
+                    string label = failAttach ? "attach-failure" : blocksUntilResumed ? "attach-blocks" : "hold";
                     debugger.FailAttach = failAttach;
-                    // A slow debugger: the attach takes 1.5 s, during which the new process must not print anything.
+                    settings.HoldResumeGraceMs = blocksUntilResumed ? 1500 : 3000;
+                    debugger.BlockUntil = blocksUntilResumed ? new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously) : null;
                     string outputAtAttach = null;
-                    debugger.BeforeAttach = async p =>
+                    debugger.BeforeAttach = blocksUntilResumed ? (Func<int, Task>)null : async p =>
                     {
                         await Task.Delay(1500);
-                        outputAtAttach = fixtureProc.OutputSinceMark();
+                        if (outputAtAttach == null)
+                        {
+                            outputAtAttach = fixtureProc.OutputSinceMark();   // the first attempt: the new process has not run yet
+                        }
                     };
                     debugger.Attach(heldTarget, "Native");   // the shell's debugger is attached to the process about to be restarted ...
                     coordinator.Observe();                   // ... and the extension remembers it before it sends the restart
@@ -298,8 +307,8 @@ namespace Chameleon.IntegrationTest
                     _outputAtResume = null;
                     _resumeSentAt = default(DateTime);
 
-                    object ticket = coordinator.ExpectRestarting();
-                    ControlResponse held = await session.RestartAsync(heldTarget, holdMs: 30000);   // answered after the resume and the registration
+                    ReattachCoordinator.HoldTicket ticket = coordinator.ExpectRestarting();
+                    ControlResponse held = await session.RestartAsync(heldTarget, holdMs: 30000, holdToken: ticket.Token);   // answered after the resume and the registration
                     coordinator.RestartingNoLongerExpected(ticket);
                     bool heldOk = Check(held.Ok, label + ": the held restart answered ok (" + (held.Error != null ? held.Error.ToString() : "") + ")");
                     int heldOld = heldOk && held.Result["old_pid"] != null ? (int)held.Result["old_pid"] : 0;
@@ -321,17 +330,23 @@ namespace Chameleon.IntegrationTest
                     bool attachCalled = debugger.AttachCalls.Skip(attachesBefore).Any(c => c.Pid == heldNew);
                     bool beforeResume = _outputAtResume != null && !Regex.IsMatch(_outputAtResume, @"TICK n=");
                     Check(beforeResume, label + ": the new process printed nothing before restart-resume (output since `restarting`: '" + (_outputAtResume ?? "(no resume)").Replace("\n", "|") + "')");
-                    Check(outputAtAttach != null && !Regex.IsMatch(outputAtAttach, @"TICK n="), label + ": the new process printed nothing while the debugger was attaching");
+                    if (!blocksUntilResumed)
+                    {
+                        Check(outputAtAttach != null && !Regex.IsMatch(outputAtAttach, @"TICK n="), label + ": the new process printed nothing while the debugger was attaching");
+                    }
+
                     Check(attachCalled, label + ": the debugger was asked to attach the held pid");
                     int attachMs = (int)(_resumeSentAt - _restartingAt).TotalMilliseconds;
-                    Check(attachMs >= 1400, label + ": the resume came after the slow attach (" + attachMs + " ms after `restarting`)");
+                    Check(attachMs >= (blocksUntilResumed ? 1000 : 1400) && attachMs < 15000, label + ": the resume came after the attach started and a bounded wait (" + attachMs + " ms after `restarting`)");
                     if (failAttach)
                     {
-                        Check(reattachReports.Count == reportsBefore + 1 && reattachReports.Last().Id == "CML5997", label + ": the failed attach was reported as CML5997 (" + string.Join("; ", reattachReports.Select(d => d.Id)) + ")");
+                        // The failure comes after the resume (the attempts take longer than the grace period).
+                        Check(await WaitFor(() => reattachReports.Count == reportsBefore + 1, 20000) && reattachReports.Last().Id == "CML5997", label + ": the failed attach was reported as CML5997 (" + string.Join("; ", reattachReports.Select(d => d.Id)) + ")");
                     }
                     else
                     {
-                        Check(debugger.GetDebuggedProcesses().Any(d => d.Pid == heldNew), label + ": the debugger is attached to the new pid");
+                        // A blocking attach returns once the process runs: the debugger is attached shortly after the resume.
+                        Check(await WaitFor(() => debugger.GetDebuggedProcesses().Any(d => d.Pid == heldNew), 20000), label + ": the debugger is attached to the new pid");
                         Check(reattachReports.Count == reportsBefore, label + ": nothing was reported");
                     }
 
@@ -349,6 +364,7 @@ namespace Chameleon.IntegrationTest
 
                 debugger.BeforeAttach = null;
                 debugger.FailAttach = false;
+                debugger.BlockUntil = null;
                 return Finish(brokerProc, fixtureProc);
             }
             finally
@@ -505,6 +521,9 @@ namespace Chameleon.IntegrationTest
             /// <summary>WP-34: attaching throws (the debugger refuses).</summary>
             public bool FailAttach;
 
+            /// <summary>WP-34: when set, attaching returns only once this completes (the resume), like a real attach to a suspended process.</summary>
+            public volatile TaskCompletionSource<bool> BlockUntil;
+
             public async Task AttachAsync(int pid, IReadOnlyList<string> engines, CancellationToken cancellationToken)
             {
                 Calls.Enqueue((pid, engines.ToArray()));
@@ -512,6 +531,12 @@ namespace Chameleon.IntegrationTest
                 if (before != null)
                 {
                     await before(pid).ConfigureAwait(false);
+                }
+
+                TaskCompletionSource<bool> block = BlockUntil;
+                if (block != null)
+                {
+                    await block.Task.ConfigureAwait(false);
                 }
 
                 if (FailAttach)

@@ -51,7 +51,7 @@ cml_target_exceptions_allowed(cml_it_restart_hold)
 set_target_properties(cml_it_restart_hold PROPERTIES FOLDER "tests")
 add_dependencies(cml_it_restart_hold cml_broker cml_agent fixture_hot_restart)
 
-foreach(_scenario resume timeout disconnect not-held broker-killed)
+foreach(_scenario resume timeout disconnect not-held broker-killed two-holds)
     string(REPLACE "-" "_" _name "${_scenario}")
     add_test(NAME integration.restart_hold_${_name}
         COMMAND cml_it_restart_hold

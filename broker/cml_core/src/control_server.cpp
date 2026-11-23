@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "cml/core/pipeline_diag_ids.h"
+#include "cml/core/restart_diag_ids.h"
 #include "cml/proc/diag_ids.h"
 #include "cml/util/log.h"
 
@@ -521,21 +522,39 @@ void ControlServer::serve(Connection& connection) {
         if (received->text.empty()) {
             continue;
         }
-        if (restart_worker_done.load(std::memory_order_acquire) && received->text.find("hold_new") != std::string::npos) {
-            Result<ipc::ControlRequest> held = ipc::decode_request(received->text);
-            const ipc::json::Value* hold_new = held ? held->args.find("hold_new") : nullptr;
-            if (held && held->cmd == "restart" && hold_new != nullptr && hold_new->is_bool() && hold_new->as_bool()) {
-                if (restart_worker.joinable()) {
-                    restart_worker.join();
+        const bool worker_active = !restart_worker_done.load(std::memory_order_acquire);
+        if (worker_active || received->text.find("hold_new") != std::string::npos) {
+            Result<ipc::ControlRequest> parsed = ipc::decode_request(received->text);
+            if (parsed) {
+                const ipc::json::Value* hold_new = parsed->args.find("hold_new");
+                const bool wants_hold = parsed->cmd == "restart" && hold_new != nullptr && hold_new->is_bool() && hold_new->as_bool();
+                if (worker_active && (parsed->cmd == "wait" || parsed->cmd == "restart")) {
+                    // A held restart of this connection is running: `wait` (and a second `restart`) would block this thread, which has to stay free to
+                    // read `restart-resume` and to notice a disconnect. Refused busy at once; every other command is served inline as before.
+                    const std::string busy = encode_control_response(ipc::make_error_response(
+                        parsed->id, Diag::make(restart::diag::kBusy, "a restart that holds a process is running on this connection; `" + parsed->cmd + "` cannot run meanwhile",
+                                               "Send `restart-resume`, wait for the restart's answer, or use another connection.")));
+                    Result<ipc::IoStatus> sent_busy = sender->send_line(busy, kSendTimeoutMs);
+                    if (!sent_busy || *sent_busy != ipc::IoStatus::Ok) {
+                        break;
+                    }
+                    continue;
                 }
-                restart_worker_done.store(false, std::memory_order_release);
-                restart_worker = std::thread([&, request = std::move(*held)] {
-                    CML_LOG(Debug, "control request %lld: restart (hold_new)", static_cast<long long>(request.id));
-                    const std::string reply = encode_control_response(handle_control_request(request, local));
-                    (void)sender->send_line(reply, kSendTimeoutMs);
-                    restart_worker_done.store(true, std::memory_order_release);
-                });
-                continue;
+                if (!worker_active && wants_hold) {
+                    if (restart_worker.joinable()) {
+                        restart_worker.join();  // the previous worker has finished its handler (it may still be sending its answer)
+                    }
+                    restart_worker_done.store(false, std::memory_order_release);
+                    restart_worker = std::thread([&, request = std::move(*parsed)] {
+                        CML_LOG(Debug, "control request %lld: restart (hold_new)", static_cast<long long>(request.id));
+                        const std::string reply = encode_control_response(handle_control_request(request, local));
+                        // Done *before* the answer goes out: a client that sends its next held restart as soon as it has this answer must find the
+                        // connection thread ready to hand it to a worker again (never served inline, where restart-resume could not be read).
+                        restart_worker_done.store(true, std::memory_order_release);
+                        (void)sender->send_line(reply, kSendTimeoutMs);
+                    });
+                    continue;
+                }
             }
         }
         const std::string answer = handle_control_line(received->text, local);
