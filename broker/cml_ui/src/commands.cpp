@@ -28,6 +28,7 @@ const std::vector<std::string>& passive_capabilities() {
         ipc::capability::kDiagEvents,  // `diag` events: the compile output panel
         ipc::capability::kFaultInjection,  // WP-28: `inject-failure` / `fault-stages` are for the test harness; the UI offers no button for them
         ipc::capability::kReexecute,   // WP-23: a further action of `exception-action` (and `exception_updated` events), not a command
+        ipc::capability::kRestartHold,  // WP-34: `restart {hold_new}` / `restart-resume` serve a debugger hand-over; the UI restarts without holding
     };
     return passive;
 }
