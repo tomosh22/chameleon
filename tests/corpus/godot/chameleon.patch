@@ -1,0 +1,88 @@
+diff --git a/SConstruct b/SConstruct
+index a450b04..d5ba17e 100644
+--- a/SConstruct
++++ b/SConstruct
+@@ -763,9 +763,13 @@ if env.msvc:
+     else:
+         env.AppendUnique(LINKFLAGS=["/DEBUG:NONE"])
+ 
++    # Chameleon corpus (WP-26): the build requirements of docs/BUILD_REQUIREMENTS.md.
++    env.AppendUnique(CCFLAGS=["/Gy", "/hotpatch"])
++    env.AppendUnique(LINKFLAGS=["/FUNCTIONPADMIN"])
++
+     if env["optimize"].startswith("speed"):
+-        env["OPTIMIZELEVEL"] = "/O2"
+-        env.AppendUnique(LINKFLAGS=["/OPT:REF"])
++        env["OPTIMIZELEVEL"] = "/O2 /Ob0"  # Chameleon corpus (WP-26): /Ob0, no stale inlined copies
++        env.AppendUnique(LINKFLAGS=["/OPT:NOREF", "/OPT:NOICF"])  # Chameleon corpus (WP-26): was /OPT:REF
+         if env["optimize"] == "speed_trace":
+             env.AppendUnique(LINKFLAGS=["/OPT:NOICF"])
+     elif env["optimize"].startswith("size"):
+diff --git a/platform/windows/SCsub b/platform/windows/SCsub
+index 62d28f4..329e66a 100644
+--- a/platform/windows/SCsub
++++ b/platform/windows/SCsub
+@@ -14,6 +14,7 @@ sources = []
+ 
+ common_win = [
+     "godot_windows.cpp",
++    "chameleon_corpus.cpp",  # Chameleon corpus (WP-26)
+     "os_windows.cpp",
+     "display_server_windows.cpp",
+     "key_mapping_windows.cpp",
+diff --git a/platform/windows/os_windows.cpp b/platform/windows/os_windows.cpp
+index 6c76e53..a3b761d 100644
+--- a/platform/windows/os_windows.cpp
++++ b/platform/windows/os_windows.cpp
+@@ -30,6 +30,10 @@
+ 
+ #include "os_windows.h"
+ 
++#include "chameleon_corpus.h" // Chameleon corpus (WP-26)
++
++extern "C" void cml_corpus_utils_frame(void); // Chameleon corpus (WP-26): windows_utils.cpp
++
+ #include "display_server_windows.h"
+ #include "lang_table.h"
+ #include "windows_terminal_logger.h"
+@@ -2327,11 +2331,14 @@ void OS_Windows::run() {
+ 
+ 	main_loop->initialize();
+ 
++	cml_corpus_init(); // Chameleon corpus (WP-26)
+ 	while (true) {
+ 		DisplayServer::get_singleton()->process_events(); // get rid of pending events
+ 		if (Main::iteration()) {
+ 			break;
+ 		}
++		cml_corpus_frame(); // Chameleon corpus (WP-26)
++		cml_corpus_utils_frame(); // Chameleon corpus (WP-26)
+ 	}
+ 
+ 	main_loop->finalize();
+diff --git a/platform/windows/windows_utils.cpp b/platform/windows/windows_utils.cpp
+index 7015f63..f70f5eb 100644
+--- a/platform/windows/windows_utils.cpp
++++ b/platform/windows/windows_utils.cpp
+@@ -30,6 +30,8 @@
+ 
+ #include "windows_utils.h"
+ 
++#include "chameleon_corpus.h" // Chameleon corpus (WP-26)
++
+ #ifdef WINDOWS_ENABLED
+ 
+ #include "core/error/error_macros.h"
+@@ -278,4 +280,12 @@ void WindowsUtils::remove_temp_pdbs(const String &p_dll_path) {
+ #endif
+ }
+ 
++// Chameleon corpus (WP-26): a function of this translation unit that runs once per frame (an edit target).
++extern "C" {
++int g_cml_corpus_utils_ticks = 0;
++void cml_corpus_utils_frame(void) {
++	g_cml_corpus_utils_ticks = g_cml_corpus_utils_ticks + 1;
++}
++}
++
+ #endif // WINDOWS_ENABLED
