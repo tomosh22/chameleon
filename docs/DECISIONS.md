@@ -802,3 +802,56 @@ records the chosen compiler and its version. The cells therefore test the clang-
 - **`_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH`:** not used; it builds a combination Microsoft does not support.
 - **Other workflows:** `corpus.yml` (WP-26) and `fuzz.yml` (WP-28) select clang-cl the same old way. Each owner applies this rule
   when its workflow runs on an image where the standalone LLVM is too old.
+
+## ADR-0038 Wave-8 ranges, directories, CI ownership and integration contracts (extends ADR-0008/0035)
+
+**Date:** 2026-11-23 · **Status:** Accepted
+
+Wave 8 (WP-29 CMake integration, WP-30 VS Code extension, WP-31 Visual Studio extension, WP-32 packaging) runs all four
+packages in parallel. WP-32 depends on the other three and merges last.
+
+**Diagnostic ranges**
+
+| Range | Owner |
+|---|---|
+| CML1700–1749 | WP-29 CMake integration (configure-time messages of `chameleon_enable`) |
+| CML5990–5993 | WP-30 VS Code extension (client-side failures: no broker, pipe lost, unsupported broker) |
+| CML5994–5997 | WP-31 Visual Studio extension (same, plus re-attach failures) |
+| CML5998–5999 | WP-32 licensing hook |
+
+**Directories.** WP-29: `integrations/cmake/`, `cmake/` install and export rules, the top-level `CMakeLists.txt`
+(`project(... VERSION)`, install and export), and `tests/fixtures/CmlFixture.cmake`. WP-30: `integrations/vscode/`. WP-31:
+`integrations/vs/`. WP-32: `tools/package/`, `core/cml_license/` (plus one call at broker start-up), `docs/QUICKSTART.md`,
+`docs/TROUBLESHOOTING.md`, `docs/BUILD_REQUIREMENTS.md`, `README.md`.
+
+**CI ownership.** WP-29 is the only package that edits `.github/workflows/ci.yml`, and only steps inside existing jobs (job
+names and the job count, 14, stay). WP-30 adds `vscode.yml`, WP-31 adds `vs.yml`, WP-32 adds `package.yml`. Each runs on
+`workflow_dispatch`, on `push` to `main`, and on `pull_request` filtered to its own paths, so the PR that adds it carries
+its own acceptance run.
+
+**Integration contracts**
+
+- **Clients only.** The extensions use only the existing control pipe (ADR-0011 transport and framing; commands `status`,
+  `reload`, `restart`, `revert`, `subscribe`; events `diag`, `patch_applied`, `patch_reverted`, `restarted`, `exception`).
+  They may ask for added fields in their PR, but must not rename anything. A missing capability disables that feature
+  (ADR-0032).
+- **Build entry points for WP-32.** WP-30: `npm ci && npm run package` in `integrations/vscode` writes exactly one
+  `integrations/vscode/*.vsix`. WP-31: `integrations/vs/build.ps1 -Configuration Release` writes
+  `integrations/vs/out/*.vsix`. WP-29: `cmake --install <build> --prefix <dir>` lays out `bin/`, `include/`, `lib/` and
+  `lib/cmake/Chameleon/` (`ChameleonConfig.cmake`, `ChameleonConfigVersion.cmake`, imported target `Chameleon::agent`,
+  function `chameleon_enable(target)`).
+- **`chameleon_enable(target)`** applies the flags in `docs/BUILD_REQUIREMENTS.md`, links the agent, and makes
+  `cml_broker check` report 0 WARN on the target under cl and clang-cl. The fixtures go through it (in-tree mode), and CI
+  builds an example project against an install tree with `find_package(Chameleon)`.
+- **Release package (WP-32):** RelWithDebInfo with `CML_FAULT_INJECTION=OFF` and `CML_BUILD_TESTS=OFF`, built by
+  `package.yml`. `docs/TROUBLESHOOTING.md` has an entry for every diagnostic id defined in code, kept in sync by a check
+  that runs in CI.
+- **Dependencies:** permissive licences only (MIT, BSD, Apache-2.0, Microsoft SDK packages for building the VSIX). No
+  GPL/LGPL in any dependency tree; each extension records its dependency licences in its README.
+- **Acceptance.** The plan's "manual checklist" stays: each extension's `docs/wp/WP-NN.md` contains one, and the user runs
+  it. Automated proxies are required on top:
+  - each extension's control client is tested in its workflow against a real `cml_broker` and a running fixture;
+  - WP-31's re-attach logic is unit-tested behind a debugger interface;
+  - the `.vsix` is built and uploaded as an artefact.
+  - WP-32's quickstart is followed by a fresh agent that has no prior context, as plan WP-32 requires. The orchestrator
+    runs that check as a workflow on a clean windows-2022 runner.
