@@ -74,9 +74,6 @@ async function main(): Promise<void> {
     }
   };
 
-  const defaultPipe = await resolveControlPipe("", { env, run: realDeps.run, listPipes: () => [] });
-  console.log(`WP30-IT pipe=${defaultPipe} derived=whoami`);
-
   const broker = spawn(brokerExe, ["--headless", "--pipe", agentPipe, "--log", brokerLog, "--startup-timeout", "300000", "--verbose"], {
     cwd: work,
     env: { ...env, CML_SESSION_DIR: path.join(work, "broker-session") },
@@ -84,6 +81,8 @@ async function main(): Promise<void> {
     windowsHide: true,
   });
   children.push(broker);
+  const defaultPipe = await resolveControlPipe("", { env, run: realDeps.run, listPipes: realDeps.listPipes });
+  console.log(`WP30-IT pipe=${defaultPipe} derived=whoami-or-powershell`);
   let brokerExit: number | null | undefined;
   broker.on("exit", (code) => (brokerExit = code));
 

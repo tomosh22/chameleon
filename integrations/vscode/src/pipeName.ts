@@ -3,7 +3,8 @@
 //   2. else the CML_CONTROL_PIPE environment variable,
 //   3. else \\.\pipe\cml_control_<logon-session SID>.
 // The logon-session SID is the token group flagged SE_GROUP_LOGON_ID (S-1-5-5-X-Y); the broker falls back to the user SID when the
-// token has none. Node cannot read tokens, so `whoami /groups` is asked (the logon-id group is the one whose SID starts with S-1-5-5-).
+// token has none. Node cannot read tokens, so `whoami /groups` is asked, then PowerShell's WindowsIdentity (the logon-id group is the
+// one whose SID starts with S-1-5-5-).
 // No `vscode` import.
 
 import { execFile } from "node:child_process";
@@ -66,6 +67,21 @@ export async function resolveControlPipe(explicitName: string, deps: PipeNameDep
       sid = parseLogonSid(await deps.run("whoami", ["/groups", "/fo", "csv", "/nh"]));
     } catch {
       sid = undefined;
+    }
+    if (!sid) {
+      // `whoami /groups` does not always list the logon-id group (it is missing on the GitHub runners); .NET's token view does.
+      try {
+        sid = parseLogonSid(
+          await deps.run("powershell.exe", [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[System.Security.Principal.WindowsIdentity]::GetCurrent().Groups | ForEach-Object { $_.Value }",
+          ]),
+        );
+      } catch {
+        sid = undefined;
+      }
     }
     if (sid) {
       name = `${PIPE_PREFIX}cml_control_${sid}`;

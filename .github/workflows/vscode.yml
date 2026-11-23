@@ -83,6 +83,7 @@ jobs:
         run: |
           whoami /groups /fo csv /nh
           whoami /user /fo csv /nh
+          powershell -NoProfile -Command "[System.Security.Principal.WindowsIdentity]::GetCurrent().Groups | ForEach-Object { $_.Value }"
 
       - name: Integration test (control client against a real broker and fixture)
         working-directory: ${{ env.EXT_DIR }}

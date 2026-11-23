@@ -19,8 +19,13 @@ describe("resolveControlPipe", () => {
   it("derives cml_control_<logon SID> from whoami", async () => {
     assert.equal(await resolveControlPipe("", deps()), "\\\\.\\pipe\\cml_control_S-1-5-5-0-123456");
   });
+  it("asks PowerShell when whoami lists no logon-id group", async () => {
+    const run = async (f: string): Promise<string> => (f === "whoami" ? '"Everyone","x","S-1-1-0","y"' : "S-1-1-0\r\nS-1-5-5-0-777\r\n");
+    assert.equal(await resolveControlPipe("", deps({ run })), "\\\\.\\pipe\\cml_control_S-1-5-5-0-777");
+  });
   it("falls back to the user SID, as the broker does", async () => {
-    const run = async (_f: string, args: string[]): Promise<string> => (args[0] === "/groups" ? '"Everyone","x","S-1-1-0","y"' : '"PC\\me","S-1-5-21-1-2-3-1001"');
+    const run = async (f: string, args: string[]): Promise<string> =>
+      f !== "whoami" ? "S-1-1-0" : args[0] === "/groups" ? '"Everyone","x","S-1-1-0","y"' : '"PC\\me","S-1-5-21-1-2-3-1001"';
     assert.equal(await resolveControlPipe("", deps({ run })), "\\\\.\\pipe\\cml_control_S-1-5-21-1-2-3-1001");
   });
   it("falls back to a single cml_control_ pipe that exists", async () => {
