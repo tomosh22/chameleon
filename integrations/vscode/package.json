@@ -41,9 +41,10 @@
           "description": "Connect to the broker when VS Code starts and keep reconnecting until Disconnect is run."
         },
         "chameleon.reloadTimeoutMs": {
-          "type": "number",
+          "type": "integer",
           "default": 60000,
           "minimum": 1000,
+          "maximum": 3600000,
           "description": "Time limit passed to the broker for a reload, in milliseconds."
         },
         "chameleon.watchExceptions": {
@@ -57,7 +58,7 @@
       {
         "name": "chameleon",
         "owner": "chameleon",
-        "fileLocation": [ "relative", "${workspaceFolder}" ],
+        "fileLocation": [ "autoDetect", "${workspaceFolder}" ],
         "severity": "error",
         "pattern": {
           "regexp": "^\\s*(.+?)\\((\\d+)(?:,(\\d+))?\\)\\s*:\\s+(?:fatal\\s+)?(error|warning|note)\\s+([A-Za-z]+\\d+)\\s*:\\s*(.*)$",
@@ -72,7 +73,7 @@
       {
         "name": "chameleon-clang",
         "owner": "chameleon",
-        "fileLocation": [ "relative", "${workspaceFolder}" ],
+        "fileLocation": [ "autoDetect", "${workspaceFolder}" ],
         "severity": "error",
         "pattern": {
           "regexp": "^\\s*((?:[A-Za-z]:)?[^:\\n]+?):(\\d+):(?:(\\d+):)?\\s+(?:fatal\\s+)?(error|warning|note):\\s*(.*)$",

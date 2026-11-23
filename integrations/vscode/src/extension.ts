@@ -85,9 +85,6 @@ export function activate(context: vscode.ExtensionContext): void {
     if (ev.event === "diag" && typeof ev.message === "string") {
       addProblems(ev.message);
     }
-    if (ev.event === "patch_applied") {
-      problems.clear();
-    }
     if (ev.event === "exception") {
       void offerExceptionActions(ev);
     }
@@ -95,6 +92,8 @@ export function activate(context: vscode.ExtensionContext): void {
   });
   session.on("state", (s: string) => {
     if (s === "connected") {
+      lastResult = undefined;
+      lastFailed = false;
       log(stamp(`connected to the broker${session.status?.version ? ` ${session.status.version}` : ""} (capabilities: ${[...session.capabilities].join(", ")})`));
       const missing = session.missingCapabilities;
       if (missing.length > 0) {
@@ -183,7 +182,7 @@ export function activate(context: vscode.ExtensionContext): void {
     problems.clear();
     refreshBar();
     log(stamp("reload requested"));
-    const timeout = config().get<number>("reloadTimeoutMs", 60000);
+    const timeout = Math.min(3600000, Math.max(1000, Math.round(Number(config().get<number>("reloadTimeoutMs", 60000)) || 60000)));
     const result = await run("reload", { timeout_ms: timeout }, "reload", timeout + 15000);
     reloading = false;
     if (result) {
@@ -271,6 +270,7 @@ export function activate(context: vscode.ExtensionContext): void {
   reg("chameleon.disconnect", () => {
     session.stop();
     lastResult = undefined;
+    lastFailed = false;
     log(stamp("disconnected"));
     refreshBar();
   });

@@ -110,6 +110,9 @@ export class Session extends EventEmitter {
   /** Starts connecting and keeps reconnecting until stop(). Resolves when the first attempt has ended (connected or not). */
   async start(): Promise<void> {
     this.wanted = true;
+    if (this.state !== "disconnected") {
+      return; // already connected, or an attempt is running: a second pair of connections would deliver every event twice
+    }
     this.cancelTimer();
     await this.connectOnce();
   }
@@ -181,9 +184,20 @@ export class Session extends EventEmitter {
     let pipe = "";
     let commands: ControlClient | undefined;
     let events: ControlClient | undefined;
+    // A connection that closes during the handshake is remembered here; once committed, a close means the pipe was lost.
+    let committed = false;
+    let early: Diag | undefined;
+    const onClosed = (d: Diag): void => {
+      if (committed) {
+        this.onLost(epoch, d);
+      } else {
+        early = early ?? d;
+      }
+    };
     try {
       pipe = await this.options.resolvePipe();
       commands = await ControlClient.connect(pipe, this.options.connectTimeoutMs ?? 5000);
+      commands.on("close", onClosed);
       const status = parseStatus(await commands.request("status", {}, 10000));
       const caps = new Set(status.capabilities);
       if (epoch !== this.epoch) {
@@ -192,6 +206,7 @@ export class Session extends EventEmitter {
       }
       if (caps.has("subscribe")) {
         events = await ControlClient.connect(pipe, this.options.connectTimeoutMs ?? 5000);
+        events.on("close", onClosed);
         events.on("event", (ev: ControlEvent) => this.onEvent(ev));
         const names = subscriptionEvents(caps, this.options.watchExceptions());
         await events.request("subscribe", { events: names }, 15000);
@@ -201,13 +216,15 @@ export class Session extends EventEmitter {
         events?.close();
         return;
       }
+      if (early) {
+        throw new DiagError(early);
+      }
+      committed = true;
       this.commands = commands;
       this.events = events;
       this.refused.clear();
       this.attempt = 0;
       this.lastProblem = undefined;
-      commands.on("close", (d: Diag) => this.onLost(epoch, d));
-      events?.on("close", (d: Diag) => this.onLost(epoch, d));
       this.status = undefined;
       this.applyStatus(status);
       this.setState("connected");

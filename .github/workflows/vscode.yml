@@ -1,11 +1,15 @@
 name: vscode
 
 # WP-30: the VS Code extension (integrations/vscode). Triggers follow ADR-0038: workflow_dispatch, push to main, and pull_request
-# filtered to the extension's own paths. The push trigger on wp/30-* (also path-filtered) lets the branch be tested before its PR exists.
+# filtered to the extension's own paths. Pushes (to main and to wp/30-* branches, so the branch can be tested before its PR exists)
+# use the same paths filter.
 
 on:
   push:
     branches: [main, 'wp/30-*']
+    paths:
+      - 'integrations/vscode/**'
+      - '.github/workflows/vscode.yml'
   pull_request:
     branches: [main]
     paths:

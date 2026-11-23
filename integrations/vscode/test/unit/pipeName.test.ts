@@ -28,6 +28,14 @@ describe("resolveControlPipe", () => {
       f !== "whoami" ? "S-1-1-0" : args[0] === "/groups" ? '"Everyone","x","S-1-1-0","y"' : '"PC\\me","S-1-5-21-1-2-3-1001"';
     assert.equal(await resolveControlPipe("", deps({ run })), "\\\\.\\pipe\\cml_control_S-1-5-21-1-2-3-1001");
   });
+  it("prefers the user SID over a listed pipe that may be another user's", async () => {
+    const run = async (f: string, args: string[]): Promise<string> =>
+      f !== "whoami" ? "S-1-1-0" : args[0] === "/groups" ? '"Everyone","x","S-1-1-0","y"' : '"PC\\me","S-1-5-21-1-2-3-1001"';
+    assert.equal(
+      await resolveControlPipe("", deps({ run, listPipes: () => ["cml_control_S-1-5-5-0-9"] })),
+      "\\\\.\\pipe\\cml_control_S-1-5-21-1-2-3-1001",
+    );
+  });
   it("falls back to a single cml_control_ pipe that exists", async () => {
     const run = async (): Promise<string> => {
       throw new Error("no whoami");

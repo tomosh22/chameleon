@@ -86,19 +86,19 @@ export async function resolveControlPipe(explicitName: string, deps: PipeNameDep
     if (sid) {
       name = `${PIPE_PREFIX}cml_control_${sid}`;
     } else {
-      // No logon-id group visible: a broker of this user serving a default-named pipe is the better guess when it is unambiguous;
-      // the broker itself falls back to the user SID only when its token has no logon-id group at all.
-      const found = deps.listPipes().filter((p) => /^cml_control_S-1-/.test(p));
+      // No logon-id group visible: the broker's own rule is the user SID (its token has no logon-id group at all then). A listed
+      // cml_control_* pipe is accepted only when nothing better is known and it is the only one.
       let userSid: string | undefined;
       try {
         userSid = parseUserSid(await deps.run("whoami", ["/user", "/fo", "csv", "/nh"]));
       } catch {
         userSid = undefined;
       }
-      if (found.length === 1) {
-        name = PIPE_PREFIX + found[0];
-      } else if (userSid) {
+      const found = deps.listPipes().filter((p) => /^cml_control_S-1-/.test(p));
+      if (userSid) {
         name = `${PIPE_PREFIX}cml_control_${userSid}`;
+      } else if (found.length === 1) {
+        name = PIPE_PREFIX + found[0];
       } else {
         throw new PipeNameError("the default control pipe name could not be derived (whoami gave no logon-session SID)");
       }

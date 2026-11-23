@@ -193,4 +193,61 @@ describe("Session", () => {
       await server.close();
     }
   });
+
+  it("Connect while connected keeps one pair of connections: events arrive once", async () => {
+    const pipe = testPipePath();
+    const server = broker(pipe);
+    await server.listen();
+    const s = makeSession(pipe);
+    try {
+      const events: ControlEvent[] = [];
+      s.on("event", (e: ControlEvent) => events.push(e));
+      await s.start();
+      await s.start();
+      assert.equal(server.connections.length, 2);
+      const evConn = server.connections.find((c) => c.requests.some((r) => r.cmd === "subscribe"));
+      evConn?.event({ event: "diag", id: "CML1", message: "x" });
+      await sleep(100);
+      assert.equal(events.length, 1);
+    } finally {
+      s.stop();
+      await server.close();
+    }
+  });
+
+  it("a close during the handshake is not lost: the session does not stay connected on a dead client", async () => {
+    const pipe = testPipePath();
+    let dropped = false;
+    const server: FakeServer = new FakeServer(pipe, (cmd, args, conn) => {
+      if (cmd === "status") {
+        return STATUS_ALL;
+      }
+      if (cmd === "subscribe") {
+        if (!dropped) {
+          dropped = true;
+          server.connections[0].socket.destroy(); // the commands pipe goes while subscribe is pending
+          setTimeout(() => conn.send({ id: 1, ok: true, result: { events: args.events } }), 50); // answered late, request id 1
+          return undefined;
+        }
+        return { events: args.events };
+      }
+      return undefined;
+    });
+    await server.listen();
+    const s = makeSession(pipe);
+    try {
+      const problems: string[] = [];
+      s.on("problem", (d: { id: string }) => problems.push(d.id));
+      await s.start();
+      // The first attempt's subscribe is answered, but its commands pipe is gone: that attempt must fail (CML5991) and the session
+      // reconnect, not report "connected" on a dead client.
+      assert.equal(s.state === "connected", false);
+      assert.ok(problems.includes("CML5991"));
+      await waitFor(() => s.state === "connected", 8000);
+      assert.equal((await s.call("status")).version, "0.1.0");
+    } finally {
+      s.stop();
+      await server.close();
+    }
+  });
 });
