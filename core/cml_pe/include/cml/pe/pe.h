@@ -322,6 +322,13 @@ private:
 
 // ---- files ----
 Result<std::vector<std::byte>> read_file(const std::string& path);  // CML1300
+// WP-39b: the leading bytes of an image file, enough for everything Image::parse reads: the DOS header and stub (with the
+// Rich header), the NT headers and the section table. At least the first 4096 bytes are returned, or the whole file when it
+// is shorter than what the headers need; section contents are never read, so the cost does not depend on the size of the
+// file. Image::parse on the result gives the same headers, and the same diagnostics, as on the whole file; an Image parsed
+// from it answers header questions only (file and optional header, data directory entries, section table), not what lives
+// in a section (exports, imports, the debug directory...). CML1300 like read_file.
+Result<std::vector<std::byte>> read_file_headers(const std::string& path);
 
 // An on-disk Image together with the bytes it views.
 // Copying is deleted: a copy's Image would still point into the original's buffer.

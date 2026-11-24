@@ -58,6 +58,10 @@ public:
 
     void kill(std::size_t id);
     void kill_all();
+    // WP-39b: true once every child and every other member of the job (compilers the broker started) has exited, false
+    // when some are still there after timeout_ms. kill_all() only asks for the processes to end; a file one of them had
+    // open can be rewritten reliably only after this.
+    bool wait_all_exited(std::uint32_t timeout_ms);
 
     // WP-21: the child `id` was replaced by another process (the broker restarted it): from now on `id` stands for process
     // `new_pid` (pid(), exit_code(), wait_exit(), dump_running() and kill() act on it). The old process handle is closed.

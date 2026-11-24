@@ -87,11 +87,17 @@ Result<LinkerDetection> decide_linker_family(const PeLinkerFacts& pe, const PdbL
 
 // Reads the PE at `pe_path` and its PDB (located like pdb::PdbIndex::open_for_pe), decides, and releases the PDB index
 // again before returning. A PDB that cannot be opened is a warning, not an error, as long as the PE alone decides.
-// The PE is loaded with cml_pe, whose diagnostic is returned as it is (CML1300 unreadable, CML1303 for PE32, ...).
+// The PE's headers are parsed with cml_pe, whose diagnostic is returned as it is (CML1300 unreadable, CML1303 for PE32,
+// ...). Only the headers of the file are read (pe::read_file_headers, WP-39b): the cost does not depend on the size of the
+// module, and nothing after the section table can make the detection fail.
 // lld-link is only inferred from the PE (linker version 14.0, no Rich header) when no PDB could be opened; that is the
 // warning CML3366 saying "inferred".
 Result<LinkerDetection> detect_module_linker(const std::string& pe_path, const pdb::OpenOptions& pdb_options = {},
                                              const DetectLinkerOptions& options = {});
+// WP-39b: the same decision for a module whose PDB index the caller already holds (the broker's ModuleIndex): no second
+// index is opened, `module_pdb` is only read. Same evidence, same diagnostics.
+Result<LinkerDetection> detect_module_linker_with_pdb(const std::string& pe_path, const pdb::PdbIndex& module_pdb,
+                                                      const DetectLinkerOptions& options = {});
 
 // ---- 2. the command line ----------------------------------------------------------------------------------
 

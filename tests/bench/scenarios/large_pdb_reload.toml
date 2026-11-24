@@ -1,7 +1,7 @@
 # Scenario `large_pdb_reload` (WP-39, ADR-0042): a reload INSIDE a large PDB. Run by the `pdb-benchmark` CI job only.
 #
 # The program is the generated benchmark project (tests/bench/gen_pdb_project.py: 900 translation units of 1000 functions,
-# a PDB of about 544 MiB), built by that job and cached. It is not a fixture of tests/fixtures, so the scenario is
+# a PDB of 546 MiB), built by that job and cached. It is not a fixture of tests/fixtures, so the scenario is
 # `external`: cmltest builds nothing and takes the program and its source tree from the command line,
 #
 #   cmltest --scenario tests/bench/scenarios/large_pdb_reload.toml --build-dir build --require-all-capabilities
@@ -18,7 +18,7 @@
 #      $CML_PERF_JSON and to the line `WP39-RELOAD pdb_mib=... reloads=5 total_minus_compile_median_ms=... max_ms=...
 #      budget_ms=3000 <stage>_median_ms=...`.
 name = "large_pdb_reload"
-description = "generated benchmark project (544 MiB PDB): five reloads of a 1000-function TU with per-stage timing and the broker memory limit"
+description = "generated benchmark project (546 MiB PDB): five reloads of a 1000-function TU with per-stage timing and the broker memory limit"
 fixture = "bench_project"
 external = true
 timeout_s = 2400
@@ -31,7 +31,7 @@ kind = "expect_stdout"
 regex = "TICK n=\\d+ value=1 tus=\\d+"
 within_s = 60
 
-# The index of the 544 MiB PDB, the build-requirement checks, the include scan and the hashes of the sources.
+# The index of the 546 MiB PDB, the build-requirement checks, the include scan and the hashes of the sources.
 [[step]]
 kind = "expect_module_enabled"
 module = "bench_project.exe"

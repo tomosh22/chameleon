@@ -280,6 +280,38 @@ TEST_CASE("diff: apply to a tree changes only the copy, strips one component, an
     CHECK(dir3.read("a/f.txt") == "y\n");
 }
 
+TEST_CASE("diff: a write that fails half way hands back what the earlier files held (WP-39b)") {
+    // The first file is rewritten; the second is to be created BELOW the first, which is a regular file, so its write
+    // fails after the first one succeeded.
+    TempDir dir;
+    dir.write("a.txt", "one\n");
+    const std::string patch =
+        "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+ONE\n"
+        "--- /dev/null\n+++ b/a.txt/new.txt\n@@ -0,0 +1 @@\n+hello\n";
+    AppliedPatch partial;
+    cml::Result<AppliedPatch> r = apply_patch_to_tree(dir.path, patch, 1, &partial);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().code == cml::ids::kEditFailed);
+    CHECK(dir.read("a.txt") == "ONE\n");  // already written: the tree is half patched
+    REQUIRE(partial.files.size() == 2);
+    REQUIRE(partial.originals.size() == 2);
+    CHECK(partial.files[0] == "a.txt");
+    REQUIRE(partial.originals[0].has_value());
+    CHECK(*partial.originals[0] == "one\n");  // enough to put the tree back
+    CHECK(partial.files[1] == "a.txt/new.txt");
+    CHECK_FALSE(partial.originals[1].has_value());  // the file whose creation failed did not exist before
+
+    // A failure before the first write (a hunk that does not match) leaves `partial` empty, and so does a success.
+    TempDir dir2;
+    dir2.write("a.txt", "one\n");
+    AppliedPatch none;
+    CHECK_FALSE(apply_patch_to_tree(dir2.path, "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-nope\n+NOPE\n", 1, &none).has_value());
+    CHECK(none.files.empty());
+    CHECK(apply_patch_to_tree(dir2.path, "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+ONE\n", 1, &none).has_value());
+    CHECK(none.files.empty());
+    CHECK(none.originals.empty());
+}
+
 TEST_CASE("diff: creation and deletion in a tree") {
     TempDir dir;
     dir.write("gone.txt", "bye\n");

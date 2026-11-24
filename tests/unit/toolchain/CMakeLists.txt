@@ -4,6 +4,7 @@
 #   test_command_corpus.cpp     acceptance (1): 40+ command lines (data: command_corpus*.inc)
 #   test_compile_commands.cpp   JSON reader and lookup
 #   test_link_command.cpp       WP-09: link command, flag refusal, response files, linker family decision
+#   test_linker_detection_file.cpp  WP-39b: the linker is detected from the module file's headers alone
 #   test_tool_and_flags.cpp     banners, build-flag detection, symbol sets, output parsing, job pool
 #   (Windows) test_invoke_win.cpp         CreateProcess, cancellation, timeouts, response files
 #   (Windows) test_fixture_recompile.cpp  acceptance (2): fixtures `basic` and `pch` recompiled from their PDBs
@@ -15,7 +16,8 @@ set(_cml_toolchain_tests
     test_command_corpus.cpp
     test_compile_commands.cpp
     test_tool_and_flags.cpp
-    test_link_command.cpp)
+    test_link_command.cpp
+    test_linker_detection_file.cpp)
 if(WIN32)
     list(APPEND _cml_toolchain_tests test_invoke_win.cpp test_fixture_recompile.cpp)
 endif()
