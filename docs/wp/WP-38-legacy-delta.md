@@ -216,12 +216,17 @@ FF | lock: mem 72/192, reg 40/64
 ## Function entries: main next to this branch
 
 `LDE-OUTCOME` of `cml_lde_probe` (`plan_hook()` over every function entry of the module's PDB) for every fixture
-module in every `ci` cell. main: ci run 45411803431 (755a455). This branch: ci run 45433089557 (5e49806). Read from the
+module in every `ci` cell. main: ci run 45411803431 (755a455). This branch: ci run 45456991699 (3cd27ad). Read from the
 `ctest-junit.xml` of each cell's `logs-*` artifact. `cml_lde_avx_module` is new in this branch.
 
 In all 104 module x cell pairs the number of functions is the same on both sides, `refused_unknown_opcode` and
 `refused_other` are 0 on both sides, and `refused` goes from a total of 13844 (all of it `refused_vex`) to
 0: every function that was refused is planned now, nothing that was planned is refused.
+
+A cross-check the two sides allow: `vex_entries` on this branch (the functions whose hook plan decodes a VEX or EVEX
+instruction, counted from what the plan covers) equals `refused_vex` on main in each of the 104 pairs, 13844 in total.
+The functions that are hooked through a VEX instruction now are exactly as many as main refused for one. (The pull
+request's own ci run 45457008741 has the same `LDE-OUTCOME` line in all 112 rows.)
 
 | cell | module | functions | main: padding / five_byte / refused | head: padding / five_byte / refused | refused_vex | head: unknown_opcode / other |
 |---|---|---|---|---|---|---|
