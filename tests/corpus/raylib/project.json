@@ -88,12 +88,6 @@
   "start_timeout_s": 90,
   "index_timeout_s": 300,
   "min_functions": 500,
-  "expected_failures": [
-    {
-      "step": "edit:header-inline-raymath",
-      "compiler": "msvc",
-      "reason": "F-2: rcore.c indexes global arrays through image-relative addressing; the reload is refused with CML3101"
-    }
-  ],
+  "expected_failures": [],
   "trace": true
 }

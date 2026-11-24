@@ -1,0 +1,27 @@
+--- a/imgrel.c
++++ b/imgrel.c
+@@ -11,7 +11,7 @@
+     switch (type) {
+         case 0: CORE.keys[p] = 0; break;
+         case 1:
+-            CORE.keys[p] = 1;
++            CORE.keys[p] = 2;
+             if (CORE.prev[p] == 0 && CORE.count < 16) {
+                 CORE.q[CORE.count] = p;
+                 CORE.count++;
+@@ -21,7 +21,7 @@
+         case 3: return ig_g(p + 1);
+         case 4: return ig_g(p + 2);
+         case 5: return ig_g(p * 3);
+-        case 6: return sarr[p & 63] + 1;
++        case 6: return sarr[p & 63] + 1000000;
+         case 7: return fptab[p & 7](p);
+         case 8: return (int)CORE.f[p & 31];
+         default: break;
+@@ -31,5 +31,5 @@
+ 
+ long long ig_wide(long long i)
+ {
+-    return (long long)sarr[i & 63] + (long long)CORE.q[i & 15];
++    return (long long)sarr[i & 63] + (long long)CORE.q[i & 15] + 2000000;
+ }

@@ -397,7 +397,7 @@ void emit_decisions(const std::string& tag, const BindPlan& p, const cml::pdb::P
 }
 
 
-void plan_fixture(const std::string& name) {
+BindPlan plan_fixture(const std::string& name) {
     const FixtureEntry* fx = nullptr;
     for (const FixtureEntry& f : paths().fixtures) {
         if (f.name == name) {
@@ -434,6 +434,7 @@ void plan_fixture(const std::string& name) {
             brief("PLAN-ERROR " + tag + " " + d.format());
         }
         brief("BINDPLAN " + tag + " FAILED errors=" + std::to_string(errors.size()));
+        brief(partial.imgrel_line(in.object_name) + " fixture=" + tag + " FAILED");
         emit_decisions(tag, partial, **pdb);
         FAIL("planning " << tag << " failed with " << errors.size() << " error(s); first: " << plan.error().format());
     }
@@ -442,6 +443,23 @@ void plan_fixture(const std::string& name) {
     const std::string summary = p.summary_line(tag);
     brief(summary);
     std::printf("%s\n", summary.c_str());
+    // WP-36 evidence (ADR-0042): image-relative references to old data in this object and how many were proved to be
+    // address displacements. Only cl with optimisation emits them.
+    {
+        const std::string imgrel = p.imgrel_line(in.object_name) + " fixture=" + tag + " compiler=" + (kIsCl ? "cl" : "clang-cl") + " config=" + paths().config;
+        brief(imgrel);
+        std::printf("%s\n", imgrel.c_str());
+        std::size_t displacement_fixups = 0;
+        for (const Fixup& f : p.fixups) {
+            if (f.kind == FixupKind::Addr32NbDisp) {
+                ++displacement_fixups;
+                brief("FIXUP-IMGREL " + tag + " sec=" + std::to_string(f.section_index) + "(" + f.section_name + ") off=" + hex(f.offset) + " symbol=" + f.symbol +
+                      " addend=" + std::to_string(f.addend) + " target_rva=" + hex(f.target_rva));
+            }
+        }
+        CHECK_MESSAGE(p.imgrel_verified == p.imgrel_sites, tag << ": a plan that succeeded has every image-relative site verified");
+        CHECK_MESSAGE(displacement_fixups == p.imgrel_verified, tag << ": one Addr32NbDisp fix-up per verified site");
+    }
     brief("PLAN-INFO " + tag + " compiland=" + p.compiland + " placeholders=" + std::to_string(p.placeholders.size()) +
          " new_functions=" + std::to_string(p.new_functions.size()) + " new_globals=" + std::to_string(p.new_globals.size()) +
          " initialisers=" + std::to_string(p.initialisers.size()) + " warnings=" + std::to_string(p.warnings.size()) +
@@ -636,6 +654,7 @@ void plan_fixture(const std::string& name) {
     for (const cml::Diag& w : p.warnings) {
         CHECK_MESSAGE(allowed.count(w.id()) == 1, tag << ": unexpected warning " << w.format());
     }
+    return p;
 }
 
 }  // namespace
@@ -649,3 +668,32 @@ TEST_CASE("fixture lambdas: lambdas.cpp lambda_times_10") { plan_fixture("lambda
 TEST_CASE("fixture new_function: logic.cpp add_helper") { plan_fixture("new_function"); }
 TEST_CASE("fixture new_global: logic.cpp add_tracker") { plan_fixture("new_global"); }
 TEST_CASE("fixture tls: logic.cpp step_5") { plan_fixture("tls"); }
+
+// WP-36 (ADR-0042): under cl with optimisation the two functions of imgrel.c address CORE, sarr and fptab as
+// `[reg + index*scale + sym@IMGREL]`. Every such site must be proved a displacement (the plan would have failed with
+// CML3101 otherwise) and carry an Addr32NbDisp fix-up. In Debug and under clang-cl there are none, and the same edit
+// plans through REL32. If cl stops emitting the pattern for this source, the path is no longer exercised: fail loudly.
+TEST_CASE("fixture imgrel: imgrel.c dispatch_v2 (image-relative references to old data)") {
+    const BindPlan p = plan_fixture("imgrel");
+    const auto displacement_to = [&](const std::string& symbol) {
+        for (const Fixup& f : p.fixups) {
+            if (f.kind == FixupKind::Addr32NbDisp && f.symbol == symbol) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const bool optimised = paths().config != "Debug";
+    const std::string compiler = kIsCl ? "cl" : "clang-cl";  // a run-time value: no "conditional expression is constant"
+    if (compiler == "cl" && optimised) {
+        CHECK_MESSAGE(p.imgrel_sites > 0, "cl " << paths().config << " emitted no ADDR32NB to old data for fixture imgrel: the WP-36 path is not exercised any more");
+        CHECK(displacement_to("CORE"));
+        CHECK(displacement_to("sarr"));
+        CHECK(displacement_to("fptab"));
+        const SymbolDecision* image_base = p.find_decision("__ImageBase");
+        REQUIRE(image_base != nullptr);
+        CHECK(image_base->decision == DecisionKind::LinkerProvided);  // the patch keeps its own __ImageBase
+    } else if (compiler != "cl") {
+        CHECK_MESSAGE(p.imgrel_sites == 0, "clang-cl is not known to address data image-relatively; if it does now, extend the acceptance to it");
+    }
+}

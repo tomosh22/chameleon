@@ -199,7 +199,7 @@ public:
             return f;
         }
         if (kind < static_cast<std::uint8_t>(FixupKind::Rel32) ||
-            kind > static_cast<std::uint8_t>(FixupKind::SlotWrite)) {
+            kind > static_cast<std::uint8_t>(FixupKind::Addr32NbDisp)) {
             fail("unknown fix-up kind");
             return f;
         }

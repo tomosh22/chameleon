@@ -7,7 +7,7 @@ start it under `cml_broker --headless`, edit the marked function and `reload`.
 | File | Finding | Expected today |
 |---|---|---|
 | `f1_static_library/` | F-1, members of a static library are not reloaded | the reload patches nothing (no diagnostic) |
-| `f2_global_array_index.c` | F-2, `CML3101` for a global array indexed by a variable (cl) | the reload is refused with CML3101 |
+| `f2_image_relative_data.c` | F-2, `CML3101` for a cl function that addresses globals image-relatively (a switch with a jump table that touches global arrays, or two global arrays indexed). Replaces `f2_global_array_index.c`, which did not reproduce it | fixed by WP-36 (ADR-0042): the reload succeeds and the patched code uses the running image's data; the broker logs `WP36-IMGREL sites=N verified=N`. Fixture `tests/fixtures/imgrel`, scenario `imgrel` |
 | `f3_c_statics_clang_cl.c` | F-3, clang-cl: statics of a C translation unit | after the reload `counter` restarts from 0 (or the process crashes, in raylib's case) |
 | `f4_static_overloads.cpp` | F-4, `CML3214` for overloaded static functions | the reload is refused with CML3214 |
 

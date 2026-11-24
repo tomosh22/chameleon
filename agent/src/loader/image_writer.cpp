@@ -12,6 +12,7 @@
 
 #include "cml/proc/address_space.h"
 #include "cml/proc/loader_diag_ids.h"
+#include "fixup_diag_ids.h"
 #include "cml/util/format.h"
 #include "cml/util/log.h"
 
@@ -71,15 +72,20 @@ private:
     Region current_;
 };
 
+// Rel32 and Addr32NbDisp patch a 32-bit field, Addr64 and SlotWrite a 64-bit one.
+bool is_32bit(ipc::FixupKind kind) noexcept {
+    return kind == ipc::FixupKind::Rel32 || kind == ipc::FixupKind::Addr32NbDisp;
+}
+
 std::uint32_t site_size(const ipc::Fixup& fixup) noexcept {
-    return fixup.kind == ipc::FixupKind::Rel32 ? 4u : 8u;
+    return is_32bit(fixup.kind) ? 4u : 8u;
 }
 
 // A site inside the image, in one committed image region.
 Result<void> check_site(RegionCache& cache, const ImageRef& image, std::size_t index, const ipc::Fixup& fixup) {
     // The wire decoder only produces valid kinds; in-process callers get the same scrutiny.
     const bool kind_ok = fixup.kind == ipc::FixupKind::Rel32 || fixup.kind == ipc::FixupKind::Addr64 ||
-                         fixup.kind == ipc::FixupKind::SlotWrite;
+                         fixup.kind == ipc::FixupKind::SlotWrite || fixup.kind == ipc::FixupKind::Addr32NbDisp;
     if (!kind_ok || (fixup.kind == ipc::FixupKind::Rel32 ? fixup.n > 5 : fixup.n != 0)) {
         return invalid(ids::kLoaderFixupInvalid, "fix-up " + std::to_string(index) + " has an unknown kind or a bad REL32 length");
     }
@@ -101,8 +107,23 @@ Result<void> check_site(RegionCache& cache, const ImageRef& image, std::size_t i
     return {};
 }
 
-// Value to store for a fix-up; false (and a diagnostic) when a REL32 does not fit.
+// Value to store for a fix-up; false (and a diagnostic) when a REL32 or an image-relative displacement does not fit.
 Result<void> compute(const ImageRef& image, std::size_t index, const ipc::Fixup& fixup, std::uint64_t* out) {
+    if (fixup.kind == ipc::FixupKind::Addr32NbDisp) {
+        // WP-36 (ADR-0042): the displacement of `[reg + index*scale + disp32]`, the register holding THIS image's base.
+        std::int32_t displacement = 0;
+        if (!ipc::addr32nb_displacement(image.base, fixup.value, &displacement)) {
+            const std::uint64_t distance = fixup.value >= image.base ? fixup.value - image.base : image.base - fixup.value;
+            return Diag::make(ids::kLoaderAddr32NbOutOfRange,
+                              "image-relative fix-up " + std::to_string(index) + " at RVA " + hex(fixup.rva) + " cannot reach target " +
+                                  hex(fixup.value) + " from the patch image base " + hex(image.base) + ": distance " + hex(distance) +
+                                  " does not fit a signed 32-bit displacement",
+                              "The patch was placed too far from the data it refers to; reserve address space nearer the module "
+                              "(or reload) so the patch lands within 2 GiB.");
+        }
+        *out = static_cast<std::uint64_t>(static_cast<std::uint32_t>(displacement));
+        return {};
+    }
     if (fixup.kind != ipc::FixupKind::Rel32) {
         *out = fixup.value;
         return {};
@@ -216,7 +237,7 @@ Result<std::uint32_t> write_pass(const ImageRef& image, std::span<const ipc::Fix
         if (!computed) {
             return computed.error();  // cannot happen after validation; kept for safety
         }
-        Result<void> done = fixup.kind == ipc::FixupKind::Rel32
+        Result<void> done = is_32bit(fixup.kind)
                                 ? writer.write(image.base + fixup.rva, &value, 4, false)
                                 : writer.write(image.base + fixup.rva, &value, 8, slots);
         if (!done) {
@@ -301,7 +322,7 @@ Result<std::uint32_t> apply_fixups(const ImageRef& image, std::span<const ipc::F
             }
         }
     }
-    Result<std::uint32_t> first = write_pass(image, fixups, false);  // REL32 + ADDR64
+    Result<std::uint32_t> first = write_pass(image, fixups, false);  // REL32 + ADDR64 + ADDR32NB displacements
     if (!first) {
         return first;
     }

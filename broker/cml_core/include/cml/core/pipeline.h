@@ -112,6 +112,11 @@ struct PatchReport {
     std::size_t thunks = 0;
     std::size_t fixups = 0;         // sent to the agent (wire)
     std::size_t pre_applied = 0;    // SECREL sites written into the DLL
+    // WP-36: image-relative (ADDR32NB) references to data of the old image in the recompiled objects, and how many were
+    // proved to be address displacements and retargeted (equal in every reload that succeeds). Planned, not only loaded:
+    // a compiland whose code did not change counts too.
+    std::size_t imgrel_sites = 0;
+    std::size_t imgrel_verified = 0;
     std::size_t initializers = 0;   // requested
     std::size_t initializers_run = 0;
     std::size_t load_attempts = 0;

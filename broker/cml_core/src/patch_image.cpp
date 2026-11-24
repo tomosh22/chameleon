@@ -42,6 +42,15 @@ Result<PatchFixups> to_patch_fixups(std::span<const bind::FixupTriple> triples, 
                 f.value = t.value;
                 out.wire.push_back(f);
                 break;
+            case bind::FixupKind::Addr32NbDisp: {
+                // WP-36: the triple holds int32(target - patch_base); the wire carries the absolute target and the agent
+                // computes and range-checks the displacement against the base the image really has.
+                const std::int64_t disp = static_cast<std::int32_t>(static_cast<std::uint32_t>(t.value));
+                f.kind = ipc::FixupKind::Addr32NbDisp;
+                f.value = static_cast<std::uint64_t>(static_cast<std::int64_t>(patch_base) + disp);
+                out.wire.push_back(f);
+                break;
+            }
             case bind::FixupKind::SecRel32:
                 if (t.value > 0xFFFFFFFFull) {
                     return Diag::make(bind::diag::kRel32OutOfRange, "a SECREL value does not fit 32 bits at patch rva " + std::to_string(t.rva),

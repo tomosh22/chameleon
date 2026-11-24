@@ -565,6 +565,96 @@ TEST_CASE("reload: the whole pipeline for the basic fixture shape") {
     CHECK(rig.compile_events[1].diag == 0);
 }
 
+// ---- WP-36 (ADR-0042): image-relative references to old data -----------------------------------------------------
+
+namespace {
+
+// compute_value: lea rdi,[__ImageBase] ; <an instruction with g_tick@IMGREL + 0x10> ; ret.
+// `displacement`: mov eax,[rdi+rax*4+disp32] (what cl emits); otherwise mov eax, imm32 (never retargetable).
+std::vector<std::byte> make_imgrel_object(bool displacement) {
+    SynthObj o;
+    auto f = o.function("?compute_value@@YAHXZ", true, 32);
+    const std::uint32_t image_base = o.undefined("__ImageBase");
+    const std::uint32_t tick = o.undefined("?g_tick@@3HA");
+    const std::vector<int> code = displacement ? std::vector<int>{0x48, 0x8D, 0x3D, 0, 0, 0, 0, 0x8B, 0x84, 0x87, 0, 0, 0, 0, 0xC3}
+                                               : std::vector<int>{0x48, 0x8D, 0x3D, 0, 0, 0, 0, 0xB8, 0, 0, 0, 0, 0xC3};
+    coff::ModelSection& s = o.model().sections[f.section - 1];
+    for (std::size_t i = 0; i < s.data.size(); ++i) {
+        s.data[i] = static_cast<std::byte>(i < code.size() ? code[i] : 0xCC);
+    }
+    o.reloc(f.section, 3, image_base, kRel32, 0);
+    o.reloc(f.section, displacement ? 10 : 8, tick, kAddr32Nb, 0x10);
+    Built b = o.build();
+    return std::vector<std::byte>(b.owned->bytes.begin(), b.owned->bytes.end());
+}
+
+}  // namespace
+
+TEST_CASE("reload (WP-36): an image-relative displacement to old data reaches the agent as an Addr32NbDisp fix-up") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.object = make_imgrel_object(true);
+    rig.enable();
+    rig.changed();
+    Result<Value> r = rig.reload();
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    const auto fixups = rig.seen<ipc::ApplyFixups>();
+    REQUIRE(fixups.size() == 1);
+    std::map<std::uint32_t, ipc::Fixup> by_rva;
+    for (const ipc::Fixup& f : fixups[0].fixups) {
+        by_rva[f.rva] = f;
+    }
+    // The displacement at +10 of the function (section at RVA 0x1000): the absolute target S + A travels, the agent
+    // subtracts the base the patch really has.
+    REQUIRE(by_rva.count(0x100A) == 1);
+    CHECK(by_rva[0x100A].kind == ipc::FixupKind::Addr32NbDisp);
+    CHECK(by_rva[0x100A].n == 0);
+    CHECK(by_rva[0x100A].value == kModuleBase + 0x3080 + 0x10);
+    // __ImageBase stays the patch's own: the lea at +3 gets no fix-up.
+    CHECK(by_rva.count(0x1003) == 0);
+    // The evidence counters, in the answer and per patch.
+    CHECK(r->get_integer("imgrel_sites") == 1);
+    CHECK(r->get_integer("imgrel_verified") == 1);
+    const Value* patches = r->find("patches");
+    REQUIRE(patches != nullptr);
+    REQUIRE(patches->is_array());
+    REQUIRE(patches->size() == 1);
+    CHECK(patches->items()[0].get_integer("imgrel_sites") == 1);
+    CHECK(patches->items()[0].get_integer("imgrel_verified") == 1);
+    CHECK(r->get_integer("patched") == 1);
+    CHECK(rig.events->diag_ids().empty());
+}
+
+TEST_CASE("reload (WP-36): an image-relative reference that is not a displacement is refused with CML3101 before anything is linked") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.object = make_imgrel_object(false);
+    rig.enable();
+    rig.changed();
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML3101");
+    CHECK(r.error().message.find("b8 10 00 00 00") != std::string::npos);  // the instruction bytes (the addend 0x10 in place)
+    CHECK(r.error().message.find("?g_tick@@3HA") != std::string::npos);
+    CHECK(rig.events->diag_ids() == std::vector<std::string>{"CML3101"});
+    CHECK(rig.link_calls == 0);
+    CHECK(rig.requests.empty());
+}
+
+TEST_CASE("reload: the answer always carries the WP-36 counters (0 when the object has no image-relative reference)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    Result<Value> r = rig.reload();
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    const Value* sites = r->find("imgrel_sites");
+    REQUIRE(sites != nullptr);
+    CHECK(sites->is_integer());
+    CHECK(r->get_integer("imgrel_sites") == 0);
+    CHECK(r->get_integer("imgrel_verified") == 0);
+}
+
 TEST_CASE("reload: no changed source is a successful no-op without any agent traffic") {
     QuietLogs quiet;
     Rig rig;
