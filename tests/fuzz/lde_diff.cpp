@@ -11,8 +11,10 @@
 //         WP38-DIFF-MODULE <file> functions=F instructions=N vex=V evex=E unknown=U exceptions=X mismatches=M
 //         WP38-DIFF instructions=N mismatches=M modules=K functions=F vex=V evex=E unknown=U exceptions=X
 //       `instructions` counts the positions where the decoder said Ok and the reference was asked. `unknown` counts the
-//       positions the decoder refused although the reference decodes them (what the decoder does not cover; the most
-//       frequent ones are listed as WP38-DIFF-UNKNOWN). --min-* turn a sweep that saw too little into a failure.
+//       positions the decoder refused although the reference decodes them: what the decoder does not cover. They are
+//       listed by the reference's mnemonic, most frequent first, each with one example:
+//         WP38-DIFF-UNKNOWN <mnemonic> count=N example=<the bytes of one such instruction>
+//       --min-* turn a sweep that saw too little into a failure.
 //
 //   cml_lde_diff raw <file>... [--min-instructions N] [--min-vex N] [--min-evex N]
 //       The same sweep over files that are nothing but code (a .text section dumped with objcopy, for hosts without
@@ -75,6 +77,13 @@ struct Totals {
 
 std::size_t g_mismatches_printed = 0;
 
+// Instructions the reference decodes and the decoder refuses, by mnemonic.
+struct UnknownKind {
+    std::size_t count = 0;
+    std::string example;
+};
+using UnknownKinds = std::map<std::string, UnknownKind>;
+
 void print_mismatch(const char* where, const Comparison& c, const std::uint8_t* bytes, std::size_t available) {
     if (g_mismatches_printed++ >= 100) {
         return;
@@ -95,7 +104,7 @@ struct Function {
 // One run of code: instruction by instruction until its end, a mismatch, or bytes neither decoder knows (then
 // `resync` decides between stopping and trying one byte further).
 void sweep_range(const Reference& reference, const std::uint8_t* code, std::size_t length, const std::string& where, bool resync,
-                 Totals& t, std::map<std::string, std::size_t>& unknown_kinds) {
+                 Totals& t, UnknownKinds& unknown_kinds) {
     std::size_t at = 0;
     while (at < length) {
         const Comparison c = reference.compare(code + at, length - at);
@@ -126,7 +135,10 @@ void sweep_range(const Reference& reference, const std::uint8_t* code, std::size
         }
         if (c.ours.status == DecodeStatus::Unknown && c.reference_ok) {
             ++t.unknown;
-            ++unknown_kinds[hex_bytes(code + at, std::min<std::size_t>(c.reference_length, 4))];
+            UnknownKind& kind = unknown_kinds[c.reference_mnemonic];
+            if (kind.count++ == 0) {
+                kind.example = hex_bytes(code + at, c.reference_length);
+            }
             at += c.reference_length;
             continue;
         }
@@ -137,7 +149,7 @@ void sweep_range(const Reference& reference, const std::uint8_t* code, std::size
     }
 }
 
-int sweep_module(const Reference& reference, const std::string& path, Totals& grand, std::map<std::string, std::size_t>& unknown_kinds) {
+int sweep_module(const Reference& reference, const std::string& path, Totals& grand, UnknownKinds& unknown_kinds) {
     auto owned = cml::pe::load_image_file(path);
     if (!owned) {
         std::fprintf(stderr, "%s\n", owned.error().format().c_str());
@@ -210,7 +222,7 @@ int sweep_module(const Reference& reference, const std::string& path, Totals& gr
     return 0;
 }
 
-int sweep_raw(const Reference& reference, const std::string& path, Totals& grand, std::map<std::string, std::size_t>& unknown_kinds) {
+int sweep_raw(const Reference& reference, const std::string& path, Totals& grand, UnknownKinds& unknown_kinds) {
     std::ifstream file(path, std::ios::binary);
     if (!file) {
         std::fprintf(stderr, "cml_lde_diff: cannot open %s\n", path.c_str());
@@ -482,7 +494,7 @@ int main(int argc, char** argv) {
             }
         }
         Totals grand;
-        std::map<std::string, std::size_t> unknown_kinds;
+        UnknownKinds unknown_kinds;
         for (const std::string& module : modules) {
             if (const int rc = raw ? sweep_raw(reference, module, grand, unknown_kinds) : sweep_module(reference, module, grand, unknown_kinds);
                 rc != 0) {
@@ -490,12 +502,13 @@ int main(int argc, char** argv) {
             }
         }
         std::vector<std::pair<std::size_t, std::string>> ranked;
-        for (const auto& [bytes, count] : unknown_kinds) {
-            ranked.emplace_back(count, bytes);
+        for (const auto& [mnemonic, kind] : unknown_kinds) {
+            ranked.emplace_back(kind.count, mnemonic);
         }
         std::sort(ranked.rbegin(), ranked.rend());
-        for (std::size_t i = 0; i < ranked.size() && i < 40; ++i) {
-            std::printf("WP38-DIFF-UNKNOWN %s %zu\n", ranked[i].second.c_str(), ranked[i].first);
+        for (std::size_t i = 0; i < ranked.size() && i < 100; ++i) {
+            std::printf("WP38-DIFF-UNKNOWN %s count=%zu example=%s\n", ranked[i].second.c_str(), ranked[i].first,
+                        unknown_kinds[ranked[i].second].example.c_str());
         }
         std::printf("WP38-DIFF instructions=%zu mismatches=%zu modules=%zu functions=%zu vex=%zu evex=%zu unknown=%zu exceptions=%zu\n",
                     grand.instructions, grand.mismatches, modules.size(), grand.functions, grand.vex, grand.evex, grand.unknown,

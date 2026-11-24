@@ -45,6 +45,7 @@ struct Comparison {
     bool reference_ok = false;       // Zydis decoded the bytes
     unsigned reference_length = 0;   // when reference_ok
     unsigned reference_status = 0;   // the Zydis status code otherwise
+    const char* reference_mnemonic = "";  // when reference_ok: what Zydis calls the instruction
     bool vector_encoded = false;     // ours is a VEX / EVEX instruction (when ours is Ok)
 };
 
@@ -88,6 +89,8 @@ public:
         c.reference_ok = decode(data, size, insn, c.reference_status);
         if (c.reference_ok) {
             c.reference_length = insn.length;
+            const char* mnemonic = ZydisMnemonicGetString(insn.mnemonic);
+            c.reference_mnemonic = mnemonic != nullptr ? mnemonic : "?";
         }
         if (c.ours.status == DecodeStatus::Unknown) {
             return c;

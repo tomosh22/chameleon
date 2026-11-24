@@ -46,6 +46,9 @@ constexpr std::uint32_t G_66MEM = 16u << kGroupShift;  // 0F 12, 0F 16: the 66 f
 constexpr std::uint32_t G_D6 = 17u << kGroupShift;     // 0F D6: the F3 / F2 forms (movq2dq, movdq2q) are register only
 constexpr std::uint32_t G_MOVBE = 18u << kGroupShift;  // 0F 38 F0/F1: movbe (no prefix, 66) is memory only; crc32 (F2)
 constexpr std::uint32_t G_38F6 = 19u << kGroupShift;   // 0F 38 F6: wrss (no prefix) is memory only; adcx, adox
+constexpr std::uint32_t G_38D8 = 20u << kGroupShift;   // F3 0F 38 D8: the wide Key Locker group, reg 0..3
+constexpr std::uint32_t G_F3MEM = 21u << kGroupShift;  // 0F 38 DD..DF: the F3 form (Key Locker) is memory only
+constexpr std::uint32_t G_C0 = 22u << kGroupShift;     // F3 0F 3A F0: only ModRM C0 (hreset)
 
 constexpr std::uint32_t MEM = 1u << 17;   // memory operand only: ModRM.mod == 3 is not an instruction
 constexpr std::uint32_t REG = 1u << 18;   // register operand only: ModRM.mod must be 3
@@ -179,16 +182,19 @@ constexpr void build_legacy(Tables& t) {
     fill(one, 0xFE, 0xFE, M | G_FE);
     fill(one, 0xFF, 0xFF, M | G_FF);
 
-    // x87, SDM volume 2 appendix A.5 (tables A-7 to A-22). Undocumented aliases are not covered.
+    // x87, SDM volume 2 appendix A.5 (tables A-7 to A-22), plus the aliases every processor executes although the
+    // tables leave their slots empty (fstp1 D9 D8.., fcom2 / fcomp3 DC D0.., fxch4 DD C8.., fcomp5 DE D0.., ffreep /
+    // fxch7 / fstp8 / fstp9 DF C0.., and the 8087 / 287 no-ops DB E0, E1, E4): WP-10's decoder accepted them, some
+    // compilers emit ffreep, and they are two bytes like every register form.
     t.x87_memory = {0xFF, 0xFD, 0xFF, 0xAF, 0xFF, 0xDF, 0xFF, 0xFF};  // D9 /1, DB /4 /6 and DD /5 are undefined
     t.x87_register[0] = bits(0xC0, 0xFF);                                                    // D8
-    t.x87_register[1] = bits(0xC0, 0xD0) | bits(0xE0, 0xE1) | bits(0xE4, 0xE5) | bits(0xE8, 0xEE) | bits(0xF0, 0xFF);  // D9
+    t.x87_register[1] = bits(0xC0, 0xD0) | bits(0xD8, 0xE1) | bits(0xE4, 0xE5) | bits(0xE8, 0xEE) | bits(0xF0, 0xFF);  // D9
     t.x87_register[2] = bits(0xC0, 0xDF) | bits(0xE9, 0xE9);                                 // DA: fcmovcc, fucompp
-    t.x87_register[3] = bits(0xC0, 0xDF) | bits(0xE2, 0xE3) | bits(0xE8, 0xF7);              // DB: fcmovncc, fnclex, fninit, f(u)comi
-    t.x87_register[4] = bits(0xC0, 0xCF) | bits(0xE0, 0xFF);                                 // DC
-    t.x87_register[5] = bits(0xC0, 0xC7) | bits(0xD0, 0xEF);                                 // DD: ffree, fst, fstp, fucom(p)
-    t.x87_register[6] = bits(0xC0, 0xCF) | bits(0xD9, 0xD9) | bits(0xE0, 0xFF);              // DE
-    t.x87_register[7] = bits(0xE0, 0xE0) | bits(0xE8, 0xF7);                                 // DF: fnstsw ax, f(u)comip
+    t.x87_register[3] = bits(0xC0, 0xE4) | bits(0xE8, 0xF7);                                 // DB: fcmovncc, fnclex, fninit, f(u)comi
+    t.x87_register[4] = bits(0xC0, 0xFF);                                                    // DC
+    t.x87_register[5] = bits(0xC0, 0xEF);                                                    // DD: ffree, fst, fstp, fucom(p)
+    t.x87_register[6] = bits(0xC0, 0xD7) | bits(0xD9, 0xD9) | bits(0xE0, 0xFF);              // DE
+    t.x87_register[7] = bits(0xC0, 0xE0) | bits(0xE8, 0xF7);                                 // DF: fnstsw ax, f(u)comip
 
     // 0F xx
     fill(two, 0x01, 0x01, M | G_0F01);       // group 7 (xgetbv, rdtscp, ...)
@@ -282,12 +288,17 @@ constexpr void build_legacy(Tables& t) {
     fill(m38, 0x80, 0x82, M | P66 | MEM);    // invept invvpid invpcid
     fill(m38, 0xC8, 0xCD, M | NP);           // sha1nexte sha1msg1 sha1msg2 sha256rnds2 sha256msg1 sha256msg2
     fill(m38, 0xCF, 0xCF, M | P66);          // gf2p8mulb
-    fill(m38, 0xDB, 0xDF, M | P66);          // aesimc aesenc aesenclast aesdec aesdeclast
+    fill(m38, 0xD8, 0xD8, M | PF3 | MEM | G_38D8);     // aesencwide128kl aesdecwide128kl aesencwide256kl aesdecwide256kl
+    fill(m38, 0xDB, 0xDB, M | P66);          // aesimc
+    fill(m38, 0xDC, 0xDC, M | P66 | PF3);    // aesenc; loadiwkey / aesenc128kl (Key Locker)
+    fill(m38, 0xDD, 0xDF, M | P66 | PF3 | G_F3MEM);    // aesenclast aesdec aesdeclast; aesdec128kl aesenc256kl aesdec256kl
     fill(m38, 0xF0, 0xF1, M | PS_PD | PF2 | G_MOVBE);  // movbe; crc32
     fill(m38, 0xF5, 0xF5, M | P66 | MEM);    // wruss
     fill(m38, 0xF6, 0xF6, M | PS_PD | PF3 | G_38F6);   // wrss; adcx; adox
     fill(m38, 0xF8, 0xF8, M | P66 | PF3 | PF2 | MEM);  // movdir64b enqcmds enqcmd
     fill(m38, 0xF9, 0xF9, M | NP | MEM);     // movdiri
+    fill(m38, 0xFA, 0xFB, M | PF3 | REG);    // encodekey128 encodekey256
+    fill(m38, 0xFC, 0xFC, M | ALL4 | MEM);   // aadd aand axor aor (RAO-INT)
 
     // 0F 3A xx: every opcode has a ModRM byte and an 8-bit immediate.
     auto& m3a = t.map3a;
@@ -301,6 +312,7 @@ constexpr void build_legacy(Tables& t) {
     fill(m3a, 0xCC, 0xCC, M | I8 | NP);      // sha1rnds4
     fill(m3a, 0xCE, 0xCF, M | I8 | P66);     // gf2p8affineqb gf2p8affineinvqb
     fill(m3a, 0xDF, 0xDF, M | I8 | P66);     // aeskeygenassist
+    fill(m3a, 0xF0, 0xF0, M | I8 | PF3 | G_C0);  // hreset
 }
 
 constexpr void build_vex(Tables& t) {
@@ -853,20 +865,25 @@ DecodeResult decode_instruction(const std::uint8_t* code, std::size_t available)
                 }
                 // The register forms are instructions on their own, named by the whole ModRM byte.
                 const unsigned byte = 0xC0u | (reg << 3) | modrm.rm;
-                bool defined = false;
+                // Whatever the prefix: the SVM instructions (D8..DF), swapgs rdtscp (F8 F9), clzero rdpru (FC FD).
+                bool defined = (byte >= 0xD8 && byte <= 0xDF) || byte == 0xF8 || byte == 0xF9 || byte == 0xFC || byte == 0xFD;
                 if (form == NP) {
-                    // enclv vmcall vmlaunch vmresume vmxoff pconfig wrmsrns (C0..C6), monitor mwait clac stac (C8..CB),
-                    // encls (CF), xgetbv xsetbv (D0 D1), vmfunc xend xtest enclu (D4..D7), the SVM instructions
-                    // (D8..DF), serialize (E8), rdpkru wrpkru (EE EF), swapgs rdtscp monitorx mwaitx clzero rdpru
-                    // (F8..FD).
-                    defined = (byte >= 0xC0 && byte <= 0xC6) || (byte >= 0xC8 && byte <= 0xCB) || byte == 0xCF ||
-                              byte == 0xD0 || byte == 0xD1 || (byte >= 0xD4 && byte <= 0xDF) || byte == 0xE8 ||
-                              byte == 0xEE || byte == 0xEF || (byte >= 0xF8 && byte <= 0xFD);
+                    // enclv vmcall vmlaunch vmresume vmxoff pconfig wrmsrns pbndkb (C0..C7), monitor mwait clac stac
+                    // (C8..CB), encls (CF), xgetbv xsetbv (D0 D1), vmfunc xend xtest enclu (D4..D7), serialize (E8),
+                    // rdpkru wrpkru (EE EF), monitorx mwaitx (FA FB), invlpgb tlbsync (FE FF).
+                    defined = defined || (byte >= 0xC0 && byte <= 0xCB) || byte == 0xCF || byte == 0xD0 || byte == 0xD1 ||
+                              (byte >= 0xD4 && byte <= 0xD7) || byte == 0xE8 || byte == 0xEE || byte == 0xEF ||
+                              byte == 0xFA || byte == 0xFB || byte == 0xFE || byte == 0xFF;
+                } else if (form == P66) {
+                    defined = defined || (byte >= 0xCC && byte <= 0xCF);  // tdcall seamret seamops seamcall
                 } else if (form == PF3) {
-                    // setssbsy (E8), saveprevssp (EA), uiret testui clui stui (EC..EF)
-                    defined = byte == 0xE8 || byte == 0xEA || (byte >= 0xEC && byte <= 0xEF);
-                } else if (form == PF2) {
-                    defined = byte == 0xE8 || byte == 0xE9;  // xsusldtrk xresldtrk
+                    // wrmsrlist (C6), setssbsy (E8), saveprevssp (EA), uiret testui clui stui (EC..EF), mcommit (FA),
+                    // rmpadjust psmash (FE FF)
+                    defined = defined || byte == 0xC6 || byte == 0xE8 || byte == 0xEA || (byte >= 0xEC && byte <= 0xEF) ||
+                              byte == 0xFA || byte == 0xFE || byte == 0xFF;
+                } else {
+                    // rdmsrlist (C6), xsusldtrk xresldtrk (E8 E9), rmpupdate pvalidate (FE FF)
+                    defined = defined || byte == 0xC6 || byte == 0xE8 || byte == 0xE9 || byte == 0xFE || byte == 0xFF;
                 }
                 if (!defined) {
                     return unknown();
@@ -884,7 +901,7 @@ DecodeResult decode_instruction(const std::uint8_t* code, std::size_t available)
                 } else if (form == PF3) {
                     defined = reg <= 6;  // rdfsbase rdgsbase wrfsbase wrgsbase (0..3), ptwrite, incssp, umonitor
                 } else {
-                    defined = reg == 6;  // 66: tpause; F2: umwait
+                    defined = reg == 6 || (form == P66 && reg == 7);  // 66: tpause, pcommit; F2: umwait
                 }
                 if (!defined) {
                     return unknown();
@@ -930,6 +947,21 @@ DecodeResult decode_instruction(const std::uint8_t* code, std::size_t available)
                 break;
             case G_38F6:
                 if (form == NP && !memory) {
+                    return unknown();
+                }
+                break;
+            case G_38D8:
+                if (reg > 3) {
+                    return unknown();
+                }
+                break;
+            case G_F3MEM:
+                if (form == PF3 && !memory) {
+                    return unknown();
+                }
+                break;
+            case G_C0:
+                if (memory || reg != 0 || modrm.rm != 0) {
                     return unknown();
                 }
                 break;

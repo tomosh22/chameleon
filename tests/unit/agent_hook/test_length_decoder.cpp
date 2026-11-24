@@ -929,7 +929,7 @@ TEST_CASE("legacy maps: forms that are not instructions are refused (found by th
     // Groups 7, 9 and 15.
     expect_len({0x0F, 0x01, 0xF9}, 3);                           // rdtscp
     expect_len({0x0F, 0x01, 0xD5}, 3);                           // xend
-    expect_unknown({0x0F, 0x01, 0xC7});                          // nothing
+    expect_unknown({0x0F, 0x01, 0xCC});                          // nothing without a prefix (66: tdcall)
     expect_unknown({0x0F, 0x01, 0x28});                          // 0F 01 /5 with memory, no prefix
     expect_len({0x0F, 0xC7, 0xF0}, 3);                           // rdrand eax
     expect_len({0xF3, 0x0F, 0xC7, 0xF8}, 4);                     // rdpid rax
@@ -939,4 +939,22 @@ TEST_CASE("legacy maps: forms that are not instructions are refused (found by th
     expect_len({0xF3, 0x0F, 0xAE, 0xC0}, 4);                     // rdfsbase eax
     expect_len({0x66, 0x0F, 0xAE, 0x39}, 4);                     // clflushopt [rcx]
     expect_unknown({0x0F, 0xAE, 0xC0});                          // 0F AE /0 with a register, no prefix
+    // What WP-10's decoder accepted and is an instruction stays accepted, also where no compiler emits it: the x87
+    // aliases outside the SDM's tables, system instructions of group 7, Key Locker, RAO-INT, hreset.
+    expect_len({0xDF, 0xC0}, 2);                                 // ffreep st(0)
+    expect_len({0xD9, 0xD8}, 2);                                 // fstp st(0), the alias fstp1
+    expect_len({0xDC, 0xD1}, 2);                                 // fcom st(1), the alias fcom2
+    expect_len({0x0F, 0x01, 0xFE}, 3);                           // invlpgb
+    expect_len({0x66, 0x0F, 0x01, 0xF9}, 4);                     // rdtscp behind a 66 that does nothing
+    expect_len({0x66, 0x0F, 0x01, 0xCC}, 4);                     // tdcall
+    expect_len({0x66, 0x0F, 0xAE, 0xF8}, 4);                     // pcommit
+    expect_len({0xF3, 0x0F, 0x38, 0xDC, 0xC1}, 5);               // loadiwkey xmm0, xmm1
+    expect_len({0xF3, 0x0F, 0x38, 0xDD, 0x01}, 5);               // aesdec128kl xmm0, [rcx]
+    expect_unknown({0xF3, 0x0F, 0x38, 0xDD, 0xC1});              // ... which has no register form
+    expect_len({0xF3, 0x0F, 0x38, 0xD8, 0x01}, 5);               // aesencwide128kl [rcx]
+    expect_unknown({0xF3, 0x0F, 0x38, 0xD8, 0x21});              // F3 0F 38 D8 /4
+    expect_len({0x0F, 0x38, 0xFC, 0x01}, 4);                     // aadd [rcx], eax
+    expect_unknown({0x0F, 0x38, 0xFC, 0xC1});                    // aadd with a register destination
+    expect_len({0xF3, 0x0F, 0x3A, 0xF0, 0xC0, 0x00}, 6);         // hreset 0
+    expect_unknown({0xF3, 0x0F, 0x3A, 0xF0, 0xC1, 0x00});        // F3 0F 3A F0 with another ModRM byte
 }
