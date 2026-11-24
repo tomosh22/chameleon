@@ -718,3 +718,103 @@ TEST_CASE("lambda statics: the closure matches teach the section layout, so a gu
     }
     CHECK(r->warnings.empty());
 }
+
+// ---- what cl really writes (CI evidence, cl 19.44): a unit hash after the closure's unique name ---------------------
+
+TEST_CASE("lambda statics: cl's closure names carry the unit's hash, the decorated scope does not; they still pair") {
+    // Old PDB: ".?AV<lambda_N>@?1??f@@YAXXZ@`9bfd0ef1". New object (compiled from another path): "`a8f45668".
+    SynthWorld w;
+    Types old_types;
+    for (int n = 1; n <= 2; ++n) {
+        const std::uint32_t type = old_types.call_operator("f::<lambda_" + std::to_string(n) + ">", closure_unique(n) + "`9bfd0ef1");
+        const std::uint32_t at = 0x20 + 0x10 * static_cast<std::uint32_t>(n - 1);
+        old_proc(w, "`f'::`2'::<lambda_" + std::to_string(n) + ">::operator()", 0x60 + 0x10 * static_cast<std::uint32_t>(n - 1), type, {{"sname", at}, {"$TSS0", at + 8}});
+    }
+    old_types.set.add_to(w.spec.tpi);
+    w.open();
+
+    Types t;
+    const std::uint32_t op2 = t.call_operator("f::<lambda_2>", closure_unique(2) + "`a8f45668");
+    const std::uint32_t op1 = t.call_operator("f::<lambda_1>", closure_unique(1) + "`a8f45668");
+    TypedObj o;
+    o.function(call_operator_symbol(2), op2, false);
+    o.function(call_operator_symbol(1), op1, false);
+    const std::uint32_t d = o.obj.section(".data", kData, 0x40);
+    o.obj.symbol(static_in_lambda("sname", 2), 0x00, static_cast<std::int32_t>(d), false, false);
+    o.obj.symbol(static_in_lambda("$TSS0", 2), 0x08, static_cast<std::int32_t>(d), false, false);
+    o.obj.symbol(static_in_lambda("sname", 1), 0x10, static_cast<std::int32_t>(d), false, false);
+    o.obj.symbol(static_in_lambda("$TSS0", 1), 0x18, static_cast<std::int32_t>(d), false, false);
+    Built b = o.build(t.set.debug_t());
+    auto r = plan_bind(w.input(b));
+    REQUIRE_MESSAGE(r.has_value(), err(r));
+    CHECK(decision(*r, static_in_lambda("sname", 1)).old_address.rva == 0x3020);
+    CHECK(decision(*r, static_in_lambda("$TSS0", 1)).old_address.rva == 0x3028);
+    CHECK(decision(*r, static_in_lambda("sname", 2)).old_address.rva == 0x3030);
+    CHECK(decision(*r, static_in_lambda("$TSS0", 2)).old_address.rva == 0x3038);
+    CHECK(decision(*r, static_in_lambda("sname", 1)).source == BindSource::CompilandClosure);
+    CHECK(decision(*r, call_operator_symbol(1)).old_address.rva == 0x1060);
+    CHECK(decision(*r, call_operator_symbol(1)).source == BindSource::CompilandSignature);
+    CHECK(decision(*r, call_operator_symbol(2)).old_address.rva == 0x1070);
+}
+
+// ---- doubt refuses -----------------------------------------------------------------------------------------------
+
+TEST_CASE("overloads: when no new signature occurs among the old ones nothing is called new (CML3214)") {
+    // Two old overloads, two new ones, all four signatures different: "both were replaced" and "the two sides spell a
+    // type differently" look the same, and the second would leave both old functions silently unhooked.
+    SynthWorld w;
+    Types old_types;
+    old_proc(w, "helper", 0x60, old_types.fn(tp::kTInt, {tp::kTInt}));
+    old_proc(w, "helper", 0x70, old_types.fn(tp::kTDouble, {tp::kTDouble}));
+    old_types.set.add_to(w.spec.tpi);
+    w.open();
+    Types t;
+    TypedObj o;
+    o.function(kHelperFloat, t.func_id(t.fn(tp::kTFloat, {tp::kTFloat}), "helper"));
+    o.function("?helper@@YAHD@Z", t.func_id(t.fn(tp::kTInt, {tp::kTChar}), "helper"));
+    Built b = o.build(t.set.debug_t());
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    auto r = plan_bind(w.input(b), &errors, &partial);
+    REQUIRE_FALSE(r.has_value());
+    REQUIRE(errors.size() == 2);
+    for (const cml::Diag& e : errors) {
+        CHECK(e.id() == "CML3214");
+        CHECK(contains(e.message, "none of the 2 signature(s) in the patch occurs among the 2 of the old image"));
+    }
+    CHECK(partial.hooks.empty());
+    CHECK(partial.new_functions.empty() == false);  // (the partial plan lists them; the plan as a whole failed)
+}
+
+TEST_CASE("lambda statics: closure classes that contradict the function names are not trusted (CML3207)") {
+    // The old records sit in procs named after f's lambdas, but their classes have unique names of a shape the planner
+    // does not know (as if a compiler named closures by a content hash). By name the function has two such statics, by
+    // closure class none: declaring the new ones "new" would silently start them from scratch.
+    SynthWorld w;
+    Types old_types;
+    for (int n = 1; n <= 2; ++n) {
+        const std::uint32_t type = old_types.call_operator("f::<lambda_" + std::to_string(n) + ">", ".?AV<lambda_0123456789abcdef0123456789abcde" + std::to_string(n) + ">@@");
+        old_proc(w, "`f'::`2'::<lambda_" + std::to_string(n) + ">::operator()", 0x60 + 0x10 * static_cast<std::uint32_t>(n - 1), type,
+                 {{"sname", 0x20 + 0x10 * static_cast<std::uint32_t>(n - 1)}});
+    }
+    old_types.set.add_to(w.spec.tpi);
+    w.open();
+    SynthObj o;
+    const std::uint32_t d = o.section(".data", kData, 0x40);
+    o.symbol(static_in_lambda("sname", 1), 0x20, static_cast<std::int32_t>(d), false, false);
+    o.symbol(static_in_lambda("sname", 2), 0x30, static_cast<std::int32_t>(d), false, false);
+    Built b = o.build();
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    auto r = plan_bind(w.input(b), &errors, &partial);
+    REQUIRE_FALSE(r.has_value());
+    REQUIRE(errors.size() == 2);
+    for (const cml::Diag& e : errors) {
+        CHECK(e.id() == "CML3207");
+        CHECK(contains(e.message, "cannot be identified consistently (2 by the name of their function, 0 by their closure class)"));
+    }
+    CHECK(partial.new_globals.empty() == false);
+    for (int n = 1; n <= 2; ++n) {
+        CHECK(decision(partial, static_in_lambda("sname", n)).decision != DecisionKind::BindOldData);
+    }
+}

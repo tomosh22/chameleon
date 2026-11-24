@@ -46,7 +46,9 @@ public:
 //          attributes, modifiers, array sizes) down to classes, structs, unions and enums, which are rendered by their
 //          unique (decorated) name when the record has one and by their name otherwise. No type index of a record
 //          appears in it, so the text of a function is the same in the linked PDB and in an object of the same compiler.
-//   class_unique_name   member functions: the unique name of the class (".?AV<lambda_1>@?1??f@@YAXXZ@" for a closure).
+//          Unique names are written without their translation-unit discriminator (without_tu_discriminator, below).
+//   class_unique_name   member functions: the unique name of the class exactly as recorded
+//          (".?AV<lambda_1>@?1??f@@YAXXZ@`a8f45668" for a closure under cl, without the suffix under clang-cl).
 struct FunctionSignature {
     bool known = false;
     std::string text;
@@ -57,6 +59,17 @@ struct FunctionSignature {
     std::uint32_t diag_id = 0;
     std::string why;
 };
+
+// A unique name without the parts that only say WHICH translation unit an internal type belongs to:
+//   * cl appends a backtick and eight hex digits to the unique name of a type that is local to a function
+//     (".?AV<lambda_1>@?1??f@@YAXXZ@`a8f45668"); the digits are the hash that also names the unit's anonymous
+//     namespace ("?A0xa8f45668"), which both compilers derive from the path of the source file;
+//   * an anonymous-namespace component "?A0x<hash>@" becomes "?A0x@".
+// Signatures are only ever compared between the records of ONE translation unit (its compiland in the old PDB and its
+// patch object), where that hash is a constant and tells nothing apart; leaving it out keeps a signature stable when
+// the unit is compiled from another path (a build tree that was moved, the unit tests' edited copies). The decorated
+// names of symbols never carry the backtick suffix, so the planner needs the closure name in this form as well.
+std::string without_tu_discriminator(std::string_view unique_name);
 
 // `index` is a type index (LF_PROCEDURE / LF_MFUNCTION) or, with `index_is_id`, an id index (LF_FUNC_ID / LF_MFUNC_ID):
 // what S_GPROC32 / S_LPROC32 and their _ID forms carry.

@@ -1,8 +1,8 @@
 #include "names.h"
 
+int g_ls_last[3] = {0, 0, 0};  // external on purpose: clang-cl at /O2 splits an internal array into pieces `name.N`
 namespace {
 int s_constructions = 0;
-int s_last[3] = {0, 0, 0};
 }
 
 LsName ls_make_name(int id)
@@ -28,25 +28,25 @@ int ls_step()
     a.hits += 1;
     b.hits += 2;
     c.hits += 3;
-    s_last[0] = a.id + a.hits;
-    s_last[1] = b.id + b.hits;
-    s_last[2] = c.id + c.hits;
+    g_ls_last[0] = a.id + a.hits;
+    g_ls_last[1] = b.id + b.hits;
+    g_ls_last[2] = c.id + c.hits;
     return 1;
 }
 
 int ls_a()
 {
-    return s_last[0];
+    return g_ls_last[0];
 }
 
 int ls_b()
 {
-    return s_last[1];
+    return g_ls_last[1];
 }
 
 int ls_c()
 {
-    return s_last[2];
+    return g_ls_last[2];
 }
 
 // The lambdas of two overloads: both are "ls_over::<lambda>::operator()" by display name.

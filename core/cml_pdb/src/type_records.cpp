@@ -254,7 +254,7 @@ public:
                 }
                 if (!names.unique.empty()) {
                     out += "U{";
-                    out += names.unique;
+                    out += without_tu_discriminator(names.unique);
                 } else {
                     // No unique name (C, or a compiler that writes none): the leaf kind and the name are all there is.
                     out += 'N';
@@ -350,6 +350,38 @@ FunctionSignature unknown(std::string why) {
 }
 
 }  // namespace
+
+std::string without_tu_discriminator(std::string_view name) {
+    const auto is_hex = [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); };
+    std::string out;
+    out.reserve(name.size());
+    for (std::size_t i = 0; i < name.size();) {
+        if (name[i] == '`') {
+            // "`" + exactly eight hex digits. (A backtick is not a character of the name mangling.)
+            std::size_t k = i + 1;
+            while (k < name.size() && k - i <= 8 && is_hex(name[k])) {
+                ++k;
+            }
+            if (k - i - 1 == 8 && (k == name.size() || !is_hex(name[k]))) {
+                i = k;
+                continue;
+            }
+        } else if (name.compare(i, 4, "?A0x") == 0) {
+            std::size_t k = i + 4;
+            while (k < name.size() && is_hex(name[k])) {
+                ++k;
+            }
+            if (k > i + 4 && k < name.size() && name[k] == '@') {
+                out += "?A0x";
+                i = k;  // the '@' is copied by the next round
+                continue;
+            }
+        }
+        out += name[i];
+        ++i;
+    }
+    return out;
+}
 
 FunctionSignature function_signature(const TypeSource& types, std::uint32_t index, bool index_is_id) {
     std::uint32_t function_type = index;

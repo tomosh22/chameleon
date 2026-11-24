@@ -814,3 +814,51 @@ TEST_CASE("types: every corruption of a type stream is survived (flip and trunca
         }
     }
 }
+
+TEST_CASE("types: the translation-unit discriminator is not part of a signature") {
+    using cml::pdb::without_tu_discriminator;
+    // cl: a backtick and the unit's hash after the name of a type local to a function (observed in CI, cl 19.44).
+    CHECK(without_tu_discriminator(".?AV<lambda_1>@?1??ls_step@@YAHXZ@`a8f45668") == ".?AV<lambda_1>@?1??ls_step@@YAHXZ@");
+    CHECK(without_tu_discriminator(".?AV<lambda_1>@?1??ls_step@@YAHXZ@`9BFD0EF1") == ".?AV<lambda_1>@?1??ls_step@@YAHXZ@");
+    // In the middle of a name (a type nested in such a type).
+    CHECK(without_tu_discriminator(".?AUInner@<lambda_1>@?1??f@@YAXXZ@`0123abcd@@") == ".?AUInner@<lambda_1>@?1??f@@YAXXZ@@@");
+    // The anonymous namespace of the unit.
+    CHECK(without_tu_discriminator(".?AUPoint@?A0xa8f45668@@") == ".?AUPoint@?A0x@@");
+    CHECK(without_tu_discriminator(".?AV?$vector@UPoint@?A0x9bfd0ef1@@@std@@") == ".?AV?$vector@UPoint@?A0x@@@std@@");
+    // Everything else is kept: other lengths after a backtick, a name without either, an empty name.
+    for (const char* same : {".?AUVec2@@", ".?AV<lambda_1>@?1??f@@YAXXZ@", ".?AUx@`1234567", ".?AUx@`123456789", ".?AUx@`1234567g", "?A0x", "?A0x12", "`", ""}) {
+        CAPTURE(same);
+        CHECK(without_tu_discriminator(same) == same);
+    }
+
+    // The same closure and the same anonymous-namespace struct, recorded under two unit hashes (the old PDB and an
+    // object compiled from a copy of the source at another path): one signature. Another lambda: another signature.
+    const auto program = [](const char* hash, int lambda) {
+        TypeSet t;
+        const std::string closure_unique = ".?AV<lambda_" + std::to_string(lambda) + ">@?1??f@@YAXXZ@`" + hash;
+        const std::uint32_t closure = t.add(kLfClass, lf_udt("f::<lambda_1>", closure_unique, true));
+        const std::uint32_t const_closure = t.add(kLfModifier, lf_modifier(closure, 1));
+        const std::uint32_t this_ptr = t.add(kLfPointer, lf_pointer(const_closure, kPtr64 | 0x400));
+        const std::uint32_t point = t.add(kLfStructure, lf_udt("`anonymous namespace'::Point", std::string(".?AUPoint@?A0x") + hash + "@@", true));
+        const std::uint32_t args = t.add(kLfArgList, lf_arglist({point}));
+        const std::uint32_t fn = t.add(kLfMFunction, lf_mfunction(kTInt, closure, this_ptr, args, 1));
+        return std::make_pair(t.debug_t(), fn);
+    };
+    const auto signature_of = [](const std::pair<Bytes, std::uint32_t>& p) {
+        auto parsed = cml::pdb::ObjectTypes::parse(span_of(p.first));
+        REQUIRE(parsed.has_value());
+        return cml::pdb::function_signature(*parsed, p.second, false);
+    };
+    const FunctionSignature a = signature_of(program("9bfd0ef1", 1));
+    const FunctionSignature b = signature_of(program("a8f45668", 1));
+    const FunctionSignature other = signature_of(program("a8f45668", 2));
+    REQUIRE(a.known);
+    REQUIRE(b.known);
+    CHECK(a.text == b.text);
+    CHECK(a.text.find('`') == std::string::npos);
+    CHECK(a.text.find("9bfd0ef1") == std::string::npos);
+    CHECK(a.text != other.text);
+    // The recorded name is kept as it is.
+    CHECK(a.class_unique_name == ".?AV<lambda_1>@?1??f@@YAXXZ@`9bfd0ef1");
+    CHECK(b.class_unique_name == ".?AV<lambda_1>@?1??f@@YAXXZ@`a8f45668");
+}

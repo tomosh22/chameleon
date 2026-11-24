@@ -12,7 +12,7 @@
     { "symbol_contains": "::operator()::$TSS0", "decision": "bind-old-data", "source": "compiland-static-closure", "when": "cl" },
     { "symbol_contains": "::operator()::$TSS0", "decision": "bind-old-data", "source": "compiland-layout", "when": "clang" },
     { "symbol": "(anonymous namespace)::s_constructions", "decision": "bind-old-data", "source": "compiland-static" },
-    { "symbol": "(anonymous namespace)::s_last", "decision": "bind-old-data", "source": "compiland-static" }
+    { "symbol": "g_ls_last", "decision": "bind-old-data", "source": "pdb-public" }
   ],
   "absent": [
     { "symbol_contains": "::operator()::sname", "decision": "patch-new-data" },

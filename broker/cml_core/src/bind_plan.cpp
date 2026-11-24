@@ -311,7 +311,8 @@ private:
     const pdb::FunctionSignature& old_signature(const pdb::SymbolView& proc);
     const pdb::FunctionSignature& new_signature(const Sym& sy);
     // The identity of the closure whose operator() encloses a function-local record of the old compiland: the unique
-    // name of the member function's class without its ".?AV" prefix ("<lambda_1>@?1??f@@YAXXZ@").
+    // name of the member function's class without its ".?AV" prefix and without the translation-unit discriminator cl
+    // appends ("<lambda_1>@?1??f@@YAXXZ@"), which is how the decorated name of a symbol spells it.
     struct ClosureId {
         bool known = false;  // false: the types cannot be read (`why`)
         std::string tail;    // empty when known: the enclosing function is not a member function of a uniquely named class
@@ -895,7 +896,7 @@ Planner::ClosureId Planner::closure_of(const pdb::SymbolView& local) {
     }
     id.known = true;
     // ".?AV<lambda_1>@?1??f@@YAXXZ@": '.', '?', 'A', the class key ('V' class, 'U' struct), then the qualified name.
-    const std::string& u = sig.class_unique_name;
+    const std::string u = pdb::without_tu_discriminator(sig.class_unique_name);
     if (sig.member && u.size() > 4 && u[0] == '.' && u[1] == '?' && u[2] == 'A') {
         id.tail = u.substr(4);
     }
@@ -951,6 +952,26 @@ bool Planner::pair_overloads_by_signature(const std::string& group_name, std::ve
             why[pos] = "the types needed to tell the overloads apart cannot be read (" + unreadable + ")";
         }
         return false;
+    }
+    // A group in which NOT ONE new signature occurs among the old ones is not "every overload is new": it is far more
+    // likely that the two sides spell a type differently (a compiler or linker this reader has not met) than that
+    // every overload was replaced at once, and deciding "new" would silently leave every old function unhooked.
+    // That is doubt, and doubt refuses: the group stays ambiguous (CML3214) and says why.
+    if (!free_cands.empty()) {
+        bool any_match = false;
+        for (const pdb::FunctionSignature* n : new_sig) {
+            for (const pdb::FunctionSignature* o : old_sig) {
+                any_match = any_match || n->text == o->text;
+            }
+        }
+        if (!any_match) {
+            CML_LOG(Trace, "bind: overloads '%s': none of the %zu new signature(s) occurs among the %zu old one(s): not paired", group_name.c_str(), new_sig.size(), old_sig.size());
+            for (std::size_t m = 0; m < unmatched.size(); ++m) {
+                why[unmatched[m]] = "none of the " + std::to_string(new_sig.size()) + " signature(s) in the patch occurs among the " + std::to_string(old_sig.size()) +
+                                    " of the old image (new: " + new_sig[m]->text + "; old: " + old_sig.front()->text + "), so the functions cannot be told from new ones";
+            }
+            return true;
+        }
     }
     std::vector<bool> member_done(unmatched.size(), false);
     std::vector<bool> cand_taken(free_cands.size(), false);
@@ -1048,6 +1069,22 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
         }
         return;
     }
+    // An independent second opinion on which old records belong to the lambdas of this function: the display name of the
+    // record's enclosing proc ("`f'::`2'::<lambda_1>::operator()" under cl, "f::<lambda_0>::operator()" under clang-cl)
+    // against the display name of the members' enclosing function, lambda numbers aside. The closure classes must tell
+    // the same story; if they do not, the names are spelled in a way this reader does not know and nothing is decided.
+    std::string members_function = canonical_lambda_names(syms_[unmatched[scoped.front()]].dec.display);
+    const std::string suffix = "::" + base;
+    if (members_function.size() > suffix.size() && members_function.compare(members_function.size() - suffix.size(), suffix.size(), suffix) == 0) {
+        members_function.resize(members_function.size() - suffix.size());
+    }
+    std::vector<bool> by_name(free_cands.size(), false);
+    std::size_t old_by_name = 0;
+    for (std::size_t c = 0; c < free_cands.size(); ++c) {
+        const std::uint32_t parent = free_cands[c]->parent_proc;
+        by_name[c] = parent != pdb::kNoSymbol && parent < comp_syms_.size() && comp_norm(&comp_syms_[parent]).canonical == members_function;
+        old_by_name += by_name[c] ? 1u : 0u;
+    }
     // Old records in a closure of the same enclosing function, and which member each belongs to.
     std::vector<bool> in_function(free_cands.size(), false);
     std::vector<std::vector<std::size_t>> hits(unmatched.size());
@@ -1071,7 +1108,15 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
     }
     std::vector<bool> member_done(unmatched.size(), false);
     std::vector<bool> cand_taken(free_cands.size(), false);
-    if (old_in_function == 0) {
+    if (by_name != in_function) {
+        CML_LOG(Trace, "bind: closure statics '%s': %zu old record(s) are in lambdas of '%s' by name but %zu by closure class: not paired", base.c_str(), old_by_name,
+                members_function.c_str(), old_in_function);
+        for (const std::size_t m : scoped) {
+            why[unmatched[m]] = "the old records of the lambdas of '" + members_function + "' cannot be identified consistently (" + std::to_string(old_by_name) +
+                                " by the name of their function, " + std::to_string(old_in_function) + " by their closure class)";
+            no_layout.insert(unmatched[m]);
+        }
+    } else if (old_in_function == 0) {
         // (Guards included: this compiler records guard variables, or the group would have no candidates.)
         for (const std::size_t m : scoped) {
             Sym& sy = syms_[unmatched[m]];
