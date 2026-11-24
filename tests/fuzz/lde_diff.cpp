@@ -76,6 +76,7 @@ struct Totals {
 };
 
 std::size_t g_mismatches_printed = 0;
+std::size_t g_exceptions_printed = 0;
 
 // Instructions the reference decodes and the decoder refuses, by mnemonic.
 struct UnknownKind {
@@ -129,6 +130,12 @@ void sweep_range(const Reference& reference, const std::uint8_t* code, std::size
             }
             if (c.verdict == Verdict::Exception) {
                 ++t.exceptions;
+                // Compiled code has none; where a sweep meets one it is running through data. Show where.
+                if (g_exceptions_printed++ < 40) {
+                    std::printf("WP38-DIFF-EXCEPTION %s+0x%zx reference=%s bytes=%s\n", where.c_str(), at,
+                                cml::fuzz::lde::status_name(c.reference_status),
+                                hex_bytes(code + at, std::min<std::size_t>(length - at, c.ours.length)).c_str());
+                }
             }
             at += c.ours.length;
             continue;
