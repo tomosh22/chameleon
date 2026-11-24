@@ -1462,3 +1462,192 @@ TEST_CASE("a function-local thread_local paired by its function keeps the SECREL
     CHECK(secrels == 2);
     CHECK(r->warnings.empty());
 }
+
+// ---- a known section layout decides; the place in the function is the fallback (re-review of PR #64) -----------------
+
+TEST_CASE("statics of one name in two blocks: where the section's layout is known it decides, and no order pairing touches it") {
+    // clang-cl without /Gw: the function-local statics share one non-COMDAT section. A plain static of the unit teaches
+    // its layout (old RVA = offset + 0x3000). get_argument_options() has two `names` whose RECORD order disagrees with
+    // that layout: record 1 names the symbol at 0x20, record 2 the one at 0x10, while the old records are at 0x10, 0x20.
+    SynthWorld w;
+    w.data(w.tu(), "`anonymous namespace'::s_plain", 0x08);
+    old_options(w);
+    w.open();
+
+    StaticsObj o;
+    const std::uint32_t d = o.obj.section(".data", kData, 0x40);
+    o.obj.symbol("?s_plain@?A0x1@@3HA", 0x08, static_cast<std::int32_t>(d), false, false);
+    const std::uint32_t at_20 = o.obj.symbol(kNames4, 0x20, static_cast<std::int32_t>(d), false, false);
+    const std::uint32_t at_10 = o.obj.symbol(kNames8, 0x10, static_cast<std::int32_t>(d), false, false);
+    // A guard the old image has no record for (clang-cl records none): pass C places it from the section layout, which
+    // it can only do while that layout is intact.
+    const char* const guard = "?$TSS7@?4??get_argument_options@SceneTree@@UEBAXH@Z@4HA";
+    o.obj.symbol(guard, 0x30, static_cast<std::int32_t>(d), false, false);
+    o.proc(kOptions, "SceneTree::get_argument_options");
+    o.block();
+    o.record(at_20, "names");
+    o.end();
+    o.block();
+    o.record(at_10, "names");
+    o.end();
+    o.end();
+    Built b = o.build(some_debug_t());
+    auto r = plan_bind(w.input(b));
+    REQUIRE_MESSAGE(r.has_value(), err(r));
+    // By the layout, not by the order of the records.
+    CHECK(decision(*r, kNames4).source == BindSource::CompilandRva);
+    CHECK(decision(*r, kNames4).old_address.rva == 0x3020);
+    CHECK(decision(*r, kNames8).source == BindSource::CompilandRva);
+    CHECK(decision(*r, kNames8).old_address.rva == 0x3010);
+    CHECK(decision(*r, "?s_plain@?A0x1@@3HA").old_address.rva == 0x3008);
+    // The layout is still there for the rest of the section.
+    const SymbolDecision g = decision(*r, guard);
+    CHECK(g.decision == DecisionKind::BindOldData);
+    CHECK(g.source == BindSource::CompilandLayout);
+    CHECK(g.old_address.rva == 0x3030);
+    CHECK(r->warnings.empty());  // no CML3570 (nothing was paired by order), no CML3211 (the guard was placed)
+}
+
+TEST_CASE("statics of one name in two blocks: a known layout that places nothing is not overruled by the order") {
+    // The layout is known (s_plain) and says the two `names` of the patch are at offsets no old `names` is at. The
+    // records agree in count, type and blocks, but the layout wins: CML3207, nothing bound, no CML3570.
+    SynthWorld w;
+    w.data(w.tu(), "`anonymous namespace'::s_plain", 0x08);
+    old_options(w);
+    w.open();
+    StaticsObj o;
+    const std::uint32_t d = o.obj.section(".data", kData, 0x60);
+    o.obj.symbol("?s_plain@?A0x1@@3HA", 0x08, static_cast<std::int32_t>(d), false, false);
+    const std::uint32_t first = o.obj.symbol(kNames4, 0x40, static_cast<std::int32_t>(d), false, false);
+    const std::uint32_t second = o.obj.symbol(kNames8, 0x50, static_cast<std::int32_t>(d), false, false);
+    o.proc(kOptions, "SceneTree::get_argument_options");
+    o.block();
+    o.record(first, "names");
+    o.end();
+    o.block();
+    o.record(second, "names");
+    o.end();
+    o.end();
+    Built b = o.build(some_debug_t());
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    auto r = plan_bind(w.input(b), &errors, &partial);
+    REQUIRE_FALSE(r.has_value());
+    REQUIRE(errors.size() == 2);
+    for (const cml::Diag& e : errors) {
+        CHECK(e.id() == "CML3207");
+        CHECK(contains(e.message, "is known and places no old static named 'names' at its offset"));
+    }
+    CHECK(decision(partial, kNames4).decision != DecisionKind::BindOldData);
+    for (const cml::Diag& warning : partial.warnings) {
+        CHECK(warning.code != diag::kStaticsMatchedByOrder);
+    }
+}
+
+TEST_CASE("one static of a name in each of two functions, in one shared section") {
+    // int f(int) { static int n; }  int f(float) { static int n; }: the two functions whose statics an earlier version
+    // of the by-place step made refuse each other (it learned a layout from the first and held it against the second).
+    const char* const f_int = "?f@@YAHH@Z";
+    const char* const f_float = "?f@@YAHM@Z";
+    const char* const n_int = "?n@?1??f@@YAHH@Z@4HA";
+    const char* const n_float = "?n@?1??f@@YAHM@Z@4HA";
+    const auto old_world = [&](SynthWorld& w, bool with_plain) {
+        if (with_plain) {
+            w.data(w.tu(), "`anonymous namespace'::s_plain", 0x08);
+        }
+        w.proc_with_statics(w.tu(), "f", 0x40, {{"n", 0x10}}, 0x10);
+        w.proc_with_statics(w.tu(), "f", 0x50, {{"n", 0x20}}, 0x10);
+        w.pub_func(f_int, 0x40);
+        w.pub_func(f_float, 0x50);
+        w.open();
+    };
+    const auto object = [&](StaticsObj& o, std::uint32_t int_at, std::uint32_t float_at, bool with_plain) {
+        const std::uint32_t d = o.obj.section(".data", kData, 0x40);
+        if (with_plain) {
+            o.obj.symbol("?s_plain@?A0x1@@3HA", 0x08, static_cast<std::int32_t>(d), false, false);
+        }
+        const std::uint32_t sym_float = o.obj.symbol(n_float, float_at, static_cast<std::int32_t>(d), false, false);
+        const std::uint32_t sym_int = o.obj.symbol(n_int, int_at, static_cast<std::int32_t>(d), false, false);
+        o.proc(f_float, "f");
+        o.record(sym_float, "n");
+        o.end();
+        o.proc(f_int, "f");
+        o.record(sym_int, "n");
+        o.end();
+    };
+    SUBCASE("the section's layout is known: both are placed by it, without a warning, and the layout stays") {
+        SynthWorld w;
+        old_world(w, true);
+        StaticsObj o;
+        object(o, 0x10, 0x20, true);
+        Built b = o.build(some_debug_t());
+        auto r = plan_bind(w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        CHECK(decision(*r, n_int).source == BindSource::CompilandRva);
+        CHECK(decision(*r, n_int).old_address.rva == 0x3010);
+        CHECK(decision(*r, n_float).source == BindSource::CompilandRva);
+        CHECK(decision(*r, n_float).old_address.rva == 0x3020);
+        CHECK(r->warnings.empty());
+    }
+    SUBCASE("no layout is known and the object orders them the other way round: each pairs by its function, no warning") {
+        SynthWorld w;
+        old_world(w, false);
+        StaticsObj o;
+        object(o, 0x20, 0x10, false);  // f(int)'s static now lies behind f(float)'s
+        Built b = o.build(some_debug_t());
+        auto r = plan_bind(w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        CHECK(decision(*r, n_int).source == BindSource::CompilandProcedure);
+        CHECK(decision(*r, n_int).old_address.rva == 0x3010);
+        CHECK(decision(*r, n_float).source == BindSource::CompilandProcedure);
+        CHECK(decision(*r, n_float).old_address.rva == 0x3020);
+        CHECK(r->warnings.empty());
+    }
+}
+
+TEST_CASE("the by-place step is not asked about statics without a function scope, and says when two procedures claim one") {
+    SUBCASE("two file-scope statics of one name: the reason is not about procedure records") {
+        // Two records named 's_calls' at file scope in the old compiland, two symbols in the patch, no layout.
+        SynthWorld w;
+        w.data(w.tu(), "`anonymous namespace'::s_calls", 0x10);
+        w.data(w.tu(), "`anonymous namespace'::s_calls", 0x20);
+        w.open();
+        SynthObj o;
+        comdat_static(o, "?s_calls@?A0x1@@3HA");
+        comdat_static(o, "?s_calls@?A0x1@@3NA");
+        Built b = o.build();
+        std::vector<cml::Diag> errors;
+        auto r = plan_bind(w.input(b), &errors);
+        REQUIRE_FALSE(r.has_value());
+        REQUIRE(errors.size() == 2);
+        for (const cml::Diag& e : errors) {
+            CHECK(e.id() == "CML3207");
+            CHECK_FALSE(contains(e.message, "procedure"));
+        }
+    }
+    SUBCASE("the records of two procedures name one symbol") {
+        SynthWorld w;
+        old_options(w);
+        w.open();
+        StaticsObj o;
+        const std::uint32_t first = o.symbol(kNames4);
+        const std::uint32_t second = o.symbol(kNames8);
+        o.proc(kOptions, "SceneTree::get_argument_options");
+        o.record(first, "names");
+        o.record(second, "names");
+        o.end();
+        o.proc("?other@@YAXXZ", "other");
+        o.record(first, "names");
+        o.end();
+        Built b = o.build(some_debug_t());
+        std::vector<cml::Diag> errors;
+        auto r = plan_bind(w.input(b), &errors);
+        REQUIRE_FALSE(r.has_value());
+        bool said = false;
+        for (const cml::Diag& e : errors) {
+            CHECK(e.id() == "CML3207");
+            said = said || contains(e.message, "the records of several procedures of logic.cpp.obj name it as their static");
+        }
+        CHECK(said);
+    }
+}

@@ -621,17 +621,29 @@ void plan_fixture(const std::string& name) {
 
     // ---- WP-37: what the fixture `lambda_statics` must keep covering -------------------------------
     if (tag == "lambda_statics") {
-        // The two `names` of LsTree::options() are paired by their place in the function, and the plan says so.
+        // The two `names` of LsTree::options(). cl: each is a COMDAT section of its own, no layout exists; they are
+        // paired by their place in the function and the plan says so (CML3570). clang-cl: they share a section; when
+        // its layout is known the layout places them and there is no warning, else as under cl.
         std::size_t by_procedure = 0;
+        std::size_t by_layout = 0;
         for (const SymbolDecision& d : p.decisions) {
-            by_procedure += d.display == "LsTree::options::names" && d.decision == DecisionKind::BindOldData && d.source == BindSource::CompilandProcedure ? 1u : 0u;
+            if (d.display == "LsTree::options::names" && d.decision == DecisionKind::BindOldData) {
+                by_procedure += d.source == BindSource::CompilandProcedure ? 1u : 0u;
+                by_layout += d.source == BindSource::CompilandRva ? 1u : 0u;
+            }
         }
-        CHECK_MESSAGE(by_procedure == 2, tag << ": LsTree::options::names paired by procedure: " << by_procedure << " of 2");
         std::size_t order_warnings = 0;
         for (const cml::Diag& w : p.warnings) {
             order_warnings += w.id() == "CML3570" && w.message.find("'names' of 'LsTree::options' (2)") != std::string::npos ? 1u : 0u;
         }
-        CHECK_MESSAGE(order_warnings == 1, tag << ": CML3570 for LsTree::options: " << order_warnings);
+        brief("OPTIONS-NAMES " + tag + " by_procedure=" + std::to_string(by_procedure) + " by_layout=" + std::to_string(by_layout) + " CML3570=" + std::to_string(order_warnings));
+        if (kIsCl) {
+            CHECK_MESSAGE(by_procedure == 2, tag << ": LsTree::options::names paired by procedure: " << by_procedure << " of 2");
+            CHECK_MESSAGE(order_warnings == 1, tag << ": CML3570 for LsTree::options: " << order_warnings);
+        } else {
+            CHECK_MESSAGE(((by_layout == 2 && order_warnings == 0) || (by_procedure == 2 && order_warnings == 1)),
+                          tag << ": LsTree::options::names: by layout " << by_layout << ", by procedure " << by_procedure << ", CML3570 " << order_warnings);
+        }
         if (kIsCl) {
             // cl writes the block of a local entity into its decorated name: one digit up to block 10, letters from 11
             // on ("?L@?"). LsTree::flush() / ::timers() exist to have a lambda in such a block (Godot's

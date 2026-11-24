@@ -7,7 +7,8 @@
 #              LsTree::flush() / ::timers(): member functions with LS_NAME in block 11 or later (Godot's
 #              SceneTree::_flush_scene_change() and ::process_timers(); cl writes such a block in letters, "?L@?").
 #              LsTree::options(): two `static const LsList names` in two blocks of one function, no lambda (Godot's
-#              SceneTree::get_argument_options()); paired by their place in the function, with the warning CML3570.
+#              SceneTree::get_argument_options()); under cl paired by their place in the function, with the warning
+#              CML3570, under clang-cl placed by the layout of their section.
 #   anon.cpp   a function of an anonymous namespace with two LS_NAME; not edited by anything (evidence only).
 #   edits/     mark_2.edit changes what ls_step() returns (1 -> 2). After the reload every static must be the OLD
 #              one: each value keeps counting from where it was, in its own range (a wrong pairing would show another

@@ -45,7 +45,8 @@ public:
     int timers(int k, bool on);  // id 700000, one LS_NAME inside nested blocks, after many more
     // Two statics of ONE name and type in two blocks of one function, no lambda (ids 1000000 and 1100000):
     //     if (idx == 0) { static const LsList names = ...; } else if (idx == 1) { static const LsList names = ...; }
-    // Nothing but their place in the function tells them apart (ADR-0042, amended; CML3570 says so on every reload).
+    // Under cl nothing but their place in the function tells them apart (ADR-0042, amended; CML3570 says so on every
+    // reload); under clang-cl they share a section and its layout places them.
     int options(int idx) const;
 };
 // A function of an anonymous namespace with two LS_NAME (ids 800000 and 900000), in a translation unit of its own

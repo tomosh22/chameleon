@@ -211,11 +211,14 @@ const ObjectSignatures::ProcStatics* ObjectSignatures::statics_of(std::uint32_t 
     return it == procs_.end() ? nullptr : &it->second.statics;
 }
 
-std::optional<std::uint64_t> ObjectSignatures::function_of_static(std::uint32_t section, std::uint32_t value) {
+std::optional<std::uint64_t> ObjectSignatures::function_of_static(std::uint32_t section, std::uint32_t value, bool* several) {
     if (!loaded_) {
         load();
     }
     const auto it = static_owner_.find((static_cast<std::uint64_t>(section) << 32) | value);
+    if (several != nullptr) {
+        *several = it != static_owner_.end() && it->second == kSeveralFunctions;
+    }
     if (it == static_owner_.end() || it->second == kSeveralFunctions) {
         return std::nullopt;
     }

@@ -55,8 +55,8 @@ public:
     // procedure record, or the debug sections are unreadable (detail()).
     const ProcStatics* statics_of(std::uint32_t section, std::uint32_t value);
     // The function, as (section << 32) | offset, in which the data symbol at (section, value) is declared. nullopt: no
-    // record of a procedure names it, or records of two procedures do.
-    std::optional<std::uint64_t> function_of_static(std::uint32_t section, std::uint32_t value);
+    // record of a procedure names it, or records of two procedures do (`several`, when given, says which).
+    std::optional<std::uint64_t> function_of_static(std::uint32_t section, std::uint32_t value, bool* several = nullptr);
     // The canonical text of a type of the object (cml::pdb::canonical_type). nullopt with `why` when unreadable.
     std::optional<std::string> type_text(std::uint32_t type_index, std::string* why);
 

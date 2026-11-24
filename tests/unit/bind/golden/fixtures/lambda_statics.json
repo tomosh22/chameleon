@@ -18,7 +18,8 @@
     { "symbol": "LsTree::options", "decision": "patch-hooked", "source": "pdb-public" },
     { "symbol_contains": "LsTree::flush::<lambda_", "decision": "bind-old-data", "source": "compiland-static-closure" },
     { "symbol_contains": "LsTree::timers::<lambda_", "decision": "bind-old-data", "source": "compiland-static-closure" },
-    { "symbol": "LsTree::options::names", "decision": "bind-old-data", "source": "compiland-static-procedure" }
+    { "symbol": "LsTree::options::names", "decision": "bind-old-data", "source": "compiland-static-procedure", "when": "cl" },
+    { "symbol": "LsTree::options::names", "decision": "bind-old-data", "when": "clang" }
   ],
   "allowed_warnings": ["CML3570"],
   "absent": [

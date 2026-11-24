@@ -1268,7 +1268,7 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
     free_cands = std::move(free_left);
 }
 
-// Pass B (2b), data (ADR-0042, amended). Two statics of one name in one function, declared in different blocks
+// Pass B (4), data (ADR-0042, amended). Two statics of one name in one function, declared in different blocks
 // (Godot's `if (i == 0) { static const Vector<StringName> names = ...; } else if (i == 1) { static const ... names ... }`),
 // have the same name, scope and type; under cl each is a COMDAT section of its own, so no layout tells them apart
 // either. What is left is their place in the function. Both sides record it the same way: the data records of the
@@ -1281,6 +1281,12 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
 // Swapping two such blocks, or replacing one, exchanges the statics without a trace in these records, so a pairing of
 // several is never silent: CML3570 (warning) names the function and the statics. One static of the name in the
 // function needs no order and no warning: its function is its identity (the statics of two overloads).
+//
+// This is the fallback for sections whose layout is NOT known. A member in a section with a known layout (a delta that
+// every matched static of the section agrees on) was offered to the layout step before; whatever that step decided
+// stands, and if it placed nothing the member stays ambiguous: the layout wins over the order. A pairing made here
+// never teaches, contradicts or drops a section layout (no learn_delta): the layout other statics and the guards of
+// pass C rely on must not depend on an order-based guess.
 void Planner::pair_statics_by_procedure(const std::string& base, bool is_tls, const std::vector<std::uint32_t>& members, std::vector<std::uint32_t>& unmatched,
                                         std::vector<const pdb::SymbolView*>& free_cands, std::map<std::uint32_t, Match>& matched, std::map<std::uint32_t, std::string>& why,
                                         const std::set<std::uint32_t>& no_layout) {
@@ -1291,12 +1297,20 @@ void Planner::pair_statics_by_procedure(const std::string& base, bool is_tls, co
             continue;  // refused by the rule for lambdas: not placed by any other step
         }
         const Sym& sy = syms_[pos];
-        const std::optional<std::uint64_t> fn = sy.dec.section == 0 ? std::nullopt : debug.function_of_static(sy.dec.section, sy.s->value);
+        if (delta_.count(sy.dec.section) != 0) {
+            if (why.count(pos) == 0) {
+                why[pos] = "the layout of object section " + std::to_string(sy.dec.section) + " is known and places no old static named '" + base + "' at its offset";
+            }
+            continue;  // the layout decides for this section
+        }
+        bool several = false;
+        const std::optional<std::uint64_t> fn = sy.dec.section == 0 ? std::nullopt : debug.function_of_static(sy.dec.section, sy.s->value, &several);
         if (fn) {
             by_function[*fn].push_back(pos);
         } else if (why.count(pos) == 0) {
-            why[pos] = "no procedure of " + in_.object_name + " records it as its static (" +
-                       (debug.origin() == ObjectTypeOrigin::Unreadable ? debug.detail() : std::string("the object's .debug$S has no such record")) + ")";
+            why[pos] = several ? "the records of several procedures of " + in_.object_name + " name it as their static"
+                               : "no procedure of " + in_.object_name + " records it as its static (" +
+                                     (debug.origin() == ObjectTypeOrigin::Unreadable ? debug.detail() : std::string("the object's .debug$S has no such record")) + ")";
         }
     }
     const auto path_text = [](const std::vector<std::uint32_t>& path) {
@@ -1438,6 +1452,10 @@ void Planner::pair_statics_by_procedure(const std::string& base, bool is_tls, co
                 break;
             }
             type_text[k] = *new_type;
+            if (matched.count(new_pos[k]) == 0 && delta_.count(syms_[new_pos[k]].dec.section) != 0) {
+                problem = which + " is in object section " + std::to_string(syms_[new_pos[k]].dec.section) + ", whose layout is known and does not place it";
+                break;
+            }
             const auto earlier = matched.find(new_pos[k]);
             if (earlier != matched.end() ? earlier->second.view != old_views[k] : std::find(free_cands.begin(), free_cands.end(), old_views[k]) == free_cands.end()) {
                 problem = which + " or its old record was already paired differently by an earlier step";
@@ -1457,7 +1475,6 @@ void Planner::pair_statics_by_procedure(const std::string& base, bool is_tls, co
             CML_LOG(Trace, "bind: statics '%s' of %s: record %zu of %zu (block path %s, type %s) %s paired with the old record at rva %s", base.c_str(), function.c_str(), k + 1, count,
                     path_text(new_list[k]->record.block_path).c_str(), type_text[k].c_str(), syms_[pos].name.c_str(), hex(old_views[k]->rva).c_str());
             matched[pos] = {old_views[k], BindSource::CompilandProcedure};
-            learn_delta(syms_[pos], old_views[k]->rva);
             unmatched.erase(std::remove(unmatched.begin(), unmatched.end(), pos), unmatched.end());
             free_cands.erase(std::remove(free_cands.begin(), free_cands.end(), old_views[k]), free_cands.end());
             why.erase(pos);
@@ -1468,10 +1485,9 @@ void Planner::pair_statics_by_procedure(const std::string& base, bool is_tls, co
                  "Function-local statics '" + base + "' of " + function + " (" + std::to_string(count) +
                      ") are matched by their order in the function; if you reordered or replaced blocks that declare them, their values may be exchanged.",
                  "Rename one of them, or hot-restart after reordering.");
+            // (The evidence tag of the harness: cmltest prints broker-log lines that carry "WP<nn>-<NAME>".)
+            CML_LOG(Info, "WP37-ORDER function=%s statics=%s count=%zu warning=CML3570", function.c_str(), base.c_str(), count);
         }
-    }
-    for (const std::uint32_t sec : delta_conflict_) {
-        delta_.erase(sec);
     }
 }
 
@@ -1713,11 +1729,12 @@ void Planner::bridge_statics() {
     //   functions  (1) one-to-one by the canonical signature from the type records (WP-37, ADR-0042). Only when a
     //              signature of the group cannot be read: (2) by the member's exact qualified name, as before WP-37
     //              (clang spells lambdas with the same counter as the decorated name).
-    //   data       (2) the exact qualified name, (2b) the function it is declared in and its place among that
-    //              function's statics of the name (ADR-0042, amended), (3) the RVA in the unchanged section layout.
+    //   data       (2) the exact qualified name, (3) the RVA in the unchanged section layout, (4) where no layout is
+    //              known for its section: the function it is declared in and its place among that function's statics
+    //              of the name (ADR-0042, amended).
     // Whatever is left is ambiguous: CML3214 for functions (equal signatures, a changed set of lambdas, or types that
     // cannot be read), CML3207 for data.
-    // Step (2b) needs to know which old function each function of the patch is, so every function group is handled
+    // Step (4) needs to know which old function each function of the patch is, so every function group is handled
     // before the first data group (the two rounds of the outer loop; the body is not indented a second time).
     for (const bool functions : {true, false}) {
     for (const std::string& key : deferred) {
@@ -1773,10 +1790,6 @@ void Planner::bridge_statics() {
                 ++it;
             }
         }
-        // (2b) data: by the enclosing function and the place in it
-        if (!g.is_func && !unmatched.empty()) {
-            pair_statics_by_procedure(g.base, g.is_tls, g.members, unmatched, free_cands, matched, why, pend.no_layout);
-        }
         // (3) data: the RVA the unchanged layout predicts
         if (!g.is_func) {
             for (auto it = unmatched.begin(); it != unmatched.end();) {
@@ -1796,6 +1809,12 @@ void Planner::bridge_statics() {
                 }
                 it = taken ? unmatched.erase(it) : it + 1;
             }
+        }
+        // (4) data: function-local statics whose section has NO known layout (under cl every function-local static is a
+        // COMDAT section of its own), by the function they are declared in and their place in it. Where a layout is
+        // known it has decided above, and it wins: such a member is not paired here.
+        if (!g.is_func && !g.encl.empty() && !unmatched.empty()) {
+            pair_statics_by_procedure(g.base, g.is_tls, g.members, unmatched, free_cands, matched, why, pend.no_layout);
         }
         for (const std::uint32_t pos : unmatched) {
             Sym& sy = syms_[pos];

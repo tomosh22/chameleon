@@ -4,8 +4,11 @@
 #   * the same in member functions, in block 11 or later of the function (cl writes such a block in letters in the
 #     decorated name): LsTree::flush() (`tf`) and LsTree::timers() (`tt`);
 #   * the same in a function of an anonymous namespace, in a second translation unit (`nx`, `ny`; not recompiled here);
-#   * two statics of ONE name and type in two blocks of one ordinary function, LsTree::options() (`p0`, `p1`): paired
-#     by their place in the function, which the reload must say (warning CML3570; ADR-0042, amended).
+#   * two statics of ONE name and type in two blocks of one ordinary function, LsTree::options() (`p0`, `p1`). Under
+#     cl each is a COMDAT section of its own and they are paired by their place in the function, with the warning
+#     CML3570 (ADR-0042, amended); cmltest prints the broker's line `WP37-ORDER function='LsTree::options' ...` after
+#     the reload. Under clang-cl they share a section whose layout is known, the layout places them and there is no
+#     warning; so the warning is not a step here (unit.bind_fixtures asserts it per compiler).
 # Every fetch adds to the static's `hits`, so each printed value is its static's id (100000, 200000, ... 1100000) plus
 # a growing count: the leading digits say WHICH static it is.
 #
@@ -15,7 +18,7 @@
 #     right one (a wrong pairing would print another static's range, a new static would restart just above its id);
 #   * made= is still 11: no static was constructed again (the guard variables were bound too).
 name = "lambda_statics"
-description = "fixture lambda_statics: mark=1 -> edit -> reload -> mark=2, every function-local static keeps its value, made=11, CML3570 for the two `names`"
+description = "fixture lambda_statics: mark=1 -> edit -> reload -> mark=2, every function-local static keeps its value, made=11"
 fixture = "lambda_statics"
 timeout_s = 180
 
@@ -45,12 +48,6 @@ patch = "edits/mark_2.edit"
 [[step]]
 kind = "reload"
 within_s = 90
-
-# The two `names` of LsTree::options() were matched by their order in the function: never silently.
-[[step]]
-kind = "expect_diag"
-id = "CML3570"
-within_s = 10
 
 # The patched code runs (mark=2), with the old statics: every count is still at least 20 above its id.
 [[step]]
