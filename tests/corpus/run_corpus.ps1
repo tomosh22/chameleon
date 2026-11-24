@@ -1,7 +1,7 @@
 # WP-26: runs Chameleon against one open-source project built with one compiler (docs/wp/WP-26.md).
 #
 #   pwsh tests/corpus/run_corpus.ps1 -Project raylib|imgui|godot -Compiler msvc|clang-cl `
-#        -ChameleonBin <build>/bin -WorkDir <dir> [-CxxPath <full path of cl / clang-cl>]
+#        -ChameleonBin <build>/bin -WorkDir <dir> [-CxxPath <full path of cl / clang-cl>] [-ReloadBudgetMsPerTu <ms>]
 #
 # Steps (each is a row of the pass/fail matrix, <WorkDir>/out-<project>-<compiler>/matrix.json):
 #   fetch      git clone of the pinned tag (never vendored), tests/corpus/<project>/chameleon.patch + support files
@@ -11,6 +11,10 @@
 #   enable     broker + the application with the agent: module enabled, PDB index ready, frames printed
 #   edit:<id>  one edit of project.json, `reload`, the change is observable, the application keeps running
 #   refused:<id>  the deliberately unsupported edit is refused with its diagnostic and the application keeps running
+#   reload-budget (WP-39, only with -ReloadBudgetMsPerTu): every accepted reload took at most that many ms of
+#              `total - compile` per recompiled translation unit. Every cell prints the stage timings of each accepted
+#              reload as `WP39-<PROJECT> edit=<id> total_ms=... compile_ms=... rest_ms=... budget_ms=...` (also in the
+#              step summary and in reload-timings.json); the Godot cell (523 MB PDB) asserts 3000 ms (ADR-0042).
 # Exit code 1 when a step failed (an `expected_failure` of project.json is asserted and counts as passed).
 [CmdletBinding()]
 param(
@@ -20,7 +24,8 @@ param(
     [Parameter(Mandatory)][string]$WorkDir,
     [string]$Config = 'RelWithDebInfo',
     [string]$CxxPath = '',
-    [string[]]$Skip = @()
+    [string[]]$Skip = @(),
+    [int]$ReloadBudgetMsPerTu = 0
 )
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
@@ -43,6 +48,7 @@ $script:Broker = $null
 $script:App = $null
 $script:Ctl = $null
 $script:Failed = $false
+$script:Timings = New-Object System.Collections.Generic.List[object]   # WP-39: one row per accepted reload
 
 function Add-Result([string]$Step, [string]$Result, [string]$Detail = '', [double]$Seconds = 0) {
     $row = [ordered]@{ project = $Project; compiler = $Compiler; step = $Step; result = $Result; detail = $Detail; seconds = [math]::Round($Seconds, 1) }
@@ -82,6 +88,45 @@ function Invoke-Step([string]$Name, [scriptblock]$Body) {
 }
 
 function Skip-Step([string]$Name, [string]$Why) { Add-Result $Name 'skipped' $Why 0 }
+
+# WP-39 (ADR-0042): the stage timings of one accepted reload, from the reload result's `timing_ms` (the broker's own
+# clock: sweep, compile, plan, anchor, link, load, fixups, init, hooks, total). Prints
+#   WP39-<PROJECT> edit=<id> total_ms=... compile_ms=... rest_ms=... budget_ms=... tus=N <stage>_ms=...
+# and records the row. `rest` is total - compile (the compiler's time belongs to the user's code); the budget is
+# $ReloadBudgetMsPerTu for each recompiled translation unit (`none` in a cell that asserts no budget). A stage that is
+# missing or not a number makes the edit fail: nothing is read as 0. Whether the budget holds is the step `reload-budget`.
+function Add-ReloadTiming([string]$EditId, $Result) {
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $t = $Result.timing_ms
+    if ($null -eq $t) { throw "edit ${EditId}: the reload result has no timing_ms" }
+    $v = [ordered]@{}
+    foreach ($s in 'sweep', 'compile', 'plan', 'anchor', 'link', 'load', 'fixups', 'init', 'hooks', 'total') {
+        $p = $t.PSObject.Properties[$s]
+        $isNumber = $null -ne $p -and ($p.Value -is [double] -or $p.Value -is [long] -or $p.Value -is [int] -or $p.Value -is [decimal])
+        if (-not $isNumber) { throw "edit ${EditId}: timing_ms.$s is missing or not a number" }
+        $d = [double]$p.Value
+        if ([double]::IsNaN($d) -or [double]::IsInfinity($d) -or $d -lt 0) { throw "edit ${EditId}: timing_ms.$s is negative or not finite" }
+        $v[$s] = $d
+    }
+    if ($v['total'] -lt $v['compile']) { throw "edit ${EditId}: total ($($v['total']) ms) is smaller than compile ($($v['compile']) ms)" }
+    $c = $Result.PSObject.Properties['compiled']
+    if ($null -eq $c -or -not ($c.Value -is [long] -or $c.Value -is [int]) -or [long]$c.Value -lt 1) {
+        throw "edit ${EditId}: the reload result names no recompiled translation unit (compiled)"
+    }
+    $tus = [long]$c.Value
+    $rest = $v['total'] - $v['compile']
+    $budget = [double]$ReloadBudgetMsPerTu * $tus
+    $fmt = { param($x) ([double]$x).ToString('0.0', $inv) }
+    $line = "WP39-{0} edit={1} total_ms={2} compile_ms={3} rest_ms={4} budget_ms={5} tus={6}" -f $Project.ToUpperInvariant(), $EditId, (& $fmt $v['total']),
+        (& $fmt $v['compile']), (& $fmt $rest), $(if ($ReloadBudgetMsPerTu -gt 0) { $budget.ToString('0', $inv) } else { 'none' }), $tus
+    foreach ($s in 'sweep', 'plan', 'anchor', 'link', 'load', 'fixups', 'init', 'hooks') { $line += " ${s}_ms=$(& $fmt $v[$s])" }
+    Write-Host $line
+    $script:Timings.Add([pscustomobject][ordered]@{
+            edit = $EditId; tus = $tus; total_ms = $v['total']; compile_ms = $v['compile']; rest_ms = $rest
+            budget_ms = $(if ($ReloadBudgetMsPerTu -gt 0) { $budget } else { $null })
+            over_budget = ($ReloadBudgetMsPerTu -gt 0 -and $rest -gt $budget); stages_ms = $v; line = $line
+        })
+}
 
 function Invoke-Native([string]$Label, [string]$Exe, [string[]]$ArgList, [string]$LogFile = '') {
     Write-Host ">> $Label : $Exe $($ArgList -join ' ')"
@@ -367,6 +412,7 @@ if ($built) {
                         if ([int]$r.result.patched -eq 0) { throw "the reload patched nothing (changed_files: $(@($r.result.changed_files).Count)): $($edit.file) maps to no source compiland of the module" }
                         $keep = $true   # the patch is live and the baseline accepted: the file stays as edited
                         $line = Wait-Corpus $edit.expect $from $cfg.observe_timeout_s
+                        Add-ReloadTiming $edit.id $r.result   # WP-39: the stages of this reload; throws on a missing stage
                         $t = $r.result.timing_ms
                         "reload {0:N1}s wall, total {1} ms (compile {2}, link {3}, load {4}, hooks {5}); patched={6} hooks={7}; observed: {8}" -f $wall, $t.total, $t.compile, $t.link, $t.load, $t.hooks, $r.result.patched, $r.result.hooks_installed, $line
                     }
@@ -398,14 +444,36 @@ if ($built) {
             if ((Test-Path $p) -and $script:Failed) { Write-Host "---- tail of $f"; Get-Content $p -Tail 40 | Out-Host }
         }
     }
+    # WP-39 (ADR-0042): the reload budget of this cell, when it has one. Judged after every edit ran, so one slow reload
+    # does not hide the numbers of the others; a cell where no reload was measured cannot pass.
+    if ($ReloadBudgetMsPerTu -gt 0) {
+        if ($ran) {
+            Invoke-Step 'reload-budget' {
+                $accepted = @($script:Matrix | Where-Object { $_.step -like 'edit:*' -and $_.result -eq 'pass' }).Count
+                if ($script:Timings.Count -eq 0) { throw 'no reload was measured, so nothing shows that the budget holds' }
+                if ($script:Timings.Count -lt $accepted) { throw "$accepted edits passed but only $($script:Timings.Count) reloads were measured" }
+                $over = @($script:Timings | Where-Object { $_.over_budget })
+                if ($over.Count -gt 0) {
+                    throw ("over budget ($ReloadBudgetMsPerTu ms of total - compile per recompiled TU): " + (@($over | ForEach-Object { "$($_.edit): $([math]::Round($_.rest_ms, 1)) ms for $($_.tus) TU" }) -join '; '))
+                }
+                $worst = $script:Timings | Sort-Object { $_.rest_ms / $_.tus } -Descending | Select-Object -First 1
+                "{0} reloads, each within {1} ms of total - compile per recompiled TU; slowest per TU: {2} ({3} ms for {4} TU)" -f $script:Timings.Count, $ReloadBudgetMsPerTu, $worst.edit, [math]::Round($worst.rest_ms, 1), $worst.tus
+            } | Out-Null
+        } else {
+            Skip-Step 'reload-budget' 'enable failed'
+        }
+    }
 } else {
     Skip-Step 'enable' 'build failed'
+    if ($ReloadBudgetMsPerTu -gt 0) { Skip-Step 'reload-budget' 'build failed' }
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
 # report
 # ---------------------------------------------------------------------------------------------------------------------
 $script:Matrix | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $out 'matrix.json')
+# WP-39. (ToArray, not @(): the array operator on a List[object] of custom objects fails with "Argument types do not match".)
+ConvertTo-Json -InputObject ($script:Timings.ToArray()) -Depth 5 | Set-Content (Join-Path $out 'reload-timings.json')
 if ($env:GITHUB_STEP_SUMMARY) {
     $md = New-Object System.Collections.Generic.List[string]
     $md.Add("### corpus: $Project / $Compiler")
@@ -415,6 +483,15 @@ if ($env:GITHUB_STEP_SUMMARY) {
         $d = ([string]$row.detail) -replace '\|', '/' -replace "[\r\n]+", ' '
         if ($d.Length -gt 300) { $d = $d.Substring(0, 300) + '...' }
         $md.Add("| $($row.step) | $($row.result) | $d |")
+    }
+    if ($script:Timings.Count -gt 0) {
+        # WP-39: the stage timings of every accepted reload (ms). rest = total - compile.
+        $md.Add('')
+        $md.Add($(if ($ReloadBudgetMsPerTu -gt 0) { "Reload timing (WP-39): budget $ReloadBudgetMsPerTu ms of total - compile per recompiled TU." } else { 'Reload timing (WP-39): recorded, no budget asserted in this cell.' }))
+        $md.Add('')
+        $md.Add('```')
+        foreach ($row in $script:Timings) { $md.Add([string]$row.line) }
+        $md.Add('```')
     }
     Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ($md -join "`n")
 }

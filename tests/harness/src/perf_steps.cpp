@@ -1,6 +1,7 @@
 #include "perf_steps.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <utility>
 
 #include "cml/ipc/control_ids.h"
@@ -38,7 +39,7 @@ cml::Result<Step> parse_perf_step(const toml::Table& table, const std::string& k
     step.kind = idle ? StepKind::PerfIdle : StepKind::PerfReport;
     for (const auto& entry : table.entries) {
         const std::string& key = entry.first;
-        const bool known = key == "kind" || (idle ? (key == "duration_s" || key == "max_cpu_permille") : (key == "max_median_ms" || key == "min_reloads"));
+        const bool known = key == "kind" || (idle ? (key == "duration_s" || key == "max_cpu_permille") : (key == "max_median_ms" || key == "min_reloads" || key == "tag"));
         if (!known) {
             return invalid(entry.second.line, "unknown key '" + key + "' in a " + kind + " step");
         }
@@ -57,6 +58,14 @@ cml::Result<Step> parse_perf_step(const toml::Table& table, const std::string& k
         if (!reloads) return reloads.error();
         step.result_value = *median;
         step.min_samples = static_cast<int>(*reloads);
+        if (const toml::Value* tag = table.find("tag")) {
+            const bool ok = tag->kind == toml::Value::Kind::String && !tag->text.empty() && tag->text.size() <= 32 &&
+                            std::all_of(tag->text.begin(), tag->text.end(), [](char c) { return (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-'; });
+            if (!ok) {
+                return invalid(tag->line, "'tag' must be 1-32 characters of A-Z, 0-9 and '-' (the prefix of the evidence line)");
+            }
+            step.perf_tag = tag->text;
+        }
     }
     step.has_result_value = true;
     return step;
@@ -125,6 +134,25 @@ std::vector<StageStats> compute_stage_stats(const std::vector<cml::ipc::json::Va
     s.max = *std::max_element(excl.begin(), excl.end());
     out.push_back(std::move(s));
     return out;
+}
+
+std::string reload_evidence_line(const std::string& tag, double pdb_mib, std::size_t reloads, const std::vector<StageStats>& stats, long long budget_ms) {
+    double median_excl = 0;
+    double max_excl = 0;
+    std::string stages;
+    char buf[160];
+    for (const StageStats& s : stats) {
+        if (s.stage == "total_excl_compile") {
+            median_excl = s.median;
+            max_excl = s.max;
+            continue;
+        }
+        std::snprintf(buf, sizeof buf, " %s_median_ms=%.1f", s.stage.c_str(), s.median);
+        stages += buf;
+    }
+    std::snprintf(buf, sizeof buf, " pdb_mib=%.1f reloads=%zu total_minus_compile_median_ms=%.1f max_ms=%.1f budget_ms=%lld", pdb_mib, reloads, median_excl,
+                  max_excl, budget_ms);
+    return tag + buf + stages;
 }
 
 }  // namespace cmltest

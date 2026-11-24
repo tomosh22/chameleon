@@ -1,0 +1,124 @@
+# Scenario `large_pdb_reload` (WP-39, ADR-0042): a reload INSIDE a large PDB. Run by the `pdb-benchmark` CI job only.
+#
+# The program is the generated benchmark project (tests/bench/gen_pdb_project.py: 900 translation units of 1000 functions,
+# a PDB of about 544 MiB), built by that job and cached. It is not a fixture of tests/fixtures, so the scenario is
+# `external`: cmltest builds nothing and takes the program and its source tree from the command line,
+#
+#   cmltest --scenario tests/bench/scenarios/large_pdb_reload.toml --build-dir build --require-all-capabilities
+#           --external-exe bench-build/bench_project.exe --external-source bench-src
+#
+# (the PDB records the paths of bench-src, so `edit` steps patch that tree in place; cmltest restores it afterwards).
+#
+#   1. the program runs with the agent; the broker indexes the PDB and hashes the tracked sources (900 translation units, 24 headers, main.cpp);
+#   2. src/tu_0450.cpp (1000 functions; bench_reload_value() is its last one) is edited and reloaded five times
+#      (1 -> 2 -> ... -> 6); after each reload the program prints the new value;
+#   3. perf_report: median over the five reloads of (total - compile) must stay under 3000 ms (plan target 1500 ms, CI
+#      threshold with ADR-0009's 2x slack), and the broker's peak private bytes under 1.5 x the PDB size + 32 MiB. A reload
+#      whose timing lacks a stage, or holds a non-number, fails the step (nothing is read as 0). The numbers go to
+#      $CML_PERF_JSON and to the line `WP39-RELOAD pdb_mib=... reloads=5 total_minus_compile_median_ms=... max_ms=...
+#      budget_ms=3000 <stage>_median_ms=...`.
+name = "large_pdb_reload"
+description = "generated benchmark project (544 MiB PDB): five reloads of a 1000-function TU with per-stage timing and the broker memory limit"
+fixture = "bench_project"
+external = true
+timeout_s = 2400
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1 tus=\\d+"
+within_s = 60
+
+# The index of the 544 MiB PDB, the build-requirement checks, the include scan and the hashes of the sources.
+[[step]]
+kind = "expect_module_enabled"
+module = "bench_project.exe"
+within_s = 900
+
+[[step]]
+kind = "wait"
+for = "idle"
+within_s = 120
+
+[[step]]
+kind = "edit"
+patch = "edits/reload_2.edit"
+
+[[step]]
+kind = "reload"
+within_s = 600
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2 tus=\\d+"
+within_s = 30
+
+[[step]]
+kind = "edit"
+patch = "edits/reload_3.edit"
+
+[[step]]
+kind = "reload"
+within_s = 600
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=3 tus=\\d+"
+within_s = 30
+
+[[step]]
+kind = "edit"
+patch = "edits/reload_4.edit"
+
+[[step]]
+kind = "reload"
+within_s = 600
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=4 tus=\\d+"
+within_s = 30
+
+[[step]]
+kind = "edit"
+patch = "edits/reload_5.edit"
+
+[[step]]
+kind = "reload"
+within_s = 600
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=5 tus=\\d+"
+within_s = 30
+
+[[step]]
+kind = "edit"
+patch = "edits/reload_6.edit"
+
+[[step]]
+kind = "reload"
+within_s = 600
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=6 tus=\\d+"
+within_s = 30
+
+[[step]]
+kind = "perf_report"
+max_median_ms = 3000
+min_reloads = 5
+tag = "WP39-RELOAD"

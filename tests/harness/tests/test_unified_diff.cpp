@@ -246,6 +246,10 @@ TEST_CASE("diff: apply to a tree changes only the copy, strips one component, an
     CHECK(r->files[0] == "logic.cpp");
     CHECK(dir.read("logic.cpp").find("return 2;") != std::string::npos);
     CHECK(dir.read("other.txt") == "keep\n");
+    // WP-39: the content before the patch comes back with the result (an external source tree is restored from it)
+    REQUIRE(r->originals.size() == 1);
+    REQUIRE(r->originals[0].has_value());
+    CHECK(*r->originals[0] == kLogic);
 
     // applying the same patch again fails (already applied) and changes nothing
     const std::string before = dir.read("logic.cpp");
