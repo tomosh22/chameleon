@@ -1093,6 +1093,16 @@ table entries break when the patch lies below the old image. Instead:
   (planner), `tests/fixtures/{static_overloads,lambda_statics}`, `tests/harness/scenarios`, `tests/unit/{pdb,bind}`,
   `tests/fuzz` (PDB target and seeds), `tests/corpus/{imgui,godot}/project.json`, `tests/corpus/repro`.
 
+**Amendment (2026-11-24, from the Godot corpus run of WP-37).** `scene/main/scene_tree.cpp` has, besides the `SNAME`
+lambdas, an ordinary function with two same-named, same-typed function-local statics in different blocks
+(`if (...) { static const Vector<StringName> names = ...; } else { static const ... names = ...; }`). Under cl every
+function-local static is in its own COMDAT section, so the layout step cannot place them, and the PDB record carries no
+block number. Ruling: such statics (data only, one procedure, one name) may be paired by their order of emission in the
+procedure, old PDB against the patch object's `.debug$S`, only when the counts are equal, the canonical types are
+pairwise equal, and the block-nesting paths agree where both sides record them. Each reload that pairs this way emits a
+warning (CML3570–3599) naming the statics, because reordering the blocks would exchange their values. This is the same
+class of residual risk as the lambda number, accepted only with the user told. Anything else stays CML3207.
+
 ### WP-38: VEX and EVEX in the hook length decoder; decoder fuzzing (R-04, R-41)
 
 **This reverses a WP-10 decision** ("no VEX, no EVEX": anything VEX-encoded is Unknown, CML4300). The reason then was
