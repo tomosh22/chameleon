@@ -8,7 +8,7 @@
 namespace cml::core::bind::diag {
 
 // By-design limitations (KNOWN_LIMITATIONS.md).
-inline constexpr std::uint32_t kAddr32NbToOldData = 3101;  // image-relative reference to old-module data
+inline constexpr std::uint32_t kAddr32NbToOldData = 3101;  // image-relative reference to old-module data that is not a proved address displacement (WP-36 narrowed it)
 inline constexpr std::uint32_t kThreadLocal = 3102;        // thread-local reference shape that cannot be retargeted (WP-24 narrowed it)
 
 // Errors.
@@ -32,6 +32,9 @@ inline constexpr std::uint32_t kThreadLocalInit = 3401;   // dynamic initialiser
 
 // WP-26c (ADR-0036: CML3500..CML3549, planner).
 inline constexpr std::uint32_t kUnnamedStatic = 3500;     // writable static data whose identity cannot be established (error)
+
+// WP-36 (ADR-0042: CML3550..CML3569, planner).
+inline constexpr std::uint32_t kImgrelOutOfRange = 3550;  // image-relative displacement to old data does not fit 32 bits (error)
 
 // Warnings (the plan is still produced).
 inline constexpr std::uint32_t kSharedInitialiser = 3210;  // TU-wide initialiser may re-run initialisers of bound globals

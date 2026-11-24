@@ -569,6 +569,7 @@ Result<Value> ReloadService::run_reload(const Value& args, bool automatic, bool 
     result.set("generation", Value::integer(static_cast<std::int64_t>(generation_.load())));
     std::size_t hooks = 0, run = 0, patched = 0, compiled = 0, reused = 0, attempts = 0, modules_patched = 0;
     std::size_t hooks_planned = 0, hooks_dropped = 0, modules_unchanged = 0;  // WP-25
+    std::size_t imgrel_sites = 0, imgrel_verified = 0;  // WP-36
     std::set<std::uint32_t> patched_pids;
     Value patches = Value::array();
     Value changed = Value::array();
@@ -577,6 +578,8 @@ Result<Value> ReloadService::run_reload(const Value& args, bool automatic, bool 
         hooks_planned += p.hooks_planned;
         hooks_dropped += p.hooks_dropped;
         modules_unchanged += p.no_functional_change ? 1 : 0;
+        imgrel_sites += p.imgrel_sites;
+        imgrel_verified += p.imgrel_verified;
         run += p.initializers_run;
         patched += p.patches;
         compiled += p.compiled;
@@ -608,6 +611,10 @@ Result<Value> ReloadService::run_reload(const Value& args, bool automatic, bool 
     result.set("modules_patched", Value::integer(static_cast<std::int64_t>(modules_patched)));
     result.set("processes_patched", Value::integer(static_cast<std::int64_t>(patched_pids.size())));
     result.set("initializers_run", Value::integer(static_cast<std::int64_t>(run)));
+    // WP-36: image-relative references to old data in the recompiled objects and how many were retargeted (proved to be
+    // address displacements). cmltest prints them as `WP36-IMGREL sites=N verified=N`.
+    result.set("imgrel_sites", Value::integer(static_cast<std::int64_t>(imgrel_sites)));
+    result.set("imgrel_verified", Value::integer(static_cast<std::int64_t>(imgrel_verified)));
     result.set("changed_files", std::move(changed));
     result.set("patches", std::move(patches));
     sum.total = wall_ms;

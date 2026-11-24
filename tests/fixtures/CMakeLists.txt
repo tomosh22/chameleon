@@ -47,3 +47,10 @@ foreach(_cml_m7 crash_reexecute perf inject static_lib c_statics)
         add_subdirectory(${_cml_m7})
     endif()
 endforeach()
+
+# Wave 10 fixture directories (ADR-0042), built only once a work package adds them. One line per fixture.
+foreach(_cml_m10 imgrel)
+    if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/${_cml_m10}/CMakeLists.txt")
+        add_subdirectory(${_cml_m10})
+    endif()
+endforeach()

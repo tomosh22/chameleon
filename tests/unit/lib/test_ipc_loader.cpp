@@ -197,6 +197,74 @@ TEST_CASE("WP-08 fix-up wire layout is fixed") {
     CHECK(std::memcmp(frame.data() + kFrameHeaderSize + 20, expected_fixup, 16) == 0);
 }
 
+// WP-36 (ADR-0042): the fix-up kind for image-relative displacements to old data.
+TEST_CASE("WP-36 Addr32NbDisp: wire round trip, layout and the displacement arithmetic") {
+    SUBCASE("round trip in ApplyFixups and in a LoadPatch candidate") {
+        ApplyFixups m;
+        m.request_id = 21;
+        m.image_base = 0x00000066'00000000ull;
+        m.fixups = {make_fixup(0x1003, FixupKind::Rel32, 1, 0x00007FF6'12345678ull),
+                    make_fixup(0x1011, FixupKind::Addr32NbDisp, 0, 0x00007FF6'00003280ull),
+                    make_fixup(0x2000, FixupKind::SlotWrite, 0, 0x00007FF6'00001000ull)};
+        const auto out = std::get<ApplyFixups>(round_trip(m));
+        REQUIRE(out.fixups.size() == 3);
+        CHECK(out.fixups[1].kind == FixupKind::Addr32NbDisp);
+        CHECK(out.fixups[1].rva == 0x1011);
+        CHECK(out.fixups[1].n == 0);
+        CHECK(out.fixups[1].value == 0x00007FF6'00003280ull);
+        CHECK(out.fixups[0].kind == FixupKind::Rel32);
+        CHECK(out.fixups[2].kind == FixupKind::SlotWrite);
+
+        LoadPatch load = sample_load_patch();
+        load.candidates[0].fixups.push_back(make_fixup(0x4004, FixupKind::Addr32NbDisp, 0, 0x140003080ull));
+        const auto loaded = std::get<LoadPatch>(round_trip(load));
+        REQUIRE(loaded.candidates[0].fixups.size() == load.candidates[0].fixups.size());
+        CHECK(loaded.candidates[0].fixups.back().kind == FixupKind::Addr32NbDisp);
+        CHECK(loaded.candidates[0].fixups.back().value == 0x140003080ull);
+    }
+    SUBCASE("the wire bytes: kind 4, n 0") {
+        ApplyFixups m;
+        m.request_id = 1;
+        m.image_base = 2;
+        m.fixups = {make_fixup(0x11223344, FixupKind::Addr32NbDisp, 0, 0x0102030405060708ull)};
+        const std::vector<std::uint8_t> frame = frame_bytes(m);
+        REQUIRE(frame.size() == kFrameHeaderSize + 36);
+        const std::uint8_t expected_fixup[16] = {0x44, 0x33, 0x22, 0x11,  // rva
+                                                 4,                      // kind Addr32NbDisp
+                                                 0,                      // n
+                                                 0, 0,                   // reserved
+                                                 8, 7, 6, 5, 4, 3, 2, 1};
+        CHECK(std::memcmp(frame.data() + kFrameHeaderSize + 20, expected_fixup, 16) == 0);
+        // n is meaningless for the kind and must be 0.
+        std::vector<std::uint8_t> bad = frame;
+        bad[kFrameHeaderSize + 20 + 5] = 1;
+        CHECK(error_code(decode_frame(bad.data(), bad.size())) == ids::kPayloadMalformed);
+    }
+    SUBCASE("displacement = target - image base, a signed 32-bit value") {
+        std::int32_t d = 0;
+        const std::uint64_t base = 0x00000001'80000000ull;
+        REQUIRE(addr32nb_displacement(base, base + 0x1234, &d));
+        CHECK(d == 0x1234);
+        REQUIRE(addr32nb_displacement(base, base, &d));
+        CHECK(d == 0);
+        // The old image below the patch: negative, which the processor sign-extends.
+        REQUIRE(addr32nb_displacement(base, 0x00000001'40003080ull, &d));
+        CHECK(d == static_cast<std::int32_t>(0x40003080ll - 0x80000000ll));
+        CHECK(static_cast<std::uint64_t>(static_cast<std::int64_t>(base) + d) == 0x00000001'40003080ull);
+        // The limits.
+        REQUIRE(addr32nb_displacement(base, base + 0x7FFFFFFFull, &d));
+        CHECK(d == 0x7FFFFFFF);
+        REQUIRE(addr32nb_displacement(base, base - 0x80000000ull, &d));
+        CHECK(d == (-0x7FFFFFFF - 1));
+        d = 77;
+        CHECK_FALSE(addr32nb_displacement(base, base + 0x80000000ull, &d));
+        CHECK_FALSE(addr32nb_displacement(base, base - 0x80000001ull, &d));
+        CHECK_FALSE(addr32nb_displacement(base, 0x00007FFB'00002000ull, &d));
+        CHECK_FALSE(addr32nb_displacement(0x00007FFB'00000000ull, base, &d));
+        CHECK(d == 77);  // untouched on failure
+    }
+}
+
 TEST_CASE("WP-08 malformed payloads are diagnosed") {
     const std::vector<std::uint8_t> good = frame_bytes(sample_load_patch());
     // Offsets inside the payload of LoadPatch: id (8), patch id (8), flags (4), candidate count (4).
@@ -249,7 +317,13 @@ TEST_CASE("WP-08 malformed payloads are diagnosed") {
         frame[fixup_at + 4] = 0;  // kind 0
         CHECK(error_code(decode_frame(frame.data(), frame.size())) == ids::kPayloadMalformed);
         frame = base;
-        frame[fixup_at + 4] = 4;  // kind 4 (ADDR32NB never travels)
+        frame[fixup_at + 4] = 4;  // kind 4 (Addr32NbDisp, WP-36) with n = 1: n must be 0 for it
+        CHECK(error_code(decode_frame(frame.data(), frame.size())) == ids::kPayloadMalformed);
+        frame = base;
+        frame[fixup_at + 4] = 5;  // kind 5 does not exist
+        frame[fixup_at + 5] = 0;
+        CHECK(error_code(decode_frame(frame.data(), frame.size())) == ids::kPayloadMalformed);
+        frame[fixup_at + 4] = 0xFF;
         CHECK(error_code(decode_frame(frame.data(), frame.size())) == ids::kPayloadMalformed);
         frame = base;
         frame[fixup_at + 5] = 6;  // n = 6

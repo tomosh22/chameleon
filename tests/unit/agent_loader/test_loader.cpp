@@ -13,12 +13,15 @@
 #include <fstream>
 #include <string>
 #include <thread>
+#include <variant>
 #include <vector>
 
 #include "cml/proc/address_space.h"
 #include "cml/proc/diag_ids.h"
 #include "cml/proc/loader_diag_ids.h"
 #include "doctest.h"
+#include "heap.h"
+#include "loader/fixup_diag_ids.h"
 #include "loader/image_writer.h"
 #include "loader/patch_loader.h"
 #include "loader_test_support.h"
@@ -312,6 +315,175 @@ TEST_CASE("fix-ups are validated before anything is written") {
         REQUIRE(r.has_value());
         CHECK(*r == 0);
     }
+}
+
+// ---- WP-36 (ADR-0042): Addr32NbDisp, the image-relative displacement to data of the old image -----------------
+
+namespace {
+
+// Data of the "old image" (this test executable) that a patch would address as [__ImageBase + index*scale + disp32].
+volatile std::int32_t g_wp36_old_data[4] = {0x1111, 0x2222, 0x3333, 0x4444};
+
+ipc::Fixup imgrel_fixup(std::uint32_t rva, std::uint64_t target) {
+    ipc::Fixup f;
+    f.rva = rva;
+    f.kind = ipc::FixupKind::Addr32NbDisp;
+    f.n = 0;
+    f.value = target;
+    return f;
+}
+
+std::int32_t read_i32(std::uint64_t address) {
+    std::int32_t v = 0;
+    std::memcpy(&v, reinterpret_cast<const void*>(address), 4);
+    return v;
+}
+
+}  // namespace
+
+TEST_CASE("WP-36: an Addr32NbDisp fix-up writes int32(target - image base) into data, read-only and code pages") {
+    LoaderSession session(1);
+    const std::uint64_t base = session.blocks[0].base;
+    REQUIRE(session.load(make_request(base, "imgrel", false, false)).status == 0);
+    const ImageRef image{base, proto().image_size};
+    // Old data: element 2 of an array of the host, i.e. S + A with A = 8.
+    const std::uint64_t target = reinterpret_cast<std::uint64_t>(&g_wp36_old_data[0]) + 8;
+    const std::int64_t expected = static_cast<std::int64_t>(target - base);
+    REQUIRE(expected >= INT32_MIN);
+    REQUIRE(expected <= INT32_MAX);
+
+    const std::uint64_t data_site = base + proto().rva_data + 32;
+    const std::uint64_t rodata_site = base + proto().rva_rodata + 8;
+    const std::uint64_t code_site = base + proto().rva_code_call + 5;  // the 4-byte operand of the stub's instruction
+    const std::uint64_t data_before = read64(data_site);
+    const std::uint64_t rodata_before = read64(rodata_site);
+    const DWORD rodata_protect = query(rodata_site).Protect;
+    const DWORD code_protect = query(code_site).Protect;
+
+    const std::vector<ipc::Fixup> list = {imgrel_fixup(proto().rva_data + 32, target), imgrel_fixup(proto().rva_rodata + 8, target),
+                                          imgrel_fixup(proto().rva_code_call + 5, target)};
+    cml::agent::heap::set_alloc_forbidden(true);  // the success path allocates nothing (plan section 7)
+    const cml::Result<std::uint32_t> r = cml::agent::loader::apply_fixups(image, list);
+    const bool ok = r.has_value();
+    cml::agent::heap::set_alloc_forbidden(false);
+    REQUIRE_MESSAGE(ok, (ok ? std::string() : r.error().format()));
+    CHECK(*r == 3);
+
+    for (const std::uint64_t site : {data_site, rodata_site, code_site}) {
+        const std::int32_t disp = read_i32(site);
+        CHECK(disp == static_cast<std::int32_t>(expected));
+        // What the processor computes from the instruction: base register (the patch's __ImageBase) + sign-extended disp32.
+        const std::uint64_t effective = base + static_cast<std::uint64_t>(static_cast<std::int64_t>(disp));
+        CHECK(effective == target);
+        const std::int32_t seen = *reinterpret_cast<const volatile std::int32_t*>(effective);  // a plain copy for doctest
+        CHECK(seen == 0x3333);
+    }
+    // Exactly four bytes were written: the upper half of the 8 bytes at each data site is untouched.
+    CHECK((read64(data_site) >> 32) == (data_before >> 32));
+    CHECK((read64(rodata_site) >> 32) == (rodata_before >> 32));
+    // The protection of read-only and code pages is back to what it was.
+    CHECK(query(rodata_site).Protect == rodata_protect);
+    CHECK(query(code_site).Protect == code_protect);
+    CHECK(query(code_site).Protect == static_cast<DWORD>(PAGE_EXECUTE_READ));
+
+    SUBCASE("a target below the image and one above it: the sign is kept") {
+        const std::uint64_t below = base - 0x1000;
+        const std::uint64_t above = base + 0x12345678ull;
+        const std::vector<ipc::Fixup> two = {imgrel_fixup(proto().rva_data + 40, below), imgrel_fixup(proto().rva_data + 44, above)};
+        const cml::Result<std::uint32_t> w = cml::agent::loader::apply_fixups(image, two);
+        REQUIRE_MESSAGE(w.has_value(), (w.has_value() ? std::string() : w.error().format()));
+        CHECK(read_i32(base + proto().rva_data + 40) == -0x1000);
+        CHECK(read_i32(base + proto().rva_data + 44) == 0x12345678);
+        // The limits of a signed 32-bit displacement are accepted.
+        const std::vector<ipc::Fixup> limits = {imgrel_fixup(proto().rva_data + 48, base + 0x7FFFFFFFull),
+                                                imgrel_fixup(proto().rva_data + 52, base - 0x80000000ull)};
+        const cml::Result<std::uint32_t> l = cml::agent::loader::apply_fixups(image, limits);
+        REQUIRE_MESSAGE(l.has_value(), (l.has_value() ? std::string() : l.error().format()));
+        CHECK(read_i32(base + proto().rva_data + 48) == INT32_MAX);
+        CHECK(read_i32(base + proto().rva_data + 52) == INT32_MIN);
+    }
+}
+
+TEST_CASE("WP-36: an Addr32NbDisp that does not fit a signed 32-bit displacement is CML4700 and nothing is written") {
+    LoaderSession session(1);
+    const std::uint64_t base = session.blocks[0].base;
+    REQUIRE(session.load(make_request(base, "imgrel_far", false, false)).status == 0);
+    const ImageRef image{base, proto().image_size};
+    const std::uint64_t before = read64(base + proto().rva_data);
+    const std::uint64_t before_site = read64(base + proto().rva_data + 16);
+
+    ipc::Fixup good;
+    good.rva = proto().rva_data;
+    good.kind = ipc::FixupKind::Addr64;
+    good.value = 0x0123456789ABCDEFull;
+
+    for (const std::uint64_t far_target : {base + 0x80000000ull, base - 0x80000001ull, base + (3ull << 30), std::uint64_t{0x1000}}) {
+        const std::vector<ipc::Fixup> list = {good, imgrel_fixup(proto().rva_data + 16, far_target)};
+        const cml::Result<std::uint32_t> r = cml::agent::loader::apply_fixups(image, list);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().code == ids::kLoaderAddr32NbOutOfRange);
+        CHECK(r.error().id() == "CML4700");
+        CHECK(r.error().message.find("image-relative") != std::string::npos);
+        CHECK(r.error().message.find(hex_text(far_target)) != std::string::npos);
+        CHECK_FALSE(r.error().what_to_do.empty());
+        // Validation comes first: the good fix-up before it was not written either.
+        CHECK(read64(base + proto().rva_data) == before);
+        CHECK(read64(base + proto().rva_data + 16) == before_site);
+    }
+    SUBCASE("n must be 0 and the four bytes must lie inside the image") {
+        ipc::Fixup bad = imgrel_fixup(proto().rva_data + 16, base + 0x100);
+        bad.n = 1;
+        CHECK(cml::agent::loader::apply_fixups(image, std::vector<ipc::Fixup>{bad}).error().code == ids::kLoaderFixupInvalid);
+        bad.n = 0;
+        bad.rva = proto().image_size - 2;
+        CHECK(cml::agent::loader::apply_fixups(image, std::vector<ipc::Fixup>{bad}).error().code == ids::kLoaderFixupInvalid);
+        bad.rva = proto().image_size + 0x1000;
+        CHECK(cml::agent::loader::apply_fixups(image, std::vector<ipc::Fixup>{bad}).error().code == ids::kLoaderFixupInvalid);
+    }
+    SUBCASE("through the dispatcher: the Reply carries CML4700 and the live patch stays loaded") {
+        ipc::ApplyFixups request;
+        request.request_id = 36;
+        request.image_base = base;
+        request.fixups = {imgrel_fixup(proto().rva_data + 16, base + (3ull << 30))};
+        const ipc::Message answer = session.loader.handle_request(request);
+        REQUIRE(std::holds_alternative<ipc::Reply>(answer));
+        CHECK(std::get<ipc::Reply>(answer).request_id == 36);
+        CHECK(std::get<ipc::Reply>(answer).status == ids::kLoaderAddr32NbOutOfRange);
+        CHECK(std::get<ipc::Reply>(answer).message.find("image-relative") != std::string::npos);
+        CHECK(is_module_loaded_at(base));
+        // A reachable one is applied through the same request.
+        request.request_id = 37;
+        request.fixups = {imgrel_fixup(proto().rva_data + 16, base + 0x2000)};
+        const ipc::Message applied = session.loader.handle_request(request);
+        REQUIRE(std::holds_alternative<ipc::Reply>(applied));
+        CHECK_MESSAGE(std::get<ipc::Reply>(applied).status == 0, std::get<ipc::Reply>(applied).message);
+        CHECK(read_i32(base + proto().rva_data + 16) == 0x2000);
+    }
+}
+
+TEST_CASE("WP-36: a LoadPatch whose candidate carries an unreachable Addr32NbDisp is refused and unloaded") {
+    LoaderSession session(1);
+    const std::uint64_t base = session.blocks[0].base;
+    ipc::LoadPatch request = make_request(base, "imgrel_load_far", true, false);
+    request.candidates[0].fixups.push_back(imgrel_fixup(proto().rva_data + 128, base + (3ull << 30)));
+    const ipc::PatchLoaded answer = session.load(request);
+    CHECK(answer.status == ids::kLoaderAddr32NbOutOfRange);
+    CHECK(answer.image_base == 0);
+    CHECK(answer.message.find("image-relative") != std::string::npos);
+    CHECK_FALSE(is_module_loaded_at(base));
+    CHECK(session.loader.patch_count() == 0);
+    CHECK(query(base).State == MEM_RESERVE);
+
+    // Same base with a reachable target: loads, and the displacement is there.
+    ipc::LoadPatch retry = make_request(base, "imgrel_load_ok", true, false);
+    const std::uint64_t target = reinterpret_cast<std::uint64_t>(&g_wp36_old_data[0]);
+    retry.candidates[0].fixups.push_back(imgrel_fixup(proto().rva_data + 128, target));
+    const ipc::PatchLoaded loaded = session.load(retry);
+    REQUIRE_MESSAGE(loaded.status == 0, loaded.message);
+    CHECK(loaded.fixups_applied == standard_fixups(base, host_target_address()).size() + 1);
+    CHECK(base + static_cast<std::uint64_t>(static_cast<std::int64_t>(read_i32(base + proto().rva_data + 128))) == target);
+    const std::string problems = verify_standard(base, host_target_address());
+    CHECK_MESSAGE(problems.empty(), problems);
 }
 
 TEST_CASE("initializers run in the order the broker names, on the loading thread") {

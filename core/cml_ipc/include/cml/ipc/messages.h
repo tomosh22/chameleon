@@ -342,8 +342,25 @@ inline constexpr std::uint32_t kMaxReservedBlocks = 64;
 //             that follow the displacement (REL32 .. REL32_5). Fails with CML4207 when it does not fit.
 //   Addr64    writes uint64(value) (8 bytes, no alignment required).
 //   SlotWrite writes uint64(value) atomically into an 8-byte-aligned thunk slot (__cml_slot_<name>).
-// ADDR32NB never reaches the agent: the broker rejects it (CML33xx).
-enum class FixupKind : std::uint8_t { Rel32 = 1, Addr64 = 2, SlotWrite = 3 };
+//   Addr32NbDisp (WP-36, ADR-0042) writes int32(value - image_base): the image-relative displacement of a memory
+//             operand `[reg + index*scale + disp32]` whose register holds the patch's __ImageBase, retargeted to data
+//             of the old image. The processor sign-extends it, so it must fit a signed 32-bit field: CML4700 when it
+//             does not. The broker sends this kind only for sites it has proved to be such a displacement; any other
+//             ADDR32NB to old data never reaches the agent (CML3101).
+// An agent that predates a kind rejects the message ("unknown fix-up kind", CML5201) instead of misreading it, so adding a
+// kind does not change agent_abi_version.
+enum class FixupKind : std::uint8_t { Rel32 = 1, Addr64 = 2, SlotWrite = 3, Addr32NbDisp = 4 };
+
+// The arithmetic of Addr32NbDisp, shared by the agent (which applies it) and the tests: false when `target` is not
+// within the signed 32-bit reach of `image_base`.
+inline constexpr bool addr32nb_displacement(std::uint64_t image_base, std::uint64_t target, std::int32_t* out) noexcept {
+    const std::int64_t d = static_cast<std::int64_t>(target - image_base);  // wraps like the machine
+    if (d < -0x80000000ll || d > 0x7FFFFFFFll) {
+        return false;
+    }
+    *out = static_cast<std::int32_t>(d);
+    return true;
+}
 
 struct Fixup {
     std::uint32_t rva = 0;  // site, relative to the patch image base

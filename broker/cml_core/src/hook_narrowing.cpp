@@ -95,6 +95,9 @@ public:
             if (f.kind == bind::FixupKind::SecRel32) {
                 secrel_[(static_cast<std::uint64_t>(f.section_index) << 32) | f.offset] = &f;
             }
+            if (f.kind == bind::FixupKind::Addr32NbDisp) {
+                imgrel_.insert((static_cast<std::uint64_t>(f.section_index) << 32) | f.offset);
+            }
         }
     }
 
@@ -295,6 +298,17 @@ private:
             out->value = static_cast<std::uint64_t>(static_cast<std::int64_t>(f->second->target_section_offset) + f->second->addend);
             return std::nullopt;
         }
+        if (r.reloc.type == coff::RelocType::Addr32Nb) {
+            // WP-36: an image-relative displacement the planner retargets to old data (an Addr32NbDisp fix-up) reaches a
+            // fixed address, like a REL32 to bound data. Every other ADDR32NB in code (a jump-table load, a thunk)
+            // depends on where the patch lies: not judged.
+            if (!planned_imgrel(sec_index, r.reloc.virtual_address) || d.decision != bind::DecisionKind::BindOldData || !d.old_address.valid) {
+                return Keep{NarrowReason::Unverifiable, "ADDR32NB to '" + name + "' in code is not a retargeted displacement"};
+            }
+            out->kind = CodeTarget::Kind::Address;
+            out->value = d.old_address.va;
+            return std::nullopt;
+        }
         if (!bind::is_rel32(rel32_kind_of(r.reloc.type)) && r.reloc.type != coff::RelocType::Addr64) {
             return Keep{NarrowReason::Unverifiable, std::string(coff::reloc_type_name(r.reloc.type)) + " to '" + name + "' in code"};
         }
@@ -409,6 +423,11 @@ private:
         } else if (r.reloc.type == coff::RelocType::Addr64) {
             const std::uint64_t preferred = in_.old_image->optional_header().image_base;
             old_target = old_raw + (in_.load_base - preferred) - new_raw;
+        } else if (r.reloc.type == coff::RelocType::Addr32Nb && planned_imgrel(sec_index, static_cast<std::uint32_t>(site)) &&
+                   d.decision == bind::DecisionKind::BindOldData) {
+            // WP-36: the old linker wrote RVA(S) + A into the displacement (32-bit arithmetic); the new code gets an
+            // Addr32NbDisp fix-up to the bound address. Same target = same code. Other ADDR32NB sites stay unjudged.
+            old_target = in_.load_base + static_cast<std::uint32_t>(static_cast<std::uint32_t>(old_raw) - static_cast<std::uint32_t>(new_raw));
         } else {
             return Keep{NarrowReason::Unverifiable, std::string(coff::reloc_type_name(r.reloc.type)) + " to '" + name + "' in code"};
         }
@@ -538,6 +557,10 @@ private:
     const NarrowInput& in_;
     std::unordered_map<std::uint32_t, const bind::SymbolDecision*> by_raw_index_;
     std::unordered_map<std::uint64_t, const bind::Fixup*> secrel_;
+    std::set<std::uint64_t> imgrel_;  // WP-36: (section << 32 | offset) of the planned Addr32NbDisp fix-ups
+    bool planned_imgrel(std::uint32_t sec_index, std::uint32_t offset) const {
+        return imgrel_.count((static_cast<std::uint64_t>(sec_index) << 32) | offset) != 0;
+    }
     mutable std::unordered_map<const coff::Section*, std::vector<coff::ResolvedRelocation>> relocs_;
     mutable std::shared_ptr<const CodeImage> last_prior_;
 };
