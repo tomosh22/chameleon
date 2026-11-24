@@ -1651,3 +1651,35 @@ TEST_CASE("the by-place step is not asked about statics without a function scope
         CHECK(said);
     }
 }
+
+// ---- Dear ImGui, imgui_widgets.cpp (corpus runs 45410039045 and 45477350367) ----------------------------------------
+
+TEST_CASE("a function-local static in block 11 or later is the old static, not a new one") {
+    // ImGui::ColorEdit4() declares `static const char* fmt_table_float[3][4]` deep inside; cl names it
+    // ?fmt_table_float@?BL@??ColorEdit4@ImGui@@YA_NPEBDQEAMH@Z@4PAY03PEBDA (block 27, "?BL@"). The name reader used to
+    // give that scope up, the static had no enclosing function, found no record and was declared NEW: the patch got a
+    // fresh copy and the reload "passed" (run 45410039045). It is the old static of ImGui::ColorEdit4.
+    const char* const color_edit = "?ColorEdit4@ImGui@@YA_NPEBDQEAMH@Z";
+    const char* const table_float = "?fmt_table_float@?BL@??ColorEdit4@ImGui@@YA_NPEBDQEAMH@Z@4PAY03PEBDA";
+    const char* const table_int = "?fmt_table_int@?BL@??ColorEdit4@ImGui@@YA_NPEBDQEAMH@Z@4PAY03PEBDA";
+    SynthWorld w;
+    w.proc_with_statics(w.tu(), "ImGui::ColorEdit4", 0x40, {{"fmt_table_int", 0x10}, {"fmt_table_float", 0x40}}, 0x20);
+    w.pub_func(color_edit, 0x40);
+    w.open();
+    SynthObj o;
+    o.function(color_edit, true);
+    const std::uint32_t d = o.section(".data", kData, 0x80);
+    o.symbol(table_int, 0x00, static_cast<std::int32_t>(d), false, false);
+    o.symbol(table_float, 0x30, static_cast<std::int32_t>(d), false, false);
+    Built b = o.build();
+    auto r = plan_bind(w.input(b));
+    REQUIRE_MESSAGE(r.has_value(), err(r));
+    const SymbolDecision f = decision(*r, table_float);
+    CHECK(f.display == "ImGui::ColorEdit4::fmt_table_float");
+    CHECK(f.decision == DecisionKind::BindOldData);
+    CHECK(f.source == BindSource::CompilandStatic);
+    CHECK(f.old_address.rva == 0x3040);
+    CHECK(decision(*r, table_int).decision == DecisionKind::BindOldData);
+    CHECK(decision(*r, table_int).old_address.rva == 0x3010);
+    CHECK(r->new_globals.empty());
+}
