@@ -797,3 +797,147 @@ TEST_CASE("elision: data the old image owns whose initial value changed is repor
         CHECK(s.data_changes().empty());
     }
 }
+
+// ---- WP-36 (ADR-0042): image-relative displacements to old data (Addr32NbDisp) -----------------------------------
+
+namespace {
+
+constexpr std::uint32_t kImgrelDataRva = 0x2980;  // the old data `[__ImageBase + index*4 + disp32]` reaches
+
+// foo: mov eax, [rdi+rax*4 + g_tick@IMGREL + addend] ; ret.  The old linker wrote RVA(g_tick) + addend into the displacement.
+// `planned`: the planner proved the site and retargets it (an Addr32NbDisp fix-up); `g_va`: what g_tick is bound to.
+void imgrel_load(Scenario& s, std::uint64_t g_va, std::int32_t addend = 0x10, bool planned = true, std::uint32_t old_rva = kImgrelDataRva) {
+    s.old_code({0x8B, 0x84, 0x87, 0, 0, 0, 0, 0xC3});
+    put32(s.disk, text_off(kFnRva) + 3, old_rva + static_cast<std::uint32_t>(addend));
+    const std::uint32_t a = static_cast<std::uint32_t>(addend);
+    s.new_code({0x8B, 0x84, 0x87, static_cast<std::uint8_t>(a), static_cast<std::uint8_t>(a >> 8), static_cast<std::uint8_t>(a >> 16),
+                static_cast<std::uint8_t>(a >> 24), 0xC3});
+    const std::uint32_t g = s.obj.undefined("g_tick", false);
+    s.obj.reloc(s.foo.section, 3, g, kAddr32Nb, addend);
+    s.hook();
+    SymbolDecision& d = s.decision(g, "g_tick", DecisionKind::BindOldData);
+    d.old_address.valid = true;
+    d.old_address.va = g_va;
+    if (planned) {
+        Fixup f;
+        f.section_index = s.foo.section;
+        f.offset = 3;
+        f.kind = FixupKind::Addr32NbDisp;
+        f.addend = addend;
+        f.target_va = g_va;
+        s.plan.fixups.push_back(f);
+    }
+}
+
+}  // namespace
+
+TEST_CASE("narrowing (WP-36): an image-relative displacement to bound data is judged like any bound-data site") {
+    QuietLogs quiet;
+    SUBCASE("same target: dropped") {
+        Scenario s;
+        imgrel_load(s, kPreferred + kImgrelDataRva);
+        const NarrowResult r = s.run();
+        REQUIRE(r.decisions.size() == 1);
+        CHECK_MESSAGE(r.decisions[0].reason == NarrowReason::Unchanged, to_string(r.decisions[0].reason) << " " << r.decisions[0].detail);
+        CHECK(r.hooks.empty());
+    }
+    SUBCASE("a negative addend, and the module loaded away from its preferred base") {
+        Scenario s;
+        s.load_base = 0x7FF600000000ull;
+        imgrel_load(s, s.load_base + kImgrelDataRva, -8);
+        const NarrowResult r = s.run();
+        CHECK_MESSAGE(r.hooks.empty(), to_string(r.decisions[0].reason) << " " << r.decisions[0].detail);
+    }
+    SUBCASE("the old code reached other data: kept") {
+        Scenario s;
+        imgrel_load(s, kPreferred + kImgrelDataRva, 0x10, true, kImgrelDataRva + 0x40);
+        const NarrowResult r = s.run();
+        REQUIRE(r.hooks.size() == 1);
+        CHECK(r.decisions[0].reason == NarrowReason::TargetChanged);
+    }
+    SUBCASE("the addend differs from the old code's: kept") {
+        Scenario s;
+        imgrel_load(s, kPreferred + kImgrelDataRva);
+        put32(s.disk, text_off(kFnRva) + 3, kImgrelDataRva + 0x14);  // the old code read the next element
+        const NarrowResult r = s.run();
+        REQUIRE(r.hooks.size() == 1);
+        CHECK(r.decisions[0].reason == NarrowReason::TargetChanged);
+    }
+    SUBCASE("an ADDR32NB the planner did not retarget (a jump-table load, a thunk) is not judged: kept") {
+        Scenario s;
+        imgrel_load(s, kPreferred + kImgrelDataRva, 0x10, /*planned=*/false);
+        const NarrowResult r = s.run();
+        REQUIRE(r.hooks.size() == 1);
+        CHECK(r.decisions[0].reason == NarrowReason::Unverifiable);
+    }
+    SUBCASE("an ADDR32NB to a bound FUNCTION goes through the patch's thunk: kept") {
+        Scenario s;
+        s.old_code({0x48, 0x8D, 0x84, 0x0F, 0, 0, 0, 0, 0xC3});  // lea rax, bar[rdi+rcx]
+        put32(s.disk, text_off(kFnRva) + 4, kBarRva);
+        s.new_code({0x48, 0x8D, 0x84, 0x0F, 0, 0, 0, 0, 0xC3});
+        const std::uint32_t bar = s.obj.undefined("bar", true);
+        s.obj.reloc(s.foo.section, 4, bar, kAddr32Nb, 0);
+        s.hook();
+        SymbolDecision& d = s.decision(bar, "bar", DecisionKind::BindOldFunction);
+        d.old_address.valid = true;
+        d.old_address.va = kPreferred + kBarRva;
+        const NarrowResult r = s.run();
+        REQUIRE(r.hooks.size() == 1);
+        CHECK(r.decisions[0].reason == NarrowReason::Unverifiable);
+    }
+}
+
+TEST_CASE("elision (WP-36): the record of an earlier patch holds the address an image-relative displacement reaches") {
+    QuietLogs quiet;
+    const auto record = [](std::uint64_t g_va, std::int32_t addend) {
+        Scenario first;
+        imgrel_load(first, g_va, addend);
+        return first.capture();
+    };
+    const std::shared_ptr<const CodeImage> prior = record(kPreferred + kImgrelDataRva, 0x10);
+    REQUIRE(prior->relocs.size() == 1);
+    CHECK(prior->relocs[0].offset == 3);
+    CHECK(prior->relocs[0].type == static_cast<std::uint16_t>(coff::RelocType::Addr32Nb));
+    CHECK(prior->relocs[0].addend == 0x10);
+    CHECK(prior->relocs[0].target.kind == CodeTarget::Kind::Address);
+    CHECK(prior->relocs[0].target.value == kPreferred + kImgrelDataRva);
+    // The site is zeroed in the recorded bytes.
+    CHECK(prior->bytes[3] == 0);
+
+    SUBCASE("unchanged in the next patch: dropped") {
+        Scenario s;
+        imgrel_load(s, kPreferred + kImgrelDataRva, 0x10);
+        s.prior = [&](std::uint64_t va) { return entry_is_hooked(va) ? prior : nullptr; };
+        const NarrowResult r = s.run(true, entry_is_hooked);
+        REQUIRE(r.decisions.size() == 1);
+        CHECK_MESSAGE(r.decisions[0].reason == NarrowReason::Unchanged, to_string(r.decisions[0].reason) << " " << r.decisions[0].detail);
+        CHECK(r.hooks.empty());
+    }
+    SUBCASE("another element (addend) or another target: kept") {
+        Scenario s;
+        imgrel_load(s, kPreferred + kImgrelDataRva, 0x14);
+        s.prior = [&](std::uint64_t) { return prior; };
+        NarrowResult r = s.run(true, entry_is_hooked);
+        REQUIRE(r.hooks.size() == 1);
+        CHECK(r.decisions[0].reason == NarrowReason::TargetChanged);
+
+        Scenario t;
+        imgrel_load(t, kPreferred + kImgrelDataRva + 0x100, 0x10);
+        t.prior = [&](std::uint64_t) { return prior; };
+        r = t.run(true, entry_is_hooked);
+        REQUIRE(r.hooks.size() == 1);
+        CHECK(r.decisions[0].reason == NarrowReason::TargetChanged);
+    }
+    SUBCASE("a site the planner did not retarget yields no record: the function is hooked every time") {
+        Scenario s;
+        imgrel_load(s, kPreferred + kImgrelDataRva, 0x10, /*planned=*/false);
+        Built built = s.obj.build();
+        NarrowInput in;
+        in.object = &built.obj();
+        in.plan = &s.plan;
+        in.load_base = s.load_base;
+        std::string why;
+        CHECK_FALSE(capture_code(in, "?foo@@YAHXZ", &why).has_value());
+        CHECK(why.find("ADDR32NB") != std::string::npos);
+    }
+}

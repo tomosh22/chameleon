@@ -1,0 +1,86 @@
+# Scenario `imgrel` (WP-36, ADR-0042; corpus finding F-2): image-relative references to data of the running image.
+# imgrel.c has a switch with a jump table whose cases read and write global arrays, and a function indexing two global
+# arrays. Under cl with optimisation (the RelWithDebInfo cells) both keep __ImageBase in a register and address the globals
+# as [reg + index*scale + sym@IMGREL]; the planner proves each such site to be a displacement and retargets it to the OLD
+# image (fix-up kind Addr32NbDisp). The reload prints `WP36-IMGREL sites=N verified=N`: N > 0 in those cells, 0 in Debug and
+# under clang-cl, where the same scenario runs through the REL32 path.
+#
+# main.c is never patched; it reads and writes the globals directly. What the TICK line shows after the edit:
+#   key=2            the patched case 1 wrote CORE.keys[77], which main.c had just cleared and reads back itself
+#   count=5 .. 12    the patched code keeps incrementing CORE.count, which main.c resets at 16: the storage is shared
+#   seed=1004251     sarr[9] was written ONCE, before the first tick; the patched case 6 still finds 4251 there
+#   fp=43            the patched case 7 calls the function pointer main.c stored in fptab[3] before the reload
+#   fl=7             the patched case 8 reads CORE.f[2] = 7.5, set by main.c before the reload
+#   g3=4244          case 3: the switch still dispatches through the patch's own jump table
+#   wide=2004328     the patched ig_wide() adds sarr[9] (4251) and CORE.q[9] (77), both written before the reload
+# A patch with its own copies of the globals would print key=0, a count that stops, seed=1000000, fl=0 and wide=2000000,
+# and would crash on the null function pointer.
+name = "imgrel"
+description = "fixture imgrel: a switch with a jump table and a two-array function keep using the old image's globals (key= count= seed= fp= fl= g3= wide=)"
+fixture = "imgrel"
+timeout_s = 180
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ key=1 count=\\d+ seed=4252 fp=43 fl=7 g3=4244 wide=4328\\s"
+within_s = 15
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_imgrel.exe"
+within_s = 15
+
+# At least 20 ticks before the patch: CORE.count has wrapped once (reset by main.c at 16) and CORE.q[9] is set.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=([2-9][0-9]|[1-9][0-9]{2,}) key=1 count=\\d+ seed=4252 fp=43 fl=7 g3=4244 wide=4328\\s"
+within_s = 15
+
+[[step]]
+kind = "edit"
+patch = "edits/dispatch_v2.edit"
+
+[[step]]
+kind = "reload"
+within_s = 90
+
+[[step]]
+kind = "expect_reload_result"
+key = "patched"
+value = 1
+
+# After the reload: every value comes from the patched code working on the old image's storage.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ key=2 count=5 seed=1004251 fp=43 fl=7 g3=4244 wide=2004328\\s"
+within_s = 10
+
+# The count keeps moving through the patched code (main.c only resets it): another value of the same cycle.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ key=2 count=12 seed=1004251 fp=43 fl=7 g3=4244 wide=2004328\\s"
+within_s = 10
+
+# And the next cycle: main.c's reset at 16 is seen by the patched code.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ key=2 count=3 seed=1004251 fp=43 fl=7 g3=4244 wide=2004328\\s"
+within_s = 10
+
+[[step]]
+kind = "expect_monotonic"
+key = "n"
+min_samples = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "seed"
+min_samples = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "wide"
+min_samples = 20

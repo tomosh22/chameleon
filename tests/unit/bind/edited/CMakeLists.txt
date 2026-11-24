@@ -94,3 +94,8 @@ cml_bind_edited_fixture(lambda_statics)
 if(CMAKE_C_COMPILER_LOADED)
     cml_bind_edited_fixture(c_statics)
 endif()
+
+# WP-36: a C fixture whose functions address globals image-relatively under cl with optimisation (ADDR32NB displacements).
+if(CMAKE_C_COMPILER_LOADED)
+    cml_bind_edited_fixture(imgrel)
+endif()

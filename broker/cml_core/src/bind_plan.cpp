@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -14,6 +15,7 @@
 #include "cml/core/bind_diag_ids.h"
 #include "cml/core/bind_names.h"
 #include "cml/core/bind_types.h"
+#include "cml/core/imgrel_site.h"
 #include "cml/util/format.h"
 #include "cml/util/log.h"
 
@@ -72,6 +74,7 @@ const char* to_string(FixupKind k) noexcept {
         case FixupKind::Addr64: return "ADDR64";
         case FixupKind::SecRel32: return "SECREL32";
         case FixupKind::Slot: return "SLOT";
+        case FixupKind::Addr32NbDisp: return "ADDR32NB_DISP";
     }
     return "?";
 }
@@ -99,6 +102,12 @@ std::string BindPlan::summary_line(std::string_view label) const {
     out += " thunks=" + std::to_string(s.thunks);
     out += " new=" + std::to_string(s.new_symbols);
     out += " fixups=" + std::to_string(s.fixups);
+    return out;
+}
+
+std::string BindPlan::imgrel_line(std::string_view label) const {
+    std::string out = "WP36-IMGREL sites=" + std::to_string(imgrel_sites) + " verified=" + std::to_string(imgrel_verified) + " object=";
+    out.append(label);
     return out;
 }
 
@@ -412,6 +421,10 @@ private:
     std::uint64_t module_size();
     bool rel32_reachable(const SymbolDecision& d);
     std::uint64_t module_size_ = 0;
+
+    // WP-36: is the ADDR32NB site at `offset` of section `sec_index` (1-based) the displacement of a memory operand?
+    SiteProver& site_prover(std::uint32_t sec_index);
+    std::map<std::uint32_t, std::unique_ptr<SiteProver>> site_provers_;
 };
 
 // ---- naming of the referencing function --------------------------------------------------
@@ -2160,7 +2173,51 @@ namespace {
 FixupKind rel32_kind(coff::RelocType t) {
     return static_cast<FixupKind>(static_cast<unsigned>(t) - static_cast<unsigned>(coff::RelocType::Rel32));
 }
+
+// Bytes a relocation of this type patches; 0 for a type whose field is not known (it then fits no operand).
+std::uint32_t reloc_field_width(coff::RelocType t) {
+    switch (t) {
+        case coff::RelocType::Addr64: return 8;
+        case coff::RelocType::Addr32:
+        case coff::RelocType::Addr32Nb:
+        case coff::RelocType::Rel32:
+        case coff::RelocType::Rel32_1:
+        case coff::RelocType::Rel32_2:
+        case coff::RelocType::Rel32_3:
+        case coff::RelocType::Rel32_4:
+        case coff::RelocType::Rel32_5:
+        case coff::RelocType::SecRel:
+        case coff::RelocType::SRel32: return 4;
+        case coff::RelocType::Section: return 2;
+        case coff::RelocType::SecRel7: return 1;
+        default: return 0;
+    }
+}
 }  // namespace
+
+// The prover of one section (WP-36): its relocation fields and the starts of the functions it defines.
+SiteProver& Planner::site_prover(std::uint32_t sec_index) {
+    std::unique_ptr<SiteProver>& slot = site_provers_[sec_index];
+    if (!slot) {
+        const SecInfo& si = secs_[sec_index - 1];
+        std::vector<RelocField> fields;
+        fields.reserve(relocs_[sec_index - 1].size());
+        for (const coff::ResolvedRelocation& rr : relocs_[sec_index - 1]) {
+            if (rr.reloc.type == coff::RelocType::Absolute) {
+                continue;  // the linker ignores it: it patches nothing
+            }
+            fields.push_back(RelocField{rr.reloc.virtual_address, reloc_field_width(rr.reloc.type)});
+        }
+        std::vector<std::uint32_t> starts;
+        for (const coff::Symbol& s : obj_.symbols()) {
+            if (s.section_number == static_cast<std::int32_t>(sec_index) && s.is_function() && (s.is_external() || s.is_static())) {
+                starts.push_back(s.value);
+            }
+        }
+        slot = std::make_unique<SiteProver>(si.code, si.sec->data, std::move(fields), std::move(starts));
+    }
+    return *slot;
+}
 
 void Planner::build_fixups() {
     std::set<std::uint32_t> warned_sections;
@@ -2251,16 +2308,39 @@ void Planner::build_fixups() {
                 }
                 section_offset = so->offset;
             }
-            if (type == coff::RelocType::Addr32Nb) {
-                if (dk == DecisionKind::BindOldData) {
-                    error(diag::kAddr32NbToOldData,
-                          where() + " references " + describe(ts) + " in " + ts.dec.old_address.module + " image-relatively (ADDR32NB); this cannot be retargeted",
-                          "Move the reference behind a function or pointer, or hot-restart.");
+            const bool imgrel = type == coff::RelocType::Addr32Nb;
+            if (imgrel) {
+                if (dk != DecisionKind::BindOldData) {
+                    continue;  // to a thunk: legal, resolved by the linker
                 }
-                continue;  // to a thunk: legal, resolved by the linker
+                if (ts.dec.source == BindSource::SynthesizedImportSlot) {
+                    continue;  // the placeholder itself is the slot: the reference stays as linked, relative to the patch
+                }
+                // WP-36 (ADR-0042): retargetable only where the site is PROVED to be the sign-extended 32-bit
+                // displacement of a memory operand (`[reg + index*scale + sym@IMGREL]`). Everything else is CML3101.
+                ++plan_.imgrel_sites;
+                const SiteCheck sc = site_prover(sec_index).check(off);
+                CML_LOG(Trace, "bind: imgrel site sec=%u(%s) off=0x%x target=%s verdict=%s: %s", sec_index, si.name.c_str(), off, ts.name.c_str(),
+                        to_string(sc.verdict), sc.reason.c_str());
+                if (!sc.proved()) {
+                    error(diag::kAddr32NbToOldData,
+                          where() + " references " + describe(ts) + " in " + ts.dec.old_address.module + " image-relatively (ADDR32NB) at +" + hex(off) +
+                              " of section '" + si.name + "' in " + in_.object_name + ", and the site is not proved to be an address displacement: " +
+                              sc.reason + "; this cannot be retargeted",
+                          "Move the reference behind a function or pointer, or hot-restart.");
+                    continue;
+                }
+                if (!rel32_reachable(ts.dec)) {
+                    error(diag::kImgrelOutOfRange,
+                          "image-relative reference to " + describe(ts) + " (" + hex(ts.dec.old_address.va) + ", " + ts.dec.old_address.module + ") from " + where() +
+                              " in " + in_.object_name + " cannot reach it: it is more than 2 GiB away from every place the patch can be loaded",
+                          "Access the data through a function or pointer in the module, or hot-restart.");
+                    continue;
+                }
+                ++plan_.imgrel_verified;
             }
             const bool rel = coff::is_rel32_family(type);
-            if (!rel && !secrel && type != coff::RelocType::Addr64) {
+            if (!rel && !secrel && !imgrel && type != coff::RelocType::Addr64) {
                 error(diag::kUnsupportedReloc,
                       "unsupported relocation " + std::string(coff::reloc_type_name(type)) + " against " + describe(ts) + " from " + where() + " in " + in_.object_name,
                       "Compile with /MD-compatible 64-bit code models (no 32-bit absolute addresses), or hot-restart.");
@@ -2300,7 +2380,7 @@ void Planner::build_fixups() {
                 associative_set.insert(sec_index);
             }
             // In-place addend (ADR-0025).
-            const std::size_t width = (rel || secrel) ? 4u : 8u;
+            const std::size_t width = (rel || secrel || imgrel) ? 4u : 8u;
             const coff::ByteSpan data = site.sec->data;
             if (static_cast<std::uint64_t>(off) + width > data.size()) {
                 error(diag::kBadRelocationSite,
@@ -2309,7 +2389,7 @@ void Planner::build_fixups() {
                 continue;
             }
             std::int64_t addend = 0;
-            if (rel || secrel) {
+            if (rel || secrel || imgrel) {
                 std::int32_t a32 = 0;
                 std::memcpy(&a32, data.data() + off, 4);
                 addend = a32;
@@ -2321,7 +2401,7 @@ void Planner::build_fixups() {
             Fixup f;
             f.section_index = sec_index;
             f.offset = off;
-            f.kind = rel ? rel32_kind(type) : (secrel ? FixupKind::SecRel32 : FixupKind::Addr64);
+            f.kind = rel ? rel32_kind(type) : (secrel ? FixupKind::SecRel32 : (imgrel ? FixupKind::Addr32NbDisp : FixupKind::Addr64));
             f.target_section_offset = section_offset;
             f.thunk_fallback = thunk_fallback;
             f.addend = addend;
@@ -2598,6 +2678,7 @@ Result<BindPlan> Planner::run(std::vector<Diag>* all_errors) {
     const PlanSummary s = plan_.summary();
     CML_LOG(Debug, "bind: plan for %s: hooks=%zu bind_old_data=%zu thunks=%zu new=%zu fixups=%zu warnings=%zu", in_.object_name.c_str(), s.hooks,
             s.bind_old_data, s.thunks, s.new_symbols, s.fixups, plan_.warnings.size());
+    CML_LOG(Debug, "bind: %s", plan_.imgrel_line(in_.object_name).c_str());
     return std::move(plan_);
 }
 

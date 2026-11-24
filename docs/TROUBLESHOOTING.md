@@ -705,8 +705,8 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 
 ### CML3101
 
-- **Cause:** Image-relative reference to old-module data.  
-- **Message:** `references <...> in <...> image-relatively (ADDR32NB); this cannot be retargeted`  
+- **Cause:** Image-relative reference to old-module data that is not a proved address displacement (WP-36 narrowed it). The ordinary case, `[reg + index*scale + sym@IMGREL]` in a function that keeps `__ImageBase` in a register (a switch with a jump table, two or more global arrays indexed), is retargeted and does not raise this. What remains: the reference is in a data section (a table of image-relative offsets to old data), it is an immediate operand, its instruction is RIP-relative or has a `67` prefix or an `fs`/`gs` override, its memory operand has no base register (`[index*scale+disp32]`, `[disp32]`), it is a `lea` with a 32-bit or 16-bit destination (the address would be truncated), or the instructions between the start of the function and the site cannot be decoded (an instruction the decoder does not know, or a relocation that does not fit one instruction's operand: data inside the function). The message names the offset and the instruction bytes.
+- **Message:** `<...> references <...> in <...> image-relatively (ADDR32NB) at +<...> of section '<...>' in <...>, and the site is not proved to be an address displacement: <...>; this cannot be retargeted`  
 - **What to do:** Move the reference behind a function or pointer, or hot-restart.  
 - **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
 
@@ -1141,6 +1141,15 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 - **What to do:** Give the variable an ordinary name, or hot-restart.  
 - **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
 
+### CML3550
+
+- **Cause:** Image-relative displacement to old data does not fit 32 bits (error). The code addresses the data as `[reg + index*scale + sym@IMGREL]` with the register holding the patch's `__ImageBase`; the displacement `target - patch base` is a signed 32-bit field, and the data (usually in another module) is more than 2 GiB away from where the patch can be loaded.  
+- **Message:** `image-relative reference to <...> (<...>, <...>) from <...> in <...> cannot reach it: it is more than 2 GiB away from every place the patch can be loaded`  
+- **Message:** `the image-relative displacement to '<...>' does not fit 32 bits: patch base <...>, target <...> (section '<...>' + <...>)`  
+- **What to do:** Access the data through a function or pointer in the module, or hot-restart.  
+  Other variants of the advice: Reserve the patch within +-2 GiB of the module (the loader does this), or hot-restart.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
 ### CML3570
 
 - **Cause:** (warning) Several function-local statics of one name in one function, declared in different blocks (`if (i == 0) { static const T names = ...; } else { static const T names = ...; }`), were matched to the running program's copies by their order in the function. Nothing else tells them apart: they have one name, one scope and one type, and the layout of their object section is not known (under cl every function-local static is a section of its own; where a layout is known it places them and this warning is not raised). The reload is applied; the function has the same number of them as before, each with the same type and in the same block. If the edit swapped two of those blocks or replaced one, the statics now hold each other's values.  
@@ -1545,6 +1554,16 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 - **Message:** see the diagnostic text printed with the id  
 - **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
 - **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+
+## CML4700 to CML4799
+
+### CML4700
+
+- **Cause:** The agent refused an image-relative fix-up (kind Addr32NbDisp): `target - patch image base` does not fit a signed 32-bit displacement. Nothing was written; a patch that was being loaded is unloaded and the program keeps running the old code. The broker checks the same range before it sends the fix-up (CML3550), so this is only seen when the patch landed somewhere else than planned.  
+- **Message:** `image-relative fix-up <...> at RVA <...> cannot reach target <...> from the patch image base <...>: distance <...> does not fit a signed 32-bit displacement`  
+- **What to do:** The patch was placed too far from the data it refers to; reserve address space nearer the module (or reload) so the patch lands within 2 GiB.  
+- **Raised by:** `agent/src/loader/fixup_diag_ids.h`
 
 
 ## CML5200 to CML5299

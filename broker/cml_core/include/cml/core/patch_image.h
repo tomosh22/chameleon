@@ -9,6 +9,10 @@
 //     wire.value = patch_base + rva + 4 + n + sext32(displacement)
 // which the agent inverts exactly (`int32(value - (site + 4 + n))`).
 //
+// Addr32NbDisp (WP-36, ADR-0042) is treated like Rel32: the triple holds int32(target - patch_base), the wire the
+// absolute target (`wire.value = patch_base + sext32(displacement)`), and the agent writes
+// `int32(value - image_base)` after checking that it fits (CML4700).
+//
 // SecRel32 (IMAGE_REL_AMD64_SECREL against the old module, one per thread-safe function-local static: the
 // CRT's `_Init_thread_epoch`) has no wire kind. DECISION: the value is known before the DLL is loaded (the
 // offset of the target inside its image section, from the old PDB, plus the addend) and does not depend on
@@ -35,7 +39,7 @@ struct Write32 {
 };
 
 struct PatchFixups {
-    std::vector<ipc::Fixup> wire;      // Rel32 / Addr64 / SlotWrite, in rva order
+    std::vector<ipc::Fixup> wire;      // Rel32 / Addr64 / SlotWrite / Addr32NbDisp, in rva order
     std::vector<Write32> pre_applied;  // SecRel32, in rva order
 };
 

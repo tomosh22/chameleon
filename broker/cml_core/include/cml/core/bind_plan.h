@@ -29,8 +29,10 @@
 // make_fixup_triples() turns them into (rva, kind, value) with value = S + A - (site + 4 + N) for the
 // REL32 family and S + A for ADDR64. Calls to bind-to-old functions go through the binding object's
 // thunks and need no fix-up; ADDR64 function pointers are retargeted to the real address; ADDR32NB is
-// legal only towards thunks (to old data: CML3101). Each thunk's slot gets a `Slot` fix-up with the old
-// function's address.
+// legal towards thunks, and towards old data only where the site is proved to be the sign-extended 32-bit
+// displacement of a memory operand (WP-36, ADR-0042, imgrel_site.h): such a site gets an `Addr32NbDisp`
+// fix-up, value = S + A - patch_base. Any other ADDR32NB to old data is CML3101. Each thunk's slot gets a
+// `Slot` fix-up with the old function's address.
 //
 // Everything the planner decides is logged at Trace level.
 
@@ -185,7 +187,10 @@ struct NewGlobal {
 // SecRel32: IMAGE_REL_AMD64_SECREL against a symbol of the old module (the CRT's thread-safe-static
 // epoch `_Init_thread_epoch` is read through it): the 32-bit offset of the target inside its image
 // section, plus the in-place addend. Valid for module targets only (the PDB knows the section).
-enum class FixupKind : std::uint8_t { Rel32 = 0, Rel32_1, Rel32_2, Rel32_3, Rel32_4, Rel32_5, Addr64, SecRel32, Slot };
+// Addr32NbDisp (WP-36, ADR-0042): IMAGE_REL_AMD64_ADDR32NB against data of the old image, at a site that is proved
+// to be the 32-bit displacement of a ModRM/SIB memory operand (`[reg + index*scale + sym@IMGREL]`, the register
+// holding the PATCH's __ImageBase): the value is int32(S + A - patch_base), which the processor sign-extends.
+enum class FixupKind : std::uint8_t { Rel32 = 0, Rel32_1, Rel32_2, Rel32_3, Rel32_4, Rel32_5, Addr64, SecRel32, Slot, Addr32NbDisp };
 const char* to_string(FixupKind k) noexcept;
 inline constexpr bool is_rel32(FixupKind k) noexcept { return k <= FixupKind::Rel32_5; }
 // N of REL32_N (bytes that follow the 4-byte field inside the instruction).
@@ -237,10 +242,17 @@ struct BindPlan {
     std::vector<std::uint32_t> locator_sections;
     std::vector<std::uint32_t> associative_locator_sections;
     std::vector<Diag> warnings;
+    // WP-36: ADDR32NB relocations of the object against data bound to the old image, and how many of them were proved
+    // to be address displacements (each of those has an Addr32NbDisp fix-up). A plan that is returned has
+    // verified == sites; a failed planning reports the counts through `partial`.
+    std::size_t imgrel_sites = 0;
+    std::size_t imgrel_verified = 0;
 
     PlanSummary summary() const;
     // `BINDPLAN <label> hooks=N bind_old_data=N thunks=N new=N fixups=N` (the CI evidence line).
     std::string summary_line(std::string_view label) const;
+    // `WP36-IMGREL sites=N verified=N object=<label>` (the WP-36 evidence line).
+    std::string imgrel_line(std::string_view label) const;
     // The input of WP-06's make_binding_object(): thunks first, then placeholders.
     std::vector<coff::BindSymbol> binding_symbols() const;
     const SymbolDecision* find_decision(std::string_view name) const;
@@ -281,8 +293,9 @@ struct PatchLayout {
     std::map<std::string, std::uint32_t, std::less<>> symbol_rva;  // patch publics: __cml_slot_*, placeholders
 };
 
-// One write for the agent: store `value` at patch_base + rva. Rel32* write the low 32 bits (a
-// two's-complement displacement), Addr64 and Slot write 64 bits.
+// One write for the agent: store `value` at patch_base + rva. Rel32* and Addr32NbDisp write the low 32 bits (a
+// two's-complement displacement, from the end of the field for Rel32* and from the patch base for Addr32NbDisp),
+// Addr64 and Slot write 64 bits.
 struct FixupTriple {
     std::uint32_t rva = 0;
     FixupKind kind = FixupKind::Rel32;
@@ -290,7 +303,7 @@ struct FixupTriple {
 };
 
 // Pure. CML3204 (no RVA for a fix-up's section), CML3205 (REL32 displacement out of int32 range),
-// CML3206 (slot symbol without RVA). Sorted by rva.
+// CML3206 (slot symbol without RVA), CML3550 (image-relative displacement out of int32 range). Sorted by rva.
 Result<std::vector<FixupTriple>> make_fixup_triples(const BindPlan& plan, const PatchLayout& layout);
 
 // Fills a PatchLayout from the patch's PDB: a section starts at (RVA of its locator symbol - the
