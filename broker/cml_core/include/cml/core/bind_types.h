@@ -1,0 +1,72 @@
+#pragma once
+
+// WP-37 (ADR-0042): the signatures of the functions of a patch object, for the bind planner.
+//
+// The planner tells same-named static functions apart by their canonical signature (cml/pdb/type_records.h). The old
+// side is the module PDB (PdbIndex::proc_signature). This is the new side: the object's procedure records in
+// `.debug$S` say which type each function has, and the type records come from
+//   debugT      the object's own `.debug$T` (compiled with /Z7, the usual rewrite of the patch compile), or
+//   typeserver  the compiler PDB named by LF_TYPESERVER2 (compiled with /Zi: a cl translation unit that uses a /Zi
+//               precompiled header keeps /Zi and a private compiler PDB, ADR-0026), or
+//   unreadable  neither (no debug sections, the compiler PDB is missing or is another build's, a malformed section).
+// "unreadable" never guesses: every signature is then unknown and the planner keeps its CML3214.
+//
+// Nothing is read before the first at(): planning a translation unit without same-named statics costs nothing.
+
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "cml/coff/coff.h"
+#include "cml/pdb/type_records.h"
+
+namespace cml::core::bind {
+
+enum class ObjectTypeOrigin : std::uint8_t { NotRead, DebugT, TypeServer, Unreadable };
+const char* to_string(ObjectTypeOrigin origin) noexcept;  // "not-read", "debugT", "typeserver", "unreadable"
+
+class ObjectSignatures {
+public:
+    ObjectSignatures(const coff::Object& object, std::string object_name);
+    ~ObjectSignatures();
+    ObjectSignatures(const ObjectSignatures&) = delete;
+    ObjectSignatures& operator=(const ObjectSignatures&) = delete;
+
+    // The signature of the function whose code starts at `value` in object section `section` (1-based). Unknown (with
+    // the reason) when the types are unreadable or the function has no procedure record.
+    const pdb::FunctionSignature& at(std::uint32_t section, std::uint32_t value);
+
+    // Where the types came from; NotRead before the first at().
+    ObjectTypeOrigin origin() const noexcept { return origin_; }
+    // Unreadable: why. DebugT / TypeServer: a note ("precompiled types are not resolved", the PDB path).
+    const std::string& detail() const noexcept { return detail_; }
+    std::size_t proc_records() const noexcept { return procs_.size(); }
+
+private:
+    struct Proc {
+        std::uint32_t type_index = 0;
+        bool type_is_id = false;
+        bool conflict = false;  // two records for one address disagree
+        bool computed = false;
+        pdb::FunctionSignature signature;
+    };
+
+    void load();
+    void unreadable(std::uint32_t diag_id, std::string why);
+
+    const coff::Object& object_;
+    std::string object_name_;
+    bool loaded_ = false;
+    ObjectTypeOrigin origin_ = ObjectTypeOrigin::NotRead;
+    std::string detail_;
+    std::unique_ptr<pdb::ObjectTypes> object_types_;
+    std::unique_ptr<pdb::TypeServerPdb> type_server_;
+    const pdb::TypeSource* types_ = nullptr;
+    std::map<std::uint64_t, Proc> procs_;  // (section << 32) | offset
+    pdb::FunctionSignature unknown_;       // what at() returns when nothing can be known
+    pdb::FunctionSignature no_record_;
+};
+
+}  // namespace cml::core::bind

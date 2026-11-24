@@ -1,0 +1,167 @@
+#pragma once
+
+// WP-37 (ADR-0042): CodeView type records, read the same way from the three places they live in:
+//   * the TPI and IPI streams of a linked PDB (PdbIndex, lazily; see PdbIndex::proc_signature),
+//   * the `.debug$T` section of an object compiled with /Z7 (ObjectTypes),
+//   * the compiler PDB an object compiled with /Zi refers to through LF_TYPESERVER2 (TypeServerPdb).
+// All three are a TypeSource, and function_signature() is the ONE routine that turns a function's type into a canonical
+// text. The bind planner compares those texts; it never compares type indices of two sources and never reads a
+// signature out of a decorated name.
+//
+// Everything here parses untrusted input: a malformed record gives "unknown" (FunctionSignature::known == false with a
+// CML14xx id and a reason), never a crash or a read outside the record.
+
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "cml/pdb/types.h"
+#include "cml/util/result.h"
+
+namespace cml::pdb {
+
+// One type record: the bytes after the 2-byte length and the 2-byte leaf kind.
+struct TypeRecord {
+    std::uint16_t kind = 0;
+    const std::uint8_t* body = nullptr;
+    std::uint32_t body_len = 0;
+};
+
+// A set of type records addressed by index. Types and ids are separate index spaces in a PDB (TPI, IPI) and one space
+// in an object. Returned bytes stay valid for as long as the source lives. Implementations are thread-safe.
+class TypeSource {
+public:
+    virtual ~TypeSource() = default;
+    virtual bool find_type(std::uint32_t index, TypeRecord& out) const = 0;
+    virtual bool find_id(std::uint32_t index, TypeRecord& out) const = 0;
+};
+
+// The canonical signature of a function.
+//   text   calling convention, function attributes, return type, parameter list and, for a member function, its class,
+//          the type of `this` and the `this` adjustment. Every referenced type is rendered structurally (pointer
+//          attributes, modifiers, array sizes) down to classes, structs, unions and enums, which are rendered by their
+//          unique (decorated) name when the record has one and by their name otherwise. No type index of a record
+//          appears in it, so the text of a function is the same in the linked PDB and in an object of the same compiler.
+//   class_unique_name   member functions: the unique name of the class (".?AV<lambda_1>@?1??f@@YAXXZ@" for a closure).
+struct FunctionSignature {
+    bool known = false;
+    std::string text;
+    bool member = false;
+    std::string class_unique_name;
+    std::string class_name;
+    // known == false: why (a cml::pdb::diag id, CML1430..1439, and one line of text).
+    std::uint32_t diag_id = 0;
+    std::string why;
+};
+
+// `index` is a type index (LF_PROCEDURE / LF_MFUNCTION) or, with `index_is_id`, an id index (LF_FUNC_ID / LF_MFUNC_ID):
+// what S_GPROC32 / S_LPROC32 and their _ID forms carry.
+FunctionSignature function_signature(const TypeSource& types, std::uint32_t index, bool index_is_id);
+
+// The canonical text of one type (tools and tests). nullopt with `why` when it cannot be rendered.
+std::optional<std::string> canonical_type(const TypeSource& types, std::uint32_t type_index, std::string* why = nullptr);
+
+// ---- objects ---------------------------------------------------------------------------------------------------------
+
+// What LF_TYPESERVER2 says: the compiler PDB that holds the object's types.
+struct TypeServerRef {
+    PdbId id;              // GUID and age as recorded in the object
+    std::string pdb_path;  // as the compiler wrote it (the /Fd file)
+};
+
+// What a `.debug$T` section holds.
+struct DebugTInfo {
+    enum class Kind : std::uint8_t {
+        Records,      // the object's own type records (/Z7)
+        TypeServer,   // one LF_TYPESERVER2 record: the types are in a compiler PDB (/Zi)
+        Precompiled,  // LF_PRECOMP first: indices below `first_own_index` live in the PCH object (/Z7 /Yu)
+        Empty,        // no records
+    };
+    Kind kind = Kind::Empty;
+    TypeServerRef server;                // TypeServer
+    std::uint32_t first_own_index = 0x1000;  // Precompiled: index of the first record after LF_PRECOMP
+    std::string precompiled_object;      // Precompiled: the PCH object the compiler named
+};
+
+// Reads the head of a `.debug$T` section. CML1432 when it is not a C13 type section.
+Result<DebugTInfo> inspect_debug_t(std::span<const std::uint8_t> section);
+
+// The type records of an object's `.debug$T` (types and ids share one index space). For a Precompiled section the
+// object's own records are readable and the PCH's are not (find_* returns false for them, so a signature that needs one
+// is "unknown").
+class ObjectTypes final : public TypeSource {
+public:
+    // CML1432: not a type section, or a type-server reference (use TypeServerPdb). CML1431: a record leaves the section.
+    static Result<ObjectTypes> parse(std::span<const std::uint8_t> section);
+
+    bool find_type(std::uint32_t index, TypeRecord& out) const override;
+    bool find_id(std::uint32_t index, TypeRecord& out) const override { return find_type(index, out); }
+
+    const DebugTInfo& info() const noexcept { return info_; }
+    std::uint32_t first_index() const noexcept { return first_index_; }
+    std::size_t record_count() const noexcept { return offsets_.size(); }
+
+private:
+    std::span<const std::uint8_t> bytes_;
+    DebugTInfo info_;
+    std::uint32_t first_index_ = 0x1000;
+    std::vector<std::uint32_t> offsets_;  // of each record header within bytes_
+};
+
+// A compiler PDB opened for its types only (it has no usable DBI stream, so PdbIndex cannot open it). The file stays
+// mapped while the object lives: destroy it before the compiler writes the PDB again.
+class TypeServerPdb final : public TypeSource {
+public:
+    ~TypeServerPdb() override;
+    TypeServerPdb(const TypeServerPdb&) = delete;
+    TypeServerPdb& operator=(const TypeServerPdb&) = delete;
+
+    // CML1400.. when the file cannot be opened or is not a PDB, CML1430 when its TPI stream is unusable.
+    static Result<std::unique_ptr<TypeServerPdb>> open(const std::string& pdb_path);
+
+    bool find_type(std::uint32_t index, TypeRecord& out) const override;
+    bool find_id(std::uint32_t index, TypeRecord& out) const override;
+
+    // GUID and age of the PDB info stream (what LF_TYPESERVER2 records).
+    const PdbId& id() const noexcept;
+    const std::string& path() const noexcept;
+
+    struct Impl;
+
+private:
+    explicit TypeServerPdb(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
+};
+
+// A procedure record (S_GPROC32 / S_LPROC32 and their _ID forms) of an object's `.debug$S` section. In an object the
+// record's section:offset is zero and two relocations (SECREL at `offset_field`, SECTION right after it) name the
+// function; the caller resolves them with the COFF reader.
+struct ObjectProc {
+    std::uint32_t offset_field = 0;  // offset, within the section, of the record's 32-bit code offset
+    std::uint32_t type_index = 0;
+    bool type_is_id = false;         // *_ID record: `type_index` is an id (LF_FUNC_ID / LF_MFUNC_ID)
+    bool global = false;             // S_GPROC32*
+    std::string_view name;           // display name, points into the section
+};
+
+// Walks the symbol subsections of one `.debug$S` section. CML1433 when the section is not C13 or a subsection or
+// record leaves it.
+Result<std::vector<ObjectProc>> read_object_procs(std::span<const std::uint8_t> section);
+
+// Statistics of the lazily read type streams of a PdbIndex / TypeServerPdb (logs, tests, the benchmark).
+struct TypeStreamStats {
+    bool opened = false;            // the header was read
+    bool sparse = false;            // the index-offset table of the hash stream is used (records are read by chunk)
+    std::uint32_t chunks = 0;       // chunks the stream is divided into (1 when not sparse)
+    std::uint32_t chunks_loaded = 0;
+    std::uint64_t record_bytes = 0;  // size of the record area
+    std::uint64_t bytes_loaded = 0;  // record bytes walked so far
+    std::uint64_t bytes_copied = 0;  // of those, bytes copied because their blocks are not consecutive in the file
+    std::uint32_t lookups = 0;
+};
+
+}  // namespace cml::pdb

@@ -75,6 +75,7 @@ struct SymbolView {
     std::uint32_t rva = kNoRva;              // kNoRva when the section is unknown
     std::uint32_t size = 0;                  // procs: code length in bytes; others 0
     std::uint32_t type_index = 0;            // CodeView TPI (or IPI for *_ID procs) index
+    bool type_is_id = false;                 // procs: the record is an *_ID form, `type_index` is an IPI index (WP-37)
     std::uint32_t flags = 0;                 // procs: CV_PROCFLAGS; publics: kPublic* bits
     std::uint32_t parent_proc = kNoSymbol;   // function-local symbols: index of the enclosing proc
     std::string_view parent_name;            // name of that enclosing proc ("" when top level)

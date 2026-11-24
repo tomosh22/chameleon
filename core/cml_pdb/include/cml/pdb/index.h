@@ -7,6 +7,7 @@
 #include <string_view>
 #include <vector>
 
+#include "cml/pdb/type_records.h"
 #include "cml/pdb/types.h"
 #include "cml/util/result.h"
 
@@ -132,6 +133,17 @@ public:
     // through the TPI/IPI streams. Loads the compiland's symbols and the type streams. A function whose type cannot be read
     // still returns a ProcInfo (params_known == false); an error only when the symbol records are unreadable.
     Result<ProcInfo> proc_info(const SymbolView& proc) const;
+
+    // ---- Types (WP-37, lazy) -------------------------------------------------------------
+    // The type records of this PDB: find_type reads the TPI stream, find_id the IPI stream. Opening an index reads no
+    // type record; the first lookup reads the stream header and the type-index offset table of the hash stream, and
+    // every lookup only the chunk of records around the index it asks for (cml/pdb/type_records.h).
+    const TypeSource& types() const;
+    // The canonical signature of a proc symbol of this index (compiland_symbols / find_proc_by_rva). `known` is false
+    // with a CML14xx id and a reason when the type streams or the records it needs cannot be read.
+    FunctionSignature proc_signature(const SymbolView& proc) const;
+    // What has been read of the TPI (`tpi` true) or IPI stream so far. `opened` is false before the first lookup.
+    TypeStreamStats type_stream_stats(bool tpi) const;
 
     // ---- Loading control -----------------------------------------------------------------
     Result<void> load_publics() const;

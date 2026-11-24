@@ -1,0 +1,23 @@
+{
+  "fixture": "lambda_statics",
+  "edit": "mark_2.edit (logic.cpp)",
+  "min_hooks": 12,
+  "min_bind_old_data": 7,
+  "expect": [
+    { "symbol": "ls_step", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol": "ls_make_name", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol_contains": "ls_step::<lambda_", "decision": "patch-hooked", "source": "compiland-static-signature" },
+    { "symbol_contains": "ls_over::<lambda_", "decision": "patch-hooked", "source": "compiland-static-signature" },
+    { "symbol_contains": "::operator()::sname", "decision": "bind-old-data", "source": "compiland-static-closure" },
+    { "symbol_contains": "::operator()::$TSS0", "decision": "bind-old-data", "source": "compiland-static-closure", "when": "cl" },
+    { "symbol_contains": "::operator()::$TSS0", "decision": "bind-old-data", "source": "compiland-layout", "when": "clang" },
+    { "symbol": "(anonymous namespace)::s_constructions", "decision": "bind-old-data", "source": "compiland-static" },
+    { "symbol": "(anonymous namespace)::s_last", "decision": "bind-old-data", "source": "compiland-static" }
+  ],
+  "absent": [
+    { "symbol_contains": "::operator()::sname", "decision": "patch-new-data" },
+    { "symbol_contains": "::operator()::$TSS0", "decision": "patch-new-data" },
+    { "symbol_contains": ">::operator()", "decision": "patch-new-function" },
+    { "symbol": "(anonymous namespace)::s_constructions", "decision": "patch-new-data" }
+  ]
+}

@@ -12,6 +12,8 @@
 #include <memory>
 #include <optional>
 #include <sstream>
+#include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -599,6 +601,7 @@ private:
         ipc::json::Value args = ipc::json::Value::object();
         args.set("timeout_ms", ipc::json::Value::integer(limit_ms));
         cml::Result<ipc::ControlResponse> response = control_->call("reload", std::move(args), limit_ms + 5000);
+        print_broker_evidence();
         if (!response) {
             return StepOutcome::fail(response.error());
         }
@@ -816,6 +819,41 @@ private:
         }
     }
 
+    // WP-37: the broker logs greppable evidence lines for some decisions of a reload ("WP37-TYPES source=typeserver ...": which
+    // path supplied the patch object's type records). They are in broker.log, which CI only keeps as an artifact; print the
+    // ones the reload added so the job log shows them next to RELOAD-TIMING. A line is evidence when it holds "WP<digits>-<UPPER>".
+    void print_broker_evidence() {
+        const std::string log = read_whole_file(options_.artifacts_dir / "broker.log");
+        if (log.size() < broker_log_cursor_) {
+            broker_log_cursor_ = 0;
+        }
+        std::size_t at = broker_log_cursor_;
+        while (at < log.size()) {
+            const std::size_t end = log.find('\n', at);
+            if (end == std::string::npos) {
+                break;  // an unfinished line: read it next time
+            }
+            const std::string_view line(log.data() + at, end - at);
+            at = end + 1;
+            for (std::size_t tag = line.find("WP"); tag != std::string_view::npos; tag = line.find("WP", tag + 1)) {
+                std::size_t k = tag + 2;
+                while (k < line.size() && line[k] >= '0' && line[k] <= '9') {
+                    ++k;
+                }
+                if (k > tag + 2 && k + 1 < line.size() && line[k] == '-' && line[k + 1] >= 'A' && line[k + 1] <= 'Z') {
+                    std::string text(line.substr(tag));
+                    while (!text.empty() && (text.back() == '\r' || text.back() == ' ')) {
+                        text.pop_back();
+                    }
+                    std::printf("%s\n", text.c_str());
+                    std::fflush(stdout);
+                    break;
+                }
+            }
+        }
+        broker_log_cursor_ = at;
+    }
+
     // An integer member of the most recent reload's result (WP-16: "compiled", "compile_reused", "processes", ...).
     StepOutcome expect_reload_result(const Step& step) {
         if (!has_reload_result_) {
@@ -926,6 +964,7 @@ private:
     std::size_t broker_id_ = 0;
     ipc::json::Value last_reload_result_;
     bool has_reload_result_ = false;
+    std::size_t broker_log_cursor_ = 0;  // WP-37: how much of broker.log print_broker_evidence() has looked at
     bool launched_ = false;
     fs::path signal_file_;
     ExceptionSteps exception_steps_;  // WP-20

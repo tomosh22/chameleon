@@ -1,0 +1,49 @@
+# Scenario `pch_static_overloads` (WP-37, ADR-0042): a static overload set in a translation unit that uses the
+# precompiled header. Two of the three signatures need types from the precompiled header (PchPoint, std::string).
+#
+# Under cl the fixture's PCH is built with /Zi, so the patch compile keeps /Zi and a private compiler PDB (ADR-0026,
+# PchDebugMode::KeepZiPrivatePdb): the patch object's .debug$T holds only an LF_TYPESERVER2 reference and the planner
+# reads the new side's types from that PDB. Under clang-cl the object carries its own type records. cmltest prints the
+# broker's evidence line of the reload: `WP37-TYPES source=typeserver|debugT|unreadable object=...`.
+#
+# The edit changes pch_pick(int) only: ov = 6 + 34 + 200 = 240 becomes 1006 + 34 + 200 = 1240.
+name = "pch_static_overloads"
+description = "fixture pch: ov=240 -> edit one overload of a /Yu TU -> reload -> ov=1240"
+fixture = "pch"
+timeout_s = 120
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1 base=100 ov=240\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_pch.exe"
+within_s = 10
+
+[[step]]
+kind = "edit"
+patch = "edits/pick_int.edit"
+
+[[step]]
+kind = "reload"
+within_s = 60
+
+[[step]]
+kind = "expect_reload_result"
+key = "compiled"
+value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1 base=100 ov=1240\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1 base=100 ov=1240\\b"
+within_s = 10

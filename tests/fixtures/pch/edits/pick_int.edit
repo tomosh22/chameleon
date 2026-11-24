@@ -1,0 +1,11 @@
+--- a/overloads.cpp
++++ b/overloads.cpp
+@@ -10,7 +10,7 @@
+ // only a type-server reference and the planner reads the types from that PDB.
+ static int pch_pick(int v)
+ {
+-    return v + 1;
++    return v + 1001;
+ }
+ 
+ static int pch_pick(const PchPoint& p)

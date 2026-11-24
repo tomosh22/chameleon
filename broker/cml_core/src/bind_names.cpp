@@ -482,6 +482,43 @@ bool is_compiler_generated_data_name(std::string_view n) {
     return false;
 }
 
+std::string_view call_operator_scope(std::string_view d) {
+    // '?' <identifier> '@' '?' <number> '?' <nested decorated name>, the nested name being "??R<class>...".
+    if (d.size() < 2 || d[0] != '?') {
+        return {};
+    }
+    std::size_t at = d.find('@', 1);
+    if (at == std::string_view::npos) {
+        return {};
+    }
+    ++at;
+    if (at >= d.size() || d[at] != '?') {
+        return {};
+    }
+    ++at;
+    // The scope number: one digit, or hexadecimal letters 'A'..'P' closed by '@'.
+    if (at < d.size() && is_digit(d[at])) {
+        ++at;
+    } else {
+        std::size_t k = at;
+        while (k < d.size() && d[k] >= 'A' && d[k] <= 'P') {
+            ++k;
+        }
+        if (k == at || k >= d.size() || d[k] != '@') {
+            return {};
+        }
+        at = k + 1;
+    }
+    if (at >= d.size() || d[at] != '?') {
+        return {};
+    }
+    ++at;
+    if (d.substr(at, 3) != "??R") {
+        return {};
+    }
+    return d.substr(at + 3);
+}
+
 std::string enclosing_function(std::string_view decorated) {
     if (decorated.empty() || decorated[0] != '?') {
         return {};

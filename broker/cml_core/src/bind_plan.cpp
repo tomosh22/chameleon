@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <optional>
 #include <set>
 #include <unordered_map>
@@ -12,6 +13,7 @@
 #include "cml/coff/writer.h"
 #include "cml/core/bind_diag_ids.h"
 #include "cml/core/bind_names.h"
+#include "cml/core/bind_types.h"
 #include "cml/util/format.h"
 #include "cml/util/log.h"
 
@@ -44,6 +46,8 @@ const char* to_string(BindSource s) noexcept {
         case BindSource::CompilandOrdinal: return "compiland-static-ordinal";
         case BindSource::CompilandRva: return "compiland-static-rva";
         case BindSource::CompilandLayout: return "compiland-layout";
+        case BindSource::CompilandSignature: return "compiland-static-signature";
+        case BindSource::CompilandClosure: return "compiland-static-closure";
         case BindSource::PdbPublic: return "pdb-public";
         case BindSource::PdbGlobal: return "pdb-global";
         case BindSource::ImportSlotPdb: return "import-slot-pdb";
@@ -298,6 +302,30 @@ private:
     }
     std::map<std::uint32_t, std::int64_t> delta_;  // obj section -> (old RVA - section offset); absent: unknown
     std::set<std::uint32_t> delta_conflict_;
+    void learn_delta(const Sym& sy, std::uint32_t old_rva);
+
+    // WP-37 (ADR-0042): canonical signatures, read lazily on both sides. The old side is the module PDB's type stream,
+    // the new side the patch object's .debug$S / .debug$T (or its type server PDB): cml/core/bind_types.h.
+    std::unique_ptr<ObjectSignatures> new_sigs_;
+    std::map<std::uint32_t, pdb::FunctionSignature> old_sigs_;  // by SymbolView::index within the compiland
+    const pdb::FunctionSignature& old_signature(const pdb::SymbolView& proc);
+    const pdb::FunctionSignature& new_signature(const Sym& sy);
+    // The identity of the closure whose operator() encloses a function-local record of the old compiland: the unique
+    // name of the member function's class without its ".?AV" prefix ("<lambda_1>@?1??f@@YAXXZ@").
+    struct ClosureId {
+        bool known = false;  // false: the types cannot be read (`why`)
+        std::string tail;    // empty when known: the enclosing function is not a member function of a uniquely named class
+        std::string why;
+    };
+    ClosureId closure_of(const pdb::SymbolView& local);
+    struct Match {
+        const pdb::SymbolView* view = nullptr;
+        BindSource how = BindSource::None;
+    };
+    bool pair_overloads_by_signature(const std::string& group_name, std::vector<std::uint32_t>& unmatched, std::vector<const pdb::SymbolView*>& free_cands,
+                                     std::map<std::uint32_t, Match>& matched, std::map<std::uint32_t, std::string>& why);
+    void pair_statics_by_closure(const std::string& base, std::vector<std::uint32_t>& unmatched, std::vector<const pdb::SymbolView*>& free_cands,
+                                 std::map<std::uint32_t, Match>& matched, std::map<std::uint32_t, std::string>& why, std::set<std::uint32_t>& no_layout);
 
     // ---- helpers ----
     void fatal(Diag d) {
@@ -837,6 +865,272 @@ std::uint32_t Planner::old_size_for(const TargetAddress& a) {
     return 0;
 }
 
+// ---- WP-37: signatures and closure identity ----------------------------------------------------
+
+const pdb::FunctionSignature& Planner::old_signature(const pdb::SymbolView& proc) {
+    const auto it = old_sigs_.find(proc.index);
+    if (it != old_sigs_.end()) {
+        return it->second;
+    }
+    return old_sigs_.emplace(proc.index, pdb_.proc_signature(proc)).first->second;
+}
+
+const pdb::FunctionSignature& Planner::new_signature(const Sym& sy) {
+    if (!new_sigs_) {
+        new_sigs_ = std::make_unique<ObjectSignatures>(obj_, in_.object_name);
+    }
+    return new_sigs_->at(sy.dec.section, sy.s->value);
+}
+
+Planner::ClosureId Planner::closure_of(const pdb::SymbolView& local) {
+    ClosureId id;
+    if (local.parent_proc == pdb::kNoSymbol || local.parent_proc >= comp_syms_.size()) {
+        id.known = true;  // not function-local: no closure
+        return id;
+    }
+    const pdb::FunctionSignature& sig = old_signature(comp_syms_[local.parent_proc]);
+    if (!sig.known) {
+        id.why = sig.why;
+        return id;
+    }
+    id.known = true;
+    // ".?AV<lambda_1>@?1??f@@YAXXZ@": '.', '?', 'A', the class key ('V' class, 'U' struct), then the qualified name.
+    const std::string& u = sig.class_unique_name;
+    if (sig.member && u.size() > 4 && u[0] == '.' && u[1] == '?' && u[2] == 'A') {
+        id.tail = u.substr(4);
+    }
+    return id;
+}
+
+void Planner::learn_delta(const Sym& sy, std::uint32_t old_rva) {
+    if (sy.dec.section == 0 || secs_[sy.dec.section - 1].sec->is_comdat() || delta_conflict_.count(sy.dec.section) != 0) {
+        return;
+    }
+    const std::int64_t d = static_cast<std::int64_t>(old_rva) - static_cast<std::int64_t>(sy.s->value);
+    const auto it = delta_.find(sy.dec.section);
+    if (it == delta_.end()) {
+        delta_[sy.dec.section] = d;
+    } else if (it->second != d) {
+        delta_conflict_.insert(sy.dec.section);
+    }
+}
+
+// Static functions that share scope and name (overloads; the call operators of same-numbered lambdas of overloaded
+// functions): one-to-one by canonical signature. Never by position, never by a decorated name. Members that get a
+// partner move to `matched`; a member whose signature no old function has is a new function (decided here); what is
+// left in `unmatched` is ambiguous and `why` says so. If any signature of the group is unreadable nothing is paired
+// (an unknown signature could be equal to any other) and the result is false: the caller falls back to what the
+// planner did before it had types.
+bool Planner::pair_overloads_by_signature(const std::string& group_name, std::vector<std::uint32_t>& unmatched,
+                                          std::vector<const pdb::SymbolView*>& free_cands, std::map<std::uint32_t, Match>& matched,
+                                          std::map<std::uint32_t, std::string>& why) {
+    std::vector<const pdb::FunctionSignature*> new_sig;
+    std::vector<const pdb::FunctionSignature*> old_sig;
+    std::string unreadable;
+    for (const std::uint32_t pos : unmatched) {
+        const Sym& sy = syms_[pos];
+        const pdb::FunctionSignature& sig = new_signature(sy);
+        new_sig.push_back(&sig);
+        CML_LOG(Trace, "bind: overloads '%s': new %s signature=%s", group_name.c_str(), sy.name.c_str(), sig.known ? sig.text.c_str() : ("unknown (" + sig.why + ")").c_str());
+        if (!sig.known && unreadable.empty()) {
+            unreadable = "the signature of '" + sy.name + "' in " + in_.object_name + " cannot be read: " + sig.why;
+        }
+    }
+    for (const pdb::SymbolView* c : free_cands) {
+        const pdb::FunctionSignature& sig = old_signature(*c);
+        old_sig.push_back(&sig);
+        CML_LOG(Trace, "bind: overloads '%s': old record '%s' rva=%s signature=%s", group_name.c_str(), std::string(c->name).c_str(), hex(c->rva).c_str(),
+                sig.known ? sig.text.c_str() : ("unknown (" + sig.why + ")").c_str());
+        if (!sig.known && unreadable.empty()) {
+            unreadable = "the signature of the old function '" + std::string(c->name) + "' at rva " + hex(c->rva) + " cannot be read from the PDB of " + in_.module_name + ": " + sig.why;
+        }
+    }
+    if (!unreadable.empty()) {
+        CML_LOG(Trace, "bind: overloads '%s': not paired by signature: %s", group_name.c_str(), unreadable.c_str());
+        for (const std::uint32_t pos : unmatched) {
+            why[pos] = "the types needed to tell the overloads apart cannot be read (" + unreadable + ")";
+        }
+        return false;
+    }
+    std::vector<bool> member_done(unmatched.size(), false);
+    std::vector<bool> cand_taken(free_cands.size(), false);
+    for (std::size_t m = 0; m < unmatched.size(); ++m) {
+        Sym& sy = syms_[unmatched[m]];
+        std::size_t same_new = 0;
+        for (const pdb::FunctionSignature* other : new_sig) {
+            same_new += other->text == new_sig[m]->text ? 1u : 0u;
+        }
+        std::vector<std::size_t> hits;
+        for (std::size_t c = 0; c < free_cands.size(); ++c) {
+            if (old_sig[c]->text == new_sig[m]->text) {
+                hits.push_back(c);
+            }
+        }
+        if (hits.empty()) {
+            // No old function of this name and scope has the signature: a new overload. (An old overload without a
+            // partner simply stays as it is.)
+            CML_LOG(Trace, "bind: overloads '%s': %s has a signature no old overload has: new function", group_name.c_str(), sy.name.c_str());
+            decide(sy, DecisionKind::PatchNewFunction, BindSource::None, sy.dec.type, {},
+                   "static overload whose signature no old function named '" + group_name + "' has (" + new_sig[m]->text + "): new function, not hooked");
+            member_done[m] = true;
+        } else if (hits.size() == 1 && same_new == 1) {
+            CML_LOG(Trace, "bind: overloads '%s': %s paired by signature with the old record at rva %s", group_name.c_str(), sy.name.c_str(), hex(free_cands[hits[0]]->rva).c_str());
+            matched[unmatched[m]] = {free_cands[hits[0]], BindSource::CompilandSignature};
+            cand_taken[hits[0]] = true;
+            member_done[m] = true;
+        } else {
+            CML_LOG(Trace, "bind: overloads '%s': %s is ambiguous: %zu new and %zu old functions have its signature", group_name.c_str(), sy.name.c_str(), same_new, hits.size());
+            why[unmatched[m]] = std::to_string(same_new) + " new and " + std::to_string(hits.size()) + " old functions have the same signature (" + new_sig[m]->text + ")";
+        }
+    }
+    std::vector<std::uint32_t> left;
+    for (std::size_t m = 0; m < unmatched.size(); ++m) {
+        if (!member_done[m]) {
+            left.push_back(unmatched[m]);
+        }
+    }
+    unmatched = std::move(left);
+    std::vector<const pdb::SymbolView*> free_left;
+    for (std::size_t c = 0; c < free_cands.size(); ++c) {
+        if (!cand_taken[c]) {
+            free_left.push_back(free_cands[c]);
+        }
+    }
+    free_cands = std::move(free_left);
+    return true;
+}
+
+// Same-named function-local statics of several lambdas (Godot's SNAME: `sname` and its guard in every lambda). The
+// old record belongs to the lambda whose closure class has the unique name ".?AV" + T; the new symbol's decorated
+// scope starts with the same T (bind_names.h: call_operator_scope).
+//
+// A lambda's name is a number the compiler assigns ("<lambda_2>"), so it identifies the lambda only while the lambdas
+// of the function are the same as before. The pairing is therefore made only when the closures that hold a static of
+// this name are the SAME SET in the old image and in the patch (for the enclosing function of the group); if a lambda
+// with such a static was added or removed the numbers may have shifted, nothing is paired and nothing is guessed from
+// the section layout either (`no_layout`): the statics stay ambiguous (CML3207). When the old image has no such
+// static in any lambda of the function, the new ones are new.
+void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::uint32_t>& unmatched, std::vector<const pdb::SymbolView*>& free_cands,
+                                      std::map<std::uint32_t, Match>& matched, std::map<std::uint32_t, std::string>& why, std::set<std::uint32_t>& no_layout) {
+    // The members that live in an operator(), with their scope and the scope without its first component (the
+    // closure's own name): what is left names the enclosing function.
+    const auto after_first_component = [](std::string_view text) {
+        const std::size_t at = text.find('@');
+        return at == std::string_view::npos ? std::string_view() : text.substr(at + 1);
+    };
+    std::vector<std::size_t> scoped;  // indices into unmatched
+    std::vector<std::string_view> scope(unmatched.size());
+    for (std::size_t m = 0; m < unmatched.size(); ++m) {
+        scope[m] = call_operator_scope(syms_[unmatched[m]].name);
+        if (!scope[m].empty() && !after_first_component(scope[m]).empty()) {
+            scoped.push_back(m);
+        }
+    }
+    if (scoped.empty()) {
+        return;
+    }
+    std::vector<ClosureId> ids;
+    std::string unreadable;
+    for (const pdb::SymbolView* c : free_cands) {
+        ids.push_back(closure_of(*c));
+        const ClosureId& id = ids.back();
+        CML_LOG(Trace, "bind: closure statics '%s': old record at rva %s in '%s' closure=%s", base.c_str(), hex(c->rva).c_str(), std::string(c->parent_name).c_str(),
+                id.known ? (id.tail.empty() ? "(none)" : id.tail.c_str()) : ("unknown (" + id.why + ")").c_str());
+        if (!id.known && unreadable.empty()) {
+            unreadable = "the type of the old function '" + std::string(c->parent_name) + "' cannot be read from the PDB of " + in_.module_name + ": " + id.why;
+        }
+    }
+    if (!unreadable.empty()) {
+        // Degrade to what the planner did before it had types (the layout step may still place them).
+        CML_LOG(Trace, "bind: closure statics '%s': not paired by closure: %s", base.c_str(), unreadable.c_str());
+        for (const std::size_t m : scoped) {
+            why[unmatched[m]] = "the enclosing lambdas cannot be told apart (" + unreadable + ")";
+        }
+        return;
+    }
+    // Old records in a closure of the same enclosing function, and which member each belongs to.
+    std::vector<bool> in_function(free_cands.size(), false);
+    std::vector<std::vector<std::size_t>> hits(unmatched.size());
+    std::vector<std::size_t> cand_hits(free_cands.size(), 0);
+    std::size_t old_in_function = 0;
+    for (std::size_t c = 0; c < free_cands.size(); ++c) {
+        if (ids[c].tail.empty()) {
+            continue;
+        }
+        const std::string_view function_part = after_first_component(ids[c].tail);
+        for (const std::size_t m : scoped) {
+            if (!function_part.empty() && starts_with(after_first_component(scope[m]), function_part)) {
+                in_function[c] = true;
+            }
+            if (starts_with(scope[m], ids[c].tail)) {
+                hits[m].push_back(c);
+                ++cand_hits[c];
+            }
+        }
+        old_in_function += in_function[c] ? 1u : 0u;
+    }
+    std::vector<bool> member_done(unmatched.size(), false);
+    std::vector<bool> cand_taken(free_cands.size(), false);
+    if (old_in_function == 0) {
+        // (Guards included: this compiler records guard variables, or the group would have no candidates.)
+        for (const std::size_t m : scoped) {
+            Sym& sy = syms_[unmatched[m]];
+            CML_LOG(Trace, "bind: closure statics '%s': %s: no lambda of its function had a static of this name: new", base.c_str(), sy.name.c_str());
+            decide(sy, DecisionKind::PatchNewData, BindSource::None, sy.dec.type, {},
+                   "function-local static of a lambda; no lambda of that function had a static named '" + base + "' in the old image: new");
+            member_done[m] = true;
+        }
+    } else {
+        bool same_set = true;
+        for (const std::size_t m : scoped) {
+            same_set = same_set && !hits[m].empty();
+        }
+        for (std::size_t c = 0; c < free_cands.size(); ++c) {
+            same_set = same_set && (!in_function[c] || cand_hits[c] != 0);
+        }
+        if (!same_set) {
+            CML_LOG(Trace, "bind: closure statics '%s': the lambdas holding it changed (%zu old record(s) in the function's lambdas, %zu in the patch): not paired", base.c_str(),
+                    old_in_function, scoped.size());
+            for (const std::size_t m : scoped) {
+                why[unmatched[m]] = "the lambdas of the enclosing function that hold a static named '" + base + "' are not the same as in the old image (" +
+                                    std::to_string(old_in_function) + " there, " + std::to_string(scoped.size()) +
+                                    " in the patch); a lambda's compiler-assigned number is its only identity, and the numbers may have shifted";
+                no_layout.insert(unmatched[m]);
+            }
+        } else {
+            for (const std::size_t m : scoped) {
+                Sym& sy = syms_[unmatched[m]];
+                if (hits[m].size() == 1 && cand_hits[hits[m][0]] == 1) {
+                    const pdb::SymbolView* c = free_cands[hits[m][0]];
+                    CML_LOG(Trace, "bind: closure statics '%s': %s paired with the old record at rva %s (closure %s)", base.c_str(), sy.name.c_str(), hex(c->rva).c_str(),
+                            ids[hits[m][0]].tail.c_str());
+                    matched[unmatched[m]] = {c, BindSource::CompilandClosure};
+                    learn_delta(sy, c->rva);
+                    cand_taken[hits[m][0]] = true;
+                    member_done[m] = true;
+                } else {
+                    // Several statics of this name in one lambda (different blocks): the layout step may tell them apart.
+                    why[unmatched[m]] = "the lambda has " + std::to_string(hits[m].size()) + " statics named '" + base + "' in the old image";
+                }
+            }
+        }
+    }
+    std::vector<std::uint32_t> left;
+    for (std::size_t m = 0; m < unmatched.size(); ++m) {
+        if (!member_done[m]) {
+            left.push_back(unmatched[m]);
+        }
+    }
+    unmatched = std::move(left);
+    std::vector<const pdb::SymbolView*> free_left;
+    for (std::size_t c = 0; c < free_cands.size(); ++c) {
+        if (!cand_taken[c]) {
+            free_left.push_back(free_cands[c]);
+        }
+    }
+    free_cands = std::move(free_left);
+}
+
 // ---- defined symbols --------------------------------------------------------------------------
 
 void Planner::decide_defined() {
@@ -1013,10 +1307,6 @@ void Planner::bridge_statics() {
         });
     }
 
-    struct Match {
-        const pdb::SymbolView* view = nullptr;
-        BindSource how = BindSource::None;
-    };
     std::map<std::uint32_t, Match> matched;  // pos -> match
     std::set<std::string> deferred;          // group keys that need pass B
 
@@ -1036,36 +1326,63 @@ void Planner::bridge_statics() {
         }
         if (g.members.size() == 1 && cands.size() == 1) {
             matched[g.members.front()] = {cands.front(), BindSource::CompilandStatic};
-            const Sym& sy = syms_[g.members.front()];
-            if (!g.is_func && sy.dec.section != 0 && !secs_[sy.dec.section - 1].sec->is_comdat()) {
-                const std::int64_t d = static_cast<std::int64_t>(cands.front()->rva) - static_cast<std::int64_t>(sy.s->value);
-                const auto it = delta_.find(sy.dec.section);
-                if (it == delta_.end()) {
-                    delta_[sy.dec.section] = d;
-                } else if (it->second != d) {
-                    delta_conflict_.insert(sy.dec.section);
-                }
+            if (!g.is_func) {
+                learn_delta(syms_[g.members.front()], cands.front()->rva);
             }
             continue;
         }
         deferred.insert(key);
     }
+
+    // What pass B has left of each deferred group.
+    struct Pending {
+        std::vector<const pdb::SymbolView*> cands;       // every candidate of the group (messages)
+        std::vector<const pdb::SymbolView*> free_cands;  // not yet paired
+        std::vector<std::uint32_t> unmatched;
+        std::map<std::uint32_t, std::string> why;        // pos -> why a type-based step could not decide it
+        std::set<std::uint32_t> no_layout;               // members the layout step must not place (pair_statics_by_closure)
+    };
+    std::map<std::string, Pending> pending;
+    for (const std::string& key : deferred) {
+        Group& g = groups[key];
+        Pending& p = pending[key];
+        p.cands = static_candidates(g.base, g.encl, g.is_func, g.display, g.is_tls ? 1 : 0);
+        p.free_cands = p.cands;
+        p.unmatched = g.members;
+    }
+    // Pass B0 (WP-37, data): function-local statics of lambdas, by the identity of the closure class. It runs for
+    // every group before the layout-based steps because its matches are as strong as a name match and teach the
+    // section deltas (clang-cl records no guard variable: pass C places the guards from them).
+    for (const std::string& key : deferred) {
+        const Group& g = groups[key];
+        if (!g.is_func) {
+            Pending& p = pending[key];
+            pair_statics_by_closure(g.base, p.unmatched, p.free_cands, matched, p.why, p.no_layout);
+        }
+    }
     for (const std::uint32_t sec : delta_conflict_) {
         delta_.erase(sec);
     }
 
-    // Pass B: groups with several members and/or several candidates in the same scope. Never paired
-    // by position alone: only by (1) the member's exact qualified name (clang spells lambdas with the same
-    // counter as the decorated name), (2) the RVA in the unchanged section layout (data). Whatever is left
-    // is ambiguous: CML3214 for functions (overloads), CML3207 for data. (The signature would tell
-    // overloads apart, but cml_pdb offers no type access yet.)
+    // Pass B: groups with several members and/or several candidates in the same scope. Never paired by position
+    // alone.
+    //   functions  (1) one-to-one by the canonical signature from the type records (WP-37, ADR-0042). Only when a
+    //              signature of the group cannot be read: (2) by the member's exact qualified name, as before WP-37
+    //              (clang spells lambdas with the same counter as the decorated name).
+    //   data       (2) the exact qualified name, (3) the RVA in the unchanged section layout.
+    // Whatever is left is ambiguous: CML3214 for functions (equal signatures, or types that cannot be read),
+    // CML3207 for data.
     for (const std::string& key : deferred) {
         Group& g = groups[key];
-        const std::vector<const pdb::SymbolView*> cands = static_candidates(g.base, g.encl, g.is_func, g.display, g.is_tls ? 1 : 0);
-        std::vector<std::uint32_t> unmatched = g.members;
-        std::vector<const pdb::SymbolView*> free_cands = cands;
-        // (1) exact qualified names, one-to-one
-        for (auto it = unmatched.begin(); it != unmatched.end();) {
+        Pending& pend = pending[key];
+        const std::vector<const pdb::SymbolView*>& cands = pend.cands;
+        std::vector<std::uint32_t>& unmatched = pend.unmatched;
+        std::vector<const pdb::SymbolView*>& free_cands = pend.free_cands;
+        std::map<std::uint32_t, std::string>& why = pend.why;
+        // (1) functions: one-to-one by signature
+        const bool by_signature = g.is_func && pair_overloads_by_signature(g.base, unmatched, free_cands, matched, why);
+        // (2) exact qualified names, one-to-one
+        for (auto it = unmatched.begin(); !by_signature && it != unmatched.end();) {
             const Sym& sy = syms_[*it];
             std::vector<std::size_t> hits;
             for (std::size_t c = 0; c < free_cands.size(); ++c) {
@@ -1085,13 +1402,13 @@ void Planner::bridge_statics() {
                 ++it;
             }
         }
-        // (2) data: the RVA the unchanged layout predicts
+        // (3) data: the RVA the unchanged layout predicts
         if (!g.is_func) {
             for (auto it = unmatched.begin(); it != unmatched.end();) {
                 const Sym& sy = syms_[*it];
                 const auto d = delta_.find(sy.dec.section);
                 bool taken = false;
-                if (d != delta_.end()) {
+                if (d != delta_.end() && pend.no_layout.count(*it) == 0) {
                     const std::int64_t want = d->second + static_cast<std::int64_t>(sy.s->value);
                     for (auto c = free_cands.begin(); c != free_cands.end(); ++c) {
                         if (static_cast<std::int64_t>((*c)->rva) == want) {
@@ -1107,11 +1424,13 @@ void Planner::bridge_statics() {
         }
         for (const std::uint32_t pos : unmatched) {
             Sym& sy = syms_[pos];
+            const auto reason = why.find(pos);
+            const std::string because = reason == why.end() ? std::string() : ": " + reason->second;
             if (g.is_func) {
                 error(diag::kAmbiguousOverloads,
                       "ambiguous overloads of static '" + sy.dec.display + "' (" + sy.name + ") in " + in_.object_name +
                           "; cannot tell which old function each new one replaces (" + std::to_string(g.members.size()) + " in the patch, " +
-                          std::to_string(cands.size()) + " records named '" + g.base + "' in compiland " + std::to_string(ci_) + ")",
+                          std::to_string(cands.size()) + " records named '" + g.base + "' in compiland " + std::to_string(ci_) + ")" + because,
                       "Rename one overload, or hot-restart.");
                 sy.diagnosed = true;
                 decide(sy, DecisionKind::PatchNewFunction, BindSource::None, sy.dec.type, {}, "ambiguous static overloads (CML3214)");
@@ -1119,7 +1438,7 @@ void Planner::bridge_statics() {
             }
             error(diag::kAmbiguousStatic,
                   "static data '" + sy.dec.display + "' (" + sy.name + ") matches " + std::to_string(cands.size()) +
-                      " records named '" + g.base + "' in compiland " + std::to_string(ci_) + " but the patch object defines " + std::to_string(g.members.size()) + " of them",
+                      " records named '" + g.base + "' in compiland " + std::to_string(ci_) + " but the patch object defines " + std::to_string(g.members.size()) + " of them" + because,
                   "Rename one of the statics, keep their number unchanged, or hot-restart.");
             sy.diagnosed = true;
             decide(sy, DecisionKind::PatchNewData, BindSource::None, sy.dec.type, {}, "ambiguous static (CML3207)");

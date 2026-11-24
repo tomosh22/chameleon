@@ -1,0 +1,11 @@
+--- a/logic.cpp
++++ b/logic.cpp
+@@ -31,7 +31,7 @@
+     s_last[0] = a.id + a.hits;
+     s_last[1] = b.id + b.hits;
+     s_last[2] = c.id + c.hits;
+-    return 1;
++    return 2;
+ }
+ 
+ int ls_a()

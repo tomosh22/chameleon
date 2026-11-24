@@ -23,6 +23,7 @@
 #include "cml/coff/binding.h"
 #include "cml/coff/coff.h"
 #include "cml/core/bind_plan.h"
+#include "cml/core/bind_types.h"
 #include "cml/pdb/index.h"
 #include "doctest.h"
 
@@ -361,6 +362,53 @@ public:
 
 // ---- the test ---------------------------------------------------------------------------------
 
+// WP-37 evidence: where the new side's types came from, the canonical signature of every static function of the patch
+// object, and the signature and closure class of the old compiland's local procs (the two sides the planner compares).
+void emit_signatures(const std::string& tag, const BindPlan& p, const cml::pdb::PdbIndex& pdb_index, const cml::coff::Object& object) {
+    const bool wanted = tag == "static_overloads" || tag == "lambda_statics" || tag == "lambdas";
+    if (!wanted) {
+        return;
+    }
+    ObjectSignatures sigs(object, tag + " object");
+    std::size_t shown = 0;
+    for (const SymbolDecision& d : p.decisions) {
+        if (!d.defined || !d.is_static || d.type != SymbolType::Function || d.decision == DecisionKind::PatchFresh) {
+            continue;
+        }
+        const cml::pdb::FunctionSignature& s = sigs.at(d.section, d.value);
+        if (++shown <= 24) {
+            brief("SIG-NEW " + tag + " " + d.name + " -> " + (s.known ? s.text : "UNKNOWN " + s.why) + (s.member ? " | class=" + s.class_unique_name : std::string()) + " => " +
+                  to_string(d.decision) + "/" + to_string(d.source));
+        }
+    }
+    brief("WP37-TYPES-OBJECT " + tag + " source=" + to_string(sigs.origin()) + " procs=" + std::to_string(sigs.proc_records()) + " detail=" + sigs.detail());
+    auto syms = pdb_index.compiland_symbols(p.compiland_index);
+    if (syms) {
+        shown = 0;
+        for (const cml::pdb::SymbolView& v : *syms) {
+            if (v.kind == cml::pdb::SymbolKind::LocalProc && v.rva != cml::pdb::kNoRva) {
+                const cml::pdb::FunctionSignature s = pdb_index.proc_signature(v);
+                if (++shown <= 24) {
+                    brief("SIG-OLD " + tag + " '" + std::string(v.name) + "' rva=" + hex(v.rva) + (v.type_is_id ? " (id)" : "") + " -> " + (s.known ? s.text : "UNKNOWN " + s.why) +
+                          (s.member ? " | class=" + s.class_unique_name : std::string()));
+                }
+            } else if (cml::pdb::is_data_kind(v.kind) && v.parent_proc != cml::pdb::kNoSymbol && v.parent_proc < syms->size() && tag == "lambda_statics") {
+                const cml::pdb::FunctionSignature s = pdb_index.proc_signature((*syms)[v.parent_proc]);
+                if (++shown <= 48) {
+                    brief("LOCAL-OLD " + tag + " '" + std::string(v.name) + "' in '" + std::string(v.parent_name) + "' rva=" + hex(v.rva) + " closure=" +
+                          (s.known ? s.class_unique_name : "UNKNOWN " + s.why));
+                }
+            }
+        }
+    }
+    for (const bool tpi : {true, false}) {
+        const cml::pdb::TypeStreamStats st = pdb_index.type_stream_stats(tpi);
+        brief(std::string("TYPE-STREAM ") + tag + (tpi ? " TPI" : " IPI") + " opened=" + std::to_string(st.opened ? 1 : 0) + " sparse=" + std::to_string(st.sparse ? 1 : 0) +
+              " chunks=" + std::to_string(st.chunks) + " loaded=" + std::to_string(st.chunks_loaded) + " record_bytes=" + std::to_string(st.record_bytes) +
+              " bytes_loaded=" + std::to_string(st.bytes_loaded) + " bytes_copied=" + std::to_string(st.bytes_copied) + " lookups=" + std::to_string(st.lookups));
+    }
+}
+
 void emit_decisions(const std::string& tag, const BindPlan& p, const cml::pdb::PdbIndex& pdb_index) {
     for (const SymbolDecision& d : p.decisions) {
         if (d.decision == DecisionKind::BindOldData) {
@@ -384,7 +432,7 @@ void emit_decisions(const std::string& tag, const BindPlan& p, const cml::pdb::P
                 }
                 if (v.kind == cml::pdb::SymbolKind::LocalData || v.kind == cml::pdb::SymbolKind::LocalProc ||
                     v.kind == cml::pdb::SymbolKind::LocalThread || v.parent_proc != cml::pdb::kNoSymbol) {
-                    (tag == "statics" || (tag == "lambdas" && std::string(v.name).find("operator()") != std::string::npos) ? brief : line)("PDB-STATIC " + tag + " kind=" + cml::pdb::to_string(v.kind) + " name='" + std::string(v.name) + "' parent='" +
+                    (tag == "statics" || tag == "lambda_statics" || (tag == "lambdas" && std::string(v.name).find("operator()") != std::string::npos) ? brief : line)("PDB-STATIC " + tag + " kind=" + cml::pdb::to_string(v.kind) + " name='" + std::string(v.name) + "' parent='" +
                          std::string(v.parent_name) + "' rva=" + hex(v.rva));
                     if (++shown >= 80) {
                         break;
@@ -435,10 +483,12 @@ void plan_fixture(const std::string& name) {
         }
         brief("BINDPLAN " + tag + " FAILED errors=" + std::to_string(errors.size()));
         emit_decisions(tag, partial, **pdb);
+        emit_signatures(tag, partial, **pdb, obj->object);
         FAIL("planning " << tag << " failed with " << errors.size() << " error(s); first: " << plan.error().format());
     }
     const BindPlan& p = *plan;
     emit_decisions(tag, p, **pdb);
+    emit_signatures(tag, p, **pdb, obj->object);
     const std::string summary = p.summary_line(tag);
     brief(summary);
     std::printf("%s\n", summary.c_str());
@@ -649,3 +699,6 @@ TEST_CASE("fixture lambdas: lambdas.cpp lambda_times_10") { plan_fixture("lambda
 TEST_CASE("fixture new_function: logic.cpp add_helper") { plan_fixture("new_function"); }
 TEST_CASE("fixture new_global: logic.cpp add_tracker") { plan_fixture("new_global"); }
 TEST_CASE("fixture tls: logic.cpp step_5") { plan_fixture("tls"); }
+// WP-37 (ADR-0042): overloads paired by signature, lambda-local statics by the closure class.
+TEST_CASE("fixture static_overloads: tu_a.cpp floor_plus_100 (header edit)") { plan_fixture("static_overloads"); }
+TEST_CASE("fixture lambda_statics: logic.cpp mark_2") { plan_fixture("lambda_statics"); }

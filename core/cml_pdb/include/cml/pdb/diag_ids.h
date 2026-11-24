@@ -26,4 +26,11 @@ inline constexpr std::uint32_t kCompilandOutOfRange = 1417;
 inline constexpr std::uint32_t kCapacityExceeded = 1418;      // a 32-bit offset / count would overflow
 inline constexpr std::uint32_t kBadBuildInfo = 1419;          // IPI stream (S_BUILDINFO fallback) malformed
 
+// WP-37 (ADR-0042: CML1430..CML1459), the type reader (cml/pdb/type_records.h).
+inline constexpr std::uint32_t kBadTypeStream = 1430;         // TPI / IPI stream of a PDB missing or its header invalid
+inline constexpr std::uint32_t kBadTypeRecord = 1431;         // a type record is malformed, missing, of an unsupported kind, or nested too deeply
+inline constexpr std::uint32_t kNoObjectTypes = 1432;         // an object's .debug$T is absent, not C13, or only refers to types kept elsewhere
+inline constexpr std::uint32_t kBadObjectSymbols = 1433;      // an object's .debug$S is malformed
+inline constexpr std::uint32_t kTypeServerMismatch = 1434;    // the compiler PDB an object names is not the one it was compiled with
+
 }  // namespace cml::pdb::diag

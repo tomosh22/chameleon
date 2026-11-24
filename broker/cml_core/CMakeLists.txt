@@ -16,6 +16,7 @@ add_library(cml_core STATIC
     src/bind_plan.cpp
     src/bind_fixups.cpp
     src/bind_json.cpp
+    src/bind_types.cpp  # WP-37: signatures of the patch object's functions (.debug$S / .debug$T / type server PDB)
     src/symbol_registry.cpp
     # WP-12: the reload pipeline (portable; the compiler and linker are behind PipelineEnv)
     src/hook_narrowing.cpp

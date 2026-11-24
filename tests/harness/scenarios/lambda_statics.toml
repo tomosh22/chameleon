@@ -1,0 +1,88 @@
+# Scenario `lambda_statics` (WP-37, ADR-0042): several lambdas in one function, each with a function-local static of
+# the same name, in the shape of Godot's SNAME macro. ls_step() holds three (`a`, `b`, `c`), the overloads
+# ls_over(int) / ls_over(double) one each (`oi`, `od`). Every fetch adds to the static's `hits`, so each printed value
+# is its lambda's id (100000, 200000, ...) plus a growing count: the hundred-thousands digit says WHICH static it is.
+#
+# The edit changes what ls_step() returns (mark 1 -> 2), so the whole translation unit is recompiled and every lambda
+# and static is planned again. After the reload
+#   * each value is still in its own range and has not dropped: the patch uses the OLD statics, paired with the right
+#     lambda (a wrong pairing would print another lambda's range, a new static would restart just above its id);
+#   * made= is still 5: no static was constructed again (the guard variables were bound too).
+name = "lambda_statics"
+description = "fixture lambda_statics: mark=1 -> edit -> reload -> mark=2, the five lambda statics keep their values, made=5"
+fixture = "lambda_statics"
+timeout_s = 180
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ mark=1 a=10\\d{4} b=20\\d{4} c=30\\d{4} oi=40\\d{4} od=50\\d{4} made=5\\b"
+within_s = 15
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_lambda_statics.exe"
+within_s = 15
+
+# Let every static be fetched at least 20 times before the patch (a counts by 1: a >= 100020).
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ mark=1 a=10(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) b=20\\d{4} c=30\\d{4} oi=40(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) od=50(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) made=5\\b"
+within_s = 15
+
+[[step]]
+kind = "edit"
+patch = "edits/mark_2.edit"
+
+[[step]]
+kind = "reload"
+within_s = 90
+
+# The patched code runs (mark=2), with the old statics: every count is still at least 20 above its id.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ mark=2 a=10(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) b=20\\d{4} c=30\\d{4} oi=40(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) od=50(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) made=5\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ mark=2 a=10\\d{4} b=20\\d{4} c=30\\d{4} oi=40\\d{4} od=50\\d{4} made=5\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ mark=2 a=10\\d{4} b=20\\d{4} c=30\\d{4} oi=40\\d{4} od=50\\d{4} made=5\\b"
+within_s = 10
+
+# No value ever went down, over the whole run (before and after the reload).
+[[step]]
+kind = "expect_monotonic"
+key = "a"
+min_samples = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "b"
+min_samples = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "c"
+min_samples = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "oi"
+min_samples = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "od"
+min_samples = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "made"
+min_samples = 20
