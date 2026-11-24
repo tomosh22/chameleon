@@ -338,9 +338,9 @@ private:
     void pair_statics_by_closure(const std::string& base, std::vector<std::uint32_t>& unmatched, std::vector<const pdb::SymbolView*>& free_cands,
                                  std::map<std::uint32_t, Match>& matched, std::map<std::uint32_t, std::string>& why, std::set<std::uint32_t>& no_layout);
     ObjectSignatures& object_debug();
-    void pair_statics_by_procedure(const std::string& base, bool is_tls, const std::vector<std::uint32_t>& members, std::vector<std::uint32_t>& unmatched,
-                                   std::vector<const pdb::SymbolView*>& free_cands, std::map<std::uint32_t, Match>& matched, std::map<std::uint32_t, std::string>& why,
-                                   const std::set<std::uint32_t>& no_layout);
+    void pair_statics_by_procedure(const std::string& base, bool is_tls, const std::vector<std::uint32_t>& members, const std::vector<const pdb::SymbolView*>& cands,
+                                   std::vector<std::uint32_t>& unmatched, std::vector<const pdb::SymbolView*>& free_cands, std::map<std::uint32_t, Match>& matched,
+                                   std::map<std::uint32_t, std::string>& why, const std::set<std::uint32_t>& no_layout);
 
     // ---- helpers ----
     void fatal(Diag d) {
@@ -1295,27 +1295,55 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
 // several is never silent: CML3570 (warning) names the function and the statics. One static of the name in the
 // function needs no order and no warning: its function is its identity (the statics of two overloads).
 //
-// This is the fallback for sections whose layout is NOT known. A member in a section with a known layout (a delta that
-// every matched static of the section agrees on) was offered to the layout step before; whatever that step decided
-// stands, and if it placed nothing the member stays ambiguous: the layout wins over the order. A pairing made here
-// never teaches, contradicts or drops a section layout (no learn_delta): the layout other statics and the guards of
-// pass C rely on must not depend on an order-based guess.
-void Planner::pair_statics_by_procedure(const std::string& base, bool is_tls, const std::vector<std::uint32_t>& members, std::vector<std::uint32_t>& unmatched,
-                                        std::vector<const pdb::SymbolView*>& free_cands, std::map<std::uint32_t, Match>& matched, std::map<std::uint32_t, std::string>& why,
-                                        const std::set<std::uint32_t>& no_layout) {
+// This is the fallback for statics the layout has no opinion on.
+//   * The layout WINS where it predicts something: when the known layout of a section (a delta every matched static of
+//     the section agrees on) puts a static of the function on an old record of this group, the layout step has decided
+//     (it paired the static, or the record was already taken), and no static of that function and name is paired by
+//     place. An order that disagrees with a layout never overrules it.
+//   * Where the layout predicts no old record of the group for ANY static of the function and name (no layout is known
+//     for their sections, or the known one points at nothing of the group, as after an unrelated static was added in
+//     front of them), they are paired by place.
+//   * A pairing made here never teaches, contradicts or drops a section layout (no learn_delta): the layout other
+//     statics and the guards of pass C rely on must not depend on an order-based guess.
+//   * For the same reason a static is paired by place only if every guard variable of its block is already bound to
+//     its old RECORD (cl records the guards; clang-cl does not). A guard without a record could only be placed by pass C
+//     from a section layout, which here is unknown or does not describe these statics: the patch would get a fresh
+//     guard (CML3211) and construct the bound old object a second time. That is refused (CML3207).
+void Planner::pair_statics_by_procedure(const std::string& base, bool is_tls, const std::vector<std::uint32_t>& members, const std::vector<const pdb::SymbolView*>& cands,
+                                        std::vector<std::uint32_t>& unmatched, std::vector<const pdb::SymbolView*>& free_cands, std::map<std::uint32_t, Match>& matched,
+                                        std::map<std::uint32_t, std::string>& why, const std::set<std::uint32_t>& no_layout) {
     ObjectSignatures& debug = object_debug();
+    // The old record of this group that the known layout of the member's section puts it on; null when no layout is
+    // known for the section or it points at no record of the group.
+    const auto predicted_by_layout = [&](const Sym& sy) -> const pdb::SymbolView* {
+        const auto d = delta_.find(sy.dec.section);
+        if (d == delta_.end()) {
+            return nullptr;
+        }
+        const std::int64_t want = d->second + static_cast<std::int64_t>(sy.s->value);
+        for (const pdb::SymbolView* c : cands) {
+            if (static_cast<std::int64_t>(c->rva) == want) {
+                return c;
+            }
+        }
+        return nullptr;
+    };
+    // The function each member of the group is declared in (every member: the layout's opinion on a member that is
+    // already paired counts too).
+    std::map<std::uint64_t, std::vector<std::uint32_t>> all_of_function;
+    for (const std::uint32_t pos : members) {
+        const Sym& sy = syms_[pos];
+        const std::optional<std::uint64_t> fn = sy.dec.section == 0 ? std::nullopt : debug.function_of_static(sy.dec.section, sy.s->value);
+        if (fn) {
+            all_of_function[*fn].push_back(pos);
+        }
+    }
     std::map<std::uint64_t, std::vector<std::uint32_t>> by_function;  // (section << 32) | offset of the function -> members declared in it
     for (const std::uint32_t pos : unmatched) {
         if (no_layout.count(pos) != 0) {
             continue;  // refused by the rule for lambdas: not placed by any other step
         }
         const Sym& sy = syms_[pos];
-        if (delta_.count(sy.dec.section) != 0) {
-            if (why.count(pos) == 0) {
-                why[pos] = "the layout of object section " + std::to_string(sy.dec.section) + " is known and places no old static named '" + base + "' at its offset";
-            }
-            continue;  // the layout decides for this section
-        }
         bool several = false;
         const std::optional<std::uint64_t> fn = sy.dec.section == 0 ? std::nullopt : debug.function_of_static(sy.dec.section, sy.s->value, &several);
         if (fn) {
@@ -1372,6 +1400,24 @@ void Planner::pair_statics_by_procedure(const std::string& base, bool is_tls, co
                 why[pos] = "the statics named '" + base + "' of " + function + " cannot be matched by their place in the function: " + reason;
             }
         };
+        // Does the layout have an opinion on a static of this function and name? Then it decides.
+        bool layout_decides = false;
+        for (const std::uint32_t pos : all_of_function[fn]) {
+            layout_decides = layout_decides || predicted_by_layout(syms_[pos]) != nullptr;
+        }
+        if (layout_decides) {
+            CML_LOG(Trace, "bind: statics '%s' of %s: a known section layout predicts an old record for one of them: not paired by place", base.c_str(), function.c_str());
+            for (const std::uint32_t pos : positions) {
+                const Sym& sy = syms_[pos];
+                const pdb::SymbolView* at = predicted_by_layout(sy);
+                why[pos] = at != nullptr
+                               ? "the layout of object section " + std::to_string(sy.dec.section) + " puts it on the old record at rva " + hex(at->rva) +
+                                     ", which another static of the patch was already paired with"
+                               : "the layout of object section " + std::to_string(sy.dec.section) + " places other statics named '" + base + "' of " + function +
+                                     " and no old one at its offset; the layout decides, so it is not matched by its place in the function";
+            }
+            continue;
+        }
         if (old_proc == nullptr) {
             refuse("the function is not matched to a function of this translation unit in the old image");
             continue;
@@ -1465,18 +1511,59 @@ void Planner::pair_statics_by_procedure(const std::string& base, bool is_tls, co
                 break;
             }
             type_text[k] = *new_type;
-            if (matched.count(new_pos[k]) == 0 && delta_.count(syms_[new_pos[k]].dec.section) != 0) {
-                problem = which + " is in object section " + std::to_string(syms_[new_pos[k]].dec.section) + ", whose layout is known and does not place it";
-                break;
-            }
             const auto earlier = matched.find(new_pos[k]);
             if (earlier != matched.end() ? earlier->second.view != old_views[k] : std::find(free_cands.begin(), free_cands.end(), old_views[k]) == free_cands.end()) {
                 problem = which + " or its old record was already paired differently by an earlier step";
                 break;
             }
         }
+        // The guard variables of the blocks these statics are declared in must be bound to their old records already
+        // (see above). A guard `?$TSS0@<scope>@4HA` belongs to the block whose statics are `?<name>@<scope>@4...`.
+        std::vector<std::uint32_t> unbound_guards;
+        for (std::size_t k = 0; (problem.empty() || !unbound_guards.empty()) && k < count; ++k) {
+            if (matched.count(new_pos[k]) != 0) {
+                continue;  // paired by an earlier step, which answers for its guard
+            }
+            const std::string& member = syms_[new_pos[k]].name;
+            const std::size_t member_at = member.find('@');
+            for (std::uint32_t pos = 0; member_at != std::string::npos && pos < syms_.size(); ++pos) {
+                const Sym& guard = syms_[pos];
+                if (!guard.defined || !guard.is_static || guard.dec.type != SymbolType::Data || !is_guard_variable(guard.name) || guard.name.size() < 6) {
+                    continue;
+                }
+                const std::size_t guard_at = guard.name.find('@');
+                const std::string_view tail = std::string_view(guard.name).substr(guard.name.size() - 4);
+                if (guard_at == std::string::npos || (tail != "@4HA" && tail != "@4IA")) {
+                    continue;
+                }
+                // "<scope>@4": the guard's name without its identifier and without the two characters of its type.
+                const std::string_view scope = std::string_view(guard.name).substr(guard_at + 1, guard.name.size() - guard_at - 3);
+                if (std::string_view(member).substr(member_at + 1).substr(0, scope.size()) != scope) {
+                    continue;
+                }
+                const auto bound = matched.find(pos);
+                const bool by_record = (bound != matched.end() && pdb::is_data_kind(bound->second.view->kind)) ||
+                                       (guard.decided && guard.dec.decision == DecisionKind::BindOldData && guard.dec.source != BindSource::CompilandLayout);
+                if (!by_record) {
+                    unbound_guards.push_back(pos);
+                    if (problem.empty()) {
+                        problem = "the guard variable '" + guard.dec.display + "' (" + guard.name + ") of static " + std::to_string(k + 1) + " of " + std::to_string(count) +
+                                  " has no record in the old image, so it cannot be bound to the old guard and the static would be constructed a second time";
+                    }
+                }
+            }
+        }
         if (!problem.empty()) {
             refuse(problem);
+            // The guards of the refused statics are settled here (pass C would give them the warning for a guard that was
+            // merely not found, CML3211; these belong to an error).
+            for (const std::uint32_t pos : unbound_guards) {
+                Sym& guard = syms_[pos];
+                if (!guard.decided) {
+                    guard.diagnosed = true;
+                    decide(guard, DecisionKind::PatchNewData, BindSource::None, SymbolType::Data, {}, "guard variable of a static that is refused (CML3207)");
+                }
+            }
             continue;
         }
         std::size_t paired = 0;
@@ -1823,11 +1910,12 @@ void Planner::bridge_statics() {
                 it = taken ? unmatched.erase(it) : it + 1;
             }
         }
-        // (4) data: function-local statics whose section has NO known layout (under cl every function-local static is a
-        // COMDAT section of its own), by the function they are declared in and their place in it. Where a layout is
-        // known it has decided above, and it wins: such a member is not paired here.
+        // (4) data: function-local statics the layout has no opinion on (under cl every function-local static is a
+        // COMDAT section of its own; or the known layout of the section predicts no old record of the group for any
+        // of them), by the function they are declared in and their place in it. Where the layout predicts an old record
+        // for a static of the function it has decided above, and it wins: that function's statics are not paired here.
         if (!g.is_func && !g.encl.empty() && !unmatched.empty()) {
-            pair_statics_by_procedure(g.base, g.is_tls, g.members, unmatched, free_cands, matched, why, pend.no_layout);
+            pair_statics_by_procedure(g.base, g.is_tls, g.members, cands, unmatched, free_cands, matched, why, pend.no_layout);
         }
         for (const std::uint32_t pos : unmatched) {
             Sym& sy = syms_[pos];

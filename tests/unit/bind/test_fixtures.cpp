@@ -654,7 +654,19 @@ BindPlan plan_fixture(const std::string& name) {
         for (const cml::Diag& w : p.warnings) {
             order_warnings += w.id() == "CML3570" && w.message.find("'names' of 'LsTree::options' (2)") != std::string::npos ? 1u : 0u;
         }
-        brief("OPTIONS-NAMES " + tag + " by_procedure=" + std::to_string(by_procedure) + " by_layout=" + std::to_string(by_layout) + " CML3570=" + std::to_string(order_warnings));
+        // However the two `names` were paired, their guards must be the OLD guards (cl: by their records; clang-cl: from
+        // the section layout). A fresh guard would construct the bound old object a second time.
+        std::size_t guards = 0;
+        std::size_t guards_bound = 0;
+        for (const SymbolDecision& d : p.decisions) {
+            if (d.display.rfind("LsTree::options::$TSS", 0) == 0) {
+                ++guards;
+                guards_bound += d.decision == DecisionKind::BindOldData ? 1u : 0u;
+            }
+        }
+        brief("OPTIONS-NAMES " + tag + " by_procedure=" + std::to_string(by_procedure) + " by_layout=" + std::to_string(by_layout) + " CML3570=" + std::to_string(order_warnings) +
+              " guards=" + std::to_string(guards) + " guards_bound=" + std::to_string(guards_bound));
+        CHECK_MESSAGE((guards == 2 && guards_bound == 2), tag << ": the guards of LsTree::options::names: " << guards << " in the patch, " << guards_bound << " bound to the old image");
         if (kIsCl) {
             CHECK_MESSAGE(by_procedure == 2, tag << ": LsTree::options::names paired by procedure: " << by_procedure << " of 2");
             CHECK_MESSAGE(order_warnings == 1, tag << ": CML3570 for LsTree::options: " << order_warnings);

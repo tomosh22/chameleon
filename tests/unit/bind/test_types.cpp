@@ -1508,9 +1508,10 @@ TEST_CASE("statics of one name in two blocks: where the section's layout is know
     CHECK(r->warnings.empty());  // no CML3570 (nothing was paired by order), no CML3211 (the guard was placed)
 }
 
-TEST_CASE("statics of one name in two blocks: a known layout that places nothing is not overruled by the order") {
-    // The layout is known (s_plain) and says the two `names` of the patch are at offsets no old `names` is at. The
-    // records agree in count, type and blocks, but the layout wins: CML3207, nothing bound, no CML3570.
+TEST_CASE("statics of one name in two blocks: a known layout that predicts nothing for them leaves them to their place") {
+    // The layout of the section is known (s_plain), but an unrelated static was added in front of the two `names`:
+    // their offsets moved, and the layout points at no old `names` for either. That is no opinion, not a verdict: they
+    // are paired by their place in the function, with the warning, and the layout of the section is left alone.
     SynthWorld w;
     w.data(w.tu(), "`anonymous namespace'::s_plain", 0x08);
     old_options(w);
@@ -1518,8 +1519,43 @@ TEST_CASE("statics of one name in two blocks: a known layout that places nothing
     StaticsObj o;
     const std::uint32_t d = o.obj.section(".data", kData, 0x60);
     o.obj.symbol("?s_plain@?A0x1@@3HA", 0x08, static_cast<std::int32_t>(d), false, false);
+    o.obj.symbol("?s_new@?A0x1@@3HA", 0x10, static_cast<std::int32_t>(d), false, false);
     const std::uint32_t first = o.obj.symbol(kNames4, 0x40, static_cast<std::int32_t>(d), false, false);
     const std::uint32_t second = o.obj.symbol(kNames8, 0x50, static_cast<std::int32_t>(d), false, false);
+    o.proc(kOptions, "SceneTree::get_argument_options");
+    o.block();
+    o.record(first, "names");
+    o.end();
+    o.block();
+    o.record(second, "names");
+    o.end();
+    o.end();
+    Built b = o.build(some_debug_t());
+    auto r = plan_bind(w.input(b));
+    REQUIRE_MESSAGE(r.has_value(), err(r));
+    CHECK(decision(*r, kNames4).source == BindSource::CompilandProcedure);
+    CHECK(decision(*r, kNames4).old_address.rva == 0x3010);
+    CHECK(decision(*r, kNames8).source == BindSource::CompilandProcedure);
+    CHECK(decision(*r, kNames8).old_address.rva == 0x3020);
+    CHECK(decision(*r, "?s_plain@?A0x1@@3HA").old_address.rva == 0x3008);
+    CHECK(decision(*r, "?s_new@?A0x1@@3HA").decision == DecisionKind::PatchNewData);
+    REQUIRE(r->warnings.size() == 1);
+    CHECK(r->warnings[0].id() == "CML3570");
+}
+
+TEST_CASE("statics of one name in two blocks: a layout that predicts an old record for one of them decides for both") {
+    // The layout puts the first `names` of the patch on the old SECOND record (a hit; the order says the first). The
+    // second `names` of the patch is at an offset the layout has nothing for. The layout wins: the hit stands, and the
+    // other one is not paired by its place (which would contradict the hit) but refused.
+    SynthWorld w;
+    w.data(w.tu(), "`anonymous namespace'::s_plain", 0x08);
+    old_options(w);
+    w.open();
+    StaticsObj o;
+    const std::uint32_t d = o.obj.section(".data", kData, 0x60);
+    o.obj.symbol("?s_plain@?A0x1@@3HA", 0x08, static_cast<std::int32_t>(d), false, false);
+    const std::uint32_t first = o.obj.symbol(kNames4, 0x20, static_cast<std::int32_t>(d), false, false);   // old second record is at 0x20
+    const std::uint32_t second = o.obj.symbol(kNames8, 0x50, static_cast<std::int32_t>(d), false, false);  // nothing there
     o.proc(kOptions, "SceneTree::get_argument_options");
     o.block();
     o.record(first, "names");
@@ -1533,14 +1569,98 @@ TEST_CASE("statics of one name in two blocks: a known layout that places nothing
     BindPlan partial;
     auto r = plan_bind(w.input(b), &errors, &partial);
     REQUIRE_FALSE(r.has_value());
-    REQUIRE(errors.size() == 2);
-    for (const cml::Diag& e : errors) {
-        CHECK(e.id() == "CML3207");
-        CHECK(contains(e.message, "is known and places no old static named 'names' at its offset"));
-    }
-    CHECK(decision(partial, kNames4).decision != DecisionKind::BindOldData);
+    REQUIRE(errors.size() == 1);
+    CHECK(errors[0].id() == "CML3207");
+    CHECK_MESSAGE(contains(errors[0].message, "places other statics named 'names' of 'SceneTree::get_argument_options' and no old one at its offset; the layout decides"), errors[0].message);
+    CHECK(decision(partial, kNames4).source == BindSource::CompilandRva);
+    CHECK(decision(partial, kNames4).old_address.rva == 0x3020);
+    CHECK(decision(partial, kNames8).decision != DecisionKind::BindOldData);
     for (const cml::Diag& warning : partial.warnings) {
         CHECK(warning.code != diag::kStaticsMatchedByOrder);
+    }
+}
+
+TEST_CASE("statics paired by place need their guards bound by a record: a record-less guard refuses the set, it is never left a fresh guard") {
+    // clang-cl: `if (i == 0) { static const T names = make(); } else { static const T names = make(); }` in a unit whose
+    // only statics these are. The two `names` and their guards share .bss; clang-cl records no guard variable; nothing
+    // teaches the section's layout. Paired by place, the guards could not be bound: the patch would start with fresh
+    // guards and construct the two bound old objects again. Refused instead (CML3207), as before WP-37.
+    const char* const options = "?options@LsTree@@QEBAHH@Z";
+    const char* const names_1 = "?names@?1??options@LsTree@@QEBAHH@Z@4ULsList@@B";
+    const char* const names_2 = "?names@?2??options@LsTree@@QEBAHH@Z@4ULsList@@B";
+    const char* const guard_1 = "?$TSS0@?1??options@LsTree@@QEBAHH@Z@4HA";
+    const char* const guard_2 = "?$TSS1@?2??options@LsTree@@QEBAHH@Z@4HA";
+    const auto old_world = [&](SynthWorld& w, bool with_teacher) {
+        if (with_teacher) {
+            w.data(w.tu(), "`anonymous namespace'::s_plain", 0x08);
+        }
+        w.proc_with_statics(w.tu(), "LsTree::options", 0x40, {{"names", 0x10}, {"names", 0x20}}, 0x20);  // no guard records, no blocks
+        w.pub_func(options, 0x40);
+        w.open();
+    };
+    const auto object = [&](StaticsObj& o, std::uint32_t shift, bool with_teacher) {
+        const std::uint32_t d = o.obj.section(".bss", kData, 0x80);
+        if (with_teacher) {
+            o.obj.symbol("?s_plain@?A0x1@@3HA", 0x08, static_cast<std::int32_t>(d), false, false);
+        }
+        const std::uint32_t first = o.obj.symbol(names_1, 0x10 + shift, static_cast<std::int32_t>(d), false, false);
+        o.obj.symbol(guard_1, 0x18 + shift, static_cast<std::int32_t>(d), false, false);
+        const std::uint32_t second = o.obj.symbol(names_2, 0x20 + shift, static_cast<std::int32_t>(d), false, false);
+        o.obj.symbol(guard_2, 0x28 + shift, static_cast<std::int32_t>(d), false, false);
+        o.proc(options, "LsTree::options");
+        o.record(first, "names");
+        o.record(second, "names");
+        o.end();
+    };
+    const auto refused_for_the_guard = [&](SynthWorld& w, StaticsObj& o) {
+        Built b = o.build(some_debug_t());
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        auto r = plan_bind(w.input(b), &errors, &partial);
+        REQUIRE_FALSE(r.has_value());
+        REQUIRE(errors.size() == 2);
+        for (const cml::Diag& e : errors) {
+            CHECK(e.id() == "CML3207");
+            CHECK_MESSAGE(contains(e.message, "the guard variable 'LsTree::options::$TSS0' (?$TSS0@?1??options@LsTree@@QEBAHH@Z@4HA) of static 1 of 2 has no record in the old image"), e.message);
+        }
+        CHECK(decision(partial, names_1).decision != DecisionKind::BindOldData);
+        CHECK(decision(partial, names_2).decision != DecisionKind::BindOldData);
+        CHECK(decision(partial, guard_1).decision != DecisionKind::BindOldData);
+        CHECK(decision(partial, guard_2).decision != DecisionKind::BindOldData);
+        for (const cml::Diag& warning : partial.warnings) {
+            CHECK(warning.code != diag::kStaticsMatchedByOrder);
+            CHECK_MESSAGE(warning.code != diag::kGuardUnmatched, warning.message);  // an error, never the "fresh guard" warning
+        }
+    };
+    SUBCASE("nothing teaches the layout of the section") {
+        SynthWorld w;
+        old_world(w, false);
+        StaticsObj o;
+        object(o, 0, false);
+        refused_for_the_guard(w, o);
+    }
+    SUBCASE("the layout is known but predicts nothing for them (they moved): the guards are not left to that layout either") {
+        SynthWorld w;
+        old_world(w, true);
+        StaticsObj o;
+        object(o, 0x40, true);
+        refused_for_the_guard(w, o);
+    }
+    SUBCASE("the layout is known and places them: by layout, and pass C binds the guards from it") {
+        SynthWorld w;
+        old_world(w, true);
+        StaticsObj o;
+        object(o, 0, true);
+        Built b = o.build(some_debug_t());
+        auto r = plan_bind(w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        CHECK(decision(*r, names_1).source == BindSource::CompilandRva);
+        CHECK(decision(*r, names_1).old_address.rva == 0x3010);
+        CHECK(decision(*r, names_2).old_address.rva == 0x3020);
+        CHECK(decision(*r, guard_1).source == BindSource::CompilandLayout);
+        CHECK(decision(*r, guard_1).old_address.rva == 0x3018);
+        CHECK(decision(*r, guard_2).old_address.rva == 0x3028);
+        CHECK(r->warnings.empty());
     }
 }
 
