@@ -130,19 +130,30 @@ CML_AVX_NOINLINE __m512i int_arith(const __m512i* a, __m512i y, __mmask16 k) {
     return _mm512_add_epi32(r, _mm512_set1_epi32(k));  // vpbroadcastd from a general register
 }
 
-CML_AVX_NOINLINE __m512i int_shuffles(__m512i a, __m512i b, __m512i control, __mmask64 k) {
+// Four short functions instead of one long one: cl 14.44 and 14.52 fail with C1001 (an internal error of the
+// optimiser) on the thirteen statements together at /O2, although each compiles alone.
+CML_AVX_NOINLINE __m512i int_permutes(__m512i a, __m512i b, __m512i control) {
     __m512i r = _mm512_shuffle_epi8(a, control);
     r = _mm512_shuffle_epi32(r, _MM_PERM_BADC);
     r = _mm512_permutexvar_epi16(control, r);
-    r = _mm512_permutex2var_epi64(r, control, b);
-    r = _mm512_shuffle_i64x2(r, a, 0x4E);
+    return _mm512_permutex2var_epi64(r, control, b);
+}
+
+CML_AVX_NOINLINE __m512i int_lanes(__m512i a, __m512i b) {
+    __m512i r = _mm512_shuffle_i64x2(a, b, 0x4E);
     r = _mm512_alignr_epi32(r, b, 3);
-    r = _mm512_alignr_epi8(r, a, 5);
-    r = _mm512_mask_blend_epi8(k, r, b);
+    return _mm512_alignr_epi8(r, a, 5);
+}
+
+CML_AVX_NOINLINE __m512i int_blends(__m512i a, __m512i b, __mmask64 k) {
+    __m512i r = _mm512_mask_blend_epi8(k, a, b);
     r = _mm512_maskz_mov_epi8(k, r);
     r = _mm512_unpacklo_epi16(r, _mm512_unpackhi_epi64(a, b));
-    r = _mm512_packs_epi32(r, _mm512_packus_epi16(a, b));
-    r = _mm512_inserti32x8(r, _mm512_extracti64x4_epi64(a, 1), 0);
+    return _mm512_packs_epi32(r, _mm512_packus_epi16(a, b));
+}
+
+CML_AVX_NOINLINE __m512i int_halves(__m512i a, __m512i b) {
+    const __m512i r = _mm512_inserti32x8(a, _mm512_extracti64x4_epi64(b, 1), 0);
     return _mm512_inserti64x2(r, _mm512_extracti32x4_epi32(b, 3), 2);
 }
 
@@ -197,7 +208,10 @@ std::uintptr_t anchor() {
     CML_AVX_KEEP(compares);
     CML_AVX_KEEP(shuffles);
     CML_AVX_KEEP(int_arith);
-    CML_AVX_KEEP(int_shuffles);
+    CML_AVX_KEEP(int_permutes);
+    CML_AVX_KEEP(int_lanes);
+    CML_AVX_KEEP(int_blends);
+    CML_AVX_KEEP(int_halves);
     CML_AVX_KEEP(conversions);
     CML_AVX_KEEP(gather_scatter);
     CML_AVX_KEEP(vl_forms);

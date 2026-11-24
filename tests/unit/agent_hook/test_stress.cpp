@@ -13,8 +13,9 @@
 // WP-38 (ADR-0042): the hook installer's decoder knows VEX and EVEX now, so the same run hooks functions that BEGIN
 // with a VEX instruction, with padding in front of them (strategy 1: the 2-byte write lands in a VEX instruction) and
 // without (strategy 2: the 5-byte jump covers one VEX instruction or ends inside the second):
-//   * two functions compiled with /arch:AVX2 by this cell's compiler (avx/stress_avx2.cpp, optimised in every
-//     configuration so that the first instruction of the leaf function is the VEX instruction itself),
+//   * two functions compiled with /arch:AVX2 by this cell's compiler (avx/stress_avx2.cpp: float f(float) and
+//     double f(double), optimised in every configuration so that the first instruction of the leaf function is the
+//     VEX instruction itself, vaddss / vaddsd with a RIP-relative constant),
 //   * six hand-assembled ones whose bytes do not depend on a compiler (hook_test_support.h: two-byte and three-byte
 //     VEX prefix, vzeroupper with its missing ModRM byte, a 256-bit instruction, a loop behind two VEX instructions).
 // The entry bytes are read from memory before anything is hooked; a target that does not start with C4 / C5 fails the
@@ -69,6 +70,10 @@ struct Target {
     const char* name = "";
     bool vex_entry = false;  // WP-38: the first instruction must be VEX-encoded (checked against the bytes in memory)
     bool compiled = false;   // ... and comes from this cell's compiler (avx/stress_avx2.cpp), not from a byte array
+    // How the function is called: int f(int), or (the compiled AVX2 functions) float f(float) / double f(double) with
+    // the argument converted and the result truncated.
+    enum class Abi { Int, Float, Double };
+    Abi abi = Abi::Int;
     const void* entry = nullptr;
     const void* replacement[2] = {nullptr, nullptr};
     // expected result for implementation 0 (original), 1 (A), 2 (B): arg + offset, or offset only
@@ -102,6 +107,19 @@ struct WorkerStats {
 
 int call_target(const void* entry, int argument) {
     return reinterpret_cast<IntFn>(reinterpret_cast<std::uintptr_t>(entry))(argument);
+}
+
+int call_target(const Target& t, int argument) {
+    const auto address = reinterpret_cast<std::uintptr_t>(t.entry);
+    switch (t.abi) {
+        case Target::Abi::Float:
+            return static_cast<int>(reinterpret_cast<float (*)(float)>(address)(static_cast<float>(argument)));
+        case Target::Abi::Double:
+            return static_cast<int>(reinterpret_cast<double (*)(double)>(address)(static_cast<double>(argument)));
+        case Target::Abi::Int:
+            break;
+    }
+    return call_target(t.entry, argument);
 }
 
 std::atomic<long> g_crashes{0};
@@ -253,6 +271,7 @@ TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy mul
         f.offset[2] = 3200;
         f.vex_entry = true;
         f.compiled = true;
+        f.abi = Target::Abi::Float;
         targets.push_back(f);
         Target d;
         d.name = "avx2_double";
@@ -264,6 +283,7 @@ TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy mul
         d.offset[2] = 3300;
         d.vex_entry = true;
         d.compiled = true;
+        d.abi = Target::Abi::Double;
         targets.push_back(d);
     }
     {
@@ -327,7 +347,7 @@ TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy mul
     // The functions behave as the originals before anything is hooked.
     for (const Target& t : targets) {
         const int argument = t.argument_override >= 0 ? t.argument_override : 5;
-        REQUIRE_MESSAGE(call_target(t.entry, argument) == expected(t, 0, argument), t.name);
+        REQUIRE_MESSAGE(call_target(t, argument) == expected(t, 0, argument), t.name);
     }
 
     void* const veh = AddVectoredExceptionHandler(1, &count_crashes);
@@ -346,7 +366,7 @@ TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy mul
                 for (std::size_t i = 0; i < targets.size(); ++i) {
                     const Target& t = targets[i];
                     const int argument = t.argument_override >= 0 ? t.argument_override : (x & 0xFFFF);
-                    const int result = call_target(t.entry, argument);
+                    const int result = call_target(t, argument);
                     const int which = classify(t, argument, result);
                     if (which < 0) {
                         ++mine.bad;
@@ -463,7 +483,7 @@ TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy mul
     auto verify_state = [&](int which) {
         for (const Target& t : targets) {
             const int argument = t.argument_override >= 0 ? t.argument_override : 3;
-            if (call_target(t.entry, argument) != expected(t, which, argument)) {
+            if (call_target(t, argument) != expected(t, which, argument)) {
                 ++wrong_state;
             }
         }

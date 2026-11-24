@@ -711,7 +711,7 @@ TEST_CASE("EVEX: four-byte prefix, maps 1 to 3, compressed displacement, masking
 
 TEST_CASE("VEX / EVEX: what is refused") {
     // 66, F2, F3, lock or REX in front of a VEX or EVEX prefix is #UD (SDM volume 2, 2.3.2 and 2.7.1).
-    for (const std::uint8_t prefix : {0x66, 0xF2, 0xF3, 0xF0, 0x40, 0x48, 0x4F}) {
+    for (const std::uint8_t prefix : std::initializer_list<std::uint8_t>{0x66, 0xF2, 0xF3, 0xF0, 0x40, 0x48, 0x4F}) {
         INFO("prefix " << static_cast<unsigned>(prefix));
         expect_unknown({prefix, 0xC5, 0xF8, 0x28, 0xC1});
         expect_unknown({prefix, 0xC4, 0xE2, 0x7D, 0x18, 0xC0});

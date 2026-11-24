@@ -31,6 +31,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <string>
 #include <string_view>
@@ -209,17 +211,13 @@ int sweep_module(const Reference& reference, const std::string& path, Totals& gr
 }
 
 int sweep_raw(const Reference& reference, const std::string& path, Totals& grand, std::map<std::string, std::size_t>& unknown_kinds) {
-    std::FILE* file = std::fopen(path.c_str(), "rb");
-    if (file == nullptr) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
         std::fprintf(stderr, "cml_lde_diff: cannot open %s\n", path.c_str());
         return 1;
     }
-    std::vector<std::uint8_t> bytes;
-    std::uint8_t chunk[65536];
-    for (std::size_t n = 0; (n = std::fread(chunk, 1, sizeof(chunk), file)) != 0;) {
-        bytes.insert(bytes.end(), chunk, chunk + n);
-    }
-    std::fclose(file);
+    const std::vector<char> raw((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    const std::vector<std::uint8_t> bytes(raw.begin(), raw.end());
     Totals t;
     t.functions = 1;
     sweep_range(reference, bytes.data(), bytes.size(), path, true, t, unknown_kinds);
@@ -375,6 +373,41 @@ int enumerate(const Reference& reference, std::uint64_t seed) {
                             const std::size_t size = repeat != 1 ? sizeof(buffer) : 1 + (rng.next() >> 33) % 18;
                             enumerate_case(reference, buffer, size, t);
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2b. The same maps behind a long run of the prefixes that are allowed in front of VEX / EVEX, so that the
+    //     instruction ends near, at or beyond the 15-byte limit (found by the fuzzer: docs/wp/WP-38.md).
+    static const std::uint8_t kAllowedPrefixes[] = {0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65, 0x67};
+    for (unsigned evex = 0; evex < 2; ++evex) {
+        for (unsigned map = 1; map < 4; ++map) {
+            for (unsigned pp = 0; pp < 4; ++pp) {
+                for (unsigned opcode = 0; opcode < 256; ++opcode) {
+                    for (unsigned modrm = 0; modrm < 256; ++modrm) {
+                        std::uint64_t r = rng.next();
+                        std::size_t i = 0;
+                        const unsigned run = 5 + static_cast<unsigned>(r % 8);  // 5..12 prefixes
+                        r >>= 3;
+                        for (unsigned k = 0; k < run; ++k) {
+                            buffer[i++] = kAllowedPrefixes[(rng.next() >> 40) % sizeof(kAllowedPrefixes)];
+                        }
+                        if (evex != 0) {
+                            buffer[i++] = 0x62;
+                            buffer[i++] = static_cast<std::uint8_t>(((r & 0xF) << 4) | map);
+                            buffer[i++] = static_cast<std::uint8_t>((((r >> 4) & 0x1F) << 3) | 0x04 | pp);
+                            buffer[i++] = static_cast<std::uint8_t>(r >> 9);
+                        } else {
+                            buffer[i++] = 0xC4;
+                            buffer[i++] = static_cast<std::uint8_t>(((r & 7) << 5) | map);
+                            buffer[i++] = static_cast<std::uint8_t>(((r >> 3) & 0xFC) | pp);
+                        }
+                        buffer[i++] = static_cast<std::uint8_t>(opcode);
+                        buffer[i++] = static_cast<std::uint8_t>(modrm);
+                        fill_from(i);
+                        enumerate_case(reference, buffer, sizeof(buffer), t);
                     }
                 }
             }

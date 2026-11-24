@@ -15,9 +15,9 @@
 //
 // Zydis may reject bytes the decoder accepts. That is tolerated in exactly one, mechanically checked case (see
 // docs/wp/WP-38.md, "Exceptions"): the instruction is VEX- or EVEX-encoded, and Zydis accepts a SIBLING of it (same
-// legacy prefixes, same lead byte, map, `pp` and opcode; other values of the fields the length does not depend on:
-// the register-extension bits, W, vvvv, L, the EVEX mask / zeroing / broadcast bits and the ModRM register and operand
-// form), and on that sibling both decoders agree. Such an encoding is #UD on a processor only because of one of those
+// lead byte, map, `pp` and opcode, without the legacy prefixes; other values of the fields the length does not depend
+// on: the register-extension bits, W, vvvv, L, the EVEX mask / zeroing / broadcast bits and the ModRM register and
+// operand form), and on every sibling Zydis accepts both decoders agree. Such an encoding is #UD on a processor only because of one of those
 // fields (a vector length or operand form the instruction does not have, a register number out of range, a mask that
 // is not allowed), and the decoder deliberately does not look at them. Everything else is a Mismatch.
 
@@ -192,9 +192,15 @@ private:
         return nullptr;
     }
 
-    // Tries the siblings of the VEX / EVEX instruction data[0..length) whose lead byte is at `lead`.
+    // Tries the siblings of the VEX / EVEX instruction data[0..length) whose lead byte is at `lead`. The siblings are
+    // built without the legacy prefixes in front of it (only segment overrides and 67 can be there, and they never
+    // decide whether the encoding is an instruction): an instruction that fills the 15 bytes with prefixes would
+    // otherwise have no sibling with one more byte, e.g. the SIB byte a gather needs.
     Sibling sibling_check(const std::uint8_t* data, std::size_t length, std::size_t lead) const noexcept {
         using namespace cml::agent::hook;
+        data += lead;
+        length -= lead;
+        lead = 0;
         std::uint8_t head[16] = {};
         const std::uint8_t lead_byte = data[lead];
         const std::size_t payload = lead_byte == 0xC5 ? 1u : lead_byte == 0xC4 ? 2u : 3u;

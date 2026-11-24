@@ -3,16 +3,18 @@
 // Functions of unit.agent_hook_stress that are compiled with /arch:AVX2 and optimised in every configuration
 // (tests/unit/agent_hook/avx/CMakeLists.txt): leaf functions whose first instruction is VEX-encoded. WP-38, ADR-0042.
 //
-// Each family is int f(int x) returning x + k for 0 <= x < 2^23, computed in floating point so that the compiler has
-// to use the AVX scalar instructions (vcvtsi2ss / vcvtsi2sd, preceded by a dependency-breaking vxorps on cl), and
-// cannot fold the arithmetic back into an integer add.
+// Each adds a constant to its argument in floating point. The argument arrives in xmm0, so the first thing an
+// optimising compiler can do with it is the addition itself: vaddss / vaddsd xmm0, xmm0, [rip + constant]
+// (C5 FA 58 05 .. / C5 FB 58 05 ..), a VEX instruction with a RIP-relative operand at the entry. (With an integer
+// argument cl first stores ecx to its home slot, which is not VEX.) The stress test calls them with small
+// non-negative integers and truncates the result, so f(x) counts as x + k.
 namespace hooktest_avx2 {
 
-int f_orig(int x);  // x + 1200   (float)
-int f_a(int x);     // x + 2200
-int f_b(int x);     // x + 3200
-int d_orig(int x);  // x + 1300   (double)
-int d_a(int x);     // x + 2300
-int d_b(int x);     // x + 3300
+float f_orig(float x);    // x + 1200.5
+float f_a(float x);       // x + 2200.5
+float f_b(float x);       // x + 3200.5
+double d_orig(double x);  // x + 1300.5
+double d_a(double x);     // x + 2300.5
+double d_b(double x);     // x + 3300.5
 
 }  // namespace hooktest_avx2

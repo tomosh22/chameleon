@@ -10,13 +10,12 @@
 
 namespace hooktest_avx2 {
 
-// (float)x + k.5 is exact for 0 <= x < 2^23, and the conversion back truncates the half away: x + k. The half keeps
-// a compiler from proving that the float arithmetic is an integer add.
-HOOKTEST_AVX2_NOINLINE int f_orig(int x) { return static_cast<int>(static_cast<float>(x) + 1200.5f); }
-HOOKTEST_AVX2_NOINLINE int f_a(int x) { return static_cast<int>(static_cast<float>(x) + 2200.5f); }
-HOOKTEST_AVX2_NOINLINE int f_b(int x) { return static_cast<int>(static_cast<float>(x) + 3200.5f); }
-HOOKTEST_AVX2_NOINLINE int d_orig(int x) { return static_cast<int>(static_cast<double>(x) + 1300.5); }
-HOOKTEST_AVX2_NOINLINE int d_a(int x) { return static_cast<int>(static_cast<double>(x) + 2300.5); }
-HOOKTEST_AVX2_NOINLINE int d_b(int x) { return static_cast<int>(static_cast<double>(x) + 3300.5); }
+// x + k.5 is exact in float for 0 <= x < 2^16 and k < 2^12, and truncating the result gives x + k.
+HOOKTEST_AVX2_NOINLINE float f_orig(float x) { return x + 1200.5f; }
+HOOKTEST_AVX2_NOINLINE float f_a(float x) { return x + 2200.5f; }
+HOOKTEST_AVX2_NOINLINE float f_b(float x) { return x + 3200.5f; }
+HOOKTEST_AVX2_NOINLINE double d_orig(double x) { return x + 1300.5; }
+HOOKTEST_AVX2_NOINLINE double d_a(double x) { return x + 2300.5; }
+HOOKTEST_AVX2_NOINLINE double d_b(double x) { return x + 3300.5; }
 
 }  // namespace hooktest_avx2
