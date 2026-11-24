@@ -93,6 +93,9 @@ struct Step {
     std::string exception_offers;
     std::string exception_lacks;
     std::string exception_reason;
+    // WP-39. PerfReport: `tag` ("WP39-RELOAD") makes the step print the one-line evidence `<tag> pdb_mib=... reloads=N
+    // total_minus_compile_median_ms=... max_ms=... budget_ms=...` followed by the stage medians (perf_steps.h).
+    std::string perf_tag;
 
     // "expect_stdout /value=2/ within 10 s"
     std::string describe() const;
@@ -103,7 +106,10 @@ struct Step {
 struct Scenario {
     std::string name;
     std::string description;
-    std::string fixture;  // tests/fixtures/<fixture>
+    std::string fixture;  // tests/fixtures/<fixture>; with `external` only the name of the program in the report
+    // WP-39: the module is built outside cmltest (the generated benchmark project). Nothing is copied or built: the program
+    // and its source tree come from --external-exe / --external-source, and `edit` steps patch that tree in place.
+    bool external = false;
     std::string fixture_args;  // extra command-line arguments for the fixture after `--agent` (WP-17); may be empty
     int timeout_s = 120;
     std::vector<Step> steps;
