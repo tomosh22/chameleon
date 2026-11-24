@@ -632,6 +632,101 @@ TEST_CASE("VEX: two-byte and three-byte prefix, maps 1 to 3") {
     expect_len({0xC4, 0xE3, 0x75, 0x4C, 0x01, 0x30}, 6);         // vpblendvb ymm0, ymm1, [rcx], ymm3
 }
 
+// Real function entries. These are the first bytes of functions of the MSVC STL's vectorised algorithms
+// (vector_algorithms.cpp, linked into every fixture from the static runtime) as `cml_lde_probe` printed them for
+// fixture `basic` (lines `LDE-VEX <function> rva=... bytes=...`, ci run 45421496359, windows-2025 clang-cl
+// RelWithDebInfo; the library object is Microsoft's, so the bytes are the same in the cl cells). Until WP-38 every
+// one of them was refused with CML4300 (`refused_vex=361` for this module in ci run 45294653290). The lengths are
+// worked out by hand as above; the comment gives the instruction.
+TEST_CASE("VEX: real function entries of the MSVC STL's vectorised algorithms decode to their instruction boundaries") {
+    struct Entry {
+        const char* function;
+        Bytes code;
+        std::vector<unsigned> lengths;
+    };
+    const Entry entries[] = {
+        // vmovdqu ymm0, [rdx] ; vmovdqu [rcx], ymm0 ; mov rax, rcx ; vzeroupper ; ret
+        {"_Sorting::_Minmax_element_impl<1,_Traits_1_avx,1>::<lambda_10>::<lambda_10>",
+         {0xC5, 0xFE, 0x6F, 0x02, 0xC5, 0xFE, 0x7F, 0x01, 0x48, 0x8B, 0xC1, 0xC5, 0xF8, 0x77, 0xC3},
+         {4, 4, 3, 3, 1}},
+        // vzeroupper ; ret
+        {"_Zeroupper_on_exit::~_Zeroupper_on_exit", {0xC5, 0xF8, 0x77, 0xC3}, {3, 1}},
+        // vmovdqu ymm0, [rcx] ; ret
+        {"_Sorting::_Traits_1_avx::_Load", {0xC5, 0xFE, 0x6F, 0x01, 0xC3}, {4, 1}},
+        // sub rsp, 18h ; vmovdqu ymm1, [r8] (C4: B extends the base) ; vpermq ymm0, ymm1, 4Eh (map 3: imm8)
+        {"_Sorting::_Minmax_element_impl<1,_Traits_2_avx,1>::<lambda_4>::operator()<__m256i>",
+         {0x48, 0x83, 0xEC, 0x18, 0xC4, 0xC1, 0x7E, 0x6F, 0x08, 0xC4, 0xE3, 0xFD, 0x00, 0xC1, 0x4E},
+         {4, 5, 6}},
+        // vmovdqu ymm0, [r8] ; vpcmpgtq ymm1, ymm0, [r9] (map 2) ; vmovdqu [rdx], ymm1
+        {"_Sorting::_Minmax_element_impl<1,_Traits_8_avx,1>::<lambda_1>::operator()<__m256i,__m256i>",
+         {0xC4, 0xC1, 0x7E, 0x6F, 0x00, 0xC4, 0xC2, 0x7D, 0x37, 0x09, 0xC5, 0xFE, 0x7F, 0x0A},
+         {5, 5, 4}},
+        // vmovdqu ymm0, [rcx] ; vpcmpeqq ymm0, ymm0, [rdx] ; ret
+        {"_Sorting::_Traits_8_avx::_Cmp_eq", {0xC5, 0xFE, 0x6F, 0x01, 0xC4, 0xE2, 0x7D, 0x29, 0x02, 0xC3}, {4, 5, 1}},
+        // vmovdqu ymm1, [rcx] ; vmovdqu ymm0, [r8] ; vpblendvb ymm0, ymm1, [rdx], ymm0 (/is4: one immediate byte) ; ret
+        {"_Sorting::_Traits_avx_base::_Blend",
+         {0xC5, 0xFE, 0x6F, 0x09, 0xC4, 0xC1, 0x7E, 0x6F, 0x00, 0xC4, 0xE3, 0x75, 0x4C, 0x02, 0x00, 0xC3},
+         {4, 5, 6, 1}},
+        // vmovupd ymm0, [r8] ; vcmppd ymm1, ymm0, [r9], 1Eh (map 1 with imm8) ; vmovupd [rdx], ymm1
+        {"_Sorting::_Minmax_element_impl<1,_Traits_d_avx,1>::<lambda_1>::operator()<__m256d,__m256d>",
+         {0xC4, 0xC1, 0x7D, 0x10, 0x00, 0xC4, 0xC1, 0x7D, 0xC2, 0x09, 0x1E, 0xC5, 0xFD, 0x11, 0x0A},
+         {5, 6, 4}},
+        // vmovupd ymm1, [rcx] ; vshufpd ymm0, ymm1, ymm1, 5 ; vmaxpd ymm2, ymm0, ymm1
+        {"_Sorting::_Traits_d_avx::_H_max", {0xC5, 0xFD, 0x10, 0x09, 0xC5, 0xF5, 0xC6, 0xC1, 0x05, 0xC5, 0xFD, 0x5F, 0xD1}, {4, 5, 4}},
+        // vmovd xmm0, ecx ; vpshufd xmm0, xmm0, 0 ; vinsertf128 ymm0, ymm0, xmm0, 1 ; ret
+        {"_Finding::_Find_traits_4::_Set_avx",
+         {0xC5, 0xF9, 0x6E, 0xC1, 0xC5, 0xF9, 0x70, 0xC0, 0x00, 0xC4, 0xE3, 0x7D, 0x18, 0xC0, 0x01, 0xC3},
+         {4, 5, 6, 1}},
+        // vpermq ymm0, [rcx], 4Eh ; vpshufb ymm0, ymm0, [rip+000B1F31h] ; ret
+        {"_Reversing::_Traits_1::_Rev_avx",
+         {0xC4, 0xE3, 0xFD, 0x00, 0x01, 0x4E, 0xC4, 0xE2, 0x7D, 0x00, 0x05, 0x31, 0x1F, 0x0B, 0x00, 0xC3},
+         {6, 9, 1}},
+        // vmovq xmm0, rcx (W = 1) ; vpunpcklqdq xmm0, xmm0, xmm0 ; vinsertf128 ymm0, ymm0, xmm0, 1 ; ret
+        {"_Finding::_Find_traits_8::_Set_avx",
+         {0xC4, 0xE1, 0xF9, 0x6E, 0xC1, 0xC5, 0xF9, 0x6C, 0xC0, 0xC4, 0xE3, 0x7D, 0x18, 0xC0, 0x01, 0xC3},
+         {5, 4, 6, 1}},
+        // vmovdqu ymm0, [rdx] ; vpmaskmovd ymm0, ymm0, [rcx] ; ret
+        {"_Sorting::_Traits_avx_i_base::_Load_mask", {0xC5, 0xFE, 0x6F, 0x02, 0xC4, 0xE2, 0x7D, 0x8C, 0x01, 0xC3}, {4, 5, 1}},
+        // vmovdqu ymm0, [rip+000AFEF8h] ; vpaddd ymm0, ymm0, [rcx] ; ret
+        {"_Sorting::_Traits_4_avx::_Inc", {0xC5, 0xFE, 0x6F, 0x05, 0xF8, 0xFE, 0x0A, 0x00, 0xC5, 0xFD, 0xFE, 0x01, 0xC3}, {8, 4, 1}},
+        // vmovdqu ymm1, [rdx] ; vpsrld ymm0, ymm1, 5 (group 13 /2: imm8) ; vpermd ymm2, ymm0, [rcx]
+        {"_Find_meow_of::_Bitmap_details::_Bitmap_step",
+         {0xC5, 0xFE, 0x6F, 0x0A, 0xC5, 0xFD, 0x72, 0xD1, 0x05, 0xC4, 0xE2, 0x7D, 0x36, 0x11},
+         {4, 5, 5}},
+        // sub rsp, 28h ; vmovdqu ymm2, [rcx] ; mov r8, rdx
+        {"_Sorting::_Minmax_impl<3,_Traits_1_avx,1,0>", {0x48, 0x83, 0xEC, 0x28, 0xC5, 0xFE, 0x6F, 0x11, 0x4C, 0x8B, 0xC2}, {4, 4, 3}},
+        // vmovdqu ymm2, [rdx] ; mov rax, [rcx] ; shl r8, 5
+        {"_Sorting::_Minmax_impl<1,_Traits_8_avx,1,0>::<lambda_1>::operator()<__m256i>",
+         {0xC5, 0xFE, 0x6F, 0x12, 0x48, 0x8B, 0x01, 0x49, 0xC1, 0xE0, 0x05},
+         {4, 3, 4}},
+    };
+    for (const Entry& e : entries) {
+        INFO(e.function << ": " << hex(e.code));
+        std::size_t at = 0;
+        for (const unsigned want : e.lengths) {
+            REQUIRE(at < e.code.size());
+            const DecodeResult r = decode_instruction(e.code.data() + at, e.code.size() - at);
+            REQUIRE(r.status == DecodeStatus::Ok);
+            CHECK(r.length == want);
+            at += r.length;
+        }
+        CHECK(at == e.code.size());
+    }
+    // Two of them with a RIP-relative operand: the displacement is where the relocation of the constant would be.
+    const Bytes rev = {0xC4, 0xE2, 0x7D, 0x00, 0x05, 0x31, 0x1F, 0x0B, 0x00};
+    const DecodeResult r1 = decode_instruction(rev.data(), rev.size());
+    REQUIRE(r1.status == DecodeStatus::Ok);
+    CHECK(r1.flags == kInsnRipRel);
+    CHECK(r1.disp_offset == 5);
+    CHECK(r1.disp_size == 4);
+    const Bytes inc = {0xC5, 0xFE, 0x6F, 0x05, 0xF8, 0xFE, 0x0A, 0x00};
+    const DecodeResult r2 = decode_instruction(inc.data(), inc.size());
+    REQUIRE(r2.status == DecodeStatus::Ok);
+    CHECK(r2.flags == kInsnRipRel);
+    CHECK(r2.disp_offset == 4);
+    CHECK(r2.disp_size == 4);
+}
+
 TEST_CASE("VEX: the opcodes with and without ModRM and immediate that are easy to get wrong") {
     // 0F 77 is the only VEX opcode without a ModRM byte: the byte behind it belongs to the next instruction.
     expect_len({0xC5, 0xF8, 0x77}, 3);                           // vzeroupper
