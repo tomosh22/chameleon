@@ -296,6 +296,33 @@ void Supervisor::kill_all() {
     }
 }
 
+bool Supervisor::wait_all_exited(std::uint32_t timeout_ms) {
+    const ULONGLONG until = GetTickCount64() + timeout_ms;
+    const auto left = [until]() -> DWORD {
+        const ULONGLONG now = GetTickCount64();
+        return now >= until ? 0u : static_cast<DWORD>(until - now);
+    };
+    for (const Child& child : children_) {
+        if (child.process != nullptr && WaitForSingleObject(child.process, left()) != WAIT_OBJECT_0) {
+            return false;
+        }
+    }
+    // Grandchildren are known to the job only.
+    for (;;) {
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info{};
+        if (job_ == nullptr || !QueryInformationJobObject(job_, JobObjectBasicAccountingInformation, &info, sizeof(info), nullptr)) {
+            return true;  // no job to ask: the children themselves have exited, nothing more can be known
+        }
+        if (info.ActiveProcesses == 0) {
+            return true;
+        }
+        if (left() == 0) {
+            return false;
+        }
+        Sleep(20);
+    }
+}
+
 }  // namespace cmltest
 
 #endif  // _WIN32

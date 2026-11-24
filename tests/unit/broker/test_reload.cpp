@@ -208,7 +208,8 @@ struct Rig {
             }
             return results;
         };
-        env.resolve_linker = [this](const std::string&, const std::vector<std::string>&, const ReloadOptions&, std::vector<Diag>*) -> Result<toolchain::ToolInfo> {
+        env.resolve_linker = [this](const std::string&, const pdb::PdbIndex*, const std::vector<std::string>&, const ReloadOptions&,
+                                    std::vector<Diag>*) -> Result<toolchain::ToolInfo> {
             ++resolve_calls;
             toolchain::ToolInfo t;
             t.family = toolchain::ToolFamily::Link;

@@ -855,7 +855,7 @@ private:
         if (Result<void> t = check_time("link"); !t) {
             return t;
         }
-        if (Result<void> r = ensure_linker(u, report); !r) {
+        if (Result<void> r = ensure_linker(u, pdb, report); !r) {
             return r;
         }
         toolchain::LinkedPatch linked;
@@ -1226,7 +1226,7 @@ private:
         return Result<void>();
     }
 
-    Result<void> ensure_linker(const Unit& u, PatchReport& report) {
+    Result<void> ensure_linker(const Unit& u, const pdb::PdbIndex& pdb, PatchReport& report) {
         // The cache is keyed by the options that decide the linker: set-option linker / linker_path takes effect.
         const std::string key = options_.linker_override + "|" + options_.linker_path;
         {
@@ -1243,7 +1243,7 @@ private:
             dirs.push_back(std::string(path::parent_directory(std::string_view(u.outcome.compiler_used))));
         }
         std::vector<Diag> warnings;
-        Result<toolchain::ToolInfo> tool = env_.resolve_linker(module_.path, dirs, options_, &warnings);
+        Result<toolchain::ToolInfo> tool = env_.resolve_linker(module_.path, &pdb, dirs, options_, &warnings);
         for (const Diag& w : warnings) {
             warn(report, "link", w);
         }

@@ -165,8 +165,8 @@ tag = "WP39-RELOAD"            # optional, [A-Z0-9-]{1,32}: also print `<tag> pd
 ### Externally built programs (WP-39)
 
 A scenario normally names a fixture of `tests/fixtures`, which cmltest copies and builds. The generated benchmark project
-(`tests/bench/gen_pdb_project.py`: 900 translation units, a PDB of about 544 MiB) takes too long to build for that, so
-the `pdb-benchmark` job builds and caches it, and the scenario says where the program comes from:
+(`tests/bench/gen_pdb_project.py`: 900 translation units, a PDB of 546 MiB, a 3-minute build) is built once by the
+`pdb-benchmark` job and cached, and the scenario says where the program comes from:
 
 ```toml
 name = "large_pdb_reload"
@@ -181,9 +181,12 @@ cmltest --scenario tests/bench/scenarios/large_pdb_reload.toml --build-dir build
 
 `--external-exe` is the program (its PDB must lie beside it; `cml_agent.dll` is copied next to it) and
 `--external-source` the source tree its PDB records. The PDB holds absolute paths, so there is no copy to edit: `edit`
-steps patch that tree in place (`patch` is relative to it, `-p1`), and when the run ends cmltest writes every edited file
-back as it was before its first edit. A scenario with `external = true` run without the two options, or the options given
-to another scenario, is a usage error (exit code 2). Everything else (broker, launch with `--agent`, steps, artifacts) is
+steps patch that tree in place (`patch` is relative to it, `-p1`). When the run ends cmltest waits until the broker, the
+program and their children have exited and writes every edited file back as it was before its first edit, also the files a
+patch had written before a later write of the same patch failed. That is the report's last step, `restore external
+sources`; if a file cannot be put back the step fails and so does the scenario (exit code 1), because the next run would
+start from edited sources. A scenario with `external = true` run without the two options, or the options given to another
+scenario, is a usage error (exit code 2). Everything else (broker, launch with `--agent`, steps, artifacts) is
 as for a fixture; the program must take the fixtures' command line (`tests/fixtures/common/fixture_runtime.h`).
 
 Unknown keys, unknown kinds, missing fields, bad values and steps that need a running process before `launch`

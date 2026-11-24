@@ -6,7 +6,7 @@
 #                    [-Runner r] [-RunId n]
 #
 # Inputs are the JSON files of cml_pdb_bench --json, cml_broker_mem --json, the `perf` scenario (perf-reload.json) and, since
-# WP-39, the `large_pdb_reload` scenario (the reloads inside the 544 MiB PDB of the generated project); any of them may be
+# WP-39, the `large_pdb_reload` scenario (the reloads inside the 546 MiB PDB of the generated project); any of them may be
 # missing (that measuring step failed): the metric is then absent and the table says so.
 param(
     [string]$PdbJson = '',
