@@ -212,3 +212,128 @@ FF | lock: mem 72/192, reg 40/64
 0F 3A F0 | none: all; 66: all; F3: mem 192/192, reg 63/64; F2: all; lock: all
 0F 3A F1..FF | none: all; 66: all; F3: all; F2: all; lock: all
 ```
+
+## Function entries: main next to this branch
+
+`LDE-OUTCOME` of `cml_lde_probe` (`plan_hook()` over every function entry of the module's PDB) for every fixture
+module in every `ci` cell. main: ci run 45411803431 (755a455). This branch: ci run 45433089557 (5e49806). Read from the
+`ctest-junit.xml` of each cell's `logs-*` artifact. `cml_lde_avx_module` is new in this branch.
+
+In all 104 module x cell pairs the number of functions is the same on both sides, `refused_unknown_opcode` and
+`refused_other` are 0 on both sides, and `refused` goes from a total of 13844 (all of it `refused_vex`) to
+0: every function that was refused is planned now, nothing that was planned is refused.
+
+| cell | module | functions | main: padding / five_byte / refused | head: padding / five_byte / refused | refused_vex | head: unknown_opcode / other |
+|---|---|---|---|---|---|---|
+| windows-2022 / clang-cl / Debug | basic (`tool.lde_probe_basic`) | 5115 | 5064 / 50 / 1 | 5065 / 50 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / Debug | avx_module | 3649 | (new) | 3532 / 117 / 0 | 0 | 0 / 0 |
+| windows-2022 / clang-cl / Debug | basic | 5115 | 5064 / 50 / 1 | 5065 / 50 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / Debug | templates | 5247 | 5196 / 50 / 1 | 5197 / 50 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / Debug | virtuals | 5256 | 5205 / 50 / 1 | 5206 / 50 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / Debug | statics | 5247 | 5196 / 50 / 1 | 5197 / 50 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / Debug | lambdas | 5276 | 5225 / 50 / 1 | 5226 / 50 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / Debug | optimised | 4982 | 4931 / 50 / 1 | 4932 / 50 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / Debug | tls | 5521 | 5470 / 50 / 1 | 5471 / 50 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / Debug | pch | 5139 | 5088 / 50 / 1 | 5089 / 50 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / Debug | bigobj | 69603 | 69554 / 49 / 0 | 69554 / 49 / 0 | 0 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / Debug | elision | 5249 | 5198 / 50 / 1 | 5199 / 50 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / Debug | hot_restart | 5109 | 5058 / 50 / 1 | 5059 / 50 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / Debug | new_function | 5243 | 5192 / 50 / 1 | 5193 / 50 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / RelWithDebInfo | basic (`tool.lde_probe_basic`) | 4905 | 4659 / 34 / 212 | 4871 / 34 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / RelWithDebInfo | avx_module | 3484 | (new) | 3402 / 82 / 0 | 0 | 0 / 0 |
+| windows-2022 / clang-cl / RelWithDebInfo | basic | 4905 | 4659 / 34 / 212 | 4871 / 34 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / RelWithDebInfo | templates | 5003 | 4757 / 34 / 212 | 4969 / 34 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / RelWithDebInfo | virtuals | 5010 | 4764 / 34 / 212 | 4976 / 34 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / RelWithDebInfo | statics | 5002 | 4756 / 34 / 212 | 4968 / 34 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / RelWithDebInfo | lambdas | 5030 | 4784 / 34 / 212 | 4996 / 34 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / RelWithDebInfo | optimised | 4780 | 4534 / 34 / 212 | 4746 / 34 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / RelWithDebInfo | tls | 5273 | 5027 / 34 / 212 | 5239 / 34 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / RelWithDebInfo | pch | 4927 | 4681 / 34 / 212 | 4893 / 34 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / RelWithDebInfo | bigobj | 69439 | 69401 / 33 / 5 | 69406 / 33 / 0 | 5 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / RelWithDebInfo | elision | 5005 | 4759 / 34 / 212 | 4971 / 34 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / RelWithDebInfo | hot_restart | 4923 | 4677 / 34 / 212 | 4889 / 34 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2022 / clang-cl / RelWithDebInfo | new_function | 4999 | 4753 / 34 / 212 | 4965 / 34 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2022 / msvc / Debug | basic (`tool.lde_probe_basic`) | 5206 | 5173 / 32 / 1 | 5174 / 32 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / msvc / Debug | avx_module | 3711 | (new) | 3679 / 32 / 0 | 0 | 0 / 0 |
+| windows-2022 / msvc / Debug | basic | 5206 | 5173 / 32 / 1 | 5174 / 32 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / msvc / Debug | templates | 5343 | 5310 / 32 / 1 | 5311 / 32 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / msvc / Debug | virtuals | 5354 | 5321 / 32 / 1 | 5322 / 32 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / msvc / Debug | statics | 5344 | 5311 / 32 / 1 | 5312 / 32 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / msvc / Debug | lambdas | 5374 | 5341 / 32 / 1 | 5342 / 32 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / msvc / Debug | optimised | 5274 | 5241 / 32 / 1 | 5242 / 32 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / msvc / Debug | tls | 5609 | 5576 / 32 / 1 | 5577 / 32 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / msvc / Debug | pch | 5233 | 5200 / 32 / 1 | 5201 / 32 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / msvc / Debug | bigobj | 3865 | 3833 / 32 / 0 | 3833 / 32 / 0 | 0 -> 0 | 0 / 0 |
+| windows-2022 / msvc / Debug | elision | 5345 | 5312 / 32 / 1 | 5313 / 32 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / msvc / Debug | hot_restart | 5205 | 5172 / 32 / 1 | 5173 / 32 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / msvc / Debug | new_function | 5339 | 5306 / 32 / 1 | 5307 / 32 / 0 | 1 -> 0 | 0 / 0 |
+| windows-2022 / msvc / RelWithDebInfo | basic (`tool.lde_probe_basic`) | 4922 | 4693 / 17 / 212 | 4905 / 17 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2022 / msvc / RelWithDebInfo | avx_module | 3474 | (new) | 3457 / 17 / 0 | 0 | 0 / 0 |
+| windows-2022 / msvc / RelWithDebInfo | basic | 4922 | 4693 / 17 / 212 | 4905 / 17 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2022 / msvc / RelWithDebInfo | templates | 5034 | 4805 / 17 / 212 | 5017 / 17 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2022 / msvc / RelWithDebInfo | virtuals | 5043 | 4814 / 17 / 212 | 5026 / 17 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2022 / msvc / RelWithDebInfo | statics | 5034 | 4805 / 17 / 212 | 5017 / 17 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2022 / msvc / RelWithDebInfo | lambdas | 5069 | 4840 / 17 / 212 | 5052 / 17 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2022 / msvc / RelWithDebInfo | optimised | 5033 | 4804 / 17 / 212 | 5016 / 17 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2022 / msvc / RelWithDebInfo | tls | 5301 | 5072 / 17 / 212 | 5284 / 17 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2022 / msvc / RelWithDebInfo | pch | 4946 | 4717 / 17 / 212 | 4929 / 17 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2022 / msvc / RelWithDebInfo | bigobj | 3628 | 3606 / 17 / 5 | 3611 / 17 / 0 | 5 -> 0 | 0 / 0 |
+| windows-2022 / msvc / RelWithDebInfo | elision | 5036 | 4807 / 17 / 212 | 5019 / 17 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2022 / msvc / RelWithDebInfo | hot_restart | 4920 | 4691 / 17 / 212 | 4903 / 17 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2022 / msvc / RelWithDebInfo | new_function | 5030 | 4801 / 17 / 212 | 5013 / 17 / 0 | 212 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / Debug | basic (`tool.lde_probe_basic`) | 6034 | 5974 / 58 / 2 | 5976 / 58 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / Debug | avx_module | 3642 | (new) | 3519 / 123 / 0 | 0 | 0 / 0 |
+| windows-2025 / clang-cl / Debug | basic | 6034 | 5974 / 58 / 2 | 5976 / 58 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / Debug | templates | 6169 | 6109 / 58 / 2 | 6111 / 58 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / Debug | virtuals | 6178 | 6118 / 58 / 2 | 6120 / 58 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / Debug | statics | 6169 | 6109 / 58 / 2 | 6111 / 58 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / Debug | lambdas | 6198 | 6138 / 58 / 2 | 6140 / 58 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / Debug | optimised | 5896 | 5836 / 58 / 2 | 5838 / 58 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / Debug | tls | 6424 | 6364 / 58 / 2 | 6366 / 58 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / Debug | pch | 6060 | 6000 / 58 / 2 | 6002 / 58 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / Debug | bigobj | 69596 | 69539 / 57 / 0 | 69539 / 57 / 0 | 0 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / Debug | elision | 6171 | 6111 / 58 / 2 | 6113 / 58 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / Debug | hot_restart | 6028 | 5968 / 58 / 2 | 5970 / 58 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / Debug | new_function | 6165 | 6105 / 58 / 2 | 6107 / 58 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / RelWithDebInfo | basic (`tool.lde_probe_basic`) | 5823 | 5420 / 42 / 361 | 5781 / 42 / 0 | 361 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / RelWithDebInfo | avx_module | 3474 | (new) | 3391 / 83 / 0 | 0 | 0 / 0 |
+| windows-2025 / clang-cl / RelWithDebInfo | basic | 5823 | 5420 / 42 / 361 | 5781 / 42 / 0 | 361 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / RelWithDebInfo | templates | 5921 | 5519 / 41 / 361 | 5880 / 41 / 0 | 361 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / RelWithDebInfo | virtuals | 5928 | 5526 / 41 / 361 | 5887 / 41 / 0 | 361 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / RelWithDebInfo | statics | 5920 | 5518 / 41 / 361 | 5879 / 41 / 0 | 361 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / RelWithDebInfo | lambdas | 5948 | 5546 / 41 / 361 | 5907 / 41 / 0 | 361 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / RelWithDebInfo | optimised | 5689 | 5287 / 41 / 361 | 5648 / 41 / 0 | 361 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / RelWithDebInfo | tls | 6174 | 5772 / 41 / 361 | 6133 / 41 / 0 | 361 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / RelWithDebInfo | pch | 5846 | 5444 / 41 / 361 | 5805 / 41 / 0 | 361 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / RelWithDebInfo | bigobj | 69430 | 69385 / 40 / 5 | 69390 / 40 / 0 | 5 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / RelWithDebInfo | elision | 5923 | 5521 / 41 / 361 | 5882 / 41 / 0 | 361 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / RelWithDebInfo | hot_restart | 5841 | 5438 / 42 / 361 | 5799 / 42 / 0 | 361 -> 0 | 0 / 0 |
+| windows-2025 / clang-cl / RelWithDebInfo | new_function | 5917 | 5515 / 41 / 361 | 5876 / 41 / 0 | 361 -> 0 | 0 / 0 |
+| windows-2025 / msvc / Debug | basic (`tool.lde_probe_basic`) | 6114 | 6080 / 32 / 2 | 6082 / 32 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / msvc / Debug | avx_module | 3696 | (new) | 3664 / 32 / 0 | 0 | 0 / 0 |
+| windows-2025 / msvc / Debug | basic | 6114 | 6080 / 32 / 2 | 6082 / 32 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / msvc / Debug | templates | 6254 | 6220 / 32 / 2 | 6222 / 32 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / msvc / Debug | virtuals | 6265 | 6231 / 32 / 2 | 6233 / 32 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / msvc / Debug | statics | 6255 | 6221 / 32 / 2 | 6223 / 32 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / msvc / Debug | lambdas | 6285 | 6251 / 32 / 2 | 6253 / 32 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / msvc / Debug | optimised | 6186 | 6152 / 32 / 2 | 6154 / 32 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / msvc / Debug | tls | 6502 | 6468 / 32 / 2 | 6470 / 32 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / msvc / Debug | pch | 6143 | 6109 / 32 / 2 | 6111 / 32 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / msvc / Debug | bigobj | 3850 | 3818 / 32 / 0 | 3818 / 32 / 0 | 0 -> 0 | 0 / 0 |
+| windows-2025 / msvc / Debug | elision | 6256 | 6222 / 32 / 2 | 6224 / 32 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / msvc / Debug | hot_restart | 6112 | 6078 / 32 / 2 | 6080 / 32 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / msvc / Debug | new_function | 6250 | 6216 / 32 / 2 | 6218 / 32 / 0 | 2 -> 0 | 0 / 0 |
+| windows-2025 / msvc / RelWithDebInfo | basic (`tool.lde_probe_basic`) | 5828 | 5451 / 16 / 361 | 5812 / 16 / 0 | 361 -> 0 | 0 / 0 |
+| windows-2025 / msvc / RelWithDebInfo | avx_module | 3456 | (new) | 3441 / 15 / 0 | 0 | 0 / 0 |
+| windows-2025 / msvc / RelWithDebInfo | basic | 5828 | 5451 / 16 / 361 | 5812 / 16 / 0 | 361 -> 0 | 0 / 0 |
+| windows-2025 / msvc / RelWithDebInfo | templates | 5942 | 5565 / 16 / 361 | 5926 / 16 / 0 | 361 -> 0 | 0 / 0 |
+| windows-2025 / msvc / RelWithDebInfo | virtuals | 5951 | 5574 / 16 / 361 | 5935 / 16 / 0 | 361 -> 0 | 0 / 0 |
+| windows-2025 / msvc / RelWithDebInfo | statics | 5942 | 5565 / 16 / 361 | 5926 / 16 / 0 | 361 -> 0 | 0 / 0 |
+| windows-2025 / msvc / RelWithDebInfo | lambdas | 5977 | 5600 / 16 / 361 | 5961 / 16 / 0 | 361 -> 0 | 0 / 0 |
+| windows-2025 / msvc / RelWithDebInfo | optimised | 5940 | 5563 / 16 / 361 | 5924 / 16 / 0 | 361 -> 0 | 0 / 0 |
+| windows-2025 / msvc / RelWithDebInfo | tls | 6193 | 5816 / 16 / 361 | 6177 / 16 / 0 | 361 -> 0 | 0 / 0 |
+| windows-2025 / msvc / RelWithDebInfo | pch | 5854 | 5477 / 16 / 361 | 5838 / 16 / 0 | 361 -> 0 | 0 / 0 |
+| windows-2025 / msvc / RelWithDebInfo | bigobj | 3610 | 3590 / 15 / 5 | 3595 / 15 / 0 | 5 -> 0 | 0 / 0 |
+| windows-2025 / msvc / RelWithDebInfo | elision | 5944 | 5567 / 16 / 361 | 5928 / 16 / 0 | 361 -> 0 | 0 / 0 |
+| windows-2025 / msvc / RelWithDebInfo | hot_restart | 5826 | 5448 / 17 / 361 | 5809 / 17 / 0 | 361 -> 0 | 0 / 0 |
+| windows-2025 / msvc / RelWithDebInfo | new_function | 5938 | 5561 / 16 / 361 | 5922 / 16 / 0 | 361 -> 0 | 0 / 0 |
