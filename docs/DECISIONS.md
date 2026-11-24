@@ -1105,6 +1105,8 @@ class of residual risk as the lambda number, accepted only with the user told. A
 Order pairing is only the fallback for sections whose layout is unknown (cl's COMDAT section per static). Where the
 section layout of a member is known, the layout decides, with no warning; where order and a known layout disagree, the
 layout wins, and an order pairing never teaches, contradicts or erases a learned layout (high re-review of PR #64).
+Consequently CML3570 is raised only where the layout is unknown (cl); the acceptance's "warning in all 8 cells" becomes a
+per-compiler assertion in `unit.bind_fixtures` on each cell's PDB plus the `WP37-ORDER` line in the cl cells.
 
 ### WP-38: VEX and EVEX in the hook length decoder; decoder fuzzing (R-04, R-41)
 
