@@ -439,6 +439,7 @@ cml::Result<AppliedPatch> apply_patch_to_tree(const fs::path& root, std::string_
                                    "The fixture file changed; regenerate the .edit file against the current sources.");
         }
         applied.files.push_back(item.relative);
+        applied.originals.push_back(is_create ? std::nullopt : std::optional<std::string>(std::move(original)));
         pending.push_back(std::move(item));
     }
     for (const Pending& item : pending) {

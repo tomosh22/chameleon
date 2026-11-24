@@ -137,6 +137,9 @@ std::string Step::describe() const {
             break;
         case StepKind::PerfReport:
             out += " median at most " + std::to_string(result_value) + " ms over at least " + std::to_string(min_samples) + " reloads";
+            if (!perf_tag.empty()) {
+                out += " (" + perf_tag + ")";
+            }
             break;
     }
     return out;
@@ -627,7 +630,7 @@ cml::Result<Scenario> parse_scenario(std::string_view text) {
         return doc.error();
     }
     Scenario scenario;
-    cml::Result<void> root_keys = only_keys(doc->root, {"name", "description", "fixture", "fixture_args", "timeout_s"}, "the scenario header");
+    cml::Result<void> root_keys = only_keys(doc->root, {"name", "description", "fixture", "fixture_args", "timeout_s", "external"}, "the scenario header");
     if (!root_keys) return root_keys.error();
     if (!doc->tables.empty()) {
         return invalid(doc->tables[0].line, "plain tables are not used in scenarios (only [[step]])");
@@ -645,6 +648,10 @@ cml::Result<Scenario> parse_scenario(std::string_view text) {
     if (!fixture) return fixture.error();
     if (!name_chars_ok(*fixture, false)) return invalid(doc->root.find("fixture")->line, "'fixture' must be a fixture directory name (tests/fixtures/<name>)");
     scenario.fixture = *fixture;
+    if (const toml::Value* external = doc->root.find("external")) {
+        if (external->kind != toml::Value::Kind::Boolean) return invalid(external->line, "'external' must be true or false");
+        scenario.external = external->boolean;  // WP-39
+    }
     if (const toml::Value* args = doc->root.find("fixture_args")) {
         const bool plain = args->kind == toml::Value::Kind::String && args->text.size() <= 200 &&
                            std::all_of(args->text.begin(), args->text.end(), [](char ch) {

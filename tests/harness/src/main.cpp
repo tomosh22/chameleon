@@ -47,6 +47,8 @@ void print_usage(std::FILE* out) {
         "                            fixture stdout and dumps (default base: <build-dir>/cmltest-artifacts)\n"
         "  --junit FILE              write a JUnit XML report\n"
         "  --prebuilt-fixture EXE    debugging aid: skip configuring/building and run this fixture exe\n"
+        "  --external-exe EXE        for a scenario with `external = true`: the program built outside cmltest (its PDB beside it)\n"
+        "  --external-source DIR     ... and the source tree its PDB records; `edit` steps patch it in place, it is restored afterwards\n"
         "  --build-timeout-s N       limit for configuring + building the fixture (default: 900)\n"
         "  --require-all-capabilities  steps skipped for missing broker capabilities fail the run\n"
         "  --clean-work              delete the scratch directory (the one cmltest created) after the run\n"
@@ -71,6 +73,8 @@ struct Args {
     std::string artifacts;
     std::string junit;
     std::string prebuilt_fixture;
+    std::string external_exe;
+    std::string external_source;
     unsigned long build_timeout_s = 900;
     bool require_all = false;
     bool clean_work = false;
@@ -106,6 +110,8 @@ bool parse_args(const std::vector<std::string>& argv, Args* args) {
         else if (a == "--artifacts") { if (!value(&args->artifacts)) return false; }
         else if (a == "--junit") { if (!value(&args->junit)) return false; }
         else if (a == "--prebuilt-fixture") { if (!value(&args->prebuilt_fixture)) return false; }
+        else if (a == "--external-exe") { if (!value(&args->external_exe)) return false; }
+        else if (a == "--external-source") { if (!value(&args->external_source)) return false; }
         else if (a == "--build-timeout-s") {
             if (!value(&text)) return false;
             if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos || text.size() > 6) {
@@ -123,6 +129,14 @@ bool parse_args(const std::vector<std::string>& argv, Args* args) {
     }
     if (args->scenario.empty()) {
         std::fputs("cmltest: --scenario is required\n", stderr);
+        return false;
+    }
+    if (args->external_exe.empty() != args->external_source.empty()) {
+        std::fputs("cmltest: --external-exe and --external-source go together\n", stderr);
+        return false;
+    }
+    if (!args->external_exe.empty() && !args->prebuilt_fixture.empty()) {
+        std::fputs("cmltest: --external-exe and --prebuilt-fixture exclude each other\n", stderr);
         return false;
     }
     if (args->generator != "ninja" && args->generator != "msbuild") {
@@ -212,6 +226,14 @@ int wmain(int argc, wchar_t** wargv) {
         return finish(failed_early, args);
     }
 
+    // WP-39: an external program and a scenario that expects one go together; anything else is a usage error, not a run.
+    if (scenario->external != !args.external_exe.empty()) {
+        std::fprintf(stderr, "cmltest: %s\n",
+                     scenario->external ? "this scenario has external = true: pass --external-exe and --external-source"
+                                        : "--external-exe is only for scenarios with external = true");
+        return 2;
+    }
+
     cmltest::RunnerOptions options;
     options.repo_root = args.repo_root.empty() ? find_repo_root(scenario_path.parent_path()) : make_absolute(to_path(args.repo_root));
     const fs::path build_dir = make_absolute(args.build_dir.empty() ? options.repo_root / "build" : to_path(args.build_dir));
@@ -222,6 +244,10 @@ int wmain(int argc, wchar_t** wargv) {
     options.require_all_capabilities = args.require_all;
     if (!args.prebuilt_fixture.empty()) {
         options.prebuilt_fixture = make_absolute(to_path(args.prebuilt_fixture));
+    }
+    if (!args.external_exe.empty()) {
+        options.external_exe = make_absolute(to_path(args.external_exe));
+        options.external_source = make_absolute(to_path(args.external_source));
     }
     options.build_timeout_ms = static_cast<std::uint32_t>(std::min<unsigned long>(args.build_timeout_s, 100000ul) * 1000ul);
 
@@ -241,7 +267,7 @@ int wmain(int argc, wchar_t** wargv) {
                          .c_str());
         return 2;
     }
-    if (args.cmake.empty() && !args.prebuilt_fixture.empty()) {
+    if (args.cmake.empty() && (!args.prebuilt_fixture.empty() || !args.external_exe.empty())) {
         options.cmake = "cmake.exe";  // never started: nothing is configured or built
     } else if (args.cmake.empty()) {
         cml::Result<fs::path> cmake = cmltest::find_executable("cmake.exe");

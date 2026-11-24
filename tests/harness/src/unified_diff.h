@@ -15,6 +15,7 @@
 // hunk and the first line that differs; nothing is written unless every hunk of every file applies.
 
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -54,6 +55,9 @@ cml::Result<std::string> apply_file_patch(std::string_view original, const FileP
 struct AppliedPatch {
     std::vector<std::string> files;  // paths relative to the root, as changed
     std::vector<std::string> notes;  // "hunk 2 of logic.cpp applied at offset +3"
+    // WP-39: what each file of `files` held before the patch (no value: the patch created it). The runner uses it to put an
+    // external source tree back after the run; for a scratch copy of a fixture nobody reads it.
+    std::vector<std::optional<std::string>> originals;
 };
 
 // Parses `patch_text` and applies it to the tree below `root` (like `patch -p<strip>`). Paths that

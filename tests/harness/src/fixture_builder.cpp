@@ -185,6 +185,28 @@ cml::Result<CompilerChoice> resolve_compiler(const std::string& cxx) {
     return choice;
 }
 
+cml::Result<BuiltFixture> use_external_fixture(const fs::path& exe, const fs::path& source_dir, const fs::path& agent_dir) {
+    std::error_code ec;
+    const fs::path pdb = fs::path(exe).replace_extension(".pdb");
+    const char* const todo = "Build the program first (tests/bench/gen_pdb_project.py and its CMakeLists.txt) and pass --external-exe and --external-source.";
+    if (!fs::is_regular_file(exe, ec)) {
+        return cml::Diag::make(cml::ids::kHarnessUsage, "the external program '" + exe.string() + "' does not exist", todo);
+    }
+    if (!fs::is_regular_file(pdb, ec)) {
+        return cml::Diag::make(cml::ids::kHarnessUsage, "the external program has no PDB beside it: '" + pdb.string() + "' does not exist", todo);
+    }
+    if (!fs::is_directory(source_dir, ec)) {
+        return cml::Diag::make(cml::ids::kHarnessUsage, "the external source directory '" + source_dir.string() + "' does not exist", todo);
+    }
+    BuiltFixture built;
+    built.source_dir = source_dir;
+    built.build_dir = exe.parent_path();
+    built.exe = exe;
+    BuildSettings settings;
+    settings.agent_dir = agent_dir;
+    return finish_fixture(&built, settings);
+}
+
 cml::Result<BuiltFixture> build_fixture(Supervisor& supervisor, const BuildSettings& settings) {
     BuiltFixture built;
     const fs::path fixture_source = settings.repo_root / "tests" / "fixtures" / settings.fixture;
