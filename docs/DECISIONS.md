@@ -965,3 +965,189 @@ Decisions:
   refusals become reloads, and `cml_lde_probe` reports `refused_vex=0`.
 - Plan §2's differentiator "source-available licensing" no longer applies after ADR-0039; positioning is an open user
   decision (R-30).
+
+## ADR-0042 Wave 10: real-code coverage (WP-36..WP-39; closes R-01..R-04, R-13, the decoder part of R-41)
+
+**Date:** 2026-11-24 · **Status:** Accepted
+
+Wave 10 runs four packages in parallel under the plan's §0 rules. Each closes roadmap items (ADR-0041); the acceptance
+of the wave is the corpus.
+
+| WP | Roadmap | Title | Branch | Review |
+|---|---|---|---|---|
+| WP-36 | R-01 | Image-relative references to old data (F-2) | `wp/36-imgrel` | high (bind planner, agent fix-ups) |
+| WP-37 | R-02, R-03 | PDB type stream; static overloads and lambda-local statics | `wp/37-pdb-types` | high (bind planner) |
+| WP-38 | R-04, R-41 (decoder) | VEX/EVEX in the hook length decoder; decoder fuzzing | `wp/38-vex-decoder` | high (length decoder) |
+| WP-39 | R-13 | Reload timing inside a large PDB, with budgets | `wp/39-large-pdb-reload` | medium |
+
+**Ranges.** WP-36: CML3550–3569 (planner), CML4700–4719 (agent fix-ups). WP-37: CML1430–1459 (PDB reader),
+CML3570–3599 (planner). WP-38: CML4317–4329 (hook installer). WP-39: CML5940–5959 (the WP-27 range, unused so far).
+No new agent message types. WP-36 adds one fix-up kind to `ApplyFixups` (below); `agent_abi_version` rises only if an
+older agent would misread the message rather than reject the unknown kind.
+
+### WP-36: image-relative references to old data (R-01, F-2)
+
+**Evidence (orchestrator spike, run 45402685481, windows-2022, cl 19.44, `/O2 /Ob0 /Gy` and `/O1`).**
+- The checked-in repro `tests/corpus/repro/f2_global_array_index.c` does **not** reproduce F-2. For one global array
+  indexed by a variable cl emits `lea rax,[table]` (REL32), which already works.
+- cl emits `sym@IMGREL` (ADDR32NB) to data only when the function has `__ImageBase` in a register: a function with a
+  switch jump table that also touches globals (`mov byte ptr CORE[rbx+rdi],0`, bytes `C6 84 3B disp32 00`), or one that
+  indexes two or more global arrays (`/O1` and `/O2`). raylib's `PlayAutomationEvent` is the first kind.
+- Every such site is the 32-bit **displacement** of a ModRM/SIB memory operand whose base register holds
+  `__ImageBase` (`mov`, `cmp`, `lea`, `cvttss2si`, `mov rax,[rdi+rax*8+fptab]`). The processor sign-extends it.
+- The jump table lives in the function's own code section (in `.rdata` with `/jumptablerdata`). Its entries are
+  ADDR32NB to labels of the patch, loaded **zero-extended** (`mov eax,[rdi+rax*4+$LN16]`, `add rax,rdi`, `jmp rax`).
+- `/Od` has no ADDR32NB to data. clang-cl has none at all (jump tables are table-relative).
+
+**Decision.** The roadmap's direction (bind the patch's `__ImageBase` to the old image base and refuse mixed TUs) is
+rejected: the references occur precisely in functions that mix a jump table with old data, and the zero-extended
+table entries break when the patch lies below the old image. Instead:
+
+1. `__ImageBase` stays the patch image's base. Jump tables, `.pdata`, `.xdata` and RTTI are untouched.
+2. An ADDR32NB site whose target is bound to the old image (`BindOldData`) gets a new fix-up kind, `Addr32NbDisp`:
+   the agent writes `int32(S + A − patch_image_base)`, where `S + A` is the absolute target as for the other kinds
+   (ADR-0025), and refuses with a CML47xx diagnostic when the value does not fit a signed 32-bit field. Patches load
+   within 1.5 GiB of the module (WP-08), so it fits in practice.
+3. The planner accepts such a site only when it is **proved** to be a sign-extended displacement: the site lies in a
+   code section, and decoding the section linearly from its start (the shared length decoder, compiled into the broker
+   unchanged) reaches an instruction whose `disp_size == 4` and whose `disp_offset` is exactly the site, without a
+   RIP-relative operand and without a `67` prefix. Anything else (a site in a data section, an immediate, an instruction
+   the decoder does not know before the site, a site inside the bytes of an earlier relocation) keeps CML3101, whose
+   message now names the instruction bytes. "Unknown" always refuses; nothing is guessed.
+4. The decoder reports the displacement (`DecodeResult::disp_offset`, `disp_size`). The orchestrator adds those two
+   fields in the PR that carries this ADR, so that WP-36 and WP-38 both start from them. WP-38 owns
+   `agent/src/hook/length_decoder.*` and keeps the fields correct for the encodings it adds; WP-36 does not edit the
+   decoder.
+5. Unchanged-function elision (WP-25) and hook narrowing must treat an `Addr32NbDisp` site like the other bound-data
+   sites. If comparing them is not possible, the function counts as changed (more hooks, never fewer).
+
+**Acceptance.**
+- The repro is replaced by one that reproduces F-2 (a switch with a jump table that reads and writes global arrays,
+  plus a function indexing two global arrays), and becomes fixture `imgrel` with a cmltest scenario in
+  `tests/harness/scenarios/`: the edit reloads and the process reads and writes the **old** globals afterwards (values
+  written before the reload are visible after it, and the switch still dispatches). Green in all 8 matrix cells.
+- In the cl RelWithDebInfo cells the log shows that the path was taken: a line `WP36-IMGREL sites=N verified=N` with
+  N > 0 for the fixture's object. In Debug and clang-cl cells N may be 0.
+- Unit tests: planner (verified site, immediate site refused, unknown instruction before the site refused, site in a
+  data section refused), fix-up triples, the agent's write and its range check, wire round trip.
+- Corpus: raylib/cl `edit:header-inline-raymath` passes and is removed from `expected_failures`; the raylib cells stay
+  green under both compilers.
+- Directories: `broker/cml_core` (planner, fix-ups, pipeline, narrowing), `core/cml_ipc` (fix-up kind),
+  `agent/src/loader` (apply), `tests/fixtures/imgrel`, `tests/harness/scenarios`, `tests/unit/{bind,agent_loader,lib}`,
+  `tests/corpus/repro`, `tests/corpus/raylib/project.json`.
+
+### WP-37: PDB type stream; static overloads and lambda-local statics (R-02, R-03)
+
+**Decision.**
+1. `cml_pdb` reads the TPI and IPI streams itself (ADR-0014: no third-party parser). Access is lazy: opening an index
+   reads no type records, and the first lookup builds whatever offset table it needs. The WP-27 budgets (index time,
+   broker memory) must hold with the reader in place; the `pdb-benchmark` job shows it.
+2. The patch object is compiled `/Z7` (ADR-0026), so it carries its own type records in `.debug$T` and its procedure
+   records in `.debug$S`. One canonical signature (calling convention, return type, parameter list, member-function
+   class and `this` adjustment, with every referenced type rendered structurally and by its unique name where it has
+   one) is computed by the **same** code for a TPI record and for a `.debug$T` record. The planner compares
+   signatures; it never compares type indices across the two and never parses decorated names to learn a signature.
+3. Static functions that share scope and name (pass B of the static matching) pair one-to-one by signature. A
+   function with no partner is a new function (not hooked); an old one with no partner stays as it is. CML3214 stays
+   for what is still ambiguous: equal signatures, or types that cannot be read (no type records, a type server PDB
+   that is absent, a malformed record).
+4. Same-named function-local statics of several lambdas in one function (Godot's `SNAME`: `sname`, `$TSS0`) are told
+   apart by the identity of the enclosing lambda: the closure class's unique name from the type stream on the old
+   side, the decorated scope on the new side. CML3207 stays for true ambiguity.
+5. A non-overloaded static function whose signature changed keeps today's documented behaviour (matched to its
+   namesake). Changing that is not this package.
+6. The type reader is a parser of untrusted input: malformed records give a CML14xx diagnostic or "unknown", never a
+   crash or an out-of-bounds read, and `fuzz_pdb` (WP-28) covers it with seeds that carry type streams.
+
+**Acceptance.**
+- Fixture `static_overloads` (a header with a `static inline` overload set, included by two TUs; the edit changes one
+  overload) and fixture `lambda_statics` (two or more lambdas in one function, each with a local static of the same
+  name, in the shape of `SNAME`), each with a cmltest scenario, green in all 8 matrix cells. The scenarios show that
+  the statics keep their values across the reload (no re-initialisation) and that the edited overload, not its
+  sibling, changed.
+- Unit tests on synthetic type streams and on the real fixture PDBs, including true ambiguity (CML3214/CML3207 still
+  raised) and unreadable types.
+- Corpus, Dear ImGui under cl and clang-cl: the three `unsupported-static-overloads-*` edits become successful
+  reloads with an observed marker (the win32 backend, `imgui.cpp`, and the `ImFloor` header edit).
+- Corpus, Godot: a new edit of `scene/main/scene_tree.cpp` reloads and its marker is observed.
+- `pdb-benchmark` stays inside its budgets.
+- Directories: `core/cml_pdb`, `core/cml_coff` (reading `.debug$T`/`.debug$S` if not there yet), `broker/cml_core`
+  (planner), `tests/fixtures/{static_overloads,lambda_statics}`, `tests/harness/scenarios`, `tests/unit/{pdb,bind}`,
+  `tests/fuzz` (PDB target and seeds), `tests/corpus/{imgui,godot}/project.json`, `tests/corpus/repro`.
+
+### WP-38: VEX and EVEX in the hook length decoder; decoder fuzzing (R-04, R-41)
+
+**This reverses a WP-10 decision** ("no VEX, no EVEX": anything VEX-encoded is Unknown, CML4300). The reason then was
+caution about a decoder nobody had checked against a reference. The corpus shows the cost: the MSVC STL's vectorised
+helpers and 220 Godot functions cannot be hooked, and any `/arch:AVX2` build has VEX at the entry of many leaf
+functions. The decision is reversed **together with** a reference check, which is what makes it safe.
+
+**Decision.**
+1. In 64-bit mode `C4` and `C5` are always VEX and `62` is always EVEX. The decoder reads the prefix payload (1, 2 and
+   3 bytes), the opcode map (VEX and EVEX maps 1–3), the opcode, then ModRM/SIB/displacement as for legacy
+   instructions, then an 8-bit immediate where the opcode has one. An EVEX compressed displacement is still one byte.
+   A legacy prefix (`66`, `F2`, `F3`, `F0`) or a REX before a VEX/EVEX prefix is Unknown. Other maps (EVEX 4–7, XOP,
+   3DNow!) stay Unknown. `disp_offset`/`disp_size` and `kInsnRipRel` are filled as for legacy instructions.
+2. "Unknown rather than probably" still holds: an opcode the tables do not name is Unknown. The four assertions in
+   `test_length_decoder.cpp` that pin "VEX is unknown" are replaced by vectors worked out by hand from the SDM.
+3. **Reference check.** A fuzz target (`fuzz_lde`, libFuzzer + ASan in `fuzz.yml`, replay over checked-in seeds in
+   every `ci` cell) asserts the decoder's own invariants (never reads past `available`, length 1..15, a displacement
+   inside the instruction, the same verdict whatever follows the instruction). In `fuzz.yml` it also compares with
+   Zydis (MIT), fetched at a pinned commit at run time, linked only into the fuzz/differential executables, never
+   vendored and never shipped: whenever our decoder says `Ok`, Zydis must decode the same bytes in 64-bit mode to the
+   same length. A disagreement is a failure. Where Zydis rejects bytes that we accept, the WP either makes the decoder
+   refuse them or lists the exception with its reason in `docs/wp/WP-38.md`.
+4. The same comparison runs once over real code: a linear sweep from every function entry of the fixture modules and
+   of an `/arch:AVX2` module.
+
+**Acceptance.**
+- `cml_lde_probe` reports `refused_vex=0` for every fixture module (`tool.lde_corpus_*`, which now fail on a non-zero
+  count) and for the five corpus cells (raylib, ImGui, Godot); the corpus driver fails on `refused_vex` > 0.
+- A test module built with `/arch:AVX2` (clang-cl: `-mavx2`) whose hooked functions begin with VEX instructions, with
+  and without padding before them, runs under the existing 16-thread stress test for the full 60 s:
+  `WP10-STRESS ... crashes=0` in every matrix cell, with a line naming the VEX-entry targets and their first bytes.
+- `fuzz.yml`: `fuzz_lde` runs with the Zydis comparison, zero disagreements; the differential sweep line
+  `WP38-DIFF instructions=N mismatches=0`.
+- KNOWN_LIMITATIONS text for CML4300 is proposed in the PR (the orchestrator applies it).
+- Directories: `agent/src/hook/length_decoder.*`, `tests/unit/agent_hook`, `tests/fuzz`, `.github/workflows/fuzz.yml`,
+  the decoder step of `tests/corpus/run_corpus.ps1`.
+
+### WP-39: reload timing inside a large PDB (R-13)
+
+**Decision.**
+1. The measure is the WP-27 one: per reload the broker's `timing_ms` (sweep, compile, plan, anchor, link, load,
+   fixups, init, hooks, total). "Detect to applied" is `total`; the budgeted figure is `total − compile`, because the
+   compiler's time belongs to the user's code.
+2. Two places measure it.
+   - **Every pull request:** the generated benchmark project of the `pdb-benchmark` job (544 MiB PDB) becomes a
+     program that runs with the agent, and a cmltest scenario reloads a translation unit inside it five times.
+   - **The real thing:** the Godot corpus cell (523 MB PDB) records the same stages for each of its edits.
+3. Budgets. Plan target: 1.5 s for `total − compile` (the WP-27 figure, unchanged by module size). CI thresholds carry
+   ADR-0009's 2× slack: median ≤ 3.0 s on the generated project, and each Godot edit ≤ 3.0 s per recompiled TU. If
+   the first measurement is over the plan target, the WP finds the stage responsible and fixes it when the fix is
+   local (for example a PDB re-map or a full symbol scan per reload); otherwise it reports the numbers and the cause,
+   and the orchestrator rules. A threshold is never raised to make a run pass.
+4. Broker memory during those reloads is asserted against the WP-27 limit (1.5 × PDB + 32 MiB).
+5. Guards as in WP-27: a missing or non-numeric stage fails; nothing is read as 0.
+
+**Acceptance.**
+- `pdb-benchmark`: a line `WP39-RELOAD pdb_mib=… reloads=5 total_minus_compile_median_ms=… max_ms=… budget_ms=3000`
+  with the stage medians, in `perf-results.json` and the step summary; the job fails over budget.
+- Godot cell: `WP39-GODOT edit=… total_ms=… compile_ms=… rest_ms=… budget_ms=…` per edit, in the step summary; the
+  cell fails over budget.
+- Directories: `tests/bench`, `tests/harness` (steps), `tests/ci/perf_results.ps1`, the `pdb-benchmark` job of
+  `.github/workflows/ci.yml` (the only package that edits `ci.yml`, apart from registering new ctest entries, which
+  needs no workflow change), the timing part of `tests/corpus/run_corpus.ps1`, `.github/workflows/corpus.yml`.
+  Broker code only for a fix under point 3.
+
+### Shared files and merge order
+
+- `tests/corpus/run_corpus.ps1`: WP-38 owns the decoder step, WP-39 the timing output; WP-36 and WP-37 change only
+  their `project.json` files.
+- `broker/cml_core/src/bind_plan.cpp`: WP-36 works in the relocation walk (fix-ups), WP-37 in the static matching.
+  Whichever merges second merges `main` and re-runs its acceptance.
+- `tests/fixtures/CMakeLists.txt` and the scenario lists: one line per fixture; conflicts are resolved by keeping both.
+- `corpus.yml` runs on pull requests that touch `tests/corpus/**`. Every package of this wave touches that tree, so
+  every PR carries a corpus run. Its `push` trigger is extended to `wp/3*` branches (without Godot, as before).
+- No fixed merge order. Each PR is reviewed at the level in the table, re-reviewed after a substantial fix round, and
+  merged as a squash with the expected head sha once the orchestrator has read its CI logs.

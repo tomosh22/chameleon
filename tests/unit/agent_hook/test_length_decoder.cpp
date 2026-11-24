@@ -434,6 +434,65 @@ TEST_CASE("incomplete instructions are Truncated, and nothing past `available` i
     CHECK(decode_instruction(vex.data(), 1).status == DecodeStatus::Unknown);
 }
 
+// ADR-0042: where the ModRM displacement sits. The first five vectors are the instructions cl /O2 emitted for
+// image-relative array indexing in the orchestrator's spike (run 45402685481): the relocation site of `sym@IMGREL`
+// is exactly this displacement.
+TEST_CASE("the displacement of a memory operand is located; immediates and branch targets are not displacements") {
+    struct Case {
+        Bytes bytes;
+        unsigned length;
+        unsigned disp_offset;
+        unsigned disp_size;
+        std::uint8_t flags;
+    };
+    const Case cases[] = {
+        {{0xC6, 0x84, 0x3B, 0x00, 0x00, 0x00, 0x00, 0x00}, 8, 3, 4, 0},              // mov byte ptr [rbx+rdi+disp32], 0
+        {{0x89, 0x9C, 0x87, 0x00, 0x04, 0x00, 0x00}, 7, 3, 4, 0},                    // mov [rdi+rax*4+disp32], ebx
+        {{0x48, 0x8B, 0x84, 0xC7, 0x00, 0x00, 0x00, 0x00}, 8, 4, 4, 0},              // mov rax, [rdi+rax*8+disp32]
+        {{0xF3, 0x0F, 0x2C, 0x84, 0x87, 0x44, 0x04, 0x00, 0x00}, 9, 5, 4, 0},        // cvttss2si eax, [rdi+rax*4+disp32]
+        {{0x8B, 0x84, 0x87, 0x00, 0x00, 0x00, 0x00}, 7, 3, 4, 0},                    // mov eax, [rdi+rax*4+disp32] (jump table)
+        {{0x81, 0x84, 0x87, 0x10, 0x00, 0x00, 0x00, 0x78, 0x56, 0x34, 0x12}, 11, 3, 4, 0},  // add [..+disp32], imm32
+        {{0x8B, 0x87, 0x00, 0x01, 0x00, 0x00}, 6, 2, 4, 0},                          // mov eax, [rdi+disp32] (no SIB)
+        {{0x48, 0x8B, 0x04, 0x25, 0x00, 0x10, 0x00, 0x00}, 8, 4, 4, 0},              // mov rax, [disp32] (SIB, no base)
+        {{0x48, 0x8B, 0x04, 0xC5, 0x00, 0x10, 0x00, 0x00}, 8, 4, 4, 0},              // mov rax, [rax*8+disp32]
+        {{0x48, 0x8D, 0x05, 0x00, 0x00, 0x00, 0x00}, 7, 3, 4, kInsnRipRel},          // lea rax, [rip+disp32]
+        {{0x48, 0x89, 0x5C, 0x24, 0x08}, 5, 4, 1, 0},                                // mov [rsp+8], rbx (disp8)
+        {{0x8B, 0x45, 0x10}, 3, 2, 1, 0},                                            // mov eax, [rbp+10h] (disp8)
+        {{0x8B, 0x04, 0x88}, 3, 0, 0, 0},                                            // mov eax, [rax+rcx*4]
+        {{0x48, 0x03, 0xC7}, 3, 0, 0, 0},                                            // add rax, rdi
+        {{0xB8, 0x78, 0x56, 0x34, 0x12}, 5, 0, 0, 0},                                // mov eax, imm32
+        {{0x05, 0x78, 0x56, 0x34, 0x12}, 5, 0, 0, 0},                                // add eax, imm32
+        {{0x68, 0x78, 0x56, 0x34, 0x12}, 5, 0, 0, 0},                                // push imm32
+        {{0xE8, 0x00, 0x00, 0x00, 0x00}, 5, 0, 0, kInsnCall},                        // call rel32
+        {{0xE9, 0x00, 0x00, 0x00, 0x00}, 5, 0, 0, kInsnJmp},                         // jmp rel32
+        {{0x0F, 0x84, 0x00, 0x00, 0x00, 0x00}, 6, 0, 0, kInsnJcc},                   // je rel32
+        {{0xC7, 0x05, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00}, 10, 2, 4, kInsnRipRel},  // mov [rip+disp32], imm32
+    };
+    for (const Case& c : cases) {
+        INFO("bytes: " << hex(c.bytes));
+        expect_len(c.bytes, c.length, c.flags);
+        const DecodeResult r = decode_exact(c.bytes);
+        REQUIRE(r.status == DecodeStatus::Ok);
+        CHECK(r.disp_offset == c.disp_offset);
+        CHECK(r.disp_size == c.disp_size);
+        if (r.disp_size != 0) {
+            CHECK(r.disp_offset + r.disp_size <= r.length);
+        }
+    }
+    // Not Ok: no displacement is reported.
+    const Bytes vex = {0xC5, 0xF8, 0x10, 0x84, 0x87, 0x00, 0x00, 0x00, 0x00, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC};
+    const DecodeResult u = decode_instruction(vex.data(), vex.size());
+    if (u.status != DecodeStatus::Ok) {
+        CHECK(u.disp_offset == 0);
+        CHECK(u.disp_size == 0);
+    }
+    const Bytes cut = {0x8B, 0x84, 0x87, 0x00};
+    const DecodeResult t = decode_instruction(cut.data(), cut.size());
+    CHECK(t.status == DecodeStatus::Truncated);
+    CHECK(t.disp_offset == 0);
+    CHECK(t.disp_size == 0);
+}
+
 TEST_CASE("a linear sweep over a realistic function prologue finds every boundary") {
     // cl RelWithDebInfo style: sub rsp, 38h / mov [rsp+40h], rcx / lea rax,[rip+..] / call / add rsp / ret
     const Bytes code = {

@@ -156,9 +156,11 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
   - Not fuzzed: the hook decoder, the user-hook scanner, the bind planner and the toolchain parser.
   - Only RelWithDebInfo is fuzzed (ASan needs the release CRT).
 - **Real-project findings (WP-26 corpus, ADR-0036).**
-  - **Image-relative array indexing (F-2, cl):** a translation unit that indexes a global array by a variable through
-    `__ImageBase` (`lea rcx, __ImageBase` + `[rcx+rax*4+sym@IMGREL]`, ADDR32NB) is refused with CML3101 for the whole TU,
-    whichever function was edited. This is ordinary code (raylib `rcore.c`), so it excludes many cl TUs.
+  - **Image-relative references to old data (F-2, cl):** when a function has `__ImageBase` in a register (it has a switch
+    jump table, or indexes two or more global arrays), cl with optimisation addresses globals as
+    `[reg+index*scale+sym@IMGREL]` (ADDR32NB), and the translation unit is refused with CML3101, whichever function was
+    edited. This is ordinary code (raylib `rcore.c`), so it excludes many cl TUs. One array indexed by a variable is not
+    enough to trigger it (ADR-0042). Being fixed by WP-36.
   - **Overloaded statics (F-4):** any `static` / `static inline` overload set in a header (Dear ImGui's `ImFloor`) refuses
     every TU that includes it (CML3214), because the PDB reader has no type information yet.
   - **VEX prologues:** the hook decoder refuses functions that start with a VEX-encoded (C4/C5) instruction; the STL's AVX

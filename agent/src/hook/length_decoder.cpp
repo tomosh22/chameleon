@@ -153,10 +153,10 @@ constexpr bool is_legacy_prefix(std::uint8_t b) noexcept {
 }
 
 constexpr DecodeResult unknown() noexcept {
-    return DecodeResult{DecodeStatus::Unknown, 0, 0};
+    return DecodeResult{DecodeStatus::Unknown, 0, 0, 0, 0};
 }
 constexpr DecodeResult truncated() noexcept {
-    return DecodeResult{DecodeStatus::Truncated, 0, 0};
+    return DecodeResult{DecodeStatus::Truncated, 0, 0, 0, 0};
 }
 
 }  // namespace
@@ -224,6 +224,8 @@ DecodeResult decode_instruction(const std::uint8_t* code, std::size_t available)
 
     std::uint8_t flags = 0;
     std::size_t immediate = 0;
+    std::size_t disp_offset = 0;
+    std::size_t disp_size = 0;
 
     // ModRM, SIB, displacement (64-bit addressing; a 67 prefix selects 32-bit addressing, which has
     // the same ModRM/SIB/displacement layout).
@@ -257,6 +259,10 @@ DecodeResult decode_instruction(const std::uint8_t* code, std::size_t available)
             } else {
                 displacement = 4;
             }
+        }
+        if (displacement != 0) {
+            disp_offset = i;
+            disp_size = displacement;
         }
         i += displacement;
 
@@ -333,7 +339,8 @@ DecodeResult decode_instruction(const std::uint8_t* code, std::size_t available)
     if ((attributes & RET) != 0) flags = static_cast<std::uint8_t>(flags | kInsnRet);
     if ((attributes & TRAP) != 0) flags = static_cast<std::uint8_t>(flags | kInsnTrap);
 
-    return DecodeResult{DecodeStatus::Ok, static_cast<std::uint8_t>(i), flags};
+    return DecodeResult{DecodeStatus::Ok, static_cast<std::uint8_t>(i), flags, static_cast<std::uint8_t>(disp_offset),
+                        static_cast<std::uint8_t>(disp_size)};
 }
 
 }  // namespace cml::agent::hook

@@ -39,6 +39,13 @@ struct DecodeResult {
     DecodeStatus status = DecodeStatus::Unknown;
     std::uint8_t length = 0;  // 1..15 when status == Ok, else 0
     std::uint8_t flags = 0;   // kInsn* bits, only when status == Ok
+    // The displacement of the ModRM memory operand, only when status == Ok (ADR-0042): `disp_size` is 0 (no memory
+    // operand, or one without a displacement), 1 or 4, and `disp_offset` is where it starts, counted from the first
+    // byte of the instruction (0 when disp_size == 0). The processor sign-extends a displacement to 64 bits, which an
+    // immediate of the same width is not guaranteed to be; the broker uses this to tell the two apart at a relocation
+    // site. Branch targets (rel8/rel32) and moffs operands are immediates here, never displacements.
+    std::uint8_t disp_offset = 0;
+    std::uint8_t disp_size = 0;
 };
 
 // Length of the one instruction at `code`, looking at no more than `available` bytes.

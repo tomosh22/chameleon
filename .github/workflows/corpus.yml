@@ -20,7 +20,7 @@ on:
       - 'tests/corpus/**'
       - '.github/workflows/corpus.yml'
   push:
-    branches: ['wp/26-*']
+    branches: ['wp/26-*', 'wp/3*']
     paths:
       - 'tests/corpus/**'
       - '.github/workflows/corpus.yml'
@@ -33,7 +33,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # `push` runs (branch wp/26-*) skip Godot, whose cold build takes hours and would be cancelled by the next push; the
+  # `push` runs (branches wp/26-*, wp/3*) skip Godot, whose cold build takes hours and would be cancelled by the next push; the
   # pull_request, schedule and workflow_dispatch runs include it. workflow_dispatch can pick one project.
   plan:
     name: plan

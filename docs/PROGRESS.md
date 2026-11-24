@@ -42,6 +42,10 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-35 | File and line on diag events (ADR-0040) | 9 | done | wp/35-diag-locations | #58 (38676cd) | ci 14/14 x2, vscode and vs at 25c4b84 verified (WP35-LOC line=12 col=0 cl / col=15 clang-cl, WP35-VSCODE result=ok C2059 line 12, WP35-VS result=ok line 12); medium review, 2 important + 4 nits fixed. Merged before WP-33 (no shared files) |
 | WP-27 | Performance budgets | 7 | done | wp/27-perf-budgets | #42 (f39dc19) | CI 14/14 push 42460887634 + PR 42460890741 at 00e0ac6; pdb index 328 ms/544 MiB (budget 4352), reload excl. compile median 40.9 ms, idle CPU 0.000 %, large-PDB broker 219 MiB = 0.40x PDB, session broker peak 11.0 MiB (limit 1.5x PDB + 32 MiB baseline). Test-coverage gap: no reload measured inside the large PDB (benchmark has no agent). |
 | WP-28 | Fuzzing and failure injection | 7 | done | wp/28-fuzz-injection | #44 (5b6dffb) | CI 14/14 x2 + fuzz 6/6 (incl. OFF build) at e41c1f5 verified; inject_stages 89/89, crash_reexecute 25/25, agent_hook 25/25 (windows-2025 clang-cl RelWithDebInfo); 8 high findings fixed, post-patch-hooks fires before commit; delta checked |
+| WP-36 | Image-relative references to old data (R-01, F-2; ADR-0042) | 10 | in progress | wp/36-imgrel | — | — |
+| WP-37 | PDB type stream; static overloads and lambda-local statics (R-02, R-03; ADR-0042) | 10 | in progress | wp/37-pdb-types | — | — |
+| WP-38 | VEX/EVEX in the hook length decoder; decoder fuzzing (R-04, R-41; ADR-0042) | 10 | in progress | wp/38-vex-decoder | — | — |
+| WP-39 | Reload timing inside a large PDB, with budgets (R-13; ADR-0042) | 10 | in progress | wp/39-large-pdb-reload | — | — |
 
 ## Orchestrator integration work
 
@@ -119,3 +123,9 @@ Wave 6 complete. Wave 7 is paused at the user's request: WP-23, WP-27 and WP-28 
 **Wave 9 complete (2026-11-23):** WP-33..35 done. Merge order changed from ADR-0040's 33→35→34 to 35→34→33: the PRs shared no files and WP-33 needed further review rounds. Remaining follow-ups (WP-34 review nits, the real-VS suspended attach, CML1712 subdirectory case) are in KNOWN_LIMITATIONS.
 
 **v1 plan complete (2026-11-23).** All WPs of the implementation plan are done. What remains for a competitive product is in `docs/ROADMAP.md` (ADR-0041); the recommended wave 10 is R-01, R-02/R-03, R-04, R-13.
+
+**Wave 10 launched (2026-11-24):** WP-36..39 in parallel under ADR-0042 (R-01, R-02 + R-03, R-04 with decoder fuzzing, R-13).
+Before the launch the orchestrator ran a compiler-output spike for R-01 (run 45402685481): the checked-in F-2 repro does not
+reproduce the finding, and the roadmap's proposed direction would not have fixed raylib; ADR-0042 records the evidence and
+the design chosen instead. The same PR adds `DecodeResult::disp_offset`/`disp_size` to the length decoder (used by WP-36,
+kept by WP-38).
