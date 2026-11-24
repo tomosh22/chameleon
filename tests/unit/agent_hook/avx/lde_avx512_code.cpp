@@ -130,8 +130,9 @@ CML_AVX_NOINLINE __m512i int_arith(const __m512i* a, __m512i y, __mmask16 k) {
     return _mm512_add_epi32(r, _mm512_set1_epi32(k));  // vpbroadcastd from a general register
 }
 
-// Four short functions instead of one long one: cl 14.44 and 14.52 fail with C1001 (an internal error of the
-// optimiser) on the thirteen statements together at /O2, although each compiles alone.
+// Short functions on purpose: cl 14.44 and 14.52 fail with C1001 (an internal error of the optimiser, at /O2) on
+// longer chains of these, e.g. on _mm512_mask_blend_epi8 followed by _mm512_maskz_mov_epi8 with the same mask. Each of
+// the functions below was compiled alone with both compilers before it was written this way.
 CML_AVX_NOINLINE __m512i int_permutes(__m512i a, __m512i b, __m512i control) {
     __m512i r = _mm512_shuffle_epi8(a, control);
     r = _mm512_shuffle_epi32(r, _MM_PERM_BADC);
@@ -145,16 +146,28 @@ CML_AVX_NOINLINE __m512i int_lanes(__m512i a, __m512i b) {
     return _mm512_alignr_epi8(r, a, 5);
 }
 
-CML_AVX_NOINLINE __m512i int_blends(__m512i a, __m512i b, __mmask64 k) {
-    __m512i r = _mm512_mask_blend_epi8(k, a, b);
-    r = _mm512_maskz_mov_epi8(k, r);
-    r = _mm512_unpacklo_epi16(r, _mm512_unpackhi_epi64(a, b));
-    return _mm512_packs_epi32(r, _mm512_packus_epi16(a, b));
+CML_AVX_NOINLINE __m512i int_blend(__m512i a, __m512i b, __mmask64 k) {
+    return _mm512_mask_blend_epi8(k, a, b);
 }
 
-CML_AVX_NOINLINE __m512i int_halves(__m512i a, __m512i b) {
-    const __m512i r = _mm512_inserti32x8(a, _mm512_extracti64x4_epi64(b, 1), 0);
-    return _mm512_inserti64x2(r, _mm512_extracti32x4_epi32(b, 3), 2);
+CML_AVX_NOINLINE __m512i int_masked_move(__m512i a, __mmask64 k) {
+    return _mm512_maskz_mov_epi8(k, a);
+}
+
+CML_AVX_NOINLINE __m512i int_unpacks(__m512i a, __m512i b) {
+    return _mm512_unpacklo_epi16(a, _mm512_unpackhi_epi64(a, b));
+}
+
+CML_AVX_NOINLINE __m512i int_packs(__m512i a, __m512i b) {
+    return _mm512_packs_epi32(a, _mm512_packus_epi16(a, b));
+}
+
+CML_AVX_NOINLINE __m512i int_upper_half(__m512i a, __m512i b) {
+    return _mm512_inserti32x8(a, _mm512_extracti64x4_epi64(b, 1), 0);
+}
+
+CML_AVX_NOINLINE __m512i int_quarter(__m512i a, __m512i b) {
+    return _mm512_inserti64x2(a, _mm512_extracti32x4_epi32(b, 3), 2);
 }
 
 CML_AVX_NOINLINE __m512i conversions(__m512 f, __m512d d, __m512i q, __m256i* narrow, __m128i* bytes) {
@@ -210,8 +223,12 @@ std::uintptr_t anchor() {
     CML_AVX_KEEP(int_arith);
     CML_AVX_KEEP(int_permutes);
     CML_AVX_KEEP(int_lanes);
-    CML_AVX_KEEP(int_blends);
-    CML_AVX_KEEP(int_halves);
+    CML_AVX_KEEP(int_blend);
+    CML_AVX_KEEP(int_masked_move);
+    CML_AVX_KEEP(int_unpacks);
+    CML_AVX_KEEP(int_packs);
+    CML_AVX_KEEP(int_upper_half);
+    CML_AVX_KEEP(int_quarter);
     CML_AVX_KEEP(conversions);
     CML_AVX_KEEP(gather_scatter);
     CML_AVX_KEEP(vl_forms);
