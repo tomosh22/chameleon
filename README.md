@@ -52,6 +52,9 @@ other hosts for syntax checking only (not a supported configuration).
 See section 6 of `docs/IMPLEMENTATION_PLAN.md`. Vendored dependencies and their licences are
 listed in `third_party/README.md`. Per-work-package notes are in `docs/wp/`.
 
+What is still missing, and in what order to do it, is in `docs/ROADMAP.md` (ADR-0041); per-diagnostic
+limitations are in `docs/KNOWN_LIMITATIONS.md`.
+
 ## Licence
 
 Chameleon is proprietary, commercial software: all rights reserved (see `LICENSE`, ADR-0039). Use

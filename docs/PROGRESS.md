@@ -117,3 +117,5 @@ Wave 6 complete. Wave 7 is paused at the user's request: WP-23, WP-27 and WP-28 
 **Wave 9 launched (2026-11-23):** WP-33..35, the wave-8 follow-ups, in parallel under ADR-0040, as the user asked.
 
 **Wave 9 complete (2026-11-23):** WP-33..35 done. Merge order changed from ADR-0040's 33→35→34 to 35→34→33: the PRs shared no files and WP-33 needed further review rounds. Remaining follow-ups (WP-34 review nits, the real-VS suspended attach, CML1712 subdirectory case) are in KNOWN_LIMITATIONS.
+
+**v1 plan complete (2026-11-23).** All WPs of the implementation plan are done. What remains for a competitive product is in `docs/ROADMAP.md` (ADR-0041); the recommended wave 10 is R-01, R-02/R-03, R-04, R-13.

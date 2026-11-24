@@ -946,3 +946,22 @@ overlaps in the capability and event lists).
 `restarting`; WP-35 adds `diag-locations`. In `integrations/vs/`, WP-34 owns `ChameleonController.cs`, the re-attach code
 and `VsDebuggerAttach.cs`, and WP-35 owns `ErrorListSink.cs` and the diag parsing in `Chameleon.Control`. Both may add
 tests in their own files.
+
+## ADR-0041 v1 plan complete; follow-on work is tracked in docs/ROADMAP.md
+
+**Date:** 2026-11-23 · **Status:** Accepted
+
+Every work package of `docs/IMPLEMENTATION_PLAN.md` (WP-01..WP-35, waves 1–9) is merged and verified on the Windows CI
+matrix. The plan's bar for v1 (§2, "as robust as Live++ on Windows for the supported subset") is not yet met on real
+code: the WP-26 corpus still has refusals of ordinary code (F-2, F-4, VEX prologues), and the product has had no real use.
+
+Decisions:
+- `docs/ROADMAP.md` is the single index of follow-on work, with stable ids `R-nn`. New waves cite the R-ids they close;
+  a closed item is marked done there with its PR, as PROGRESS does for WPs.
+- Per-diagnostic detail stays in `docs/KNOWN_LIMITATIONS.md`; ROADMAP links to it rather than repeating it.
+- Recommended next engineering wave (wave 10): R-01 (image-relative array indexing), R-02 + R-03 (PDB type stream for
+  static overloads and same-named local statics), R-04 (VEX/EVEX in the hook decoder, with decoder fuzzing), R-13
+  (reload timing in a large PDB). Its acceptance is the corpus: the F-2 xfail flips to pass, the ImGui CML3214
+  refusals become reloads, and `cml_lde_probe` reports `refused_vex=0`.
+- Plan §2's differentiator "source-available licensing" no longer applies after ADR-0039; positioning is an open user
+  decision (R-30).
