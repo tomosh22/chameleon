@@ -706,6 +706,15 @@ private:
             std::printf("%s\n", timing.c_str());
             std::fflush(stdout);
         }
+        // WP-36 evidence (ADR-0042): the image-relative (ADDR32NB) references to data of the old image in the objects this
+        // reload planned, and how many of them the planner proved to be address displacements and retargeted. N > 0 only
+        // where the compiler emits them (cl with optimisation, fixture `imgrel`).
+        if (const ipc::json::Value* sites = response->result.find("imgrel_sites"); sites != nullptr && sites->is_integer()) {
+            std::printf("WP36-IMGREL sites=%lld verified=%lld fixture=%s compiler=%s config=%s\n", static_cast<long long>(sites->as_integer()),
+                        static_cast<long long>(response->result.get_integer("imgrel_verified")), scenario_.fixture.c_str(), report_.compiler.c_str(),
+                        options_.config.c_str());
+            std::fflush(stdout);
+        }
         {
             std::ofstream out(options_.artifacts_dir / "reload-result.json", std::ios::binary | std::ios::app);
             out << ipc::json::serialize(response->result) << "\n";

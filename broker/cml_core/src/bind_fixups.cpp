@@ -51,6 +51,17 @@ Result<std::vector<FixupTriple>> make_fixup_triples(const BindPlan& plan, const 
                                       "Reserve the patch within +-2 GiB of the module (the loader does this), or hot-restart.");
                 }
                 t.value = static_cast<std::uint32_t>(static_cast<std::int32_t>(disp));
+            } else if (f.kind == FixupKind::Addr32NbDisp) {
+                // WP-36 (ADR-0042): the displacement of `[reg + index*scale + disp32]` with the register holding the
+                // patch's __ImageBase; the processor sign-extends it, so it must fit a signed 32-bit field.
+                const std::int64_t disp = static_cast<std::int64_t>(target - layout.patch_base);
+                if (disp < INT32_MIN || disp > INT32_MAX) {
+                    return Diag::make(diag::kImgrelOutOfRange,
+                                      "the image-relative displacement to '" + f.symbol + "' does not fit 32 bits: patch base " + hex(layout.patch_base) +
+                                          ", target " + hex(target) + " (section '" + f.section_name + "' + " + hex(f.offset) + ")",
+                                      "Reserve the patch within +-2 GiB of the module (the loader does this), or hot-restart.");
+                }
+                t.value = static_cast<std::uint32_t>(static_cast<std::int32_t>(disp));
             } else if (f.kind == FixupKind::SecRel32) {
                 const std::int64_t v = static_cast<std::int64_t>(f.target_section_offset) + f.addend;
                 if (v < 0 || v > static_cast<std::int64_t>(UINT32_MAX)) {

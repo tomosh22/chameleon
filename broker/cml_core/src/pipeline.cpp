@@ -105,6 +105,8 @@ ipc::json::Value to_json(const PatchReport& r) {
     v.set("thunks", n(r.thunks));
     v.set("fixups", n(r.fixups));
     v.set("pre_applied", n(r.pre_applied));
+    v.set("imgrel_sites", n(r.imgrel_sites));
+    v.set("imgrel_verified", n(r.imgrel_verified));
     v.set("initializers", n(r.initializers));
     v.set("initializers_run", n(r.initializers_run));
     v.set("load_attempts", n(r.load_attempts));
@@ -712,6 +714,10 @@ private:
         for (const Diag& w : plan.warnings) {
             warn(report, "plan", w);
         }
+        // WP-36 evidence: image-relative references to old data in this object, and how many were proved displacements.
+        report.imgrel_sites += plan.imgrel_sites;
+        report.imgrel_verified += plan.imgrel_verified;
+        CML_LOG(Info, "%s", plan.imgrel_line(in.object_name).c_str());
         NarrowInput ni;
         ni.object = &object->object;
         ni.plan = &plan;

@@ -1,0 +1,20 @@
+{
+  "fixture": "imgrel",
+  "edit": "dispatch_v2.edit (imgrel.c)",
+  "min_hooks": 2,
+  "min_bind_old_data": 3,
+  "exact_hooks": true,
+  "expect": [
+    { "symbol": "ig_mixed", "decision": "patch-hooked" },
+    { "symbol": "ig_wide", "decision": "patch-hooked" },
+    { "symbol": "CORE", "decision": "bind-old-data" },
+    { "symbol": "fptab", "decision": "bind-old-data" },
+    { "symbol": "sarr", "decision": "bind-old-data", "source": "compiland-static" },
+    { "symbol": "ig_g", "decision": "bind-old-function" }
+  ],
+  "absent": [
+    { "symbol": "CORE", "decision": "patch-new-data" },
+    { "symbol": "fptab", "decision": "patch-new-data" },
+    { "symbol": "sarr", "decision": "patch-new-data" }
+  ]
+}
