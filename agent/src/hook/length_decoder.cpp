@@ -153,10 +153,10 @@ constexpr bool is_legacy_prefix(std::uint8_t b) noexcept {
 }
 
 constexpr DecodeResult unknown() noexcept {
-    return DecodeResult{DecodeStatus::Unknown, 0, 0};
+    return DecodeResult{DecodeStatus::Unknown, 0, 0, 0, 0};
 }
 constexpr DecodeResult truncated() noexcept {
-    return DecodeResult{DecodeStatus::Truncated, 0, 0};
+    return DecodeResult{DecodeStatus::Truncated, 0, 0, 0, 0};
 }
 
 }  // namespace
@@ -170,6 +170,7 @@ DecodeResult decode_instruction(const std::uint8_t* code, std::size_t available)
     // makes the processor ignore the REX.
     std::size_t i = 0;
     bool operand_size = false;
+    std::uint8_t prefix_flags = 0;  // kInsnAddr32, kInsnSegFsGs
     std::uint8_t rex = 0;
     unsigned prefix_count = 0;
     for (;;) {
@@ -179,6 +180,11 @@ DecodeResult decode_instruction(const std::uint8_t* code, std::size_t available)
         const std::uint8_t b = code[i];
         if (is_legacy_prefix(b)) {
             operand_size = operand_size || b == 0x66;
+            if (b == 0x67) {
+                prefix_flags = static_cast<std::uint8_t>(prefix_flags | kInsnAddr32);
+            } else if (b == 0x64 || b == 0x65) {
+                prefix_flags = static_cast<std::uint8_t>(prefix_flags | kInsnSegFsGs);
+            }
             rex = 0;
         } else if ((b & 0xF0) == 0x40) {
             rex = b;
@@ -222,8 +228,10 @@ DecodeResult decode_instruction(const std::uint8_t* code, std::size_t available)
         return unknown();
     }
 
-    std::uint8_t flags = 0;
+    std::uint8_t flags = prefix_flags;
     std::size_t immediate = 0;
+    std::size_t disp_offset = 0;
+    std::size_t disp_size = 0;
 
     // ModRM, SIB, displacement (64-bit addressing; a 67 prefix selects 32-bit addressing, which has
     // the same ModRM/SIB/displacement layout).
@@ -257,6 +265,10 @@ DecodeResult decode_instruction(const std::uint8_t* code, std::size_t available)
             } else {
                 displacement = 4;
             }
+        }
+        if (displacement != 0) {
+            disp_offset = i;
+            disp_size = displacement;
         }
         i += displacement;
 
@@ -333,7 +345,8 @@ DecodeResult decode_instruction(const std::uint8_t* code, std::size_t available)
     if ((attributes & RET) != 0) flags = static_cast<std::uint8_t>(flags | kInsnRet);
     if ((attributes & TRAP) != 0) flags = static_cast<std::uint8_t>(flags | kInsnTrap);
 
-    return DecodeResult{DecodeStatus::Ok, static_cast<std::uint8_t>(i), flags};
+    return DecodeResult{DecodeStatus::Ok, static_cast<std::uint8_t>(i), flags, static_cast<std::uint8_t>(disp_offset),
+                        static_cast<std::uint8_t>(disp_size)};
 }
 
 }  // namespace cml::agent::hook

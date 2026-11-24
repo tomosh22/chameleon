@@ -153,19 +153,21 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
   - If an injected post-patch-hooks rollback is incomplete (CML4656), the patch image stays mapped with some hooks possibly live;
     restart the application. A later revert of that batch may report hooks it cannot find.
 - **Fuzzing (WP-28)** covers the COFF, PE, PDB, IPC and control-JSON readers.
-  - Not fuzzed: the hook decoder, the user-hook scanner, the bind planner and the toolchain parser.
+  - Not fuzzed: the hook decoder (WP-38 adds it), the user-hook scanner, the bind planner and the toolchain parser.
   - Only RelWithDebInfo is fuzzed (ASan needs the release CRT).
 - **Real-project findings (WP-26 corpus, ADR-0036).**
-  - **Image-relative array indexing (F-2, cl):** a translation unit that indexes a global array by a variable through
-    `__ImageBase` (`lea rcx, __ImageBase` + `[rcx+rax*4+sym@IMGREL]`, ADDR32NB) is refused with CML3101 for the whole TU,
-    whichever function was edited. This is ordinary code (raylib `rcore.c`), so it excludes many cl TUs.
+  - **Image-relative references to old data (F-2, cl):** when a function has `__ImageBase` in a register (it has a switch
+    jump table, or indexes two or more global arrays), cl with optimisation addresses globals as
+    `[reg+index*scale+sym@IMGREL]` (ADDR32NB), and the translation unit is refused with CML3101, whichever function was
+    edited. This is ordinary code (raylib `rcore.c`), so it excludes many cl TUs. One array indexed by a variable is not
+    enough to trigger it (ADR-0042). Being fixed by WP-36.
   - **Overloaded statics (F-4):** any `static` / `static inline` overload set in a header (Dear ImGui's `ImFloor`) refuses
-    every TU that includes it (CML3214), because the PDB reader has no type information yet.
+    every TU that includes it (CML3214), because the PDB reader has no type information yet. Being fixed by WP-37.
   - **VEX prologues:** the hook decoder refuses functions that start with a VEX-encoded (C4/C5) instruction; the STL's AVX
-    helpers and 220 of Godot's 512 467 functions do. Such a function cannot be hooked.
+    helpers and 220 of Godot's 512 467 functions do. Such a function cannot be hooked. Being fixed by WP-38.
   - **Same-named function-local statics in one function (F-4 family):** several lambdas in one function each defining
     a local static of the same name (Godot's `SNAME` in `scene/main/scene_tree.cpp`: `$TSS0`, `sname`) cannot be told
-    apart; the planner refuses the TU with CML3207/CML3214 (found by WP-26b).
+    apart; the planner refuses the TU with CML3207/CML3214 (found by WP-26b). Being fixed by WP-37.
   - **Unreadable C static names (WP-26c):** a writable static whose name is neither a plain identifier, an MS-decorated
     name, a clang-cl C spelling (`a`, `a.N`, `f.x`, `f.x.N`) nor on the compiler-generated list is refused with CML3500
     rather than reset. No fixture or corpus case hits it.
