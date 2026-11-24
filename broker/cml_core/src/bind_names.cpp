@@ -150,12 +150,34 @@ std::string parse_fragment(Reader& r) {
     return id;
 }
 
+// The length of "?<number>" at `at` when it opens the function scope of a local entity ("?<number>?" followed by the
+// enclosing function's own decorated name), else 0. The number is the block the entity was declared in: one digit
+// ('0'..'9' stand for 1..10), or, from block 11 on, hexadecimal letters 'A'..'P' closed by '@' (cl writes block 11 as
+// "?L@?", observed in Godot's scene_tree.cpp). The letters form is only taken when the nested name follows ("@?"), so
+// an anonymous namespace ("?A0x1234abcd@") and a template ("?$") are never mistaken for it.
+std::size_t function_scope_length(std::string_view s, std::size_t at) noexcept {
+    if (at + 1 >= s.size() || s[at] != '?') {
+        return 0;
+    }
+    if (is_digit(s[at + 1])) {
+        return 2;
+    }
+    std::size_t k = at + 1;
+    while (k < s.size() && s[k] >= 'A' && s[k] <= 'P') {
+        ++k;
+    }
+    if (k == at + 1 || k + 1 >= s.size() || s[k] != '@' || s[k + 1] != '?') {
+        return 0;
+    }
+    return k + 1 - at;
+}
+
 Scope parse_qualified(Reader& r) {
     Scope sc;
     while (r.ok && !r.at_end() && r.peek() != '@') {
-        if (r.peek() == '?' && is_digit(r.peek(1))) {
+        if (const std::size_t scope = function_scope_length(r.s, r.i); scope != 0) {
             // Function scope of a local entity: "?<n>?" followed by the enclosing function's own name.
-            r.i += 2;
+            r.i += scope;
             if (r.peek() == '?') {
                 ++r.i;
             }
@@ -495,20 +517,12 @@ std::string_view call_operator_scope(std::string_view d) {
     if (at >= d.size() || d[at] != '?') {
         return {};
     }
-    ++at;
-    // The scope number: one digit, or hexadecimal letters 'A'..'P' closed by '@'.
-    if (at < d.size() && is_digit(d[at])) {
-        ++at;
-    } else {
-        std::size_t k = at;
-        while (k < d.size() && d[k] >= 'A' && d[k] <= 'P') {
-            ++k;
-        }
-        if (k == at || k >= d.size() || d[k] != '@') {
-            return {};
-        }
-        at = k + 1;
+    // The scope number (function_scope_length), then the '?' that opens the nested name.
+    const std::size_t scope = function_scope_length(d, at);
+    if (scope == 0) {
+        return {};
     }
+    at += scope;
     if (at >= d.size() || d[at] != '?') {
         return {};
     }
@@ -540,7 +554,8 @@ bool is_tu_private_name(std::string_view d) {
         return true;
     }
     for (std::size_t k = 0; k + 3 < d.size(); ++k) {
-        if (d[k] == '?' && is_digit(d[k + 1]) && d[k + 2] == '?' && d[k + 3] == '?') {
+        const std::size_t scope = function_scope_length(d, k);
+        if (scope != 0 && k + scope + 1 < d.size() && d[k + scope] == '?' && d[k + scope + 1] == '?') {
             return true;
         }
     }

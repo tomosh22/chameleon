@@ -181,6 +181,26 @@ private:
     std::uint32_t first_ = 0x1000;
 };
 
+// A `.debug$S` section around symbol records: the C13 signature, an unrelated subsection (a string table, 0xF3, so the
+// symbols do not start right after the signature) and one symbols subsection (0xF1). `base` receives the offset of the
+// first symbol record within the section.
+inline Bytes debug_s_section(const Bytes& symbols, std::uint32_t* base = nullptr) {
+    Bytes out;
+    put32(out, 4);  // C13 signature
+    put32(out, 0xF3);
+    put32(out, 5);
+    out.insert(out.end(), {0, 'a', '.', 'c', 0});
+    pad4(out);
+    put32(out, 0xF1);
+    put32(out, static_cast<std::uint32_t>(symbols.size()));
+    if (base != nullptr) {
+        *base = static_cast<std::uint32_t>(out.size());
+    }
+    out.insert(out.end(), symbols.begin(), symbols.end());
+    pad4(out);
+    return out;
+}
+
 // A `.debug$S` section with one symbols subsection holding one procedure record per entry. `offset_fields` receives,
 // per entry, the offset within the section of the record's code-offset field (where the object has its SECREL
 // relocation).
@@ -197,18 +217,8 @@ inline Bytes debug_s(const std::vector<DebugSProc>& procs, std::vector<std::uint
         symbols.proc(p.kind, p.name, 0, 0, 0x10, 0, p.type);
         symbols.add(p.kind == 0x1146 || p.kind == 0x1147 ? std::uint16_t{0x114F} : std::uint16_t{0x0006}, Bytes());  // S_PROC_ID_END / S_END
     }
-    Bytes out;
-    put32(out, 4);  // C13 signature
-    // An unrelated subsection first (string table, 0xF3), so the symbols do not start right after the signature.
-    put32(out, 0xF3);
-    put32(out, 5);
-    out.insert(out.end(), {0, 'a', '.', 'c', 0});
-    pad4(out);
-    put32(out, 0xF1);
-    put32(out, static_cast<std::uint32_t>(symbols.bytes().size()));
-    const std::uint32_t base = static_cast<std::uint32_t>(out.size());
-    out.insert(out.end(), symbols.bytes().begin(), symbols.bytes().end());
-    pad4(out);
+    std::uint32_t base = 0;
+    Bytes out = debug_s_section(symbols.bytes(), &base);
     if (offset_fields != nullptr) {
         for (const std::uint32_t s : starts) {
             offset_fields->push_back(base + s + 4 + 28);

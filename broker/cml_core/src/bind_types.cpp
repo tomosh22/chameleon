@@ -160,6 +160,39 @@ void ObjectSignatures::load() {
                 } else if (it->second.type_index != p.type_index || it->second.type_is_id != p.type_is_id) {
                     it->second.conflict = true;
                 }
+                // The function-local statics of the procedure: each record names its variable through the SECREL
+                // relocation on its offset field, like the procedure record names its function.
+                ProcStatics& statics = it->second.statics;
+                if (!inserted) {
+                    if (!statics.statics.empty() || !p.statics.empty()) {
+                        statics.usable = false;
+                        statics.why = "two procedure records of " + object_name_ + " name this function";
+                    }
+                    continue;
+                }
+                if (!p.statics_complete) {
+                    statics.usable = false;
+                    statics.why = "the procedure has more than " + std::to_string(pdb::kMaxProcStatics) + " function-local statics";
+                }
+                for (const pdb::ProcStatic& s : p.statics) {
+                    LocalStatic local;
+                    local.record = s;
+                    const auto data_site = secrel.find(s.offset_field);
+                    const coff::Symbol* variable = data_site == secrel.end() ? nullptr : object_.symbol_at(data_site->second);
+                    if (variable != nullptr && variable->section_number > 0 && static_cast<std::uint64_t>(s.offset_field) + 4 <= bytes.size()) {
+                        const std::uint64_t at = static_cast<std::uint64_t>(variable->value) + rd32(bytes.data() + s.offset_field);
+                        if (at <= 0xFFFFFFFFull) {
+                            local.section = static_cast<std::uint32_t>(variable->section_number);
+                            local.value = static_cast<std::uint32_t>(at);
+                            const std::uint64_t data_key = (static_cast<std::uint64_t>(local.section) << 32) | at;
+                            const auto [owner, first] = static_owner_.try_emplace(data_key, key);
+                            if (!first && owner->second != key) {
+                                owner->second = kSeveralFunctions;
+                            }
+                        }
+                    }
+                    statics.statics.push_back(std::move(local));
+                }
             }
         }
         if (bad_sections != 0) {
@@ -168,6 +201,38 @@ void ObjectSignatures::load() {
     }
     // The evidence line of ADR-0042 (WP-37): which path supplied the new side's types.
     CML_LOG(Info, "WP37-TYPES source=%s object=%s procs=%zu detail=%s", to_string(origin_), object_name_.c_str(), procs_.size(), detail_.c_str());
+}
+
+const ObjectSignatures::ProcStatics* ObjectSignatures::statics_of(std::uint32_t section, std::uint32_t value) {
+    if (!loaded_) {
+        load();
+    }
+    const auto it = procs_.find((static_cast<std::uint64_t>(section) << 32) | value);
+    return it == procs_.end() ? nullptr : &it->second.statics;
+}
+
+std::optional<std::uint64_t> ObjectSignatures::function_of_static(std::uint32_t section, std::uint32_t value) {
+    if (!loaded_) {
+        load();
+    }
+    const auto it = static_owner_.find((static_cast<std::uint64_t>(section) << 32) | value);
+    if (it == static_owner_.end() || it->second == kSeveralFunctions) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+std::optional<std::string> ObjectSignatures::type_text(std::uint32_t type_index, std::string* why) {
+    if (!loaded_) {
+        load();
+    }
+    if (types_ == nullptr) {
+        if (why != nullptr) {
+            *why = unknown_.why;
+        }
+        return std::nullopt;
+    }
+    return pdb::canonical_type(*types_, type_index, why);
 }
 
 const pdb::FunctionSignature& ObjectSignatures::at(std::uint32_t section, std::uint32_t value) {

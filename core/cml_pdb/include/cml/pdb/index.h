@@ -139,6 +139,13 @@ public:
     // type record; the first lookup reads the stream header and the type-index offset table of the hash stream, and
     // every lookup only the chunk of records around the index it asks for (cml/pdb/type_records.h).
     const TypeSource& types() const;
+    // WP-37 (ADR-0042, amended): the data records declared inside `proc` (a proc symbol of this index), in the order of
+    // the module stream, with the place of each in the procedure (ProcStatic::block_path). They are the symbols of
+    // compiland_symbols() whose parent_proc is `proc.index`, in the same order. Walks the compiland's module stream up
+    // to the end of the procedure; nothing is cached. `complete` turns false when the procedure has more than
+    // kMaxProcStatics of them. CML1413 when the stream is unreadable or the procedure's record is not found.
+    Result<std::vector<ProcStatic>> proc_statics(const SymbolView& proc, bool* complete = nullptr) const;
+
     // The canonical signature of a proc symbol of this index (compiland_symbols / find_proc_by_rva). `known` is false
     // with a CML14xx id and a reason when the type streams or the records it needs cannot be read.
     FunctionSignature proc_signature(const SymbolView& proc) const;

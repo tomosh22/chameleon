@@ -1,8 +1,8 @@
 {
   "fixture": "lambda_statics",
   "edit": "mark_2.edit (logic.cpp)",
-  "min_hooks": 12,
-  "min_bind_old_data": 7,
+  "min_hooks": 15,
+  "min_bind_old_data": 11,
   "expect": [
     { "symbol": "ls_step", "decision": "patch-hooked", "source": "pdb-public" },
     { "symbol": "ls_make_name", "decision": "patch-hooked", "source": "pdb-public" },
@@ -12,12 +12,21 @@
     { "symbol_contains": "::operator()::$TSS0", "decision": "bind-old-data", "source": "compiland-static-closure", "when": "cl" },
     { "symbol_contains": "::operator()::$TSS0", "decision": "bind-old-data", "source": "compiland-layout", "when": "clang" },
     { "symbol": "(anonymous namespace)::s_constructions", "decision": "bind-old-data", "source": "compiland-static" },
-    { "symbol": "g_ls_last", "decision": "bind-old-data", "source": "pdb-public" }
+    { "symbol": "g_ls_last", "decision": "bind-old-data", "source": "pdb-public" },
+    { "symbol": "LsTree::flush", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol": "LsTree::timers", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol": "LsTree::options", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol_contains": "LsTree::flush::<lambda_", "decision": "bind-old-data", "source": "compiland-static-closure" },
+    { "symbol_contains": "LsTree::timers::<lambda_", "decision": "bind-old-data", "source": "compiland-static-closure" },
+    { "symbol": "LsTree::options::names", "decision": "bind-old-data", "source": "compiland-static-procedure" }
   ],
+  "allowed_warnings": ["CML3570"],
   "absent": [
     { "symbol_contains": "::operator()::sname", "decision": "patch-new-data" },
     { "symbol_contains": "::operator()::$TSS0", "decision": "patch-new-data" },
     { "symbol_contains": ">::operator()", "decision": "patch-new-function" },
-    { "symbol": "(anonymous namespace)::s_constructions", "decision": "patch-new-data" }
+    { "symbol": "(anonymous namespace)::s_constructions", "decision": "patch-new-data" },
+    { "symbol_contains": "LsTree::", "decision": "patch-new-data" },
+    { "symbol_contains": "LsTree::", "decision": "patch-new-function" }
   ]
 }

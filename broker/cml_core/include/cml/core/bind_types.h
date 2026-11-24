@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -38,6 +39,27 @@ public:
     // the reason) when the types are unreadable or the function has no procedure record.
     const pdb::FunctionSignature& at(std::uint32_t section, std::uint32_t value);
 
+    // ADR-0042, amended: the function-local statics of the object's procedures, as `.debug$S` records them (the planner
+    // tells same-named statics of one procedure apart by their place in it; the old side is PdbIndex::proc_statics).
+    struct LocalStatic {
+        pdb::ProcStatic record;
+        std::uint32_t section = 0;  // the data symbol the record names through its SECREL relocation; 0: none found
+        std::uint32_t value = 0;
+    };
+    struct ProcStatics {
+        std::vector<LocalStatic> statics;  // in the order the compiler emitted them
+        bool usable = true;                // false: `why`
+        std::string why;
+    };
+    // The statics declared in the function whose code starts at (section, value). nullptr: the function has no
+    // procedure record, or the debug sections are unreadable (detail()).
+    const ProcStatics* statics_of(std::uint32_t section, std::uint32_t value);
+    // The function, as (section << 32) | offset, in which the data symbol at (section, value) is declared. nullopt: no
+    // record of a procedure names it, or records of two procedures do.
+    std::optional<std::uint64_t> function_of_static(std::uint32_t section, std::uint32_t value);
+    // The canonical text of a type of the object (cml::pdb::canonical_type). nullopt with `why` when unreadable.
+    std::optional<std::string> type_text(std::uint32_t type_index, std::string* why);
+
     // Where the types came from; NotRead before the first at().
     ObjectTypeOrigin origin() const noexcept { return origin_; }
     // Unreadable: why. DebugT / TypeServer: a note ("precompiled types are not resolved", the PDB path).
@@ -51,6 +73,7 @@ private:
         bool conflict = false;  // two records for one address disagree
         bool computed = false;
         pdb::FunctionSignature signature;
+        ProcStatics statics;
     };
 
     void load();
@@ -65,6 +88,8 @@ private:
     std::unique_ptr<pdb::TypeServerPdb> type_server_;
     const pdb::TypeSource* types_ = nullptr;
     std::map<std::uint64_t, Proc> procs_;  // (section << 32) | offset
+    static constexpr std::uint64_t kSeveralFunctions = ~0ull;
+    std::map<std::uint64_t, std::uint64_t> static_owner_;  // data (section << 32) | offset -> its function, or kSeveralFunctions
     pdb::FunctionSignature unknown_;       // what at() returns when nothing can be known
     pdb::FunctionSignature no_record_;
 };

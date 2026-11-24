@@ -862,3 +862,173 @@ TEST_CASE("types: the translation-unit discriminator is not part of a signature"
     CHECK(a.class_unique_name == ".?AV<lambda_1>@?1??f@@YAXXZ@`9bfd0ef1");
     CHECK(b.class_unique_name == ".?AV<lambda_1>@?1??f@@YAXXZ@`a8f45668");
 }
+
+// ---- function-local statics and their place in the procedure (ADR-0042, amended) --------------------------------------
+
+namespace {
+
+// f() { static a;  { static names; { static deep; } }  { static names; }  <inlined call: static inl>  static tail; }
+// and g() { static names; } after it. `seg` / `off`: an address for a PDB, zero for an object.
+void write_two_procs(Records& r, std::uint16_t seg, std::uint32_t code, std::uint32_t data) {
+    const std::uint16_t dseg = static_cast<std::uint16_t>(seg == 0 ? 0 : 2);
+    r.proc(0x1110, "f", seg, code, 0x10);
+    r.data(0x110C, "a", dseg, data + 0x00);
+    r.block();
+    r.data(0x110C, "names", dseg, data + 0x08, kTDouble);
+    r.block();
+    r.data(0x110C, "deep", dseg, data + 0x10);
+    r.end();
+    r.end();
+    r.block();
+    r.data(0x1112, "names", dseg, data + 0x18);  // S_LTHREAD32
+    r.end();
+    r.add(0x114D, Bytes(12, 0));  // S_INLINESITE
+    r.data(0x110C, "inl", dseg, data + 0x20);
+    r.add(0x114E, Bytes());       // S_INLINESITE_END
+    r.data(0x110C, "tail", dseg, data + 0x28);
+    r.end();
+    r.proc(0x110F, "g", seg, code + 0x10, 0x10);
+    r.data(0x110C, "names", dseg, data + 0x30);
+    r.end();
+}
+
+void check_statics_of_f(const std::vector<cml::pdb::ProcStatic>& s) {
+    REQUIRE(s.size() == 6);
+    const char* const names[] = {"a", "names", "deep", "names", "inl", "tail"};
+    const std::vector<std::uint32_t> paths[] = {{}, {0}, {0, 0}, {1}, {}, {}};
+    for (std::size_t i = 0; i < 6; ++i) {
+        CAPTURE(i);
+        CHECK(s[i].name == names[i]);
+        CHECK(s[i].block_path == paths[i]);
+        CHECK(s[i].plain_scopes == (i != 4));  // `inl` is inside an inline site
+        CHECK(s[i].thread_storage == (i == 3));
+    }
+    CHECK(s[1].type_index == kTDouble);
+    CHECK(s[0].type_index == kTInt);
+}
+
+}  // namespace
+
+TEST_CASE("statics: the data records of a procedure and the blocks they sit in, read alike from an object and from a PDB") {
+    SUBCASE("an object's .debug$S") {
+        Records r;
+        r.data(0x110C, "file_scope", 0, 0);  // not in a procedure: nobody's static
+        write_two_procs(r, 0, 0, 0);
+        std::uint32_t base = 0;
+        const Bytes section = debug_s_section(r.bytes(), &base);
+        auto procs = cml::pdb::read_object_procs(span_of(section));
+        REQUIRE(procs.has_value());
+        REQUIRE(procs->size() == 2);
+        CHECK((*procs)[0].name == "f");
+        check_statics_of_f((*procs)[0].statics);
+        CHECK((*procs)[0].statics_complete);
+        REQUIRE((*procs)[1].statics.size() == 1);
+        CHECK((*procs)[1].statics[0].name == "names");
+        CHECK((*procs)[1].statics[0].block_path.empty());
+        // The offset field of a data record is where the object has the SECREL relocation that names the variable:
+        // record header (4), type index (4). The first record of f() follows the file-scope record and f's own.
+        const std::uint32_t first = (*procs)[0].statics[0].offset_field;
+        CHECK(first > base);
+        CHECK(first < (*procs)[0].statics[1].offset_field);
+        CHECK((*procs)[0].statics[0].rva == cml::pdb::kNoRva);
+    }
+    SUBCASE("the module stream of a PDB: the symbols of the compiland whose parent is the procedure, in the same order") {
+        Spec s;
+        s.sections = {{".text", 0x1000, 0x1000, 0x1000, 0x60000020}, {".data", 0x400, 0x3000, 0x400, 0xC0000040}};
+        Module m;
+        m.name = "C:\\proj\\obj\\logic.cpp.obj";
+        m.symbols.objname(m.name);
+        write_two_procs(m.symbols, 1, 0x100, 0x40);
+        s.modules.push_back(std::move(m));
+        TempDir dir;
+        const auto idx = open_spec(dir, s);
+        const std::vector<SymbolView> procs = procs_of(*idx);
+        REQUIRE(procs.size() == 2);
+        bool complete = false;
+        auto statics = idx->proc_statics(procs[0], &complete);
+        REQUIRE_MESSAGE(statics.has_value(), (statics.has_value() ? std::string() : statics.error().format()));
+        CHECK(complete);
+        check_statics_of_f(*statics);
+        // The same records as compiland_symbols() gives, by address.
+        auto all = idx->compiland_symbols(0);
+        REQUIRE(all.has_value());
+        std::vector<std::uint32_t> rvas;
+        for (const SymbolView& v : *all) {
+            if (v.parent_proc == procs[0].index && cml::pdb::is_data_kind(v.kind)) {
+                rvas.push_back(v.rva);
+            }
+        }
+        REQUIRE(rvas.size() == statics->size());
+        for (std::size_t i = 0; i < rvas.size(); ++i) {
+            CHECK((*statics)[i].rva == rvas[i]);
+        }
+        CHECK((*statics)[0].rva == 0x3040);
+        // g(): only its own.
+        auto of_g = idx->proc_statics(procs[1]);
+        REQUIRE(of_g.has_value());
+        REQUIRE(of_g->size() == 1);
+        CHECK((*of_g)[0].rva == 0x3070);
+        // Not a procedure of this index.
+        SymbolView not_a_proc = (*all)[0];
+        not_a_proc.kind = cml::pdb::SymbolKind::LocalData;
+        CHECK_FALSE(idx->proc_statics(not_a_proc).has_value());
+    }
+}
+
+TEST_CASE("statics: nesting the reader does not follow, and too many statics, are reported, never guessed") {
+    SUBCASE("65 nested blocks: the place of the record is unknown") {
+        Records r;
+        r.proc(0x1110, "f", 0, 0, 0x10);
+        for (int i = 0; i < 65; ++i) {
+            r.block();
+        }
+        r.data(0x110C, "bottom", 0, 0);
+        for (int i = 0; i < 65; ++i) {
+            r.end();
+        }
+        r.data(0x110C, "after", 0, 0);
+        r.end();
+        r.proc(0x1110, "g", 0, 0, 0x10);
+        r.data(0x110C, "mine", 0, 0);
+        r.end();
+        auto procs = cml::pdb::read_object_procs(span_of(debug_s_section(r.bytes())));
+        REQUIRE(procs.has_value());
+        REQUIRE(procs->size() == 2);
+        REQUIRE((*procs)[0].statics.size() == 2);
+        CHECK((*procs)[0].statics[0].name == "bottom");
+        CHECK_FALSE((*procs)[0].statics[0].plain_scopes);
+        CHECK((*procs)[0].statics[1].name == "after");  // every scope was closed again: back in the procedure
+        CHECK((*procs)[0].statics[1].plain_scopes);
+        CHECK((*procs)[0].statics[1].block_path.empty());
+        REQUIRE((*procs)[1].statics.size() == 1);
+        CHECK((*procs)[1].statics[0].name == "mine");
+    }
+    SUBCASE("more statics than kMaxProcStatics") {
+        Records r;
+        r.proc(0x1110, "f", 0, 0, 0x10);
+        for (std::size_t i = 0; i < cml::pdb::kMaxProcStatics + 3; ++i) {
+            r.data(0x110C, "n", 0, 0);
+        }
+        r.end();
+        auto procs = cml::pdb::read_object_procs(span_of(debug_s_section(r.bytes())));
+        REQUIRE(procs.has_value());
+        REQUIRE(procs->size() == 1);
+        CHECK((*procs)[0].statics.size() == cml::pdb::kMaxProcStatics);
+        CHECK_FALSE((*procs)[0].statics_complete);
+    }
+    SUBCASE("unbalanced records: more ends than scopes, a procedure record too short to read") {
+        Records r;
+        r.end();
+        r.end();
+        r.add(0x1110, Bytes(8, 0));  // a procedure record without its fields
+        r.data(0x110C, "orphan", 0, 0);
+        r.end();
+        r.proc(0x1110, "f", 0, 0, 0x10);
+        r.data(0x110C, "mine", 0, 0);
+        auto procs = cml::pdb::read_object_procs(span_of(debug_s_section(r.bytes())));
+        REQUIRE(procs.has_value());
+        REQUIRE(procs->size() == 1);
+        REQUIRE((*procs)[0].statics.size() == 1);
+        CHECK((*procs)[0].statics[0].name == "mine");
+    }
+}

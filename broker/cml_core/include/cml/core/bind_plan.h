@@ -80,6 +80,8 @@ enum class BindSource : std::uint8_t {
     CompilandLayout,     //     ... compiler-generated guard inferred from the unchanged section layout
     CompilandSignature,  //     ... a static function told apart from its overloads by its signature (WP-37)
     CompilandClosure,    //     ... a lambda's function-local static, by the identity of the closure class (WP-37)
+    CompilandProcedure,  //     ... a function-local static, by its (matched) function and its place among the
+                         //         function's statics of that name (WP-37, ADR-0042 amended; CML3570 when there are several)
     PdbPublic,           // (3) S_PUB32
     PdbGlobal,           // (3) S_GDATA32
     ImportSlotPdb,       // (4) public __imp_X of the module's PDB

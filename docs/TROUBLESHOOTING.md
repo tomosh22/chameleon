@@ -783,7 +783,7 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 
 ### CML3207
 
-- **Cause:** Static matches several old symbols. Same-named function-local statics of several lambdas (a macro such as Godot's `SNAME`) are told apart by their lambda as long as the function has the same lambdas as before; when a lambda with such a static was added or removed, the compiler's lambda numbers may have shifted and the message says so after a colon. The message also says so when the type records needed for this could not be read (`CML1430` to `CML1434`).  
+- **Cause:** Static matches several old symbols. The reason follows a colon in the message. Same-named function-local statics of several lambdas (a macro such as Godot's `SNAME`) are told apart by their lambda as long as the function has the same lambdas as before; when a lambda with such a static was added or removed, the compiler's lambda numbers may have shifted. Several statics of one name in one function (declared in different blocks) are matched by their place in the function (with the warning `CML3570`) only when the function has the same number of them as before, each has the same type and sits in the same block; otherwise this error names what differs. The message also says so when the debug records needed for either could not be read (`CML1430` to `CML1434`).  
 - **Message:** `static data '<...>' (<...>) matches <...> records named '<...>' in compiland <...> but the patch object defines <...> of them<...>`  
 - **What to do:** Rename one of the statics, keep their number unchanged, or hot-restart.  
 - **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
@@ -825,7 +825,7 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 
 ### CML3214
 
-- **Cause:** Same-scope static overloads cannot be told apart. Overloads are paired by their signature from the debug type records, so this is left for two cases, named after a colon in the message: several functions of that name and scope have the same signature, or the type records cannot be read (`CML1430` to `CML1434`: no debug information in the patch object, a compiler PDB that is missing, types that live in a precompiled header object, a malformed record).  
+- **Cause:** Same-scope static overloads cannot be told apart. Overloads are paired by their signature from the debug type records, so this is left for the cases named after a colon in the message: several functions of that name and scope have the same signature; no signature of the patch occurs in the old image; the call operators of lambdas whose function no longer has the same lambdas as before (a lambda is known only by the number the compiler gives it, and adding or removing one shifts the numbers); or the type records cannot be read (`CML1430` to `CML1434`: no debug information in the patch object, a compiler PDB that is missing, types that live in a precompiled header object, a malformed record).  
 - **Message:** `ambiguous overloads of static '<...>' (<...>) in <...>; cannot tell which old function each new one replaces (<...> in the patch, <...> records named '<...>' in compiland <...>)<...>`  
 - **What to do:** Rename one overload, or hot-restart.  
 - **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
@@ -1139,6 +1139,13 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 - **Cause:** Writable static data whose identity cannot be established (error).  
 - **Message:** `static data <...> in <...> has no source-level name the planner can match to the old image (object section '<...>'), so it cannot be bound to the running process's copy`  
 - **What to do:** Give the variable an ordinary name, or hot-restart.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3570
+
+- **Cause:** (warning) Several function-local statics of one name in one function, declared in different blocks (`if (i == 0) { static const T names = ...; } else { static const T names = ...; }`), were matched to the running program's copies by their order in the function. Nothing else tells them apart: they have one name, one scope and one type. The reload is applied; the function has the same number of them as before, each with the same type and in the same block. If the edit swapped two of those blocks or replaced one, the statics now hold each other's values.  
+- **Message:** `Function-local statics '<...>' of '<...>' (<...>) are matched by their order in the function; if you reordered or replaced blocks that declare them, their values may be exchanged.`  
+- **What to do:** Rename one of them, or hot-restart after reordering.  
 - **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
 
 

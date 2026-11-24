@@ -13,6 +13,7 @@
 #include "cml/pdb/diag_ids.h"
 #include "detail/codeview.h"
 #include "detail/le.h"
+#include "detail/static_scopes.h"
 #include "index_impl.h"
 
 namespace cml::pdb {
@@ -449,6 +450,107 @@ Result<ProcInfo> PdbIndex::proc_info(const SymbolView& proc) const {
     }
     resolve_params(impl, type_index, id_proc, info);
     return info;
+}
+
+// ---- WP-37 (ADR-0042, amended): the function-local statics of a procedure, with their place in it ---------------------
+
+Result<std::vector<ProcStatic>> PdbIndex::proc_statics(const SymbolView& proc, bool* complete) const {
+    const Impl& impl = *impl_;
+    if (complete != nullptr) {
+        *complete = true;
+    }
+    if (!is_proc_kind(proc.kind) || proc.compiland >= impl.compilands.size()) {
+        return Diag::make(diag::kCompilandOutOfRange, "proc_statics needs a proc symbol of a compiland of this index.", "Pass a symbol returned by compiland_symbols.");
+    }
+    const Compiland& c = impl.compilands[proc.compiland];
+    if (c.symbol_stream == 0xFFFF || c.symbol_bytes <= 4 || c.symbol_bytes > impl.msf->stream_size(c.symbol_stream)) {
+        return Diag::make(diag::kBadModuleSymbols, "The symbols of module '" + std::string(c.object_name) + "' in '" + impl.path + "' are unreadable.",
+                          "Rebuild the module so the linker regenerates the PDB.");
+    }
+    CountedBuffer scratch;
+    std::size_t got = 0;
+    const std::uint8_t* data = impl.msf->read_range(c.symbol_stream, 0, c.symbol_bytes, scratch, got);
+    if (data == nullptr || got < c.symbol_bytes) {
+        return Diag::make(diag::kBadModuleSymbols, "The symbols of module '" + std::string(c.object_name) + "' in '" + impl.path + "' cannot be read.",
+                          "Rebuild the module so the linker regenerates the PDB.");
+    }
+
+    // The same scopes as the walk that built the symbol table (index_symbols.cpp: every data record inside a procedure,
+    // however deep, has that procedure as its parent), stopped at the end of the wanted procedure.
+    constexpr std::uint32_t kWanted = 1;
+    constexpr std::uint32_t kOther = 0;
+    std::vector<ProcStatic> out;
+    ScopeStack scopes;
+    std::vector<std::uint32_t> path;
+    enum class State { Before, Inside, Done } state = State::Before;
+    std::size_t depth_inside = 0;  // scopes open since the wanted procedure's record, itself included
+    bool walked = true;
+    for (std::uint64_t off = 4; off < c.symbol_bytes && state != State::Done;) {
+        if (c.symbol_bytes - off < 4) {
+            break;
+        }
+        const std::uint32_t reclen = rd16(data + off);
+        if (reclen < 2 || reclen > c.symbol_bytes - off - 2) {
+            walked = false;
+            break;
+        }
+        const std::uint16_t k = rd16(data + off + 2);
+        const std::uint8_t* b = data + off + 4;
+        const std::uint32_t n = reclen - 2;
+        off += 2 + reclen;
+        if (state == State::Before) {
+            if (cv::is_proc(k) && n >= 36 && rd16(b + 32) == proc.section && rd32(b + 28) == proc.offset) {
+                state = State::Inside;
+                depth_inside = 1;
+                scopes.open(ScopeStack::Kind::Proc, kWanted);
+            }
+            continue;
+        }
+        if (cv::is_scope_opener(k)) {
+            ++depth_inside;
+            scopes.open(cv::is_proc(k) ? ScopeStack::Kind::Proc : (k == cv::S_BLOCK32 ? ScopeStack::Kind::Block : ScopeStack::Kind::Other), kOther);
+            continue;
+        }
+        if (cv::is_scope_closer(k)) {
+            scopes.close();
+            if (--depth_inside == 0) {
+                state = State::Done;
+            }
+            continue;
+        }
+        const bool thread = k == cv::S_LTHREAD32 || k == cv::S_GTHREAD32;
+        if ((k != cv::S_LDATA32 && k != cv::S_GDATA32 && !thread) || n < 11) {
+            continue;
+        }
+        std::uint32_t owner = kOther;
+        bool plain = false;
+        if (!scopes.locate(owner, path, plain) || owner != kWanted) {
+            continue;  // inside a procedure record nested in the wanted one: not its static
+        }
+        if (out.size() >= kMaxProcStatics) {
+            if (complete != nullptr) {
+                *complete = false;
+            }
+            continue;
+        }
+        ProcStatic s;
+        s.name.assign(reinterpret_cast<const char*>(b + 10), cv::cstr_len(b + 10, n - 10));
+        s.type_index = rd32(b);
+        s.thread_storage = thread;
+        s.rva = impl.rva_or_none(rd16(b + 8), rd32(b + 4));
+        s.block_path = path;
+        s.plain_scopes = plain;
+        out.push_back(std::move(s));
+    }
+    if (!walked) {
+        return Diag::make(diag::kBadModuleSymbols, "The symbols of module '" + std::string(c.object_name) + "' in '" + impl.path + "' are corrupt (a record leaves the symbol area).",
+                          "Rebuild the module so the linker regenerates the PDB.");
+    }
+    if (state == State::Before) {
+        return Diag::make(diag::kBadModuleSymbols, "The symbol record of '" + std::string(proc.name) + "' was not found in module '" + std::string(c.object_name) + "'.",
+                          "Rebuild the module so the linker regenerates the PDB.");
+    }
+    return out;
 }
 
 }  // namespace cml::pdb

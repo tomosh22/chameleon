@@ -9,6 +9,7 @@
 
 #include "cml/pdb/diag_ids.h"
 #include "detail/codeview.h"
+#include "detail/static_scopes.h"
 #include "detail/le.h"
 
 namespace cml::pdb {
@@ -555,17 +556,57 @@ Result<std::vector<ObjectProc>> read_object_procs(std::span<const std::uint8_t> 
             return bad("a subsection leaves the section");
         }
         if ((kind & ~kSubsectionIgnore) == kSubsectionSymbols && (kind & kSubsectionIgnore) == 0) {
+            // Scopes do not cross a subsection. A procedure record too short to read still opens its scope, so that its
+            // statics are not taken for those of an enclosing one.
+            constexpr std::uint32_t kNoProc = 0xFFFFFFFFu;
+            ScopeStack scopes;
+            std::vector<std::uint32_t> path;
             const bool ok = cv::for_each_record(d, begin, begin + len, [&](const cv::Record& r) {
-                if (!cv::is_proc(r.kind) || r.body_len < 36) {
+                if (cv::is_proc(r.kind)) {
+                    if (r.body_len < 36) {
+                        scopes.open(ScopeStack::Kind::Proc, kNoProc);
+                        return;
+                    }
+                    ObjectProc p;
+                    p.offset_field = static_cast<std::uint32_t>(r.offset + 4 + 28);
+                    p.type_index = rd32(r.body + 24);
+                    p.type_is_id = r.kind == cv::S_LPROC32_ID || r.kind == cv::S_GPROC32_ID || r.kind == cv::S_LPROC32_DPC_ID;
+                    p.global = cv::is_global_proc(r.kind);
+                    p.name = std::string_view(reinterpret_cast<const char*>(r.body + 35), cv::cstr_len(r.body + 35, r.body_len - 35));
+                    scopes.open(ScopeStack::Kind::Proc, static_cast<std::uint32_t>(out.size()));
+                    out.push_back(std::move(p));
                     return;
                 }
-                ObjectProc p;
-                p.offset_field = static_cast<std::uint32_t>(r.offset + 4 + 28);
-                p.type_index = rd32(r.body + 24);
-                p.type_is_id = r.kind == cv::S_LPROC32_ID || r.kind == cv::S_GPROC32_ID || r.kind == cv::S_LPROC32_DPC_ID;
-                p.global = cv::is_global_proc(r.kind);
-                p.name = std::string_view(reinterpret_cast<const char*>(r.body + 35), cv::cstr_len(r.body + 35, r.body_len - 35));
-                out.push_back(p);
+                if (cv::is_scope_opener(r.kind)) {
+                    scopes.open(r.kind == cv::S_BLOCK32 ? ScopeStack::Kind::Block : ScopeStack::Kind::Other);
+                    return;
+                }
+                if (cv::is_scope_closer(r.kind)) {
+                    scopes.close();
+                    return;
+                }
+                const bool thread = r.kind == cv::S_LTHREAD32 || r.kind == cv::S_GTHREAD32;
+                if ((r.kind != cv::S_LDATA32 && r.kind != cv::S_GDATA32 && !thread) || r.body_len < 11) {
+                    return;
+                }
+                std::uint32_t proc = kNoProc;
+                bool plain = false;
+                if (!scopes.locate(proc, path, plain) || proc == kNoProc) {
+                    return;  // file scope, or inside a procedure whose record could not be read
+                }
+                ObjectProc& owner = out[proc];
+                if (owner.statics.size() >= kMaxProcStatics) {
+                    owner.statics_complete = false;
+                    return;
+                }
+                ProcStatic s;
+                s.name.assign(reinterpret_cast<const char*>(r.body + 10), cv::cstr_len(r.body + 10, r.body_len - 10));
+                s.type_index = rd32(r.body);
+                s.thread_storage = thread;
+                s.offset_field = static_cast<std::uint32_t>(r.offset + 4 + 4);
+                s.block_path = path;
+                s.plain_scopes = plain;
+                owner.statics.push_back(std::move(s));
             });
             if (!ok) {
                 return bad("a symbol record leaves its subsection");

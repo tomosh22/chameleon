@@ -150,6 +150,24 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// A data record (S_LDATA32 / S_GDATA32 / S_LTHREAD32 / S_GTHREAD32) declared inside a procedure: a function-local
+// static. (ADR-0042, amended: two statics of one name in one procedure, declared in different blocks, have nothing that
+// tells them apart but their place in the procedure. The planner compares that place in the old PDB and in the patch
+// object, so both are read by the same code: PdbIndex::proc_statics and read_object_procs.)
+struct ProcStatic {
+    std::string name;                // as recorded: the source name ("names", "$TSS0")
+    std::uint32_t type_index = 0;
+    bool thread_storage = false;     // S_LTHREAD32 / S_GTHREAD32
+    std::uint32_t rva = kNoRva;      // PDB: where the variable is. Object: kNoRva (the record is relocated)
+    std::uint32_t offset_field = 0;  // object: offset, within the section, of the record's 32-bit offset (its SECREL site)
+    // Where in the procedure it was declared: for every S_BLOCK32 open around the record, outermost first, the index of
+    // that block among the blocks of its parent scope. Empty: directly in the procedure.
+    std::vector<std::uint32_t> block_path;
+    // False when the record is inside a scope that is not a block (an inline site: the static of an inlined function)
+    // or nested deeper than the reader follows; its place in the procedure is then not known.
+    bool plain_scopes = true;
+};
+
 // A procedure record (S_GPROC32 / S_LPROC32 and their _ID forms) of an object's `.debug$S` section. In an object the
 // record's section:offset is zero and two relocations (SECREL at `offset_field`, SECTION right after it) name the
 // function; the caller resolves them with the COFF reader.
@@ -159,7 +177,11 @@ struct ObjectProc {
     bool type_is_id = false;         // *_ID record: `type_index` is an id (LF_FUNC_ID / LF_MFUNC_ID)
     bool global = false;             // S_GPROC32*
     std::string_view name;           // display name, points into the section
+    std::vector<ProcStatic> statics; // the data records declared inside it, in the order the compiler emitted them
+    bool statics_complete = true;    // false: more than kMaxProcStatics, the rest was dropped
 };
+// A procedure with more function-local statics than this is not followed further (untrusted input).
+inline constexpr std::size_t kMaxProcStatics = 4096;
 
 // Walks the symbol subsections of one `.debug$S` section. CML1433 when the section is not C13 or a subsection or
 // record leaves it.

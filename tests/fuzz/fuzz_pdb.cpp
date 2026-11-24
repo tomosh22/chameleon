@@ -99,6 +99,16 @@ void exercise(const cml::pdb::PdbIndex& idx) {
                 if (cml::pdb::is_proc_kind(v.kind) && asked++ < 256) {
                     const cml::pdb::FunctionSignature s = idx.proc_signature(v);
                     acc += s.known ? s.text.size() + s.class_unique_name.size() : s.why.size() + s.diag_id;
+                    // ADR-0042, amended: its function-local statics and the blocks they sit in.
+                    bool complete = true;
+                    if (const auto statics = idx.proc_statics(v, &complete)) {
+                        for (const cml::pdb::ProcStatic& local : *statics) {
+                            acc += local.name.size() + local.type_index + local.rva + local.block_path.size() + (local.plain_scopes ? 1u : 0u);
+                        }
+                        acc += complete ? 1u : 0u;
+                    } else {
+                        acc += statics.error().code;
+                    }
                 }
             }
         }
@@ -159,6 +169,10 @@ void exercise_object_sections(const std::uint8_t* data, std::size_t size) {
     if (const auto procs = cml::pdb::read_object_procs(bytes)) {
         for (const cml::pdb::ObjectProc& p : *procs) {
             acc += p.offset_field + p.type_index + p.name.size() + (p.type_is_id ? 1u : 0u) + (p.global ? 2u : 0u);
+            for (const cml::pdb::ProcStatic& local : p.statics) {
+                acc += local.name.size() + local.type_index + local.offset_field + local.block_path.size() + (local.plain_scopes ? 1u : 0u);
+            }
+            acc += p.statics_complete ? 1u : 0u;
         }
     } else {
         acc += procs.error().code;

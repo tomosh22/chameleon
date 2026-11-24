@@ -401,6 +401,46 @@ void emit_signatures(const std::string& tag, const BindPlan& p, const cml::pdb::
             }
         }
     }
+    if (tag == "lambda_statics") {
+        // The function-local statics of the fixture's procedures with the blocks they sit in, as the old PDB records
+        // them (ADR-0042, amended: the planner compares this with the patch object's .debug$S).
+        if (syms) {
+            for (const cml::pdb::SymbolView& v : *syms) {
+                if (!cml::pdb::is_proc_kind(v.kind) || std::string(v.name).find("options") == std::string::npos) {
+                    continue;
+                }
+                bool complete = true;
+                const auto statics = pdb_index.proc_statics(v, &complete);
+                if (!statics) {
+                    brief("PROC-STATICS " + tag + " '" + std::string(v.name) + "' UNREADABLE " + statics.error().format());
+                    continue;
+                }
+                for (const cml::pdb::ProcStatic& local : *statics) {
+                    std::string path;
+                    for (const std::uint32_t index : local.block_path) {
+                        path += (path.empty() ? "" : ".") + std::to_string(index);
+                    }
+                    brief("PROC-STATICS " + tag + " '" + std::string(v.name) + "' static '" + local.name + "' rva=" + hex(local.rva) + " type=" + hex(local.type_index) +
+                          " block_path=" + (path.empty() ? "-" : path) + (local.plain_scopes ? "" : " (not in plain blocks)"));
+                }
+            }
+        }
+        // anon.cpp is not edited by anything: how this compiler and linker name the call operator of a lambda in a
+        // function of an anonymous namespace, and its closure class (the two spellings the planner compares).
+        for (const std::uint32_t ci : pdb_index.compilands_by_object_stem("anon")) {
+            const auto other = pdb_index.compiland_symbols(ci);
+            if (!other) {
+                continue;
+            }
+            for (const cml::pdb::SymbolView& v : *other) {
+                if (cml::pdb::is_data_kind(v.kind) && v.parent_proc != cml::pdb::kNoSymbol && v.parent_proc < other->size()) {
+                    const cml::pdb::FunctionSignature s = pdb_index.proc_signature((*other)[v.parent_proc]);
+                    brief("LOCAL-OTHER " + tag + " '" + std::string(v.name) + "' in '" + std::string(v.parent_name) + "' rva=" + hex(v.rva) + " closure=" +
+                          (s.known ? s.class_unique_name : "UNKNOWN " + s.why));
+                }
+            }
+        }
+    }
     for (const bool tpi : {true, false}) {
         const cml::pdb::TypeStreamStats st = pdb_index.type_stream_stats(tpi);
         brief(std::string("TYPE-STREAM ") + tag + (tpi ? " TPI" : " IPI") + " opened=" + std::to_string(st.opened ? 1 : 0) + " sparse=" + std::to_string(st.sparse ? 1 : 0) +
@@ -576,6 +616,35 @@ void plan_fixture(const std::string& name) {
         CHECK_MESSAGE(triples.has_value(), (triples.has_value() ? std::string() : triples.error().format()));
         if (triples) {
             CHECK(triples->size() == p.fixups.size());
+        }
+    }
+
+    // ---- WP-37: what the fixture `lambda_statics` must keep covering -------------------------------
+    if (tag == "lambda_statics") {
+        // The two `names` of LsTree::options() are paired by their place in the function, and the plan says so.
+        std::size_t by_procedure = 0;
+        for (const SymbolDecision& d : p.decisions) {
+            by_procedure += d.display == "LsTree::options::names" && d.decision == DecisionKind::BindOldData && d.source == BindSource::CompilandProcedure ? 1u : 0u;
+        }
+        CHECK_MESSAGE(by_procedure == 2, tag << ": LsTree::options::names paired by procedure: " << by_procedure << " of 2");
+        std::size_t order_warnings = 0;
+        for (const cml::Diag& w : p.warnings) {
+            order_warnings += w.id() == "CML3570" && w.message.find("'names' of 'LsTree::options' (2)") != std::string::npos ? 1u : 0u;
+        }
+        CHECK_MESSAGE(order_warnings == 1, tag << ": CML3570 for LsTree::options: " << order_warnings);
+        if (kIsCl) {
+            // cl writes the block of a local entity into its decorated name: one digit up to block 10, letters from 11
+            // on ("?L@?"). LsTree::flush() / ::timers() exist to have a lambda in such a block (Godot's
+            // SceneTree::_flush_scene_change); if the compiler stops numbering that way the fixture covers nothing.
+            std::size_t in_late_blocks = 0;
+            for (const SymbolDecision& d : p.decisions) {
+                const std::size_t at = d.name.find(">@?");
+                if (d.display.find("LsTree::") == 0 && at != std::string::npos && at + 3 < d.name.size() && d.name[at + 3] >= 'A' && d.name[at + 3] <= 'P') {
+                    ++in_late_blocks;
+                    brief("LATE-BLOCK " + tag + " " + d.name + " display=" + d.display);
+                }
+            }
+            CHECK_MESSAGE(in_late_blocks >= 2, tag << ": no lambda of LsTree in block 11 or later (symbols with a block number in letters: " << in_late_blocks << ")");
         }
     }
 

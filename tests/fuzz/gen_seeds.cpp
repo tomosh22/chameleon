@@ -332,6 +332,35 @@ void pdb_seeds(const fs::path& dir) {
     const Bytes debug_s_bytes = debug_s({{0x1146, "floor", oid_float}, {0x1146, "floor", oid_vec2}, {0x1147, "f::<lambda_1>::operator()", oid_call}, {0x110F, "old_style", fn_mixed}});
     write_seed(dir, "debug_s.bin", debug_s_bytes);
     write_seed(dir, "debug_s_truncated.bin", truncated(debug_s_bytes, debug_s_bytes.size() - 9));
+    // ADR-0042, amended: function-local statics in blocks (and in an inline site), in an object and in a module stream.
+    const auto with_statics = [](Records& r, std::uint16_t code_seg, std::uint16_t data_seg, std::uint32_t code, std::uint32_t data) {
+        r.proc(0x1110, "get_argument_options", code_seg, code, 0x10);
+        r.block();
+        r.data(0x110C, "names", data_seg, data);
+        r.data(0x110C, "$TSS0", data_seg, data + 8);
+        r.block();
+        r.data(0x1112, "deep", data_seg, data + 0x10);
+        r.end();
+        r.end();
+        r.block();
+        r.data(0x110C, "names", data_seg, data + 0x18);
+        r.end();
+        r.add(0x114D, Bytes(12, 0));
+        r.data(0x110C, "inlined", data_seg, data + 0x20);
+        r.add(0x114E, Bytes());
+        r.end();
+    };
+    Records object_records;
+    with_statics(object_records, 0, 0, 0, 0);
+    write_seed(dir, "debug_s_statics.bin", debug_s_section(object_records.bytes()));
+    Spec blocks;
+    blocks.sections = spec.sections;
+    Module bm;
+    bm.name = "C:\\proj\\obj\\logic.cpp.obj";
+    bm.symbols.objname(bm.name);
+    with_statics(bm.symbols, 1, 2, 0x100, 0x40);
+    blocks.modules.push_back(std::move(bm));
+    write_seed(dir, "statics_blocks.bin", build(blocks));
 }
 
 // ---- IPC --------------------------------------------------------------------------------------------------------------
