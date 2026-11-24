@@ -199,16 +199,48 @@ Result<LinkerDetection> decide_linker_family(const PeLinkerFacts& pe, const PdbL
     return d;
 }
 
+namespace {
+
+// What the module file says about its linker. Only the headers are read (WP-39b): a module of several hundred MiB used to
+// be read whole, into private memory, for the sake of four bytes and the Rich marker. cml_pe still parses the headers, so
+// what is not an x64 PE32+ image is refused with its diagnostic (CML1300 unreadable, CML1303 PE32, ...), worded as
+// pe::load_image_file words it.
+Result<PeLinkerFacts> read_module_pe_facts(const std::string& pe_path) {
+    Result<std::vector<std::byte>> head = pe::read_file_headers(pe_path);
+    if (!head) {
+        return head.error();
+    }
+    const Result<pe::Image> image = pe::Image::parse(pe::ByteSpan(head->data(), head->size()), pe::ImageKind::OnDisk);
+    if (!image) {
+        Diag d = image.error();
+        d.message = pe_path + ": " + d.message;
+        return d;
+    }
+    return read_pe_linker_facts(*head);
+}
+
+Result<LinkerDetection> finish_detection(const std::string& pe_path, const PeLinkerFacts& pe_facts, const PdbLinkerFacts* pdb_facts,
+                                         std::vector<Diag> notes, const DetectLinkerOptions& options) {
+    Result<LinkerDetection> decided = decide_linker_family(pe_facts, pdb_facts, options);
+    if (!decided) {
+        return decided;
+    }
+    for (Diag& n : notes) {
+        decided->warnings.push_back(std::move(n));
+    }
+    for (const std::string& line : decided->evidence) {
+        CML_LOG(Debug, "toolchain: linker detection for %s: %s", pe_path.c_str(), line.c_str());
+    }
+    return decided;
+}
+
+}  // namespace
+
 Result<LinkerDetection> detect_module_linker(const std::string& pe_path, const pdb::OpenOptions& pdb_options,
                                              const DetectLinkerOptions& options) {
-    // cml_pe refuses what is not an x64 PE32+ image (CML1300 unreadable, CML1303 PE32, ...): its diagnostic is returned.
-    PeLinkerFacts pe_facts;
-    {
-        Result<pe::OwnedImage> image = pe::load_image_file(pe_path);
-        if (!image) {
-            return image.error();
-        }
-        pe_facts = read_pe_linker_facts(image->bytes);
+    const Result<PeLinkerFacts> pe_facts = read_module_pe_facts(pe_path);
+    if (!pe_facts) {
+        return pe_facts.error();
     }
 
     // The index maps the PDB read-only for as long as it lives (ADR-0017): it is dropped before this function returns,
@@ -229,17 +261,17 @@ Result<LinkerDetection> detect_module_linker(const std::string& pe_path, const p
                                        "The linker is detected from the PE alone; check that the PDB is next to the module."));
         }
     }
-    Result<LinkerDetection> decided = decide_linker_family(pe_facts, have_pdb ? &pdb_facts : nullptr, options);
-    if (!decided) {
-        return decided;
+    return finish_detection(pe_path, *pe_facts, have_pdb ? &pdb_facts : nullptr, std::move(notes), options);
+}
+
+Result<LinkerDetection> detect_module_linker_with_pdb(const std::string& pe_path, const pdb::PdbIndex& module_pdb,
+                                                      const DetectLinkerOptions& options) {
+    const Result<PeLinkerFacts> pe_facts = read_module_pe_facts(pe_path);
+    if (!pe_facts) {
+        return pe_facts.error();
     }
-    for (Diag& n : notes) {
-        decided->warnings.push_back(std::move(n));
-    }
-    for (const std::string& line : decided->evidence) {
-        CML_LOG(Debug, "toolchain: linker detection for %s: %s", pe_path.c_str(), line.c_str());
-    }
-    return decided;
+    const PdbLinkerFacts pdb_facts = read_pdb_linker_facts(module_pdb);
+    return finish_detection(pe_path, *pe_facts, &pdb_facts, {}, options);
 }
 
 // ---- 2. the command line ----------------------------------------------------------------------------------

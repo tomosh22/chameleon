@@ -174,6 +174,7 @@ public:
         }
 
         shutdown();
+        restore_external_sources();
         report_.seconds = std::chrono::duration<double>(Clock::now() - start).count();
         return report_;
     }
@@ -229,13 +230,21 @@ private:
     void shutdown() {
         control_.reset();
         supervisor_.kill_all();
-        restore_external_sources();
     }
 
     // WP-39: an external source tree was edited in place (its paths are in the PDB, so there is no copy to edit). Put every
-    // file back as it was before the first edit, now that the broker and the program are gone.
+    // file back as it was before the first edit. WP-39b: only after the killed broker, program and compilers have really
+    // exited (one of them may still hold a file), and as a step of the report: a tree that could not be put back fails the
+    // scenario, because the next run would start from edited sources.
     void restore_external_sources() {
+        if (external_originals_.empty()) {
+            return;
+        }
+        const Clock::time_point t0 = Clock::now();
+        constexpr std::uint32_t kExitWaitMs = 15000;
+        const bool gone = supervisor_.wait_all_exited(kExitWaitMs);
         std::size_t restored = 0;
+        std::string problems;
         for (const auto& entry : external_originals_) {
             std::error_code ec;
             if (!entry.second) {
@@ -249,18 +258,31 @@ private:
                 }
             }
             if (ec) {
-                std::printf("cmltest: could not restore the edited file %s (%s); generate the external sources again\n", entry.first.string().c_str(),
-                            ec.message().c_str());
+                problems += (problems.empty() ? "" : "; ") + entry.first.string() + " (" + ec.message() + ")";
             } else {
                 ++restored;
             }
         }
-        if (!external_originals_.empty()) {
-            std::printf("cmltest: restored %zu of %zu edited files of the external source tree %s\n", restored, external_originals_.size(),
-                        built_.source_dir.string().c_str());
-            std::fflush(stdout);
-        }
+        const std::string summary = "restored " + std::to_string(restored) + " of " + std::to_string(external_originals_.size()) +
+                                    " edited files of the external source tree " + built_.source_dir.string();
         external_originals_.clear();
+        const double seconds = std::chrono::duration<double>(Clock::now() - t0).count();
+        if (problems.empty()) {
+            add("restore external sources", StepStatus::Passed, summary, std::string(), seconds);
+            return;
+        }
+        add("restore external sources", StepStatus::Failed,
+            summary + "; could not restore: " + problems +
+                (gone ? std::string() : "; some child processes had not exited after " + std::to_string(kExitWaitMs / 1000) + " s") +
+                ". Generate the external sources again before the next run.",
+            cml::Diag::make(cml::ids::kEditFailed, "", "").id(), seconds);
+    }
+
+    // WP-39: what a file of the external tree held before its FIRST edit (later edits stack on top).
+    void remember_external_originals(AppliedPatch& patch) {
+        for (std::size_t i = 0; i < patch.files.size() && i < patch.originals.size(); ++i) {
+            external_originals_.try_emplace(built_.source_dir / fs::path(patch.files[i]), std::move(patch.originals[i]));
+        }
     }
 
     std::uint32_t remaining_ms() const {
@@ -625,8 +647,10 @@ private:
         buffer << in.rdbuf();
         // Applied to the COPY of the sources in the scratch tree; the repository is never touched. (An external program's
         // tree, WP-39, is patched in place and restored at the end of the run.)
-        cml::Result<AppliedPatch> applied = apply_patch_to_tree(built_.source_dir, buffer.str(), 1);
+        AppliedPatch partial;  // WP-39b: what a patch that failed half way had already written
+        cml::Result<AppliedPatch> applied = apply_patch_to_tree(built_.source_dir, buffer.str(), 1, scenario_.external ? &partial : nullptr);
         if (!applied) {
+            remember_external_originals(partial);
             return StepOutcome::fail(applied.error());
         }
         std::string detail = "patched";
@@ -634,10 +658,7 @@ private:
             detail += " " + f;
         }
         if (scenario_.external) {
-            // WP-39: remember what the file held before its FIRST edit (later edits stack on top), for restore_external_sources().
-            for (std::size_t i = 0; i < applied->files.size() && i < applied->originals.size(); ++i) {
-                external_originals_.try_emplace(built_.source_dir / fs::path(applied->files[i]), std::move(applied->originals[i]));
-            }
+            remember_external_originals(*applied);  // for restore_external_sources()
         }
         for (const std::string& n : applied->notes) {
             detail += "; " + n;

@@ -516,9 +516,12 @@ jobs:
   # --funcs-per-tu (and BENCH_ID) for a larger PDB.
   # WP-39 (ADR-0042): the generated program runs with the agent, and the scenario large_pdb_reload reloads
   # a translation unit inside it five times. The sources are generated on EVERY run (the PDB records their
-  # paths; the broker hashes and recompiles them), and the cache key is the hash of everything the
-  # generator wrote, of the two repository headers main.cpp includes and of the MSVC toolset version (the
-  # broker recompiles with the cl.exe the PDB records). A cold build takes about 3 minutes (log line
+  # paths; the broker hashes and recompiles them). The cache key names everything the cached executable
+  # and PDB depend on: what the generator wrote (its manifest), the two repository headers main.cpp
+  # includes, the configure flags of the build step, the MSVC toolset, the Windows SDK, the CMake version
+  # and the workspace path (the PDB records it). The broker replays the RECORDED compiler and command line
+  # in its CURRENT environment (INCLUDE, LIB), so a cached program from another toolset or SDK would be
+  # recompiled against headers it was not built with. A cold build takes about 3 minutes (log line
   # `benchmark project build time`, docs/wp/WP-39.md).
   pdb-benchmark:
     name: pdb-benchmark (windows-2022 / msvc / RelWithDebInfo)
@@ -530,6 +533,8 @@ jobs:
       actions: read
     env:
       BENCH_ID: tus900-f1000-h24-s1-Z7
+      # The configure flags of the benchmark project (the generated CMakeLists.txt sets the compile and link flags itself).
+      BENCH_CONFIGURE: -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=cl
       LOG_DIR: ci-logs
     defaults:
       run:
@@ -553,9 +558,22 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $manifest = (Get-Content bench-src/manifest.sha256 -Raw).Trim()
           if ($manifest.Length -ne 64) { throw "bench-src/manifest.sha256 does not hold a sha256: '$manifest'" }
-          $headers = (Get-FileHash agent/include/Chameleon_API.h -Algorithm SHA256).Hash.Substring(0, 16) + (Get-FileHash tests/fixtures/common/fixture_runtime.h -Algorithm SHA256).Hash.Substring(0, 16)
           if (-not $env:VCToolsVersion) { throw 'VCToolsVersion is not set: no MSVC developer environment' }
-          $key = "pdb-bench-v2-$($env:BENCH_ID)-$($manifest.Substring(0, 32))-$headers-msvc$($env:VCToolsVersion)".ToLowerInvariant()
+          if (-not $env:WindowsSDKVersion) { throw 'WindowsSDKVersion is not set: no MSVC developer environment' }
+          # WP-39b: what else the cached executable and PDB depend on, hashed into one component of the key.
+          $cmakeVersion = [string](cmake --version | Select-Object -First 1)
+          $deps = @(
+            "api=$((Get-FileHash agent/include/Chameleon_API.h -Algorithm SHA256).Hash)",
+            "runtime=$((Get-FileHash tests/fixtures/common/fixture_runtime.h -Algorithm SHA256).Hash)",
+            "configure=$($env:BENCH_CONFIGURE)",
+            "sdk=$($env:WindowsSDKVersion)",
+            "cmake=$cmakeVersion",
+            "workspace=$($PWD.Path)"
+          )
+          foreach ($d in $deps) { Write-Host "benchmark cache key input: $d" }
+          $sha = [System.Security.Cryptography.SHA256]::Create()
+          $depsHash = -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($deps -join '|')) | ForEach-Object { $_.ToString('x2') })
+          $key = "pdb-bench-v3-$($env:BENCH_ID)-$($manifest.Substring(0, 32))-$($depsHash.Substring(0, 32))-msvc$($env:VCToolsVersion)".ToLowerInvariant()
           "key=$key" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
           Write-Host "benchmark cache key: $key"
 
@@ -573,7 +591,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
           if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
-          cmake -S bench-src -B bench-build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=cl "-DCML_REPO_ROOT=$($PWD.Path -replace '\\', '/')" *>&1 | Tee-Object -FilePath "$env:LOG_DIR/bench-configure.log"
+          $configure = $env:BENCH_CONFIGURE -split ' '   # the same flags the cache key hashes
+          cmake -S bench-src -B bench-build @configure "-DCML_REPO_ROOT=$($PWD.Path -replace '\\', '/')" *>&1 | Tee-Object -FilePath "$env:LOG_DIR/bench-configure.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $sw = [Diagnostics.Stopwatch]::StartNew()
           cmake --build bench-build --parallel *>&1 | Tee-Object -FilePath "$env:LOG_DIR/bench-build.log"
@@ -623,8 +642,11 @@ jobs:
           if ($rc -ne 0) { exit $rc }
           & bench-build/bench_project.exe --ticks 2 *>&1 | Tee-Object -FilePath "$env:LOG_DIR/bench-run.txt"
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::bench_project.exe --ticks 2 exited with $LASTEXITCODE"; exit 1 }
-          if (-not (Select-String -Path "$env:LOG_DIR/bench-run.txt" -Pattern '^TICK n=1 value=1 tus=900\s*$' -Quiet)) {
-            Write-Host '::error::bench_project.exe did not print TICK n=1 value=1 tus=900: the cached program does not match the generated sources'
+          # The number of translation units comes from the generator's own record, so changing --tus needs no edit here.
+          $tus = [int](Get-Content bench-src/params.json -Raw | ConvertFrom-Json).tus
+          $expected = "TICK n=1 value=1 tus=$tus"
+          if (-not (Select-String -Path "$env:LOG_DIR/bench-run.txt" -Pattern ('^' + [regex]::Escape($expected) + '\s*$') -Quiet)) {
+            Write-Host "::error::bench_project.exe --ticks 2 did not print '$expected' (the initial value of bench_reload_value() and the --tus of bench-src/params.json): the program in bench-build was not built from the sources in bench-src"
             exit 1
           }
           '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
@@ -648,9 +670,10 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
           # Deterministic input: the sources the PDB lists are ALWAYS present (the step `Generate the benchmark project
-          # sources` runs on every run), and the tool refuses to run with fewer than 900 tracked files, so the source
-          # baseline is part of every measurement.
-          build/bin/cml_broker_mem.exe bench-build/bench_project.pdb --factor 1.5 --min-tracked-files 900 --json "$env:LOG_DIR/perf-broker-mem.json" *>&1 | Tee-Object -FilePath "$env:LOG_DIR/broker-memory.txt"
+          # sources` runs on every run), and the tool refuses to run with fewer tracked files than the project has
+          # translation units (900), so the source baseline is part of every measurement.
+          $tus = [int](Get-Content bench-src/params.json -Raw | ConvertFrom-Json).tus
+          build/bin/cml_broker_mem.exe bench-build/bench_project.pdb --factor 1.5 --min-tracked-files $tus --json "$env:LOG_DIR/perf-broker-mem.json" *>&1 | Tee-Object -FilePath "$env:LOG_DIR/broker-memory.txt"
           $rc = $LASTEXITCODE
           '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
           Get-Content "$env:LOG_DIR/broker-memory.txt" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
