@@ -1102,6 +1102,9 @@ procedure, old PDB against the patch object's `.debug$S`, only when the counts a
 pairwise equal, and the block-nesting paths agree where both sides record them. Each reload that pairs this way emits a
 warning (CML3570–3599) naming the statics, because reordering the blocks would exchange their values. This is the same
 class of residual risk as the lambda number, accepted only with the user told. Anything else stays CML3207.
+Order pairing is only the fallback for sections whose layout is unknown (cl's COMDAT section per static). Where the
+section layout of a member is known, the layout decides, with no warning; where order and a known layout disagree, the
+layout wins, and an order pairing never teaches, contradicts or erases a learned layout (high re-review of PR #64).
 
 ### WP-38: VEX and EVEX in the hook length decoder; decoder fuzzing (R-04, R-41)
 
