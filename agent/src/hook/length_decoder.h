@@ -10,11 +10,17 @@
 // bind planner compiles this same file in and uses that to prove that a relocation site is a
 // sign-extended displacement (ADR-0042).
 //
-// Scope: the integer, x87 and legacy-prefix SSE/SSE2..SSE4/AES (no VEX, no EVEX, no XOP) instructions
-// that cl and clang-cl emit in prologues and early function bodies, written from the Intel SDM
-// opcode maps (volume 2, appendix A). Anything else is reported as Unknown and the caller must fail
-// safe: a wrong length would make the installer overwrite half of an instruction that can still be
-// reached, so "unknown" is always preferred over "probably".
+// Scope: the integer, x87 and SSE/SSE2..SSE4/AES/SHA instructions that cl and clang-cl emit, and (WP-38,
+// ADR-0042, which reverses WP-10's "no VEX, no EVEX") the VEX (C4, C5) and EVEX (62) encoded ones of opcode
+// maps 1 to 3: AVX, AVX2, FMA, BMI, the opmask instructions, AVX-512. Written from the Intel SDM (volume 2:
+// 2.3 and 2.7 for the prefixes, appendix A and the instruction pages for the opcodes). Anything else (XOP,
+// 3DNow!, other VEX / EVEX maps, a legacy prefix or REX in front of VEX / EVEX, an opcode or operand form the
+// tables do not name) is reported as Unknown and the caller must fail safe: a wrong length would make the
+// installer overwrite half of an instruction that can still be reached, so "unknown" is always preferred over
+// "probably".
+//
+// The lengths are checked against a reference disassembler (Zydis) by the fuzz target and the differential
+// sweep of tests/fuzz (lde_reference.h has the rule); the decoder itself contains no third-party code.
 //
 // The decoder is table driven (the tables are built at compile time from range rules), portable
 // (no OS dependency), allocation-free and never reads beyond `available` bytes.
@@ -50,6 +56,11 @@ struct DecodeResult {
     // which an immediate of the same width is not guaranteed to be. The address computed from it is a plain 64-bit
     // address only when none of kInsnRipRel, kInsnAddr32 and kInsnSegFsGs is set. Branch targets (rel8/rel32) are
     // immediates here, never displacements; the moffs forms (A0..A3) are not covered at all (Unknown).
+    // One exception to "sign-extends" (WP-38): the 1-byte displacement of an EVEX-encoded instruction (62 ...) is a
+    // compressed displacement, which the processor multiplies by a factor N that depends on the instruction (disp8*N,
+    // SDM volume 2, 2.7.5) before it sign-extends it. `disp_size == 1` then says only where the byte is and that it is
+    // one byte; no flag marks it, so a user that needs the value must look at the first non-prefix byte for 62 or
+    // restrict itself to `disp_size == 4`, which is the literal sign-extended displacement under every encoding.
     std::uint8_t disp_offset = 0;
     std::uint8_t disp_size = 0;
 };
