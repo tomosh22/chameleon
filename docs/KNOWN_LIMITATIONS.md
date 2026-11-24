@@ -39,7 +39,7 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
 | CML2210 | `/GL` or LTO removed for the patch compile (warning) | `<obj>` was built with /GL (or -flto); the patch is compiled without it. | Disable /GL for iterated modules to avoid behaviour differences. | WP-05 | **live** |
 | CML3104 | Small changed function of a compiland optimised with inlining (warning, one per compiland and reload) | Compiland `<obj>` of `<module>` is optimised with inlining and `<n>` small changed function(s) (`<names>`) may be inlined into their callers: a caller that is still executing, or whose own code did not change, keeps the old code. | Build iterated modules with /Ob0 or /Od, or hot-restart. | WP-18 | **live** (advisory: see docs/wp/WP-18.md, "CML3104: what is and is not true") |
 | CML4101 | Function too short to hook (<5 bytes, no padding) | `<function>` is shorter than 5 bytes and has no hot-patch padding; it cannot be hooked. | Build with /hotpatch and link with /FUNCTIONPADMIN. | WP-10 | superseded by CML4301 (live, see docs/wp/WP-10.md) |
-| CML4300 | Unknown instruction in the bytes a hook overwrites (VEX/EVEX prologue, ...) | The instruction at `<function>+N` (bytes ..) is not understood; the hook installer fails safe. | Report the bytes, or exclude the function. | WP-10 | **live** |
+| CML4300 | Unknown instruction in the bytes a hook overwrites: an instruction set the decoder does not cover (XOP, 3DNow!, FMA4, AMX, AVX512-FP16, APX) or bytes that are no instruction | The instruction at `<function>+N` (bytes ..) is not understood; the hook installer fails safe. | Report the bytes, or exclude the function. | WP-10, WP-38 | **live** (VEX and EVEX are decoded since WP-38) |
 | CML4301 | Function shorter than 5 bytes with no padding before or after | `<function>` is too short for the 5-byte jump and no `CC`/`90` padding can be used. | Link with /FUNCTIONPADMIN or give the function a longer body. | WP-10 | **live** |
 | CML4304 | A call ends inside the overwritten bytes | A call at `<function>+N` ends inside the hook's overwritten range. | Exclude the function or add padding before it. | WP-10 | **live** |
 | CML4305 | Thread stayed inside the function's first bytes for 50 stops | Thread N kept executing inside the first bytes of `<function>`. | Wait for the application to leave the function and reload again. | WP-10 | **live** |
@@ -153,7 +153,7 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
   - If an injected post-patch-hooks rollback is incomplete (CML4656), the patch image stays mapped with some hooks possibly live;
     restart the application. A later revert of that batch may report hooks it cannot find.
 - **Fuzzing (WP-28)** covers the COFF, PE, PDB, IPC and control-JSON readers.
-  - Not fuzzed: the hook decoder (WP-38 adds it), the user-hook scanner, the bind planner and the toolchain parser.
+  - Not fuzzed: the user-hook scanner, the bind planner and the toolchain parser. The hook decoder is fuzzed since WP-38.
   - Only RelWithDebInfo is fuzzed (ASan needs the release CRT).
 - **Real-project findings (WP-26 corpus, ADR-0036).**
   - **Image-relative references to old data (F-2, cl):** when a function has `__ImageBase` in a register (it has a switch
@@ -163,8 +163,9 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
     enough to trigger it (ADR-0042). Being fixed by WP-36.
   - **Overloaded statics (F-4):** any `static` / `static inline` overload set in a header (Dear ImGui's `ImFloor`) refuses
     every TU that includes it (CML3214), because the PDB reader has no type information yet. Being fixed by WP-37.
-  - **VEX prologues:** the hook decoder refuses functions that start with a VEX-encoded (C4/C5) instruction; the STL's AVX
-    helpers and 220 of Godot's 512 467 functions do. Such a function cannot be hooked. Being fixed by WP-38.
+  - **VEX prologues (fixed by WP-38, #65):** the hook decoder knows VEX and EVEX, opcode maps 1 to 3 (AVX, AVX2, FMA,
+    BMI, AVX-512), checked against Zydis by fuzzing and a sweep over real modules; functions that begin with such an
+    instruction are hooked (Godot: 220 functions that were refused now hook).
   - **Same-named function-local statics in one function (F-4 family):** several lambdas in one function each defining
     a local static of the same name (Godot's `SNAME` in `scene/main/scene_tree.cpp`: `$TSS0`, `sname`) cannot be told
     apart; the planner refuses the TU with CML3207/CML3214 (found by WP-26b). Being fixed by WP-37.
