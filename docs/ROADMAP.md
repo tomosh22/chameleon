@@ -80,10 +80,11 @@ fixtures" to "works on your project".
 
 ## Suggested order
 
-1. **Wave 10 (Eng), in progress (ADR-0042):** WP-36 = R-01, WP-37 = R-02 + R-03 (PDB type stream), WP-38 = R-04 + the
-   decoder part of R-41, WP-39 = R-13. Acceptance is the corpus: the F-2 xfail flips, the ImGui CML3214 refusals become
-   reloads, `refused_vex=0`.
+1. **Wave 10 (Eng), ADR-0042:** done except WP-37 (final CI). WP-36 = R-01, WP-37 = R-02 + R-03, WP-38 = R-04 + the decoder part of R-41,
+   WP-39 = R-13 (plus WP-39b).
+   **Wave 11 (Eng), proposed (ADR-0043), starts when WP-37 merges:** WP-40 = R-48 + R-50 (planner pairing defects, first because they can pair
+   wrong state), WP-41 and WP-42 = R-06 (corpus), WP-43 = R-40 + R-42 (restart, revert), WP-44 = rest of R-42 + R-49.
 2. **In parallel (User):** R-10 dogfooding, R-11 and R-12 checklists, R-30/R-31 decisions.
-3. **Wave 11 (Eng):** fixes from R-10, R-06 corpus widening, R-40 and R-42.
+3. **Then:** fixes from R-10 as they come; R-46, R-47.
 4. **Before first sale (User + Eng):** R-32, R-33, R-34, R-35.
 5. **After GA:** R-20 / R-21 per the positioning decision, R-23 research.
