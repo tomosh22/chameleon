@@ -109,6 +109,13 @@ inline bool cpu_has_avx2() {
            IsProcessorFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE) != FALSE;
 }
 
+// The tests that execute VEX code must run in every CI cell (the WP-38 acceptance), so there a machine without AVX2
+// is a failure. On any other machine without AVX2 they skip their VEX part with a message and run everything else.
+inline bool running_in_ci() {
+    char value[8];
+    return GetEnvironmentVariableA("GITHUB_ACTIONS", value, sizeof(value)) != 0;
+}
+
 // ---- executable memory -----------------------------------------------------------------------------
 
 struct Placed {

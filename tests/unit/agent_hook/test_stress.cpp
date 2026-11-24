@@ -19,8 +19,9 @@
 //   * six hand-assembled ones whose bytes do not depend on a compiler (hook_test_support.h: two-byte and three-byte
 //     VEX prefix, vzeroupper with its missing ModRM byte, a 256-bit instruction, a loop behind two VEX instructions).
 // The entry bytes are read from memory before anything is hooked; a target that does not start with C4 / C5 fails the
-// test. The functions are executed by all 16 threads, so a CPU without AVX2 fails the test with a message (it is not
-// skipped).
+// test. The functions are executed by all 16 threads, so they need AVX2: in CI (GITHUB_ACTIONS set) a machine without
+// it fails the test, because the acceptance wants them run in every cell; anywhere else the eight VEX targets are left
+// out with a message and the other nine run as before.
 //
 // Output (also written to <build>/test_work/agent_hook/evidence.txt for the CI log):
 //   WP10-STRESS seconds=60 threads=16 installs=N reverts=N retries=N crashes=0
@@ -199,12 +200,15 @@ std::string hex8(const void* address) {
 TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy multithreaded load") {
     const int seconds = configured_seconds();
     start_evidence_file();
-    // WP-38: the VEX-entry targets execute AVX2 code on every thread. No AVX2, no acceptance: fail, do not skip.
+    // WP-38: the VEX-entry targets execute AVX2 code on every thread. In CI no AVX2 means no acceptance: fail. On any
+    // other machine without AVX2 they are left out, loudly, and the nine legacy targets get their full run.
     const bool avx2 = cpu_has_avx2();
     if (!avx2) {
-        write_evidence("WP38-STRESS-VEX cpu_avx2=0 targets=0 (the processor or the operating system does not provide AVX2)");
+        write_evidence("WP38-STRESS-VEX cpu_avx2=0 targets=0 SKIPPED (the processor or the operating system does not provide AVX2)");
+        REQUIRE_MESSAGE(!running_in_ci(),
+                        "unit.agent_hook_stress hooks and executes AVX2 functions (WP-38); a CI cell must provide AVX2");
+        MESSAGE("WP-38: no AVX2 on this machine: the eight VEX-entry targets are SKIPPED, the legacy targets run");
     }
-    REQUIRE_MESSAGE(avx2, "unit.agent_hook_stress hooks and executes AVX2 functions (WP-38); this machine does not provide AVX2");
     Arena arena(16);
     REQUIRE(arena.ok());
 
@@ -250,8 +254,9 @@ TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy mul
     add_blob("push_first_padded", push_first(0), 16, 16, 13, 23);     // padding, but first instruction 1 byte: strategy 2
     add_blob("short_padded", short_lea(0), 8, 8, 14, 24);             // 4 bytes, padding both sides: strategy 1
     add_blob("short_trailing_pad", short_lea(0), 0, 12, 15, 25);      // 4 bytes, padding only after: strategy 2, short function
-    // WP-38: entries that are VEX instructions. `first_vex` is where they start in `targets`.
+    // WP-38: entries that are VEX instructions (only with AVX2). `first_vex` is where they start in `targets`.
     const std::size_t first_vex = targets.size();
+    if (avx2) {
     add_blob("vex_c5_padded", vex_c5(0), 8, 8, 30, 40);               // strategy 1; 4-byte VEX instruction at the entry
     add_blob("vex_c5_no_padding", vex_c5(0), 0, 0, 31, 41);           // strategy 2; the jump ends inside the second VEX instruction
     add_blob("vex_c4_no_padding", vex_c4(0), 0, 0, 32, 42);           // strategy 2; a 5-byte VEX instruction is exactly the jump
@@ -305,6 +310,7 @@ TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy mul
         slow.vex_entry = true;
         targets.push_back(slow);
     }
+    }  // if (avx2)
     {
         // Loops inside its first four bytes for `argument` iterations, then returns a constant.
         Target slow;
@@ -341,8 +347,8 @@ TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy mul
         ++vex_targets;
         vex_compiled += t.compiled ? 1u : 0u;
     }
-    REQUIRE(vex_targets == 8);
-    REQUIRE(vex_compiled == 2);
+    REQUIRE(vex_targets == (avx2 ? 8u : 0u));
+    REQUIRE(vex_compiled == (avx2 ? 2u : 0u));
 
     // The functions behave as the originals before anything is hooked.
     for (const Target& t : targets) {
@@ -581,7 +587,7 @@ TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy mul
     }
     // WP-38: the VEX-entry targets, their first bytes and the strategy each was hooked with.
     std::size_t vex_padding = 0, vex_five_byte = 0, vex_compiled_hooked = 0;
-    {
+    if (avx2) {
         std::string line;
         std::size_t k = 0;
         for (std::size_t i = 0; i < targets.size(); ++i) {
@@ -613,10 +619,12 @@ TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy mul
     CHECK(failures * 4 <= cycles * 3 + 3);
     CHECK(installer.hook_count() == 0);
     // WP-38: every VEX-entry target was hooked, some through the padding and some with the 5-byte jump.
-    CHECK(vex_padding + vex_five_byte == vex_targets);
-    CHECK(vex_padding >= 2);
-    CHECK(vex_five_byte >= 4);
-    CHECK(vex_compiled_hooked == vex_compiled);
+    if (avx2) {
+        CHECK(vex_padding + vex_five_byte == vex_targets);
+        CHECK(vex_padding >= 2);
+        CHECK(vex_five_byte >= 4);
+        CHECK(vex_compiled_hooked == vex_compiled);
+    }
     for (const Target& t : targets) {
         const Bytes now = snapshot(static_cast<const std::uint8_t*>(t.entry) - 16, 16 + 48);
         CHECK_MESSAGE(now == t.snapshot_before, t.name << ": bytes differ from the original after the last revert");

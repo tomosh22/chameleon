@@ -28,9 +28,10 @@
 // refused_vex counts the CML4300 refusals whose instruction starts with a VEX/EVEX prefix (C4, C5, 62), the others
 // are refused_unknown_opcode. Until WP-38 the decoder knew no VEX at all ("no VEX, no EVEX", WP-10) and refused_vex was
 // tolerated; since WP-38 (ADR-0042) the decoder covers VEX and EVEX maps 1..3 and a VEX refusal is as much an error
-// as any other. vex_entries counts the functions whose hook plan had to decode a VEX/EVEX instruction (the STL's
-// vectorised algorithms, __std_minmax_*, __std_find_*, in every MSVC build; much more with /arch:AVX2); the LDE-VEX
-// lines show their bytes.
+// as any other. vex_entries counts the functions whose hook plan had to decode a VEX/EVEX instruction: the first
+// instruction for a padding plan, every instruction inside the window of a 5-byte plan, everything up to the culprit
+// for a refusal (the STL's vectorised algorithms, __std_minmax_*, __std_find_*, in every MSVC build; much more with
+// /arch:AVX2); the LDE-VEX lines show their bytes.
 // --fail-on-unknown-opcode makes every refusal for CML4300 an error (exit code 3): on a real project that is a
 // decoder gap (a common prologue the decoder does not know) and must be reduced to a unit test. --min-functions N exits
 // with 4 when fewer than N functions were examined (a PDB that lost its functions would otherwise pass).
@@ -169,22 +170,10 @@ int main(int argc, char** argv) {
         ++examined;
         std::string lens;
         bool unknown = false;
-        bool vex_within_plan = false;  // a VEX/EVEX instruction among those the hook plan decodes (the first 5 bytes)
         std::size_t at = 0;
         std::string unknown_key;
         while (at < head.size()) {
             const auto d = cml::agent::hook::decode_instruction(head.data() + at, head.size() - at);
-            if (at < cml::agent::hook::kJmpRel32Size) {
-                // Segment and address-size prefixes may precede the VEX / EVEX byte.
-                std::size_t lead = at;
-                while (lead < head.size() && (head[lead] == 0x26 || head[lead] == 0x2E || head[lead] == 0x36 || head[lead] == 0x3E ||
-                                              head[lead] == 0x64 || head[lead] == 0x65 || head[lead] == 0x67)) {
-                    ++lead;
-                }
-                if (lead < head.size() && (head[lead] == 0xC4 || head[lead] == 0xC5 || head[lead] == 0x62)) {
-                    vex_within_plan = true;
-                }
-            }
             if (d.status == DecodeStatus::Unknown) {
                 unknown = true;
                 unknown_key = hex_bytes(head.data() + at, std::min<std::size_t>(3, head.size() - at));
@@ -239,6 +228,35 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Did the plan have to decode a VEX / EVEX instruction? The padding strategy decodes the first instruction
+        // only; the 5-byte strategy every instruction that starts inside its window; a refusal everything up to and
+        // including the instruction it names.
+        std::size_t plan_end = 0;  // instructions that start below this offset were decoded for the plan
+        if (plan.strategy == cml::agent::hook::Strategy::PaddingTwoByte) {
+            plan_end = 1;
+        } else if (plan.strategy == cml::agent::hook::Strategy::FiveByte) {
+            plan_end = plan.window_after;
+        } else {
+            plan_end = static_cast<std::size_t>(plan.fail_offset) + 1;
+        }
+        bool vex_within_plan = false;
+        for (std::size_t p = 0; p < plan_end && p < ahead.size();) {
+            // Segment and address-size prefixes may precede the VEX / EVEX byte.
+            std::size_t lead = p;
+            while (lead < ahead.size() && (ahead[lead] == 0x26 || ahead[lead] == 0x2E || ahead[lead] == 0x36 || ahead[lead] == 0x3E ||
+                                           ahead[lead] == 0x64 || ahead[lead] == 0x65 || ahead[lead] == 0x67)) {
+                ++lead;
+            }
+            if (lead < ahead.size() && (ahead[lead] == 0xC4 || ahead[lead] == 0xC5 || ahead[lead] == 0x62)) {
+                vex_within_plan = true;
+                break;
+            }
+            const auto d = cml::agent::hook::decode_instruction(ahead.data() + p, ahead.size() - p);
+            if (d.status != DecodeStatus::Ok) {
+                break;
+            }
+            p += d.length;
+        }
         if (vex_within_plan) {
             ++vex_entries;
             if (!quiet && vex_listed < 400) {

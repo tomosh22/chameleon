@@ -804,6 +804,26 @@ TEST_CASE("EVEX: four-byte prefix, maps 1 to 3, compressed displacement, masking
     expect_len({0x62, 0xF3, 0xFD, 0x48, 0x00, 0x44, 0x24, 0x01, 0xD8}, 9);  // vpermq zmm0, [rsp+40h], 0D8h
 }
 
+TEST_CASE("EVEX: a compressed disp8 is reported as the one byte it is, not as the scaled displacement") {
+    // vmovups zmm0, [rcx+40h]: 62 F1 7C 48 (prefix) 10 (opcode) 41 (ModRM: mod 01, rm rcx) 01 (disp8, times N = 64).
+    // The decoder reports where the byte is and that it is one byte; it has no flag for "scaled" (the header says
+    // so), and the length is 7 whatever N is.
+    const Bytes code = {0x62, 0xF1, 0x7C, 0x48, 0x10, 0x41, 0x01};
+    const DecodeResult r = decode_exact(code);
+    REQUIRE(r.status == DecodeStatus::Ok);
+    CHECK(r.length == 7);
+    CHECK(r.disp_offset == 6);
+    CHECK(r.disp_size == 1);
+    CHECK(r.flags == 0);
+    // The same instruction with a disp32 carries the literal displacement, as under every encoding.
+    const Bytes wide = {0x62, 0xF1, 0x7C, 0x48, 0x10, 0x81, 0x40, 0x00, 0x00, 0x00};
+    const DecodeResult w = decode_exact(wide);
+    REQUIRE(w.status == DecodeStatus::Ok);
+    CHECK(w.length == 10);
+    CHECK(w.disp_offset == 6);
+    CHECK(w.disp_size == 4);
+}
+
 TEST_CASE("VEX / EVEX: what is refused") {
     // 66, F2, F3, lock or REX in front of a VEX or EVEX prefix is #UD (SDM volume 2, 2.3.2 and 2.7.1).
     for (const std::uint8_t prefix : std::initializer_list<std::uint8_t>{0x66, 0xF2, 0xF3, 0xF0, 0x40, 0x48, 0x4F}) {

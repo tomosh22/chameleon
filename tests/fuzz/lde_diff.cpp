@@ -111,7 +111,9 @@ void sweep_range(const Reference& reference, const std::uint8_t* code, std::size
         const Comparison c = reference.compare(code + at, length - at);
         if (c.verdict == Verdict::Mismatch) {
             ++t.mismatches;
-            const std::string here = where + "+0x" + std::to_string(at);
+            char offset[32];
+            std::snprintf(offset, sizeof(offset), "+0x%zx", at);
+            const std::string here = where + offset;
             print_mismatch(here.c_str(), c, code + at, length - at);
             if (!resync) {
                 return;

@@ -1069,7 +1069,11 @@ TEST_CASE("which threads exist after the tests above (information for the exit c
 // WP-38 (ADR-0042): functions whose first instruction is VEX-encoded are hooked, re-pointed and reverted like any
 // other, through the padding and through the 5-byte jump. The functions are executed, so the CPU must have AVX2.
 TEST_CASE("WP-38: functions that begin with VEX instructions are hooked with both strategies") {
-    REQUIRE_MESSAGE(cpu_has_avx2(), "this test executes AVX2 code and the CPU (or the OS) does not provide AVX2");
+    if (!cpu_has_avx2()) {
+        REQUIRE_MESSAGE(!running_in_ci(), "this test executes AVX2 code; a CI cell must provide AVX2 (WP-38 acceptance)");
+        MESSAGE("SKIPPED: this machine does not provide AVX2, so the functions that begin with VEX instructions cannot be run");
+        return;
+    }
     struct Shape {
         const char* name;
         Bytes code;

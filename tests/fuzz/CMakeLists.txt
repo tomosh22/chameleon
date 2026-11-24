@@ -35,9 +35,19 @@ if(CML_ZYDIS_DIR)
                            ZYDIS_FEATURE_ENCODER ZYDIS_FEATURE_FORMATTER ZYDIS_BUILD_SHARED_LIB)
         set(${_cml_zydis_off} OFF CACHE BOOL "" FORCE)
     endforeach()
-    # SYSTEM: its headers are not held to /W4 /WX. EXCLUDE_FROM_ALL: built only for the two test executables.
-    add_subdirectory("${CML_ZYDIS_DIR}" "${CMAKE_BINARY_DIR}/zydis" EXCLUDE_FROM_ALL SYSTEM)
+    # EXCLUDE_FROM_ALL: built only for the two test executables.
+    add_subdirectory("${CML_ZYDIS_DIR}" "${CMAKE_BINARY_DIR}/zydis" EXCLUDE_FROM_ALL)
 endif()
+
+# Links a test executable with the reference. Its headers are not held to /W4 /WX: the include directories of Zydis
+# and Zycore are repeated as SYSTEM directories of the consuming target, which makes CMake pass them as system
+# includes (add_subdirectory(... SYSTEM) would do it, but needs CMake 3.25; the project supports 3.24).
+function(cml_link_zydis target)
+    target_link_libraries(${target} PRIVATE Zydis)
+    target_include_directories(${target} SYSTEM PRIVATE
+        $<TARGET_PROPERTY:Zydis,INTERFACE_INCLUDE_DIRECTORIES>
+        $<TARGET_PROPERTY:Zycore,INTERFACE_INCLUDE_DIRECTORIES>)
+endfunction()
 
 set(CML_FUZZ_TARGETS coff pe pdb ipc control lde)
 set(CML_FUZZ_LIBS_coff cml_coff cml_util)
@@ -162,14 +172,15 @@ endforeach()
 # WP-38: the length decoder's sources come from agent/src; with CML_ZYDIS_DIR the target also asks the reference.
 target_include_directories(cml_fuzz_lde PRIVATE "${PROJECT_SOURCE_DIR}/agent/src")
 if(CML_ZYDIS_DIR)
-    target_link_libraries(cml_fuzz_lde PRIVATE Zydis)
+    cml_link_zydis(cml_fuzz_lde)
     target_compile_definitions(cml_fuzz_lde PRIVATE CML_LDE_REFERENCE=1)
 
     # cml_lde_diff: the comparison over real modules (linear sweep from every function entry) and over the encoding
     # space. Not a ctest here: fuzz.yml runs it on the fixture modules and on the /arch:AVX2 and /arch:AVX512 modules.
     add_executable(cml_lde_diff lde_diff.cpp ${CML_LDE_SOURCES})
     target_include_directories(cml_lde_diff PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${PROJECT_SOURCE_DIR}/agent/src")
-    target_link_libraries(cml_lde_diff PRIVATE cml_pdb cml_pe cml_util Zydis)
+    target_link_libraries(cml_lde_diff PRIVATE cml_pdb cml_pe cml_util)
+    cml_link_zydis(cml_lde_diff)
     cml_apply_warnings(cml_lde_diff)
     cml_target_core_style(cml_lde_diff)
     set_target_properties(cml_lde_diff PROPERTIES FOLDER "tests/fuzz")

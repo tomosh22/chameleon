@@ -56,6 +56,11 @@ struct DecodeResult {
     // which an immediate of the same width is not guaranteed to be. The address computed from it is a plain 64-bit
     // address only when none of kInsnRipRel, kInsnAddr32 and kInsnSegFsGs is set. Branch targets (rel8/rel32) are
     // immediates here, never displacements; the moffs forms (A0..A3) are not covered at all (Unknown).
+    // One exception to "sign-extends" (WP-38): the 1-byte displacement of an EVEX-encoded instruction (62 ...) is a
+    // compressed displacement, which the processor multiplies by a factor N that depends on the instruction (disp8*N,
+    // SDM volume 2, 2.7.5) before it sign-extends it. `disp_size == 1` then says only where the byte is and that it is
+    // one byte; no flag marks it, so a user that needs the value must look at the first non-prefix byte for 62 or
+    // restrict itself to `disp_size == 4`, which is the literal sign-extended displacement under every encoding.
     std::uint8_t disp_offset = 0;
     std::uint8_t disp_size = 0;
 };
