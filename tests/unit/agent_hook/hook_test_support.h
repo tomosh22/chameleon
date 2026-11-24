@@ -65,8 +65,56 @@ inline Bytes spin_until() { return {0x80, 0x39, 0x00, 0x74, 0xFB, 0xC3}; }
 inline Bytes slow_const(std::int32_t v) { return cat({{0xFF, 0xC9, 0x75, 0xFC, 0xB8}, imm32(v), {0xC3}}); }
 // A call as the 1st instruction followed by more code: call rax ; sub rsp,28h ; ...
 inline Bytes call_first() { return {0xFF, 0xD0, 0x48, 0x83, 0xEC, 0x28, 0x48, 0x83, 0xC4, 0x28, 0xC3}; }
-// vmovaps xmm0, xmm1 ; ret  (VEX: not covered by the length decoder)
-inline Bytes vex_first() { return {0xC5, 0xF8, 0x28, 0xC1, 0xC3, 0x90, 0x90, 0x90}; }
+// pfadd mm0, mm1 ; ret  (3DNow!: not covered by the length decoder; never executed)
+inline Bytes unknown_first() { return {0x0F, 0x0F, 0xC1, 0x9E, 0xC3, 0x90, 0x90, 0x90}; }
+
+// ---- functions that begin with VEX instructions (WP-38). They need AVX (cpu_has_avx2() below) to run. ----
+//   int f(int x) shapes all return x + k.
+// vmovd xmm0, ecx (C5 F9 6E C1) ; vmovd eax, xmm0 (C5 F9 7E C0) ; add eax, k ; ret
+//   Two-byte VEX prefix, first instruction 4 bytes: a 5-byte jump ends inside the second VEX instruction.
+inline Bytes vex_c5(std::int32_t k) {
+    return cat({{0xC5, 0xF9, 0x6E, 0xC1}, {0xC5, 0xF9, 0x7E, 0xC0}, {0x05}, imm32(k), {0xC3}});
+}
+// vmovd xmm0, ecx in the three-byte form (C4 E1 79 6E C1, 5 bytes: exactly the jump) ; vmovd eax, xmm0 ; add ; ret
+inline Bytes vex_c4(std::int32_t k) {
+    return cat({{0xC4, 0xE1, 0x79, 0x6E, 0xC1}, {0xC5, 0xF9, 0x7E, 0xC0}, {0x05}, imm32(k), {0xC3}});
+}
+// vzeroupper (C5 F8 77: 3 bytes and no ModRM) ; lea eax, [rcx+k] (8D 81 imm32: 6 bytes) ; ret
+//   A decoder that gave vzeroupper a ModRM byte would take 8D 81 for it and the following four bytes for a
+//   displacement, and put the instruction boundary in the middle of the lea.
+inline Bytes vex_zeroupper(std::int32_t k) { return cat({{0xC5, 0xF8, 0x77}, {0x8D, 0x81}, imm32(k), {0xC3}}); }
+// vpxor ymm0, ymm0, ymm0 (C5 FD EF C0) ; vzeroupper ; lea eax, [rcx+k] ; ret      (256-bit: needs AVX2)
+inline Bytes vex_ymm(std::int32_t k) {
+    return cat({{0xC5, 0xFD, 0xEF, 0xC0}, {0xC5, 0xF8, 0x77}, {0x8D, 0x81}, imm32(k), {0xC3}});
+}
+// int f(int n): vmovd xmm0, ecx ; vmovd ecx, xmm0 (C5 F9 7E C1) ; then slow_const's loop and constant. A thread spends
+// its time in the loop behind the two VEX instructions, and passes through them on every call.
+inline Bytes vex_slow_const(std::int32_t v) {
+    return cat({{0xC5, 0xF9, 0x6E, 0xC1}, {0xC5, 0xF9, 0x7E, 0xC1}, {0xFF, 0xC9, 0x75, 0xFC, 0xB8}, imm32(v), {0xC3}});
+}
+
+// AVX2 usable: the processor has it and the operating system saves the YMM state (Windows reports the feature only
+// then). The constants are spelled out for Windows SDKs whose winnt.h does not have them yet.
+#if !defined(PF_XSAVE_ENABLED)
+#define PF_XSAVE_ENABLED 17
+#endif
+#if !defined(PF_AVX_INSTRUCTIONS_AVAILABLE)
+#define PF_AVX_INSTRUCTIONS_AVAILABLE 39
+#endif
+#if !defined(PF_AVX2_INSTRUCTIONS_AVAILABLE)
+#define PF_AVX2_INSTRUCTIONS_AVAILABLE 40
+#endif
+inline bool cpu_has_avx2() {
+    return IsProcessorFeaturePresent(PF_XSAVE_ENABLED) != FALSE && IsProcessorFeaturePresent(PF_AVX_INSTRUCTIONS_AVAILABLE) != FALSE &&
+           IsProcessorFeaturePresent(PF_AVX2_INSTRUCTIONS_AVAILABLE) != FALSE;
+}
+
+// The tests that execute VEX code must run in every CI cell (the WP-38 acceptance), so there a machine without AVX2
+// is a failure. On any other machine without AVX2 they skip their VEX part with a message and run everything else.
+inline bool running_in_ci() {
+    char value[8];
+    return GetEnvironmentVariableA("GITHUB_ACTIONS", value, sizeof(value)) != 0;
+}
 
 // ---- executable memory -----------------------------------------------------------------------------
 

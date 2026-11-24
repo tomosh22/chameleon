@@ -279,16 +279,16 @@ TEST_CASE("functions shorter than 5 bytes, with and without padding") {
 TEST_CASE("fail-safe refusals name the function and change nothing") {
     Arena arena;
     const Placed new_fn = arena.place_padded(lea_ret(1), 8, 8);
-    SUBCASE("an instruction the decoder does not know (VEX): CML4300") {
-        const Placed old_fn = arena.place_padded(vex_first(), 0, 0);
+    SUBCASE("an instruction the decoder does not know (3DNow!): CML4300") {
+        const Placed old_fn = arena.place_padded(unknown_first(), 0, 0);
         arena.seal();
         const Bytes before = around(old_fn);
         Installer installer;
         HookOutcome outcome;
-        const BatchResult r = install_one(installer, old_fn.entry, new_fn.entry, "vex_fn", &outcome);
+        const BatchResult r = install_one(installer, old_fn.entry, new_fn.entry, "unknown_fn", &outcome);
         CHECK(r.diag.code == ids::kDecodeUnknown);
-        CHECK(outcome.diag.message.find("vex_fn") != std::string::npos);
-        CHECK(outcome.diag.message.find("c5 f8") != std::string::npos);  // the bytes are quoted
+        CHECK(outcome.diag.message.find("unknown_fn") != std::string::npos);
+        CHECK(outcome.diag.message.find("0f 0f") != std::string::npos);  // the bytes are quoted
         CHECK(around(old_fn) == before);
     }
     SUBCASE("a call that ends inside the overwritten bytes: CML4304") {
@@ -1064,6 +1064,53 @@ TEST_CASE("which threads exist after the tests above (information for the exit c
     }
     CloseHandle(snapshot);
     CHECK(threads < 16);
+}
+
+// WP-38 (ADR-0042): functions whose first instruction is VEX-encoded are hooked, re-pointed and reverted like any
+// other, through the padding and through the 5-byte jump. The functions are executed, so the CPU must have AVX2.
+TEST_CASE("WP-38: functions that begin with VEX instructions are hooked with both strategies") {
+    if (!cpu_has_avx2()) {
+        REQUIRE_MESSAGE(!running_in_ci(), "this test executes AVX2 code; a CI cell must provide AVX2 (WP-38 acceptance)");
+        MESSAGE("SKIPPED: this machine does not provide AVX2, so the functions that begin with VEX instructions cannot be run");
+        return;
+    }
+    struct Shape {
+        const char* name;
+        Bytes code;
+        std::size_t pad_before;
+        Strategy strategy;
+    };
+    const Shape shapes[] = {
+        {"vex_c5_padded", vex_c5(0), 8, Strategy::PaddingTwoByte},
+        {"vex_c5_bare", vex_c5(0), 0, Strategy::FiveByte},
+        {"vex_c4_padded", vex_c4(0), 16, Strategy::PaddingTwoByte},
+        {"vex_c4_bare", vex_c4(0), 0, Strategy::FiveByte},
+        {"vex_zeroupper_padded", vex_zeroupper(0), 8, Strategy::PaddingTwoByte},
+        {"vex_zeroupper_bare", vex_zeroupper(0), 0, Strategy::FiveByte},
+        {"vex_ymm_padded", vex_ymm(0), 8, Strategy::PaddingTwoByte},
+        {"vex_ymm_bare", vex_ymm(0), 0, Strategy::FiveByte},
+    };
+    for (const Shape& shape : shapes) {
+        CAPTURE(shape.name);
+        Arena arena;
+        const Placed old_fn = arena.place_padded(shape.code, shape.pad_before, 0);
+        const Placed new_a = arena.place_padded(lea_ret(1000), 8, 8);
+        const Placed new_b = arena.place_padded(lea_ret(2000), 8, 8);
+        arena.seal();
+        REQUIRE((old_fn.entry[0] == 0xC5 || old_fn.entry[0] == 0xC4));
+        const Bytes before = around(old_fn);
+        CHECK(old_fn.as_int()(7) == 7);
+        Installer installer;
+        HookOutcome outcome;
+        REQUIRE_MESSAGE(install_one(installer, old_fn.entry, new_a.entry, shape.name, &outcome).ok(), outcome.diag.format());
+        CHECK(outcome.strategy == shape.strategy);
+        CHECK(old_fn.as_int()(7) == 1007);
+        REQUIRE(install_one(installer, old_fn.entry, new_b.entry, shape.name, &outcome).ok());  // re-point
+        CHECK(old_fn.as_int()(7) == 2007);
+        REQUIRE(revert_one(installer, old_fn.entry, shape.name, nullptr).ok());
+        CHECK(around(old_fn) == before);
+        CHECK(old_fn.as_int()(7) == 7);
+    }
 }
 
 #endif  // _WIN32

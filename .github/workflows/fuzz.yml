@@ -9,6 +9,12 @@ name: fuzz
 #
 # Runs nightly, on demand, and on pull requests that touch a fuzz target, the readers or the IPC code, so the PR that changes
 # them carries its own run. It does not edit ci.yml (ADR-0035).
+#
+# WP-38 (ADR-0042): target `lde` is the hook installer's instruction-length decoder. In this workflow it is built with the
+# reference disassembler Zydis (MIT; fetched at a pinned commit by tests/fuzz/fetch_zydis.ps1, never vendored, linked only into
+# the test executables): whenever the decoder says Ok, Zydis must decode the same bytes to the same length. Job `lde-diff` runs
+# the same comparison as a linear sweep from every function entry of real modules (the fixtures, the agent, the broker, and a
+# module compiled with /arch:AVX2 and /arch:AVX512) and over a structured walk of the encoding space.
 
 on:
   schedule:
@@ -28,6 +34,8 @@ on:
       - 'core/cml_pe/**'
       - 'core/cml_pdb/**'
       - 'core/cml_ipc/**'
+      - 'agent/src/hook/**'
+      - 'tests/unit/agent_hook/**'
 
 permissions:
   contents: read
@@ -50,6 +58,7 @@ jobs:
           - { target: pdb,     max_len: 131072 }
           - { target: ipc,     max_len: 65536 }
           - { target: control, max_len: 16384 }
+          - { target: lde,     max_len: 64 }
     env:
       FUZZ_MINUTES: ${{ github.event.inputs.minutes || '10' }}
     defaults:
@@ -92,10 +101,20 @@ jobs:
           Get-ChildItem $win | ForEach-Object { Write-Host $_.Name }
           "### clang-cl for the fuzz targets`n$v" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
 
+      # WP-38: the length decoder's reference. Only the `lde` target links it.
+      - name: Fetch Zydis at the pinned commit (lde only)
+        if: ${{ matrix.target == 'lde' }}
+        run: |
+          pwsh tests/fuzz/fetch_zydis.ps1 -Destination "$env:RUNNER_TEMP/zydis" *>&1 | Tee-Object -FilePath ci-logs/zydis.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "CML_ZYDIS_ARG=-DCML_ZYDIS_DIR=$("$env:RUNNER_TEMP/zydis" -replace '\\', '/')" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
       # RelWithDebInfo: AddressSanitizer needs the release CRT (/MT; the project is static-CRT, and libFuzzer is built for it), never /MTd.
       - name: Configure
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER="$env:CML_CXX" -DCML_FUZZ=ON `
+          $extra = @()
+          if ($env:CML_ZYDIS_ARG) { $extra += $env:CML_ZYDIS_ARG }
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER="$env:CML_CXX" -DCML_FUZZ=ON @extra `
             *>&1 | Tee-Object -FilePath ci-logs/configure.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -132,8 +151,14 @@ jobs:
             "-artifact_prefix=crashes/" "fuzz-corpus/${{ matrix.target }}" "tests/fuzz/corpus/${{ matrix.target }}" `
             *>&1 | Tee-Object -FilePath ci-logs/fuzz.log
           $code = $LASTEXITCODE
-          $stats = Select-String -Path ci-logs/fuzz.log -Pattern 'stat::|^#\d+\s+(DONE|INITED)|Done \d+ runs' | ForEach-Object { $_.Line }
+          $stats = Select-String -Path ci-logs/fuzz.log -Pattern 'stat::|^#\d+\s+(DONE|INITED)|Done \d+ runs|^WP38-FUZZ' | ForEach-Object { $_.Line }
           "### fuzz ${{ matrix.target }} (${{ env.FUZZ_MINUTES }} min), exit code $code`n``````n$($stats -join "`n")`n``````" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          # WP-38: the lde target must have run WITH the reference, and says so when it ends without a disagreement.
+          if ($code -eq 0 -and '${{ matrix.target }}' -eq 'lde') {
+            $line = Select-String -Path ci-logs/fuzz.log -Pattern '^WP38-FUZZ reference=zydis inputs=[1-9]\d* positions=[1-9]\d* ok=[1-9]\d* agree=[1-9]\d* exceptions=\d+ disagreements=0$' | Select-Object -Last 1
+            if (-not $line) { Write-Host 'fuzz_lde did not print its WP38-FUZZ reference=zydis line'; exit 1 }
+            Write-Host $line.Line
+          }
           exit $code
 
       # A crash leaves crash-*, leak-*, timeout-* and oom-* files in crashes/.
@@ -152,6 +177,100 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-logs-${{ matrix.target }}
+          path: ci-logs/
+          retention-days: 14
+
+  # WP-38 (ADR-0042 point 4): the length decoder against Zydis over real code and over the encoding space. Fails on the first
+  # disagreement, and when the sweep saw too few instructions to mean anything.
+  lde-diff:
+    name: lde-diff / ${{ matrix.compiler }} / ${{ matrix.config }}
+    runs-on: windows-2022
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { compiler: msvc,     config: RelWithDebInfo }
+          - { compiler: msvc,     config: Debug }
+          - { compiler: clang-cl, config: RelWithDebInfo }
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC developer environment (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Fetch Zydis at the pinned commit
+        run: |
+          New-Item -ItemType Directory -Force -Path ci-logs | Out-Null
+          pwsh tests/fuzz/fetch_zydis.ps1 -Destination "$env:RUNNER_TEMP/zydis" *>&1 | Tee-Object -FilePath ci-logs/zydis.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Configure
+        run: |
+          $cxx = 'cl'
+          if ('${{ matrix.compiler }}' -eq 'clang-cl') {
+            $cxx = 'C:\Program Files\LLVM\bin\clang-cl.exe'
+            if (-not (Test-Path $cxx)) { $cxx = (Get-Command clang-cl).Source }
+            & $cxx --version
+          }
+          $zydis = "$env:RUNNER_TEMP/zydis" -replace '\\', '/'
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.config }} -DCMAKE_CXX_COMPILER="$cxx" "-DCML_ZYDIS_DIR=$zydis" `
+            *>&1 | Tee-Object -FilePath ci-logs/configure.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # The modules that are swept: the twelve fixtures of the decoder corpus test, the AVX2 / AVX-512 module, the stress test
+      # (it carries the /arch:AVX2 functions the hook installer is tested on), the agent and the broker.
+      - name: Build the tools and the modules
+        run: |
+          $fixtures = 'basic templates virtuals statics lambdas optimised tls pch bigobj elision hot_restart new_function'.Split(' ') | ForEach-Object { "fixture_$_" }
+          cmake --build build --parallel --target cml_lde_diff cml_lde_probe cml_fuzz_lde cml_lde_avx_module cml_test_agent_hook_stress cml_agent cml_broker @fixtures `
+            *>&1 | Tee-Object -FilePath ci-logs/build.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Replay the fuzz seeds with the reference
+        run: |
+          & build/bin/cml_fuzz_lde.exe tests/fuzz/corpus/lde *>&1 | Tee-Object -FilePath ci-logs/replay.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Hook plans for the AVX2 / AVX-512 module (cml_lde_probe)
+        run: |
+          & build/bin/cml_lde_probe.exe build/bin/cml_lde_avx_module.exe --fail-on-unknown-opcode --min-functions 60 *>&1 | Out-File -Encoding utf8 ci-logs/probe-avx.log
+          $code = $LASTEXITCODE
+          Get-Content ci-logs/probe-avx.log | Select-String -Pattern '^LDE-(VEX|SUMMARY|PLAN|OUTCOME|REFUSED|UNKNOWN)|cml_lde_probe' | Select-Object -First 160 | ForEach-Object { $_.Line }
+          if ($code -ne 0) { exit $code }
+
+      - name: Differential sweep over real modules (WP38-DIFF)
+        run: |
+          $modules = @(Get-ChildItem build/bin/fixture_*.exe | Where-Object { $_.Name -match '^fixture_(basic|templates|virtuals|statics|lambdas|optimised|tls|pch|bigobj|elision|hot_restart|new_function)\.exe$' } | ForEach-Object { $_.FullName })
+          if ($modules.Count -ne 12) { Write-Host "expected 12 fixture modules, found $($modules.Count)"; exit 1 }
+          $modules += @('build/bin/cml_lde_avx_module.exe', 'build/bin/cml_test_agent_hook_stress.exe', 'build/bin/cml_agent.dll', 'build/bin/cml_broker.exe')
+          & build/bin/cml_lde_diff.exe sweep @modules --min-instructions 500000 --min-vex 1000 --min-evex 50 *>&1 | Tee-Object -FilePath ci-logs/diff-sweep.log
+          $code = $LASTEXITCODE
+          $line = (Select-String -Path ci-logs/diff-sweep.log -Pattern '^WP38-DIFF instructions=' | Select-Object -Last 1).Line
+          "### WP-38 differential sweep, ${{ matrix.compiler }} ${{ matrix.config }} (exit code $code)`n``````n$line`n``````" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          if ($code -ne 0) { exit $code }
+          if ($line -notmatch '^WP38-DIFF instructions=[1-9]\d* mismatches=0 ') { Write-Host "unexpected result line: $line"; exit 1 }
+
+      - name: Differential walk over the encoding space (WP38-ENUM)
+        run: |
+          & build/bin/cml_lde_diff.exe enumerate *>&1 | Tee-Object -FilePath ci-logs/diff-enumerate.log
+          $code = $LASTEXITCODE
+          $line = (Select-String -Path ci-logs/diff-enumerate.log -Pattern '^WP38-ENUM cases=' | Select-Object -Last 1).Line
+          "### WP-38 encoding-space walk, ${{ matrix.compiler }} ${{ matrix.config }} (exit code $code)`n``````n$line`n``````" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          if ($code -ne 0) { exit $code }
+          if ($line -notmatch '^WP38-ENUM cases=[1-9]\d* ok=[1-9]\d* agree=[1-9]\d* exceptions=\d+ mismatches=0 ') { Write-Host "unexpected result line: $line"; exit 1 }
+
+      - name: Upload logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: lde-diff-logs-${{ matrix.compiler }}-${{ matrix.config }}
           path: ci-logs/
           retention-days: 14
 
