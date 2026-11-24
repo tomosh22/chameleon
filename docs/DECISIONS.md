@@ -1107,6 +1107,10 @@ section layout of a member is known, the layout decides, with no warning; where 
 layout wins, and an order pairing never teaches, contradicts or erases a learned layout (high re-review of PR #64).
 Consequently CML3570 is raised only where the layout is unknown (cl); the acceptance's "warning in all 8 cells" becomes a
 per-compiler assertion in `unit.bind_fixtures` on each cell's PDB plus the `WP37-ORDER` line in the cl cells.
+Two refinements from the second re-review: the layout wins when it predicts an old record of the set (a hit or a conflict);
+when it predicts none (a miss), the order pairing applies, still without touching the learned layout. A static paired by
+order whose guard variable cannot be bound to the old guard is refused (CML3207), never given a fresh guard, because the
+initialiser would run again over live state.
 
 ### WP-38: VEX and EVEX in the hook length decoder; decoder fuzzing (R-04, R-41)
 
