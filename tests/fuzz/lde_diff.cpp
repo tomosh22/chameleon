@@ -22,6 +22,7 @@
 //       A structured walk over the encoding space instead of real code: every legacy opcode of the four legacy maps
 //       under a set of prefix combinations, every VEX and EVEX map / pp / opcode with every ModRM byte and varied
 //       payload bits, and prefixes in front of VEX / EVEX. Deterministic for a seed.
+//         WP38-ENUM-EXCEPTIONS (...) DECODING_ERROR=a BAD_REGISTER=b INVALID_MASK=c ...
 //         WP38-ENUM cases=N ok=A agree=B exceptions=X mismatches=M unknown_reference_ok=U
 //
 // Exit code: 0; 1 a module or its PDB cannot be read; 2 bad command line; 3 at least one mismatch; 4 a --min-* bound.
@@ -253,6 +254,7 @@ struct EnumTotals {
     std::size_t exceptions = 0;
     std::size_t mismatches = 0;
     std::size_t unknown_reference_ok = 0;
+    std::map<std::string, std::size_t> exception_status;  // what Zydis said about the encodings counted as exceptions
 };
 
 void enumerate_case(const Reference& reference, const std::uint8_t* bytes, std::size_t size, EnumTotals& t) {
@@ -265,7 +267,10 @@ void enumerate_case(const Reference& reference, const std::uint8_t* bytes, std::
     }
     switch (c.verdict) {
         case Verdict::Agree: ++t.agree; break;
-        case Verdict::Exception: ++t.exceptions; break;
+        case Verdict::Exception:
+            ++t.exceptions;
+            ++t.exception_status[cml::fuzz::lde::status_name(c.reference_status)];
+            break;
         case Verdict::Mismatch:
             ++t.mismatches;
             print_mismatch("enumerate", c, bytes, size);
@@ -399,6 +404,11 @@ int enumerate(const Reference& reference, std::uint64_t seed) {
         enumerate_case(reference, buffer, 1 + (rng.next() >> 33) % sizeof(buffer), t);
     }
 
+    std::string by_status;
+    for (const auto& [status, count] : t.exception_status) {
+        by_status += " " + status + "=" + std::to_string(count);
+    }
+    std::printf("WP38-ENUM-EXCEPTIONS (VEX/EVEX encodings the reference rejects, by its status)%s\n", by_status.c_str());
     std::printf("WP38-ENUM cases=%zu ok=%zu agree=%zu exceptions=%zu mismatches=%zu unknown_reference_ok=%zu\n", t.cases, t.ok,
                 t.agree, t.exceptions, t.mismatches, t.unknown_reference_ok);
     return t.mismatches != 0 ? 3 : 0;

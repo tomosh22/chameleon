@@ -204,7 +204,7 @@ CML_AVX_NOINLINE __m256d convert(__m256 a, __m128i i, __m256i wide) {
 
 CML_AVX_NOINLINE __m256 half_precision(__m128i halves, __m256 a, __m128i* out) {
     const __m256 wide = _mm256_cvtph_ps(halves);
-    _mm_storeu_si128(out, _mm256_cvtps_ph(_mm256_add_ps(wide, a), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    _mm_storeu_si128(out, _mm256_cvtps_ph(_mm256_add_ps(wide, a), _MM_FROUND_TO_NEAREST_INT));
     return wide;
 }
 
@@ -356,7 +356,7 @@ CML_AVX_NOINLINE void mxcsr(unsigned* saved, unsigned value) {
 // ---- BMI1, BMI2, LZCNT: VEX-encoded general-purpose instructions ----------------------------------------------------
 
 CML_AVX_NOINLINE std::uint32_t bits32(std::uint32_t a, std::uint32_t b, std::uint32_t n) {
-    std::uint32_t r = _andn_u32(a, b);
+    std::uint32_t r = ~a & b;  // andn
     r += _blsi_u32(a) + _blsr_u32(b) + _blsmsk_u32(a ^ b);
     r += _bextr_u32(a, 3, 9);
     r += _bzhi_u32(b, n);
@@ -367,7 +367,7 @@ CML_AVX_NOINLINE std::uint32_t bits32(std::uint32_t a, std::uint32_t b, std::uin
 }
 
 CML_AVX_NOINLINE unsigned long long bits64(unsigned long long a, unsigned long long b, unsigned long long n, unsigned long long* high) {
-    unsigned long long r = _andn_u64(a, b);
+    unsigned long long r = ~a & b;  // andn
     r += _blsi_u64(a) + _blsr_u64(b) + _blsmsk_u64(a ^ b);
     r += _bextr_u64(a, 5, 20);
     r += _bzhi_u64(b, static_cast<std::uint32_t>(n));
