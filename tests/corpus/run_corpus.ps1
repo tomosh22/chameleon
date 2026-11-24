@@ -472,7 +472,8 @@ if ($built) {
 # report
 # ---------------------------------------------------------------------------------------------------------------------
 $script:Matrix | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $out 'matrix.json')
-ConvertTo-Json -InputObject @($script:Timings) -Depth 5 | Set-Content (Join-Path $out 'reload-timings.json')   # WP-39
+# WP-39. (ToArray, not @(): the array operator on a List[object] of custom objects fails with "Argument types do not match".)
+ConvertTo-Json -InputObject ($script:Timings.ToArray()) -Depth 5 | Set-Content (Join-Path $out 'reload-timings.json')
 if ($env:GITHUB_STEP_SUMMARY) {
     $md = New-Object System.Collections.Generic.List[string]
     $md.Add("### corpus: $Project / $Compiler")
@@ -489,7 +490,7 @@ if ($env:GITHUB_STEP_SUMMARY) {
         $md.Add($(if ($ReloadBudgetMsPerTu -gt 0) { "Reload timing (WP-39): budget $ReloadBudgetMsPerTu ms of total - compile per recompiled TU." } else { 'Reload timing (WP-39): recorded, no budget asserted in this cell.' }))
         $md.Add('')
         $md.Add('```')
-        foreach ($row in $script:Timings) { $md.Add($row.line) }
+        foreach ($row in $script:Timings) { $md.Add([string]$row.line) }
         $md.Add('```')
     }
     Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ($md -join "`n")

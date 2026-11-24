@@ -518,12 +518,12 @@ jobs:
   # a translation unit inside it five times. The sources are generated on EVERY run (the PDB records their
   # paths; the broker hashes and recompiles them), and the cache key is the hash of everything the
   # generator wrote, of the two repository headers main.cpp includes and of the MSVC toolset version (the
-  # broker recompiles with the cl.exe the PDB records). The log line `benchmark project build time` gives
-  # the length of a cold build; docs/wp/WP-39.md records it.
+  # broker recompiles with the cl.exe the PDB records). A cold build takes about 3 minutes (log line
+  # `benchmark project build time`, docs/wp/WP-39.md).
   pdb-benchmark:
     name: pdb-benchmark (windows-2022 / msvc / RelWithDebInfo)
     runs-on: windows-2022
-    timeout-minutes: 120
+    timeout-minutes: 90
     # WP-27: the trend step downloads the perf-results artifact of the last successful main run.
     permissions:
       contents: read
