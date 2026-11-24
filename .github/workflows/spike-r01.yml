@@ -1,0 +1,45 @@
+name: spike-r01
+# Temporary orchestrator spike (ADR-0042, R-01): what does cl emit for image-relative array indexing?
+# Removed before the branch is merged.
+on:
+  push:
+    branches: ['ccr-**']
+    paths: ['spike/r01/**', '.github/workflows/spike-r01.yml']
+permissions:
+  contents: read
+jobs:
+  dump:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Compile and dump
+        run: |
+          cd spike/r01
+          $sets = @(
+            @{ name = 'O2';  flags = @('/O2','/Ob0','/Gy','/Z7') },
+            @{ name = 'O1';  flags = @('/O1','/Ob0','/Gy','/Z7') },
+            @{ name = 'Od';  flags = @('/Od','/Gy','/Z7') },
+            @{ name = 'O2jtr'; flags = @('/O2','/Ob0','/Gy','/Z7','/jumptablerdata') }
+          )
+          foreach ($s in $sets) {
+            foreach ($f in 'a','b') {
+              $obj = "$f-$($s.name).obj"
+              Write-Host "=================== cl $($s.flags -join ' ') $f.c"
+              & cl /nologo /c @($s.flags) "$f.c" "/Fo$obj"
+              if ($LASTEXITCODE -ne 0) { Write-Host "COMPILE-FAILED $obj"; continue }
+              & dumpbin /nologo /disasm /relocations $obj | Select-String -NotMatch -Pattern '^\s*$' | ForEach-Object { $_.Line }
+              & dumpbin /nologo /headers $obj | Select-String -Pattern 'SECTION HEADER|name$|COMDAT|Code|Read Only|Initialized Data|\$' | ForEach-Object { $_.Line } | Select-Object -First 80
+            }
+          }
+          $clang = 'C:\Program Files\LLVM\bin\clang-cl.exe'
+          foreach ($f in 'a','b') {
+            Write-Host "=================== clang-cl /O2 $f.c"
+            & $clang /nologo /c /O2 /Ob0 /Gy /Z7 "$f.c" "/Fo$f-clang.obj"
+            & dumpbin /nologo /disasm /relocations "$f-clang.obj" | Select-String -NotMatch -Pattern '^\s*$' | ForEach-Object { $_.Line }
+          }
