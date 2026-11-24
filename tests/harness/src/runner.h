@@ -26,6 +26,9 @@ struct RunnerOptions {
     std::string config = "Debug";
     std::string cxx = "cl";                // "cl" | "clang-cl" | path
     std::filesystem::path prebuilt_fixture;  // debugging aid: skip configure/build and use this fixture exe
+    // WP-39, scenarios with `external = true`: the program built outside cmltest and the source tree its PDB records.
+    std::filesystem::path external_exe;
+    std::filesystem::path external_source;
     bool require_all_capabilities = false;
     std::uint32_t build_timeout_ms = 900000;  // configure + build of the fixture (not part of timeout_s)
 };

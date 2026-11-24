@@ -107,6 +107,7 @@ cml_add_unit_test(harness
         tests/test_wp20_scenarios.cpp
         tests/test_wp23_scenarios.cpp
         tests/test_wp27_scenarios.cpp
+        tests/test_wp39_scenarios.cpp
     LIBS cmltest_core)
 target_compile_definitions(cml_test_harness PRIVATE
     "CML_HARNESS_SCENARIOS_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/scenarios\""

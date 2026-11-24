@@ -33,3 +33,12 @@ if(WIN32)
         set_tests_properties(bench.broker_mem_smoke PROPERTIES TIMEOUT 120)
     endif()
 endif()
+
+# WP-39: the generator of the benchmark project checks itself on a tiny project (the edits apply in order, the manifest
+# that keys the CI cache is stable). The real project is generated, built and reloaded by the `pdb-benchmark` CI job
+# (scenario tests/bench/scenarios/large_pdb_reload.toml, run by cmltest with --external-exe); nothing of it is built here.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME bench.gen_project_self_test COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/gen_pdb_project.py" --self-test)
+    set_tests_properties(bench.gen_project_self_test PROPERTIES TIMEOUT 120 PASS_REGULAR_EXPRESSION "self-test ok")
+endif()

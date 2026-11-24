@@ -4,6 +4,9 @@ name: corpus
 # tag and fetched at run time, never vendored. Nightly, on demand, and on pull requests that touch tests/corpus or this
 # file, so the PR that changes the corpus carries its own acceptance run. The matrix (project x compiler x step) is in
 # each cell's step summary and in docs/wp/WP-26.md.
+# WP-39 (ADR-0042): every cell prints the stage timings of each accepted reload (`WP39-<PROJECT> edit=... total_ms=...
+# compile_ms=... rest_ms=... budget_ms=...`); the Godot cell (523 MB PDB) fails when a reload takes more than 3000 ms of
+# total - compile per recompiled translation unit (step `reload-budget`).
 
 on:
   schedule:
@@ -144,7 +147,8 @@ jobs:
         timeout-minutes: ${{ matrix.project == 'godot' && 130 || 75 }}
         run: |
           pwsh -NoProfile -File tests/corpus/run_corpus.ps1 -Project ${{ matrix.project }} -Compiler ${{ matrix.compiler }} `
-            -ChameleonBin chameleon-bin -WorkDir $env:WORK -CxxPath $env:CXX
+            -ChameleonBin chameleon-bin -WorkDir $env:WORK -CxxPath $env:CXX `
+            -ReloadBudgetMsPerTu ${{ matrix.project == 'godot' && 3000 || 0 }}
           exit $LASTEXITCODE
 
       - name: Save the Godot build tree

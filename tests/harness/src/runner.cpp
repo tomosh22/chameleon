@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -226,6 +227,38 @@ private:
     void shutdown() {
         control_.reset();
         supervisor_.kill_all();
+        restore_external_sources();
+    }
+
+    // WP-39: an external source tree was edited in place (its paths are in the PDB, so there is no copy to edit). Put every
+    // file back as it was before the first edit, now that the broker and the program are gone.
+    void restore_external_sources() {
+        std::size_t restored = 0;
+        for (const auto& entry : external_originals_) {
+            std::error_code ec;
+            if (!entry.second) {
+                fs::remove(entry.first, ec);  // the patch created the file
+            } else {
+                std::ofstream out(entry.first, std::ios::binary | std::ios::trunc);
+                out.write(entry.second->data(), static_cast<std::streamsize>(entry.second->size()));
+                out.close();
+                if (!out) {
+                    ec = std::make_error_code(std::errc::io_error);
+                }
+            }
+            if (ec) {
+                std::printf("cmltest: could not restore the edited file %s (%s); generate the external sources again\n", entry.first.string().c_str(),
+                            ec.message().c_str());
+            } else {
+                ++restored;
+            }
+        }
+        if (!external_originals_.empty()) {
+            std::printf("cmltest: restored %zu of %zu edited files of the external source tree %s\n", restored, external_originals_.size(),
+                        built_.source_dir.string().c_str());
+            std::fflush(stdout);
+        }
+        external_originals_.clear();
     }
 
     std::uint32_t remaining_ms() const {
@@ -279,6 +312,22 @@ private:
     }
 
     StepOutcome build() {
+        if (scenario_.external) {
+            // WP-39: the module is built outside cmltest; nothing is copied, configured or built here.
+            report_.compiler = options_.cxx;
+            if (options_.external_exe.empty() || options_.external_source.empty()) {
+                return StepOutcome::fail(cml::Diag::make(cml::ids::kHarnessUsage,
+                                                         "the scenario '" + scenario_.name + "' runs an externally built program (external = true)",
+                                                         "Pass --external-exe <program.exe> and --external-source <its source tree>."));
+            }
+            cml::Result<BuiltFixture> external = use_external_fixture(options_.external_exe, options_.external_source, options_.agent_dir);
+            if (!external) {
+                return StepOutcome::fail(external.error());
+            }
+            built_ = *external;
+            return StepOutcome::pass("external program " + built_.exe.string() + ", sources " + built_.source_dir.string() +
+                                     " (edit steps patch them in place; they are restored after the run)");
+        }
         cml::Result<CompilerChoice> resolved = resolve_compiler(options_.cxx);
         CompilerChoice compiler;
         if (resolved) {
@@ -572,7 +621,8 @@ private:
         }
         std::ostringstream buffer;
         buffer << in.rdbuf();
-        // Applied to the COPY of the sources in the scratch tree; the repository is never touched.
+        // Applied to the COPY of the sources in the scratch tree; the repository is never touched. (An external program's
+        // tree, WP-39, is patched in place and restored at the end of the run.)
         cml::Result<AppliedPatch> applied = apply_patch_to_tree(built_.source_dir, buffer.str(), 1);
         if (!applied) {
             return StepOutcome::fail(applied.error());
@@ -580,6 +630,12 @@ private:
         std::string detail = "patched";
         for (const std::string& f : applied->files) {
             detail += " " + f;
+        }
+        if (scenario_.external) {
+            // WP-39: remember what the file held before its FIRST edit (later edits stack on top), for restore_external_sources().
+            for (std::size_t i = 0; i < applied->files.size() && i < applied->originals.size(); ++i) {
+                external_originals_.try_emplace(built_.source_dir / fs::path(applied->files[i]), std::move(applied->originals[i]));
+            }
         }
         for (const std::string& n : applied->notes) {
             detail += "; " + n;
@@ -930,6 +986,7 @@ private:
     fs::path signal_file_;
     ExceptionSteps exception_steps_;  // WP-20
     PerfRecorder perf_;               // WP-27
+    std::map<fs::path, std::optional<std::string>> external_originals_;  // WP-39: file -> content before the first edit
     bool failed_ = false;
     std::optional<std::string> skip_reason_;
     Clock::time_point run_deadline_ = Clock::now();

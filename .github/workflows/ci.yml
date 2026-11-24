@@ -511,13 +511,19 @@ jobs:
           if-no-files-found: ignore
 
   # WP-04 (ADR-0009): load-time / memory benchmark of cml_pdb on a large synthetic PDB. Not part of
-  # the 8-cell matrix. The PDB is built once (python generator -> MSVC /Z7 + /DEBUG:FULL) and cached
-  # by actions/cache, keyed by the generator script's hash and BENCH_ID (the generator parameters);
-  # a cache hit skips the long build. Raise --tus / --funcs-per-tu (and BENCH_ID) for a 500 MB+ PDB.
+  # the 8-cell matrix. The project is built once (python generator -> MSVC /Z7 + /DEBUG:FULL) and its
+  # executable and PDB are cached by actions/cache; a cache hit skips the long build. Raise --tus /
+  # --funcs-per-tu (and BENCH_ID) for a larger PDB.
+  # WP-39 (ADR-0042): the generated program runs with the agent, and the scenario large_pdb_reload reloads
+  # a translation unit inside it five times. The sources are generated on EVERY run (the PDB records their
+  # paths; the broker hashes and recompiles them), and the cache key is the hash of everything the
+  # generator wrote, of the two repository headers main.cpp includes and of the MSVC toolset version (the
+  # broker recompiles with the cl.exe the PDB records). The log line `benchmark project build time` gives
+  # the length of a cold build; docs/wp/WP-39.md records it.
   pdb-benchmark:
     name: pdb-benchmark (windows-2022 / msvc / RelWithDebInfo)
     runs-on: windows-2022
-    timeout-minutes: 90
+    timeout-minutes: 120
     # WP-27: the trend step downloads the perf-results artifact of the last successful main run.
     permissions:
       contents: read
@@ -531,42 +537,62 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Restore the cached benchmark PDB
-        id: pdbcache
-        uses: actions/cache/restore@v4
-        with:
-          path: bench-pdb/bench_project.pdb
-          key: pdb-bench-${{ env.BENCH_ID }}-${{ hashFiles('tests/bench/gen_pdb_project.py') }}
-
       - name: Set up MSVC developer environment (x64)
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      - name: Generate and build the benchmark project (cache miss only)
+      # WP-39: always, also on a cache hit (which restores the executable and the PDB only). The generator is
+      # deterministic and writes the paths the PDB records; its manifest (a hash of every file it wrote) is part
+      # of the cache key, so a cached program can never be older than the sources beside it.
+      - name: Generate the benchmark project sources
+        id: benchkey
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          python tests/bench/gen_pdb_project.py bench-src --tus 900 --funcs-per-tu 1000 --headers 24 --seed 1 --debug-format Z7 *>&1 | Tee-Object -FilePath "$env:LOG_DIR/bench-generate.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $manifest = (Get-Content bench-src/manifest.sha256 -Raw).Trim()
+          if ($manifest.Length -ne 64) { throw "bench-src/manifest.sha256 does not hold a sha256: '$manifest'" }
+          $headers = (Get-FileHash agent/include/Chameleon_API.h -Algorithm SHA256).Hash.Substring(0, 16) + (Get-FileHash tests/fixtures/common/fixture_runtime.h -Algorithm SHA256).Hash.Substring(0, 16)
+          if (-not $env:VCToolsVersion) { throw 'VCToolsVersion is not set: no MSVC developer environment' }
+          $key = "pdb-bench-v2-$($env:BENCH_ID)-$($manifest.Substring(0, 32))-$headers-msvc$($env:VCToolsVersion)".ToLowerInvariant()
+          "key=$key" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          Write-Host "benchmark cache key: $key"
+
+      - name: Restore the cached benchmark program and PDB
+        id: pdbcache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            bench-build/bench_project.exe
+            bench-build/bench_project.pdb
+          key: ${{ steps.benchkey.outputs.key }}
+
+      - name: Build the benchmark project (cache miss only)
         if: steps.pdbcache.outputs.cache-hit != 'true'
         run: |
           New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
           if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
-          python tests/bench/gen_pdb_project.py bench-src --tus 900 --funcs-per-tu 1000 --headers 24 --seed 1 --debug-format Z7 *>&1 | Tee-Object -FilePath "$env:LOG_DIR/bench-generate.log"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cmake -S bench-src -B bench-build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=cl *>&1 | Tee-Object -FilePath "$env:LOG_DIR/bench-configure.log"
+          cmake -S bench-src -B bench-build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=cl "-DCML_REPO_ROOT=$($PWD.Path -replace '\\', '/')" *>&1 | Tee-Object -FilePath "$env:LOG_DIR/bench-configure.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $sw = [Diagnostics.Stopwatch]::StartNew()
           cmake --build bench-build --parallel *>&1 | Tee-Object -FilePath "$env:LOG_DIR/bench-build.log"
           $rc = $LASTEXITCODE
           "benchmark project build time: $([int]$sw.Elapsed.TotalSeconds) s" | Tee-Object -FilePath "$env:LOG_DIR/bench-build-time.txt"
           if ($rc -ne 0) { exit $rc }
-          New-Item -ItemType Directory -Force -Path bench-pdb | Out-Null
-          Copy-Item bench-build/bench_project.pdb bench-pdb/bench_project.pdb
-          "benchmark PDB size: $((Get-Item bench-pdb/bench_project.pdb).Length) bytes" | Tee-Object -FilePath "$env:LOG_DIR/bench-pdb-size.txt"
+          "benchmark PDB size: $((Get-Item bench-build/bench_project.pdb).Length) bytes, executable: $((Get-Item bench-build/bench_project.exe).Length) bytes" | Tee-Object -FilePath "$env:LOG_DIR/bench-pdb-size.txt"
+          # Leave what a cache hit restores and nothing else (objects, ninja files): a cold run and a cached run then give the
+          # broker the same tree, and the disk gets several GB back.
+          Get-ChildItem bench-build -Force | Where-Object { $_.Name -notin 'bench_project.exe', 'bench_project.pdb' } | Remove-Item -Recurse -Force
 
-      - name: Cache the benchmark PDB
+      - name: Cache the benchmark program and PDB
         if: steps.pdbcache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: bench-pdb/bench_project.pdb
-          key: pdb-bench-${{ env.BENCH_ID }}-${{ hashFiles('tests/bench/gen_pdb_project.py') }}
+          path: |
+            bench-build/bench_project.exe
+            bench-build/bench_project.pdb
+          key: ${{ steps.benchkey.outputs.key }}
 
       # WP-27: besides the PDB benchmark this job builds what the other budgets need: the broker memory tool, and cmltest
       # with the broker and the agent (the `perf` scenario).
@@ -580,11 +606,36 @@ jobs:
           cmake --build build --target cml_pdb_bench cml_broker_mem cmltest cml_broker cml_agent *>&1 | Tee-Object -FilePath "$env:LOG_DIR/build.log"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # WP-39: the generated program must be a module Chameleon accepts (docs/BUILD_REQUIREMENTS.md), and the cached
+      # executable must be the one the generated sources describe: without the agent it prints the initial value.
+      - name: The benchmark program passes cml_broker check and runs
+        id: benchcheck
+        if: ${{ !cancelled() && steps.buildbench.outcome == 'success' }}
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          "benchmark PDB: $((Get-Item bench-build/bench_project.pdb).Length) bytes, executable: $((Get-Item bench-build/bench_project.exe).Length) bytes, cache hit: '${{ steps.pdbcache.outputs.cache-hit }}'"
+          build/bin/cml_broker.exe check --verbose bench-build/bench_project.exe *>&1 | Tee-Object -FilePath "$env:LOG_DIR/bench-check.txt"
+          $rc = $LASTEXITCODE
+          $text = Get-Content "$env:LOG_DIR/bench-check.txt" -Raw
+          $warn = ([regex]::Matches($text, '(?m)^\s*WARN\b')).Count
+          $fail = ([regex]::Matches($text, '(?m)^\s*FAIL\b')).Count
+          "WP39-CHECK module=bench_project.exe exit=$rc fail=$fail warn=$warn" | Tee-Object -FilePath "$env:LOG_DIR/bench-check-summary.txt"
+          if ($rc -ne 0) { exit $rc }
+          & bench-build/bench_project.exe --ticks 2 *>&1 | Tee-Object -FilePath "$env:LOG_DIR/bench-run.txt"
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::bench_project.exe --ticks 2 exited with $LASTEXITCODE"; exit 1 }
+          if (-not (Select-String -Path "$env:LOG_DIR/bench-run.txt" -Pattern '^TICK n=1 value=1 tus=900\s*$' -Quiet)) {
+            Write-Host '::error::bench_project.exe did not print TICK n=1 value=1 tus=900: the cached program does not match the generated sources'
+            exit 1
+          }
+          '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          Get-Content "$env:LOG_DIR/bench-check-summary.txt" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+
       - name: Run the benchmark (asserts the load-time and memory budgets)
         if: ${{ !cancelled() && steps.buildbench.outcome == 'success' }}
         run: |
           New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
-          build/bin/cml_pdb_bench.exe bench-pdb/bench_project.pdb --min-size-mb 500 --json "$env:LOG_DIR/perf-pdb.json" *>&1 | Tee-Object -FilePath "$env:LOG_DIR/pdb-benchmark.txt"
+          build/bin/cml_pdb_bench.exe bench-build/bench_project.pdb --min-size-mb 500 --json "$env:LOG_DIR/perf-pdb.json" *>&1 | Tee-Object -FilePath "$env:LOG_DIR/pdb-benchmark.txt"
           $rc = $LASTEXITCODE
           '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
           Get-Content "$env:LOG_DIR/pdb-benchmark.txt" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
@@ -596,14 +647,10 @@ jobs:
         if: ${{ !cancelled() && steps.buildbench.outcome == 'success' }}
         run: |
           New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
-          # Deterministic input: the sources the PDB lists are ALWAYS present (a cache hit has the PDB only, so the generator,
-          # which is deterministic and writes the same paths, recreates them), and the tool refuses to run with fewer than 900
-          # tracked files, so the source baseline is part of every measurement.
-          if (-not (Test-Path bench-src/CMakeLists.txt)) {
-            python tests/bench/gen_pdb_project.py bench-src --tus 900 --funcs-per-tu 1000 --headers 24 --seed 1 --debug-format Z7 *>&1 | Tee-Object -FilePath "$env:LOG_DIR/bench-regenerate.log" | Out-Null
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
-          build/bin/cml_broker_mem.exe bench-pdb/bench_project.pdb --factor 1.5 --min-tracked-files 900 --json "$env:LOG_DIR/perf-broker-mem.json" *>&1 | Tee-Object -FilePath "$env:LOG_DIR/broker-memory.txt"
+          # Deterministic input: the sources the PDB lists are ALWAYS present (the step `Generate the benchmark project
+          # sources` runs on every run), and the tool refuses to run with fewer than 900 tracked files, so the source
+          # baseline is part of every measurement.
+          build/bin/cml_broker_mem.exe bench-build/bench_project.pdb --factor 1.5 --min-tracked-files 900 --json "$env:LOG_DIR/perf-broker-mem.json" *>&1 | Tee-Object -FilePath "$env:LOG_DIR/broker-memory.txt"
           $rc = $LASTEXITCODE
           '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
           Get-Content "$env:LOG_DIR/broker-memory.txt" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
@@ -632,6 +679,42 @@ jobs:
           Get-Content "$env:LOG_DIR/cmltest-perf.log" | Where-Object { $_ -match '^(CMLTEST_RESULT|PERF|RELOAD-TIMING)' }
           if ($rc -ne 0) { exit $rc }
 
+      # WP-39 (ADR-0042): a reload INSIDE the large PDB. The generated program runs with the agent; src/tu_0450.cpp (1000
+      # functions) is edited and reloaded five times. The scenario asserts median(total - compile) <= 3000 ms (plan target
+      # 1500 ms, 2x slack) and the broker's peak private bytes <= 1.5 x PDB + 32 MiB, fails on a reload whose timing lacks a
+      # stage, and prints `WP39-RELOAD pdb_mib=... reloads=5 total_minus_compile_median_ms=... max_ms=... budget_ms=3000`
+      # with the stage medians. The program is not a fixture: cmltest takes it and its sources from --external-exe /
+      # --external-source (tests/harness/README.md).
+      - name: Reload inside the large PDB (cmltest scenario large_pdb_reload)
+        if: ${{ !cancelled() && steps.buildbench.outcome == 'success' && steps.benchcheck.outcome == 'success' }}
+        env:
+          CML_PERF_JSON: ${{ github.workspace }}/ci-logs/perf-large-reload.json
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          & build/bin/cmltest.exe --scenario tests/bench/scenarios/large_pdb_reload.toml `
+            --build-dir build --generator ninja --config RelWithDebInfo --cxx cl `
+            --require-all-capabilities `
+            --external-exe bench-build/bench_project.exe --external-source bench-src `
+            --artifacts "$PWD/$env:LOG_DIR/cmltest-large-pdb" --junit "$PWD/$env:LOG_DIR/cmltest-large-pdb-junit.xml" `
+            *>&1 | Tee-Object -FilePath "$env:LOG_DIR/cmltest-large-pdb.log"
+          $rc = $LASTEXITCODE
+          # What the broker says about the module: index time, tracked files, and each reload's sweep.
+          $brokerLog = Get-ChildItem "$env:LOG_DIR/cmltest-large-pdb" -Recurse -Filter broker.log -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($brokerLog) {
+            Select-String -Path $brokerLog.FullName -Pattern 'index: .* ready: |reload: sweep of ' | ForEach-Object { "BROKER " + ($_.Line -replace '^.*?(index: |reload: )', '$1') } | Tee-Object -FilePath "$env:LOG_DIR/large-pdb-broker-lines.txt"
+          }
+          '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          Get-Content "$env:LOG_DIR/cmltest-large-pdb.log" | Where-Object { $_ -match '^(CMLTEST_RESULT|WP39-RELOAD|PERF|RELOAD-TIMING|PARTIAL|FAILED)' } | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          if (Test-Path "$env:LOG_DIR/large-pdb-broker-lines.txt") { Get-Content "$env:LOG_DIR/large-pdb-broker-lines.txt" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY }
+          '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          Get-Content "$env:LOG_DIR/cmltest-large-pdb.log" | Where-Object { $_ -match '^(CMLTEST_RESULT|WP39-RELOAD|PERF|RELOAD-TIMING)' }
+          if ($rc -ne 0) { exit $rc }
+          # A run that passed without the evidence line measured nothing: that is a failure, not a pass.
+          if (-not (Select-String -Path "$env:LOG_DIR/cmltest-large-pdb.log" -Pattern '^WP39-RELOAD pdb_mib=[0-9.]+ reloads=5 total_minus_compile_median_ms=[0-9.]+ max_ms=[0-9.]+ budget_ms=3000 ' -Quiet)) {
+            Write-Host '::error::the scenario passed but printed no WP39-RELOAD line with five reloads and the 3000 ms budget'
+            exit 1
+          }
+
       # WP-27: trend output. perf-results.json (sha, runner, every number) is uploaded as the artifact `perf-results`, the
       # numbers go to the step summary, and they are compared with the artifact of the latest successful run on main. Only
       # the absolute budgets above fail the job; a regression of more than 25 % prints a ::warning:: line.
@@ -655,7 +738,7 @@ jobs:
             if (-not $prevDir) { Write-Host 'no main run with a perf-results artifact to compare with' }
           } catch { Write-Host "could not fetch the previous main run: $_" }
           ./tests/ci/perf_results.ps1 -PdbJson "$env:LOG_DIR/perf-pdb.json" -MemJson "$env:LOG_DIR/perf-broker-mem.json" `
-            -ReloadJson "$env:LOG_DIR/perf-reload.json" -Out perf-results.json -PreviousDir $prevDir `
+            -ReloadJson "$env:LOG_DIR/perf-reload.json" -LargeReloadJson "$env:LOG_DIR/perf-large-reload.json" -Out perf-results.json -PreviousDir $prevDir `
             -Sha $env:GITHUB_SHA -Runner "${{ runner.os }} / windows-2022 / msvc / RelWithDebInfo" -RunId $env:GITHUB_RUN_ID
           Copy-Item perf-results.json "$env:LOG_DIR/perf-results.json"
 

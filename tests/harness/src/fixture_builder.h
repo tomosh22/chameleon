@@ -55,6 +55,13 @@ struct BuiltFixture {
 // build fails (the message carries the end of the log) or times out (children are dumped then killed).
 cml::Result<BuiltFixture> build_fixture(Supervisor& supervisor, const BuildSettings& settings);
 
+// WP-39, scenarios with `external = true`: a program built outside cmltest (the generated benchmark project of
+// tests/bench). Nothing is copied, configured or built: `exe` runs where it is, with its PDB beside it, and `source_dir`
+// is the tree its PDB records (so `edit` steps patch it in place). Only cml_agent.dll is copied next to the exe.
+// CML5421 when the exe, its PDB or the source directory does not exist.
+cml::Result<BuiltFixture> use_external_fixture(const std::filesystem::path& exe, const std::filesystem::path& source_dir,
+                                               const std::filesystem::path& agent_dir);
+
 }  // namespace cmltest
 
 #endif  // _WIN32
