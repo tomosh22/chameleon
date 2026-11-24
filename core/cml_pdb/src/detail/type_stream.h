@@ -11,13 +11,14 @@
 // A stream without a usable table is one chunk: the first lookup walks all of it (what cml_pdb did before).
 //
 // Untrusted input: the header, the table and every record are bounds-checked; a chunk whose records do not add up to
-// what the table promises is "bad" and its indices are simply not found.
+// what the table promises is "bad" and its indices are simply not found. Memory is proportional to the table (8 bytes
+// per entry, as in the file) plus the chunks actually read.
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <vector>
 
 #include "cml/pdb/type_records.h"
 #include "cml/util/result.h"
@@ -38,30 +39,30 @@ public:
 private:
     TypeStream() = default;
 
-    enum : std::uint8_t { kNotLoaded = 0, kReady = 1, kBad = 2 };
-    static constexpr std::uint32_t kUnknownCount = 0xFFFFFFFFu;
-
-    struct Chunk {
+    // One entry of the offset table: the chunk [offset, next entry's offset) starts with record `first_index`.
+    struct Entry {
         std::uint32_t first_index = 0;
-        std::uint32_t offset = 0;    // of the chunk within the record area
-        std::uint32_t size = 0;
-        std::uint32_t expected = kUnknownCount;  // records the table promises (unknown for the last chunk)
-        std::uint8_t state = kNotLoaded;
+        std::uint32_t offset = 0;  // within the record area
+    };
+    // A chunk that was read.
+    struct Chunk {
+        bool bad = false;
         const std::uint8_t* data = nullptr;
         CountedBuffer owned;         // when the chunk's blocks are not consecutive in the file
         Vec<std::uint32_t> offsets;  // of each record header within the chunk
     };
 
-    void load(Chunk& chunk) const;
+    void load(std::size_t entry, Chunk& chunk) const;
 
     const Msf* msf_ = nullptr;
     std::uint32_t stream_ = 0;
     std::uint32_t header_size_ = 0;
     std::uint32_t type_begin_ = 0;
     std::uint32_t record_bytes_ = 0;
+    Vec<Entry> entries_;  // by first_index; at least one
 
     mutable std::mutex mutex_;
-    mutable Vec<Chunk> chunks_;  // by first_index
+    mutable std::map<std::size_t, Chunk> loaded_;  // by entry; nodes are stable, so returned record bytes stay valid
     mutable TypeStreamStats stats_;
 };
 

@@ -50,7 +50,6 @@ Result<std::unique_ptr<TypeStream>> TypeStream::open(const Msf& msf, std::uint32
     out->stats_.record_bytes = out->record_bytes_;
 
     // The type-index offset table. Any defect in it means "no table": the stream is then one chunk.
-    Vec<Chunk> chunks;
     bool table_ok = hash_stream != 0xFFFFu && table_bytes >= 8 && table_bytes % 8 == 0 && table_bytes <= kMaxTableBytes &&
                     static_cast<std::uint64_t>(table_offset) + table_bytes <= msf.stream_size(hash_stream);
     if (table_ok) {
@@ -59,74 +58,77 @@ Result<std::unique_ptr<TypeStream>> TypeStream::open(const Msf& msf, std::uint32
         const std::uint8_t* t = msf.read_range(hash_stream, table_offset, table_bytes, table_scratch, table_got);
         table_ok = t != nullptr && table_got == table_bytes;
         if (table_ok) {
+            // Validated before anything is allocated: the first entry is (first index, 0), indices and offsets rise
+            // strictly and stay inside the stream.
             const std::uint32_t n = table_bytes / 8;
-            chunks.resize(n);
+            std::uint32_t previous_index = 0;
+            std::uint32_t previous_offset = 0;
             for (std::uint32_t i = 0; i < n && table_ok; ++i) {
                 const std::uint32_t index = rd32(t + static_cast<std::size_t>(i) * 8);
                 const std::uint32_t offset = rd32(t + static_cast<std::size_t>(i) * 8 + 4);
-                if (i == 0) {
-                    table_ok = index == out->type_begin_ && offset == 0;
-                } else {
-                    table_ok = index > chunks[i - 1].first_index && offset > chunks[i - 1].offset;
-                }
+                table_ok = i == 0 ? (index == out->type_begin_ && offset == 0) : (index > previous_index && offset > previous_offset);
                 table_ok = table_ok && index < type_end && offset < out->record_bytes_;
-                chunks[i].first_index = index;
-                chunks[i].offset = offset;
+                previous_index = index;
+                previous_offset = offset;
             }
-            for (std::uint32_t i = 0; i < n && table_ok; ++i) {
-                const bool last = i + 1 == n;
-                chunks[i].size = (last ? out->record_bytes_ : chunks[i + 1].offset) - chunks[i].offset;
-                chunks[i].expected = last ? kUnknownCount : chunks[i + 1].first_index - chunks[i].first_index;
+            if (table_ok) {
+                out->entries_.reserve(n);
+                for (std::uint32_t i = 0; i < n; ++i) {
+                    Entry e;
+                    e.first_index = rd32(t + static_cast<std::size_t>(i) * 8);
+                    e.offset = rd32(t + static_cast<std::size_t>(i) * 8 + 4);
+                    out->entries_.push_back(e);
+                }
             }
         }
     }
     if (!table_ok) {
-        chunks.clear();
-        chunks.resize(1);
-        chunks[0].first_index = out->type_begin_;
-        chunks[0].offset = 0;
-        chunks[0].size = out->record_bytes_;
+        Entry whole;
+        whole.first_index = out->type_begin_;
+        out->entries_.assign(1, whole);
     }
-    out->stats_.sparse = table_ok && chunks.size() > 1;
-    out->stats_.chunks = static_cast<std::uint32_t>(chunks.size());
-    out->chunks_ = std::move(chunks);
+    out->stats_.sparse = out->entries_.size() > 1;
+    out->stats_.chunks = static_cast<std::uint32_t>(out->entries_.size());
     return out;
 }
 
-void TypeStream::load(Chunk& chunk) const {
-    chunk.state = kBad;
-    if (chunk.size == 0) {
-        chunk.state = chunk.expected == kUnknownCount || chunk.expected == 0 ? kReady : kBad;
+void TypeStream::load(std::size_t entry, Chunk& chunk) const {
+    chunk.bad = true;
+    const bool last = entry + 1 == entries_.size();
+    const std::uint32_t begin = entries_[entry].offset;
+    const std::uint32_t size = (last ? record_bytes_ : entries_[entry + 1].offset) - begin;
+    // How many records the table promises (unknown for the last chunk, whose end is the end of the stream).
+    const std::uint32_t expected = last ? 0u : entries_[entry + 1].first_index - entries_[entry].first_index;
+    if (size == 0) {
+        chunk.bad = !last;  // an empty stream is fine; an empty chunk between two entries cannot be (offsets rise)
         return;
     }
     CountedBuffer scratch;
     std::size_t got = 0;
-    const std::uint8_t* data = msf_->read_range(stream_, static_cast<std::uint64_t>(header_size_) + chunk.offset, chunk.size, scratch, got);
-    if (data == nullptr || got < chunk.size) {
+    const std::uint8_t* data = msf_->read_range(stream_, static_cast<std::uint64_t>(header_size_) + begin, size, scratch, got);
+    if (data == nullptr || got < size) {
         return;
     }
     // First pass counts, so the offset table is allocated once and exactly.
-    std::uint32_t count = 0;
     for (int pass = 0; pass < 2; ++pass) {
         std::uint32_t off = 0;
-        std::uint32_t n = 0;
-        while (off < chunk.size) {
-            if (chunk.size - off < 4) {
+        std::uint32_t count = 0;
+        while (off < size) {
+            if (size - off < 4) {
                 break;  // a trailing fragment too short for a record header
             }
             const std::uint32_t reclen = rd16(data + off);
-            if (reclen < 2 || reclen > chunk.size - off - 2) {
+            if (reclen < 2 || reclen > size - off - 2) {
                 return;  // a record leaves the chunk
             }
             if (pass == 1) {
                 chunk.offsets.push_back(off);
             }
-            ++n;
+            ++count;
             off += 2 + reclen;
         }
         if (pass == 0) {
-            count = n;
-            if (chunk.expected != kUnknownCount && count != chunk.expected) {
+            if (!last && count != expected) {
                 return;  // the table and the records disagree
             }
             chunk.offsets.reserve(count);
@@ -135,13 +137,13 @@ void TypeStream::load(Chunk& chunk) const {
     if (scratch.data() != nullptr && data == scratch.data()) {
         chunk.owned = std::move(scratch);
         chunk.data = chunk.owned.data();
-        stats_.bytes_copied += chunk.size;
+        stats_.bytes_copied += size;
     } else {
         chunk.data = data;
     }
-    chunk.state = kReady;
+    chunk.bad = false;
     ++stats_.chunks_loaded;
-    stats_.bytes_loaded += chunk.size;
+    stats_.bytes_loaded += size;
 }
 
 bool TypeStream::find(std::uint32_t index, TypeRecord& out) const {
@@ -150,19 +152,22 @@ bool TypeStream::find(std::uint32_t index, TypeRecord& out) const {
     }
     std::lock_guard<std::mutex> lock(mutex_);
     ++stats_.lookups;
-    // The last chunk whose first index is <= index.
-    auto it = std::upper_bound(chunks_.begin(), chunks_.end(), index, [](std::uint32_t v, const Chunk& c) { return v < c.first_index; });
-    if (it == chunks_.begin()) {
+    // The last entry whose first index is <= index (entries_[0].first_index == type_begin_).
+    const auto it = std::upper_bound(entries_.begin(), entries_.end(), index, [](std::uint32_t v, const Entry& e) { return v < e.first_index; });
+    if (it == entries_.begin()) {
         return false;
     }
-    Chunk& chunk = *(it - 1);
-    if (chunk.state == kNotLoaded) {
-        load(chunk);
+    const std::size_t entry = static_cast<std::size_t>(it - entries_.begin()) - 1;
+    auto found = loaded_.find(entry);
+    if (found == loaded_.end()) {
+        found = loaded_.try_emplace(entry).first;
+        load(entry, found->second);
     }
-    if (chunk.state != kReady) {
+    const Chunk& chunk = found->second;
+    if (chunk.bad) {
         return false;
     }
-    const std::uint32_t i = index - chunk.first_index;
+    const std::uint32_t i = index - entries_[entry].first_index;
     if (i >= chunk.offsets.size()) {
         return false;
     }
