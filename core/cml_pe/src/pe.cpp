@@ -895,6 +895,58 @@ Result<std::vector<std::byte>> read_file(const std::string& path) {
     return data;
 }
 
+namespace {
+// How many leading bytes Image::parse reads, as far as the first `b.size()` bytes of the file can tell: the DOS header,
+// then the NT headers up to the end of the file header, then the optional header and the section table.
+std::uint64_t header_extent(ByteSpan b) noexcept {
+    if (b.size() < kDosHeaderSize) {
+        return kDosHeaderSize;
+    }
+    const std::uint64_t fixed = static_cast<std::uint64_t>(rd32(b, 0x3C)) + 4 + kFileHeaderSize;
+    if (b.size() < fixed) {
+        return fixed;
+    }
+    const std::size_t fh = static_cast<std::size_t>(fixed) - kFileHeaderSize;
+    const std::uint64_t section_count = rd16(b, fh + 2);
+    const std::uint64_t optional_size = rd16(b, fh + 16);
+    // check_signatures reads the optional header magic even when SizeOfOptionalHeader says there is none.
+    return fixed + std::max<std::uint64_t>(optional_size, 2) + section_count * kSectionHeaderSize;
+}
+}  // namespace
+
+Result<std::vector<std::byte>> read_file_headers(const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
+        return make_diag(1300, format("cannot open '%s' for reading", path.c_str()), "Check that the file exists and is readable.");
+    }
+    const std::streamoff size = f.tellg();
+    if (size < 0) {
+        return make_diag(1300, format("cannot determine the size of '%s'", path.c_str()), "Check that the path names a regular file.");
+    }
+    const std::uint64_t file_size = static_cast<std::uint64_t>(size);
+    constexpr std::uint64_t kFirstRead = 4096;
+    std::uint64_t want = std::min(file_size, kFirstRead);
+    std::vector<std::byte> data;
+    // At most three reads: the first block, then (when e_lfanew points past it) up to the file header, then up to the end
+    // of the section table. Each read starts at offset 0; the amounts are a few kilobytes.
+    for (int pass = 0; pass < 3; ++pass) {
+        data.resize(static_cast<std::size_t>(want));
+        f.seekg(0, std::ios::beg);
+        if (want > 0) {
+            f.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(want));
+        }
+        if (!f) {
+            return make_diag(1300, format("failed while reading '%s'", path.c_str()), "Check that the file is not locked or truncated.");
+        }
+        const std::uint64_t need = std::min(file_size, header_extent(ByteSpan(data.data(), data.size())));
+        if (need <= want) {
+            break;
+        }
+        want = need;
+    }
+    return data;
+}
+
 Result<OwnedImage> load_image_file(const std::string& path) {
     Result<std::vector<std::byte>> bytes = read_file(path);
     if (!bytes) {

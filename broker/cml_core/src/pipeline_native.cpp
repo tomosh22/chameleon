@@ -12,16 +12,19 @@ PipelineEnv native_pipeline_env() {
                          toolchain::CancelToken* cancel, const std::function<void(std::size_t)>& on_done) {
         return toolchain::compile_all(requests, outcomes, max_parallel, cancel, on_done);
     };
-    env.resolve_linker = [](const std::string& module_path, const std::vector<std::string>& search_dirs, const ReloadOptions& options,
-                            std::vector<Diag>* warnings) -> Result<toolchain::ToolInfo> {
+    env.resolve_linker = [](const std::string& module_path, const pdb::PdbIndex* module_pdb, const std::vector<std::string>& search_dirs,
+                            const ReloadOptions& options, std::vector<Diag>* warnings) -> Result<toolchain::ToolInfo> {
         toolchain::DetectLinkerOptions detect;
         if (options.linker_override == "link") {
             detect.override_family = toolchain::ToolFamily::Link;
         } else if (options.linker_override == "lld-link") {
             detect.override_family = toolchain::ToolFamily::LldLink;
         }
-        // The module's own PDB is opened and released again inside (ADR-0017: no mapping outlives the call).
-        Result<toolchain::LinkerDetection> detection = toolchain::detect_module_linker(module_path, pdb::OpenOptions{}, detect);
+        // WP-39b: the reload holds the module's PDB index; the detection reads it and only the headers of the module file.
+        // Without one the module's own PDB is opened and released again inside (ADR-0017: no mapping outlives the call).
+        Result<toolchain::LinkerDetection> detection = module_pdb != nullptr
+                                                           ? toolchain::detect_module_linker_with_pdb(module_path, *module_pdb, detect)
+                                                           : toolchain::detect_module_linker(module_path, pdb::OpenOptions{}, detect);
         if (!detection) {
             return detection.error();
         }

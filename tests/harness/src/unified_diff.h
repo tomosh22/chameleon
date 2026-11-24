@@ -62,7 +62,11 @@ struct AppliedPatch {
 
 // Parses `patch_text` and applies it to the tree below `root` (like `patch -p<strip>`). Paths that
 // are absolute or contain `..` are refused (CML5412). CML5422 when a file cannot be read or written.
-cml::Result<AppliedPatch> apply_patch_to_tree(const std::filesystem::path& root, std::string_view patch_text,
-                                              int strip = 1);
+// Nothing is written unless every hunk of every file applies; a WRITE can still fail half way (a locked file, a full disk).
+// `partial` (optional, WP-39b) then receives the files that were written, removed or damaged before the failure (the file
+// whose write failed included) with what they held before, in the shape of the result, so that the caller can put them
+// back. It is left empty when the function succeeds or fails before the first write.
+cml::Result<AppliedPatch> apply_patch_to_tree(const std::filesystem::path& root, std::string_view patch_text, int strip = 1,
+                                              AppliedPatch* partial = nullptr);
 
 }  // namespace cmltest
