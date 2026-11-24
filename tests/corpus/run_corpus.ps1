@@ -14,7 +14,7 @@
 #   reload-budget (WP-39, only with -ReloadBudgetMsPerTu): every accepted reload took at most that many ms of
 #              `total - compile` per recompiled translation unit. Every cell prints the stage timings of each accepted
 #              reload as `WP39-<PROJECT> edit=<id> total_ms=... compile_ms=... rest_ms=... budget_ms=...` (also in the
-#              step summary and in reload-timings.json); the Godot cell (523 MB PDB) asserts 3000 ms (ADR-0042).
+#              step summary and in reload-timings.json); the Godot cell (529 MB PDB) asserts 3000 ms (ADR-0042).
 # Exit code 1 when a step failed (an `expected_failure` of project.json is asserted and counts as passed).
 [CmdletBinding()]
 param(

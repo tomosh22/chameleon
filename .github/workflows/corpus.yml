@@ -5,7 +5,7 @@ name: corpus
 # file, so the PR that changes the corpus carries its own acceptance run. The matrix (project x compiler x step) is in
 # each cell's step summary and in docs/wp/WP-26.md.
 # WP-39 (ADR-0042): every cell prints the stage timings of each accepted reload (`WP39-<PROJECT> edit=... total_ms=...
-# compile_ms=... rest_ms=... budget_ms=...`); the Godot cell (523 MB PDB) fails when a reload takes more than 3000 ms of
+# compile_ms=... rest_ms=... budget_ms=...`); the Godot cell (529 MB PDB) fails when a reload takes more than 3000 ms of
 # total - compile per recompiled translation unit (step `reload-budget`).
 
 on:

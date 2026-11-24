@@ -381,7 +381,7 @@ cml::Result<std::string> strip_path(const std::string& path, int strip) {
 
 }  // namespace
 
-cml::Result<AppliedPatch> apply_patch_to_tree(const fs::path& root, std::string_view patch_text, int strip) {
+cml::Result<AppliedPatch> apply_patch_to_tree(const fs::path& root, std::string_view patch_text, int strip, AppliedPatch* partial) {
     cml::Result<std::vector<FilePatch>> patches = parse_unified_diff(patch_text);
     if (!patches) {
         return patches.error();
@@ -442,15 +442,28 @@ cml::Result<AppliedPatch> apply_patch_to_tree(const fs::path& root, std::string_
         applied.originals.push_back(is_create ? std::nullopt : std::optional<std::string>(std::move(original)));
         pending.push_back(std::move(item));
     }
-    for (const Pending& item : pending) {
+    // A write that fails leaves the files before it changed, and may have truncated its own: hand their previous content
+    // to the caller (files 0..index) before reporting the failure.
+    const auto write_failed = [&](std::size_t index, cml::Diag why) {
+        if (partial != nullptr) {
+            partial->files.assign(applied.files.begin(), applied.files.begin() + static_cast<std::ptrdiff_t>(index + 1));
+            partial->originals.clear();
+            for (std::size_t i = 0; i <= index; ++i) {
+                partial->originals.push_back(std::move(applied.originals[i]));
+            }
+        }
+        return why;
+    };
+    for (std::size_t index = 0; index < pending.size(); ++index) {
+        const Pending& item = pending[index];
         std::error_code ec;
         if (item.remove) {
             const bool removed = fs::remove(item.file, ec);
             if (ec || !removed) {
-                return cml::Diag::make(cml::ids::kEditFailed,
-                                       "cannot delete '" + item.file.string() + "' while applying the patch" +
-                                           (ec ? " (" + ec.message() + ")" : " (it does not exist)"),
-                                       "Check that the scratch directory is writable and the file is not locked by another process.");
+                return write_failed(index, cml::Diag::make(cml::ids::kEditFailed,
+                                                           "cannot delete '" + item.file.string() + "' while applying the patch" +
+                                                               (ec ? " (" + ec.message() + ")" : " (it does not exist)"),
+                                                           "Check that the scratch directory is writable and the file is not locked by another process."));
             }
         } else {
             fs::create_directories(item.file.parent_path(), ec);
@@ -458,8 +471,8 @@ cml::Result<AppliedPatch> apply_patch_to_tree(const fs::path& root, std::string_
             out.write(item.content.data(), static_cast<std::streamsize>(item.content.size()));
             out.close();
             if (!out) {
-                return cml::Diag::make(cml::ids::kEditFailed, "cannot write '" + item.file.string() + "' while applying the patch",
-                                       "Check that the scratch directory is writable and not locked by another process.");
+                return write_failed(index, cml::Diag::make(cml::ids::kEditFailed, "cannot write '" + item.file.string() + "' while applying the patch",
+                                                           "Check that the scratch directory is writable and not locked by another process."));
             }
         }
     }
