@@ -1098,9 +1098,9 @@ public:
         const std::uint32_t sec = obj.section(".bss", kDataComdat, 8, coff::ComdatSelection::Any);
         return obj.symbol(decorated, 0, static_cast<std::int32_t>(sec), false, false);
     }
-    void record(std::uint32_t symbol_index, const std::string& name, std::uint32_t type = tp::kTInt) {
+    void record(std::uint32_t symbol_index, const std::string& name, std::uint32_t type = tp::kTInt, std::uint16_t kind = 0x110C) {
         sites_.push_back({static_cast<std::uint32_t>(records_.bytes().size()) + 4 + 4, symbol_index});
-        records_.data(0x110C, name, 0, 0, type);
+        records_.data(kind, name, 0, 0, type);
     }
     void local(const std::string& decorated, const std::string& name, std::uint32_t type = tp::kTInt) { record(symbol(decorated), name, type); }
 
@@ -1405,4 +1405,60 @@ TEST_CASE("two statics of one name in ONE lambda (two blocks of its call operato
     CHECK(decision(*r, second).source == BindSource::CompilandProcedure);
     REQUIRE(r->warnings.size() == 1);
     CHECK(r->warnings[0].id() == "CML3570");
+}
+
+TEST_CASE("a function-local thread_local paired by its function keeps the SECREL of its old slot") {
+    // int g(int) { static thread_local int calls; ... }  int g(float) { static thread_local int calls; ... }
+    const char* const g_int = "?g@@YAHH@Z";
+    const char* const g_float = "?g@@YAHM@Z";
+    const char* const calls_int = "?calls@?1??g@@YAHH@Z@4HA";
+    const char* const calls_float = "?calls@?1??g@@YAHM@Z@4HA";
+    constexpr std::uint16_t tls_image_section = 4;
+    SynthWorld w;
+    w.spec.sections.push_back({".tls", 0x100, 0x4000, 0x100, 0xC0000040});
+    for (int i = 0; i < 2; ++i) {
+        w.tu().symbols.proc(0x1110, "g", SynthWorld::kTextSec, 0x40 + 0x10 * static_cast<std::uint32_t>(i), 0x10);
+        w.tu().symbols.data(0x1112, "calls", tls_image_section, 0x10 + 8 * static_cast<std::uint32_t>(i));  // S_LTHREAD32
+        w.tu().symbols.end();
+    }
+    w.pub_func(g_int, 0x40);
+    w.pub_func(g_float, 0x50);
+    w.open();
+
+    StaticsObj o;
+    const std::uint32_t tls = o.obj.section(".tls$", kData, 0x10);
+    const std::uint32_t sym_float = o.obj.symbol(calls_float, 0, static_cast<std::int32_t>(tls), false, false);
+    const std::uint32_t sym_int = o.obj.symbol(calls_int, 8, static_cast<std::int32_t>(tls), false, false);
+    o.proc(g_float, "g");
+    o.record(sym_float, "calls", tp::kTInt, 0x1112);
+    o.end();
+    o.proc(g_int, "g");
+    o.record(sym_int, "calls", tp::kTInt, 0x1112);
+    o.end();
+    // Each function reads its variable the way compilers do: a SECREL displacement.
+    std::uint32_t text_float = 0;
+    std::uint32_t text_int = 0;
+    for (std::uint32_t i = 0; i < o.obj.model().sections.size(); ++i) {
+        if (o.obj.model().sections[i].name == ".text$mn") {
+            (text_float == 0 ? text_float : text_int) = i + 1;
+        }
+    }
+    REQUIRE(text_int != 0);
+    o.obj.reloc(text_float, 4, sym_float, coff::RelocType::SecRel);
+    o.obj.reloc(text_int, 4, sym_int, coff::RelocType::SecRel);
+    Built b = o.build(some_debug_t());
+    auto r = plan_bind(w.input(b));
+    REQUIRE_MESSAGE(r.has_value(), err(r));
+    CHECK(decision(*r, calls_int).source == BindSource::CompilandProcedure);
+    CHECK(decision(*r, calls_int).old_address.rva == 0x4010);
+    CHECK(decision(*r, calls_float).old_address.rva == 0x4018);
+    std::size_t secrels = 0;
+    for (const Fixup& fx : r->fixups) {
+        if (fx.kind == FixupKind::SecRel32) {
+            ++secrels;
+            CHECK(fx.target_section_offset == (fx.symbol == calls_int ? 0x10u : 0x18u));
+        }
+    }
+    CHECK(secrels == 2);
+    CHECK(r->warnings.empty());
 }

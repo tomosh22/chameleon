@@ -1306,7 +1306,9 @@ void Planner::pair_statics_by_procedure(const std::string& base, bool is_tls, co
         }
         return text.empty() ? std::string("-") : text;
     };
-    for (const auto& [fn, positions] : by_function) {
+    for (const auto& entry : by_function) {
+        const std::uint64_t fn = entry.first;
+        const std::vector<std::uint32_t>& positions = entry.second;  // (not a structured binding: a lambda below captures it)
         const std::uint32_t fn_section = static_cast<std::uint32_t>(fn >> 32);
         const std::uint32_t fn_value = static_cast<std::uint32_t>(fn & 0xFFFFFFFFull);
         // The function and its old version.
@@ -1436,15 +1438,9 @@ void Planner::pair_statics_by_procedure(const std::string& base, bool is_tls, co
                 break;
             }
             type_text[k] = *new_type;
-            const Sym& sy = syms_[new_pos[k]];
             const auto earlier = matched.find(new_pos[k]);
             if (earlier != matched.end() ? earlier->second.view != old_views[k] : std::find(free_cands.begin(), free_cands.end(), old_views[k]) == free_cands.end()) {
                 problem = which + " or its old record was already paired differently by an earlier step";
-                break;
-            }
-            const auto d = delta_.find(sy.dec.section);
-            if (d != delta_.end() && d->second + static_cast<std::int64_t>(sy.s->value) != static_cast<std::int64_t>(old_views[k]->rva)) {
-                problem = "the layout of object section " + std::to_string(sy.dec.section) + " places " + which + " elsewhere";
                 break;
             }
         }
@@ -2201,7 +2197,10 @@ void Planner::build_fixups() {
             if (dk == DecisionKind::BindOldData && ts.dec.old_address.rva != kNoRva) {
                 const bool in_tls = in_old_tls(ts.dec.old_address.rva);
                 const BindSource src = ts.dec.source;
-                const bool thread_source = src == BindSource::PdbGlobal || src == BindSource::CompilandStatic || src == BindSource::CompilandRva;
+                // (WP-37: a function-local thread_local paired by its closure or by its place in its function was paired
+                // with a thread-local record as well: both steps only see candidates of the member's storage kind.)
+                const bool thread_source = src == BindSource::PdbGlobal || src == BindSource::CompilandStatic || src == BindSource::CompilandRva ||
+                                           src == BindSource::CompilandClosure || src == BindSource::CompilandProcedure;
                 if (secrel && !(in_tls && thread_source)) {
                     error(diag::kThreadLocal,
                           "SECREL reference to " + describe(ts) + " from " + where() + " in " + in_.object_name +
