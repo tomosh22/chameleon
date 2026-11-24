@@ -20,7 +20,7 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
 | CML5552 | A compiland to recompile uses a precompiled header (`/Yu`) whose files cannot be determined | Cannot tell which files make up the precompiled header used by `<obj>`; a recompile could use a stale .pch. | Rebuild and hot-restart, or name the header with `/Yu<header>`. | WP-15 | **live** |
 | CML5551 | A reload would recompile more compilands than `max_affected_compilands` (default 64) | The change affects `<n>` compilands of `<module>`, more than the limit of `<N>`. | Repeat `reload` with `"confirm": true`, or raise the option. | WP-15 | **live** |
 | CML2102 | PCH-creating TU (`/Yc`, or clang `-emit-pch`) changed | `<file>` creates the precompiled header (/Yc); changes to it cannot be hot-reloaded. | Rebuild the project and hot-restart. | WP-05 | **live** |
-| CML3101 | Image-relative (`ADDR32NB`) reference from patch to old-module data | `<function>` references `<symbol>` in `<module>` image-relatively (ADDR32NB); this cannot be retargeted. | Move the reference behind a function or pointer, or hot-restart. | WP-07 | **live** |
+| CML3101 | Image-relative (`ADDR32NB`) reference from patch to old-module data that is not a proved sign-extended disp32 of a memory operand with a base register (since WP-36 the common `cl` form `[base+index*scale+sym@IMGREL]` is retargeted) | `<function>` references `<symbol>` in `<module>` image-relatively (ADDR32NB); this cannot be retargeted (with the instruction bytes and the reason). | Move the reference behind a function or pointer, or hot-restart. | WP-07, WP-36 | **live** |
 | CML3102 | Thread-local reference shape that cannot be retargeted (SECTION/SECREL7 relocation, SECREL against a symbol that is not a thread-local of the old image, address-of-TLS through REL32/ADDR64, ordinary data that was `thread_local` in the old image) | `<function>` references thread_local `<symbol>` in a way that cannot be retargeted. | Move the thread_local to an unchanged source file, or hot-restart. | WP-07 (narrowed by WP-24) | **live** |
 | CML3400 | New `thread_local` variable the old image does not have (also a static that gained `thread_local`) | `<symbol>` is a new thread_local; patch-local thread-local storage is not supported. | Hot-restart, or move the new thread_local to an unchanged source file. | WP-24 | **live** |
 | CML3401 | TLS dynamic initialiser/destructor in a patched TU (warning) | The old image's initialiser and destructor stay in effect; a changed initialiser is not run. | Hot-restart if the changed initialiser must take effect. | WP-24 (unit-tested only; no CI fixture has a dynamic `thread_local`) | **live** |
@@ -156,11 +156,8 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
   - Not fuzzed: the user-hook scanner, the bind planner and the toolchain parser. The hook decoder is fuzzed since WP-38.
   - Only RelWithDebInfo is fuzzed (ASan needs the release CRT).
 - **Real-project findings (WP-26 corpus, ADR-0036).**
-  - **Image-relative references to old data (F-2, cl):** when a function has `__ImageBase` in a register (it has a switch
-    jump table, or indexes two or more global arrays), cl with optimisation addresses globals as
-    `[reg+index*scale+sym@IMGREL]` (ADDR32NB), and the translation unit is refused with CML3101, whichever function was
-    edited. This is ordinary code (raylib `rcore.c`), so it excludes many cl TUs. One array indexed by a variable is not
-    enough to trigger it (ADR-0042). Being fixed by WP-36.
+  - **Image-relative references to old data (F-2) are fixed (WP-36, #67).** The common `cl` form is retargeted; what is
+    still refused is listed under CML3101 above.
   - **Overloaded statics (F-4):** any `static` / `static inline` overload set in a header (Dear ImGui's `ImFloor`) refuses
     every TU that includes it (CML3214), because the PDB reader has no type information yet. Being fixed by WP-37.
   - **VEX prologues (fixed by WP-38, #65):** the hook decoder knows VEX and EVEX, opcode maps 1 to 3 (AVX, AVX2, FMA,
