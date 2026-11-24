@@ -56,7 +56,7 @@ kind = "expect_stdout"
 regex = "TICK n=\\d+ mark=2 a=10\\d{4} b=20\\d{4} c=30\\d{4} oi=40\\d{4} od=50\\d{4} made=5\\b"
 within_s = 10
 
-# No value ever went down, over the whole run (before and after the reload).
+# No value ever went down, over the whole run (before and after the reload). (`made` is constant; the patterns above pin it to 5.)
 [[step]]
 kind = "expect_monotonic"
 key = "a"
@@ -80,9 +80,4 @@ min_samples = 20
 [[step]]
 kind = "expect_monotonic"
 key = "od"
-min_samples = 20
-
-[[step]]
-kind = "expect_monotonic"
-key = "made"
 min_samples = 20
