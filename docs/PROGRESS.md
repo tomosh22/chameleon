@@ -45,7 +45,8 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-36 | Image-relative references to old data (R-01, F-2; ADR-0042) | 10 | in progress | wp/36-imgrel | — | — |
 | WP-37 | PDB type stream; static overloads and lambda-local statics (R-02, R-03; ADR-0042) | 10 | in progress | wp/37-pdb-types | — | — |
 | WP-38 | VEX/EVEX in the hook length decoder; decoder fuzzing (R-04, R-41; ADR-0042) | 10 | in progress | wp/38-vex-decoder | — | — |
-| WP-39 | Reload timing inside a large PDB, with budgets (R-13; ADR-0042) | 10 | in progress | wp/39-large-pdb-reload | — | — |
+| WP-39 | Reload timing inside a large PDB, with budgets (R-13; ADR-0042) | 10 | done | wp/39-large-pdb-reload | #63 (2453615) | ci 14/14 x2 (push 45422099800, PR 45422114245) and corpus 5/5 (45422114246) at b22d155 verified: `WP39-RELOAD pdb_mib=546.1 reloads=5 total_minus_compile_median_ms=109.3 max_ms=1340.4 budget_ms=3000`, `PERF broker_peak_private_mib=836.9 limit_mib=851.2`, Godot `reload-budget: PASS 6 reloads`, slowest per TU 972.8 ms. Medium review: nits only. Memory headroom of 14 MiB and the review nits go to WP-39b |
+| WP-39b | The broker reads the module file once (follow-up to WP-39) | 10 | in progress | wp/39b-module-read | — | — |
 
 ## Orchestrator integration work
 
