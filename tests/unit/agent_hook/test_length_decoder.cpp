@@ -376,9 +376,8 @@ TEST_CASE("prefix handling") {
 }
 
 TEST_CASE("everything outside the covered set is unknown, never guessed") {
-    expect_unknown({0xC4, 0xE2, 0x7D, 0x18, 0xC0});       // VEX3
-    expect_unknown({0xC5, 0xF8, 0x28, 0xC1});             // VEX2: vmovaps
-    expect_unknown({0x62, 0xF1, 0x7C, 0x48, 0x28, 0xC1}); // EVEX
+    // VEX and EVEX were pinned as unknown here until WP-38 (ADR-0042 reverses that WP-10 decision); their vectors are
+    // in the test cases further down. What stays outside:
     expect_unknown({0x8F, 0xE9, 0x78, 0xC2, 0xC1});       // XOP (8F with reg != 0)
     expect_unknown({0x0F, 0x0F, 0xC1, 0x9E});             // 3DNow!
     expect_unknown({0xA0, 0, 0, 0, 0, 0, 0, 0, 0});       // mov al, moffs64
@@ -430,8 +429,19 @@ TEST_CASE("incomplete instructions are Truncated, and nothing past `available` i
     const Bytes imm_missing = {0x48, 0x83, 0xEC};
     CHECK(decode_instruction(imm_missing.data(), 3).status == DecodeStatus::Truncated);
     // An unknown opcode that is complete is Unknown even when nothing follows it.
-    const Bytes vex = {0xC5};
-    CHECK(decode_instruction(vex.data(), 1).status == DecodeStatus::Unknown);
+    const Bytes hlt = {0xF4};
+    CHECK(decode_instruction(hlt.data(), 1).status == DecodeStatus::Unknown);
+    // VEX and EVEX: the prefix payload, the opcode, ModRM, SIB, displacement and immediate can each be missing.
+    const Bytes vex2 = {0xC5, 0xF8, 0x28, 0xC1};                         // vmovaps xmm0, xmm1
+    const Bytes vex3 = {0xC4, 0xE3, 0xFD, 0x00, 0x44, 0x24, 0x08, 0xD8}; // vpermq ymm0, [rsp+8], 0D8h
+    const Bytes evex = {0x62, 0xF1, 0x7C, 0x48, 0x10, 0x44, 0x24, 0x01}; // vmovups zmm0, [rsp+40h]
+    for (const Bytes* v : {&vex2, &vex3, &evex}) {
+        for (std::size_t k = 1; k < v->size(); ++k) {
+            INFO("bytes: " << hex(*v) << " cut to " << k);
+            CHECK(decode_instruction(v->data(), k).status == DecodeStatus::Truncated);
+        }
+        CHECK(decode_instruction(v->data(), v->size()).status == DecodeStatus::Ok);
+    }
 }
 
 // ADR-0042: where the ModRM displacement sits. The first five vectors are the instructions cl /O2 emitted for
@@ -472,6 +482,25 @@ TEST_CASE("the displacement of a memory operand is located; immediates and branc
         {{0x65, 0x8B, 0x84, 0x87, 0x00, 0x00, 0x00, 0x00}, 8, 4, 4, kInsnSegFsGs},   // mov eax, gs:[rdi+rax*4+disp32]
         {{0x67, 0x65, 0x8B, 0x87, 0x00, 0x00, 0x00, 0x00}, 8, 4, 4, static_cast<std::uint8_t>(kInsnAddr32 | kInsnSegFsGs)},
         {{0x2E, 0x8B, 0x87, 0x00, 0x00, 0x00, 0x00}, 7, 3, 4, 0},                    // cs override: ignored in 64-bit mode
+        // VEX and EVEX (WP-38): the displacement sits behind the longer prefix, and an EVEX disp8 is one byte although
+        // the processor scales it.
+        {{0xC5, 0xF8, 0x10, 0x84, 0x87, 0x00, 0x00, 0x00, 0x00}, 9, 5, 4, 0},        // vmovups xmm0, [rdi+rax*4+disp32]
+        {{0xC5, 0xFA, 0x11, 0x44, 0x24, 0x08}, 6, 5, 1, 0},                          // vmovss [rsp+8], xmm0
+        {{0xC5, 0xFD, 0x6F, 0x05, 0x00, 0x00, 0x00, 0x00}, 8, 4, 4, kInsnRipRel},    // vmovdqa ymm0, [rip+disp32]
+        {{0xC4, 0xC1, 0x7E, 0x6F, 0x40, 0x20}, 6, 5, 1, 0},                          // vmovdqu ymm0, [r8+20h]
+        {{0xC4, 0xE3, 0x7D, 0x06, 0x05, 0x00, 0x00, 0x00, 0x00, 0x31}, 10, 5, 4, kInsnRipRel},  // vperm2f128 ymm0, ymm0, [rip+disp32], 31h
+        {{0xC4, 0xE2, 0x6D, 0x92, 0x44, 0x88, 0x10}, 7, 6, 1, 0},                    // vgatherdps ymm0, [rax+ymm1*4+10h], ymm2 (VSIB)
+        {{0xC5, 0xF8, 0x28, 0xC1}, 4, 0, 0, 0},                                      // vmovaps xmm0, xmm1
+        {{0xC5, 0xF8, 0x77}, 3, 0, 0, 0},                                            // vzeroupper
+        {{0x62, 0xF1, 0x7C, 0x48, 0x10, 0x41, 0x01}, 7, 6, 1, 0},                    // vmovups zmm0, [rcx+40h] (disp8*64)
+        {{0x62, 0xF1, 0x7C, 0x48, 0x10, 0x81, 0x00, 0x01, 0x00, 0x00}, 10, 6, 4, 0}, // vmovups zmm0, [rcx+100h]
+        {{0x62, 0xF1, 0x7C, 0x48, 0x10, 0x05, 0x00, 0x00, 0x00, 0x00}, 10, 6, 4, kInsnRipRel},  // vmovups zmm0, [rip+disp32]
+        {{0x62, 0xF3, 0x7D, 0x48, 0x25, 0x44, 0x24, 0x01, 0xFF}, 9, 7, 1, 0},        // vpternlogd zmm0, zmm0, [rsp+40h], 0FFh
+        // A segment override or 67 in front of VEX / EVEX is a prefix of the instruction and shows in the flags.
+        {{0x65, 0xC5, 0xFA, 0x10, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00}, 10, 6, 4, kInsnSegFsGs},  // vmovss xmm0, gs:[disp32]
+        {{0x67, 0xC5, 0xF8, 0x10, 0x40, 0x10}, 6, 5, 1, kInsnAddr32},                // vmovups xmm0, [eax+10h]
+        {{0x64, 0x67, 0x62, 0xF1, 0x7C, 0x48, 0x10, 0x41, 0x01}, 9, 8, 1, static_cast<std::uint8_t>(kInsnAddr32 | kInsnSegFsGs)},
+        {{0x2E, 0xC5, 0xF8, 0x10, 0x87, 0x00, 0x00, 0x00, 0x00}, 9, 5, 4, 0},        // cs override: ignored
     };
     for (const Case& c : cases) {
         INFO("bytes: " << hex(c.bytes));
@@ -520,4 +549,432 @@ TEST_CASE("a linear sweep over a realistic function prologue finds every boundar
         at += r.length;
     }
     CHECK(at == code.size());
+}
+
+// ---- VEX and EVEX (WP-38, ADR-0042) ---------------------------------------------------------------------------------
+//
+// How the lengths below were worked out, by hand, from the Intel SDM volume 2 (2.3 "AVX" and 2.7 "EVEX" for the
+// prefixes, the instruction pages for the opcodes; AMD APM volume 4 says the same):
+//
+//   C5  [R vvvv L pp]                             2 bytes of prefix, opcode map 0F
+//   C4  [R X B m-mmmm] [W vvvv L pp]              3 bytes of prefix, map 1 = 0F, 2 = 0F 38, 3 = 0F 3A
+//   62  [R X B R' 0 0 m m] [W vvvv 1 pp] [z L'L b V' aaa]   4 bytes of prefix, the same maps
+//   then one opcode byte, ModRM (+ SIB + disp8 / disp32 exactly as for a legacy instruction; an EVEX disp8 is scaled by
+//   the processor but still one byte), then one immediate byte for every map-3 opcode and for 0F 70..73, C2, C4, C5, C6.
+//   VEX 0F 77 (vzeroupper, vzeroall) alone has no ModRM byte.
+//
+// The R, X, B, vvvv fields are stored inverted, so "no extended register, no second source" is all ones: C5 F8 is
+// R=1 vvvv=1111 L=0 pp=00.
+TEST_CASE("VEX: two-byte and three-byte prefix, maps 1 to 3") {
+    // Map 1 through C5.
+    expect_len({0xC5, 0xF8, 0x28, 0xC1}, 4);                     // vmovaps xmm0, xmm1
+    expect_len({0xC5, 0xFC, 0x28, 0xC1}, 4);                     // vmovaps ymm0, ymm1          (L = 1)
+    expect_len({0xC5, 0x78, 0x29, 0x44, 0x24, 0x20}, 6);         // vmovaps [rsp+20h], xmm8     (R = 0; SIB, disp8)
+    expect_len({0xC5, 0xFA, 0x11, 0x44, 0x24, 0x08}, 6);         // vmovss [rsp+8], xmm0        (pp = F3)
+    expect_len({0xC5, 0xFB, 0x11, 0x44, 0x24, 0x08}, 6);         // vmovsd [rsp+8], xmm0        (pp = F2)
+    expect_len({0xC5, 0xFB, 0x10, 0x05, 0x00, 0x00, 0x00, 0x00}, 8, kInsnRipRel);  // vmovsd xmm0, [rip+disp32]
+    expect_len({0xC5, 0xFE, 0x6F, 0x01}, 4);                     // vmovdqu ymm0, [rcx]
+    expect_len({0xC5, 0xFE, 0x7F, 0x02}, 4);                     // vmovdqu [rdx], ymm0
+    expect_len({0xC5, 0xFD, 0x6F, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00}, 9);  // vmovdqa ymm0, [rsp+80h] (SIB, disp32)
+    expect_len({0xC5, 0xF9, 0x6E, 0xC1}, 4);                     // vmovd xmm0, ecx
+    expect_len({0xC5, 0xF9, 0x7E, 0xC0}, 4);                     // vmovd eax, xmm0
+    expect_len({0xC5, 0xF9, 0xEF, 0xC0}, 4);                     // vpxor xmm0, xmm0, xmm0
+    expect_len({0xC5, 0xF1, 0xEF, 0xC9}, 4);                     // vpxor xmm1, xmm1, xmm1      (vvvv = 1110)
+    expect_len({0xC5, 0xF8, 0x57, 0xC0}, 4);                     // vxorps xmm0, xmm0, xmm0
+    expect_len({0xC5, 0xFA, 0x2A, 0xC1}, 4);                     // vcvtsi2ss xmm0, xmm0, ecx
+    expect_len({0xC5, 0xFA, 0x2C, 0xC0}, 4);                     // vcvttss2si eax, xmm0
+    expect_len({0xC5, 0xFA, 0x58, 0x05, 0x00, 0x00, 0x00, 0x00}, 8, kInsnRipRel);  // vaddss xmm0, xmm0, [rip+disp32]
+    expect_len({0xC5, 0xF8, 0x2E, 0xC1}, 4);                     // vucomiss xmm0, xmm1
+    expect_len({0xC5, 0xFD, 0xD7, 0xC0}, 4);                     // vpmovmskb eax, ymm0
+    expect_len({0xC5, 0xFD, 0x74, 0x01}, 4);                     // vpcmpeqb ymm0, ymm0, [rcx]
+    expect_len({0xC5, 0xF8, 0xAE, 0x14, 0x24}, 5);               // vldmxcsr [rsp]
+    expect_len({0xC5, 0xF8, 0xAE, 0x5C, 0x24, 0x08}, 6);         // vstmxcsr [rsp+8]
+    // Map 1 through C4 (needed for W = 1 or for the X / B register extensions).
+    expect_len({0xC4, 0xE1, 0xF9, 0x6E, 0xC1}, 5);               // vmovq xmm0, rcx             (W = 1)
+    expect_len({0xC4, 0xE1, 0xF9, 0x7E, 0xC0}, 5);               // vmovq rax, xmm0
+    expect_len({0xC4, 0xC1, 0x7E, 0x6F, 0x00}, 5);               // vmovdqu ymm0, [r8]          (B = 0)
+    expect_len({0xC4, 0xC1, 0x7D, 0x6F, 0x00}, 5);               // vmovdqa ymm0, [r8]
+    expect_len({0xC4, 0xC1, 0x7C, 0x10, 0x00}, 5);               // vmovups ymm0, [r8]
+    expect_len({0xC4, 0xC1, 0x7E, 0x7F, 0x04, 0x01}, 6);         // vmovdqu [r9+rax], ymm0      (SIB)
+    expect_len({0xC4, 0xA1, 0x7E, 0x6F, 0x04, 0x01}, 6);         // vmovdqu ymm0, [rcx+r8]      (X = 0)
+    expect_len({0xC4, 0xE1, 0x78, 0x28, 0xC1}, 5);               // vmovaps xmm0, xmm1 in the long form
+    // Map 2 (0F 38): ModRM, never an immediate.
+    expect_len({0xC4, 0xE2, 0x7D, 0x18, 0xC0}, 5);               // vbroadcastss ymm0, xmm0
+    expect_len({0xC4, 0xE2, 0x7D, 0x18, 0x05, 0x00, 0x00, 0x00, 0x00}, 9, kInsnRipRel);  // vbroadcastss ymm0, [rip+disp32]
+    expect_len({0xC4, 0xE2, 0x7D, 0x78, 0xC0}, 5);               // vpbroadcastb ymm0, xmm0
+    expect_len({0xC4, 0xE2, 0x7D, 0x58, 0xC1}, 5);               // vpbroadcastd ymm0, xmm1
+    expect_len({0xC4, 0xC2, 0x7D, 0x59, 0x00}, 5);               // vpbroadcastq ymm0, [r8]
+    expect_len({0xC4, 0xE2, 0x79, 0x00, 0xC1}, 5);               // vpshufb xmm0, xmm0, xmm1
+    expect_len({0xC4, 0xE2, 0x7D, 0x17, 0xC0}, 5);               // vptest ymm0, ymm0
+    expect_len({0xC4, 0xE2, 0x71, 0xA9, 0xC2}, 5);               // vfmadd213ss xmm0, xmm1, xmm2
+    expect_len({0xC4, 0xE2, 0xF1, 0xB8, 0x01}, 5);               // vfmadd231pd xmm0, xmm1, [rcx]
+    expect_len({0xC4, 0xE2, 0x7D, 0x13, 0xC0}, 5);               // vcvtph2ps ymm0, xmm0
+    expect_len({0xC4, 0xE2, 0x78, 0xF2, 0xC1}, 5);               // andn eax, eax, ecx
+    expect_len({0xC4, 0xE2, 0x78, 0xF3, 0xD9}, 5);               // blsi eax, ecx               (group 17, /3)
+    expect_len({0xC4, 0xE2, 0x7A, 0xF7, 0xC1}, 5);               // sarx eax, ecx, eax
+    expect_len({0xC4, 0xE2, 0x7B, 0xF6, 0xC1}, 5);               // mulx eax, eax, ecx
+    expect_len({0xC4, 0xE2, 0xFB, 0xF5, 0x44, 0x24, 0x10}, 7);   // pdep rax, rax, [rsp+10h]
+    expect_len({0xC4, 0xE2, 0x6D, 0x92, 0x04, 0x88}, 6);         // vgatherdps ymm0, [rax+ymm1*4], ymm2  (VSIB)
+    expect_len({0xC4, 0xE2, 0x79, 0xDC, 0xC1}, 5);               // vaesenc xmm0, xmm0, xmm1
+    // Map 3 (0F 3A): ModRM and always one immediate byte.
+    expect_len({0xC4, 0xE3, 0xFD, 0x00, 0xC0, 0xD8}, 6);         // vpermq ymm0, ymm0, 0D8h
+    expect_len({0xC4, 0xE3, 0xFD, 0x00, 0x01, 0x1B}, 6);         // vpermq ymm0, [rcx], 1Bh
+    expect_len({0xC4, 0xE3, 0x7D, 0x19, 0xC1, 0x01}, 6);         // vextractf128 xmm1, ymm0, 1
+    expect_len({0xC4, 0xE3, 0x7D, 0x39, 0x44, 0x24, 0x20, 0x01}, 8);  // vextracti128 [rsp+20h], ymm0, 1
+    expect_len({0xC4, 0xE3, 0x7D, 0x18, 0xC1, 0x01}, 6);         // vinsertf128 ymm0, ymm0, xmm1, 1
+    expect_len({0xC4, 0xE3, 0x79, 0x16, 0xC0, 0x01}, 6);         // vpextrd eax, xmm0, 1
+    expect_len({0xC4, 0xE3, 0x79, 0x0F, 0xC1, 0x08}, 6);         // vpalignr xmm0, xmm0, xmm1, 8
+    expect_len({0xC4, 0xE3, 0x7D, 0x1D, 0xC0, 0x04}, 6);         // vcvtps2ph xmm0, ymm0, 4
+    expect_len({0xC4, 0xE3, 0x79, 0x63, 0xC1, 0x0C}, 6);         // vpcmpistri xmm0, xmm1, 0Ch
+    expect_len({0xC4, 0xE3, 0x7B, 0xF0, 0xC1, 0x07}, 6);         // rorx eax, ecx, 7
+    // The /is4 forms: the fourth register travels in the immediate byte, which is still exactly one byte.
+    expect_len({0xC4, 0xE3, 0x75, 0x4A, 0xC2, 0x30}, 6);         // vblendvps ymm0, ymm1, ymm2, ymm3
+    expect_len({0xC4, 0xE3, 0x75, 0x4C, 0x01, 0x30}, 6);         // vpblendvb ymm0, ymm1, [rcx], ymm3
+}
+
+// Real function entries. These are the first bytes of functions of the MSVC STL's vectorised algorithms
+// (vector_algorithms.cpp, linked into every fixture from the static runtime) as `cml_lde_probe` printed them for
+// fixture `basic` (lines `LDE-VEX <function> rva=... bytes=...`, ci run 45421496359, windows-2025 clang-cl
+// RelWithDebInfo; the library object is Microsoft's, so the bytes are the same in the cl cells). Until WP-38 every
+// one of them was refused with CML4300 (`refused_vex=361` for this module in ci run 45294653290). The lengths are
+// worked out by hand as above; the comment gives the instruction.
+TEST_CASE("VEX: real function entries of the MSVC STL's vectorised algorithms decode to their instruction boundaries") {
+    struct Entry {
+        const char* function;
+        Bytes code;
+        std::vector<unsigned> lengths;
+    };
+    const Entry entries[] = {
+        // vmovdqu ymm0, [rdx] ; vmovdqu [rcx], ymm0 ; mov rax, rcx ; vzeroupper ; ret
+        {"_Sorting::_Minmax_element_impl<1,_Traits_1_avx,1>::<lambda_10>::<lambda_10>",
+         {0xC5, 0xFE, 0x6F, 0x02, 0xC5, 0xFE, 0x7F, 0x01, 0x48, 0x8B, 0xC1, 0xC5, 0xF8, 0x77, 0xC3},
+         {4, 4, 3, 3, 1}},
+        // vzeroupper ; ret
+        {"_Zeroupper_on_exit::~_Zeroupper_on_exit", {0xC5, 0xF8, 0x77, 0xC3}, {3, 1}},
+        // vmovdqu ymm0, [rcx] ; ret
+        {"_Sorting::_Traits_1_avx::_Load", {0xC5, 0xFE, 0x6F, 0x01, 0xC3}, {4, 1}},
+        // sub rsp, 18h ; vmovdqu ymm1, [r8] (C4: B extends the base) ; vpermq ymm0, ymm1, 4Eh (map 3: imm8)
+        {"_Sorting::_Minmax_element_impl<1,_Traits_2_avx,1>::<lambda_4>::operator()<__m256i>",
+         {0x48, 0x83, 0xEC, 0x18, 0xC4, 0xC1, 0x7E, 0x6F, 0x08, 0xC4, 0xE3, 0xFD, 0x00, 0xC1, 0x4E},
+         {4, 5, 6}},
+        // vmovdqu ymm0, [r8] ; vpcmpgtq ymm1, ymm0, [r9] (map 2) ; vmovdqu [rdx], ymm1
+        {"_Sorting::_Minmax_element_impl<1,_Traits_8_avx,1>::<lambda_1>::operator()<__m256i,__m256i>",
+         {0xC4, 0xC1, 0x7E, 0x6F, 0x00, 0xC4, 0xC2, 0x7D, 0x37, 0x09, 0xC5, 0xFE, 0x7F, 0x0A},
+         {5, 5, 4}},
+        // vmovdqu ymm0, [rcx] ; vpcmpeqq ymm0, ymm0, [rdx] ; ret
+        {"_Sorting::_Traits_8_avx::_Cmp_eq", {0xC5, 0xFE, 0x6F, 0x01, 0xC4, 0xE2, 0x7D, 0x29, 0x02, 0xC3}, {4, 5, 1}},
+        // vmovdqu ymm1, [rcx] ; vmovdqu ymm0, [r8] ; vpblendvb ymm0, ymm1, [rdx], ymm0 (/is4: one immediate byte) ; ret
+        {"_Sorting::_Traits_avx_base::_Blend",
+         {0xC5, 0xFE, 0x6F, 0x09, 0xC4, 0xC1, 0x7E, 0x6F, 0x00, 0xC4, 0xE3, 0x75, 0x4C, 0x02, 0x00, 0xC3},
+         {4, 5, 6, 1}},
+        // vmovupd ymm0, [r8] ; vcmppd ymm1, ymm0, [r9], 1Eh (map 1 with imm8) ; vmovupd [rdx], ymm1
+        {"_Sorting::_Minmax_element_impl<1,_Traits_d_avx,1>::<lambda_1>::operator()<__m256d,__m256d>",
+         {0xC4, 0xC1, 0x7D, 0x10, 0x00, 0xC4, 0xC1, 0x7D, 0xC2, 0x09, 0x1E, 0xC5, 0xFD, 0x11, 0x0A},
+         {5, 6, 4}},
+        // vmovupd ymm1, [rcx] ; vshufpd ymm0, ymm1, ymm1, 5 ; vmaxpd ymm2, ymm0, ymm1
+        {"_Sorting::_Traits_d_avx::_H_max", {0xC5, 0xFD, 0x10, 0x09, 0xC5, 0xF5, 0xC6, 0xC1, 0x05, 0xC5, 0xFD, 0x5F, 0xD1}, {4, 5, 4}},
+        // vmovd xmm0, ecx ; vpshufd xmm0, xmm0, 0 ; vinsertf128 ymm0, ymm0, xmm0, 1 ; ret
+        {"_Finding::_Find_traits_4::_Set_avx",
+         {0xC5, 0xF9, 0x6E, 0xC1, 0xC5, 0xF9, 0x70, 0xC0, 0x00, 0xC4, 0xE3, 0x7D, 0x18, 0xC0, 0x01, 0xC3},
+         {4, 5, 6, 1}},
+        // vpermq ymm0, [rcx], 4Eh ; vpshufb ymm0, ymm0, [rip+000B1F31h] ; ret
+        {"_Reversing::_Traits_1::_Rev_avx",
+         {0xC4, 0xE3, 0xFD, 0x00, 0x01, 0x4E, 0xC4, 0xE2, 0x7D, 0x00, 0x05, 0x31, 0x1F, 0x0B, 0x00, 0xC3},
+         {6, 9, 1}},
+        // vmovq xmm0, rcx (W = 1) ; vpunpcklqdq xmm0, xmm0, xmm0 ; vinsertf128 ymm0, ymm0, xmm0, 1 ; ret
+        {"_Finding::_Find_traits_8::_Set_avx",
+         {0xC4, 0xE1, 0xF9, 0x6E, 0xC1, 0xC5, 0xF9, 0x6C, 0xC0, 0xC4, 0xE3, 0x7D, 0x18, 0xC0, 0x01, 0xC3},
+         {5, 4, 6, 1}},
+        // vmovdqu ymm0, [rdx] ; vpmaskmovd ymm0, ymm0, [rcx] ; ret
+        {"_Sorting::_Traits_avx_i_base::_Load_mask", {0xC5, 0xFE, 0x6F, 0x02, 0xC4, 0xE2, 0x7D, 0x8C, 0x01, 0xC3}, {4, 5, 1}},
+        // vmovdqu ymm0, [rip+000AFEF8h] ; vpaddd ymm0, ymm0, [rcx] ; ret
+        {"_Sorting::_Traits_4_avx::_Inc", {0xC5, 0xFE, 0x6F, 0x05, 0xF8, 0xFE, 0x0A, 0x00, 0xC5, 0xFD, 0xFE, 0x01, 0xC3}, {8, 4, 1}},
+        // vmovdqu ymm1, [rdx] ; vpsrld ymm0, ymm1, 5 (group 13 /2: imm8) ; vpermd ymm2, ymm0, [rcx]
+        {"_Find_meow_of::_Bitmap_details::_Bitmap_step",
+         {0xC5, 0xFE, 0x6F, 0x0A, 0xC5, 0xFD, 0x72, 0xD1, 0x05, 0xC4, 0xE2, 0x7D, 0x36, 0x11},
+         {4, 5, 5}},
+        // sub rsp, 28h ; vmovdqu ymm2, [rcx] ; mov r8, rdx
+        {"_Sorting::_Minmax_impl<3,_Traits_1_avx,1,0>", {0x48, 0x83, 0xEC, 0x28, 0xC5, 0xFE, 0x6F, 0x11, 0x4C, 0x8B, 0xC2}, {4, 4, 3}},
+        // vmovdqu ymm2, [rdx] ; mov rax, [rcx] ; shl r8, 5
+        {"_Sorting::_Minmax_impl<1,_Traits_8_avx,1,0>::<lambda_1>::operator()<__m256i>",
+         {0xC5, 0xFE, 0x6F, 0x12, 0x48, 0x8B, 0x01, 0x49, 0xC1, 0xE0, 0x05},
+         {4, 3, 4}},
+    };
+    for (const Entry& e : entries) {
+        INFO(e.function << ": " << hex(e.code));
+        std::size_t at = 0;
+        for (const unsigned want : e.lengths) {
+            REQUIRE(at < e.code.size());
+            const DecodeResult r = decode_instruction(e.code.data() + at, e.code.size() - at);
+            REQUIRE(r.status == DecodeStatus::Ok);
+            CHECK(r.length == want);
+            at += r.length;
+        }
+        CHECK(at == e.code.size());
+    }
+    // Two of them with a RIP-relative operand: the displacement is where the relocation of the constant would be.
+    const Bytes rev = {0xC4, 0xE2, 0x7D, 0x00, 0x05, 0x31, 0x1F, 0x0B, 0x00};
+    const DecodeResult r1 = decode_instruction(rev.data(), rev.size());
+    REQUIRE(r1.status == DecodeStatus::Ok);
+    CHECK(r1.flags == kInsnRipRel);
+    CHECK(r1.disp_offset == 5);
+    CHECK(r1.disp_size == 4);
+    const Bytes inc = {0xC5, 0xFE, 0x6F, 0x05, 0xF8, 0xFE, 0x0A, 0x00};
+    const DecodeResult r2 = decode_instruction(inc.data(), inc.size());
+    REQUIRE(r2.status == DecodeStatus::Ok);
+    CHECK(r2.flags == kInsnRipRel);
+    CHECK(r2.disp_offset == 4);
+    CHECK(r2.disp_size == 4);
+}
+
+TEST_CASE("VEX: the opcodes with and without ModRM and immediate that are easy to get wrong") {
+    // 0F 77 is the only VEX opcode without a ModRM byte: the byte behind it belongs to the next instruction.
+    expect_len({0xC5, 0xF8, 0x77}, 3);                           // vzeroupper
+    expect_len({0xC5, 0xFC, 0x77}, 3);                           // vzeroall
+    expect_len({0xC4, 0xE1, 0x78, 0x77}, 4);                     // vzeroupper in the long form
+    {
+        const Bytes code = {0xC5, 0xF8, 0x77, 0xC3};             // vzeroupper ; ret
+        const DecodeResult first = decode_instruction(code.data(), code.size());
+        REQUIRE(first.status == DecodeStatus::Ok);
+        CHECK(first.length == 3);
+        const DecodeResult second = decode_instruction(code.data() + 3, 1);
+        REQUIRE(second.status == DecodeStatus::Ok);
+        CHECK(second.flags == kInsnRet);
+    }
+    // Map-1 opcodes with an immediate byte: 70, 71, 72, 73, C2, C4, C5, C6.
+    expect_len({0xC5, 0xFD, 0x70, 0xC0, 0x1B}, 5);               // vpshufd ymm0, ymm0, 1Bh
+    expect_len({0xC5, 0xFA, 0x70, 0xC1, 0x00}, 5);               // vpshufhw xmm0, xmm1, 0
+    expect_len({0xC5, 0xFB, 0x70, 0x01, 0x00}, 5);               // vpshuflw xmm0, [rcx], 0
+    expect_len({0xC5, 0xF9, 0x71, 0xD0, 0x04}, 5);               // vpsrlw xmm0, xmm0, 4        (group 12, /2)
+    expect_len({0xC5, 0xF1, 0x72, 0xF0, 0x04}, 5);               // vpslld xmm1, xmm0, 4        (group 13, /6)
+    expect_len({0xC5, 0xF9, 0x73, 0xD8, 0x08}, 5);               // vpsrldq xmm0, xmm0, 8       (group 14, /3)
+    expect_len({0xC5, 0xF8, 0xC2, 0xC1, 0x00}, 5);               // vcmpeqps xmm0, xmm0, xmm1
+    expect_len({0xC5, 0xFB, 0xC2, 0x44, 0x24, 0x08, 0x01}, 7);   // vcmpltsd xmm0, xmm0, [rsp+8]
+    expect_len({0xC5, 0xF9, 0xC4, 0xC1, 0x01}, 5);               // vpinsrw xmm0, xmm0, ecx, 1
+    expect_len({0xC5, 0xF9, 0xC5, 0xC0, 0x02}, 5);               // vpextrw eax, xmm0, 2
+    expect_len({0xC5, 0xF8, 0xC6, 0xC1, 0x44}, 5);               // vshufps xmm0, xmm0, xmm1, 44h
+    // Their neighbours have none.
+    expect_len({0xC5, 0xF9, 0x74, 0xC1}, 4);                     // vpcmpeqb
+    expect_len({0xC5, 0xF9, 0x6F, 0xC1}, 4);                     // vmovdqa
+    expect_len({0xC5, 0xFA, 0x7E, 0xC1}, 4);                     // vmovq xmm0, xmm1
+    expect_len({0xC5, 0xF8, 0xC6, 0x05, 0, 0, 0, 0, 0x44}, 9, kInsnRipRel);  // vshufps with [rip+disp32]: disp32 then imm8
+    // The opmask (k-register) instructions of AVX-512 are VEX-encoded.
+    expect_len({0xC5, 0xF8, 0x90, 0xC1}, 4);                     // kmovw k0, k1
+    expect_len({0xC5, 0xFB, 0x92, 0xC8}, 4);                     // kmovd k1, eax
+    expect_len({0xC5, 0xF4, 0x41, 0xCA}, 4);                     // kandw k1, k1, k2
+    expect_len({0xC5, 0xF8, 0x98, 0xC1}, 4);                     // kortestw k0, k1
+    expect_len({0xC4, 0xE3, 0x79, 0x32, 0xC9, 0x04}, 6);         // kshiftlb k1, k1, 4
+}
+
+TEST_CASE("EVEX: four-byte prefix, maps 1 to 3, compressed displacement, masking, broadcast, rounding") {
+    expect_len({0x62, 0xF1, 0x7C, 0x48, 0x28, 0xC1}, 6);         // vmovaps zmm0, zmm1
+    expect_len({0x62, 0xF1, 0x7C, 0x08, 0x28, 0xC1}, 6);         // vmovaps xmm0, xmm1 (EVEX.128)
+    expect_len({0x62, 0xE1, 0x7C, 0x08, 0x28, 0xC1}, 6);         // vmovaps xmm16, xmm1         (R' = 0)
+    expect_len({0x62, 0xF1, 0x7C, 0x48, 0x10, 0x01}, 6);         // vmovups zmm0, [rcx]
+    expect_len({0x62, 0xF1, 0x7C, 0x48, 0x10, 0x41, 0x01}, 7);   // vmovups zmm0, [rcx+40h]     (disp8*64 is one byte)
+    expect_len({0x62, 0xF1, 0x7C, 0x48, 0x10, 0x81, 0x00, 0x01, 0x00, 0x00}, 10);  // vmovups zmm0, [rcx+100h]
+    expect_len({0x62, 0xF1, 0x7C, 0x48, 0x10, 0x05, 0x00, 0x00, 0x00, 0x00}, 10, kInsnRipRel);
+    expect_len({0x62, 0xF1, 0xFE, 0x48, 0x6F, 0x44, 0x24, 0x01}, 8);  // vmovdqu64 zmm0, [rsp+40h] (SIB, disp8)
+    expect_len({0x62, 0xF1, 0xFE, 0x48, 0x7F, 0x01}, 6);         // vmovdqu64 [rcx], zmm0
+    expect_len({0x62, 0xF1, 0x7F, 0x48, 0x6F, 0x01}, 6);         // vmovdqu8 zmm0, [rcx]        (pp = F2)
+    expect_len({0x62, 0xF1, 0x7C, 0xC9, 0x28, 0xC2}, 6);         // vmovaps zmm0{k1}{z}, zmm2
+    expect_len({0x62, 0xF1, 0x7C, 0x58, 0x58, 0x01}, 6);         // vaddps zmm0, zmm0, [rcx]{1to16}
+    expect_len({0x62, 0xF1, 0x7C, 0x18, 0x58, 0xC1}, 6);         // vaddps zmm0, zmm0, zmm1, {rn-sae}
+    expect_len({0x62, 0xF1, 0x7C, 0x78, 0x58, 0xC1}, 6);         // vaddps zmm0, zmm0, zmm1, {rz-sae} (L'L = 3 as rounding)
+    expect_len({0x62, 0xF1, 0x7D, 0x48, 0xEF, 0xC0}, 6);         // vpxord zmm0, zmm0, zmm0
+    expect_len({0x62, 0xF1, 0x7D, 0x48, 0x74, 0xC1}, 6);         // vpcmpeqb k0, zmm0, zmm1
+    expect_len({0x62, 0xF1, 0x7F, 0x08, 0x7B, 0xC1}, 6);         // vcvtusi2sd xmm0, xmm0, ecx
+    // Map 1 opcodes with an immediate.
+    expect_len({0x62, 0xF1, 0x7C, 0x48, 0xC2, 0xC1, 0x00}, 7);   // vcmpeqps k0, zmm0, zmm1
+    expect_len({0x62, 0xF1, 0x7D, 0x48, 0x72, 0xF0, 0x04}, 7);   // vpslld zmm0, zmm0, 4
+    expect_len({0x62, 0xF1, 0x7D, 0x48, 0x72, 0xC8, 0x04}, 7);   // vprold zmm0, zmm0, 4        (/1: EVEX only)
+    expect_len({0x62, 0xF1, 0x7D, 0x48, 0x70, 0x41, 0x01, 0x1B}, 8);  // vpshufd zmm0, [rcx+40h], 1Bh
+    // Map 2.
+    expect_len({0x62, 0xF2, 0x7D, 0x48, 0x7C, 0xC0}, 6);         // vpbroadcastd zmm0, eax
+    expect_len({0x62, 0xF2, 0xFD, 0x48, 0x59, 0x01}, 6);         // vpbroadcastq zmm0, [rcx]
+    expect_len({0x62, 0xF2, 0x7E, 0x48, 0x28, 0xC1}, 6);         // vpmovm2b zmm0, k1           (pp = F3)
+    expect_len({0x62, 0xF2, 0x7E, 0x48, 0x31, 0x01}, 6);         // vpmovdb [rcx], zmm0
+    expect_len({0x62, 0xF2, 0x75, 0x48, 0xB8, 0xC2}, 6);         // vfmadd231ps zmm0, zmm1, zmm2
+    expect_len({0x62, 0xF2, 0xFD, 0x49, 0xA0, 0x04, 0x88}, 7);   // vpscatterdq [rax+ymm1*4]{k1}, zmm0 (VSIB)
+    expect_len({0x62, 0xF2, 0x7D, 0x49, 0x92, 0x44, 0x88, 0x04}, 8);  // vgatherdps zmm0{k1}, [rax+zmm1*4+10h] (disp8*4)
+    // Map 3: always an immediate byte.
+    expect_len({0x62, 0xF3, 0x7D, 0x48, 0x25, 0xC1, 0xFF}, 7);   // vpternlogd zmm0, zmm0, zmm1, 0FFh
+    expect_len({0x62, 0xF3, 0x7D, 0x48, 0x3F, 0xC1, 0x02}, 7);   // vpcmpb k0, zmm0, zmm1, 2
+    expect_len({0x62, 0xF3, 0xFD, 0x48, 0x1B, 0xC1, 0x01}, 7);   // vextractf64x4 ymm1, zmm0, 1
+    expect_len({0x62, 0xF3, 0xFD, 0x48, 0x00, 0x44, 0x24, 0x01, 0xD8}, 9);  // vpermq zmm0, [rsp+40h], 0D8h
+}
+
+TEST_CASE("EVEX: a compressed disp8 is reported as the one byte it is, not as the scaled displacement") {
+    // vmovups zmm0, [rcx+40h]: 62 F1 7C 48 (prefix) 10 (opcode) 41 (ModRM: mod 01, rm rcx) 01 (disp8, times N = 64).
+    // The decoder reports where the byte is and that it is one byte; it has no flag for "scaled" (the header says
+    // so), and the length is 7 whatever N is.
+    const Bytes code = {0x62, 0xF1, 0x7C, 0x48, 0x10, 0x41, 0x01};
+    const DecodeResult r = decode_exact(code);
+    REQUIRE(r.status == DecodeStatus::Ok);
+    CHECK(r.length == 7);
+    CHECK(r.disp_offset == 6);
+    CHECK(r.disp_size == 1);
+    CHECK(r.flags == 0);
+    // The same instruction with a disp32 carries the literal displacement, as under every encoding.
+    const Bytes wide = {0x62, 0xF1, 0x7C, 0x48, 0x10, 0x81, 0x40, 0x00, 0x00, 0x00};
+    const DecodeResult w = decode_exact(wide);
+    REQUIRE(w.status == DecodeStatus::Ok);
+    CHECK(w.length == 10);
+    CHECK(w.disp_offset == 6);
+    CHECK(w.disp_size == 4);
+}
+
+TEST_CASE("VEX / EVEX: what is refused") {
+    // 66, F2, F3, lock or REX in front of a VEX or EVEX prefix is #UD (SDM volume 2, 2.3.2 and 2.7.1).
+    for (const std::uint8_t prefix : std::initializer_list<std::uint8_t>{0x66, 0xF2, 0xF3, 0xF0, 0x40, 0x48, 0x4F}) {
+        INFO("prefix " << static_cast<unsigned>(prefix));
+        expect_unknown({prefix, 0xC5, 0xF8, 0x28, 0xC1});
+        expect_unknown({prefix, 0xC4, 0xE2, 0x7D, 0x18, 0xC0});
+        expect_unknown({prefix, 0x62, 0xF1, 0x7C, 0x48, 0x28, 0xC1});
+    }
+    expect_unknown({0x66, 0x2E, 0xC5, 0xF8, 0x28, 0xC1});        // ... also with an allowed prefix in between
+    expect_unknown({0x48, 0x2E, 0xC5, 0xF8, 0x28, 0xC1});
+    expect_unknown({0x65, 0xF3, 0xC5, 0xF8, 0x28, 0xC1});
+    // In 64-bit mode C4, C5 and 62 are never LES, LDS or BOUND: a ModRM-like second byte with mod != 3 does not make
+    // them something else. C5 00 ...: R = 0, vvvv = 0000, L = 0, pp = 00, then opcode 28.
+    expect_len({0xC5, 0x00, 0x28, 0xC1}, 4);                     // vmovaps xmm8, xmm1 with vvvv = 0 (#UD, same length)
+    // Maps other than 1, 2, 3.
+    expect_unknown({0xC4, 0xE0, 0x78, 0x28, 0xC1});              // map 0
+    expect_unknown({0xC4, 0xE4, 0x78, 0x28, 0xC1});              // map 4
+    expect_unknown({0xC4, 0xE7, 0x78, 0x28, 0xC1});              // map 7
+    expect_unknown({0xC4, 0xE8, 0x78, 0x85, 0xC1, 0x00});        // map 8 (the XOP numbering)
+    expect_unknown({0xC4, 0xFF, 0x78, 0x28, 0xC1});              // map 31
+    expect_unknown({0x62, 0xF0, 0x7C, 0x48, 0x28, 0xC1});        // EVEX map 0
+    expect_unknown({0x62, 0xF4, 0x7C, 0x08, 0x01, 0xC1});        // EVEX map 4 (APX)
+    expect_unknown({0x62, 0xF5, 0x7C, 0x48, 0x58, 0xC1});        // EVEX map 5 (AVX512-FP16: vaddph)
+    expect_unknown({0x62, 0xF6, 0x7D, 0x48, 0x98, 0xC1});        // EVEX map 6
+    expect_unknown({0x62, 0xF7, 0x7C, 0x48, 0x28, 0xC1});        // EVEX map 7
+    expect_unknown({0x62, 0xF9, 0x7C, 0x48, 0x28, 0xC1});        // the reserved bit 3 of the first payload byte
+    expect_unknown({0x62, 0xF1, 0x78, 0x48, 0x28, 0xC1});        // the fixed 1 bit of the second payload byte is 0
+    expect_unknown({0x62, 0xF1, 0x7C, 0xC8, 0x28, 0xC1});        // zeroing ({z}) without a mask register
+    expect_unknown({0x62, 0xF1, 0x7C, 0x68, 0x28, 0xC1});        // L'L = 3 without EVEX.b
+    expect_unknown({0x62, 0xF1, 0x7C, 0x78, 0x58, 0x01});        // L'L = 3 with a memory operand
+    // Opcodes that exist in the legacy map but not under VEX: sharing the map byte does not make them instructions.
+    expect_unknown({0xC5, 0xF8, 0x05});                          // 0F 05 syscall
+    expect_unknown({0xC5, 0xF8, 0x0B});                          // 0F 0B ud2
+    expect_unknown({0xC5, 0xF8, 0x1F, 0x00});                    // 0F 1F nop
+    expect_unknown({0xC5, 0xF8, 0xA2});                          // 0F A2 cpuid
+    expect_unknown({0xC5, 0xF8, 0xAF, 0xC1});                    // 0F AF imul
+    expect_unknown({0xC5, 0xF8, 0xB6, 0xC1});                    // 0F B6 movzx
+    expect_unknown({0xC5, 0xF8, 0x80, 0x00, 0x00, 0x00, 0x00});  // 0F 80 jo rel32
+    expect_unknown({0xC5, 0xF8, 0x40, 0xC1});                    // 0F 40 cmovo
+    expect_unknown({0xC5, 0xF8, 0xC3, 0x01});                    // 0F C3 movnti
+    expect_unknown({0xC5, 0xF8, 0xC7, 0x09});                    // 0F C7 /1 cmpxchg8b
+    expect_unknown({0xC5, 0xF8, 0x6F, 0xC1});                    // 0F 6F without a prefix is MMX movq: no VEX form
+    expect_unknown({0xC5, 0xF8, 0xD4, 0xC1});                    // MMX paddq
+    expect_unknown({0xC5, 0xFA, 0x28, 0xC1});                    // F3 0F 28 is nothing
+    expect_unknown({0xC5, 0xFB, 0x6F, 0xC1});                    // F2 0F 6F is EVEX only (vmovdqu8)
+    expect_unknown({0xC5, 0xF9, 0x77});                          // 66 0F 77 is nothing
+    expect_unknown({0xC5, 0xF8, 0xFF, 0xC1});                    // 0F FF
+    expect_unknown({0xC4, 0xE2, 0x78, 0xF0, 0x01});              // 0F 38 F0 movbe
+    expect_unknown({0xC4, 0xE2, 0x7B, 0xF0, 0xC1});              // F2 0F 38 F0 crc32
+    expect_unknown({0xC4, 0xE2, 0x78, 0xC8, 0xC1});              // 0F 38 C8 sha1nexte
+    expect_unknown({0xC4, 0xE2, 0x79, 0x80, 0x01});              // 66 0F 38 80 invept
+    expect_unknown({0xC4, 0xE2, 0x79, 0x10, 0xC1});              // 66 0F 38 10 pblendvb (the VEX form is 0F 3A 4C)
+    expect_unknown({0xC4, 0xE3, 0x78, 0xCC, 0xC1, 0x00});        // 0F 3A CC sha1rnds4
+    expect_unknown({0xC4, 0xE3, 0x78, 0x0F, 0xC1, 0x00});        // 0F 3A 0F without 66 (MMX palignr)
+    // VEX instructions that have no EVEX form.
+    expect_unknown({0x62, 0xF1, 0x7C, 0x48, 0x77});              // vzeroupper
+    expect_unknown({0x62, 0xF1, 0x7C, 0x48, 0x50, 0xC1});        // vmovmskps
+    expect_unknown({0x62, 0xF1, 0x7D, 0x48, 0xD7, 0xC1});        // vpmovmskb
+    expect_unknown({0x62, 0xF1, 0x7F, 0x48, 0xF0, 0x01});        // vlddqu
+    expect_unknown({0x62, 0xF1, 0x7C, 0x48, 0xAE, 0x10});        // vldmxcsr
+    expect_unknown({0x62, 0xF2, 0x7D, 0x48, 0x17, 0xC1});        // vptest
+    expect_unknown({0x62, 0xF2, 0x78, 0x48, 0xF2, 0xC1});        // andn
+    expect_unknown({0x62, 0xF3, 0x7D, 0x48, 0x4A, 0xC1, 0x00});  // vblendvps
+    // Sets this decoder leaves out (docs/wp/WP-38.md): FMA4, AMX.
+    expect_unknown({0xC4, 0xE3, 0xF9, 0x69, 0xC2, 0x10});        // vfmaddpd xmm0, xmm0, xmm1, xmm2 (FMA4)
+    expect_unknown({0xC4, 0xE2, 0x78, 0x49, 0xC0});              // tilerelease
+}
+
+TEST_CASE("legacy maps: forms that are not instructions are refused (found by the reference comparison, WP-38)") {
+    // A lock prefix is #UD except on a read-modify-write instruction with a memory destination.
+    expect_len({0xF0, 0xFF, 0x01}, 3);                           // lock inc dword [rcx]
+    expect_len({0xF0, 0x83, 0x09, 0x01}, 4);                     // lock or dword [rcx], 1
+    expect_len({0xF0, 0x0F, 0xBA, 0x29, 0x03}, 5);               // lock bts dword [rcx], 3
+    expect_len({0xF0, 0x48, 0x0F, 0xC7, 0x0E}, 5);               // lock cmpxchg16b [rsi]
+    expect_len({0xF0, 0x87, 0x01}, 3);                           // lock xchg [rcx], eax
+    expect_len({0xF0, 0xF7, 0x19}, 3);                           // lock neg dword [rcx]
+    expect_unknown({0xF0, 0xFF, 0xC0});                          // lock inc eax (register destination)
+    expect_unknown({0xF0, 0x8B, 0x01});                          // lock mov
+    expect_unknown({0xF0, 0x03, 0x01});                          // lock add eax, [rcx] (memory is the source)
+    expect_unknown({0xF0, 0x39, 0x01});                          // lock cmp
+    expect_unknown({0xF0, 0x83, 0x39, 0x01});                    // lock cmp dword [rcx], 1
+    expect_unknown({0xF0, 0x0F, 0xBA, 0x21, 0x03});              // lock bt
+    expect_unknown({0xF0, 0x90});                                // lock nop
+    expect_unknown({0xF0, 0x0F, 0xAF, 0x01});                    // lock imul
+    // Operand forms an opcode does not have.
+    expect_unknown({0x8D, 0xC1});                                // lea with a register operand
+    expect_unknown({0x8C, 0xF0});                                // mov eax, segment register 6
+    expect_unknown({0x8E, 0xC8});                                // mov cs, eax
+    expect_len({0x8C, 0xE0}, 2);                                 // mov eax, fs
+    expect_len({0x8E, 0xD8}, 2);                                 // mov ds, eax
+    expect_unknown({0x0F, 0x50, 0x01});                          // movmskps from memory
+    expect_unknown({0x0F, 0x2B, 0xC1});                          // movntps to a register
+    expect_unknown({0x0F, 0xC3, 0xC1});                          // movnti to a register
+    expect_unknown({0x66, 0x0F, 0x73, 0x19, 0x08});              // psrldq with a memory operand
+    expect_unknown({0x0F, 0x73, 0xD9, 0x08});                    // psrldq without 66
+    expect_unknown({0x66, 0x0F, 0x71, 0xC8, 0x08});              // group 12 /1
+    // Mandatory prefixes: an SSE opcode exists only in the forms the tables name.
+    expect_unknown({0x0F, 0x6C, 0xC1});                          // punpcklqdq needs 66
+    expect_unknown({0xF3, 0x0F, 0x28, 0xC1});                    // F3 on movaps
+    expect_unknown({0x0F, 0xB8, 0xC1});                          // popcnt needs F3
+    expect_unknown({0x0F, 0xF0, 0x01});                          // lddqu needs F2
+    expect_unknown({0x0F, 0x38, 0x17, 0xC1});                    // ptest needs 66
+    expect_unknown({0xF3, 0x0F, 0x38, 0x00, 0xC1});              // F3 on pshufb
+    expect_unknown({0x0F, 0x38, 0x50, 0xC1});                    // nothing at 0F 38 50
+    expect_unknown({0x0F, 0x3A, 0x0A, 0xC1, 0x00});              // roundss needs 66
+    expect_unknown({0x0F, 0x3A, 0x00, 0xC1, 0x00});              // nothing at 0F 3A 00 without VEX
+    expect_len({0x66, 0x0F, 0x3A, 0x0A, 0xC1, 0x00}, 6);         // roundss
+    expect_len({0xF2, 0x0F, 0x38, 0xF1, 0xC1}, 5);               // crc32 eax, ecx
+    expect_len({0x0F, 0x38, 0xF0, 0x01}, 4);                     // movbe eax, [rcx]
+    expect_unknown({0x0F, 0x38, 0xF0, 0xC1});                    // movbe with a register operand
+    // The last F2 / F3 prefix selects the form, 66 only when there is neither.
+    expect_len({0x66, 0xF2, 0x0F, 0x58, 0xC1}, 5);               // addsd with a stray 66
+    expect_unknown({0x66, 0xF3, 0x0F, 0x6C, 0xC1});              // F3 wins over 66: punpcklqdq has no F3 form
+    // x87: the slots the SDM leaves undefined.
+    expect_unknown({0xD9, 0x09});                                // D9 /1 with memory
+    expect_unknown({0xD9, 0xD1});                                // D9 D1
+    expect_unknown({0xDB, 0x21});                                // DB /4 with memory
+    expect_unknown({0xDD, 0x29});                                // DD /5 with memory
+    expect_unknown({0xDF, 0xE1});                                // DF E1
+    expect_len({0xD9, 0xD0}, 2);                                 // fnop
+    expect_len({0xDB, 0xE3}, 2);                                 // fninit
+    expect_len({0xDE, 0xD9}, 2);                                 // fcompp
+    // Groups 7, 9 and 15.
+    expect_len({0x0F, 0x01, 0xF9}, 3);                           // rdtscp
+    expect_len({0x0F, 0x01, 0xD5}, 3);                           // xend
+    expect_unknown({0x0F, 0x01, 0xCC});                          // nothing without a prefix (66: tdcall)
+    expect_unknown({0x0F, 0x01, 0x28});                          // 0F 01 /5 with memory, no prefix
+    expect_len({0x0F, 0xC7, 0xF0}, 3);                           // rdrand eax
+    expect_len({0xF3, 0x0F, 0xC7, 0xF8}, 4);                     // rdpid rax
+    expect_unknown({0x0F, 0xC7, 0xC8});                          // cmpxchg8b with a register operand
+    expect_unknown({0x0F, 0xC7, 0x01});                          // 0F C7 /0
+    expect_len({0x0F, 0xAE, 0xE8}, 3);                           // lfence
+    expect_len({0xF3, 0x0F, 0xAE, 0xC0}, 4);                     // rdfsbase eax
+    expect_len({0x66, 0x0F, 0xAE, 0x39}, 4);                     // clflushopt [rcx]
+    expect_unknown({0x0F, 0xAE, 0xC0});                          // 0F AE /0 with a register, no prefix
+    // What WP-10's decoder accepted and is an instruction stays accepted, also where no compiler emits it: the x87
+    // aliases outside the SDM's tables, system instructions of group 7, Key Locker, RAO-INT, hreset.
+    expect_len({0xDF, 0xC0}, 2);                                 // ffreep st(0)
+    expect_len({0xD9, 0xD8}, 2);                                 // fstp st(0), the alias fstp1
+    expect_len({0xDC, 0xD1}, 2);                                 // fcom st(1), the alias fcom2
+    expect_len({0x0F, 0x01, 0xFE}, 3);                           // invlpgb
+    expect_len({0x66, 0x0F, 0x01, 0xF9}, 4);                     // rdtscp behind a 66 that does nothing
+    expect_len({0x66, 0x0F, 0x01, 0xCC}, 4);                     // tdcall
+    expect_len({0x66, 0x0F, 0xAE, 0xF8}, 4);                     // pcommit
+    expect_len({0xF3, 0x0F, 0x38, 0xDC, 0xC1}, 5);               // loadiwkey xmm0, xmm1
+    expect_len({0xF3, 0x0F, 0x38, 0xDD, 0x01}, 5);               // aesdec128kl xmm0, [rcx]
+    expect_unknown({0xF3, 0x0F, 0x38, 0xDD, 0xC1});              // ... which has no register form
+    expect_len({0xF3, 0x0F, 0x38, 0xD8, 0x01}, 5);               // aesencwide128kl [rcx]
+    expect_unknown({0xF3, 0x0F, 0x38, 0xD8, 0x21});              // F3 0F 38 D8 /4
+    expect_len({0x0F, 0x38, 0xFC, 0x01}, 4);                     // aadd [rcx], eax
+    expect_unknown({0x0F, 0x38, 0xFC, 0xC1});                    // aadd with a register destination
+    expect_len({0xF3, 0x0F, 0x3A, 0xF0, 0xC0, 0x00}, 6);         // hreset 0
+    expect_unknown({0xF3, 0x0F, 0x3A, 0xF0, 0xC1, 0x00});        // F3 0F 3A F0 with another ModRM byte
 }

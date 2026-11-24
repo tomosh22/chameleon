@@ -200,27 +200,113 @@ TEST_CASE("a call that ends inside the overwritten range is refused (CML4304)") 
 }
 
 TEST_CASE("unknown instructions fail safe (CML4300) with the offset and bytes") {
+    // The unknown instruction is 3DNow! (0F 0F C1 9E, pfadd mm0, mm1): VEX was the example here until WP-38 taught
+    // the decoder VEX and EVEX (the test case below).
     SUBCASE("unknown first instruction") {
-        const HookPlan p = plan(pad(16), Bytes{0xC5, 0xF8, 0x28, 0xC1, 0xC3});  // vmovaps
+        const HookPlan p = plan(pad(16), Bytes{0x0F, 0x0F, 0xC1, 0x9E, 0xC3});
         CHECK(p.strategy == Strategy::None);
         CHECK(p.diag == ids::kDecodeUnknown);
         CHECK(p.fail_offset == 0);
         CHECK(p.fail_byte_count == 4);
-        CHECK(p.fail_bytes[0] == 0xC5);
+        CHECK(p.fail_bytes[0] == 0x0F);
     }
     SUBCASE("unknown instruction inside the 5-byte range of strategy 2") {
-        const HookPlan p = plan({}, Bytes{0x53, 0xC5, 0xF8, 0x28, 0xC1, 0xC3});
+        const HookPlan p = plan({}, Bytes{0x53, 0x0F, 0x0F, 0xC1, 0x9E, 0xC3});
         CHECK(p.diag == ids::kDecodeUnknown);
         CHECK(p.fail_offset == 1);
     }
     SUBCASE("an unknown instruction AFTER the range is irrelevant") {
-        const HookPlan p = plan({}, Bytes{0x48, 0x83, 0xEC, 0x28, 0x90, 0xC5, 0xF8, 0x28, 0xC1});
+        const HookPlan p = plan({}, Bytes{0x48, 0x83, 0xEC, 0x28, 0x90, 0x0F, 0x0F, 0xC1, 0x9E});
         REQUIRE(p.strategy == Strategy::FiveByte);
         CHECK(p.window_after == 5);
     }
     SUBCASE("strategy 1 only needs the first instruction to decode") {
-        const HookPlan p = plan(pad(8), Bytes{0x48, 0x83, 0xEC, 0x28, 0xC5, 0xF8});
+        const HookPlan p = plan(pad(8), Bytes{0x48, 0x83, 0xEC, 0x28, 0x0F, 0x0F});
         CHECK(p.strategy == Strategy::PaddingTwoByte);
+    }
+    SUBCASE("a VEX instruction with a 66 prefix in front is #UD, not an instruction: refused") {
+        const HookPlan p = plan(pad(16), Bytes{0x66, 0xC5, 0xF8, 0x28, 0xC1, 0xC3});
+        CHECK(p.strategy == Strategy::None);
+        CHECK(p.diag == ids::kDecodeUnknown);
+        CHECK(p.fail_bytes[0] == 0x66);
+    }
+    SUBCASE("a VEX opcode map the decoder does not cover: refused") {
+        const HookPlan p = plan({}, Bytes{0xC4, 0xE8, 0x78, 0x85, 0xC1, 0x00, 0xC3});  // map 8
+        CHECK(p.strategy == Strategy::None);
+        CHECK(p.diag == ids::kDecodeUnknown);
+        CHECK(p.fail_bytes[0] == 0xC4);
+    }
+}
+
+// WP-38 (ADR-0042): a function that begins with a VEX or EVEX instruction is planned like any other. The lengths in
+// the comments are worked out by hand (test_length_decoder.cpp explains how).
+TEST_CASE("functions that begin with VEX or EVEX instructions get a hook plan") {
+    SUBCASE("padding in front: strategy 1, the window is the whole first instruction") {
+        // cl /Od /arch:AVX homes a float argument first: vmovss [rsp+8], xmm0 = C5 FA 11 44 24 08 (6 bytes).
+        const HookPlan p = plan(pad(8), Bytes{0xC5, 0xFA, 0x11, 0x44, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x10});
+        REQUIRE(p.strategy == Strategy::PaddingTwoByte);
+        CHECK(p.first_insn_len == 6);
+        CHECK(p.entry_write_len == 2);
+        CHECK(p.window_before == 5);
+        CHECK(p.window_after == 6);
+    }
+    SUBCASE("padding in front, vzeroupper first (3 bytes, no ModRM): strategy 1") {
+        const HookPlan p = plan(pad(16), Bytes{0xC5, 0xF8, 0x77, 0xC3});
+        REQUIRE(p.strategy == Strategy::PaddingTwoByte);
+        CHECK(p.first_insn_len == 3);
+        CHECK(p.window_after == 3);
+    }
+    SUBCASE("no padding: two 4-byte VEX instructions, the jump ends inside the second") {
+        // vmovdqu ymm0, [rcx] ; vmovdqu [rdx], ymm0 ; vzeroupper ; ret   (the MSVC STL's _Load / store helpers)
+        const HookPlan p = plan({}, Bytes{0xC5, 0xFE, 0x6F, 0x01, 0xC5, 0xFE, 0x7F, 0x02, 0xC5, 0xF8, 0x77, 0xC3});
+        REQUIRE(p.strategy == Strategy::FiveByte);
+        CHECK(p.first_insn_len == 4);
+        CHECK(p.entry_write_len == 5);
+        CHECK(p.window_after == 8);
+        CHECK_FALSE(p.short_function);
+    }
+    SUBCASE("no padding: vzeroupper (3) then sub rsp, 28h (4): window 7") {
+        const HookPlan p = plan({}, Bytes{0xC5, 0xF8, 0x77, 0x48, 0x83, 0xEC, 0x28, 0xC3});
+        REQUIRE(p.strategy == Strategy::FiveByte);
+        CHECK(p.window_after == 7);
+    }
+    SUBCASE("no padding: a three-byte VEX prefix with an immediate is 6 bytes, one instruction covers the jump") {
+        const HookPlan p = plan({}, Bytes{0xC4, 0xE3, 0xFD, 0x00, 0xC1, 0x1B, 0xC3});  // vpermq ymm0, ymm1, 1Bh ; ret
+        REQUIRE(p.strategy == Strategy::FiveByte);
+        CHECK(p.first_insn_len == 6);
+        CHECK(p.window_after == 6);
+    }
+    SUBCASE("no padding: the 5-byte VEX instruction is exactly the jump") {
+        const HookPlan p = plan({}, Bytes{0xC4, 0xE1, 0xF9, 0x6E, 0xC1, 0xC3});  // vmovq xmm0, rcx ; ret
+        REQUIRE(p.strategy == Strategy::FiveByte);
+        CHECK(p.window_after == 5);
+    }
+    SUBCASE("EVEX, with and without padding") {
+        const Bytes code = {0x62, 0xF1, 0x7C, 0x48, 0x10, 0x41, 0x01, 0xC3};  // vmovups zmm0, [rcx+40h] ; ret
+        const HookPlan padded = plan(pad(8), code);
+        REQUIRE(padded.strategy == Strategy::PaddingTwoByte);
+        CHECK(padded.window_after == 7);
+        const HookPlan bare = plan({}, code);
+        REQUIRE(bare.strategy == Strategy::FiveByte);
+        CHECK(bare.window_after == 7);
+    }
+    SUBCASE("vzeroupper ; ret is 4 bytes: a short function, hooked only when padding follows") {
+        const HookPlan with_tail = plan({}, Bytes{0xC5, 0xF8, 0x77, 0xC3, 0xCC, 0xCC, 0xCC, 0xCC});
+        REQUIRE(with_tail.strategy == Strategy::FiveByte);
+        CHECK(with_tail.short_function);
+        CHECK(with_tail.window_after == 5);
+        const HookPlan without = plan({}, Bytes{0xC5, 0xF8, 0x77, 0xC3, 0x48, 0x83, 0xEC, 0x28});
+        CHECK(without.strategy == Strategy::None);
+        CHECK(without.diag == ids::kFunctionTooShort);
+    }
+    SUBCASE("a call that ends inside the overwritten bytes is still refused when VEX follows it") {
+        const HookPlan p = plan({}, Bytes{0xFF, 0xD0, 0xC5, 0xF8, 0x77, 0xC3});  // call rax ; vzeroupper ; ret
+        CHECK(p.strategy == Strategy::None);
+        CHECK(p.diag == ids::kCallInWindow);
+    }
+    SUBCASE("the readable bytes end inside a VEX instruction: CML4303, not a guess") {
+        const Bytes cut = {0xC4, 0xE3, 0xFD, 0x00, 0xC1};  // vpermq without its immediate
+        CHECK(plan_hook(nullptr, 0, cut.data(), cut.size()).diag == ids::kCodeUnreadable);
     }
 }
 
