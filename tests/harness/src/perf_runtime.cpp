@@ -178,6 +178,16 @@ PerfStepResult PerfRecorder::report(std::uint32_t broker_pid, const Step& step, 
         samples.push(t);
     }
 
+    // The size of the module's PDB: the memory limit scales with it, and a tagged report (WP-39) names it.
+    std::error_code size_ec;
+    const std::uintmax_t pdb_bytes = fs::file_size(module_pdb, size_ec);
+    const bool have_pdb_size = !size_ec && pdb_bytes != 0;
+    std::string evidence;
+    if (!step.perf_tag.empty() && have_pdb_size) {
+        evidence = reload_evidence_line(step.perf_tag, static_cast<double>(pdb_bytes) / 1048576.0, timings_.size(), stats, step.result_value);
+        std::printf("%s\n", evidence.c_str());
+    }
+
     Value broker = Value::object();
     ProcessHandle process(broker_pid);
     PROCESS_MEMORY_COUNTERS_EX pmc{};
@@ -185,9 +195,7 @@ PerfStepResult PerfRecorder::report(std::uint32_t broker_pid, const Step& step, 
     if (process.h == nullptr || !GetProcessMemoryInfo(process.h, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof pmc)) {
         memory_problem = "cannot read the broker's memory counters (error " + std::to_string(GetLastError()) + ")";
     } else {
-        std::error_code size_ec;
-        const std::uintmax_t pdb_bytes = fs::file_size(module_pdb, size_ec);
-        if (size_ec || pdb_bytes == 0) {
+        if (!have_pdb_size) {
             memory_problem = "cannot read the size of the module PDB " + module_pdb.string();
         } else {
             const double limit = 1.5 * static_cast<double>(pdb_bytes) + kBrokerBaselineMiB * 1024.0 * 1024.0;
@@ -205,7 +213,15 @@ PerfStepResult PerfRecorder::report(std::uint32_t broker_pid, const Step& step, 
         std::printf("PERF broker_peak_private_bytes=%llu private_bytes=%llu peak_working_set_bytes=%llu\n",
                     static_cast<unsigned long long>(pmc.PeakPagefileUsage), static_cast<unsigned long long>(pmc.PrivateUsage),
                     static_cast<unsigned long long>(pmc.PeakWorkingSetSize));
+        if (have_pdb_size) {
+            // WP-39: the broker's peak against its limit, as one line (the limit is asserted below).
+            std::printf("PERF broker_peak_private_mib=%.1f limit_mib=%.1f module_pdb_mib=%.1f (limit = 1.5 x PDB + %.0f MiB)\n",
+                        static_cast<double>(pmc.PeakPagefileUsage) / 1048576.0,
+                        (1.5 * static_cast<double>(pdb_bytes) + kBrokerBaselineMiB * 1024.0 * 1024.0) / 1048576.0,
+                        static_cast<double>(pdb_bytes) / 1048576.0, kBrokerBaselineMiB);
+        }
     }
+    std::fflush(stdout);
     if (have_idle_) {
         broker.set("idle_cpu_percent", Value::number(idle_cpu_percent_));
         broker.set("idle_cpu_ms", Value::number(idle_cpu_ms_));
@@ -218,6 +234,11 @@ PerfStepResult PerfRecorder::report(std::uint32_t broker_pid, const Step& step, 
     doc.set("stages", std::move(stages));
     doc.set("reload_median_excl_compile_ms", Value::number(median_excl));
     doc.set("reload_max_excl_compile_ms", Value::number(max_excl));
+    doc.set("reload_budget_ms", Value::integer(step.result_value));
+    if (!step.perf_tag.empty()) {
+        doc.set("tag", Value::string(step.perf_tag));
+        doc.set("evidence", Value::string(evidence));  // WP-39: the line as printed; empty when the PDB size is unknown (the step fails then)
+    }
     doc.set("samples", std::move(samples));
     doc.set("broker", std::move(broker));
 

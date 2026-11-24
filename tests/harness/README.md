@@ -22,6 +22,7 @@ cmltest --scenario tests/harness/scenarios/basic.toml --build-dir build --genera
 | `--require-all-capabilities` | steps skipped for missing broker capabilities fail the run (WP-12 switches CI to this) |
 | `--repo-root`, `--broker`, `--agent-dir`, `--cmake`, `--work-dir`, `--vs-generator`, `--build-timeout-s` | locations and limits, see `--help` |
 | `--prebuilt-fixture EXE` | debugging aid: skip configure/build and run this fixture exe |
+| `--external-exe EXE`, `--external-source DIR` | for a scenario with `external = true` (WP-39): the program built outside cmltest and the source tree its PDB records; see "Externally built programs" |
 
 Exit code: 0 passed or partial, 1 failed, 2 usage error. Console output ends with
 `CMLTEST_RESULT scenario=... outcome=passed|partial|failed passed=N failed=N skipped=N not_run=N`.
@@ -30,7 +31,7 @@ Exit code: 0 passed or partial, 1 failed, 2 usage error. Console output ends wit
 
 ```toml
 name = "basic"                 # [A-Za-z0-9_.-]{1,64}
-fixture = "basic"              # tests/fixtures/<fixture>
+fixture = "basic"              # tests/fixtures/<fixture> (with `external = true`, WP-39: only a name, see below)
 timeout_s = 120                # 10..7200, default 120; bounds everything after the build
 description = "free text"      # optional
 
@@ -145,6 +146,45 @@ expect_error = "CML5960"       # optional: the command itself must be refused wi
 The failing reload, its diagnostic and the clean reload afterwards are ordinary steps: `reload` with `expect_error` = the
 stage's id, `expect_diag`, `expect_stdout` for the previous value, a `reload` without injection and `expect_stdout` for the new
 one (scenario `inject_stages`, fixture `inject`).
+
+Steps added by WP-27 (performance; `tests/bench/scenarios`, run by the `pdb-benchmark` CI job, keys in
+`src/perf_steps.h`): `perf_idle` (the broker's CPU while it idles with a connected program) and `perf_report` (median and
+maximum per stage over the recorded reloads, the budget on the median of `total - compile`, the broker's peak private
+bytes against 1.5 x the module's PDB + 32 MiB). A reload whose `timing_ms` lacks a stage or holds a non-number fails the
+report. WP-39 adds the optional key `tag`:
+
+```toml
+[[step]]
+kind = "perf_report"
+max_median_ms = 3000           # required: limit on the median of (total - compile) over the recorded reloads
+min_reloads = 5                # 1..100, default 3
+tag = "WP39-RELOAD"            # optional, [A-Z0-9-]{1,32}: also print `<tag> pdb_mib=... reloads=N
+                               # total_minus_compile_median_ms=... max_ms=... budget_ms=... <stage>_median_ms=...`
+```
+
+### Externally built programs (WP-39)
+
+A scenario normally names a fixture of `tests/fixtures`, which cmltest copies and builds. The generated benchmark project
+(`tests/bench/gen_pdb_project.py`: 900 translation units, a PDB of about 544 MiB) takes too long to build for that, so
+the `pdb-benchmark` job builds and caches it, and the scenario says where the program comes from:
+
+```toml
+name = "large_pdb_reload"
+fixture = "bench_project"      # only the name in the report
+external = true                # header key: nothing is copied, configured or built
+```
+
+```
+cmltest --scenario tests/bench/scenarios/large_pdb_reload.toml --build-dir build --require-all-capabilities \
+        --external-exe bench-build/bench_project.exe --external-source bench-src
+```
+
+`--external-exe` is the program (its PDB must lie beside it; `cml_agent.dll` is copied next to it) and
+`--external-source` the source tree its PDB records. The PDB holds absolute paths, so there is no copy to edit: `edit`
+steps patch that tree in place (`patch` is relative to it, `-p1`), and when the run ends cmltest writes every edited file
+back as it was before its first edit. A scenario with `external = true` run without the two options, or the options given
+to another scenario, is a usage error (exit code 2). Everything else (broker, launch with `--agent`, steps, artifacts) is
+as for a fixture; the program must take the fixtures' command line (`tests/fixtures/common/fixture_runtime.h`).
 
 Unknown keys, unknown kinds, missing fields, bad values and steps that need a running process before `launch`
 are rejected with `CML5411` before anything runs; a pattern that does not compile is `CML5420`.
