@@ -1,18 +1,30 @@
 // WP-10 acceptance: unit tests hooking functions in the test host under heavy multithreaded load.
 //
-// 16 threads spin through nine hooked functions (two compiled by this cell's compiler, seven
+// 16 threads spin through the hooked functions (two compiled by this cell's compiler, seven
 // hand-assembled with different entry shapes: padding or none, first instruction one byte or more,
 // shorter than 5 bytes, one that loops inside its own first bytes so that threads are often caught
-// inside a window) while the main thread repeatedly installs, re-points and reverts all nine hooks in
-// one batch each, for 60 seconds. A further thread churns the process heap, the loader lock and
+// inside a window; and, WP-38, the functions whose first instruction is VEX-encoded, see below) while
+// the main thread repeatedly installs, re-points and reverts all hooks in one batch each, for 60 seconds. A further thread churns the process heap, the loader lock and
 // thread creation, so that a stopped thread is regularly holding exactly the locks the installer
 // must not need. Every result a worker sees must be the original, the first or the second
 // implementation (anything else is a corrupted call), the main thread checks all nine functions
 // after every batch, and the process must not take a single hardware exception.
 //
+// WP-38 (ADR-0042): the hook installer's decoder knows VEX and EVEX now, so the same run hooks functions that BEGIN
+// with a VEX instruction, with padding in front of them (strategy 1: the 2-byte write lands in a VEX instruction) and
+// without (strategy 2: the 5-byte jump covers one VEX instruction or ends inside the second):
+//   * two functions compiled with /arch:AVX2 by this cell's compiler (avx/stress_avx2.cpp, optimised in every
+//     configuration so that the first instruction of the leaf function is the VEX instruction itself),
+//   * six hand-assembled ones whose bytes do not depend on a compiler (hook_test_support.h: two-byte and three-byte
+//     VEX prefix, vzeroupper with its missing ModRM byte, a 256-bit instruction, a loop behind two VEX instructions).
+// The entry bytes are read from memory before anything is hooked; a target that does not start with C4 / C5 fails the
+// test. The functions are executed by all 16 threads, so a CPU without AVX2 fails the test with a message (it is not
+// skipped).
+//
 // Output (also written to <build>/test_work/agent_hook/evidence.txt for the CI log):
 //   WP10-STRESS seconds=60 threads=16 installs=N reverts=N retries=N crashes=0
 //   WP10-STRESS-DETAIL ...
+//   WP38-STRESS-VEX cpu_avx2=1 targets=8 padding=P five_byte=F compiled=2 <name>[<first 8 bytes>]=<strategy> ...
 #if defined(_WIN32)
 
 #include <algorithm>
@@ -26,6 +38,7 @@
 #include <vector>
 
 #include "alloc_guard.h"
+#include "avx/stress_avx2.h"
 #include "crash_report.h"
 #include "doctest.h"
 #include "hook/diag_ids.h"
@@ -54,6 +67,8 @@ const void* address_of(Function function) {
 
 struct Target {
     const char* name = "";
+    bool vex_entry = false;  // WP-38: the first instruction must be VEX-encoded (checked against the bytes in memory)
+    bool compiled = false;   // ... and comes from this cell's compiler (avx/stress_avx2.cpp), not from a byte array
     const void* entry = nullptr;
     const void* replacement[2] = {nullptr, nullptr};
     // expected result for implementation 0 (original), 1 (A), 2 (B): arg + offset, or offset only
@@ -147,11 +162,31 @@ void write_evidence(const std::string& line) {
 #endif
 }
 
+std::string hex8(const void* address) {
+    static const char kDigits[] = "0123456789abcdef";
+    const auto* p = static_cast<const std::uint8_t*>(address);
+    std::string s;
+    for (int i = 0; i < 8; ++i) {
+        if (i != 0) {
+            s += ' ';
+        }
+        s += kDigits[p[i] >> 4];
+        s += kDigits[p[i] & 15];
+    }
+    return s;
+}
+
 }  // namespace
 
 TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy multithreaded load") {
     const int seconds = configured_seconds();
     start_evidence_file();
+    // WP-38: the VEX-entry targets execute AVX2 code on every thread. No AVX2, no acceptance: fail, do not skip.
+    const bool avx2 = cpu_has_avx2();
+    if (!avx2) {
+        write_evidence("WP38-STRESS-VEX cpu_avx2=0 targets=0 (the processor or the operating system does not provide AVX2)");
+    }
+    REQUIRE_MESSAGE(avx2, "unit.agent_hook_stress hooks and executes AVX2 functions (WP-38); this machine does not provide AVX2");
     Arena arena(16);
     REQUIRE(arena.ok());
 
@@ -197,6 +232,59 @@ TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy mul
     add_blob("push_first_padded", push_first(0), 16, 16, 13, 23);     // padding, but first instruction 1 byte: strategy 2
     add_blob("short_padded", short_lea(0), 8, 8, 14, 24);             // 4 bytes, padding both sides: strategy 1
     add_blob("short_trailing_pad", short_lea(0), 0, 12, 15, 25);      // 4 bytes, padding only after: strategy 2, short function
+    // WP-38: entries that are VEX instructions. `first_vex` is where they start in `targets`.
+    const std::size_t first_vex = targets.size();
+    add_blob("vex_c5_padded", vex_c5(0), 8, 8, 30, 40);               // strategy 1; 4-byte VEX instruction at the entry
+    add_blob("vex_c5_no_padding", vex_c5(0), 0, 0, 31, 41);           // strategy 2; the jump ends inside the second VEX instruction
+    add_blob("vex_c4_no_padding", vex_c4(0), 0, 0, 32, 42);           // strategy 2; a 5-byte VEX instruction is exactly the jump
+    add_blob("vex_zeroupper_no_padding", vex_zeroupper(0), 0, 0, 33, 43);  // strategy 2; vzeroupper has no ModRM byte
+    add_blob("vex_ymm_padded", vex_ymm(0), 16, 16, 34, 44);           // strategy 1; 256-bit instruction, then vzeroupper
+    for (std::size_t i = first_vex; i < targets.size(); ++i) {
+        targets[i].vex_entry = true;
+    }
+    {
+        Target f;
+        f.name = "avx2_float";
+        f.entry = address_of(&hooktest_avx2::f_orig);
+        f.replacement[0] = address_of(&hooktest_avx2::f_a);
+        f.replacement[1] = address_of(&hooktest_avx2::f_b);
+        f.offset[0] = 1200;
+        f.offset[1] = 2200;
+        f.offset[2] = 3200;
+        f.vex_entry = true;
+        f.compiled = true;
+        targets.push_back(f);
+        Target d;
+        d.name = "avx2_double";
+        d.entry = address_of(&hooktest_avx2::d_orig);
+        d.replacement[0] = address_of(&hooktest_avx2::d_a);
+        d.replacement[1] = address_of(&hooktest_avx2::d_b);
+        d.offset[0] = 1300;
+        d.offset[1] = 2300;
+        d.offset[2] = 3300;
+        d.vex_entry = true;
+        d.compiled = true;
+        targets.push_back(d);
+    }
+    {
+        // Loops like slow_loop, but behind two VEX instructions: threads are inside the function (past the bytes a
+        // hook overwrites) for most of every call, and pass through the VEX instructions each time.
+        Target slow;
+        slow.name = "vex_slow_loop_no_padding";
+        const Placed old_fn = arena.place_padded(vex_slow_const(8), 0, 0);
+        const Placed a = arena.place_padded(const_ret(80001), 8, 8);
+        const Placed b = arena.place_padded(const_ret(80002), 8, 8);
+        slow.entry = old_fn.entry;
+        slow.replacement[0] = a.entry;
+        slow.replacement[1] = b.entry;
+        slow.ignores_argument = true;
+        slow.offset[0] = 8;
+        slow.offset[1] = 80001;
+        slow.offset[2] = 80002;
+        slow.argument_override = 150;
+        slow.vex_entry = true;
+        targets.push_back(slow);
+    }
     {
         // Loops inside its first four bytes for `argument` iterations, then returns a constant.
         Target slow;
@@ -218,6 +306,23 @@ TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy mul
     for (Target& t : targets) {
         t.snapshot_before = snapshot(static_cast<const std::uint8_t*>(t.entry) - 16, 16 + 48);
     }
+    // WP-38: what is really at the entries, read from memory before anything is hooked. A compiler is free to start a
+    // function differently; then this is not the test the acceptance asks for, and it fails here.
+    std::size_t vex_targets = 0, vex_compiled = 0;
+    std::vector<std::string> vex_entry_bytes;
+    for (const Target& t : targets) {
+        if (!t.vex_entry) {
+            continue;
+        }
+        const std::uint8_t first = *static_cast<const std::uint8_t*>(t.entry);
+        vex_entry_bytes.push_back(hex8(t.entry));
+        REQUIRE_MESSAGE((first == 0xC4 || first == 0xC5),
+                        t.name << " must begin with a VEX-encoded instruction, its first bytes are " << vex_entry_bytes.back());
+        ++vex_targets;
+        vex_compiled += t.compiled ? 1u : 0u;
+    }
+    REQUIRE(vex_targets == 8);
+    REQUIRE(vex_compiled == 2);
 
     // The functions behave as the originals before anything is hooked.
     for (const Target& t : targets) {
@@ -339,6 +444,7 @@ TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy mul
         revert_all.push_back({t.entry, nullptr, t.name});
     }
     std::vector<HookOutcome> outcomes;
+    std::vector<Strategy> strategies;  // of the first batch that was installed (the strategy of a function never changes)
     unsigned long long installs = 0, reverts = 0, retries = 0, attempts = 0, failures = 0, cycles = 0;
     unsigned max_window_ms = 0, max_threads = 0;
     unsigned long long wrong_state = 0;
@@ -388,6 +494,11 @@ TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy mul
                 if (r.ok()) {
                     ++installs;
                     verify_state(phase + 1);
+                    if (strategies.empty()) {
+                        for (const HookOutcome& o : outcomes) {
+                            strategies.push_back(o.strategy);
+                        }
+                    }
                 } else {
                     note_failure(r);
                 }
@@ -448,6 +559,24 @@ TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy mul
     for (const std::string& text : failure_texts) {
         write_evidence("WP10-STRESS-REFUSED " + text);
     }
+    // WP-38: the VEX-entry targets, their first bytes and the strategy each was hooked with.
+    std::size_t vex_padding = 0, vex_five_byte = 0, vex_compiled_hooked = 0;
+    {
+        std::string line;
+        std::size_t k = 0;
+        for (std::size_t i = 0; i < targets.size(); ++i) {
+            if (!targets[i].vex_entry) {
+                continue;
+            }
+            const Strategy strategy = i < strategies.size() ? strategies[i] : Strategy::None;
+            vex_padding += strategy == Strategy::PaddingTwoByte ? 1u : 0u;
+            vex_five_byte += strategy == Strategy::FiveByte ? 1u : 0u;
+            vex_compiled_hooked += (targets[i].compiled && strategy != Strategy::None) ? 1u : 0u;
+            line += std::string(" ") + targets[i].name + "[" + vex_entry_bytes[k++] + "]=" + to_string(strategy);
+        }
+        write_evidence("WP38-STRESS-VEX cpu_avx2=1 targets=" + std::to_string(vex_targets) + " padding=" + std::to_string(vex_padding) +
+                       " five_byte=" + std::to_string(vex_five_byte) + " compiled=" + std::to_string(vex_compiled_hooked) + line);
+    }
 
     CHECK(g_crashes.load() == 0);
     CHECK_MESSAGE(bad == 0, "target " << (bad_target >= 0 ? targets[static_cast<std::size_t>(bad_target)].name : "?")
@@ -463,6 +592,11 @@ TEST_CASE("WP10 stress: hooks installed, re-pointed and reverted under heavy mul
     // Refusals are allowed, a majority of them is not.
     CHECK(failures * 4 <= cycles * 3 + 3);
     CHECK(installer.hook_count() == 0);
+    // WP-38: every VEX-entry target was hooked, some through the padding and some with the 5-byte jump.
+    CHECK(vex_padding + vex_five_byte == vex_targets);
+    CHECK(vex_padding >= 2);
+    CHECK(vex_five_byte >= 4);
+    CHECK(vex_compiled_hooked == vex_compiled);
     for (const Target& t : targets) {
         const Bytes now = snapshot(static_cast<const std::uint8_t*>(t.entry) - 16, 16 + 48);
         CHECK_MESSAGE(now == t.snapshot_before, t.name << ": bytes differ from the original after the last revert");

@@ -194,6 +194,14 @@ if ($built) {
         $m = [regex]::Match($text, 'LDE-OUTCOME (.*)')
         $summary = if ($m.Success) { $m.Groups[1].Value.Trim() } else { 'no LDE-OUTCOME line' }
         if ($rc -ne 0) { throw "cml_lde_probe exited with ${rc}: $summary" }
+        # WP-38 (ADR-0042): the decoder covers VEX and EVEX, so a function entry refused for a VEX/EVEX instruction
+        # fails the cell like any other unknown opcode. The counts are read from the line; a line without them fails
+        # too (nothing is taken for 0).
+        foreach ($count in 'refused_vex', 'refused_unknown_opcode') {
+            $c = [regex]::Match($summary, "\b$count=(\d+)\b")
+            if (-not $c.Success) { throw "the probe's LDE-OUTCOME line has no ${count}: $summary" }
+            if ([int64]$c.Groups[1].Value -ne 0) { throw "$count=$($c.Groups[1].Value): function entries the hook decoder refuses with CML4300 ($summary)" }
+        }
         $summary
     } | Out-Null
 } else {

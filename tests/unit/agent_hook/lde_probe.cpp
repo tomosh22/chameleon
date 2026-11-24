@@ -21,14 +21,18 @@
 // reports one count per outcome of plan_hook() (nothing is ever relocated, ADR-0020: a hook either uses the padding
 // in front of the entry or overwrites whole instructions at the entry):
 //
-//   LDE-OUTCOME functions=N padding=A five_byte=B refused=C refused_vex=V refused_unknown_opcode=D refused_other=E
+//   LDE-OUTCOME functions=N padding=A five_byte=B refused=C refused_vex=V refused_unknown_opcode=D refused_other=E vex_entries=X
 //   LDE-REFUSED CML4300 <function> rva=0x... at=+N bytes=xx xx xx    (every refusal for an unknown opcode, at most 200)
+//   LDE-VEX <function> rva=0x... bytes=<the first 16 bytes> lens=... plan=...   (not with --quiet; at most 400)
 //
-// refused_vex counts the CML4300 refusals whose instruction starts with a VEX/EVEX prefix (C4, C5, 62): AVX code in a
-// function entry, a documented limitation of the decoder (KNOWN_LIMITATIONS CML4300, WP-10: "no VEX, no EVEX"). The
-// STL's vectorised algorithms (__std_minmax_*, __std_find_*) are the usual source in MSVC builds.
-// --fail-on-unknown-opcode makes any OTHER refusal for CML4300 an error (exit code 3): on a real project that is a
-// decoder bug (a common prologue the decoder does not know) and must be reduced to a unit test. --min-functions N exits
+// refused_vex counts the CML4300 refusals whose instruction starts with a VEX/EVEX prefix (C4, C5, 62), the others
+// are refused_unknown_opcode. Until WP-38 the decoder knew no VEX at all ("no VEX, no EVEX", WP-10) and refused_vex was
+// tolerated; since WP-38 (ADR-0042) the decoder covers VEX and EVEX maps 1..3 and a VEX refusal is as much an error
+// as any other. vex_entries counts the functions whose hook plan had to decode a VEX/EVEX instruction (the STL's
+// vectorised algorithms, __std_minmax_*, __std_find_*, in every MSVC build; much more with /arch:AVX2); the LDE-VEX
+// lines show their bytes.
+// --fail-on-unknown-opcode makes every refusal for CML4300 an error (exit code 3): on a real project that is a
+// decoder gap (a common prologue the decoder does not know) and must be reduced to a unit test. --min-functions N exits
 // with 4 when fewer than N functions were examined (a PDB that lost its functions would otherwise pass).
 //
 // Exit code: 0, 1 when the module or its PDB cannot be read, 2 for a bad command line, 3 / 4 as above.
@@ -155,6 +159,7 @@ int main(int argc, char** argv) {
     std::map<std::string, std::size_t> unknown_bytes;
     std::size_t outcome_padding = 0, outcome_five_byte = 0, outcome_refused = 0, refused_unknown_opcode = 0, refused_vex = 0;
     std::size_t refused_listed = 0;
+    std::size_t vex_entries = 0, vex_listed = 0;
     std::size_t examined = 0;  // functions whose bytes could be read (the others are not counted anywhere)
     for (const auto& [rva, name] : by_rva) {
         const std::vector<std::uint8_t> head = read_clamped(owned->image, rva, 16);
@@ -164,10 +169,22 @@ int main(int argc, char** argv) {
         ++examined;
         std::string lens;
         bool unknown = false;
+        bool vex_within_plan = false;  // a VEX/EVEX instruction among those the hook plan decodes (the first 5 bytes)
         std::size_t at = 0;
         std::string unknown_key;
         while (at < head.size()) {
             const auto d = cml::agent::hook::decode_instruction(head.data() + at, head.size() - at);
+            if (at < cml::agent::hook::kJmpRel32Size) {
+                // Segment and address-size prefixes may precede the VEX / EVEX byte.
+                std::size_t lead = at;
+                while (lead < head.size() && (head[lead] == 0x26 || head[lead] == 0x2E || head[lead] == 0x36 || head[lead] == 0x3E ||
+                                              head[lead] == 0x64 || head[lead] == 0x65 || head[lead] == 0x67)) {
+                    ++lead;
+                }
+                if (lead < head.size() && (head[lead] == 0xC4 || head[lead] == 0xC5 || head[lead] == 0x62)) {
+                    vex_within_plan = true;
+                }
+            }
             if (d.status == DecodeStatus::Unknown) {
                 unknown = true;
                 unknown_key = hex_bytes(head.data() + at, std::min<std::size_t>(3, head.size() - at));
@@ -212,10 +229,8 @@ int main(int argc, char** argv) {
             ++outcome_refused;
             const bool vex = plan.fail_byte_count > 0 &&
                              (plan.fail_bytes[0] == 0xC4 || plan.fail_bytes[0] == 0xC5 || plan.fail_bytes[0] == 0x62);
-            if (plan.diag == cml::agent::hook::ids::kDecodeUnknown && vex) {
-                ++refused_vex;
-            } else if (plan.diag == cml::agent::hook::ids::kDecodeUnknown) {
-                ++refused_unknown_opcode;
+            if (plan.diag == cml::agent::hook::ids::kDecodeUnknown) {
+                ++(vex ? refused_vex : refused_unknown_opcode);
                 if (refused_listed < 200) {
                     ++refused_listed;
                     std::printf("LDE-REFUSED CML%u %s rva=0x%x at=+%u bytes=%s\n", plan.diag, name.c_str(), rva, plan.fail_offset,
@@ -224,6 +239,14 @@ int main(int argc, char** argv) {
             }
         }
 
+        if (vex_within_plan) {
+            ++vex_entries;
+            if (!quiet && vex_listed < 400) {
+                ++vex_listed;
+                std::printf("LDE-VEX %s rva=0x%x bytes=%s lens=%s plan=%s\n", name.c_str(), rva, hex_bytes(head.data(), head.size()).c_str(),
+                            lens.empty() ? "-" : lens.c_str(), plan_text.c_str());
+            }
+        }
         if (unknown) {
             ++unknown_count;
             ++unknown_bytes[unknown_key];
@@ -241,9 +264,9 @@ int main(int argc, char** argv) {
     for (const auto& [text, count] : plans) {
         std::printf("LDE-PLAN %s %zu\n", text.c_str(), count);
     }
-    std::printf("LDE-OUTCOME functions=%zu padding=%zu five_byte=%zu refused=%zu refused_vex=%zu refused_unknown_opcode=%zu refused_other=%zu\n",
+    std::printf("LDE-OUTCOME functions=%zu padding=%zu five_byte=%zu refused=%zu refused_vex=%zu refused_unknown_opcode=%zu refused_other=%zu vex_entries=%zu\n",
                 examined, outcome_padding, outcome_five_byte, outcome_refused, refused_vex, refused_unknown_opcode,
-                outcome_refused - refused_vex - refused_unknown_opcode);
+                outcome_refused - refused_vex - refused_unknown_opcode, vex_entries);
     std::vector<std::pair<std::size_t, std::string>> ranked;
     for (const auto& [bytes, count] : unknown_bytes) {
         ranked.emplace_back(count, bytes);
@@ -252,8 +275,9 @@ int main(int argc, char** argv) {
     for (std::size_t i = 0; i < ranked.size() && i < 40; ++i) {
         std::printf("LDE-UNKNOWN %s %zu\n", ranked[i].second.c_str(), ranked[i].first);
     }
-    if (fail_on_unknown_opcode && refused_unknown_opcode != 0) {
-        std::fprintf(stderr, "cml_lde_probe: %zu function(s) refused for an unknown opcode (CML4300)\n", refused_unknown_opcode);
+    if (fail_on_unknown_opcode && refused_unknown_opcode + refused_vex != 0) {
+        std::fprintf(stderr, "cml_lde_probe: %zu function(s) refused for an unknown opcode (CML4300), %zu of them VEX/EVEX\n",
+                     refused_unknown_opcode + refused_vex, refused_vex);
         return 3;
     }
     if (examined < min_functions) {

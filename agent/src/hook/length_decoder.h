@@ -10,11 +10,17 @@
 // bind planner compiles this same file in and uses that to prove that a relocation site is a
 // sign-extended displacement (ADR-0042).
 //
-// Scope: the integer, x87 and legacy-prefix SSE/SSE2..SSE4/AES (no VEX, no EVEX, no XOP) instructions
-// that cl and clang-cl emit in prologues and early function bodies, written from the Intel SDM
-// opcode maps (volume 2, appendix A). Anything else is reported as Unknown and the caller must fail
-// safe: a wrong length would make the installer overwrite half of an instruction that can still be
-// reached, so "unknown" is always preferred over "probably".
+// Scope: the integer, x87 and SSE/SSE2..SSE4/AES/SHA instructions that cl and clang-cl emit, and (WP-38,
+// ADR-0042, which reverses WP-10's "no VEX, no EVEX") the VEX (C4, C5) and EVEX (62) encoded ones of opcode
+// maps 1 to 3: AVX, AVX2, FMA, BMI, the opmask instructions, AVX-512. Written from the Intel SDM (volume 2:
+// 2.3 and 2.7 for the prefixes, appendix A and the instruction pages for the opcodes). Anything else (XOP,
+// 3DNow!, other VEX / EVEX maps, a legacy prefix or REX in front of VEX / EVEX, an opcode or operand form the
+// tables do not name) is reported as Unknown and the caller must fail safe: a wrong length would make the
+// installer overwrite half of an instruction that can still be reached, so "unknown" is always preferred over
+// "probably".
+//
+// The lengths are checked against a reference disassembler (Zydis) by the fuzz target and the differential
+// sweep of tests/fuzz (lde_reference.h has the rule); the decoder itself contains no third-party code.
 //
 // The decoder is table driven (the tables are built at compile time from range rules), portable
 // (no OS dependency), allocation-free and never reads beyond `available` bytes.
