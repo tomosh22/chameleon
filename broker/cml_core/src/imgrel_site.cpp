@@ -15,7 +15,137 @@ namespace {
 
 constexpr std::uint32_t kMaxInstruction = 15;
 
+constexpr bool is_legacy_prefix(std::uint8_t b) noexcept {
+    switch (b) {
+        case 0x26: case 0x2E: case 0x36: case 0x3E: case 0x64: case 0x65: case 0x66: case 0x67: case 0xF0: case 0xF2: case 0xF3:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// One-byte opcodes WITHOUT a ModRM byte that carry a 32-bit (or, for B8..BF with REX.W, 64-bit) immediate: the only
+// instructions without ModRM whose immediate a 4- or 8-byte relocation can fill. Every other opcode is parsed as if it
+// had a ModRM byte; when it has none, either the displacement derived from the pretended ModRM disagrees with the
+// decoder (layout unknown) or what is left behind it is too short for a relocation.
+constexpr bool is_immediate_without_modrm(std::uint8_t opcode) noexcept {
+    switch (opcode) {
+        case 0x05: case 0x0D: case 0x15: case 0x1D: case 0x25: case 0x2D: case 0x35: case 0x3D:  // add/or/adc/sbb/and/sub/xor/cmp eAX, imm32
+        case 0x68:  // push imm32
+        case 0xA9:  // test eAX, imm32
+        case 0xE8: case 0xE9:  // call rel32, jmp rel32
+            return true;
+        default:
+            return opcode >= 0xB8 && opcode <= 0xBF;  // mov r, imm32 / imm64
+    }
+}
+
 }  // namespace
+
+InsnLayout parse_layout(const std::uint8_t* insn, std::size_t length, std::uint8_t disp_offset, std::uint8_t disp_size) noexcept {
+    InsnLayout out;
+    if (insn == nullptr || length == 0 || length > kMaxInstruction) {
+        return out;
+    }
+    // Prefixes, as the decoder reads them: a REX prefix only counts when it is the last one.
+    std::size_t i = 0;
+    std::uint8_t rex = 0;
+    for (; i < length; ++i) {
+        if (is_legacy_prefix(insn[i])) {
+            rex = 0;
+        } else if ((insn[i] & 0xF0) == 0x40) {
+            rex = insn[i];
+        } else {
+            break;
+        }
+    }
+    if (i >= length) {
+        return out;
+    }
+    std::size_t modrm_at = 0;
+    bool expect_modrm = true;
+    const std::uint8_t first = insn[i];
+    if (first == 0xC4 || first == 0xC5 || first == 0x62) {
+        // VEX (C5 + 1 byte, C4 + 2 bytes) or EVEX (62 + 3 bytes), then the opcode, then ModRM. In 64-bit mode these bytes
+        // are never LES/LDS/BOUND. A REX prefix before them is invalid.
+        if (rex != 0) {
+            return out;
+        }
+        out.vex = true;
+        modrm_at = i + (first == 0xC5 ? 2u : (first == 0xC4 ? 3u : 4u)) + 1u;
+    } else {
+        out.rex_w = (rex & 0x08) != 0;
+        std::size_t opcode_at = i;
+        bool one_byte_map = true;
+        if (first == 0x0F) {
+            one_byte_map = false;
+            ++opcode_at;
+            if (opcode_at >= length) {
+                return out;
+            }
+            if (insn[opcode_at] == 0x38 || insn[opcode_at] == 0x3A) {
+                ++opcode_at;
+                if (opcode_at >= length) {
+                    return out;
+                }
+            }
+        }
+        const std::uint8_t opcode = insn[opcode_at];
+        const bool two_byte_map = !one_byte_map && opcode_at == i + 1;
+        out.lea = one_byte_map && opcode == 0x8D;
+        if ((one_byte_map && is_immediate_without_modrm(opcode)) || (two_byte_map && opcode >= 0x80 && opcode <= 0x8F)) {  // 0F 80..8F: jcc rel32
+            expect_modrm = false;
+            if (disp_size != 0) {
+                return out;  // the decoder found a displacement where there is no ModRM: disagreement
+            }
+            out.immediate_start = static_cast<std::uint8_t>(opcode_at + 1);
+            out.known = true;
+            return out;
+        }
+        modrm_at = opcode_at + 1;
+    }
+    // ModRM, SIB and the displacement they dictate (64-bit addressing; 67 selects the same layout).
+    std::size_t my_disp_offset = 0;
+    std::size_t my_disp_size = 0;
+    std::size_t behind = modrm_at;  // first byte behind ModRM / SIB / displacement
+    if (expect_modrm && modrm_at < length) {
+        out.has_modrm = true;
+        const std::uint8_t modrm = insn[modrm_at];
+        const unsigned mod = modrm >> 6;
+        const unsigned rm = modrm & 7u;
+        behind = modrm_at + 1;
+        if (mod != 3) {
+            unsigned sib_base = 0;
+            if (rm == 4) {
+                if (behind >= length) {
+                    return out;
+                }
+                sib_base = insn[behind] & 7u;
+                ++behind;
+            }
+            if (mod == 0) {
+                if (rm == 5) {
+                    my_disp_size = 4;  // RIP-relative
+                } else if (rm == 4 && sib_base == 5) {
+                    my_disp_size = 4;  // no base register
+                    out.no_base = true;
+                }
+            } else {
+                my_disp_size = mod == 1 ? 1u : 4u;
+            }
+        }
+        if (my_disp_size != 0) {
+            my_disp_offset = behind;
+            behind += my_disp_size;
+        }
+    }
+    if (behind > length || my_disp_size != disp_size || my_disp_offset != disp_offset) {
+        return out;  // not what the decoder saw: nothing in this instruction is located
+    }
+    out.immediate_start = static_cast<std::uint8_t>(out.vex ? length : behind);
+    out.known = true;
+    return out;
+}
 
 const char* to_string(SiteVerdict v) noexcept {
     switch (v) {
@@ -29,6 +159,8 @@ const char* to_string(SiteVerdict v) noexcept {
         case SiteVerdict::RipRelative: return "rip-relative";
         case SiteVerdict::Address32: return "address-size-32";
         case SiteVerdict::SegmentFsGs: return "segment-fs-gs";
+        case SiteVerdict::NoBaseRegister: return "no-base-register";
+        case SiteVerdict::LeaTruncates: return "lea-truncates";
     }
     return "?";
 }
@@ -90,14 +222,17 @@ const SiteProver::Sweep& SiteProver::sweep_from(std::uint32_t start) {
         }
         const std::uint64_t end = off + r.length;
         const std::uint64_t disp_lo = off + r.disp_offset;
-        const std::uint64_t disp_hi = disp_lo + r.disp_size;
-        const std::uint64_t tail_lo = r.disp_size != 0 ? disp_hi : off + 1;
+        // Where the operands are, derived from the bytes and checked against the decoder (see parse_layout).
+        const InsnLayout layout = parse_layout(base + off, r.length, r.disp_offset, r.disp_size);
+        const std::uint64_t immediate_lo = off + layout.immediate_start;
         for (; fi < fields_.size() && fields_[fi].offset < end; ++fi) {
             const RelocField& f = fields_[fi];
             const std::uint64_t f_end = static_cast<std::uint64_t>(f.offset) + f.width;
-            const bool in_displacement = f.width != 0 && r.disp_size != 0 && f.offset >= disp_lo && f_end <= disp_hi;
-            const bool in_immediate = f.width != 0 && f.offset >= tail_lo && f_end == end;
-            if (!in_displacement && !in_immediate) {
+            // Exactly the 32-bit displacement, or wholly inside the immediate (legacy encodings; a relocated immediate is
+            // 4 or 8 bytes and is the last thing in the instruction).
+            const bool is_displacement = layout.known && r.disp_size == 4 && f.width == 4 && f.offset == disp_lo;
+            const bool in_immediate = layout.known && !layout.vex && (f.width == 4 || f.width == 8) && f.offset >= immediate_lo && f_end == end;
+            if (!is_displacement && !in_immediate) {
                 s.stop = SiteVerdict::RanIntoData;
                 s.stop_length = r.length;
                 s.stop_reason = "the relocation at +" + hex(f.offset) + " does not fit an operand of the instruction decoded at +" + hex(off) + " (" +
@@ -116,6 +251,7 @@ const SiteProver::Sweep& SiteProver::sweep_from(std::uint32_t start) {
         insn.flags = r.flags;
         insn.disp_offset = r.disp_offset;
         insn.disp_size = r.disp_size;
+        insn.layout = layout;
         s.insns.push_back(insn);
         off = end;
     }
@@ -188,6 +324,22 @@ SiteCheck SiteProver::check(std::uint32_t site) {
     if ((insn.flags & lde::kInsnSegFsGs) != 0) {
         c.verdict = SiteVerdict::SegmentFsGs;
         c.reason = where + " has an fs/gs segment override: its address is relative to that segment";
+        return c;
+    }
+    if (!insn.layout.known) {
+        // Cannot happen: the site's own relocation was accepted as this instruction's displacement, which needs the layout.
+        c.verdict = SiteVerdict::RanIntoData;
+        c.reason = "the operands of " + where + " could not be located";
+        return c;
+    }
+    if (insn.layout.no_base) {
+        c.verdict = SiteVerdict::NoBaseRegister;
+        c.reason = where + " has no base register that could hold the image base";
+        return c;
+    }
+    if (insn.layout.lea && !insn.layout.rex_w) {
+        c.verdict = SiteVerdict::LeaTruncates;
+        c.reason = where + " is a lea with a 32-bit or 16-bit destination: the address it computes is truncated";
         return c;
     }
     c.verdict = SiteVerdict::Displacement;

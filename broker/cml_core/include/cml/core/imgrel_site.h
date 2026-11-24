@@ -17,14 +17,20 @@
 //      follows its code;
 //   3. the sweep reaches an instruction whose displacement is 4 bytes wide and starts exactly at the site;
 //   4. that instruction has no RIP-relative operand, no 67 prefix (the address would be truncated to 32 bits) and no
-//      fs/gs override (the address would be relative to that segment base);
-//   5. every relocation the sweep passes on the way (and the site's own) lies wholly inside the displacement or the
-//      immediate of ONE decoded instruction. A relocation that starts in one instruction and ends in another, or covers
-//      opcode bytes, means the sweep ran into data (a jump table) or lost the instruction boundaries; from there on
-//      nothing is trusted. The decoder does not report where an immediate starts, so "the immediate" is taken as: the
-//      field ends where the instruction ends and starts after the displacement (or after the first byte when there is
-//      none). That is narrower than the truth, never wider.
+//      fs/gs override (the address would be relative to that segment base); its memory operand has a base register
+//      (`[index*scale+disp32]` and the absolute `[disp32]` have no register that could hold __ImageBase); and it is not
+//      a `lea` with a 32-bit or 16-bit destination (8D without REX.W), which truncates the computed address: with the
+//      patch above the module the displacement is negative, and the zero-extended result is 4 GiB off;
+//   5. every relocation the sweep passes on the way (and the site's own) is EXACTLY the 32-bit displacement of one
+//      decoded instruction, or lies wholly inside its immediate. A relocation that starts in one instruction and ends
+//      in another, or covers prefix, opcode, ModRM or SIB bytes, means the sweep ran into data (a jump table) or lost
+//      the instruction boundaries; from there on nothing is trusted.
 // An instruction the decoder does not know stops the sweep as well: every site behind it is refused.
+//
+// The decoder reports the length and the displacement of an instruction, not where its ModRM byte or its immediate
+// are. parse_layout() re-derives those from the instruction's own bytes (prefixes, REX, opcode, ModRM, SIB) and
+// CHECKS the result against the decoder's displacement: on any disagreement the layout is unknown and no relocation
+// in that instruction is accepted. For a VEX/EVEX instruction a relocation is accepted only at the displacement.
 
 #include <cstddef>
 #include <cstdint>
@@ -46,6 +52,8 @@ enum class SiteVerdict : std::uint8_t {
     RipRelative,      // the displacement belongs to a RIP-relative operand
     Address32,        // the instruction has a 67 prefix
     SegmentFsGs,      // the instruction has an fs or gs override
+    NoBaseRegister,   // the operand is `[index*scale+disp32]` or `[disp32]`: no base register that could hold __ImageBase
+    LeaTruncates,     // a `lea` with a 32-bit or 16-bit destination: the address it computes is truncated
 };
 
 const char* to_string(SiteVerdict v) noexcept;
@@ -60,6 +68,23 @@ struct SiteCheck {
 
     bool proved() const noexcept { return verdict == SiteVerdict::Displacement; }
 };
+
+// Where the operands of one decoded instruction are, re-derived from its bytes and checked against the decoder.
+struct InsnLayout {
+    bool known = false;      // parsed, and the displacement found here is the one the decoder reported
+    bool vex = false;        // VEX (C4, C5) or EVEX (62) encoded: only the displacement is located
+    bool rex_w = false;      // REX.W (legacy encodings)
+    bool has_modrm = false;
+    bool no_base = false;    // memory operand without a base register (mod=00, r/m=100, SIB base=101)
+    bool lea = false;        // opcode 8D
+    // Offset of the first byte behind prefixes, opcode, ModRM, SIB and displacement: where an immediate starts, if the
+    // instruction has one. Equal to the length when it has none. Legacy encodings only.
+    std::uint8_t immediate_start = 0;
+};
+
+// `insn`: the `length` bytes of ONE instruction the length decoder accepted; `disp_offset` / `disp_size`: what the
+// decoder reported for it. Never reads beyond `length`. Portable, allocation-free.
+InsnLayout parse_layout(const std::uint8_t* insn, std::size_t length, std::uint8_t disp_offset, std::uint8_t disp_size) noexcept;
 
 // The field one relocation of the section patches.
 struct RelocField {
@@ -86,6 +111,7 @@ private:
         std::uint8_t flags = 0;
         std::uint8_t disp_offset = 0;
         std::uint8_t disp_size = 0;
+        InsnLayout layout;
     };
     struct Sweep {
         std::vector<Insn> insns;        // the trusted instructions, in order

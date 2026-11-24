@@ -73,10 +73,10 @@ TEST_CASE("imgrel prover: the instruction forms of the cl evidence are displacem
     const std::uint32_t mov_q = c.emit_reloc({0x48, 0x8B, 0x84, 0xC7, 0, 0, 0, 0}, 4);               // mov rax, [rdi+rax*8+d32]
     const std::uint32_t cvt = c.emit_reloc({0xF3, 0x0F, 0x2C, 0x84, 0x87, 0x44, 0x04, 0, 0}, 5);     // cvttss2si eax, [rdi+rax*4+d32]
     const std::uint32_t lea = c.emit_reloc({0x48, 0x8D, 0x84, 0x0F, 0, 0, 0, 0}, 4);                 // lea rax, [rdi+rcx+d32]
-    const std::uint32_t no_base = c.emit_reloc({0x8B, 0x04, 0x85, 0, 0, 0, 0}, 3);                   // mov eax, [rax*4+d32] (SIB without base)
+    const std::uint32_t rbp_base = c.emit_reloc({0x8B, 0x84, 0x85, 0, 0, 0, 0}, 3);                  // mov eax, [rbp+rax*4+d32]
     const std::uint32_t mod10 = c.emit_reloc({0x8B, 0x87, 0, 0, 0, 0}, 2);                           // mov eax, [rdi+d32]
     c.emit({0xC3});
-    for (const std::uint32_t site : {mov_load, mov_byte, cmp_byte, mov_store, mov_q, cvt, lea, no_base, mod10}) {
+    for (const std::uint32_t site : {mov_load, mov_byte, cmp_byte, mov_store, mov_q, cvt, lea, rbp_base, mod10}) {
         const SiteCheck k = c.check(site);
         CHECK_MESSAGE(k.proved(), "site +" << site << ": " << to_string(k.verdict) << " " << k.reason);
         CHECK(k.function_start == 0);
@@ -277,6 +277,218 @@ TEST_CASE("imgrel prover: a relocation that straddles an instruction boundary st
         c.emit_reloc({0x8B, 0x80, 0, 0, 0, 0}, 2);
         const std::uint32_t site = c.emit_reloc({0x8B, 0x84, 0x87, 0, 0, 0, 0}, 3);
         CHECK(c.check(site).proved());
+    }
+}
+
+// ---- review of PR #67: what the first version accepted and must not ---------------------------------------------
+
+TEST_CASE("imgrel prover: lea with a 32-bit or 16-bit destination truncates the address and is refused; lea r64 is proved") {
+    // lea eax,[rdi+rcx*4+sym@IMGREL] zero-extends a truncated sum: with the patch above the module the displacement is
+    // negative and `add rax, rdi` afterwards lands 4 GiB away from the old data.
+    const auto verdict_of = [](std::initializer_list<int> insn, std::uint32_t field_at) {
+        Code c;
+        lea_image_base(c);
+        const std::uint32_t site = c.emit_reloc(insn, field_at);
+        c.emit({0xC3});
+        return c.check(site);
+    };
+    {
+        const SiteCheck k = verdict_of({0x8D, 0x84, 0x8F, 0, 0, 0, 0}, 3);  // lea eax,[rdi+rcx*4+d32]
+        CHECK(k.verdict == SiteVerdict::LeaTruncates);
+        CHECK(contains(k.reason, "8d 84 8f 00 00 00 00"));
+        CHECK(contains(k.reason, "lea"));
+    }
+    CHECK(verdict_of({0x66, 0x8D, 0x84, 0x8F, 0, 0, 0, 0}, 4).verdict == SiteVerdict::LeaTruncates);        // lea ax,[...]
+    CHECK(verdict_of({0x41, 0x8D, 0x84, 0x8F, 0, 0, 0, 0}, 4).verdict == SiteVerdict::LeaTruncates);        // REX.B only: lea eax,[r15+rcx*4+d32]
+    CHECK(verdict_of({0x44, 0x8D, 0x87, 0, 0, 0, 0}, 3).verdict == SiteVerdict::LeaTruncates);              // REX.R only: lea r8d,[rdi+d32]
+    CHECK(verdict_of({0x48, 0x66, 0x8D, 0x84, 0x8F, 0, 0, 0, 0}, 5).verdict == SiteVerdict::LeaTruncates);  // a REX before a legacy prefix is ignored
+    CHECK(verdict_of({0x48, 0x8D, 0x84, 0x8F, 0, 0, 0, 0}, 4).proved());                                    // lea rax,[rdi+rcx*4+d32]
+    CHECK(verdict_of({0x4C, 0x8D, 0x84, 0x0F, 0, 0, 0, 0}, 4).proved());                                    // lea r8,[rdi+rcx+d32]
+    CHECK(verdict_of({0x48, 0x8D, 0x87, 0, 0, 0, 0}, 3).proved());                                          // lea rax,[rdi+d32]
+    // Only lea computes an address into a register: a 32-bit LOAD through the same operand is fine.
+    CHECK(verdict_of({0x8B, 0x84, 0x8F, 0, 0, 0, 0}, 3).proved());                                          // mov eax,[rdi+rcx*4+d32]
+    CHECK(verdict_of({0x66, 0x8B, 0x84, 0x8F, 0, 0, 0, 0}, 4).proved());                                    // mov ax,[rdi+rcx*4+d32]
+}
+
+TEST_CASE("imgrel prover: an operand without a base register cannot hold the image base and is refused") {
+    const auto verdict_of = [](std::initializer_list<int> insn, std::uint32_t field_at) {
+        Code c;
+        lea_image_base(c);
+        const std::uint32_t site = c.emit_reloc(insn, field_at);
+        c.emit({0xC3});
+        return c.check(site);
+    };
+    {
+        const SiteCheck k = verdict_of({0x8B, 0x04, 0x25, 0, 0, 0, 0}, 3);  // mov eax,[disp32]: absolute, no base, no index
+        CHECK(k.verdict == SiteVerdict::NoBaseRegister);
+        CHECK(contains(k.reason, "8b 04 25 00 00 00 00"));
+        CHECK(contains(k.reason, "no base register"));
+    }
+    CHECK(verdict_of({0x8B, 0x04, 0x85, 0, 0, 0, 0}, 3).verdict == SiteVerdict::NoBaseRegister);        // mov eax,[rax*4+d32]
+    CHECK(verdict_of({0x42, 0x8B, 0x04, 0x85, 0, 0, 0, 0}, 4).verdict == SiteVerdict::NoBaseRegister);  // mov eax,[r8*4+d32]
+    CHECK(verdict_of({0x8B, 0x04, 0x3D, 0, 0, 0, 0}, 3).verdict == SiteVerdict::NoBaseRegister);        // mov eax,[rdi*1+d32]
+    CHECK(verdict_of({0x8D, 0x04, 0x8D, 0, 0, 0, 0}, 3).verdict == SiteVerdict::NoBaseRegister);        // lea eax,[rcx*4+d32]
+    CHECK(verdict_of({0x48, 0x8D, 0x04, 0x8D, 0, 0, 0, 0}, 4).verdict == SiteVerdict::NoBaseRegister);  // lea rax,[rcx*4+d32]
+    CHECK(verdict_of({0xC6, 0x04, 0x25, 0, 0, 0, 0, 0x01}, 3).verdict == SiteVerdict::NoBaseRegister);  // mov byte ptr [disp32], 1
+    // With a base (mod=10) the same shapes are proved: rbp/r13 as base need mod=01/10 and have a displacement.
+    CHECK(verdict_of({0x8B, 0x84, 0x85, 0, 0, 0, 0}, 3).proved());                                      // mov eax,[rbp+rax*4+d32]
+    CHECK(verdict_of({0x8B, 0x87, 0, 0, 0, 0}, 2).proved());                                            // mov eax,[rdi+d32]
+}
+
+TEST_CASE("imgrel prover: a relocation that ends with the instruction but covers prefix, opcode, ModRM or SIB bytes stops the sweep") {
+    // Each of these was accepted as "the immediate" by a check that only asked for a field ending at the instruction's
+    // end. That is how a sweep misaligned by data could carry on and later prove a site among real instruction bytes.
+    const auto site_behind = [](std::initializer_list<int> insn, std::uint32_t field_at, std::uint32_t width) {
+        Code c;
+        const std::uint32_t at = c.emit(insn);
+        c.fields.push_back(RelocField{at + field_at, width});
+        const std::uint32_t site = c.emit_reloc({0x8B, 0x84, 0x87, 0, 0, 0, 0}, 3);
+        return c.check(site);
+    };
+    {
+        const SiteCheck k = site_behind({0x66, 0x41, 0x81, 0xC0, 0, 0}, 2, 4);  // add r8w, imm16: the relocation covers 81 c0 too
+        CHECK(k.verdict == SiteVerdict::RanIntoData);
+        CHECK(k.at == 0);
+        CHECK(contains(k.reason, "66 41 81 c0 00 00"));
+    }
+    CHECK(site_behind({0x66, 0x0F, 0x3A, 0x0F, 0xC1, 0x08}, 2, 4).verdict == SiteVerdict::RanIntoData);  // palignr: opcode, ModRM, imm8
+    CHECK(site_behind({0xF3, 0x48, 0x0F, 0x2A, 0xC1}, 1, 4).verdict == SiteVerdict::RanIntoData);        // cvtsi2ss: REX, opcode, ModRM
+    CHECK(site_behind({0x48, 0x0F, 0xAF, 0xC1, 0x90}, 0, 4).verdict == SiteVerdict::RanIntoData);        // imul rax, rcx: the whole instruction
+    CHECK(site_behind({0x41, 0x83, 0xC0, 0x05}, 0, 4).verdict == SiteVerdict::RanIntoData);              // add r8d, 5 (imm8)
+    CHECK(site_behind({0x48, 0x89, 0x44, 0x24, 0x08}, 1, 4).verdict == SiteVerdict::RanIntoData);        // mov [rsp+8], rax: opcode, ModRM, SIB, disp8
+    CHECK(site_behind({0x48, 0xC7, 0xC0, 0, 0, 0, 0}, 2, 4).verdict == SiteVerdict::RanIntoData);        // mov rax, imm32: ModRM + 3 of 4 bytes, not at the end
+    CHECK(site_behind({0x6A, 0x05, 0x90, 0x90}, 0, 2).verdict == SiteVerdict::RanIntoData);              // push 5: a 2-byte relocation
+    CHECK(site_behind({0xEB, 0x00}, 1, 1).verdict == SiteVerdict::RanIntoData);                          // jmp short: a 1-byte relocation
+    CHECK(site_behind({0xC2, 0x08, 0x00}, 1, 2).verdict == SiteVerdict::RanIntoData);                    // ret 8: a 2-byte relocation on imm16
+    CHECK(site_behind({0x8B, 0x84, 0x87, 0, 0, 0, 0}, 3, 1).verdict == SiteVerdict::RanIntoData);        // inside the displacement but not the displacement
+    CHECK(site_behind({0x8B, 0x44, 0x87, 0x10}, 3, 1).verdict == SiteVerdict::RanIntoData);              // a disp8 is never a relocation
+    CHECK(site_behind({0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0}, 2, 4).verdict == SiteVerdict::RanIntoData);  // the low half of an imm64
+
+    // The immediates a relocation really fills still pass, and the site behind them is proved.
+    CHECK(site_behind({0xE8, 0, 0, 0, 0}, 1, 4).proved());                             // call rel32
+    CHECK(site_behind({0xE9, 0, 0, 0, 0}, 1, 4).proved());                             // jmp rel32
+    CHECK(site_behind({0x0F, 0x84, 0, 0, 0, 0}, 2, 4).proved());                       // je rel32
+    CHECK(site_behind({0xB8, 0, 0, 0, 0}, 1, 4).proved());                             // mov eax, imm32
+    CHECK(site_behind({0x41, 0xB8, 0, 0, 0, 0}, 2, 4).proved());                       // mov r8d, imm32
+    CHECK(site_behind({0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0}, 2, 8).proved());           // mov rax, imm64 (ADDR64)
+    CHECK(site_behind({0x68, 0, 0, 0, 0}, 1, 4).proved());                             // push imm32
+    CHECK(site_behind({0x05, 0, 0, 0, 0}, 1, 4).proved());                             // add eax, imm32
+    CHECK(site_behind({0x48, 0x3D, 0, 0, 0, 0}, 2, 4).proved());                       // cmp rax, imm32
+    CHECK(site_behind({0xA9, 0, 0, 0, 0}, 1, 4).proved());                             // test eax, imm32
+    CHECK(site_behind({0x48, 0x81, 0xC0, 0, 0, 0, 0}, 3, 4).proved());                 // add rax, imm32
+    CHECK(site_behind({0xC7, 0x00, 0, 0, 0, 0}, 2, 4).proved());                       // mov dword ptr [rax], imm32
+    CHECK(site_behind({0x48, 0xC7, 0xC0, 0, 0, 0, 0}, 3, 4).proved());                 // mov rax, imm32
+    CHECK(site_behind({0xF7, 0xC0, 0, 0, 0, 0}, 2, 4).proved());                       // test eax, imm32 (F7 /0)
+    CHECK(site_behind({0x69, 0xC0, 0, 0, 0, 0}, 2, 4).proved());                       // imul eax, eax, imm32
+    CHECK(site_behind({0xC7, 0x84, 0x87, 0, 0, 0, 0, 0, 0, 0, 0}, 7, 4).proved());     // mov dword ptr [rdi+rax*4+d32], imm32: the immediate
+    CHECK(site_behind({0xC7, 0x84, 0x87, 0, 0, 0, 0, 0, 0, 0, 0}, 3, 4).proved());     // ... and its displacement
+    CHECK(site_behind({0x83, 0x3D, 0, 0, 0, 0, 0x00}, 2, 4).proved());                 // cmp dword ptr [rip+d32], 0 (REL32_1)
+}
+
+TEST_CASE("imgrel layout: ModRM, SIB, displacement and immediate start are derived from the bytes and checked against the decoder") {
+    const auto layout = [](std::initializer_list<int> insn, int disp_offset, int disp_size) {
+        std::vector<std::uint8_t> bytes;
+        for (const int v : insn) {
+            bytes.push_back(static_cast<std::uint8_t>(v));
+        }
+        return parse_layout(bytes.data(), bytes.size(), static_cast<std::uint8_t>(disp_offset), static_cast<std::uint8_t>(disp_size));
+    };
+    SUBCASE("legacy encodings") {
+        InsnLayout l = layout({0x8B, 0x84, 0x87, 0, 0, 0, 0}, 3, 4);  // mov eax,[rdi+rax*4+d32]
+        CHECK(l.known);
+        CHECK(l.has_modrm);
+        CHECK_FALSE(l.vex);
+        CHECK_FALSE(l.no_base);
+        CHECK_FALSE(l.lea);
+        CHECK(l.immediate_start == 7);
+        l = layout({0xC6, 0x84, 0x3B, 0, 0, 0, 0, 0x01}, 3, 4);  // mov byte ptr [rbx+rdi+d32], 1
+        CHECK(l.known);
+        CHECK(l.immediate_start == 7);
+        l = layout({0xF3, 0x0F, 0x2C, 0x84, 0x87, 0, 0, 0, 0}, 5, 4);  // cvttss2si eax,[rdi+rax*4+d32]
+        CHECK(l.known);
+        CHECK(l.immediate_start == 9);
+        l = layout({0x66, 0x0F, 0x3A, 0x0F, 0xC1, 0x08}, 0, 0);  // palignr xmm0, xmm1, 8 (three-byte map)
+        CHECK(l.known);
+        CHECK(l.immediate_start == 5);
+        l = layout({0x48, 0x8D, 0x84, 0x8F, 0, 0, 0, 0}, 4, 4);  // lea rax,[rdi+rcx*4+d32]
+        CHECK(l.known);
+        CHECK(l.lea);
+        CHECK(l.rex_w);
+        l = layout({0x8D, 0x84, 0x8F, 0, 0, 0, 0}, 3, 4);  // lea eax,[...]
+        CHECK(l.known);
+        CHECK(l.lea);
+        CHECK_FALSE(l.rex_w);
+        l = layout({0x48, 0x66, 0x8D, 0x84, 0x8F, 0, 0, 0, 0}, 5, 4);  // the REX is ignored: a legacy prefix follows it
+        CHECK(l.known);
+        CHECK(l.lea);
+        CHECK_FALSE(l.rex_w);
+        l = layout({0x8B, 0x04, 0x25, 0, 0, 0, 0}, 3, 4);  // mov eax,[disp32]
+        CHECK(l.known);
+        CHECK(l.no_base);
+        l = layout({0x8B, 0x05, 0, 0, 0, 0}, 2, 4);  // mov eax,[rip+d32]: has no SIB; RIP-relative is the decoder's flag
+        CHECK(l.known);
+        CHECK_FALSE(l.no_base);
+        l = layout({0x8B, 0x44, 0x24, 0x08}, 3, 1);  // mov eax,[rsp+8]
+        CHECK(l.known);
+        CHECK(l.immediate_start == 4);
+        l = layout({0x8B, 0xC1}, 0, 0);  // mov eax, ecx
+        CHECK(l.known);
+        CHECK(l.has_modrm);
+        CHECK(l.immediate_start == 2);
+    }
+    SUBCASE("opcodes without ModRM") {
+        InsnLayout l = layout({0xE8, 0, 0, 0, 0}, 0, 0);  // call rel32
+        CHECK(l.known);
+        CHECK_FALSE(l.has_modrm);
+        CHECK(l.immediate_start == 1);
+        l = layout({0x0F, 0x84, 0, 0, 0, 0}, 0, 0);  // je rel32
+        CHECK(l.known);
+        CHECK(l.immediate_start == 2);
+        l = layout({0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0}, 0, 0);  // mov rax, imm64
+        CHECK(l.known);
+        CHECK(l.rex_w);
+        CHECK(l.immediate_start == 2);
+        l = layout({0xC3}, 0, 0);  // ret: nothing behind the opcode
+        CHECK(l.known);
+        CHECK_FALSE(l.has_modrm);
+        CHECK(l.immediate_start == 1);
+        // An opcode without ModRM that is not on the list is read as if it had one. Here the pretended ModRM (05: a
+        // RIP-relative operand) asks for a displacement the decoder did not report: the layout is unknown.
+        l = layout({0x6A, 0x05}, 0, 0);  // push 5
+        CHECK_FALSE(l.known);
+    }
+    SUBCASE("disagreement with the decoder is never resolved in favour of either") {
+        CHECK_FALSE(layout({0x8B, 0x84, 0x87, 0, 0, 0, 0}, 2, 4).known);  // displacement one byte early
+        CHECK_FALSE(layout({0x8B, 0x84, 0x87, 0, 0, 0, 0}, 3, 1).known);  // another size
+        CHECK_FALSE(layout({0x8B, 0x84, 0x87, 0, 0, 0, 0}, 0, 0).known);  // none reported
+        CHECK_FALSE(layout({0x8B, 0xC1}, 2, 4).known);                    // one reported for a register operand
+        CHECK_FALSE(layout({0xE8, 0, 0, 0, 0}, 1, 4).known);              // a displacement on call rel32
+        CHECK_FALSE(layout({0x8B, 0x84}, 0, 0).known);                    // cut off behind the ModRM that announces a SIB
+        CHECK_FALSE(layout({0x66, 0x66}, 0, 0).known);                    // prefixes only
+        CHECK_FALSE(parse_layout(nullptr, 4, 0, 0).known);
+    }
+    SUBCASE("VEX and EVEX: only the displacement is located") {
+        InsnLayout l = layout({0xC5, 0xFA, 0x10, 0x84, 0x87, 0, 0, 0, 0}, 5, 4);  // vmovss xmm0,[rdi+rax*4+d32]
+        CHECK(l.known);
+        CHECK(l.vex);
+        CHECK(l.has_modrm);
+        CHECK_FALSE(l.no_base);
+        CHECK_FALSE(l.lea);
+        CHECK(l.immediate_start == 9);  // = the length: no immediate is located
+        l = layout({0xC4, 0xE2, 0x79, 0x18, 0x84, 0x87, 0, 0, 0, 0}, 6, 4);  // vbroadcastss xmm0,[rdi+rax*4+d32]
+        CHECK(l.known);
+        CHECK(l.vex);
+        l = layout({0x62, 0xF1, 0x7C, 0x48, 0x10, 0x84, 0x87, 0, 0, 0, 0}, 7, 4);  // vmovups zmm0,[rdi+rax*4+d32]
+        CHECK(l.known);
+        CHECK(l.vex);
+        l = layout({0xC5, 0xFA, 0x10, 0x04, 0x85, 0, 0, 0, 0}, 5, 4);  // vmovss xmm0,[rax*4+d32]
+        CHECK(l.known);
+        CHECK(l.no_base);
+        l = layout({0xC5, 0xF8, 0x77}, 0, 0);  // vzeroupper: no ModRM
+        CHECK(l.known);
+        CHECK_FALSE(l.has_modrm);
+        CHECK_FALSE(layout({0xC5, 0xFA, 0x10, 0x84, 0x87, 0, 0, 0, 0}, 4, 4).known);        // not where the decoder says
+        CHECK_FALSE(layout({0x48, 0xC5, 0xFA, 0x10, 0x84, 0x87, 0, 0, 0, 0}, 6, 4).known);  // a REX before a VEX prefix is invalid
     }
 }
 
@@ -595,6 +807,68 @@ TEST_CASE("imgrel plan: a relocation straddling an instruction boundary before t
     REQUIRE(d != nullptr);
     CHECK(contains(d->message, "the relocation at +0x3 does not fit"));
     CHECK(contains(d->message, "b8 00 00 00 00"));
+}
+
+TEST_CASE("imgrel plan: a truncating lea and an operand without a base register are CML3101") {
+    {
+        OneSite s({0x8D, 0x84, 0x8F, 0, 0, 0, 0}, 3);  // lea eax, g_tick[rdi+rcx*4]
+        Built b = s.o.build();
+        std::vector<cml::Diag> errors;
+        REQUIRE(!plan_bind(s.w.input(b), &errors).has_value());
+        REQUIRE(errors.size() == 1);
+        CHECK(errors[0].code == diag::kAddr32NbToOldData);
+        CHECK(contains(errors[0].message, "lea with a 32-bit or 16-bit destination"));
+        CHECK(contains(errors[0].message, "8d 84 8f 00 00 00 00"));
+    }
+    {
+        OneSite s({0x8B, 0x04, 0x25, 0, 0, 0, 0}, 3);  // mov eax, dword ptr [g_tick@IMGREL]
+        Built b = s.o.build();
+        std::vector<cml::Diag> errors;
+        REQUIRE(!plan_bind(s.w.input(b), &errors).has_value());
+        REQUIRE(errors.size() == 1);
+        CHECK(errors[0].code == diag::kAddr32NbToOldData);
+        CHECK(contains(errors[0].message, "no base register"));
+        CHECK(contains(errors[0].message, "8b 04 25 00 00 00 00"));
+    }
+    {
+        OneSite s({0x8B, 0x04, 0x85, 0, 0, 0, 0}, 3);  // mov eax, g_tick[rax*4]
+        Built b = s.o.build();
+        std::vector<cml::Diag> errors;
+        REQUIRE(!plan_bind(s.w.input(b), &errors).has_value());
+        REQUIRE(errors.size() == 1);
+        CHECK(errors[0].code == diag::kAddr32NbToOldData);
+        CHECK(contains(errors[0].message, "no base register"));
+    }
+    {
+        OneSite s({0x48, 0x8D, 0x84, 0x8F, 0, 0, 0, 0}, 4, 0x20);  // lea rax, g_tick[rdi+rcx*4+20h]: the full address
+        Built b = s.o.build();
+        auto r = plan_bind(s.w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        const Fixup* fx = fixup_at(*r, s.f.section, s.site);
+        REQUIRE(fx != nullptr);
+        CHECK(fx->kind == FixupKind::Addr32NbDisp);
+        CHECK(fx->addend == 0x20);
+    }
+}
+
+TEST_CASE("imgrel plan: a relocation over opcode bytes of an earlier instruction refuses the site behind it") {
+    SynthWorld w = basic_world();
+    SynthObj o;
+    auto f = o.function("?compute_value@@YAHXZ", true, 0x20);
+    const std::uint32_t tick = o.undefined("?g_tick@@3HA", false);
+    const std::uint32_t note = o.undefined("fixture_note", true);
+    // add r8w, imm16 (66 41 81 c0 iw), then the load. A REL32 at +2 ends with the first instruction but covers 81 c0.
+    put(o, f.section, 0, {0x66, 0x41, 0x81, 0xC0, 0, 0, 0x8B, 0x84, 0x87, 0, 0, 0, 0, 0xC3});
+    o.reloc(f.section, 2, note, kRel32, 0xC081);  // the in-place addend IS the bytes 81 c0 00 00
+    o.reloc(f.section, 9, tick, kAddr32Nb);
+    Built b = o.build();
+    std::vector<cml::Diag> errors;
+    auto r = plan_bind(w.input(b), &errors);
+    REQUIRE(!r.has_value());
+    const cml::Diag* d = with_code(errors, diag::kAddr32NbToOldData);
+    REQUIRE(d != nullptr);
+    CHECK(contains(d->message, "the relocation at +0x2 does not fit"));
+    CHECK(contains(d->message, "66 41 81 c0 00 00"));
 }
 
 TEST_CASE("imgrel plan: ADDR32NB to a thunk and to a synthesized import slot stay with the linker") {
