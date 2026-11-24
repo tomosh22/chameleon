@@ -170,6 +170,7 @@ DecodeResult decode_instruction(const std::uint8_t* code, std::size_t available)
     // makes the processor ignore the REX.
     std::size_t i = 0;
     bool operand_size = false;
+    std::uint8_t prefix_flags = 0;  // kInsnAddr32, kInsnSegFsGs
     std::uint8_t rex = 0;
     unsigned prefix_count = 0;
     for (;;) {
@@ -179,6 +180,11 @@ DecodeResult decode_instruction(const std::uint8_t* code, std::size_t available)
         const std::uint8_t b = code[i];
         if (is_legacy_prefix(b)) {
             operand_size = operand_size || b == 0x66;
+            if (b == 0x67) {
+                prefix_flags = static_cast<std::uint8_t>(prefix_flags | kInsnAddr32);
+            } else if (b == 0x64 || b == 0x65) {
+                prefix_flags = static_cast<std::uint8_t>(prefix_flags | kInsnSegFsGs);
+            }
             rex = 0;
         } else if ((b & 0xF0) == 0x40) {
             rex = b;
@@ -222,7 +228,7 @@ DecodeResult decode_instruction(const std::uint8_t* code, std::size_t available)
         return unknown();
     }
 
-    std::uint8_t flags = 0;
+    std::uint8_t flags = prefix_flags;
     std::size_t immediate = 0;
     std::size_t disp_offset = 0;
     std::size_t disp_size = 0;
