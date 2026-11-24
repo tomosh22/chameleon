@@ -492,6 +492,76 @@ TEST_CASE("imgrel layout: ModRM, SIB, displacement and immediate start are deriv
     }
 }
 
+// ---- VEX / EVEX through the real decoder (WP-38 made it accept them) -------------------------------------------
+
+TEST_CASE("imgrel prover: a VEX or EVEX instruction is proved at its displacement and nowhere else") {
+    const auto verdict_of = [](std::initializer_list<int> insn, std::uint32_t field_at) {
+        Code c;
+        lea_image_base(c);
+        const std::uint32_t site = c.emit_reloc(insn, field_at);
+        c.emit({0xC3});
+        return c.check(site);
+    };
+    {
+        const SiteCheck k = verdict_of({0xC5, 0xFA, 0x10, 0x84, 0x87, 0, 0, 0, 0}, 5);  // vmovss xmm0, dword ptr [rdi+rax*4+d32]
+        CHECK_MESSAGE(k.proved(), to_string(k.verdict) << " " << k.reason);
+        CHECK(k.at == 7);
+        CHECK(k.length == 9);
+        CHECK(k.bytes == "c5 fa 10 84 87 00 00 00 00");
+    }
+    CHECK(verdict_of({0xC5, 0xFA, 0x11, 0x84, 0x87, 0, 0, 0, 0}, 5).proved());                    // vmovss [rdi+rax*4+d32], xmm0 (C5: two-byte VEX)
+    CHECK(verdict_of({0xC4, 0xE2, 0x79, 0x18, 0x84, 0x87, 0, 0, 0, 0}, 6).proved());              // vbroadcastss xmm0, [rdi+rax*4+d32] (C4: three-byte VEX)
+    CHECK(verdict_of({0xC4, 0xE3, 0x79, 0x04, 0x84, 0x87, 0, 0, 0, 0, 0x1B}, 6).proved());        // vpermilps xmm0, [rdi+rax*4+d32], 1Bh (imm8 behind it)
+    CHECK(verdict_of({0x62, 0xF1, 0x7C, 0x48, 0x10, 0x84, 0x87, 0, 0, 0, 0}, 7).proved());        // vmovups zmm0, [rdi+rax*4+d32] (EVEX)
+    CHECK(verdict_of({0xC5, 0xFA, 0x10, 0x87, 0, 0, 0, 0}, 4).proved());                          // vmovss xmm0, [rdi+d32]
+
+    // The same refusals as for legacy encodings: the decoder's flags come through for VEX, and so does the base rule.
+    CHECK(verdict_of({0xC5, 0xFA, 0x10, 0x05, 0, 0, 0, 0}, 4).verdict == SiteVerdict::RipRelative);                  // [rip+d32]
+    CHECK(verdict_of({0x67, 0xC5, 0xFA, 0x10, 0x84, 0x87, 0, 0, 0, 0}, 6).verdict == SiteVerdict::Address32);        // 67 prefix
+    CHECK(verdict_of({0x65, 0xC5, 0xFA, 0x10, 0x84, 0x87, 0, 0, 0, 0}, 6).verdict == SiteVerdict::SegmentFsGs);      // gs:
+    CHECK(verdict_of({0x64, 0xC5, 0xFA, 0x10, 0x84, 0x87, 0, 0, 0, 0}, 6).verdict == SiteVerdict::SegmentFsGs);      // fs:
+    CHECK(verdict_of({0x65, 0x62, 0xF1, 0x7C, 0x48, 0x10, 0x84, 0x87, 0, 0, 0, 0}, 8).verdict == SiteVerdict::SegmentFsGs);  // gs: on EVEX
+    CHECK(verdict_of({0xC5, 0xFA, 0x10, 0x04, 0x85, 0, 0, 0, 0}, 5).verdict == SiteVerdict::NoBaseRegister);         // [rax*4+d32]
+    CHECK(verdict_of({0xC5, 0xFA, 0x10, 0x04, 0x25, 0, 0, 0, 0}, 5).verdict == SiteVerdict::NoBaseRegister);         // [d32]
+}
+
+TEST_CASE("imgrel prover: a relocation anywhere but the displacement of a VEX instruction stops the sweep") {
+    const auto site_behind = [](std::initializer_list<int> insn, std::uint32_t field_at, std::uint32_t width) {
+        Code c;
+        const std::uint32_t at = c.emit(insn);
+        c.fields.push_back(RelocField{at + field_at, width});
+        const std::uint32_t site = c.emit_reloc({0x8B, 0x84, 0x87, 0, 0, 0, 0}, 3);
+        return c.check(site);
+    };
+    {
+        // vshufps xmm0, xmm0, xmm1, 8 (c5 f8 c6 c1 08): a relocation over its last four bytes ends with the instruction.
+        const SiteCheck k = site_behind({0xC5, 0xF8, 0xC6, 0xC1, 0x08}, 1, 4);
+        CHECK(k.verdict == SiteVerdict::RanIntoData);
+        CHECK(k.at == 0);
+        CHECK(contains(k.reason, "c5 f8 c6 c1 08"));
+    }
+    CHECK(site_behind({0xC5, 0xFA, 0x10, 0x84, 0x87, 0, 0, 0, 0}, 4, 4).verdict == SiteVerdict::RanIntoData);             // one byte early: SIB + 3 of the displacement
+    CHECK(site_behind({0xC5, 0xFA, 0x10, 0x84, 0x87, 0, 0, 0, 0}, 1, 4).verdict == SiteVerdict::RanIntoData);             // payload, opcode, ModRM, SIB
+    CHECK(site_behind({0xC4, 0xE3, 0x79, 0x04, 0x84, 0x87, 0, 0, 0, 0, 0x1B}, 7, 4).verdict == SiteVerdict::RanIntoData); // 3 of the displacement + the imm8
+    CHECK(site_behind({0xC4, 0xE3, 0x79, 0x04, 0x84, 0x87, 0, 0, 0, 0, 0x1B}, 10, 1).verdict == SiteVerdict::RanIntoData);  // the imm8 itself
+    CHECK(site_behind({0x62, 0xF1, 0x7C, 0x48, 0x10, 0x84, 0x87, 0, 0, 0, 0}, 3, 4).verdict == SiteVerdict::RanIntoData); // inside the EVEX payload
+    CHECK(site_behind({0xC5, 0xFA, 0x10, 0x44, 0x87, 0x10}, 5, 1).verdict == SiteVerdict::RanIntoData);                   // a disp8 is never a relocation
+    // At the displacement the sweep goes on and the site behind it is proved.
+    CHECK(site_behind({0xC5, 0xFA, 0x10, 0x84, 0x87, 0, 0, 0, 0}, 5, 4).proved());
+    CHECK(site_behind({0xC5, 0xFA, 0x10, 0x05, 0, 0, 0, 0}, 4, 4).proved());                                                // vmovss xmm0, [rip+d32] (REL32)
+    CHECK(site_behind({0x62, 0xF1, 0x7C, 0x48, 0x10, 0x84, 0x87, 0, 0, 0, 0}, 7, 4).proved());
+    CHECK(site_behind({0xC4, 0xE3, 0x79, 0x04, 0x05, 0, 0, 0, 0, 0x1B}, 5, 4).proved());                                    // REL32_1 on a RIP-relative VEX operand
+    // VEX instructions without any relocation never stop it.
+    {
+        Code c;
+        c.emit({0xC5, 0xF8, 0x77});              // vzeroupper
+        c.emit({0xC5, 0xF8, 0x28, 0xC1});        // vmovaps xmm0, xmm1
+        c.emit({0xC5, 0xF8, 0xC6, 0xC1, 0x08});  // vshufps xmm0, xmm0, xmm1, 8
+        const std::uint32_t site = c.emit_reloc({0xC5, 0xFA, 0x10, 0x84, 0x87, 0, 0, 0, 0}, 5);
+        CHECK(c.check(site).proved());
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The planner
 // ---------------------------------------------------------------------------------------------
@@ -869,6 +939,29 @@ TEST_CASE("imgrel plan: a relocation over opcode bytes of an earlier instruction
     REQUIRE(d != nullptr);
     CHECK(contains(d->message, "the relocation at +0x2 does not fit"));
     CHECK(contains(d->message, "66 41 81 c0 00 00"));
+}
+
+TEST_CASE("imgrel plan: a VEX-encoded load of old data is retargeted (the decoder knows VEX since WP-38)") {
+    OneSite s({0xC5, 0xFA, 0x10, 0x84, 0x87, 0, 0, 0, 0}, 5, 0x444);  // vmovss xmm0, dword ptr g_tick[rdi+rax*4+444h]
+    Built b = s.o.build();
+    auto r = plan_bind(s.w.input(b));
+    REQUIRE_MESSAGE(r.has_value(), err(r));
+    CHECK(r->imgrel_sites == 1);
+    CHECK(r->imgrel_verified == 1);
+    const Fixup* fx = fixup_at(*r, s.f.section, s.site);
+    REQUIRE(fx != nullptr);
+    CHECK(fx->kind == FixupKind::Addr32NbDisp);
+    CHECK(fx->addend == 0x444);
+    {
+        OneSite gs({0x65, 0xC5, 0xFA, 0x10, 0x84, 0x87, 0, 0, 0, 0}, 6);  // the same through gs:
+        Built bg = gs.o.build();
+        std::vector<cml::Diag> errors;
+        REQUIRE(!plan_bind(gs.w.input(bg), &errors).has_value());
+        REQUIRE(errors.size() == 1);
+        CHECK(errors[0].code == diag::kAddr32NbToOldData);
+        CHECK(contains(errors[0].message, "fs/gs"));
+        CHECK(contains(errors[0].message, "65 c5 fa 10 84 87"));
+    }
 }
 
 TEST_CASE("imgrel plan: ADDR32NB to a thunk and to a synthesized import slot stay with the linker") {
