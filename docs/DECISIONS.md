@@ -1008,14 +1008,21 @@ table entries break when the patch lies below the old image. Instead:
    the agent writes `int32(S + A − patch_image_base)`, where `S + A` is the absolute target as for the other kinds
    (ADR-0025), and refuses with a CML47xx diagnostic when the value does not fit a signed 32-bit field. Patches load
    within 1.5 GiB of the module (WP-08), so it fits in practice.
-3. The planner accepts such a site only when it is **proved** to be a sign-extended displacement: the site lies in a
-   code section, and decoding the section linearly from its start (the shared length decoder, compiled into the broker
-   unchanged) reaches an instruction whose `disp_size == 4` and whose `disp_offset` is exactly the site, without a
-   RIP-relative operand and without a `67` prefix. Anything else (a site in a data section, an immediate, an instruction
-   the decoder does not know before the site, a site inside the bytes of an earlier relocation) keeps CML3101, whose
-   message now names the instruction bytes. "Unknown" always refuses; nothing is guessed.
-4. The decoder reports the displacement (`DecodeResult::disp_offset`, `disp_size`). The orchestrator adds those two
-   fields in the PR that carries this ADR, so that WP-36 and WP-38 both start from them. WP-38 owns
+3. The planner accepts such a site only when it is **proved** to be a sign-extended displacement of a plain 64-bit
+   address:
+   - the site lies in a code section;
+   - decoding linearly (the shared length decoder, compiled into the broker unchanged) from the nearest function
+     symbol at or before the site reaches an instruction whose `disp_size == 4` and whose `disp_offset` is exactly the
+     site. The sweep starts at the function, not at the section, because a section can hold several functions
+     (`/Gy-`, `#pragma code_seg`) and each one's jump table follows its code;
+   - that instruction has none of `kInsnRipRel`, `kInsnAddr32` (a `67` prefix) and `kInsnSegFsGs`;
+   - every other relocation site the sweep passes lies wholly inside the displacement or the immediate of one decoded
+     instruction. A relocation that straddles an instruction boundary means the sweep ran into data.
+
+   Anything else (a site in a data section, an immediate, an instruction the decoder does not know before the site)
+   keeps CML3101, whose message now names the instruction bytes. "Unknown" always refuses; nothing is guessed.
+4. The decoder reports the displacement (`DecodeResult::disp_offset`, `disp_size`) and the two prefix flags above.
+   The orchestrator adds them in the PR that carries this ADR, so that WP-36 and WP-38 both start from them. WP-38 owns
    `agent/src/hook/length_decoder.*` and keeps the fields correct for the encodings it adds; WP-36 does not edit the
    decoder.
 5. Unchanged-function elision (WP-25) and hook narrowing must treat an `Addr32NbDisp` site like the other bound-data
@@ -1042,11 +1049,18 @@ table entries break when the patch lies below the old image. Instead:
 1. `cml_pdb` reads the TPI and IPI streams itself (ADR-0014: no third-party parser). Access is lazy: opening an index
    reads no type records, and the first lookup builds whatever offset table it needs. The WP-27 budgets (index time,
    broker memory) must hold with the reader in place; the `pdb-benchmark` job shows it.
-2. The patch object is compiled `/Z7` (ADR-0026), so it carries its own type records in `.debug$T` and its procedure
-   records in `.debug$S`. One canonical signature (calling convention, return type, parameter list, member-function
-   class and `this` adjustment, with every referenced type rendered structurally and by its unique name where it has
-   one) is computed by the **same** code for a TPI record and for a `.debug$T` record. The planner compares
-   signatures; it never compares type indices across the two and never parses decorated names to learn a signature.
+2. The new side's types come from the patch object. With `/Z7` (the usual rewrite, ADR-0026) they are in its
+   `.debug$T`, next to the procedure records in `.debug$S`. A cl TU that uses a `/Zi` precompiled header is compiled
+   with `/Zi` and a private compiler PDB (`PchDebugMode::KeepZiPrivatePdb`, the default): its `.debug$T` holds only a
+   type-server reference (`LF_TYPESERVER2`), and the types are read from that PDB with the same TPI reader. A
+   `/Z7 /Yu` object refers to the PCH object's types (`LF_PRECOMP`); if those cannot be resolved the types count as
+   unreadable (point 3). `/Zi` with a PCH is Visual Studio's default project shape, so the type-server path is in
+   scope.
+
+   One canonical signature (calling convention, return type, parameter list, member-function class and `this`
+   adjustment, with every referenced type rendered structurally and by its unique name where it has one) is computed
+   by the **same** code for a TPI record and for a `.debug$T` record. The planner compares signatures; it never
+   compares type indices across the two sides and never parses decorated names to learn a signature.
 3. Static functions that share scope and name (pass B of the static matching) pair one-to-one by signature. A
    function with no partner is a new function (not hooked); an old one with no partner stays as it is. CML3214 stays
    for what is still ambiguous: equal signatures, or types that cannot be read (no type records, a type server PDB
@@ -1067,6 +1081,10 @@ table entries break when the patch lies below the old image. Instead:
   sibling, changed.
 - Unit tests on synthetic type streams and on the real fixture PDBs, including true ambiguity (CML3214/CML3207 still
   raised) and unreadable types.
+- Fixture `pch` gains a static overload set in a TU that uses the precompiled header, with a scenario that edits one
+  overload. Under cl the log shows which path supplied the new side's types (`WP37-TYPES source=debugT|typeserver|
+  unreadable`). `typeserver` or `debugT` must end in a correct reload; `unreadable` must end in CML3214, and the WP
+  document says why it could not be read. A wrong pairing is the only unacceptable result.
 - Corpus, Dear ImGui under cl and clang-cl: the three `unsupported-static-overloads-*` edits become successful
   reloads with an observed marker (the win32 backend, `imgui.cpp`, and the `ImFloor` header edit).
 - Corpus, Godot: a new edit of `scene/main/scene_tree.cpp` reloads and its marker is observed.
@@ -1148,6 +1166,7 @@ functions. The decision is reversed **together with** a reference check, which i
   Whichever merges second merges `main` and re-runs its acceptance.
 - `tests/fixtures/CMakeLists.txt` and the scenario lists: one line per fixture; conflicts are resolved by keeping both.
 - `corpus.yml` runs on pull requests that touch `tests/corpus/**`. Every package of this wave touches that tree, so
-  every PR carries a corpus run. Its `push` trigger is extended to `wp/3*` branches (without Godot, as before).
+  every PR carries a corpus run. Its `push` trigger is extended to the branches of wave 10 and later (`wp/36-*` and
+  up), without Godot, as before.
 - No fixed merge order. Each PR is reviewed at the level in the table, re-reviewed after a substantial fix round, and
   merged as a squash with the expected head sha once the orchestrator has read its CI logs.

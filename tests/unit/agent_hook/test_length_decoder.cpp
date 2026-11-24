@@ -125,9 +125,9 @@ TEST_CASE("mov and lea with ModRM, SIB and displacements") {
     expect_len({0x4C, 0x8D, 0x1D, 0x00, 0x00, 0x00, 0x00}, 7, kInsnRipRel);  // lea r11, [rip+0]
     expect_len({0x48, 0x8D, 0x4C, 0x24, 0x20}, 5);        // lea rcx, [rsp+20h]
     expect_len({0x48, 0x8D, 0x54, 0x24, 0x28}, 5);
-    expect_len({0x67, 0x8B, 0x00}, 3);                    // mov eax, [eax]     (67 prefix: same layout)
-    expect_len({0x64, 0x48, 0x8B, 0x04, 0x25, 0x30, 0x00, 0x00, 0x00}, 9);  // mov rax, fs/gs:[30h] (SIB no base)
-    expect_len({0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00}, 9);  // mov rax, gs:[60h]
+    expect_len({0x67, 0x8B, 0x00}, 3, kInsnAddr32);       // mov eax, [eax]     (67 prefix: same layout)
+    expect_len({0x64, 0x48, 0x8B, 0x04, 0x25, 0x30, 0x00, 0x00, 0x00}, 9, kInsnSegFsGs);  // mov rax, fs:[30h] (SIB no base)
+    expect_len({0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00}, 9, kInsnSegFsGs);  // mov rax, gs:[60h]
     expect_len({0x48, 0x63, 0xD1}, 3);                    // movsxd rdx, ecx
     expect_len({0x0F, 0xB6, 0xC1}, 3);                    // movzx eax, cl
     expect_len({0x0F, 0xB7, 0x01}, 3);
@@ -467,6 +467,11 @@ TEST_CASE("the displacement of a memory operand is located; immediates and branc
         {{0xE9, 0x00, 0x00, 0x00, 0x00}, 5, 0, 0, kInsnJmp},                         // jmp rel32
         {{0x0F, 0x84, 0x00, 0x00, 0x00, 0x00}, 6, 0, 0, kInsnJcc},                   // je rel32
         {{0xC7, 0x05, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00}, 10, 2, 4, kInsnRipRel},  // mov [rip+disp32], imm32
+        // The same layout, but the address is not a plain 64-bit one: the flags say so.
+        {{0x67, 0x8B, 0x84, 0x87, 0x00, 0x00, 0x00, 0x00}, 8, 4, 4, kInsnAddr32},    // mov eax, [edi+eax*4+disp32]
+        {{0x65, 0x8B, 0x84, 0x87, 0x00, 0x00, 0x00, 0x00}, 8, 4, 4, kInsnSegFsGs},   // mov eax, gs:[rdi+rax*4+disp32]
+        {{0x67, 0x65, 0x8B, 0x87, 0x00, 0x00, 0x00, 0x00}, 8, 4, 4, static_cast<std::uint8_t>(kInsnAddr32 | kInsnSegFsGs)},
+        {{0x2E, 0x8B, 0x87, 0x00, 0x00, 0x00, 0x00}, 7, 3, 4, 0},                    // cs override: ignored in 64-bit mode
     };
     for (const Case& c : cases) {
         INFO("bytes: " << hex(c.bytes));
@@ -479,13 +484,12 @@ TEST_CASE("the displacement of a memory operand is located; immediates and branc
             CHECK(r.disp_offset + r.disp_size <= r.length);
         }
     }
-    // Not Ok: no displacement is reported.
-    const Bytes vex = {0xC5, 0xF8, 0x10, 0x84, 0x87, 0x00, 0x00, 0x00, 0x00, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC};
-    const DecodeResult u = decode_instruction(vex.data(), vex.size());
-    if (u.status != DecodeStatus::Ok) {
-        CHECK(u.disp_offset == 0);
-        CHECK(u.disp_size == 0);
-    }
+    // Not Ok: no displacement is reported. (0F 0F is the 3DNow! escape, which stays outside the covered set.)
+    const Bytes unknown_bytes = {0x0F, 0x0F, 0x84, 0x87, 0x00, 0x00, 0x00, 0x00, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC};
+    const DecodeResult u = decode_instruction(unknown_bytes.data(), unknown_bytes.size());
+    CHECK(u.status == DecodeStatus::Unknown);
+    CHECK(u.disp_offset == 0);
+    CHECK(u.disp_size == 0);
     const Bytes cut = {0x8B, 0x84, 0x87, 0x00};
     const DecodeResult t = decode_instruction(cut.data(), cut.size());
     CHECK(t.status == DecodeStatus::Truncated);
