@@ -36,6 +36,17 @@ constexpr std::uint16_t LF_FUNC_ID = 0x1601;
 constexpr std::uint16_t LF_MFUNC_ID = 0x1602;
 
 constexpr std::uint16_t kPropHasUniqueName = 0x0200;
+constexpr std::uint16_t kPropForwardRef = 0x0080;
+
+// WP-46: local variable records, and the field-list leaves a closure class holds.
+constexpr std::uint16_t kSymLocal = 0x113E;     // S_LOCAL: type u32, flags u16, name
+constexpr std::uint16_t kSymRegRel32 = 0x1111;  // S_REGREL32: offset u32, type u32, register u16, name
+constexpr std::uint16_t kSymBpRel32 = 0x110B;   // S_BPREL32: offset i32, type u32, name
+constexpr std::uint16_t LF_FIELDLIST = 0x1203;
+constexpr std::uint16_t LF_MEMBER = 0x150D;
+constexpr std::uint16_t LF_METHOD = 0x150F;
+constexpr std::uint16_t LF_NESTTYPE = 0x1510;
+constexpr std::uint16_t LF_ONEMETHOD = 0x1511;
 
 // Limits of one signature. Real signatures use a few dozen records; a crafted record graph (a pointer to itself, an
 // argument list that fans out) runs into these instead of the stack or the heap.
@@ -437,6 +448,212 @@ std::optional<std::string> canonical_type(const TypeSource& types, std::uint32_t
     return out;
 }
 
+bool udt_record_names(const TypeRecord& record, std::string_view& name, std::string_view& unique) {
+    UdtNames names;
+    if (record.body == nullptr || !udt_names(record, names)) {
+        return false;
+    }
+    name = names.name;
+    unique = names.unique;
+    return true;
+}
+
+std::optional<std::uint64_t> udt_definition_size(const TypeRecord& r) {
+    if ((r.kind != LF_CLASS && r.kind != LF_STRUCTURE && r.kind != LF_UNION) || r.body == nullptr) {
+        return std::nullopt;
+    }
+    const std::uint32_t fixed = r.kind == LF_UNION ? 8u : 16u;
+    if (r.body_len < fixed + 2 || (rd16(r.body + 2) & kPropForwardRef) != 0) {
+        return std::nullopt;
+    }
+    std::uint32_t used = 0;
+    std::uint64_t size = 0;
+    if (!read_numeric(r.body + fixed, r.body_len - fixed, used, size)) {
+        return std::nullopt;
+    }
+    return size;
+}
+
+std::optional<std::uint64_t> type_size_of(const TypeSource& types, std::uint32_t index,
+                                          const std::function<std::optional<std::uint64_t>(const std::string& unique)>& forward) {
+    for (int depth = 0; depth < 8; ++depth) {
+        if (index < 0x1000) {
+            if (((index >> 8) & 0xFu) != 0) {
+                return 8;  // a pointer mode of a simple type (64-bit)
+            }
+            switch (index & 0xFFu) {
+                case 0x10: case 0x20: case 0x30: case 0x68: case 0x69: case 0x70: case 0x7C: return 1;
+                case 0x11: case 0x21: case 0x31: case 0x71: case 0x72: case 0x73: case 0x7A: return 2;
+                case 0x12: case 0x22: case 0x32: case 0x40: case 0x74: case 0x75: case 0x7B: return 4;
+                case 0x13: case 0x23: case 0x33: case 0x41: case 0x76: case 0x77: return 8;
+                default: return std::nullopt;
+            }
+        }
+        TypeRecord r;
+        if (!types.find_type(index, r)) {
+            return std::nullopt;
+        }
+        switch (r.kind) {
+            case LF_MODIFIER:
+                if (r.body_len < 6) {
+                    return std::nullopt;
+                }
+                index = rd32(r.body);
+                continue;
+            case LF_POINTER: {
+                if (r.body_len < 8) {
+                    return std::nullopt;
+                }
+                const std::uint32_t size = (rd32(r.body + 4) >> 13) & 0x3Fu;
+                return size == 0 ? 8u : size;
+            }
+            case LF_ENUM:
+                if (r.body_len < 8) {
+                    return std::nullopt;
+                }
+                index = rd32(r.body + 4);
+                continue;
+            case LF_ARRAY: {
+                std::uint32_t used = 0;
+                std::uint64_t size = 0;
+                if (r.body_len < 10 || !read_numeric(r.body + 8, r.body_len - 8, used, size)) {
+                    return std::nullopt;
+                }
+                return size;
+            }
+            case LF_CLASS:
+            case LF_STRUCTURE:
+            case LF_UNION: {
+                if (const std::optional<std::uint64_t> size = udt_definition_size(r)) {
+                    return size;
+                }
+                UdtNames names;
+                if (!udt_names(r, names) || names.unique.empty() || !forward) {
+                    return std::nullopt;
+                }
+                return forward(std::string(names.unique));  // (second review: exact, the unit's discriminator included)
+            }
+            default: return std::nullopt;
+        }
+    }
+    return std::nullopt;
+}
+
+std::string class_unique_name_of(const TypeSource& types, std::uint32_t index) {
+    for (int depth = 0; depth < 4 && index >= 0x1000; ++depth) {
+        TypeRecord r;
+        if (!types.find_type(index, r)) {
+            return {};
+        }
+        if (r.kind == LF_MODIFIER && r.body_len >= 6) {
+            index = rd32(r.body);
+            continue;
+        }
+        if (r.kind != LF_CLASS && r.kind != LF_STRUCTURE) {
+            return {};
+        }
+        UdtNames names;
+        if (!udt_names(r, names) || names.unique.empty()) {
+            return {};
+        }
+        return without_tu_discriminator(names.unique);
+    }
+    return {};
+}
+
+std::optional<std::string> udt_layout(const TypeSource& types, std::uint32_t index, std::string* why) {
+    const auto fail = [&](const std::string& text) -> std::optional<std::string> {
+        if (why != nullptr) {
+            *why = text;
+        }
+        return std::nullopt;
+    };
+    TypeRecord r;
+    if (!types.find_type(index, r)) {
+        return fail("type record 0x" + hex(index) + " cannot be read");
+    }
+    if ((r.kind != LF_CLASS && r.kind != LF_STRUCTURE) || r.body_len < 18) {
+        return fail("type record 0x" + hex(index) + " is not a class");
+    }
+    if ((rd16(r.body + 2) & kPropForwardRef) != 0) {
+        return fail("type record 0x" + hex(index) + " is a forward reference");
+    }
+    const std::uint32_t field_index = rd32(r.body + 4);
+    std::uint32_t used = 0;
+    std::uint64_t size = 0;
+    if (!read_numeric(r.body + 16, r.body_len - 16, used, size)) {
+        return fail("the size of type record 0x" + hex(index) + " cannot be read");
+    }
+    std::string out = "size=" + std::to_string(size);
+    if (field_index == 0) {
+        return out;
+    }
+    TypeRecord fl;
+    if (!types.find_type(field_index, fl) || fl.kind != LF_FIELDLIST) {
+        return fail("the field list 0x" + hex(field_index) + " cannot be read");
+    }
+    const std::uint8_t* p = fl.body;
+    const std::uint32_t n = fl.body_len;
+    std::uint32_t off = 0;
+    std::uint32_t members = 0;
+    while (off < n) {
+        if (p[off] >= 0xF0) {  // LF_PAD<k>: k bytes of padding, this one included
+            const std::uint32_t skip = p[off] & 0x0Fu;
+            if (skip == 0) {
+                return fail("the field list 0x" + hex(field_index) + " is malformed");
+            }
+            off += skip;
+            continue;
+        }
+        if (n - off < 2) {
+            return fail("the field list 0x" + hex(field_index) + " is malformed");
+        }
+        const std::uint16_t leaf = rd16(p + off);
+        std::uint32_t name_at = 0;
+        if (leaf == LF_MEMBER) {
+            if (n - off < 10) {
+                return fail("a member of the field list 0x" + hex(field_index) + " is malformed");
+            }
+            const std::uint32_t type = rd32(p + off + 4);
+            std::uint64_t at = 0;
+            std::uint32_t width = 0;
+            if (!read_numeric(p + off + 8, n - off - 8, width, at)) {
+                return fail("a member offset of the field list 0x" + hex(field_index) + " cannot be read");
+            }
+            std::string unreadable;
+            const std::optional<std::string> text = canonical_type(types, type, &unreadable);
+            if (!text) {
+                return fail("the type of a member cannot be read: " + unreadable);
+            }
+            out += ";" + std::to_string(at) + ":" + *text;
+            if (++members > kMaxArguments) {
+                return fail("the class has too many members");
+            }
+            name_at = off + 8 + width;
+        } else if (leaf == LF_ONEMETHOD) {
+            if (n - off < 8) {
+                return fail("a method of the field list 0x" + hex(field_index) + " is malformed");
+            }
+            const std::uint32_t kind = (rd16(p + off + 2) >> 2) & 7u;  // CV_MTintro / CV_MTpureintro carry a vbase offset
+            name_at = off + 8 + ((kind == 4 || kind == 6) ? 4u : 0u);
+        } else if (leaf == LF_METHOD || leaf == LF_NESTTYPE) {
+            name_at = off + 8;
+        } else {
+            return fail("the field list 0x" + hex(field_index) + " has a leaf 0x" + hex(leaf) + " this reader does not know");
+        }
+        if (name_at >= n) {
+            return fail("the field list 0x" + hex(field_index) + " is malformed");
+        }
+        std::string_view name;
+        std::uint32_t name_len = 0;
+        if (!read_cstr(p + name_at, n - name_at, name, name_len)) {
+            return fail("the field list 0x" + hex(field_index) + " is malformed");
+        }
+        off = name_at + name_len;
+    }
+    return out;
+}
+
 // ---- objects ---------------------------------------------------------------------------------------------------------
 
 Result<DebugTInfo> inspect_debug_t(std::span<const std::uint8_t> section) {
@@ -583,6 +800,19 @@ Result<std::vector<ObjectProc>> read_object_procs(std::span<const std::uint8_t> 
                 }
                 if (cv::is_scope_closer(r.kind)) {
                     scopes.close();
+                    return;
+                }
+                // WP-46: the types of the procedure's own local variables (S_LOCAL; S_REGREL32 / S_BPREL32 of cl at /Od), not
+                // those of an inlined call (an inline site scope).
+                if ((r.kind == kSymLocal && r.body_len >= 6) || ((r.kind == kSymRegRel32 || r.kind == kSymBpRel32) && r.body_len >= 8)) {
+                    std::uint32_t proc = kNoProc;
+                    bool plain = false;
+                    // (Second review: a parameter, S_LOCAL with fIsParam, is not counted: a template that takes the closure is not
+                    // the function that creates it.)
+                    const bool parameter = r.kind == kSymLocal && (rd16(r.body + 4) & 1u) != 0;
+                    if (!parameter && scopes.locate(proc, path, plain) && proc != kNoProc && plain && out[proc].local_types.size() < kMaxProcStatics) {
+                        out[proc].local_types.push_back(rd32(r.body + (r.kind == kSymLocal ? 0 : 4)));
+                    }
                     return;
                 }
                 const bool thread = r.kind == cv::S_LTHREAD32 || r.kind == cv::S_GTHREAD32;

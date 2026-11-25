@@ -927,6 +927,106 @@ LambdaPairing pair_lambdas_by_code(const NarrowInput& input) {
     return out;
 }
 
+std::vector<Diag> prove_hashed_lambdas(const NarrowInput& input) {
+    std::vector<Diag> out;
+    if (input.plan == nullptr || input.plan->hashed_lambdas.empty()) {
+        return out;
+    }
+    const bind::BindPlan& plan = *input.plan;
+    NarrowInput ni = input;
+    ni.enabled = true;
+    const Narrower narrower(ni);
+    std::map<std::string, const bind::HookEntry*> hook_of;
+    for (const bind::HookEntry& h : plan.hooks) {
+        hook_of.emplace(h.new_symbol, &h);
+    }
+    std::vector<std::string> changed;   // closures whose code changed
+    std::vector<std::string> unknown;   // closures whose code cannot be compared
+    std::string unknown_why;
+    std::size_t unchanged = 0;
+    std::size_t eliminated = 0;  // paired by elimination: the changed lambda (its code is not the old one's, by construction)
+    for (const bind::HashedLambda& lambda : plan.hashed_lambdas) {
+        if (!lambda.old_closure.empty()) {
+            ++eliminated;
+            bool hooked = !lambda.functions.empty();
+            for (const std::string& function : lambda.functions) {
+                hooked = hooked && hook_of.count(function) != 0;
+            }
+            CML_LOG(Trace, "hashed lambda %s: paired by elimination with the old %s%s", lambda.closure.c_str(), lambda.old_closure.c_str(), hooked ? "" : " (a function is not hooked)");
+            if (!hooked) {
+                unknown.push_back(lambda.closure);
+                unknown_why = unknown_why.empty() ? "the call operator of '" + lambda.closure + "', paired by elimination with '" + lambda.old_closure + "', is not hooked to the old one" : unknown_why;
+            }
+            continue;
+        }
+        Equivalence verdict = Equivalence::Yes;
+        std::string why;
+        for (const std::string& function : lambda.functions) {
+            const auto hook = hook_of.find(function);
+            if (hook == hook_of.end()) {
+                verdict = Equivalence::Unknown;
+                why = "'" + bind::display_name(function) + "' is not hooked to an old function";
+                break;
+            }
+            const NarrowDecision d = narrower.judge(*hook->second);
+            CML_LOG(Trace, "hashed lambda %s: %s -> %s%s%s", lambda.closure.c_str(), bind::display_name(function).c_str(), to_string(d.reason), d.detail.empty() ? "" : ": ",
+                    d.detail.c_str());
+            switch (d.reason) {
+                case NarrowReason::Unchanged: break;
+                case NarrowReason::BytesDiffer:
+                case NarrowReason::SizeDiffers:
+                case NarrowReason::TargetChanged:
+                case NarrowReason::TargetNew: verdict = verdict == Equivalence::Unknown ? verdict : Equivalence::No; break;
+                default:
+                    verdict = Equivalence::Unknown;
+                    why = "the code of '" + bind::display_name(function) + "' cannot be compared with the old code: " + to_string(d.reason) + (d.detail.empty() ? std::string() : " - " + d.detail);
+                    break;
+            }
+            if (verdict == Equivalence::Unknown) {
+                break;
+            }
+        }
+        if (verdict == Equivalence::Yes) {
+            ++unchanged;
+        } else if (verdict == Equivalence::No) {
+            changed.push_back(lambda.closure);
+        } else {
+            unknown.push_back(lambda.closure);
+            unknown_why = unknown_why.empty() ? why : unknown_why;
+        }
+    }
+    // ADR-0043 rule (d), as ruled for these lambdas (WP-46, D1): every lambda whose code is the old one's is that lambda; one
+    // lambda left whose code changed is the one the edit changed. Two or more changed, or one that cannot be compared: the
+    // names are all that pairs them, and nothing proves them.
+    // (The lambda paired by elimination is the one changed lambda rule (d) allows; then every name-matched one must be unchanged.)
+    const bool proven = unknown.empty() && changed.size() + eliminated <= 1;
+    CML_LOG(Info, "WP46-HASHED-LAMBDAS object=%s closures=%zu unchanged=%zu changed=%zu eliminated=%zu unknown=%zu proven=%s", plan.object_name.c_str(), plan.hashed_lambdas.size(),
+            unchanged, changed.size(), eliminated, unknown.size(),
+            proven ? (eliminated != 0 ? "by-elimination" : (changed.empty() ? "unchanged" : "one-changed")) : "refused");
+    if (proven) {
+        return out;
+    }
+    const std::vector<std::string>& named = unknown.empty() ? changed : unknown;
+    std::string list;
+    for (std::size_t i = 0; i < named.size() && i < 8; ++i) {
+        list += (list.empty() ? "" : ", ") + named[i];
+    }
+    if (named.size() > 8) {
+        list += " and " + std::to_string(named.size() - 8) + " more";
+    }
+    const std::string reason =
+        !unknown.empty() ? unknown_why
+        : eliminated != 0 ? "one lambda was paired by elimination (its name changed with its code) while " + std::to_string(changed.size()) +
+                                " lambda(s) whose names were kept changed as well, so their code cannot say which old lambda each one is"
+                          : std::to_string(changed.size()) + " of them changed, so their code cannot say which old lambda each one is";
+    out.push_back(Diag::make(bind::diag::kHashedLambdasUnproven,
+                             "Lambdas " + list + " in " + plan.object_name +
+                                 " are named by a hash (cl's legacy lambda processor) and were paired with the old lambdas of the same name, which only their code can confirm, and " + reason +
+                                 "; a wrong pairing would run one lambda's code, or give its statics, for another",
+                             "Change at most one lambda of this file per reload, compile with /Zc:lambda (the default under /std:c++20), or hot-restart."));
+    return out;
+}
+
 std::vector<Diag> prove_bitmask_guards(const NarrowInput& input) {
     std::vector<Diag> out;
     if (input.plan == nullptr) {

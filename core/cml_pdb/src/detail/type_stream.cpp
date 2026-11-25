@@ -46,6 +46,7 @@ Result<std::unique_ptr<TypeStream>> TypeStream::open(const Msf& msf, std::uint32
     if (out->type_begin_ < 0x1000u || type_end < out->type_begin_) {
         return fail("the type index range is invalid");
     }
+    out->type_end_ = type_end;
     out->stats_.opened = true;
     out->stats_.record_bytes = out->record_bytes_;
 
@@ -177,6 +178,43 @@ bool TypeStream::find(std::uint32_t index, TypeRecord& out) const {
     out.body = chunk.data + off + 4;
     out.body_len = reclen - 2;
     return true;
+}
+
+bool TypeStream::walk(const std::function<void(std::uint32_t index, const TypeRecord& record)>& visit) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::uint64_t visited = 0;
+    for (std::size_t entry = 0; entry < entries_.size(); ++entry) {
+        // A chunk that is already loaded is used; any other is read for this walk only and not kept (a walk of the whole
+        // stream must not hold all of it in memory afterwards).
+        Chunk scratch;
+        const auto cached = loaded_.find(entry);
+        const Chunk* chunk = &scratch;
+        if (cached != loaded_.end()) {
+            chunk = &cached->second;
+        } else {
+            // (load() counts what it reads as kept: chunks, bytes loaded and copied. This chunk is not kept, so none of it
+            // stays in the statistics, which describe what the stream holds.)
+            const TypeStreamStats before = stats_;
+            load(entry, scratch);
+            stats_.chunks_loaded = before.chunks_loaded;
+            stats_.bytes_loaded = before.bytes_loaded;
+            stats_.bytes_copied = before.bytes_copied;
+        }
+        if (chunk->bad) {
+            return false;
+        }
+        for (std::size_t i = 0; i < chunk->offsets.size(); ++i) {
+            const std::uint32_t off = chunk->offsets[i];
+            const std::uint32_t reclen = rd16(chunk->data + off);
+            TypeRecord record;
+            record.kind = rd16(chunk->data + off + 2);
+            record.body = chunk->data + off + 4;
+            record.body_len = reclen - 2;
+            visit(entries_[entry].first_index + static_cast<std::uint32_t>(i), record);
+            ++visited;
+        }
+    }
+    return visited == static_cast<std::uint64_t>(type_end_ - type_begin_);
 }
 
 TypeStreamStats TypeStream::stats() const {

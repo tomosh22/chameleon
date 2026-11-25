@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -184,6 +185,17 @@ struct PdbIndex::Impl {
     mutable std::unique_ptr<TypeSource> type_source;  // find_type -> TPI, find_id -> IPI (created on first use)
     // The stream (nullptr when it cannot be opened; `error` then receives why).
     const detail::TypeStream* type_stream(bool want_tpi, Diag* error = nullptr) const;
+    // WP-46 (R-54): the closure classes of the TPI, built by the first closure_classes() call (index_types.cpp).
+    mutable std::mutex closures_mutex;
+    mutable bool closures_built = false;
+    mutable std::optional<Diag> closures_error;
+    mutable std::vector<ClosureClass> closures;
+    // WP-46 (review): sizes of the class / struct / union definitions by unique name (without the unit's discriminator), built
+    // by the first type_size() that meets a forward reference; `udt_sizes_ok` false when the walk was incomplete.
+    mutable std::mutex udt_sizes_mutex;
+    mutable bool udt_sizes_built = false;
+    mutable bool udt_sizes_ok = false;
+    mutable std::map<std::string, std::uint64_t> udt_sizes;
 
     mutable std::unique_ptr<std::atomic<std::uint8_t>[]> module_state;
     mutable std::vector<std::unique_ptr<detail::ModuleSymbols>> module_symbols;

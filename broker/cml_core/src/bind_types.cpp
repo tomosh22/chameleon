@@ -160,6 +160,7 @@ void ObjectSignatures::load() {
                 } else if (it->second.type_index != p.type_index || it->second.type_is_id != p.type_is_id) {
                     it->second.conflict = true;
                 }
+                it->second.local_types.insert(it->second.local_types.end(), p.local_types.begin(), p.local_types.end());  // WP-46
                 // The function-local statics of the procedure: each record names its variable through the SECREL
                 // relocation on its offset field, like the procedure record names its function.
                 ProcStatics& statics = it->second.statics;
@@ -223,6 +224,68 @@ std::optional<std::uint64_t> ObjectSignatures::function_of_static(std::uint32_t 
         return std::nullopt;
     }
     return it->second;
+}
+
+std::vector<std::uint64_t> ObjectSignatures::functions_with_local(const std::string& unique) {
+    std::vector<std::uint64_t> out;
+    if (!loaded_) {
+        load();
+    }
+    if (types_ == nullptr) {
+        return out;
+    }
+    for (const auto& [key, proc] : procs_) {
+        for (const std::uint32_t type : proc.local_types) {
+            if (pdb::class_unique_name_of(*types_, type) == unique) {
+                out.push_back(key);
+                break;
+            }
+        }
+    }
+    return out;
+}
+
+std::optional<std::string> ObjectSignatures::class_layout(const std::string& unique, std::string* why) {
+    if (!loaded_) {
+        load();
+    }
+    if (types_ == nullptr) {
+        if (why != nullptr) {
+            *why = unknown_.why;
+        }
+        return std::nullopt;
+    }
+    // The definition record of the class: the object's own records, or the type server's TPI.
+    std::uint32_t definition = 0;
+    const auto visit = [&](std::uint32_t index, const pdb::TypeRecord& record) {
+        std::string_view name;
+        std::string_view u;
+        if (definition == 0 && (record.kind == 0x1504 || record.kind == 0x1505) && record.body_len >= 4 && (record.body[2] & 0x80u) == 0 &&
+            pdb::udt_record_names(record, name, u) && pdb::without_tu_discriminator(u) == unique) {
+            definition = index;
+        }
+    };
+    if (object_types_ != nullptr) {
+        for (std::uint32_t i = 0; i < object_types_->record_count() && definition == 0; ++i) {
+            pdb::TypeRecord record;
+            const std::uint32_t index = object_types_->first_index() + i;
+            if (object_types_->find_type(index, record)) {
+                visit(index, record);
+            }
+        }
+    } else if (type_server_ != nullptr && !type_server_->walk_types(visit)) {
+        if (why != nullptr) {
+            *why = "the type server's types cannot be read completely";
+        }
+        return std::nullopt;
+    }
+    if (definition == 0) {
+        if (why != nullptr) {
+            *why = "the object has no definition of the class " + unique;
+        }
+        return std::nullopt;
+    }
+    return pdb::udt_layout(*types_, definition, why);
 }
 
 std::optional<std::string> ObjectSignatures::type_text(std::uint32_t type_index, std::string* why) {

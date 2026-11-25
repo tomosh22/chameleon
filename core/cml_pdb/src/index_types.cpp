@@ -1,7 +1,11 @@
 // WP-37: the type streams of a PdbIndex (lazy, sparse; detail/type_stream.h) and TypeServerPdb, the compiler PDB of an
 // object compiled with /Zi, opened for its types only.
 
+#include <chrono>
+#include <map>
 #include <cstring>
+#include <set>
+#include <string>
 
 #include "cml/pdb/diag_ids.h"
 #include "cml/util/log.h"
@@ -85,6 +89,89 @@ FunctionSignature PdbIndex::proc_signature(const SymbolView& proc) const {
     return function_signature(types(), proc.type_index, proc.type_is_id);
 }
 
+Result<const std::vector<ClosureClass>*> PdbIndex::closure_classes() const {
+    std::lock_guard<std::mutex> lock(impl_->closures_mutex);
+    if (!impl_->closures_built) {
+        impl_->closures_built = true;
+        Diag error;
+        const TypeStream* tpi = impl_->type_stream(true, &error);
+        if (tpi == nullptr) {
+            impl_->closures_error = error.code != 0 ? error : Diag::make(diag::kBadTypeStream, "The TPI stream of '" + impl_->path + "' cannot be read.", "Rebuild the module with full debug information.");
+        } else {
+            std::map<std::string, std::size_t> seen;  // unique name -> position in closures
+            const auto start = std::chrono::steady_clock::now();
+            // One walk of the stream; the chunks it reads are not kept (the signature reader keeps only what it looks up).
+            const bool complete = tpi->walk([&](std::uint32_t index, const TypeRecord& record) {
+                if (record.kind != 0x1504 && record.kind != 0x1505) {  // LF_CLASS, LF_STRUCTURE
+                    return;
+                }
+                std::string_view name;
+                std::string_view unique;
+                if (!udt_record_names(record, name, unique) || unique.size() < 13 || unique.compare(0, 2, ".?") != 0 || unique.compare(4, 8, "<lambda_") != 0) {
+                    return;
+                }
+                std::string plain = without_tu_discriminator(unique);
+                const bool forward = record.body_len >= 4 && (static_cast<std::uint32_t>(record.body[2]) & 0x80u) != 0;  // property: fwdref
+                const auto [at, added] = seen.emplace(plain, impl_->closures.size());
+                if (added) {
+                    impl_->closures.push_back({std::string(name), std::move(plain), 0});
+                }
+                if (!forward && impl_->closures[at->second].definition == 0) {
+                    impl_->closures[at->second].definition = index;
+                }
+            });
+            if (!complete) {
+                // A record that cannot be read could be a closure: the list would say less than the PDB, and its user refuses
+                // on less rather than more. Not a partial answer.
+                impl_->closures.clear();
+                impl_->closures_error = Diag::make(diag::kBadTypeRecord, "The TPI stream of '" + impl_->path + "' has records that cannot be read, so its closure classes are not known.",
+                                                   "Rebuild the module with full debug information.");
+            }
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            CML_LOG(Info, "WP46-CLOSURES pdb='%s' closures=%zu records=%u complete=%d ms=%.1f", impl_->path.c_str(), impl_->closures.size(), tpi->type_end() - tpi->type_begin(),
+                    complete ? 1 : 0, ms);
+        }
+    }
+    if (impl_->closures_error) {
+        return *impl_->closures_error;
+    }
+    return &impl_->closures;
+}
+
+namespace {
+constexpr std::uint64_t kConflictingSize = ~0ull;  // two definitions of one unique name with different sizes
+}  // namespace
+
+std::optional<std::uint64_t> PdbIndex::type_size(std::uint32_t index) const {
+    const TypeSource& source = types();
+    return type_size_of(source, index, [this](const std::string& unique) -> std::optional<std::uint64_t> {
+        std::lock_guard<std::mutex> lock(impl_->udt_sizes_mutex);
+        if (!impl_->udt_sizes_built) {
+            impl_->udt_sizes_built = true;
+            const TypeStream* tpi = impl_->type_stream(true);
+            impl_->udt_sizes_ok = tpi != nullptr && tpi->walk([&](std::uint32_t, const TypeRecord& record) {
+                std::string_view name;
+                std::string_view u;
+                const std::optional<std::uint64_t> size = udt_definition_size(record);
+                // (Second review: keyed by the EXACT unique name; two definitions of one name that disagree on the size make it
+                // unknown, never the first one's.)
+                if (size && udt_record_names(record, name, u) && !u.empty()) {
+                    const auto [at, added] = impl_->udt_sizes.emplace(std::string(u), *size);
+                    if (!added && at->second != *size) {
+                        at->second = kConflictingSize;
+                    }
+                }
+            });
+            CML_LOG(Info, "WP46-UDT-SIZES pdb='%s' definitions=%zu complete=%d", impl_->path.c_str(), impl_->udt_sizes.size(), impl_->udt_sizes_ok ? 1 : 0);
+        }
+        if (!impl_->udt_sizes_ok) {
+            return std::nullopt;
+        }
+        const auto it = impl_->udt_sizes.find(unique);
+        return it == impl_->udt_sizes.end() || it->second == kConflictingSize ? std::nullopt : std::optional<std::uint64_t>(it->second);
+    });
+}
+
 TypeStreamStats PdbIndex::type_stream_stats(bool tpi) const {
     const int slot = tpi ? 1 : 0;
     std::lock_guard<std::mutex> lock(impl_->type_stream_mutex);
@@ -132,6 +219,10 @@ Result<std::unique_ptr<TypeServerPdb>> TypeServerPdb::open(const std::string& pd
 
 bool TypeServerPdb::find_type(std::uint32_t index, TypeRecord& out) const {
     return impl_->tpi->find(index, out);
+}
+
+bool TypeServerPdb::walk_types(const std::function<void(std::uint32_t index, const TypeRecord& record)>& visit) const {
+    return impl_->tpi->walk(visit);
 }
 
 bool TypeServerPdb::find_id(std::uint32_t index, TypeRecord& out) const {
