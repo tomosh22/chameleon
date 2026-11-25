@@ -1426,7 +1426,9 @@ records each load and unload with a per-process sequence number, so a FreeLibrar
 unload and a load. The notification callback only appends to a preallocated lock-free ring and never calls the loader or
 allocates; the existing poll drains it. The snapshot diff stays as the fallback. A new message type is needed (`ModuleEvents`),
 so `agent_abi_version` is bumped by one with a broker that still accepts the old agent (falls back to snapshots). Range
-CML4700–4719 (agent), CML5620–5629 (broker). **Acceptance:** the `plugin_reload` fixture gains a step that frees and loads the
+CML4720–4739 (agent; amended: 4700–4719 belong to WP-36), CML5620–5629 (broker). **Amended (WP-48 round 1):** the wire ABI
+(`ipc::kAgentAbiVersion`, Hello/Welcome) goes 2 → 3; the C API's `CML_AGENT_ABI_VERSION` in `Chameleon_API.h` stays 2 (ADR-0034: a bump
+forces every application to rebuild). A pre-WP-48 agent gets the old Welcome layout and CML5621. **Acceptance:** the `plugin_reload` fixture gains a step that frees and loads the
 DLL within 50 ms; the edit is re-applied in all 8 cells; WP10-REPEAT stays 25/25.
 
 ### WP-49: hook narrowing verifies jump tables (R-46)
