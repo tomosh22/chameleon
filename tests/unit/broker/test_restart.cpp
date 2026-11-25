@@ -1240,7 +1240,7 @@ bool has_diag(Rig& rig, const std::string& severity, const std::string& id, cons
     return false;
 }
 
-std::int64_t diag_pid(Rig& rig, const std::string& id) {
+[[maybe_unused]] std::int64_t diag_pid(Rig& rig, const std::string& id) {  // only the injection tests use it
     std::lock_guard<std::mutex> lock(rig.events->mutex);
     for (const Event& e : rig.events->events) {
         if (e.name == "diag" && e.body.get_string("id") == id) {
@@ -1511,6 +1511,7 @@ TEST_CASE("restart injection: pre-restart-hooks (agent): the refusal after the h
     REQUIRE_MESSAGE(again.has_value(), again.error().format());
 }
 
+#if defined(CML_FAULT_INJECTION)  // the broker's stages arm only in a build with failure injection (ADR-0035)
 TEST_CASE("restart injection: restart-terminate fails before the termination; the next restart works") {
     QuietLogs quiet;
     Rig rig;
@@ -1527,7 +1528,9 @@ TEST_CASE("restart injection: restart-terminate fails before the termination; th
     REQUIRE_MESSAGE(again.has_value(), again.error().format());
     CHECK(again->get_integer("new_pid") == 200);
 }
+#endif
 
+#if defined(CML_FAULT_INJECTION)  // the broker's stages arm only in a build with failure injection (ADR-0035)
 TEST_CASE("restart injection: restart-relaunch fails the first start; the second starts the new process") {
     QuietLogs quiet;
     Rig rig;
@@ -1540,6 +1543,7 @@ TEST_CASE("restart injection: restart-relaunch fails the first start; the second
     CHECK(rig.launch_calls == 1);  // the injected failure took the place of the first attempt
     CHECK(rig.service.faults().armed(ipc::fault::Stage::RestartRelaunch) == 0);
 }
+#endif
 
 TEST_CASE("restart: a real failure of the first start is tried once more (CML5822); two failures are CML5807") {
     QuietLogs quiet;
@@ -1564,6 +1568,7 @@ TEST_CASE("restart: a real failure of the first start is tried once more (CML582
     }
 }
 
+#if defined(CML_FAULT_INJECTION)  // the broker's stages arm only in a build with failure injection (ADR-0035)
 TEST_CASE("restart injection: restart-hold resumes the new process at once, without `restarting`; a plain restart does not use it up") {
     QuietLogs quiet;
     Rig rig;
@@ -1589,7 +1594,9 @@ TEST_CASE("restart injection: restart-hold resumes the new process at once, with
     CHECK(late.error().code == restart::diag::kNotHeld);
     CHECK(late.error().message.find("could not be kept") != std::string::npos);
 }
+#endif
 
+#if defined(CML_FAULT_INJECTION)  // the broker's stages arm only in a build with failure injection (ADR-0035)
 TEST_CASE("restart injection: restart-registration leaves the new process running; its next restart enables its modules again") {
     QuietLogs quiet;
     Rig rig;
@@ -1620,7 +1627,9 @@ TEST_CASE("restart injection: restart-registration leaves the new process runnin
     }
     CHECK_FALSE(rig.service.restart_coordinator_for_testing()->has_unfinished_for_testing(200));
 }
+#endif
 
+#if defined(CML_FAULT_INJECTION)  // the broker's stages arm only in a build with failure injection (ADR-0035)
 TEST_CASE("restart injection: what an unfinished restart left is kept when the next restart is refused before the termination") {
     QuietLogs quiet;
     Rig rig;
@@ -1639,6 +1648,7 @@ TEST_CASE("restart injection: what an unfinished restart left is kept when the n
     REQUIRE(rig.reenabled.size() == 1);
     CHECK(rig.reenabled[0].path == kDll);
 }
+#endif
 
 TEST_CASE("restart: a new process that registers too late is remembered like an injected registration failure") {
     QuietLogs quiet;
@@ -1657,6 +1667,7 @@ TEST_CASE("restart: a new process that registers too late is remembered like an 
     CHECK(rig.reenabled[0].path == kDll);
 }
 
+#if defined(CML_FAULT_INJECTION)  // the broker's stages arm only in a build with failure injection (ADR-0035)
 TEST_CASE("restart injection: restart-reenable does not ask the new process; the module is reported and its next restart asks") {
     QuietLogs quiet;
     Rig rig;
@@ -1682,7 +1693,9 @@ TEST_CASE("restart injection: restart-reenable does not ask the new process; the
     REQUIRE(rig.reenabled.size() == 1);
     CHECK(rig.reenabled[0].path == kDll);
 }
+#endif
 
+#if defined(CML_FAULT_INJECTION)  // the broker's stages arm only in a build with failure injection (ADR-0035)
 TEST_CASE("restart injection: an armed stage fires only for the pid it was armed for, and the restart stages are listed in order") {
     QuietLogs quiet;
     Rig rig;
@@ -1700,6 +1713,7 @@ TEST_CASE("restart injection: an armed stage fires only for the pid it was armed
     CHECK(restart_group == std::vector<std::string>{"pre-restart-hooks", "restart-terminate", "restart-relaunch", "restart-hold", "restart-registration",
                                                      "restart-reenable", "restart-reapply"});
 }
+#endif
 
 // ---- WP-43: what is retried, and what an unfinished restart's record applies to --------------------------------------------------
 
@@ -1720,8 +1734,8 @@ TEST_CASE("restart: an attempt that created the new process and then failed is n
 TEST_CASE("restart: an unfinished restart's record is dropped when that process's agent disconnects (exit, DestroyAgent)") {
     QuietLogs quiet;
     Rig rig;
-    REQUIRE(rig.service.faults().arm(ipc::fault::Stage::RestartRegistration, 1, std::nullopt).has_value());
-    REQUIRE_FALSE(rig.service.restart(args_for(100, 10000)).has_value());
+    rig.register_delay_ms = 700;  // registers after the budget: the restart ends with CML5808 and leaves the record (no injection needed)
+    REQUIRE_FALSE(rig.service.restart(args_for(100, 10000, 200)).has_value());
     REQUIRE(wait_until([&] { return rig.service.link_for_pid(200) != nullptr; }));
     CHECK(rig.service.restart_coordinator_for_testing()->has_unfinished_for_testing(200));
     rig.service.detach(rig.service.link_for_pid(200)->agent_id());  // what the connection server does when the pipe ends
