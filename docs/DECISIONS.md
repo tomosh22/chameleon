@@ -1188,6 +1188,13 @@ only in a compiland that records no guards; its placement is then decided by `se
 teach, or refused (CML3600). R-54: a lazy TPI closure lookup in `cml_pdb`; an own static of a function that had a closure with no
 `operator()` procedure is refused (CML3207), including when that lambda had no static (accepted over-refusal).
 
+**Ruling (WP-46 reviews; ADR-0018 convergence):** cl's legacy `<lambda_HASH>` is derived from the lambda's body (CI evidence:
+`WP46-HASH-SET ... common=2 changed` after a body edit, `same` after an edit elsewhere). An edited hash-named lambda pairs only by
+elimination with identity evidence (signature, statics, closure layout, and the one non-template function that holds a
+closure-typed local, on both sides); otherwise CML3630. An edited lambda used only as a temporary is therefore refused under cl's
+legacy processor (KNOWN_LIMITATIONS). After the third review round WP-46 merges on green; a later review holds it only for a new
+wrong pairing.
+
 ### Shared files and merge order
 
 - `tests/corpus/run_corpus.ps1`: WP-38 owns the decoder step, WP-39 the timing output; WP-36 and WP-37 change only
