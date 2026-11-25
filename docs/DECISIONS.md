@@ -1192,9 +1192,9 @@ functions. The decision is reversed **together with** a reference check, which i
 
 ## ADR-0043 Wave 11: planner correctness, a wider corpus, restart and injection hardening (WP-40..WP-44)
 
-**Date:** 2026-11-24 · **Status:** Proposed (accepted when wave 10 closes with WP-37)
+**Date:** 2026-11-25 · **Status:** Accepted
 
-Wave 10 (ADR-0042) closes R-01, R-02, R-03, R-04, R-13 and the decoder part of R-41 (R-02/R-03 when WP-37 merges). It also found pre-existing
+Wave 10 (ADR-0042) closed R-01, R-02, R-03, R-04, R-13 and the decoder part of R-41. It also found pre-existing
 bind-planner defects that can pair the wrong state (R-48), one of which can make an accepted reload use an object that was
 never constructed. A wrong pairing is the worst outcome the product has, so R-48 leads this wave, ahead of the user's list
 (R-06, R-40, R-42). No R-10 (dogfooding) findings exist yet.
