@@ -1286,9 +1286,14 @@ item; the vs workflow green. **Directories:** `broker/cml_core` (restart, revert
 compile-on-save watcher (debounce, change detection, the reload it starts). Arming survives a broker restart only when the
 user asks (`inject-failure {persist:true}`), stored next to the broker's log and cleared by `{"stage":"none"}`. R-49's three
 nits.
+**Amended (WP-43 merged as #71):** WP-44 also fixes R-51, the five races and stale records the high re-review of WP-43's fix
+round found in `fault_injection.cpp`, `restart.cpp` and `reload_service.cpp`: an operation's end-of-operation disarm runs while it
+still holds its run lock; an arming is recorded before its ArmFault round trips and check-and-arm is atomic against operation
+start; `detach` drops a pid's armings; a revert's per-pid outcome decides per pid; `process_gone` re-checks before keeping a record.
+Each gets a unit test. They exist only in fault-injection builds, so they did not hold WP-43's merge.
 **Acceptance.** Scenarios for the new stages in all 8 cells; a test for persistent arming across a broker restart.
-**Directories:** `agent/src/crash`, `broker/cml_core` (exception service, save watcher, fault injection), `core/cml_pe`
-(R-49), `tests/harness`.
+**Directories:** `agent/src/crash`, `broker/cml_core` (exception service, save watcher, fault injection, and for R-51 restart and
+reload service), `core/cml_pe` (R-49), `tests/harness`, `tests/unit/broker`.
 
 ### WP-45: re-apply session edits to re-loaded and late-enabled modules (from WP-42's corpus findings)
 
