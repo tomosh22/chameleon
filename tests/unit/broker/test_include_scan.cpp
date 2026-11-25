@@ -221,3 +221,44 @@ TEST_CASE("the precompiled header is the named header and the forced includes wi
     CHECK(roots.creates_pch);
     CHECK(roots.pch_header == "cmake_pch.hxx");
 }
+
+TEST_CASE("WP-50: the scan's statistics count each path read once, found or missing, and the questions answered from the cache") {
+    FakeFs fs;
+    fs.files["c:\\proj\\src\\main.cpp"] = "#include \"a.h\"\n#include <b.h>\n";
+    fs.files["c:\\proj\\src\\a.h"] = "#include <b.h>\n";
+    fs.files["c:\\proj\\inc2\\b.h"] = "";
+    std::size_t calls = 0;
+    std::size_t hits = 0;
+    const ScanFileReader inner = fs.reader();
+    IncludeScanner scanner([&](const std::string& path) {
+        ++calls;
+        std::optional<std::string> text = inner(path);
+        hits += text ? 1 : 0;
+        return text;
+    });
+    ScanRoots roots;
+    roots.source = "c:\\proj\\src\\main.cpp";
+    roots.cwd = "c:\\proj";
+    roots.include_dirs = {"c:\\proj\\inc1", "c:\\proj\\inc2"};  // <b.h> is looked for in inc1 first: a missing path
+
+    CHECK(scanner.dependencies(roots) == std::set<std::string>{"c:\\proj\\src\\a.h", "c:\\proj\\inc2\\b.h"});
+    const IncludeScanner::Stats first = scanner.stats();
+    CHECK(first.walks == 1);
+    CHECK(first.found == hits);
+    CHECK(first.missing == calls - hits);
+    CHECK(first.found == 3);    // main.cpp, a.h, inc2\b.h
+    CHECK(first.missing >= 1);  // at least inc1\b.h
+    CHECK(first.found + first.missing == scanner.files_read());
+    CHECK(first.lookups > scanner.files_read());  // <b.h> twice: the second time from the cache
+    CHECK(first.read_ms >= 0.0);
+    CHECK(first.parse_ms >= 0.0);
+
+    // The same translation unit again: nothing is read again, every question comes from the cache.
+    scanner.dependencies(roots);
+    const IncludeScanner::Stats second = scanner.stats();
+    CHECK(second.walks == 2);
+    CHECK(second.found == first.found);
+    CHECK(second.missing == first.missing);
+    CHECK(calls == first.found + first.missing);
+    CHECK(second.lookups > first.lookups);
+}

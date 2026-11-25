@@ -72,6 +72,19 @@ public:
 
     std::size_t files_read() const noexcept { return parsed_.size(); }
 
+    // WP-50 (R-55): what the scan cost. Every distinct path the scan asked about is read once (`files_read()` = found + missing);
+    // `read_ms` is the time spent in the file reader (opening, reading, and failing to open the paths that do not exist), `parse_ms`
+    // in parse_includes, `lookups` counts the questions answered (most from the cache of paths already read).
+    struct Stats {
+        std::size_t found = 0;    // paths that could be read
+        std::size_t missing = 0;  // paths that could not (no such file, or unreadable): candidates of the include search
+        std::size_t lookups = 0;
+        std::size_t walks = 0;    // dependencies() / pch_files() calls
+        double read_ms = 0;
+        double parse_ms = 0;
+    };
+    const Stats& stats() const noexcept { return stats_; }
+
 private:
     struct Start {
         std::string file;
@@ -87,6 +100,7 @@ private:
 
     ScanFileReader reader_;
     std::map<std::string, std::optional<std::vector<IncludeDirective>>> parsed_;  // nullopt: unreadable
+    Stats stats_;
 };
 
 }  // namespace cml::core

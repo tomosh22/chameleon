@@ -1147,8 +1147,10 @@ private:
             }
         };
         if (!hooks.empty()) {
+            const Clock::time_point hooks_started = Clock::now();  // WP-50: request built / round trip
             ipc::InstallHooks req;
             req.request_id = link_.next_request_id();
+            const std::uint64_t hooks_request_id = req.request_id;
             for (const bind::HookEntry& h : hooks) {
                 const std::optional<std::uint64_t> target = function_va(plan, linked, h.new_symbol);
                 if (!target) {
@@ -1159,7 +1161,13 @@ private:
                 req.hooks.push_back(ipc::HookSpec{h.old_va, *target, h.display});
                 applied.hooks.push_back(AppliedHook{h.old_va, *target, h.display});
             }
+            const Clock::time_point hooks_sent = Clock::now();
             Result<ipc::Message> answer = link_.request(ipc::Message(std::move(req)), clamp_timeout(options_.hooks_timeout_ms));
+            // WP-50 (R-47): the broker's side of the hooks stage. The agent's breakdown of the same request (the line
+            // `WP50-HOOKS side=agent request=<same id>`) is forwarded by the agent and logged by the session before this one.
+            CML_LOG(Info, "WP50-HOOKS side=broker request=%llu module=%s hooks=%zu prepare_ms=%.1f roundtrip_ms=%.1f answered=%d",
+                    static_cast<unsigned long long>(hooks_request_id), module_.name.c_str(), hooks.size(), ms_between(hooks_started, hooks_sent),
+                    ms_between(hooks_sent, Clock::now()), answer ? 1 : 0);
             if (!answer) {
                 // No answer: the agent may still apply the hooks (synchronised mode waits for SyncPoint). The
                 // patch must then stay loaded; remember the hooks as installed so the next reload re-points them.
@@ -1266,7 +1274,11 @@ private:
     std::shared_ptr<const pe::OwnedImage> module_image(PatchReport& report) {
         std::lock_guard<std::mutex> lock(module_.mutex);
         if (!module_.image) {
+            const Clock::time_point read_started = Clock::now();
             Result<pe::OwnedImage> loaded = pe::load_image_file(module_.path);
+            // WP-50 (R-47): a one-off cost of the session's first reload of the module (the copy is kept for the session).
+            CML_LOG(Info, "WP50-ONEOFF what=module-image module=%s ms=%.1f mib=%.1f ok=%d", module_.name.c_str(), ms_between(read_started, Clock::now()),
+                    loaded ? static_cast<double>(loaded->bytes.size()) / (1024.0 * 1024.0) : 0.0, loaded ? 1 : 0);
             if (!loaded) {
                 // Not fatal: without the old bytes every planned hook is kept.
                 const Diag d = Diag::make(pd::kModuleImage, "cannot read the module file '" + module_.path + "' to compare function bodies: " + loaded.error().message,
@@ -1287,6 +1299,7 @@ private:
                 return Result<void>();
             }
         }
+        const Clock::time_point reserve_started = Clock::now();
         ipc::ReserveRange req;
         req.request_id = link_.next_request_id();
         req.module_base = module_.base;
@@ -1310,6 +1323,7 @@ private:
         for (const ipc::AddressBlock& b : rr->blocks) {
             CML_LOG(Info, "reload: reserved %llu MiB at %s near %s", static_cast<unsigned long long>(b.size >> 20), hex(b.base).c_str(), module_.name.c_str());
         }
+        CML_LOG(Info, "WP50-ONEOFF what=reserve-range module=%s ms=%.1f blocks=%zu", module_.name.c_str(), ms_between(reserve_started, Clock::now()), rr->blocks.size());
         std::lock_guard<std::mutex> lock(module_.mutex);
         module_.reservation.set_blocks(rr->blocks);
         return Result<void>();
@@ -1327,6 +1341,7 @@ private:
         if (!env_.resolve_linker) {
             return fail("link", Diag::make(pd::kStageFailed, "this broker has no linker driver", "Run the broker on Windows."));
         }
+        const Clock::time_point detect_started = Clock::now();
         std::vector<std::string> dirs;
         if (!u.outcome.compiler_used.empty()) {
             dirs.push_back(std::string(path::parent_directory(std::string_view(u.outcome.compiler_used))));
@@ -1340,6 +1355,7 @@ private:
             return fail("link", tool.error());
         }
         CML_LOG(Info, "reload: linker for %s: %s %s", module_.name.c_str(), tool->path.c_str(), tool->version_text.c_str());
+        CML_LOG(Info, "WP50-ONEOFF what=linker-detection module=%s ms=%.1f", module_.name.c_str(), ms_between(detect_started, Clock::now()));
         std::lock_guard<std::mutex> lock(module_.mutex);
         module_.linker = *tool;
         module_.linker_key = key;

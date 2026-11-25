@@ -46,6 +46,15 @@ struct IndexStatus {
     std::size_t files = 0;      // tracked source files
     double pdb_ms = 0;
     double baseline_ms = 0;
+    // WP-50 (R-55): the other phases of the build, and what the include scan read (IncludeScanner::Stats). Set when each ends.
+    double audit_ms = 0;       // the build-requirement checks (spec.audit)
+    double scan_ms = 0;        // the file lists of the compilands and the include scan (ADR-0013)
+    double scan_read_ms = 0;   //   of scan_ms: in the file reader
+    double scan_parse_ms = 0;  //   of scan_ms: parsing #include lines
+    std::size_t scan_found = 0;
+    std::size_t scan_missing = 0;
+    std::size_t scan_lookups = 0;
+    std::size_t baseline_files = 0;  // files the baseline hashed (= files listed)
 };
 
 struct ModuleIndexSpec {

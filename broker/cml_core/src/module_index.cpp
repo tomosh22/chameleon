@@ -230,7 +230,12 @@ void ModuleIndex::run() {
     }
     if (spec_.audit) {
         set_status(IndexState::Loading, 20, "checking the build requirements");
+        const Clock::time_point audit_started = Clock::now();
         ModuleAudit audit = audit_opened_module(spec_.module_path, *index);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            status_.audit_ms = ms_since(audit_started);
+        }
         if (cancel_.load(std::memory_order_acquire)) {
             return;  // the module was disabled meanwhile: no diagnostics, no Failed state
         }
@@ -263,6 +268,7 @@ void ModuleIndex::run() {
         }
     }
     set_status(IndexState::Loading, 30, "reading the file lists");
+    const Clock::time_point scan_started = Clock::now();
     std::set<std::string> files;
     std::map<std::string, std::vector<std::uint32_t>> header_deps;
     std::set<std::string> pch_files;
@@ -371,6 +377,12 @@ void ModuleIndex::run() {
         header_deps_ = std::move(header_deps);
         pch_files_ = std::move(pch_files);
         pch_unverified_ = std::move(pch_unverified);
+        status_.scan_ms = ms_since(scan_started);
+        status_.scan_read_ms = scanner.stats().read_ms;
+        status_.scan_parse_ms = scanner.stats().parse_ms;
+        status_.scan_found = scanner.stats().found;
+        status_.scan_missing = scanner.stats().missing;
+        status_.scan_lookups = scanner.stats().lookups;
     }
     CML_LOG(Debug, "index: include scan of %s: %zu files read, %zu headers mapped", spec_.module_path.c_str(), scanner.files_read(), scanned_headers());
     const Clock::time_point t1 = Clock::now();
@@ -401,9 +413,18 @@ void ModuleIndex::run() {
         std::lock_guard<std::mutex> lock(mutex_);
         status_.files = baseline_.size();
         status_.baseline_ms = ms_since(t1);
+        status_.baseline_files = list.size();
     }
     CML_LOG(Info, "index: %s ready: %zu compilands, %zu tracked files of %zu listed (pdb %.1f ms, baseline %.1f ms)", spec_.module_path.c_str(),
             static_cast<std::size_t>(index->compiland_count()), baseline_.size(), list.size(), status().pdb_ms, status().baseline_ms);
+    {
+        // WP-50 (R-55): where the build of the index went, one evidence line per index.
+        const IndexStatus s = status();
+        CML_LOG(Info, "WP50-INDEX module=%s total_ms=%.1f pdb_ms=%.1f audit_ms=%.1f scan_ms=%.1f scan_read_ms=%.1f scan_parse_ms=%.1f scan_found=%zu scan_missing=%zu "
+                      "scan_lookups=%zu baseline_ms=%.1f baseline_files=%zu compilands=%zu cache=cold",
+                base_name_of(spec_.module_path).c_str(), ms_since(t0), s.pdb_ms, s.audit_ms, s.scan_ms, s.scan_read_ms,
+                s.scan_parse_ms, s.scan_found, s.scan_missing, s.scan_lookups, s.baseline_ms, s.baseline_files, static_cast<std::size_t>(index->compiland_count()));
+    }
     {
         std::size_t archive_members = 0;
         for (const SkippedCompiland& k : skipped) {

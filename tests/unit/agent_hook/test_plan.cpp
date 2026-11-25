@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "hook/diag_ids.h"
+#include "hook/hook_timing.h"
 #include "doctest.h"
 
 using namespace cml::agent::hook;
@@ -378,4 +379,46 @@ TEST_CASE("to_string names the strategies") {
     CHECK(std::string(to_string(Strategy::PaddingTwoByte)) == "padding+2-byte");
     CHECK(std::string(to_string(Strategy::FiveByte)) == "5-byte");
     CHECK(std::string(to_string(Strategy::None)) == "none");
+}
+
+TEST_CASE("WP-50: the WP50-HOOKS line carries every phase under a stable key, in order") {
+    HooksTimingLine l;
+    l.request_id = 17;
+    l.batch = 1;
+    l.op = "install";
+    l.hooks = 275;
+    l.threads = 3;
+    l.attempts = 1;
+    l.batch_timing.installs = 275;
+    l.batch_timing.pages = 61;
+    l.batch_timing.plan_us = 1200;
+    l.batch_timing.write_us = 380000;
+    l.batch_timing.write_max_us = 9000;
+    l.dispatch.total_us = 395000;
+    l.dispatch.install_us = 392000;
+    const std::string line = format_hooks_timing(l);
+    CHECK(line.rfind("WP50-HOOKS side=agent request=17 batch=1 op=install hooks=275 installed=275 repointed=0 unchanged=0 reverted=0 pages=61 "
+                     "threads=3 attempts=1 status=0 total_us=395000 ",
+                     0) == 0);
+    const char* const keys[] = {"wait_us",      "collect_us", "prepatch_us",   "build_us",     "install_us", "lock_us",     "plan_us",
+                                "probe_us",     "protect_us", "stop_us",       "enumerate_us", "suspend_us", "context_us",  "check_us",
+                                "write_us",     "write_max_us", "step_us",     "resume_us",    "retry_wait_us", "unprotect_us", "commit_us",
+                                "rollback_us",  "postpatch_us", "reply_us"};
+    std::size_t at = 0;
+    for (const char* key : keys) {
+        const std::size_t found = line.find(std::string(" ") + key + "=", at);
+        CHECK_MESSAGE(found != std::string::npos, key);
+        if (found != std::string::npos) {
+            at = found + 1;
+        }
+    }
+    CHECK(line.find(" write_us=380000 write_max_us=9000 ") != std::string::npos);
+    CHECK(line.find(" plan_us=1200 ") != std::string::npos);
+    CHECK(line.find('\n') == std::string::npos);
+
+    l.status = 4301;
+    l.op = "revert";
+    const std::string refused = format_hooks_timing(l);
+    CHECK(refused.find(" op=revert ") != std::string::npos);
+    CHECK(refused.find(" status=CML4301 total_us=") != std::string::npos);
 }

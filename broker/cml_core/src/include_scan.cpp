@@ -1,6 +1,7 @@
 #include "cml/core/include_scan.h"
 
 #include <cctype>
+#include <chrono>
 #include <fstream>
 
 #include "cml/core/source_baseline.h"
@@ -235,11 +236,22 @@ ScanFileReader disk_file_reader() {
 IncludeScanner::IncludeScanner(ScanFileReader reader) : reader_(std::move(reader)) {}
 
 const std::vector<IncludeDirective>* IncludeScanner::includes_of(const std::string& normalised_path) {
+    ++stats_.lookups;
     auto it = parsed_.find(normalised_path);
     if (it == parsed_.end()) {
+        using Clock = std::chrono::steady_clock;
+        const auto ms = [](Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
         std::optional<std::vector<IncludeDirective>> parsed;
-        if (std::optional<std::string> text = reader_(normalised_path)) {
+        const Clock::time_point t0 = Clock::now();
+        std::optional<std::string> text = reader_(normalised_path);
+        const Clock::time_point t1 = Clock::now();
+        stats_.read_ms += ms(t0, t1);
+        if (text) {
             parsed = parse_includes(*text);
+            stats_.parse_ms += ms(t1, Clock::now());
+            ++stats_.found;
+        } else {
+            ++stats_.missing;
         }
         it = parsed_.emplace(normalised_path, std::move(parsed)).first;
     }
@@ -322,6 +334,7 @@ std::set<std::string> IncludeScanner::walk(const std::vector<Start>& starts, con
 }
 
 std::set<std::string> IncludeScanner::dependencies(const ScanRoots& roots) {
+    ++stats_.walks;
     if (roots.source.empty()) {
         return {};
     }
@@ -339,6 +352,7 @@ std::set<std::string> IncludeScanner::dependencies(const ScanRoots& roots) {
 }
 
 std::set<std::string> IncludeScanner::pch_files(const ScanRoots& roots) {
+    ++stats_.walks;
     const std::string source = roots.source.empty() ? std::string() : pdb::normalize_path(roots.source, roots.cwd);
     const std::string source_dir(path::parent_directory(std::string_view(source)));
     std::vector<Start> starts;

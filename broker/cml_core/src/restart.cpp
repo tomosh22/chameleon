@@ -1,12 +1,16 @@
 #include "cml/core/restart.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "cml/core/agent_link.h"
 #include "cml/core/control_args.h"
 #include "cml/core/event_bus.h"
+#include "cml/core/module_index.h"
 #include "cml/core/module_state.h"
 #include "cml/core/pipeline_diag_ids.h"
 #include "cml/core/reload_service.h"
@@ -32,6 +36,43 @@ constexpr std::uint32_t kDefaultRegistrationMs = 30000;  // after the old proces
 constexpr std::uint32_t kTerminateTimeoutMs = 10000;
 constexpr std::uint32_t kPollMs = 20;
 constexpr std::chrono::seconds kEnableWait{3};  // how long enabled modules may take to show up after the broker asked
+
+// WP-50 (R-55): the stages of one restart, in the order they ran, each from the end of the one before (so they add up to the
+// total). `mark` ends the current stage; `add` books time measured separately (the index waits and the baseline restores of
+// the loop over the modules) under one name.
+class StageClock {
+public:
+    explicit StageClock(Clock::time_point start) : start_(start), last_(start) {}
+    void mark(const char* name) {
+        const Clock::time_point now = Clock::now();
+        add(name, ms(last_, now));
+        last_ = now;
+    }
+    void add(const char* name, double milliseconds) {
+        for (auto& stage : stages_) {
+            if (stage.first == name) {
+                stage.second += milliseconds;
+                return;
+            }
+        }
+        stages_.emplace_back(name, milliseconds);
+    }
+    void restart_from_now() { last_ = Clock::now(); }
+    double total_ms() const { return ms(start_, Clock::now()); }
+    const std::vector<std::pair<std::string, double>>& stages() const { return stages_; }
+
+private:
+    static double ms(Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); }
+    Clock::time_point start_;
+    Clock::time_point last_;
+    std::vector<std::pair<std::string, double>> stages_;
+};
+
+std::string fixed1(double v) {
+    char buffer[48];
+    std::snprintf(buffer, sizeof buffer, "%.1f", v);
+    return buffer;
+}
 
 // ASCII upper case; the environment names this code looks at are ASCII.
 char16_t fold(char16_t c) {
@@ -306,6 +347,7 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
         registration_ms = kDefaultRegistrationMs;
     }
     const Clock::time_point start = Clock::now();
+    StageClock stage_clock(start);  // WP-50
     // `timeout_ms` bounds everything before the old process is terminated; the budget after it is separate (reassigned there), so
     // a slow preparation cannot leave a killed process with no time to register.
     Clock::time_point deadline = start + std::chrono::milliseconds(timeout_ms);
@@ -426,6 +468,7 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
     if (trace_) {
         trace_("prepared");
     }
+    stage_clock.mark("prepare");
     // The modules to have enabled again: what the application enabled (with its options); the broker's own list when the
     // agent reports none.
     std::vector<ipc::RestartModule> modules = info->modules;
@@ -540,6 +583,7 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
         trace_("snapshot");
         trace_("terminate");
     }
+    stage_clock.mark("takeover");
     // WP-43 (R-40): a broker that is shutting down does not terminate anything any more.
     if (aborting_.load()) {
         return fail(Diag::make(rd::kShutdown, "the broker is shutting down; process " + std::to_string(old_pid) + " was not restarted (it was not touched)." + hooks_note,
@@ -558,6 +602,7 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
                     old_pid);
     }
     *old_terminated = true;
+    stage_clock.mark("terminate");
     if (unfinished) {
         forget_unfinished(old_pid);  // the old process is gone: what was remembered for it travels with this restart now
     }
@@ -608,6 +653,7 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
         CML_LOG(Info, "restart: the second attempt started the new process (pid %u)", *launched);
     }
     CML_LOG(Info, "restart: started process %u (token %s)%s, waiting for its agent", *launched, token.c_str(), hold_new ? " suspended" : "");
+    stage_clock.mark("relaunch");
 
     // ---- 2b. WP-34: the new process is suspended until the client resumes it, hold_ms passes, or something goes wrong ----
     // It has not run a single instruction, so its agent does not exist yet and cannot register: the registration budget starts at
@@ -757,6 +803,7 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
         }
         CML_LOG(Info, "restart: process %u resumed (%s)", held_pid, how);
         deadline = Clock::now() + std::chrono::milliseconds(registration_ms);  // the time held does not count against the registration budget
+        stage_clock.mark("held");
     }
 
     // ---- 3. the new agent registers ----
@@ -803,12 +850,14 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
     const std::uint32_t new_pid = new_link->snapshot().pid;
     const std::uint64_t new_agent = new_link->agent_id();
     CML_LOG(Info, "restart: process %u registered as agent#%llu", new_pid, static_cast<unsigned long long>(new_agent));
+    stage_clock.mark("register");
 
     // ---- 4. the same modules, enabled again ----
     // The module list arrives right after the handshake; EnableModule needs it.
     while (new_link->snapshot().modules.empty() && remaining_ms() > 0 && !aborting_.load()) {
         pause_ms(kPollMs);
     }
+    stage_clock.mark("module_list");
     const auto missing_in = [&](const LinkSnapshot& snap) {
         std::vector<ipc::RestartModule> missing;
         for (const ipc::RestartModule& m : modules) {
@@ -886,6 +935,7 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
         return out;
     };
 
+    stage_clock.mark("reenable");
     // The enabled modules of the new process, and their PDB indexes.
     const LinkSnapshot new_snap = new_link->snapshot();
     // WP-45 (F-42.3): every carried baseline of a module the new process has not enabled (a module it loads lazily, one the restart
@@ -939,10 +989,17 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
                  new_pid);
         }
     }
+    stage_clock.mark("carry");
     Value enabled_json = Value::array();
     std::size_t restored = 0;
+    // WP-50: per enabled module, how long the restart waited for its index and where the index's own build went (it started when
+    // the module was enabled, during the stages before). `slowest_line` describes the module the restart waited for longest.
+    Value indexes_json = Value::array();
+    std::string slowest_line;
+    double slowest_wait = -1;
     for (const std::string& full : new_snap.enabled) {
         enabled_json.push(Value::string(full));
+        const Clock::time_point wait_started = Clock::now();
         std::shared_ptr<ModuleState> state;
         std::shared_ptr<ModuleIndex> index;
         while (remaining_ms() > 0 && !aborting_.load()) {
@@ -967,6 +1024,51 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
         if (aborting_.load()) {
             return fail(shutting_down(new_pid), new_pid);
         }
+        {
+            const double waited = std::chrono::duration<double, std::milli>(Clock::now() - wait_started).count();
+            stage_clock.add("index", waited);
+            const std::string module_name(path::base_name(std::string_view(full)));
+            Value entry = Value::object();
+            entry.set("module", Value::string(module_name));
+            entry.set("wait_ms", Value::number(waited));
+            std::string line = "index_module=" + module_name + " index_wait_ms=" + fixed1(waited);
+            if (index) {
+                const IndexStatus s = index->status();
+                entry.set("state", Value::string(to_string(s.state)));
+                entry.set("pdb_ms", Value::number(s.pdb_ms));
+                entry.set("audit_ms", Value::number(s.audit_ms));
+                entry.set("scan_ms", Value::number(s.scan_ms));
+                entry.set("scan_read_ms", Value::number(s.scan_read_ms));
+                entry.set("scan_found", Value::integer(static_cast<std::int64_t>(s.scan_found)));
+                entry.set("scan_missing", Value::integer(static_cast<std::int64_t>(s.scan_missing)));
+                entry.set("baseline_ms", Value::number(s.baseline_ms));
+                entry.set("baseline_files", Value::integer(static_cast<std::int64_t>(s.baseline_files)));
+                entry.set("cache", Value::string("cold"));
+                line += " index_state=" + std::string(to_string(s.state)) + " index_pdb_ms=" + fixed1(s.pdb_ms) + " index_audit_ms=" + fixed1(s.audit_ms) +
+                        " index_scan_ms=" + fixed1(s.scan_ms) + " index_scan_read_ms=" + fixed1(s.scan_read_ms) + " index_scan_found=" + std::to_string(s.scan_found) +
+                        " index_scan_missing=" + std::to_string(s.scan_missing) + " index_baseline_ms=" + fixed1(s.baseline_ms) +
+                        " index_baseline_files=" + std::to_string(s.baseline_files) + " index_cache=cold";
+            } else {
+                entry.set("state", Value::string("absent"));
+                line += " index_state=absent";
+            }
+            indexes_json.push(std::move(entry));
+            if (waited > slowest_wait) {
+                slowest_wait = waited;
+                slowest_line = std::move(line);
+            }
+        }
+        class BookRestore {  // every way out of this iteration books its time under "restore"
+        public:
+            explicit BookRestore(StageClock& clock) : clock_(clock), started_(Clock::now()) {}
+            BookRestore(const BookRestore&) = delete;
+            BookRestore& operator=(const BookRestore&) = delete;
+            ~BookRestore() { clock_.add("restore", std::chrono::duration<double, std::milli>(Clock::now() - started_).count()); }
+
+        private:
+            StageClock& clock_;
+            Clock::time_point started_;
+        } book_restore(stage_clock);
         if (!index || !ready || index->status().state != IndexState::Ready) {
             // WP-45: the carried baselines go to the module's state (or, without one yet, to its enable): the re-apply worker restores them
             // and reloads once the index is ready. Without that, the index would take the edited files as its baseline and a `reload`
@@ -1008,6 +1110,7 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
         }
     }
 
+    stage_clock.restart_from_now();  // the loop booked "index" and "restore" itself
     // ---- 6. one reload applies every file that had been patched before ----
     Value result = Value::object();
     if (restored > 0) {
@@ -1040,6 +1143,26 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
         }
     }
 
+    stage_clock.mark("reapply");
+    // WP-50 (R-55): the stage breakdown. `timing` is one line, RESTART-TIMING old_pid=.. new_pid=.. total_ms=.. <stage>_ms=..
+    // index_module=<the module waited for longest> index_<phase>_ms=..; cmltest and the corpus driver print it as WP50-RESTART.
+    {
+        Value stages = Value::object();
+        const double total = stage_clock.total_ms();
+        std::string body = "old_pid=" + std::to_string(old_pid) + " new_pid=" + std::to_string(new_pid) + " total_ms=" + fixed1(total);
+        for (const auto& [name, ms] : stage_clock.stages()) {
+            stages.set(name, Value::number(ms));
+            body += " " + name + "_ms=" + fixed1(ms);
+        }
+        stages.set("total", Value::number(total));
+        if (!slowest_line.empty()) {
+            body += " " + slowest_line;
+        }
+        result.set("stages_ms", std::move(stages));
+        result.set("indexes", std::move(indexes_json));
+        result.set("timing", Value::string("RESTART-TIMING " + body));
+        CML_LOG(Info, "WP50-RESTART %s", body.c_str());
+    }
     result.set("old_pid", Value::integer(old_pid));
     result.set("new_pid", Value::integer(new_pid));
     result.set("modules", std::move(enabled_json));

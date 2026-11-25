@@ -45,6 +45,7 @@
 #include "cml/ipc/fault_stages.h"
 #include "cml/util/diag.h"
 #include "hook_plan.h"
+#include "hook_timing.h"
 #include "thread_set.h"
 
 namespace cml::agent::hook {
@@ -78,9 +79,12 @@ struct BatchStats {
     unsigned window_ms = 0;        // longest time the world was stopped
 };
 
+// WP-50 (R-47): BatchTiming (where the time of one batch went) is in hook_timing.h, portable so that its log line is tested on every host.
+
 struct BatchResult {
     Diag diag;  // code 0 = every hook of the batch was applied
     BatchStats stats;
+    BatchTiming timing;  // WP-50
     bool ok() const noexcept { return diag.code == 0; }
 };
 
@@ -171,6 +175,9 @@ private:
     struct Report;
 
     BatchResult apply(bool revert, const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes, ipc::fault::Stage inject);
+    // `called`: the counter when apply() was entered (WP-50: the wait for the mutex is the batch's lock_us).
+    BatchResult apply_locked(bool revert, const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes, ipc::fault::Stage inject,
+                             long long called);
     void attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, Report* report, ipc::fault::Stage inject) noexcept;
     bool find_conflict(const Job* jobs, std::size_t count, std::size_t* thread_index, std::size_t* job_index) const noexcept;
     Record* find_record(std::uintptr_t target);

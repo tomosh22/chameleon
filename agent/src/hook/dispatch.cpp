@@ -5,6 +5,7 @@
 
 #include <process.h>
 
+#include <atomic>
 #include <memory>
 #include <new>
 #include <string>
@@ -12,10 +13,12 @@
 #include <vector>
 
 #include "agent.h"
+#include "agent_log.h"
 #include "cml/proc/diag_ids.h"
 #include "cml/util/log.h"
 #include "crash/exception_gate.h"
 #include "fault/fault_injection.h"
+#include "hook/hook_timing.h"
 #include "hook/installer.h"
 #include "hook/user_hook_ids.h"
 #include "hook/user_hooks.h"
@@ -33,7 +36,30 @@ constexpr std::size_t kMaxQueuedReplies = 256;
 struct HookJob {
     Agent* agent;
     ipc::InstallHooks request;
+    long long received;  // WP-50: QueryPerformanceCounter at arrival
 };
+
+// WP-50: the performance counter and its conversion to microseconds.
+long long now_ticks() {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
+}
+
+std::uint64_t ticks_to_us(long long elapsed) {
+    static const long long frequency = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return f.QuadPart > 0 ? f.QuadPart : 1;
+    }();
+    if (elapsed <= 0) {
+        return 0;
+    }
+    return static_cast<std::uint64_t>(elapsed / frequency * 1000000 + (elapsed % frequency) * 1000000 / frequency);
+}
+
+// WP-50: InstallHooks requests this process has applied (1 = the first), for the evidence line.
+std::atomic<std::uint64_t> g_hook_batches{0};
 
 ipc::HookStrategy to_wire(hook::Strategy strategy) {
     switch (strategy) {
@@ -66,7 +92,7 @@ void Agent::handle_install_hooks(const ipc::InstallHooks& request) {
     // The request id is repeated by the answer. In synchronised mode the job waits in the SyncPoint
     // queue (the application chooses where its threads are quiescent); in immediate mode
     // post_main_thread_work runs it on this thread at once.
-    auto* job = new (std::nothrow) HookJob{this, request};
+    auto* job = new (std::nothrow) HookJob{this, request, now_ticks()};
     if (job == nullptr) {
         ipc::HooksInstalled refusal;
         refusal.request_id = request.request_id;
@@ -82,10 +108,23 @@ void Agent::handle_install_hooks(const ipc::InstallHooks& request) {
 
 void Agent::run_hook_job(void* context) {
     std::unique_ptr<HookJob> job(static_cast<HookJob*>(context));
-    job->agent->apply_install_hooks(job->request);
+    job->agent->apply_install_hooks(job->request, job->received);
 }
 
-void Agent::apply_install_hooks(const ipc::InstallHooks& request) {
+void Agent::apply_install_hooks(const ipc::InstallHooks& request, long long received) {
+    // WP-50 (R-47): one counter read at every phase boundary; the line is logged and forwarded to the broker at the end.
+    const long long started = now_ticks();
+    long long mark = started;
+    const auto lap = [&mark]() {
+        const long long now = now_ticks();
+        const std::uint64_t spent = ticks_to_us(now - mark);
+        mark = now;
+        return spent;
+    };
+    hook::HooksTimingLine timing;
+    timing.request_id = request.request_id;
+    timing.batch = g_hook_batches.fetch_add(1, std::memory_order_relaxed) + 1;
+    timing.dispatch.wait_us = received != 0 ? ticks_to_us(started - received) : 0;
     const bool revert = (request.flags & ipc::kInstallHooksRevert) != 0;
     const bool quiet = revert || (request.flags & ipc::kInstallHooksQuiet) != 0;  // WP-22: part of a patch revert
     const std::size_t count = request.hooks.size();
@@ -110,6 +149,7 @@ void Agent::apply_install_hooks(const ipc::InstallHooks& request) {
                     user_hooks::ids::kOutOfMemory);
         }
     }
+    timing.dispatch.collect_us = lap();
     const HookThread hook_thread_here = synchronized() ? HookThread::None : HookThread::AgentThread;
     if (session != nullptr) {
         ScopedHookThread scope(hook_thread_here);
@@ -117,6 +157,7 @@ void Agent::apply_install_hooks(const ipc::InstallHooks& request) {
         CML_LOG(Info, "hooks: request %llu: %llu pre-patch hook(s) ran", static_cast<unsigned long long>(request.request_id),
                 static_cast<unsigned long long>(ran));
     }
+    timing.dispatch.prepatch_us = lap();
 
     std::vector<hook::HookRequest> specs(count);
     for (std::size_t i = 0; i < count; ++i) {
@@ -143,7 +184,10 @@ void Agent::apply_install_hooks(const ipc::InstallHooks& request) {
     // agent (ArmFault, count 0) before it sends the undo, and refuses to arm a revert stage while a revert runs, so the undo is never
     // injectable (docs/wp/WP-43.md).
     const ipc::fault::Stage inject = revert ? ipc::fault::Stage::RevertRestore : quiet ? ipc::fault::Stage::RevertRepoint : ipc::fault::Stage::HookInstall;
+    timing.dispatch.build_us = lap();
     hook::BatchResult batch = revert ? installer.revert(specs.data(), count, outcomes, inject) : installer.install(specs.data(), count, outcomes, inject);
+    timing.dispatch.install_us = lap();
+    timing.batch_timing = batch.timing;
 
     // WP-28 (stage post-patch-hooks): the hooks are installed, but nothing has been committed and the application's post-patch
     // hooks have not run. Take the hooks out again (functions that were hooked to an earlier patch go back to that patch, the
@@ -186,6 +230,7 @@ void Agent::apply_install_hooks(const ipc::InstallHooks& request) {
         }
         CML_LOG(Warn, "hooks: request %llu: %s", static_cast<unsigned long long>(request.request_id), batch.diag.format().c_str());
     }
+    timing.dispatch.rollback_us = lap();
 
     if (!quiet) {
         set_last_patch_status(static_cast<std::int32_t>(batch.diag.code));
@@ -207,6 +252,7 @@ void Agent::apply_install_hooks(const ipc::InstallHooks& request) {
                 static_cast<unsigned long long>(ran), batch.ok() ? "succeeded" : "failed");
         session.reset();  // releases the patch images
     }
+    timing.dispatch.postpatch_us = lap();
 
     ipc::HooksInstalled reply;
     reply.request_id = request.request_id;
@@ -231,6 +277,17 @@ void Agent::apply_install_hooks(const ipc::InstallHooks& request) {
         }
         reply.results.push_back(std::move(result));
     }
+    timing.dispatch.reply_us = lap();
+    timing.dispatch.total_us = ticks_to_us(mark - (received != 0 ? received : started));
+    timing.op = revert ? "revert" : quiet ? "quiet" : "install";
+    timing.hooks = count;
+    timing.status = batch.diag.code;
+    timing.threads = batch.stats.threads;
+    timing.attempts = batch.stats.attempts;
+    // Before the answer is queued, so the broker (the agent thread sends logs before answers) has the line when it hears the answer.
+    const std::string line = hook::format_hooks_timing(timing);
+    CML_LOG(Info, "%s", line.c_str());
+    forward_to_broker(LogLevel::Info, line);
     queue_reply(std::move(reply));
 }
 

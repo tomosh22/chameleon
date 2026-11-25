@@ -18,6 +18,19 @@ revert, restart).
 3. Look for the diagnostic in the `diag` events or the reload response: the `id`, `message` and `action` fields are the
    text shown below.
 4. Hot-restart (`restart`) is the way out when a change cannot be patched in place (`docs/KNOWN_LIMITATIONS.md`).
+5. Slow, not failing (WP-50): the broker log says where the time went, in lines that start with a `WP50-` tag.
+   * `WP50-INDEX module=... pdb_ms=... audit_ms=... scan_ms=... scan_read_ms=... scan_missing=... baseline_ms=...`: one
+     per PDB index (enabling a module, and again in the new process of a hot-restart). `scan_ms` is the include scan
+     (ADR-0013): with thousands of translation units it is most of the time, `scan_missing` counts the include-path
+     candidates that do not exist. `pdb_ms` is the PDB, `baseline_ms` the hashes of the tracked sources.
+   * `WP50-RESTART old_pid=... total_ms=... prepare_ms=... terminate_ms=... relaunch_ms=... register_ms=... reenable_ms=...
+     index_ms=... reapply_ms=... index_module=...`: one per hot-restart (also the `timing` and `stages_ms` members of the
+     `restart` result). `index_ms` is the wait for the new process's indexes; their own phases follow (`index_*_ms`).
+   * `WP50-HOOKS side=agent ...` and `side=broker ...`: one each per `InstallHooks`. The agent's line splits the request
+     into the wait, the application hooks, planning (`plan_us`, `probe_us`), `VirtualProtect` (`protect_us`), stopping the
+     threads (`stop_us` = `enumerate_us` + `suspend_us` + `context_us`), the writes (`write_us`, slowest hook
+     `write_max_us`) and resuming; the broker's line gives the round trip it saw. `batch=1` is the first of the process.
+   * `WP50-ONEOFF what=module-image|linker-detection|reserve-range ms=...`: work done once per module at its first reload.
 
 ## Ids raised by the integrations
 
@@ -2612,7 +2625,7 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 
 - **Cause:** The new process did not register in time (left running).  
 - **Message:** `the new process (pid <...>) did not register within <...> ms; it was left running; its next restart enables its modules and re-applies the session's edits once it has registered`  
-- **What to do:** Check that the application creates its agent at start-up (and that it can reach the broker); raise 'registration_timeout_ms' if it starts slowly. Since WP-43 the broker remembers the modules and edits of that restart: once the process has registered, its next `restart` enables the modules and re-applies the edits.  
+- **What to do:** Check that the application creates its agent at start-up (and that it can reach the broker); raise 'registration_timeout_ms' if it starts slowly. Since WP-43 the broker remembers the modules and edits of that restart: once the process has registered, its next `restart` enables the modules and re-applies the edits. The same budget also covers the new process's PDB indexes and the re-apply: when a restart that did register runs out of it, the broker log's `WP50-INDEX` and `WP50-RESTART` lines say which stage took the time (first steps, item 5).  
 - **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
 
 ### CML5809
