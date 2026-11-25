@@ -371,15 +371,6 @@ std::string hashed_closure_static(std::string_view name) {
     return !c.empty() && name.compare(at + 4, c.size() + 2, c + "@@") == 0 ? c : std::string();
 }
 
-// WP-46 (R-54, review): does the closure class named `closure` (its TPI name, "o2_step::<lambda_0>", as clang writes it) belong
-// to the function whose display name is `function` ("o2_step", "o2_step::<lambda_0>::operator()"), directly or through a local
-// scope of it? The scope is read from the display names (the name reader of the planner, display_name, parses the scope of a
-// static; its decorated type part is never searched). Overloads share a display name: their closures all count (over-refusal).
-bool closure_in_function(std::string_view closure, const std::string& function) {
-    return !function.empty() && closure.size() > function.size() + 2 && closure.compare(0, function.size(), function) == 0 &&
-           closure.compare(function.size(), 2, "::") == 0 && closure.find("<lambda_", function.size()) != std::string_view::npos;
-}
-
 class Planner {
 public:
     Planner(const PlanInput& in, BindPlan* partial) : in_(in), obj_(*in.object), pdb_(*in.module_pdb), partial_(partial) {}
@@ -519,10 +510,6 @@ private:
     std::map<std::uint32_t, std::int64_t> guard_delta_;            // delta_ plus what place_taught_ adds; used by settle_guards
     std::map<std::uint32_t, std::uint16_t> guard_delta_image_section_;
     void learn_guard_layout();
-    // WP-46 (R-54): why an own static of a function may be an inlined lambda's record ("" when it cannot be).
-    std::set<std::string> closures_with_proc_;  // unique names (without the unit's discriminator) of closures with an operator() procedure
-    bool closures_with_proc_built_ = false;
-    std::string inlined_lambda_risk(const std::string& member, const std::string& display, const std::string& base);
     // WP-46 (F-41.2): BindPlan::hashed_lambdas, and CML3630 for a hashed lambda's static that no hooked function vouches for.
     void note_hashed_lambdas();
     // The closure pairing the planner follows: PlanInput::closure_pairing (rule (d)) plus the hash-named lambda paired by
@@ -1447,97 +1434,6 @@ void Planner::learn_guard_layout() {
     if (!place_taught_.empty()) {
         CML_LOG(Info, "WP46-GUARD-LAYOUT object=%s taught=%zu sections_known=%zu conflicts=%zu", in_.object_name.c_str(), place_taught_.size(), guard_delta_.size(), conflict.size());
     }
-}
-
-std::string Planner::inlined_lambda_risk(const std::string& member, const std::string& display, const std::string& base) {
-    // Only clang inlines a lambda into every caller without emitting its call operator (cl at /O2 /Ob2 emits it as well,
-    // WP-40), and only clang names a closure by its function's scope in the TPI.
-    const pdb::Compiland& comp = pdb_.compiland(ci_);
-    if (!comp.has_compile3 || comp.compile.version.find("clang") == std::string_view::npos) {
-        return {};
-    }
-    // The function the static is declared in, by the display name the name reader gave it ("o2_step::sname" -> "o2_step";
-    // a lambda's static "o2_step::<lambda_0>::operator()::x" -> "o2_step::<lambda_0>::operator()", whose own lambdas can be
-    // inlined into it too). (Review: the decorated scope is not cut at a guessed "@4", which a back-reference in the static's
-    // type can also contain.) A name the reader cannot parse is a risk, not a pass.
-    const std::string suffix = "::" + base;
-    if (display.size() <= suffix.size() || display.compare(display.size() - suffix.size(), suffix.size(), suffix) != 0) {
-        return "the function of '" + member + "' cannot be read from its name, so a lambda of it that the compiler inlined cannot be ruled out";
-    }
-    const std::string function = normalized_pdb_name(display.substr(0, display.size() - suffix.size()));
-    // (Second review: the display spellings of the static's scope and of a closure's TPI name differ, "(anonymous namespace)"
-    // against "`anonymous namespace'", template arguments with or without spaces. The decorated scope is compared as well: the
-    // function's decorated name is the patch's own symbol whose name, followed by '@', begins the static's scope; a closure of
-    // that function has it, after a block prefix, in its unique name at some depth. Both in the spelling without the unit's
-    // discriminator.)
-    std::string decorated_function;
-    {
-        const std::string plain_member = pdb::without_tu_discriminator(member);
-        const std::size_t at = plain_member.find('@');
-        const std::string_view scope = at == std::string::npos ? std::string_view() : std::string_view(plain_member).substr(at + 1);
-        const std::size_t block = block_prefix_length(scope);
-        const std::string_view rest = block == 0 || block >= scope.size() || scope[block] != '?' ? std::string_view() : scope.substr(block + 1);
-        for (const Sym& f : syms_) {
-            if (!f.defined || f.dec.type != SymbolType::Function) {
-                continue;
-            }
-            const std::string& name = plain_name(f);
-            if (name.size() > decorated_function.size() && rest.size() > name.size() && rest.compare(0, name.size(), name) == 0 && rest[name.size()] == '@') {
-                decorated_function = name;
-            }
-        }
-    }
-    const auto in_function = [&](const pdb::ClosureClass& c) {
-        if (closure_in_function(normalized_pdb_name(c.name), function)) {
-            return true;
-        }
-        if (decorated_function.empty()) {
-            return false;
-        }
-        const std::string needle = decorated_function + "@";
-        for (std::size_t at = c.unique.find(needle); at != std::string::npos; at = c.unique.find(needle, at + 1)) {
-            if (at > 0 && c.unique[at - 1] == '?') {
-                return true;
-            }
-        }
-        return false;
-    };
-    const Result<const std::vector<pdb::ClosureClass>*> closures = pdb_.closure_classes();
-    if (!closures) {
-        return "the closure classes of the old image cannot be read (" + closures.error().message + "), so a lambda of the function that the compiler inlined cannot be ruled out";
-    }
-    bool risky_unknown = decorated_function.empty();
-    for (const pdb::ClosureClass& c : **closures) {
-        if (!in_function(c)) {
-            continue;
-        }
-        if (!closures_with_proc_built_) {
-            closures_with_proc_built_ = true;
-            if (ensure_compiland_symbols()) {
-                for (const pdb::SymbolView& v : comp_syms_) {
-                    if (pdb::is_proc_kind(v.kind) && comp_last(&v) == "operator()" && std::string_view(v.name).find("<lambda") != std::string_view::npos) {
-                        const pdb::FunctionSignature& sig = old_signature(v);
-                        if (sig.known && sig.member && !sig.class_unique_name.empty()) {
-                            closures_with_proc_.insert(pdb::without_tu_discriminator(sig.class_unique_name));
-                        }
-                    }
-                }
-            }
-        }
-        if (closures_with_proc_.count(c.unique) != 0) {
-            continue;  // its call operator is a procedure of the compiland: its statics are recorded there
-        }
-        CML_LOG(Info, "WP46-R54 static=%s function=%s closure='%s' unique=%s inlined-everywhere refused", member.c_str(), function.c_str(), c.name.c_str(), c.unique.c_str());
-        return "the old image has a lambda of that function ('" + c.name + "') whose call operator the compiler inlined everywhere (no procedure of it in compiland " + std::to_string(ci_) +
-               "), and the statics of such a lambda are recorded in the function itself";
-    }
-    if (risky_unknown) {
-        // Neither spelling of the function could be reconciled with the closures (its decorated name is no symbol of the patch):
-        // a lambda of it cannot be ruled out.
-        CML_LOG(Info, "WP46-R54 static=%s function=%s refused (the decorated function is not a symbol of the patch)", member.c_str(), function.c_str());
-        return "the decorated name of the function of '" + member + "' is not a symbol of the patch, so its lambdas cannot be told from the closures of the old image";
-    }
-    return {};
 }
 
 std::string Planner::elimination_problem(const std::string& fresh, const std::string& old, const Sym& op, const pdb::SymbolView& old_op) {
@@ -3125,25 +3021,7 @@ void Planner::bridge_statics() {
             }
         }
         if (!cands.empty()) {
-            std::string risk = own_static_lambda_risk(g);
-            // WP-46 (R-54, ADR-0043): a lambda that clang-cl inlined into every caller leaves no call operator and no record that
-            // names it; the static it had is a record of the caller, under the same name as an own static of the caller would
-            // be. The TPI still has the lambda's closure class: when the function had such a lambda, a record of the name in the
-            // function is not provably the own static's (the patch may have deleted the lambda and declared the own static).
-            // (Review: the statics of a lambda's call operator too: clang inlines a lambda into the lambda that calls it as well.
-            // C statics have no lambdas and are not decorated.)
-            if (risk.empty() && !g.is_func && !g.encl.empty() && !is_guard_variable("?" + g.base + "@")) {
-                for (const std::uint32_t pos : g.members) {
-                    const Sym& msym = syms_[pos];
-                    if (msym.name.empty() || msym.name[0] != '?') {
-                        continue;
-                    }
-                    risk = inlined_lambda_risk(msym.name, msym.dec.display == msym.name ? std::string() : msym.dec.display, g.base);
-                    if (!risk.empty()) {
-                        break;
-                    }
-                }
-            }
+            const std::string risk = own_static_lambda_risk(g);
             if (!risk.empty()) {
                 for (const std::uint32_t pos : g.members) {
                     Sym& sy = syms_[pos];

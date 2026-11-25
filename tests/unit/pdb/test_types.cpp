@@ -1033,7 +1033,7 @@ TEST_CASE("statics: nesting the reader does not follow, and too many statics, ar
     }
 }
 
-// ---- WP-46 (R-54): the closure classes of the TPI ---------------------------------------------------------------------
+// ---- WP-46: the closure classes of the TPI (kept for WP-51, R-54) ------------------------------------------------------
 
 TEST_CASE("types: closure_classes lists every lambda class of the TPI once, with its unique name without the unit's hash") {
     TempDir dir;
