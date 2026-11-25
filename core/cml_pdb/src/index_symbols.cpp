@@ -51,7 +51,8 @@ constexpr std::uint8_t kProcKind = static_cast<std::uint8_t>(SymbolKind::GlobalP
 constexpr std::uint8_t kLocalProcKind = static_cast<std::uint8_t>(SymbolKind::LocalProc);
 
 bool is_proc_rec(const SymRec& s) noexcept {
-    return s.kind == kProcKind || s.kind == kLocalProcKind;
+    const std::uint8_t kind = s.kind & kSymRecKindMask;
+    return kind == kProcKind || kind == kLocalProcKind;
 }
 
 // What the module record walker reports for each symbol it keeps.
@@ -65,6 +66,7 @@ struct Found {
     std::uint32_t type_index;
     std::uint8_t flags;
     std::uint32_t parent;
+    bool id_proc = false;  // S_GPROC32_ID / S_LPROC32_ID: type_index is an id (IPI) index
 };
 
 // Walks the symbol area of a module stream. `emit(const Found&)` returns the index given to the
@@ -92,6 +94,7 @@ bool walk_module_records(const std::uint8_t* data, std::uint64_t len, std::uint3
             f.type_index = rd32(b + 24);
             f.flags = b[34];
             f.parent = parent;
+            f.id_proc = k == cv::S_LPROC32_ID || k == cv::S_GPROC32_ID || k == cv::S_LPROC32_DPC_ID;
             scope_proc.back() = emit(f);
         } else if (cv::is_scope_opener(k)) {
             scope_proc.push_back(scope_proc.empty() ? kNoSymbol : scope_proc.back());
@@ -288,7 +291,7 @@ Result<std::unique_ptr<ModuleSymbols>> parse_module_symbols(const PdbIndex::Impl
         s.type_index = f.type_index;
         s.parent = f.parent;
         s.section = f.section;
-        s.kind = static_cast<std::uint8_t>(f.kind);
+        s.kind = static_cast<std::uint8_t>(static_cast<std::uint8_t>(f.kind) | (f.id_proc ? kSymRecIdProc : 0));
         s.flags = f.flags;
         ms.syms.push_back(s);
         return static_cast<std::uint32_t>(ms.syms.size() - 1);
@@ -676,7 +679,8 @@ SymbolView view_of(const PdbIndex::Impl& im, const SymRec& s, const char* base, 
                    const ModuleSymbols* ms) {
     SymbolView v;
     v.name = std::string_view(base + s.name_off, s.name_len);
-    v.kind = static_cast<SymbolKind>(s.kind);
+    v.kind = static_cast<SymbolKind>(s.kind & kSymRecKindMask);
+    v.type_is_id = (s.kind & kSymRecIdProc) != 0;
     v.compiland = compiland;
     v.index = index;
     v.section = s.section;

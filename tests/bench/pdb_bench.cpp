@@ -266,6 +266,46 @@ int main(int argc, char** argv) {
     check.expect(looked_up > 0 && resolved * 100 >= looked_up * 99, "sampled lookups (proc by rva, by name, file map)",
                  std::to_string(resolved) + "/" + std::to_string(looked_up) + " resolved in " + fmt("%.1f ms", q_ms));
 
+    // ---- WP-37: the type streams are lazy ----------------------------------------------------------
+    // Nothing above (open, publics, every compiland's symbols, the sampled lookups) may have touched a type record,
+    // so the load-time and memory figures of this run are the figures with the type reader in place. Then the cost of
+    // what a reload asks for: the canonical signatures of a sample of procs, read through the type-index offset table.
+    {
+        const cml::pdb::TypeStreamStats tpi_before = idx.type_stream_stats(true);
+        const cml::pdb::TypeStreamStats ipi_before = idx.type_stream_stats(false);
+        check.expect(!tpi_before.opened && !ipi_before.opened, "type streams untouched by the load (lazy)",
+                     std::string("TPI opened=") + (tpi_before.opened ? "1" : "0") + " IPI opened=" + (ipi_before.opened ? "1" : "0"));
+        std::size_t asked = 0;
+        std::size_t known = 0;
+        const auto t_sig = Clock::now();
+        for (std::uint32_t c = 0; c < idx.compiland_count(); c += step) {
+            auto syms = idx.compiland_symbols(c);
+            if (!syms) {
+                continue;
+            }
+            std::size_t taken = 0;
+            for (const auto& sym : *syms) {
+                if (!cml::pdb::is_proc_kind(sym.kind) || sym.type_index == 0) {
+                    continue;
+                }
+                ++asked;
+                known += idx.proc_signature(sym).known ? 1u : 0u;
+                if (++taken >= 25) {
+                    break;
+                }
+            }
+        }
+        const double sig_ms = ms_since(t_sig);
+        const cml::pdb::TypeStreamStats tpi = idx.type_stream_stats(true);
+        std::printf("\n== type streams (WP-37; read after the measures above) ==\n");
+        std::printf("  signatures: %zu asked, %zu known, %.1f ms\n", asked, known, sig_ms);
+        std::printf("  TPI: %.1f MiB of records in %u chunk(s), %u read (%.2f MiB walked, %.2f MiB copied), %s, %u lookups\n", mib(static_cast<double>(tpi.record_bytes)),
+                    tpi.chunks, tpi.chunks_loaded, mib(static_cast<double>(tpi.bytes_loaded)), mib(static_cast<double>(tpi.bytes_copied)),
+                    tpi.sparse ? "sparse (type-index offset table)" : "one chunk", tpi.lookups);
+        check.expect(tpi.chunks_loaded <= tpi.chunks && tpi.bytes_loaded <= tpi.record_bytes, "type records read on demand",
+                     std::to_string(tpi.chunks_loaded) + " of " + std::to_string(tpi.chunks) + " chunks");
+    }
+
     // ---- budgets ------------------------------------------------------------------------------
     const double budget_ms = std::max(100.0, 2000.0 * (size_mb / 500.0) * slack);
     if (!json_path.empty()) {

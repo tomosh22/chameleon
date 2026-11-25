@@ -264,6 +264,68 @@ TEST_CASE("fixture basic: full load and concurrent queries") {
     CHECK(t.module_symbols_ms >= 0);
 }
 
+// WP-37 (ADR-0042): the real type stream, written by this cell's compiler and linker. Lazy: a fresh index has read
+// nothing of it; afterwards only the chunks the signatures needed.
+TEST_CASE("fixture basic: canonical signatures from the real TPI stream") {
+    cml::pdb::OpenOptions options;
+    options.use_cache = false;  // a fresh index, so that "nothing read yet" can be observed
+    auto opened = PdbIndex::open_pdb(CML_FIXTURE_BASIC_PDB, options);
+    REQUIRE_MESSAGE(opened.has_value(), (opened.has_value() ? std::string() : opened.error().format()));
+    const PdbIndex& idx = **opened;
+    CHECK_FALSE(idx.type_stream_stats(true).opened);
+    CHECK_FALSE(idx.type_stream_stats(false).opened);
+
+    const std::uint32_t logic_c = only(idx.compilands_by_object_stem("logic"), "logic compiland");
+    const std::uint32_t extras_c = only(idx.compilands_by_object_stem("extras"), "extras compiland");
+    const std::uint32_t main_c = only(idx.compilands_by_object_stem("main"), "main compiland");
+
+    // int compute_value(): cdecl, returns int (T_INT4 = 0x74), no parameters. Both compilers record it so.
+    bool found_compute_value = false;
+    std::size_t asked = 0;
+    std::size_t member_functions = 0;
+    for (const std::uint32_t c : {logic_c, extras_c, main_c}) {
+        auto syms = idx.compiland_symbols(c);
+        REQUIRE(syms.has_value());
+        for (const cml::pdb::SymbolView& v : *syms) {
+            if (!cml::pdb::is_proc_kind(v.kind) || v.type_index == 0) {
+                continue;  // (a proc without a type: compiler-generated funclets)
+            }
+            const cml::pdb::FunctionSignature s = idx.proc_signature(v);
+            ++asked;
+            // Every function of the fixture's own translation units has a readable signature: a record kind the reader
+            // does not know would show here, with its number in the message.
+            CHECK_MESSAGE(s.known, std::string(v.name) << " (type 0x" << std::hex << v.type_index << std::dec << "): CML" << s.diag_id << " " << s.why);
+            if (s.known) {
+                CHECK_FALSE(s.text.empty());
+                member_functions += s.member ? 1u : 0u;
+                if (s.member) {
+                    CHECK_FALSE(s.class_name.empty());
+                }
+            }
+            if (c == logic_c && v.name == "compute_value") {
+                found_compute_value = true;
+                CHECK(s.text.rfind("F(cc=0,fa=0,r=t74,a=[", 0) == 0);
+                CHECK_FALSE(s.member);
+            }
+        }
+    }
+    CHECK(found_compute_value);
+    CHECK(asked >= 3);
+
+    const cml::pdb::TypeStreamStats tpi = idx.type_stream_stats(true);
+    CHECK(tpi.opened);
+    CHECK(tpi.lookups > 0);
+    CHECK(tpi.chunks >= 1);
+    CHECK(tpi.chunks_loaded >= 1);
+    CHECK(tpi.chunks_loaded <= tpi.chunks);
+    CHECK(tpi.bytes_loaded <= tpi.record_bytes);
+    if (tpi.chunks > 1) {
+        CHECK(tpi.sparse);  // the linker's type-index offset table was usable
+    }
+    MESSAGE("TPI of fixture basic: record_bytes=" << tpi.record_bytes << " chunks=" << tpi.chunks << " loaded=" << tpi.chunks_loaded << " bytes_loaded=" << tpi.bytes_loaded
+                                                 << " bytes_copied=" << tpi.bytes_copied << " lookups=" << tpi.lookups << " signatures=" << asked << " member=" << member_functions);
+}
+
 #else
 
 TEST_CASE("fixture basic: not configured") {

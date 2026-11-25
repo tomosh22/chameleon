@@ -42,4 +42,7 @@ inline constexpr std::uint32_t kGuardUnmatched = 3211;     // function-local sta
 inline constexpr std::uint32_t kSectionRelative = 3212;    // reference through a section symbol into bound data
 // 3213 is retired (ambiguous static functions are the error 3214).
 
+// WP-37 (ADR-0042: CML3570..CML3599, planner).
+inline constexpr std::uint32_t kStaticsMatchedByOrder = 3570;  // same-named statics of one function were paired by their place in it (warning)
+
 }  // namespace cml::core::bind::diag

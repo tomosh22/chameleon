@@ -1,4 +1,4 @@
-// Fixture `pch` main loop: prints `TICK n=<k> value=<compute_value()> base=<pch_base()>` every 100 ms.
+// Fixture `pch` main loop: prints `TICK n=<k> value=<compute_value()> base=<pch_base()> ov=<pch_overloads()>` every 100 ms.
 // `--ticks N` stops after N lines (for ctest); without it the loop runs until killed.
 // `--agent` (opt-in, WP-11) also starts the Chameleon agent; see the comments marked AGENT below.
 // `--agent-wait MS` bounds how long it waits at exit for the broker's answer (default 30000).
@@ -73,7 +73,7 @@ int main(int argc, char** argv)
     }
 
     while (max_ticks < 0 || g_tick < max_ticks) {
-        std::printf("TICK n=%d value=%d base=%d\n", g_tick, compute_value(), pch_base());
+        std::printf("TICK n=%d value=%d base=%d ov=%d\n", g_tick, compute_value(), pch_base(), pch_overloads());
         ++g_tick;
         agent.SyncPoint();  // AGENT: no-op for an invalid agent and in immediate mode
         if (!enable_reported) {

@@ -12,10 +12,12 @@
 #include <vector>
 
 #include "cml/pdb/index.h"
+#include "cml/pdb/type_records.h"
 #include "detail/counting.h"
 #include "detail/mapped_file.h"
 #include "detail/msf.h"
 #include "detail/name_table.h"
+#include "detail/type_stream.h"
 
 namespace cml::pdb {
 
@@ -31,10 +33,13 @@ struct SymRec {
     std::uint32_t type_index = 0;
     std::uint32_t parent = kNoSymbol;
     std::uint16_t section = 0;
-    std::uint8_t kind = 0;   // SymbolKind
+    std::uint8_t kind = 0;   // SymbolKind in the low 7 bits; kSymRecIdProc for an *_ID proc record (WP-37)
     std::uint8_t flags = 0;  // procs: CV_PROCFLAGS
 };
 static_assert(sizeof(SymRec) == 28, "SymRec layout");
+// Set in SymRec::kind when the proc record is S_GPROC32_ID / S_LPROC32_ID (its type index is an IPI index).
+inline constexpr std::uint8_t kSymRecIdProc = 0x80;
+inline constexpr std::uint8_t kSymRecKindMask = 0x7F;
 
 // A public (S_PUB32) or global data (S_GDATA32 / S_GTHREAD32) record of the symbol record stream.
 // 20 bytes. Names point into the retained stream.
@@ -169,6 +174,16 @@ struct PdbIndex::Impl {
     mutable std::atomic<std::uint8_t> tpi_state{0};
     mutable std::optional<Diag> tpi_error;
     mutable std::unique_ptr<detail::IpiTable> tpi;
+
+    // WP-37: the type streams as the signature reader uses them (sparse, see detail/type_stream.h). [0] = IPI, [1] = TPI.
+    // Opened on first use under type_stream_mutex; a failure is remembered.
+    mutable std::mutex type_stream_mutex;
+    mutable std::unique_ptr<detail::TypeStream> type_streams[2];
+    mutable std::optional<Diag> type_stream_errors[2];
+    mutable bool type_stream_tried[2] = {false, false};
+    mutable std::unique_ptr<TypeSource> type_source;  // find_type -> TPI, find_id -> IPI (created on first use)
+    // The stream (nullptr when it cannot be opened; `error` then receives why).
+    const detail::TypeStream* type_stream(bool want_tpi, Diag* error = nullptr) const;
 
     mutable std::unique_ptr<std::atomic<std::uint8_t>[]> module_state;
     mutable std::vector<std::unique_ptr<detail::ModuleSymbols>> module_symbols;

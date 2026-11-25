@@ -228,6 +228,9 @@ exits 0, and the console prints `PARTIAL: N steps skipped for missing broker cap
   `tests/fixtures/CmlFixture.cmake` and points it at this repository's `agent/include`; `cml_agent.dll` is copied
   beside the exe afterwards.
 - The control protocol (named pipe, JSON lines) is specified in `docs/wp/WP-13.md`.
+- After every `reload` step (accepted or refused) cmltest prints the lines the broker logged for it that carry an evidence
+  tag of the form `WP<nn>-<NAME>` (WP-37: `WP37-TYPES source=debugT|typeserver|unreadable object=...`, which path supplied
+  the patch object's type records). `broker.log` itself is only kept as an artifact; these lines reach the job log.
 
 ## Tests
 

@@ -52,8 +52,9 @@ public:
     const Bytes& bytes() const { return bytes_; }
 
     // Symbol helpers -------------------------------------------------------------------------
+    // `type`: the type index (S_GPROC32 / S_LPROC32) or the id index (the _ID forms 0x1146 / 0x1147).
     void proc(std::uint16_t kind, const std::string& name, std::uint16_t seg, std::uint32_t off, std::uint32_t len,
-              std::uint8_t flags = 0) {
+              std::uint8_t flags = 0, std::uint32_t type = 0x1000) {
         Bytes b;
         put32(b, 0);       // parent
         put32(b, 0);       // end
@@ -61,7 +62,7 @@ public:
         put32(b, len);     // code length
         put32(b, 0);       // debug start
         put32(b, len);     // debug end
-        put32(b, 0x1000);  // type
+        put32(b, type);    // type
         put32(b, off);
         put16(b, seg);
         b.push_back(flags);
@@ -165,8 +166,7 @@ public:
         Bytes b;
         put32(b, substr);
         putstr(b, s);
-        recs_.add(0x1605, b);
-        return next_++;
+        return record(0x1605, b);
     }
     std::uint32_t substr_list(const std::vector<std::uint32_t>& ids) {
         Bytes b;
@@ -174,8 +174,7 @@ public:
         for (auto id : ids) {
             put32(b, id);
         }
-        recs_.add(0x1604, b);
-        return next_++;
+        return record(0x1604, b);
     }
     std::uint32_t buildinfo(const std::vector<std::uint32_t>& args) {
         Bytes b;
@@ -183,32 +182,56 @@ public:
         for (auto id : args) {
             put32(b, id);
         }
-        recs_.add(0x1603, b);
-        return next_++;
+        return record(0x1603, b);
     }
     // WP-23: any record (type records for a TPI built with this class). Returns its id.
     std::uint32_t record(std::uint16_t kind, const Bytes& body) {
+        offsets_.push_back(static_cast<std::uint32_t>(recs_.bytes().size()));
         recs_.add(kind, body);
         return next_++;
     }
-    Bytes stream() const {
+    // WP-37: `hash_stream` / `table_bytes` describe the type-index offset table (the stream that holds it at offset 0
+    // and its size); without them the header says "no hash stream", as before.
+    Bytes stream(std::uint16_t hash_stream = 0xFFFF, std::uint32_t table_bytes = 0) const {
         Bytes s;
         put32(s, 20040203);  // version
         put32(s, 56);        // header size
         put32(s, 0x1000);    // type index begin
         put32(s, next_);     // type index end
         put32(s, static_cast<std::uint32_t>(recs_.bytes().size()));
+        if (hash_stream != 0xFFFF) {
+            put16(s, hash_stream);  // @20
+            put16(s, 0xFFFF);       // hash aux stream
+            put32(s, 4);            // hash key size
+            put32(s, 0);            // hash buckets
+            put32(s, 0);            // hash values: offset
+            put32(s, 0);            //              length
+            put32(s, 0);            // @40 type-index offsets: offset in the hash stream
+            put32(s, table_bytes);  // @44                     length
+        }
         while (s.size() < 56) {
             s.push_back(0);
         }
         s.insert(s.end(), recs_.bytes().begin(), recs_.bytes().end());
         return s;
     }
+    // WP-37: the type-index offset table, one (index, offset) pair for every `every` records (the first is (0x1000, 0)).
+    Bytes index_offsets(std::uint32_t every) const {
+        Bytes t;
+        for (std::size_t i = 0; i < offsets_.size(); i += every) {
+            put32(t, 0x1000u + static_cast<std::uint32_t>(i));
+            put32(t, offsets_[i]);
+        }
+        return t;
+    }
     bool empty() const { return next_ == 0x1000; }
     std::uint32_t next_id() const { return next_; }  // the id the next record added will get
+    std::uint32_t record_bytes() const { return static_cast<std::uint32_t>(recs_.bytes().size()); }
+    std::uint32_t offset_of(std::uint32_t id) const { return offsets_[id - 0x1000u]; }
 
 private:
     Records recs_;
+    std::vector<std::uint32_t> offsets_;  // of every record within the record area
     std::uint32_t next_ = 0x1000;
 };
 
@@ -224,6 +247,12 @@ struct Spec {
     std::vector<Contribution> contributions;
     Ipi ipi;
     Ipi tpi;  // WP-23: written as stream 2 when it has records (else the stream stays empty, as before)
+    // WP-37: when not 0, TPI and IPI get a hash stream holding a type-index offset table with one entry per this many
+    // records (what linkers write for about every 8 KiB), so readers can find a record without walking the stream.
+    std::uint32_t type_offsets_every = 0;
+    // Deliberate defects of that table: replace the TPI table by these bytes / claim another length in the header.
+    Bytes tpi_offsets_override;
+    bool tpi_offsets_use_override = false;
     bool omit_section_stream = false;
     // Deliberate defects.
     bool bad_dbi_signature = false;
@@ -250,10 +279,22 @@ inline Bytes build(const Spec& spec) {
     if (spec.empty_info_stream) {
         streams[1].clear();
     }
-    if (!spec.tpi.empty()) {
-        streams[2] = spec.tpi.stream();
+    if (spec.type_offsets_every != 0) {
+        // Streams 7 and 8: the hash streams of TPI and IPI (only the type-index offset table, at offset 0).
+        Bytes tpi_table = spec.tpi_offsets_use_override ? spec.tpi_offsets_override : spec.tpi.index_offsets(spec.type_offsets_every);
+        Bytes ipi_table = spec.ipi.index_offsets(spec.type_offsets_every);
+        if (!spec.tpi.empty()) {
+            streams[2] = spec.tpi.stream(7, static_cast<std::uint32_t>(tpi_table.size()));
+        }
+        streams[4] = spec.ipi.stream(8, static_cast<std::uint32_t>(ipi_table.size()));
+        streams.push_back(std::move(tpi_table));
+        streams.push_back(std::move(ipi_table));
+    } else {
+        if (!spec.tpi.empty()) {
+            streams[2] = spec.tpi.stream();
+        }
+        streams[4] = spec.ipi.stream();
     }
-    streams[4] = spec.ipi.stream();
     streams[5] = spec.symrec.bytes();
     {
         Bytes& sec = streams[6];

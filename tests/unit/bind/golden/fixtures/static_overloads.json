@@ -1,0 +1,22 @@
+{
+  "fixture": "static_overloads",
+  "edit": "floor_plus_100.edit (overloads.h, planned for tu_a.cpp)",
+  "min_hooks": 9,
+  "min_bind_old_data": 1,
+  "expect": [
+    { "symbol": "a_float", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol": "a_vec", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol": "a_weight", "decision": "patch-hooked", "source": "pdb-public" },
+    { "symbol": "?so_floor@@YAMM@Z", "decision": "patch-hooked", "source": "compiland-static-signature" },
+    { "symbol": "?so_floor@@YA?AUSoVec2@@AEBU1@@Z", "decision": "patch-hooked", "source": "compiland-static-signature" },
+    { "symbol": "?so_weight@@YAHH@Z", "decision": "patch-hooked", "source": "compiland-static-signature" },
+    { "symbol": "?so_weight@@YAH_J@Z", "decision": "patch-hooked", "source": "compiland-static-signature" },
+    { "symbol": "?so_weight@@YAHPEBD@Z", "decision": "patch-hooked", "source": "compiland-static-signature" },
+    { "symbol": "(anonymous namespace)::s_calls", "decision": "bind-old-data", "source": "compiland-static" }
+  ],
+  "absent": [
+    { "symbol": "so_floor", "decision": "patch-new-function" },
+    { "symbol": "so_weight", "decision": "patch-new-function" },
+    { "symbol": "(anonymous namespace)::s_calls", "decision": "patch-new-data" }
+  ]
+}

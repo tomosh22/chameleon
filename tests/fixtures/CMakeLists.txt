@@ -41,6 +41,10 @@ foreach(_cml_m6 crash hot_restart revert tls elision)
     endif()
 endforeach()
 
+# Wave 10 fixture directories (ADR-0042), one line per work package.
+add_subdirectory(static_overloads)  # WP-37
+add_subdirectory(lambda_statics)    # WP-37
+
 # Wave 7 fixture directories (ADR-0035, ADR-0036), built only once a work package adds them.
 foreach(_cml_m7 crash_reexecute perf inject static_lib c_statics)
     if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/${_cml_m7}/CMakeLists.txt")

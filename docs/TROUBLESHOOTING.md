@@ -476,6 +476,42 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
   Other variants of the advice: Rebuild the module so the compiler and linker regenerate the debug info.  
 - **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
 
+### CML1430
+
+- **Cause:** The TPI or IPI stream (the type records) of a PDB is missing or its header is invalid. The bind planner reads types only to tell same-named static functions and lambda-local statics apart, so this shows up as the reason inside a `CML3214` or `CML3207` message, never on its own.  
+- **Message:** `The <...>TPI<...>IPI<...> stream of '<...>' is unusable (<...>); type information is unavailable.`  
+- **What to do:** Rebuild the module so the linker regenerates the PDB.  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
+### CML1431
+
+- **Cause:** A type record needed for a function's signature is malformed, missing, of a kind the reader does not know, or nested too deeply. The signature is then unknown and nothing is paired by it (the reason appears inside `CML3214` / `CML3207`).  
+- **Message:** `type <...> is not in the type records` (other variants name the record and what is wrong with it)  
+- **What to do:** Recompile the translation unit; if the message names a record kind, report it with the compiler version.  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
+### CML1432
+
+- **Cause:** The patch object carries no usable type records: it has no `.debug$T` section (compiled without debug information), the section is not CodeView C13, or it only refers to types kept elsewhere.  
+- **Message:** `The object's .debug$T section is not a CodeView C13 type section.`  
+- **What to do:** Compile the translation unit with /Z7 (or /Zi) so the object carries type information.  
+  Other variants of the advice: Read the types from that PDB, or compile the translation unit with /Z7.  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
+### CML1433
+
+- **Cause:** A `.debug$S` section of the patch object is malformed, or a function has no procedure record in it, so the function's type is not known.  
+- **Message:** `An object's .debug$S section is malformed (<...>).`  
+- **What to do:** Recompile the translation unit.  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
+### CML1434
+
+- **Cause:** The patch object was compiled with /Zi and names a compiler PDB for its types, but the file at that path belongs to another compilation (its GUID differs).  
+- **Message:** `the type records of <...> cannot be read: its types are in the compiler PDB '<...>', but the file there is <...> and the object was compiled against <...>`  
+- **What to do:** Reload again (the compiler PDB was rewritten in between), or build the project with /Z7.  
+- **Raised by:** `core/cml_pdb/include/cml/pdb/diag_ids.h`
+
 
 ## CML1500 to CML1599
 
@@ -747,8 +783,8 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 
 ### CML3207
 
-- **Cause:** Static matches several old symbols.  
-- **Message:** `static data '<...>' (<...>) matches <...> records named '<...>' in compiland <...> but the patch object defines <...> of them`  
+- **Cause:** Static matches several old symbols. The reason follows a colon in the message. Same-named function-local statics of several lambdas (a macro such as Godot's `SNAME`) are told apart by their lambda as long as the function has the same lambdas as before; when a lambda with such a static was added or removed, the compiler's lambda numbers may have shifted. Several statics of one name in one function (declared in different blocks) are placed by the layout of their object section where that is known; where it is not (under cl every function-local static is a section of its own) they are matched by their place in the function (with the warning `CML3570`) only when the function has the same number of them as before, each has the same type and sits in the same block; otherwise this error names what differs, also when the guard variable of such a static has no record in the old image (clang-cl records none): the patch would then construct the old object a second time. The message also says so when the debug records needed for either could not be read (`CML1430` to `CML1434`).  
+- **Message:** `static data '<...>' (<...>) matches <...> records named '<...>' in compiland <...> but the patch object defines <...> of them<...>`  
 - **What to do:** Rename one of the statics, keep their number unchanged, or hot-restart.  
 - **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
 
@@ -789,8 +825,8 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 
 ### CML3214
 
-- **Cause:** Same-scope static overloads cannot be told apart.  
-- **Message:** `ambiguous overloads of static '<...>' (<...>) in <...>; cannot tell which old function each new one replaces (<...> in the patch, <...> records named '<...>' in compiland <...>)`  
+- **Cause:** Same-scope static overloads cannot be told apart. Overloads are paired by their signature from the debug type records, so this is left for the cases named after a colon in the message: several functions of that name and scope have the same signature; no signature of the patch occurs in the old image; the call operators of lambdas whose function no longer has the same lambdas as before (a lambda is known only by the number the compiler gives it, and adding or removing one shifts the numbers); or the type records cannot be read (`CML1430` to `CML1434`: no debug information in the patch object, a compiler PDB that is missing, types that live in a precompiled header object, a malformed record).  
+- **Message:** `ambiguous overloads of static '<...>' (<...>) in <...>; cannot tell which old function each new one replaces (<...> in the patch, <...> records named '<...>' in compiland <...>)<...>`  
 - **What to do:** Rename one overload, or hot-restart.  
 - **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
 
@@ -1112,6 +1148,13 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 - **Message:** `the image-relative displacement to '<...>' does not fit 32 bits: patch base <...>, target <...> (section '<...>' + <...>)`  
 - **What to do:** Access the data through a function or pointer in the module, or hot-restart.  
   Other variants of the advice: Reserve the patch within +-2 GiB of the module (the loader does this), or hot-restart.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3570
+
+- **Cause:** (warning) Several function-local statics of one name in one function, declared in different blocks (`if (i == 0) { static const T names = ...; } else { static const T names = ...; }`), were matched to the running program's copies by their order in the function. Nothing else tells them apart: they have one name, one scope and one type, and the layout of their object section is not known (under cl every function-local static is a section of its own; where a layout is known it places them and this warning is not raised). The reload is applied; the function has the same number of them as before, each with the same type and in the same block. If the edit swapped two of those blocks or replaced one, the statics now hold each other's values.  
+- **Message:** `Function-local statics '<...>' of '<...>' (<...>) are matched by their order in the function; if you reordered or replaced blocks that declare them, their values may be exchanged.`  
+- **What to do:** Rename one of them, or hot-restart after reordering.  
 - **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
 
 

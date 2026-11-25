@@ -46,6 +46,7 @@ cml_add_unit_test(pdb
         pdb/test_robust.cpp
         pdb/test_pe_lookup.cpp
         pdb/test_fixture.cpp
+        pdb/test_types.cpp
     LIBS cml_pdb)
 # WP-04: pdb/test_fixture.cpp reads the PDB of fixture `basic` (built by this CI cell's compiler).
 # Local overrides (portable syntax-check builds have no fixture binaries): CML_TEST_FIXTURE_BASIC_PDB,

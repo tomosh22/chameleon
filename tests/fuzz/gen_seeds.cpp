@@ -5,7 +5,10 @@
 // coff/   hand-built objects from the unit tests' independent builder (regular, bigobj, COMDAT, weak external, extended
 //         relocations, long names) plus truncated and bit-flipped variants of them
 // pe/     the unit tests' PE32+ image (imports, exports with a forwarder, debug, load config, TLS, .pdata)
-// pdb/    the unit tests' synthetic PDB (several compilands, publics, sections, build info) with a small block size
+// pdb/    the unit tests' synthetic PDB (several compilands, publics, sections, build info) with a small block size;
+//         WP-37: PDBs with a TPI and an IPI stream (function types, a closure class, function ids, the type-index
+//         offset table) and the raw `.debug$T` / `.debug$S` sections of an object (own records, a type-server
+//         reference, precompiled types)
 // ipc/    one frame of every message type, both directions, with realistic content
 // control one line of every control-protocol shape
 // lde/    function entries as bytes for the hook installer's length decoder (WP-38): cl and clang-cl prologues, entries
@@ -23,6 +26,7 @@
 #include "cml/ipc/messages.h"
 #include "coff/obj_builder.h"
 #include "pdb/pdb_builder.h"
+#include "pdb/type_builder.h"
 #include "pe/pe_builder.h"
 
 namespace fs = std::filesystem;
@@ -219,6 +223,146 @@ void pdb_seeds(const fs::path& dir) {
     fragmented.fragmented = true;
     write_seed(dir, "tiny_fragmented.bin", build(fragmented));
     write_seed(dir, "empty.bin", Bytes());
+
+    // ---- WP-37: type streams ----
+    // float floor(float); Vec2 floor(const Vec2&); the call operator of a closure; a function taking a pointer to an
+    // array of an enum; ids for all of them. Filler records in between so that the offset table has several chunks.
+    TypeSet types;
+    const auto filler = [&types](int n) {
+        for (int i = 0; i < n; ++i) {
+            types.add(kLfPointer, lf_pointer(kTChar));
+        }
+    };
+    const std::uint32_t args_float = types.add(kLfArgList, lf_arglist({kTFloat}));
+    const std::uint32_t fn_float = types.add(kLfProcedure, lf_procedure(kTFloat, args_float, 1));
+    filler(5);
+    const std::uint32_t vec2 = types.add(kLfStructure, lf_udt("Vec2", ".?AUVec2@@", true));
+    const std::uint32_t const_vec2 = types.add(kLfModifier, lf_modifier(vec2, 1));
+    const std::uint32_t ref_vec2 = types.add(kLfPointer, lf_pointer(const_vec2, kRef64));
+    const std::uint32_t args_vec2 = types.add(kLfArgList, lf_arglist({ref_vec2}));
+    const std::uint32_t fn_vec2 = types.add(kLfProcedure, lf_procedure(vec2, args_vec2, 1));
+    filler(5);
+    const std::uint32_t closure = types.add(kLfClass, lf_udt("f::<lambda_1>", ".?AV<lambda_1>@?1??f@@YAXXZ@", true));
+    const std::uint32_t const_closure = types.add(kLfModifier, lf_modifier(closure, 1));
+    const std::uint32_t this_ptr = types.add(kLfPointer, lf_pointer(const_closure, kPtr64 | 0x400));
+    const std::uint32_t args_none = types.add(kLfArgList, lf_arglist({}));
+    const std::uint32_t fn_call = types.add(kLfMFunction, lf_mfunction(kTInt, closure, this_ptr, args_none, 0));
+    filler(5);
+    const std::uint32_t color = types.add(kLfEnum, lf_enum("Color", ".?AW4Color@@"));
+    const std::uint32_t colors = types.add(kLfArray, lf_array(color, 16));
+    const std::uint32_t ptr_colors = types.add(kLfPointer, lf_pointer(colors));
+    const std::uint32_t c_struct = types.add(kLfStructure, lf_udt("point", ""));
+    const std::uint32_t args_mixed = types.add(kLfArgList, lf_arglist({ptr_colors, c_struct, kTDouble}));
+    const std::uint32_t fn_mixed = types.add(kLfProcedure, lf_procedure(kTVoid, args_mixed, 3));
+
+    Spec typed;
+    typed.block_size = 512;
+    typed.sections = spec.sections;
+    types.add_to(typed.tpi);
+    const std::uint32_t id_float = typed.ipi.record(kLfFuncId, lf_func_id(fn_float, "floor"));
+    const std::uint32_t id_call = typed.ipi.record(kLfMFuncId, lf_mfunc_id(closure, fn_call, "operator()"));
+    Module tm;
+    tm.name = "C:\\proj\\obj\\logic.cpp.obj";
+    tm.symbols.objname(tm.name);
+    const struct {
+        std::uint16_t kind;
+        const char* name;
+        std::uint32_t type;
+    } procs[] = {{0x110F, "floor", fn_float}, {0x110F, "floor", fn_vec2}, {0x110F, "`f'::`2'::<lambda_1>::operator()", fn_call},
+                 {0x1110, "mixed", fn_mixed}, {0x1146, "floor", id_float}, {0x1147, "f::<lambda_1>::operator()", id_call}};
+    std::uint32_t off = 0x100;
+    for (const auto& p : procs) {
+        tm.symbols.proc(p.kind, p.name, 1, off, 0x10, 0, p.type);
+        tm.symbols.data(0x110C, "sname", 2, off);
+        tm.symbols.end();
+        off += 0x10;
+    }
+    typed.modules.push_back(std::move(tm));
+    typed.type_offsets_every = 4;
+    const Bytes with_types = build(typed);
+    write_seed(dir, "types.bin", with_types);
+    write_seed(dir, "types_truncated.bin", truncated(with_types, with_types.size() * 2 / 3));
+    Spec typed_fragmented = typed;
+    typed_fragmented.fragmented = true;
+    write_seed(dir, "types_fragmented.bin", build(typed_fragmented));
+    Spec no_table = typed;
+    no_table.type_offsets_every = 0;
+    write_seed(dir, "types_no_table.bin", build(no_table));
+    {
+        // A table whose second entry starts inside a record, and one that promises too many records.
+        Spec bad = typed;
+        bad.tpi_offsets_use_override = true;
+        bad.tpi_offsets_override = typed.tpi.index_offsets(4);
+        bad.tpi_offsets_override[12] = static_cast<std::uint8_t>(bad.tpi_offsets_override[12] + 2);
+        write_seed(dir, "types_table_into_record.bin", build(bad));
+        bad.tpi_offsets_override = typed.tpi.index_offsets(4);
+        bad.tpi_offsets_override[8] = static_cast<std::uint8_t>(bad.tpi_offsets_override[8] + 3);
+        write_seed(dir, "types_table_wrong_count.bin", build(bad));
+    }
+    {
+        // A pointer that points at itself and a function whose argument list is the function.
+        Spec cyclic = typed;
+        const std::uint32_t self = cyclic.tpi.next_id();
+        cyclic.tpi.record(kLfPointer, lf_pointer(self));
+        const std::uint32_t args_self = cyclic.tpi.record(kLfArgList, lf_arglist(std::vector<std::uint32_t>(8, self + 2)));
+        const std::uint32_t fn_self = cyclic.tpi.record(kLfProcedure, lf_procedure(self, args_self, 8));
+        cyclic.modules[0].symbols.proc(0x110F, "cyclic", 1, 0x400, 0x10, 0, fn_self);
+        cyclic.modules[0].symbols.end();
+        write_seed(dir, "types_cyclic.bin", build(cyclic));
+    }
+
+    // ---- WP-37: the debug sections of an object ----
+    TypeSet object_types = types;  // types and ids share one index space in an object
+    const std::uint32_t oid_float = object_types.add(kLfFuncId, lf_func_id(fn_float, "floor"));
+    const std::uint32_t oid_vec2 = object_types.add(kLfFuncId, lf_func_id(fn_vec2, "floor"));
+    const std::uint32_t oid_call = object_types.add(kLfMFuncId, lf_mfunc_id(closure, fn_call, "operator()"));
+    const Bytes debug_t_bytes = object_types.debug_t();
+    write_seed(dir, "debug_t.bin", debug_t_bytes);
+    write_seed(dir, "debug_t_truncated.bin", truncated(debug_t_bytes, debug_t_bytes.size() - 7));
+    {
+        TypeSet server;
+        server.add(kLfTypeServer2, lf_typeserver2({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}, 3, "C:\\proj\\obj\\vc143.pdb"));
+        write_seed(dir, "debug_t_typeserver.bin", server.debug_t());
+        TypeSet own;
+        own.set_first(0x1100);
+        const std::uint32_t own_args = own.add(kLfArgList, lf_arglist({0x1010, kTInt}));
+        const std::uint32_t own_fn = own.add(kLfProcedure, lf_procedure(kTInt, own_args, 2));
+        own.add(kLfFuncId, lf_func_id(own_fn, "pick"));
+        const std::pair<std::uint16_t, Bytes> head(kLfPrecomp, lf_precomp(0x1000, 0x100, "C:\\proj\\obj\\pch.obj"));
+        write_seed(dir, "debug_t_precomp.bin", own.debug_t(&head));
+    }
+    const Bytes debug_s_bytes = debug_s({{0x1146, "floor", oid_float}, {0x1146, "floor", oid_vec2}, {0x1147, "f::<lambda_1>::operator()", oid_call}, {0x110F, "old_style", fn_mixed}});
+    write_seed(dir, "debug_s.bin", debug_s_bytes);
+    write_seed(dir, "debug_s_truncated.bin", truncated(debug_s_bytes, debug_s_bytes.size() - 9));
+    // ADR-0042, amended: function-local statics in blocks (and in an inline site), in an object and in a module stream.
+    const auto with_statics = [](Records& r, std::uint16_t code_seg, std::uint16_t data_seg, std::uint32_t code, std::uint32_t data) {
+        r.proc(0x1110, "get_argument_options", code_seg, code, 0x10);
+        r.block();
+        r.data(0x110C, "names", data_seg, data);
+        r.data(0x110C, "$TSS0", data_seg, data + 8);
+        r.block();
+        r.data(0x1112, "deep", data_seg, data + 0x10);
+        r.end();
+        r.end();
+        r.block();
+        r.data(0x110C, "names", data_seg, data + 0x18);
+        r.end();
+        r.add(0x114D, Bytes(12, 0));
+        r.data(0x110C, "inlined", data_seg, data + 0x20);
+        r.add(0x114E, Bytes());
+        r.end();
+    };
+    Records object_records;
+    with_statics(object_records, 0, 0, 0, 0);
+    write_seed(dir, "debug_s_statics.bin", debug_s_section(object_records.bytes()));
+    Spec blocks;
+    blocks.sections = spec.sections;
+    Module bm;
+    bm.name = "C:\\proj\\obj\\logic.cpp.obj";
+    bm.symbols.objname(bm.name);
+    with_statics(bm.symbols, 1, 2, 0x100, 0x40);
+    blocks.modules.push_back(std::move(bm));
+    write_seed(dir, "statics_blocks.bin", build(blocks));
 }
 
 // ---- IPC --------------------------------------------------------------------------------------------------------------

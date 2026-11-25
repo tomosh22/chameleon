@@ -68,7 +68,7 @@
       "expect": "tmpl=64 "
     },
     {
-      "id": "unsupported-static-overloads-win32-backend",
+      "id": "static-overloads-win32-backend",
       "file": "backends/imgui_impl_win32.cpp",
       "replace": [
         {
@@ -77,11 +77,11 @@
         }
       ],
       "include": "chameleon_corpus.h",
-      "expect_error": "CML3214",
+      "expect": "markers=\\S*imgui_win32_newframe_v2:\\d+",
       "compiler": "msvc"
     },
     {
-      "id": "unsupported-static-overloads-library-tu",
+      "id": "static-overloads-library-tu",
       "file": "imgui.cpp",
       "replace": [
         {
@@ -90,10 +90,10 @@
         }
       ],
       "include": "chameleon_corpus.h",
-      "expect_error": "CML3214"
+      "expect": "markers=\\S*imgui_newframe_v2:\\d+"
     },
     {
-      "id": "unsupported-static-overloads-header",
+      "id": "static-overloads-header",
       "file": "imgui_internal.h",
       "replace": [
         {
@@ -102,8 +102,8 @@
         }
       ],
       "include": "chameleon_corpus.h",
-      "expect_error": "CML3214",
-      "include_anchor": "#include <stdio.h>"
+      "include_anchor": "#include <stdio.h>",
+      "expect": "markers=\\S*imgui_floor_v2:\\d+"
     },
     {
       "id": "unsupported-new-thread-local",
