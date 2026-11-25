@@ -118,7 +118,7 @@ namespace Chameleon.Control
                         {
                             cancellationToken.ThrowIfCancellationRequested();
                             throw new ControlException(ClientDiagnostics.PipeLost(
-                                _pipeName, "no answer to '" + command + "' within " + (timeoutMs / 1000) + " s"));
+                                _pipeName, "no answer to '" + command + "' within " + (timeoutMs / 1000) + " s"), timedOut: true);
                         }
 
                         delayCancel.Cancel();

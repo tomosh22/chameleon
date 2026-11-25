@@ -25,6 +25,11 @@
 // timeout, on shutdown, when the requesting client disconnects, when the process host is destroyed and on every error path
 // (docs/wp/WP-34.md lists them). Without hold_new nothing here changes.
 //
+// WP-43 (ADR-0043): failure injection reaches the sequence (stages pre-restart-hooks .. restart-reapply, cml/ipc/fault_stages.h), and
+// a restart that could not finish its work in the new process (the registration failed, a module was not enabled again) is remembered
+// for that process: its next restart enables those modules and re-applies those edits ("unfinished restart", docs/wp/WP-43.md).
+// A broker that shuts down ends a running restart at its next wait (CML5821), whatever step it is in.
+//
 // The operating system part (open / terminate / start a process, duplicate handles) is behind ProcessHost so that the
 // whole sequence is unit-tested with a scripted agent on any host.
 
@@ -42,7 +47,9 @@
 #include <vector>
 
 #include "cml/core/restart_diag_ids.h"
+#include "cml/core/source_baseline.h"
 #include "cml/ipc/json.h"
+#include "cml/ipc/messages.h"
 #include "cml/util/result.h"
 
 namespace cml::core {
@@ -66,7 +73,8 @@ public:
     virtual ~RestartableProcess() = default;
     // Terminates the old process and waits for it to be gone.
     virtual Result<void> terminate(std::uint32_t timeout_ms) = 0;
-    // Starts the new process; returns its pid. The standard handles of the old process are handed on.
+    // Starts the new process; returns its pid. The standard handles of the old process are handed on. WP-43: may be called again after
+    // it failed (the broker tries twice); what it needs (the copied handles) is kept until it succeeds or the object is destroyed.
     virtual Result<std::uint32_t> relaunch(const RelaunchSpec& spec) = 0;
     // The exit code of the relaunched process once it has exited.
     virtual std::optional<std::uint32_t> relaunched_exit_code() = 0;
@@ -94,6 +102,12 @@ public:
 std::shared_ptr<ProcessHost> native_process_host();
 
 #if defined(_WIN32)
+// WP-43 (R-40): the executable the hold watchdog runs: this process's own image when it is cml_broker.exe. `module_file_name` stands for
+// GetModuleFileNameW(nullptr, buffer, capacity) (tests pass a fake). When there is none it says why in the log: at warn level when a call
+// failed or the path does not fit (a broker that is killed while holding would then leave the process suspended), at debug level when this
+// executable simply is not cml_broker.exe (a test host or a tool embedding the library).
+std::optional<std::wstring> hold_watchdog_executable(const std::function<unsigned long(wchar_t* buffer, unsigned long capacity)>& module_file_name);
+
 // WP-34: the hidden mode `cml_broker.exe --hold-watchdog <broker> <thread> <ended> <done> <max_ms>` (handle values inherited from the broker).
 // Resumes the held process's thread when the broker dies while holding it; see restart_win.cpp. `args` are the arguments after the flag.
 int run_hold_watchdog(const std::vector<std::string>& args);
@@ -119,10 +133,16 @@ public:
     Result<ipc::json::Value> restart(const ipc::json::Value& args, const std::function<bool()>& client_gone = {});
 
     // WP-34, command `restart-resume {pid}` -> {pid, resumed:true, held_ms}. Answers once the process runs. CML5814 when no process
-    // with that pid is held (it never was, or it was resumed already: the message says which), CML5818 for bad arguments.
+    // with that pid is held (it never was, or it was resumed already: the message says which), CML5818 for bad arguments. WP-43: CML5820
+    // when the restart did not confirm the resume in time (the process may still be held; the broker resumes it when hold_ms passes).
     Result<ipc::json::Value> resume(const ipc::json::Value& args);
     // Whether this coordinator can hold a new process (its host can).
-    bool hold_supported() const { return host_ != nullptr && host_->supports_hold(); }
+    bool hold_supported() const;
+    // WP-43 (R-40): the process host can be replaced (ReloadService::set_process_host) while a restart runs or holds a process. The
+    // coordinator stays, so `restart-resume` and a shutdown still reach the restart that holds it; a running restart keeps the host it
+    // started with. Null: no restart can start.
+    void set_host(std::shared_ptr<ProcessHost> host);
+    bool has_host() const;
     // Broker shutdown: every process that is held is resumed at once and its restart ends with CML5815; later holds end at once.
     void abort_holds();
     // A restart is running (also while it holds a process). The broker does not exit as idle meanwhile.
@@ -131,13 +151,38 @@ public:
     // How long the broker waits for the application to enable its modules by itself before it asks the agent to
     // (tests shorten it).
     void set_reenable_grace_for_testing(std::chrono::milliseconds grace) { grace_ = grace; }
-    // Called with "prepared", "snapshot" and "terminate" as the sequence passes them (tests check their order).
+    // Called with "prepared", "snapshot" and "terminate" as the sequence passes them (tests check their order). WP-43 adds "hold-ending"
+    // (a held restart: the hold's end was decided by the restart thread, before it is recorded).
     void set_trace_for_testing(std::function<void(const std::string&)> trace) { trace_ = std::move(trace); }
+    // WP-43: how long `restart-resume` waits for the restart thread to confirm that the process runs (default 10 s), and the pause before
+    // the second attempt to start the new process (default 250 ms).
+    void set_resume_confirm_wait_for_testing(std::chrono::milliseconds wait) { confirm_wait_ = wait; }
+    void set_relaunch_retry_delay_for_testing(std::chrono::milliseconds delay) { relaunch_retry_delay_ = delay; }
+    // WP-43: whether a restart that did not finish its work in process `pid` is remembered for it (tests).
+    bool has_unfinished_for_testing(std::uint32_t pid);
+    // WP-43: a `restart-resume` for held process `pid` has been received and is waiting for the restart thread (tests).
+    bool resume_requested_for_testing(std::uint32_t pid);
 
 private:
+    // A module's source baseline as the old process left it (restart.cpp, "Restart keeps the session's changes").
+    struct Carried {
+        std::string path;
+        BaselineSnapshot baseline;
+    };
+    // WP-43: what a restart could not do in its new process: modules it did not enable again, baselines it did not restore.
+    struct Unfinished {
+        std::vector<ipc::RestartModule> modules;
+        std::vector<Carried> carried;
+    };
+    void remember_unfinished(std::uint32_t pid, Unfinished unfinished);
+    std::optional<Unfinished> peek_unfinished(std::uint32_t pid);
+    void forget_unfinished(std::uint32_t pid);
+    std::shared_ptr<ProcessHost> host() const;
+
     ReloadService& service_;
     EventBus* events_;
-    std::shared_ptr<ProcessHost> host_;
+    mutable std::mutex host_mutex_;
+    std::shared_ptr<ProcessHost> host_;  // guarded by host_mutex_; restart() works on a copy
     std::chrono::milliseconds grace_{300};
     std::function<void(const std::string&)> trace_;
     std::mutex mutex_;  // one restart at a time
@@ -159,6 +204,13 @@ private:
     std::map<std::uint32_t, std::shared_ptr<Hold>> holds_;
     std::map<std::uint32_t, std::string> ended_holds_;  // pid -> how the hold ended (the last few; for the CML5814 message)
     std::deque<std::uint32_t> ended_order_;             // the same pids, oldest first (eviction)
+    std::chrono::milliseconds confirm_wait_{10000};
+    std::chrono::milliseconds relaunch_retry_delay_{250};
+
+    // WP-43: unfinished restarts by the pid of the process they started (the last 16).
+    std::mutex unfinished_mutex_;
+    std::map<std::uint32_t, Unfinished> unfinished_;
+    std::deque<std::uint32_t> unfinished_order_;
 };
 
 }  // namespace cml::core

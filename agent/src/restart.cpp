@@ -21,6 +21,7 @@
 #include "agent.h"
 #include "cml/proc/proc.h"
 #include "cml/util/log.h"
+#include "fault/fault_injection.h"
 #include "hook/user_hook_ids.h"
 #include "hook/user_hooks.h"
 #include "restart_ids.h"
@@ -173,6 +174,16 @@ void Agent::apply_restart(std::uint64_t request_id) {
             ScopedHookThread scope(hook_thread_here);
             info.hooks_run = static_cast<std::uint32_t>(session->run(user_hooks::Kind::PreRestart, nullptr));
         }
+    }
+    // WP-43 (failure injection, stage pre-restart-hooks): the hooks ran, then the preparation fails. The broker does not touch the
+    // process; the answer says how many hooks ran, so the diagnostic can tell the user.
+    if (fault::consume(ipc::fault::Stage::PreRestartHooks)) {
+        ipc::RestartInfo refused = refusal(request_id, ipc::fault::ids::kAgentPreRestartHooks,
+                                           "injected failure at the stage 'pre-restart-hooks' (after " + std::to_string(info.hooks_run) +
+                                               " pre-restart hook(s) ran); the process is not restarted");
+        refused.hooks_run = info.hooks_run;
+        queue_reply(std::move(refused));
+        return;
     }
     CML_LOG(Info, "restart: %u pre-restart hook(s) ran; handing the launch parameters to the broker", info.hooks_run);
     queue_reply(std::move(info));

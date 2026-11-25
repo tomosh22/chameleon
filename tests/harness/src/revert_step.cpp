@@ -28,6 +28,12 @@ RevertStepResult run_revert_step(ipc::ControlClient& control, const Step& step, 
                                        "Check the scenario.");
             return out;
         }
+        if (!step.expect_error_text.empty() && response->diag->message.find(step.expect_error_text) == std::string::npos) {  // WP-43
+            out.diag = cml::Diag::make(cml::ids::kScenarioFailed,
+                                       "the revert refusal " + response->diag->id + " does not mention '" + step.expect_error_text + "': " + response->diag->message,
+                                       "Check the scenario.");
+            return out;
+        }
         out.detail = "revert refused as expected: " + response->diag->id + ": " + response->diag->message;
         return out;
     }

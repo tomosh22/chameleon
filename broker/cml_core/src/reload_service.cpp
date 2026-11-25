@@ -279,12 +279,18 @@ std::shared_ptr<ModuleState> ReloadService::module_state(std::uint64_t agent_id,
 // ---- hot-restart (WP-21) --------------------------------------------------------------------------------------
 
 void ReloadService::set_process_host(std::shared_ptr<ProcessHost> host) {
+    // WP-43 (R-40): the coordinator is made once and keeps its holds, its unfinished restarts and its shutdown flag; only its host is
+    // replaced. A restart that runs (or holds a process) meanwhile keeps the host it started with, and `restart-resume` and cancel() still
+    // reach it. (Replacing the coordinator stranded a held process in the old one until hold_ms.)
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!host) {
-        restart_.reset();
+    if (restart_ == nullptr) {
+        if (!host) {
+            return;
+        }
+        restart_ = std::make_shared<RestartCoordinator>(*this, events_, std::move(host));
         return;
     }
-    restart_ = std::make_shared<RestartCoordinator>(*this, events_, std::move(host));
+    restart_->set_host(std::move(host));
 }
 
 void ReloadService::set_restart_trace_for_testing(std::function<void(const std::string&)> trace) {
@@ -294,9 +300,14 @@ void ReloadService::set_restart_trace_for_testing(std::function<void(const std::
     }
 }
 
+std::shared_ptr<RestartCoordinator> ReloadService::restart_coordinator_for_testing() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return restart_;
+}
+
 bool ReloadService::restart_available() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return restart_ != nullptr;
+    return restart_ != nullptr && restart_->has_host();
 }
 
 void ReloadService::cancel() {
@@ -317,7 +328,7 @@ Result<Value> ReloadService::restart(const Value& args, const std::function<bool
         std::lock_guard<std::mutex> lock(mutex_);
         coordinator = restart_;
     }
-    if (coordinator == nullptr) {
+    if (coordinator == nullptr || !coordinator->has_host()) {
         return Diag::make(restart::diag::kUnavailable, "this broker cannot restart processes on this system",
                           "Restart the application yourself; hot-restart needs the Windows broker.");
     }

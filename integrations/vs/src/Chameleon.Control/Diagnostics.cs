@@ -102,12 +102,16 @@ namespace Chameleon.Control
     /// <summary>Thrown by the control client and the broker session for a failure that has a client-side diagnostic.</summary>
     public sealed class ControlException : Exception
     {
-        public ControlException(ChameleonDiagnostic diagnostic)
+        public ControlException(ChameleonDiagnostic diagnostic, bool timedOut = false)
             : base(diagnostic.ToString())
         {
             Diagnostic = diagnostic;
+            TimedOut = timedOut;
         }
 
         public ChameleonDiagnostic Diagnostic { get; }
+
+        /// <summary>WP-43 (R-40): the request got no answer in time; the connection is still open (a dropped connection is false).</summary>
+        public bool TimedOut { get; }
     }
 }

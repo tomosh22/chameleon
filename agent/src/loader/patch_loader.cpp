@@ -482,6 +482,12 @@ Result<void> PatchLoader::uncommit_patch(std::uint64_t image_base) {
     if (patch == nullptr || !patch->live) {
         return make(ids::kLoaderUnknownPatch, "no patch is loaded at " + hex(image_base), "Only patches loaded by LoadPatch can be uncommitted.");
     }
+    if (fault::consume(ipc::fault::Stage::RevertUncommit)) {  // WP-43: before anything changes; the patch stays committed
+        return make(ipc::fault::ids::kAgentRevertUncommit,
+                    "injected failure at the stage 'revert-uncommit' (the un-commit of the reverted patch at " + hex(image_base) +
+                        "); the patch stays committed, so its application hooks keep being collected",
+                    "This failure was requested with the control command inject-failure. Reload again: a later patch of the same functions replaces the hooks.");
+    }
     patch->committed = false;
     patch->target_base = 0;
     return {};

@@ -122,6 +122,8 @@ public:
     void set_process_host(std::shared_ptr<ProcessHost> host);
     bool restart_available() const;
     void set_restart_trace_for_testing(std::function<void(const std::string&)> trace);
+    // WP-43: the restart coordinator (null without a process host ever set), for the knobs of its tests.
+    std::shared_ptr<RestartCoordinator> restart_coordinator_for_testing() const;
     // {"pid"?:N, "timeout_ms"?:N, "hold_new"?:bool, "hold_ms"?:N}. `client_gone` (optional) reports that the requesting client has
     // disconnected; a restart that holds a process then resumes it at once (WP-34).
     Result<ipc::json::Value> restart(const ipc::json::Value& args, const std::function<bool()>& client_gone = {});

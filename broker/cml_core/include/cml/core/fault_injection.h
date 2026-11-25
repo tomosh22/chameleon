@@ -60,7 +60,8 @@ private:
 // pid, CML5962 when the agent refuses.
 Result<ipc::json::Value> inject_failure(ReloadService& service, const ipc::json::Value& args);
 
-// Control command `fault-stages` -> {stages:[name...], details:[{name, side, id, where}]} in pipeline order.
+// Control command `fault-stages` -> {stages:[name...], details:[{name, side, id, where, group}]} in pipeline order (the reload's stages,
+// then WP-43's restart and revert stages).
 ipc::json::Value fault_stages();
 
 }  // namespace cml::core

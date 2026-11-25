@@ -20,6 +20,7 @@
 #include "cml/ipc/messages.h"
 #include "cml/ipc/pipe.h"
 #include "doctest.h"
+#include "fault/fault_injection.h"
 #include "hook/diag_ids.h"
 #include "hook/installer.h"
 #include "hook/user_hook_ids.h"
@@ -1001,5 +1002,50 @@ TEST_CASE("hot-restart: launch parameters that do not fit one message are refuse
     CHECK(reply->status == 0);
     agent.stop_and_wait_for_calls();
 }
+
+
+#if defined(CML_FAULT_INJECTION)
+TEST_CASE("hot-restart, failure injection (WP-43): pre-restart-hooks refuses after the hooks ran, says how many, and the next Restart works") {
+    namespace fi = cml::agent::fault;
+    struct Disarm {
+        ~Disarm() { fi::disarm_all(); }
+    } disarm;
+    const std::string pipe = unique_pipe_name();
+    FakeBroker broker(pipe);
+    REQUIRE(broker.listening());
+    ScopedPipeEnv env(pipe);
+    hooktest_user::reset(nullptr);
+
+    Agent agent(CML_MODE_IMMEDIATE);
+    REQUIRE(agent.start().has_value());
+    REQUIRE(broker.handshake());
+    REQUIRE(enable_this_module(agent, broker));
+    fi::arm(ipc::fault::Stage::PreRestartHooks, 1);
+
+    ipc::Restart restart;
+    restart.request_id = 131;
+    REQUIRE(broker.send(restart));
+    std::optional<ipc::RestartInfo> info = broker.wait_for<ipc::RestartInfo>(15000);
+    REQUIRE(info.has_value());
+    CHECK(info->request_id == 131);
+    CHECK(info->status == ipc::fault::ids::kAgentPreRestartHooks);
+    CHECK(info->hooks_run == 1);  // the hook ran before the injected failure
+    CHECK(info->message.find("pre-restart-hooks") != std::string::npos);
+    CHECK(info->command_line.empty());  // no launch parameters: the broker does not touch the process
+    CHECK(hooktest_user::log() == std::vector<std::string>{"pre-restart"});
+    CHECK(fi::armed(ipc::fault::Stage::PreRestartHooks) == 0);
+
+    restart.request_id = 132;
+    REQUIRE(broker.send(restart));
+    info = broker.wait_for<ipc::RestartInfo>(15000);
+    REQUIRE(info.has_value());
+    CHECK(info->request_id == 132);
+    CHECK_MESSAGE(info->status == 0, info->message);
+    CHECK(info->hooks_run == 1);
+    CHECK_FALSE(info->command_line.empty());
+    agent.stop_and_wait_for_calls();
+    hooktest_user::reset(nullptr);
+}
+#endif
 
 #endif  // _WIN32

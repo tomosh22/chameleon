@@ -1556,6 +1556,35 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 - **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
 
 
+### CML4657
+
+- **Cause:** Failure injection, stage `pre-restart-hooks`: the agent of the old process refused the preparation of a restart after the application's pre-restart hooks ran. The broker reports it as CML5804; the process is not touched.  
+- **Message:** `injected failure at the stage 'pre-restart-hooks' (after <n> pre-restart hook(s) ran); the process is not restarted`  
+- **What to do:** This failure was requested with the control command `inject-failure` (failure injection, a test facility; capability `fault-injection`). Repeat the operation without arming the stage (`{"stage":"none"}` disarms every stage). The hooks ran: an application that tore state down in its pre-restart hook must cope with running on.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML4658
+
+- **Cause:** Failure injection, stage `revert-repoint`: a revert's re-pointing of hooks to an older patch failed inside the window with the application's threads suspended, before anything was written. The broker reports it as CML5851; nothing changed.  
+- **Message:** `injected failure at the stage 'revert-repoint' (re-pointing hooks to an older patch, inside the window with the application's threads suspended); nothing was written`  
+- **What to do:** This failure was requested with the control command `inject-failure` (failure injection, a test facility; capability `fault-injection`). Repeat the operation without arming the stage (`{"stage":"none"}` disarms every stage). Revert again.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML4659
+
+- **Cause:** Failure injection, stage `revert-restore`: a revert's restoring of original bytes failed inside the window with the application's threads suspended, before anything was written. The broker reports it as CML5851 (and undoes a re-pointing it had made); nothing changed.  
+- **Message:** `injected failure at the stage 'revert-restore' (restoring original bytes, inside the window with the application's threads suspended); nothing was written`  
+- **What to do:** This failure was requested with the control command `inject-failure` (failure injection, a test facility; capability `fault-injection`). Repeat the operation without arming the stage (`{"stage":"none"}` disarms every stage). Revert again.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML4660
+
+- **Cause:** Failure injection, stage `revert-uncommit`: the agent did not un-commit a reverted patch image. The revert itself went through; the broker reports the warning CML5855.  
+- **Message:** `injected failure at the stage 'revert-uncommit' (the un-commit of the reverted patch at <base>); the patch stays committed, so its application hooks keep being collected`  
+- **What to do:** This failure was requested with the control command `inject-failure` (failure injection, a test facility; capability `fault-injection`). Repeat the operation without arming the stage (`{"stage":"none"}` disarms every stage). A later patch of the same functions replaces the hooks; nothing else to do.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+
 ## CML4700 to CML4799
 
 ### CML4700
@@ -2488,16 +2517,16 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 
 ### CML5807
 
-- **Cause:** The old process is gone, the new one could not be started.  
-- **Message:** see the diagnostic text printed with the id  
+- **Cause:** The old process is gone, the new one could not be started. Since WP-43 the broker tries twice (the first failure is the warning CML5822).  
+- **Message:** `process <pid> was terminated but the new one could not be started (2 attempts): <reason>`  
 - **What to do:** follow the advice printed after the message (`What to do:`); if it does not resolve the problem, re-run with `--verbose` and read the log lines before this diagnostic.  
 - **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
 
 ### CML5808
 
 - **Cause:** The new process did not register in time (left running).  
-- **Message:** `the new process (pid <...>) did not register within <...> ms; it was left running`  
-- **What to do:** Check that the application creates its agent at start-up (and that it can reach the broker); raise 'registration_timeout_ms' if it starts slowly.  
+- **Message:** `the new process (pid <...>) did not register within <...> ms; it was left running; its next restart enables its modules and re-applies the session's edits once it has registered`  
+- **What to do:** Check that the application creates its agent at start-up (and that it can reach the broker); raise 'registration_timeout_ms' if it starts slowly. Since WP-43 the broker remembers the modules and edits of that restart: once the process has registered, its next `restart` enables the modules and re-applies the edits.  
 - **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
 
 ### CML5809
@@ -2559,7 +2588,7 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 
 ### CML5817
 
-- **Cause:** The held process could not be resumed (`ResumeThread` failed). The broker terminated it instead of leaving it suspended.  
+- **Cause:** The held process could not be resumed (`ResumeThread` failed). The broker terminated it instead of leaving it suspended. (A `restart-resume` that is not confirmed in time is CML5820 since WP-43, not this id.)  
 - **Message:** `process <...> could not be resumed: <...>` (also `ResumeThread failed (Win32 error <...>); the process was terminated instead of being left suspended`)  
 - **What to do:** Start the application yourself. If it happens again, check that no tool blocks access to the process and send the broker log with the report.  
 - **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
@@ -2576,6 +2605,27 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 - **Cause:** `restart {hold_new:true}` was sent to a broker whose process host cannot create a process suspended. Nothing was touched.  
 - **Message:** `this broker cannot hold a new process (the process host cannot create it suspended)`  
 - **What to do:** Send `restart` without `hold_new`, or attach the debugger after the `restarted` event. Clients check for the `restart-hold` capability first.  
+- **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
+
+### CML5820
+
+- **Cause:** `restart-resume` asked the restart to resume its held process, but the restart did not confirm within 10 s that the process runs. Nothing is known to have failed: the resume stays requested and the restart acts on it; the broker resumes the process by itself when `hold_ms` passes.  
+- **Message:** `the restart did not confirm within <n> ms that process <pid> runs; the resume is still requested, and the broker resumes the process by itself when hold_ms passes`  
+- **What to do:** Wait for `restarted` (or query `status`); send `restart-resume` again if the process is still held. Before WP-43 this case was reported as CML5817.  
+- **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
+
+### CML5821
+
+- **Cause:** The broker shut down while a restart ran. Before the old process was terminated nothing was touched; after it, the new process was left running (registered or not), and its restart ended without waiting for its registration, its modules or the re-applying of the session's edits.  
+- **Message:** `the broker is shutting down; process <pid> was not restarted (it was not touched)`, `... the new process (pid <pid>) was left running before its agent registered` or `... runs, but its restart ended before its modules were enabled and its edits re-applied`  
+- **What to do:** Start the broker again. The application's agent connects by itself; reload (or restart) to get the session's edits back.  
+- **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
+
+### CML5822
+
+- **Cause:** (Warning.) The old process was terminated and the first attempt to start the new one failed (CML5807 with the reason). The broker tries once more after a short pause; when that attempt fails too the restart ends with CML5807.  
+- **Message:** `process <pid> was terminated and the first attempt to start the new one failed (<CML5807 ...>); trying once more`  
+- **What to do:** Nothing if the restart then succeeds. If it happens often, check what holds the executable (a virus scanner, a debugger) when a process ends.  
 - **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
 
 ### CML5840
@@ -2820,6 +2870,48 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 - **Cause:** Inject-failure "none": some agents could not be disarmed.  
 - **Message:** `the broker's stages are disarmed, but the agents of process(es) <...> could not be disarmed`  
 - **What to do:** Check that those processes are still running, then send {"stage":"none"} again.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5972
+
+- **Cause:** Failure injection, stage `restart-terminate`: the restart failed before the old process was terminated. The process was not terminated and keeps running; its pre-restart hooks had run.  
+- **Message:** `injected failure at the stage 'restart-terminate' (...); process <pid> was not terminated. <n> pre-restart hook(s) ran; the process was not restarted.`  
+- **What to do:** This failure was requested with the control command `inject-failure` (failure injection, a test facility; capability `fault-injection`). Repeat the operation without arming the stage (`{"stage":"none"}` disarms every stage). Then `restart` again.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5973
+
+- **Cause:** (Warning.) Failure injection, stage `restart-relaunch`: the first attempt to start the new process (after the old one was terminated) failed. The broker tried once more and started it; the restart went on.  
+- **Message:** `injected failure at the stage 'restart-relaunch' (...); process <pid> is gone, trying once more to start the new one`  
+- **What to do:** This failure was requested with the control command `inject-failure` (failure injection, a test facility; capability `fault-injection`). Repeat the operation without arming the stage (`{"stage":"none"}` disarms every stage). Nothing else: the new process runs.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5974
+
+- **Cause:** (Warning.) Failure injection, stage `restart-hold`: a restart with `hold_new` could not hold the new process for the debugger. It was resumed at once, no `restarting` event was published, and the restart went on.  
+- **Message:** `injected failure at the stage 'restart-hold' (...); process <pid> was resumed at once, without waiting for the debugger, and the restart goes on`  
+- **What to do:** Attach the debugger after `restarted`, or by hand. This failure was requested with the control command `inject-failure` (failure injection, a test facility; capability `fault-injection`). Repeat the operation without arming the stage (`{"stage":"none"}` disarms every stage).  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5975
+
+- **Cause:** Failure injection, stage `restart-registration`: the restart stopped waiting for the new process to register. The new process was left running; its agent connects by itself, but without the modules the old process had enabled (unless the application enables them) and without the session's edits. The broker remembers both for that process.  
+- **Message:** `injected failure at the stage 'restart-registration' (...); the new process (pid <pid>) was left running, not taken over by the restart; its next restart enables its modules and re-applies the session's edits`  
+- **What to do:** This failure was requested with the control command `inject-failure` (failure injection, a test facility; capability `fault-injection`). Repeat the operation without arming the stage (`{"stage":"none"}` disarms every stage). Then `restart` the new process: that restart enables its modules and re-applies the edits.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5976
+
+- **Cause:** (Warning.) Failure injection, stage `restart-reenable`: the request that enables the old process's modules in the new one was not sent. The new process runs; the modules are reported in `not_enabled` (CML5809) and remembered for that process.  
+- **Message:** `injected failure at the stage 'restart-reenable' (...); the request to enable <n> module(s) again was not sent to process <pid>`  
+- **What to do:** This failure was requested with the control command `inject-failure` (failure injection, a test facility; capability `fault-injection`). Repeat the operation without arming the stage (`{"stage":"none"}` disarms every stage). Then `restart` again (it enables the modules and re-applies the edits), or enable the modules from the application.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5977
+
+- **Cause:** Failure injection, stage `restart-reapply`: the reload that re-applies the session's edits to the new process failed before it compiled. The new process runs the original code; its source baseline was restored, so the edits are pending. Reported as `reapply_error` and the warning CML5810.  
+- **Message:** `injected failure at the stage 'restart-reapply' (...)` (in CML5810: `the new process (pid <pid>) runs the original code: re-applying the session's edits failed: CML5977 ...`)  
+- **What to do:** This failure was requested with the control command `inject-failure` (failure injection, a test facility; capability `fault-injection`). Repeat the operation without arming the stage (`{"stage":"none"}` disarms every stage). Then `reload`: it applies the session's edits.  
 - **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
 
 ### CML5985

@@ -42,6 +42,7 @@
 #include <string>
 #include <vector>
 
+#include "cml/ipc/fault_stages.h"
 #include "cml/util/diag.h"
 #include "hook_plan.h"
 #include "thread_set.h"
@@ -130,8 +131,12 @@ public:
     // `injectable` (WP-28): this batch is a reload's InstallHooks, the only kind the failure-injection stage hook-install may
     // fail; reverts, quiet re-points and the rollbacks of the injection itself pass false.
     BatchResult install(const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes, bool injectable = false);
-    // Puts the original bytes back (requests[i].replacement is ignored).
-    BatchResult revert(const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes);
+    // WP-43: the same, failed by the failure-injection stage `inject` (ipc::fault::Stage::Count: none) inside the window, before anything
+    // is written. The revert's re-pointing passes RevertRepoint.
+    BatchResult install(const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes, ipc::fault::Stage inject);
+    // Puts the original bytes back (requests[i].replacement is ignored). WP-43: `inject` as for install (a revert passes RevertRestore).
+    BatchResult revert(const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes,
+                       ipc::fault::Stage inject = ipc::fault::Stage::Count);
 
     bool ready() const noexcept { return ready_; }
     std::size_t hook_count() const;
@@ -159,8 +164,8 @@ private:
     struct Job;
     struct Report;
 
-    BatchResult apply(bool revert, const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes, bool injectable);
-    void attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, Report* report, bool injectable) noexcept;
+    BatchResult apply(bool revert, const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes, ipc::fault::Stage inject);
+    void attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, Report* report, ipc::fault::Stage inject) noexcept;
     bool find_conflict(const Job* jobs, std::size_t count, std::size_t* thread_index, std::size_t* job_index) const noexcept;
     Record* find_record(std::uintptr_t target);
     const Record* find_record(std::uintptr_t target) const;

@@ -81,6 +81,7 @@ Value fault_stages() {
         d.set("side", Value::string(s.agent_side ? "agent" : "broker"));
         d.set("id", Value::string("CML" + std::to_string(s.diag_id)));
         d.set("where", Value::string(s.where));
+        d.set("group", Value::string(s.group));  // WP-43: reload, restart or revert
         details.push(std::move(d));
     }
     Value result = Value::object();
