@@ -1,0 +1,12 @@
+--- a/twins.cpp
++++ b/twins.cpp
+@@ -11,8 +11,8 @@
+ // each new one is, and the statics follow the code, not the numbers: `ta=` stays in 400000's range, `tb=` in 450000's.
+ void pp_twins_step()
+ {
++    PpObj& b = ([]() -> PpObj& { static PpObj slot = pp_make(450000); return slot; })();
+     PpObj& a = ([]() -> PpObj& { static PpObj slot = pp_make(400000); return slot; })();
+-    PpObj& b = ([]() -> PpObj& { static PpObj slot = pp_make(450000); return slot; })();
+     a.hits += 1;
+     b.hits += 2;
+     s_twin_a = a.id + a.hits;

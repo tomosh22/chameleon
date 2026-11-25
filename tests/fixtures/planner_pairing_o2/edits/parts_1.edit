@@ -1,0 +1,9 @@
+--- a/parts.cpp
++++ b/parts.cpp
+@@ -22,5 +22,5 @@
+ 
+ int o2_parts_mark()
+ {
+-    return 1;
++    return 3;
+ }

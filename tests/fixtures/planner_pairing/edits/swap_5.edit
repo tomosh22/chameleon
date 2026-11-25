@@ -1,0 +1,12 @@
+--- a/swap.cpp
++++ b/swap.cpp
+@@ -9,8 +9,8 @@
+ // two statements, so the compiler numbers the lambdas the other way round: the number no longer names the same lambda.
+ void pp_swap_step()
+ {
++    PpObj& b = ([](int k) -> PpObj& { static PpObj slot = pp_make(350000 + k); return slot; })(0);
+     PpObj& a = ([]() -> PpObj& { static PpObj slot = pp_make(300000); return slot; })();
+-    PpObj& b = ([](int k) -> PpObj& { static PpObj slot = pp_make(350000 + k); return slot; })(0);
+     a.hits += 1;
+     b.hits += 1;
+     s_a = a.id + a.hits;

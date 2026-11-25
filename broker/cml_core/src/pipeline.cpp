@@ -711,13 +711,78 @@ private:
             return *first;
         }
         bind::BindPlan plan = std::move(*planned);
+        // WP-40 (R-48 item 5, ADR-0043 rule (d)): lambdas the type records cannot tell apart were paired by their numbers;
+        // their call operators' code decides. Where it shows that lambdas changed places, the unit is planned again with
+        // that pairing (once: the second plan is not compared again).
+        if (!plan.lambda_sets.empty()) {
+            NarrowInput li;
+            li.object = &object->object;
+            li.plan = &plan;
+            li.old_image = image ? &image->image : nullptr;
+            li.load_base = module_.base;
+            li.is_hooked = [this](std::uint64_t va) { return module_.is_hooked(va); };
+            li.prior_code = [this](std::uint64_t va) { return module_.code_running_at(va); };
+            LambdaPairing lambdas = pair_lambdas_by_code(li);
+            for (const Diag& w : lambdas.warnings) {
+                warn(report, "plan", w);
+            }
+            if (!lambdas.errors.empty()) {
+                std::optional<Diag> first;
+                for (const Diag& e : lambdas.errors) {
+                    const Diag shown = fail("plan", e);
+                    first = first ? first : std::optional<Diag>(shown);
+                }
+                return *first;
+            }
+            if (!lambdas.closure_pairing.empty()) {
+                in.closure_pairing = lambdas.closure_pairing;
+                errors.clear();
+                Result<bind::BindPlan> again = bind::plan_bind(in, &errors);
+                if (!again) {
+                    std::optional<Diag> first;
+                    for (const Diag& e : errors) {
+                        const Diag shown = fail("plan", e);
+                        first = first ? first : std::optional<Diag>(shown);
+                    }
+                    if (!first) {
+                        first = fail("plan", again.error());
+                    }
+                    return *first;
+                }
+                plan = std::move(*again);
+            }
+        }
+        // WP-40 (second high review, ADR-0043 ruling): a `$S<n>` bitmask bound to the old one only while its function's
+        // code is unchanged (the bits follow the order of its dynamically initialised statics); otherwise CML3600.
+        if (!plan.bitmask_guards.empty()) {
+            NarrowInput bi;
+            bi.object = &object->object;
+            bi.plan = &plan;
+            bi.old_image = image ? &image->image : nullptr;
+            bi.load_base = module_.base;
+            bi.is_hooked = [this](std::uint64_t va) { return module_.is_hooked(va); };
+            bi.prior_code = [this](std::uint64_t va) { return module_.code_running_at(va); };
+            const std::vector<Diag> unproven = prove_bitmask_guards(bi);
+            if (!unproven.empty()) {
+                std::optional<Diag> first;
+                for (const Diag& e : unproven) {
+                    const Diag shown = fail("plan", e);
+                    first = first ? first : std::optional<Diag>(shown);
+                }
+                return *first;
+            }
+        }
         for (const Diag& w : plan.warnings) {
             warn(report, "plan", w);
         }
         // WP-36 evidence: image-relative references to old data in this object, and how many were proved displacements.
         report.imgrel_sites += plan.imgrel_sites;
         report.imgrel_verified += plan.imgrel_verified;
-        CML_LOG(Info, "%s", plan.imgrel_line(in.object_name).c_str());
+        // (WP-40, R-50: at Info only for an object that has such references; the counters of the reload answer, which cmltest
+        // and the corpus read, do not depend on this line. The planner itself logs it at Debug for every object.)
+        if (plan.imgrel_sites != 0) {
+            CML_LOG(Info, "%s", plan.imgrel_line(in.object_name).c_str());
+        }
         NarrowInput ni;
         ni.object = &object->object;
         ni.plan = &plan;

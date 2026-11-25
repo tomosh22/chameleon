@@ -61,8 +61,12 @@ struct Step {
     std::string result_key;
     long long result_value = 0;
     bool has_result_value = false;
-    // Reload (WP-15): the reload must be refused with this diagnostic id (e.g. "CML5550"); empty = it must succeed.
+    // Reload (WP-15): the reload must be refused with this diagnostic id (e.g. "CML5550"); empty = it must succeed. WP-40: a
+    // reload step may name alternatives, "CML3207|CML3600" (the refusal must carry one of them).
     std::string expect_error;
+    // Reload (WP-40): the reload may succeed, or be refused with one of these ids ("CML3207|CML3601"); the steps after it
+    // run either way and must hold for both outcomes (for a planner that refuses under one compiler and pairs under the other).
+    std::string allow_error;
     // WP-35 (Reload with `expect_error`, and ExpectDiag): where the compiler error is. `expect_file` is a file name the reported absolute
     // path must end with, `expect_line` the exact line (0 = the location is not checked), `expect_column` the exact column, checked
     // only under clang-cl (cl prints none without /diagnostics:column; 0 = not checked).
