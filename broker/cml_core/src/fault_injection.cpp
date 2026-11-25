@@ -93,6 +93,7 @@ void FaultInjector::disarm_all() {
     for (std::set<std::uint32_t>& pids : agent_persist_) {
         pids.clear();
     }
+    created_.clear();
     (void)save_locked();  // nothing is persisted any more: the state file goes
 }
 
@@ -124,12 +125,21 @@ std::vector<std::string> FaultInjector::disarm_group(const char* group, std::uin
     return unused;
 }
 
-void FaultInjector::note_agent_armed(fault::Stage stage, std::uint32_t pid, bool persist) {
+void FaultInjector::note_agent_armed(fault::Stage stage, std::uint32_t pid, bool persist, std::optional<std::uint64_t> created) {
     std::lock_guard<std::mutex> lock(mutex_);
     agent_armed_[static_cast<std::size_t>(stage)].insert(pid);
+    if (created) {
+        created_[pid] = *created;
+    }
     if (persist && agent_persist_[static_cast<std::size_t>(stage)].insert(pid).second) {
         (void)save_locked();
     }
+}
+
+bool FaultInjector::records_belong_to(std::uint32_t pid, std::optional<std::uint64_t> created) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = created_.find(pid);
+    return created && it != created_.end() && it->second == *created;
 }
 
 bool FaultInjector::take_agent_armed(fault::Stage stage, std::uint32_t pid) {
@@ -148,6 +158,7 @@ void FaultInjector::forget_process(std::uint32_t pid) {
         dropped = agent_armed_[i].erase(pid) != 0 || dropped;
         persisted = agent_persist_[i].erase(pid) != 0 || persisted;
     }
+    created_.erase(pid);
     if (dropped) {
         CML_LOG(Trace, "failure injection: the agent of process %u is gone; what was armed in it is forgotten", pid);
     }
@@ -169,7 +180,7 @@ bool FaultInjector::has_process_records(std::uint32_t pid) const {
 void FaultInjector::disarm_process(std::uint32_t pid) {
     std::lock_guard<std::mutex> lock(mutex_);
     for (Arming& a : armed_) {
-        if (a.remaining != 0 && (!a.pid || *a.pid == pid)) {
+        if (a.remaining != 0 && a.pid && *a.pid == pid) {  // an arming without a pid applies to every process: it stays
             a = Arming{};
         }
     }
@@ -177,8 +188,21 @@ void FaultInjector::disarm_process(std::uint32_t pid) {
         agent_armed_[i].erase(pid);
         agent_persist_[i].erase(pid);
     }
-    CML_LOG(Trace, "failure injection: everything that could fire for process %u is disarmed; other processes' armings stay", pid);
+    created_.erase(pid);
+    CML_LOG(Trace, "failure injection: what was armed for process %u is disarmed; armings without a pid and other processes' stay", pid);
     (void)save_locked();
+}
+
+bool FaultInjector::armed_for_process(std::uint32_t pid) const {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const Arming& a : armed_) {
+            if (a.remaining != 0 && a.pid && *a.pid == pid) {
+                return true;
+            }
+        }
+    }
+    return has_process_records(pid);
 }
 
 void FaultInjector::begin_operation(const char* group) {
@@ -294,6 +318,9 @@ std::optional<Diag> FaultInjector::save_locked() {
             Value entry = Value::object();
             entry.set("stage", Value::string(s.name));
             entry.set("pid", Value::integer(pid));
+            if (const auto created = created_.find(pid); created != created_.end()) {
+                entry.set("created", Value::integer(static_cast<std::int64_t>(created->second)));  // which process (a pid is reused)
+            }
             agent.push(std::move(entry));
         }
     }
@@ -352,6 +379,7 @@ std::vector<Diag> FaultInjector::load_state() {
             agent_armed_[i].clear();
             agent_persist_[i].clear();
         }
+        created_.clear();
         const std::string aside = state_file_ + ".bad";
         std::error_code rename_ec;
         fs::remove(fs::path(aside), rename_ec);
@@ -394,12 +422,17 @@ std::vector<Diag> FaultInjector::load_state() {
         for (const Value& e : agent->items()) {
             const fault::StageInfo* info = e.is_object() ? fault::find_stage(e.get_string("stage")) : nullptr;
             const std::int64_t pid = e.get_integer("pid");
-            if (info == nullptr || !info->agent_side || pid <= 0 || pid > 0xFFFFFFFFll) {
-                broken("an agent entry names no stage of the agent, or has a bad pid");
+            const std::int64_t created = e.get_integer("created");
+            // (Only the groups with an end-of-operation cleanup keep a record of an agent arming, as inject-failure does.)
+            if (info == nullptr || !info->agent_side || !has_cleanup(info->group) || pid <= 0 || pid > 0xFFFFFFFFll || created < 0) {
+                broken("an agent entry names no stage of the agent that the broker keeps a record of, or has a bad pid");
                 return problems;
             }
             agent_armed_[static_cast<std::size_t>(info->stage)].insert(static_cast<std::uint32_t>(pid));
             agent_persist_[static_cast<std::size_t>(info->stage)].insert(static_cast<std::uint32_t>(pid));
+            if (created > 0) {
+                created_[static_cast<std::uint32_t>(pid)] = static_cast<std::uint64_t>(created);
+            }
             ++restored;
             CML_LOG(Info, "failure injection: the arming of '%s' in process %lld is remembered again from %s (persist)", info->name,
                     static_cast<long long>(pid), state_file_.c_str());
@@ -569,6 +602,16 @@ Result<Value> inject_failure(ReloadService& service, const Value& args) {
             }
         }
     }
+    // WP-44: "none" for a pid whose agent is gone (the process may have exited unseen) clears what is armed or recorded for it.
+    if (pid && targets.empty() && stage_name == fault::kDisarm && service.faults().armed_for_process(*pid)) {
+        service.faults().disarm_process(*pid);
+        CML_LOG(Info, "failure injection: process %u has no agent connected; what was armed or recorded for it is cleared", *pid);
+        Value cleared = Value::object();
+        cleared.set("stage", Value::string(fault::kDisarm));
+        cleared.set("armed", Value::boolean(false));
+        cleared.set("processes", Value::array());
+        return cleared;
+    }
     // A pid that matches no agent is refused before anything is changed (also for "none" and for the broker's stages).
     if (pid && targets.empty()) {
         return Diag::make(fault::ids::kNoSuchProcess, "no agent is connected for process " + std::to_string(*pid), "Query `status` for the connected processes.");
@@ -673,7 +716,8 @@ Result<Value> inject_failure(ReloadService& service, const Value& args) {
         // R-51: recorded before the agents are asked, so an operation that ends afterwards always finds the record.
         if (cleanup) {
             for (const std::shared_ptr<AgentLink>& link : targets) {
-                service.faults().note_agent_armed(info->stage, link->snapshot().pid, persist);
+                const std::uint32_t target_pid = link->snapshot().pid;
+                service.faults().note_agent_armed(info->stage, target_pid, persist, service.process_creation_time(target_pid));
             }
         }
         // All or nothing: the agents already armed are disarmed again when one of them refuses.

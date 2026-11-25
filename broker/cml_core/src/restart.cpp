@@ -193,6 +193,11 @@ void RestartCoordinator::process_gone(std::uint32_t pid, std::optional<bool> exi
     forget_unfinished(pid);
 }
 
+std::optional<std::uint64_t> RestartCoordinator::process_creation_time(std::uint32_t pid) const {
+    const std::shared_ptr<ProcessHost> h = host();
+    return h != nullptr ? h->creation_time(pid) : std::nullopt;
+}
+
 bool RestartCoordinator::process_exited(std::uint32_t pid) {
     const std::shared_ptr<ProcessHost> h = host();
     bool exited = h != nullptr && h->has_exited(pid);

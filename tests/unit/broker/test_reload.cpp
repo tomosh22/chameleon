@@ -2217,16 +2217,26 @@ TEST_CASE("fault injection (WP-44 fix round): none with a pid clears that proces
     Value other = inject_args("link", 0, static_cast<int>(kPid + 1));
     other.set("persist", Value::boolean(true));
     REQUIRE(inject_failure(*rig.service, other).has_value());  // a broker stage for the second process only
-    REQUIRE(inject_failure(*rig.service, inject_args("compile")).has_value());  // a broker stage for every process
+    Value every = inject_args("compile");
+    every.set("persist", Value::boolean(true));
+    REQUIRE(inject_failure(*rig.service, every).has_value());                      // a broker stage for every process
+    REQUIRE(inject_failure(*rig.service, inject_args("watch-reload")).has_value());  // and one of the watcher (never per process)
+    Value own = inject_args("bind-plan", 0, static_cast<int>(kPid));
+    own.set("persist", Value::boolean(true));
+    REQUIRE(inject_failure(*rig.service, own).has_value());  // one armed for kPid itself
     REQUIRE(inject_failure(*rig.service, inject_args("none", 0, static_cast<int>(kPid))).has_value());
-    CHECK(rig.faults_left("compile") == 0);  // it could fire for kPid
-    CHECK(rig.faults_left("link") == 1);     // armed for the other process: stays
+    CHECK(rig.faults_left("bind-plan") == 0);     // armed for kPid: goes
+    CHECK(rig.faults_left("compile") == 1);       // without a pid: stays (re-review: it was cleared, the answer named only kPid)
+    CHECK(rig.faults_left("watch-reload") == 1);  // the watcher's: stays
+    CHECK(rig.faults_left("link") == 1);          // armed for the other process: stays
     CHECK_FALSE(rig.service->faults().take_agent_armed(ipc::fault::Stage::RevertRepoint, kPid));
     // The other process's record and persisted entries are still there (before the fix every record and the whole file went).
     Rig restarted;
     restarted.service->faults().set_state_file(state);
     CHECK(restarted.service->faults().load_state().empty());
     CHECK(restarted.faults_left("link") == 1);
+    CHECK(restarted.faults_left("compile") == 1);
+    CHECK(restarted.faults_left("bind-plan") == 0);
     CHECK(restarted.service->faults().take_agent_armed(ipc::fault::Stage::RevertRepoint, kPid + 1));
     CHECK_FALSE(restarted.service->faults().take_agent_armed(ipc::fault::Stage::RevertRepoint, kPid));
     CHECK(rig.service->faults().take_agent_armed(ipc::fault::Stage::RevertRepoint, kPid + 1));
@@ -2365,7 +2375,9 @@ TEST_CASE("fault injection (WP-44): a state file that cannot be used arms nothin
     const std::string state = logs.file("b.log.fault-injection.json");
     for (const char* text : {"not json", R"({"version":2,"broker":[]})", R"({"version":1,"broker":[{"stage":"patch-load","count":1}]})",
                              R"({"version":1,"broker":[{"stage":"restart-hold","count":2}]})", R"({"version":1,"agent":[{"stage":"link","pid":5}]})",
-                             R"({"version":1,"broker":[{"stage":"watch-reload","count":1,"pid":5}]})"}) {
+                             R"({"version":1,"broker":[{"stage":"watch-reload","count":1,"pid":5}]})",
+                             R"({"version":1,"agent":[{"stage":"exception-hold","pid":5}]})",    // no record is kept for this group
+                             R"({"version":1,"agent":[{"stage":"patch-load","pid":5}]})"}) {
         CAPTURE(text);
         {
             std::ofstream out(state, std::ios::binary | std::ios::trunc);

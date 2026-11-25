@@ -22,6 +22,7 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -65,15 +66,22 @@ public:
     // or not; returns the names of those that had not fired.
     std::vector<std::string> disarm_group(const char* group, std::uint32_t pid);
     // WP-43: which agent stages inject-failure armed in which process, so that the end of an operation can disarm them there.
-    void note_agent_armed(ipc::fault::Stage stage, std::uint32_t pid, bool persist = false);
+    // `created`: the process's creation time (ProcessHost::creation_time), kept with its records (and in the state file) so that a later
+    // registration with the same pid can tell whether it is the same process (records_belong_to).
+    void note_agent_armed(ipc::fault::Stage stage, std::uint32_t pid, bool persist = false, std::optional<std::uint64_t> created = std::nullopt);
     bool take_agent_armed(ipc::fault::Stage stage, std::uint32_t pid);
     // R-51: process `pid` has exited (ReloadService::detach asks the process host): its records, persisted ones included, are dropped,
     // so a new process that reuses the pid never reports them.
     void forget_process(std::uint32_t pid);
     bool has_process_records(std::uint32_t pid) const;
-    // WP-44: {"stage":"none","pid":N}: the broker stages that can fire for N (armed for N or for every process) and N's agent records;
-    // the armings and persisted entries of other processes stay.
+    // WP-44: whether the records of `pid` were made for the process created at `created`: false when either time is unknown or they
+    // differ (a reused pid). ReloadService drops them then, when an agent registers with that pid.
+    bool records_belong_to(std::uint32_t pid, std::optional<std::uint64_t> created) const;
+    // WP-44: {"stage":"none","pid":N}: the broker stages armed for N and N's agent records; armings without a pid (they apply to every
+    // process) and those of other processes stay, and so do their persisted entries.
     void disarm_process(std::uint32_t pid);
+    // WP-44: a broker stage armed for `pid`, or a record of it.
+    bool armed_for_process(std::uint32_t pid) const;
 
     // R-51: see the top of the file. Taken by inject_failure (for a stage with an end-of-operation cleanup) and by the operations
     // while they start; never held while an operation runs.
@@ -107,6 +115,7 @@ private:
     std::array<Arming, ipc::fault::kStageCount> armed_{};
     std::array<std::set<std::uint32_t>, ipc::fault::kStageCount> agent_armed_{};  // WP-43
     std::array<std::set<std::uint32_t>, ipc::fault::kStageCount> agent_persist_{};  // WP-44: the records of agent_armed_ that persist
+    std::map<std::uint32_t, std::uint64_t> created_;  // WP-44: pid -> creation time of the process its records were made for
     std::vector<std::pair<std::string, int>> operations_;  // WP-44: running operations per group
     std::string state_file_;  // WP-44
     bool state_written_ = false;  // the file exists (written or loaded by this broker)

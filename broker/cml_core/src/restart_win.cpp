@@ -394,6 +394,24 @@ public:
         return exited;
     }
 
+    // WP-44: tells a reused pid from the process the failure-injection records were made for.
+    std::optional<std::uint64_t> creation_time(std::uint32_t pid) const override {
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (process == nullptr) {
+            return std::nullopt;
+        }
+        FILETIME created = {};
+        FILETIME exited = {};
+        FILETIME kernel = {};
+        FILETIME user = {};
+        const BOOL ok = GetProcessTimes(process, &created, &exited, &kernel, &user);
+        CloseHandle(process);
+        if (ok == 0) {
+            return std::nullopt;
+        }
+        return (static_cast<std::uint64_t>(created.dwHighDateTime) << 32) | created.dwLowDateTime;
+    }
+
     Result<std::unique_ptr<RestartableProcess>> open(std::uint32_t pid, const std::uint64_t std_handles[3], std::uint32_t info_flags,
                                                      std::vector<Diag>* warnings) override {
         HANDLE process = OpenProcess(PROCESS_TERMINATE | PROCESS_DUP_HANDLE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);

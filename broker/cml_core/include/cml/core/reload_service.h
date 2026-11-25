@@ -24,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -114,6 +115,8 @@ public:
     void cancel();
     // WP-28: the broker-side failure injection state (control command `inject-failure`).
     FaultInjector& faults() noexcept { return faults_; }
+    // WP-44: the creation time of process `pid` through the process host (nullopt without one or when it cannot be read).
+    std::optional<std::uint64_t> process_creation_time(std::uint32_t pid) const;
 
     // The state of a module (tests, diagnostics); null when it is not enabled.
     std::shared_ptr<ModuleState> module_state(std::uint64_t agent_id, const std::string& module_path) const;
@@ -164,6 +167,8 @@ private:
     // running reload or no module without publishing an error, and returns quietly (kBusy for "try again").
     Result<ipc::json::Value> run_reload(const ipc::json::Value& args, bool automatic, bool lock_held = false);
     std::vector<std::string> tracked_files() const;
+    // WP-44: drops the failure-injection records of the agent's pid when they were made for another process (on_session_changed).
+    void check_injection_identity(std::uint64_t agent_id, const LinkSnapshot& snap);
     std::vector<Target> targets(std::uint32_t pid, const std::string& module) const;
 
     PatchPipeline pipeline_;
@@ -177,6 +182,7 @@ private:
 
     mutable std::mutex mutex_;  // agents_, options_
     std::map<std::uint64_t, AgentEntry> agents_;
+    std::set<std::uint64_t> identity_checked_;  // WP-44: connections whose pid's failure-injection records were checked (mutex_)
     ReloadOptions options_;
 
     std::mutex watch_mutex_;  // save_watcher_, watcher_factory_

@@ -142,6 +142,7 @@ void ReloadService::detach(std::uint64_t agent_id) {
         }
         entry = std::move(it->second);
         agents_.erase(it);
+        identity_checked_.erase(agent_id);  // WP-44
         coordinator = restart_;
     }
     // WP-43: an unfinished restart's record for this process must not outlive it (its pid may be reused). R-51: neither must what
@@ -167,6 +168,41 @@ void ReloadService::detach(std::uint64_t agent_id) {
     rearm_save_watcher();
 }
 
+std::optional<std::uint64_t> ReloadService::process_creation_time(std::uint32_t pid) const {
+    std::shared_ptr<RestartCoordinator> coordinator;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        coordinator = restart_;
+    }
+    return coordinator != nullptr ? coordinator->process_creation_time(pid) : std::nullopt;
+}
+
+void ReloadService::check_injection_identity(std::uint64_t agent_id, const LinkSnapshot& snap) {
+    // WP-44 (R-51): records kept for a pid whose process was never seen to exit (a slow exit, a broker that stopped) must not apply to a
+    // new process that got the same pid. Once per connection, when its agent has registered: the records stay only if they were made for
+    // a process with this creation time.
+    if (!snap.handshaken || snap.pid == 0) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!identity_checked_.insert(agent_id).second) {
+            return;
+        }
+    }
+    if (!faults_.has_process_records(snap.pid)) {
+        return;
+    }
+    const std::optional<std::uint64_t> created = process_creation_time(snap.pid);
+    if (faults_.records_belong_to(snap.pid, created)) {
+        CML_LOG(Trace, "failure injection: process %u registered again; its records are its own (same creation time)", snap.pid);
+        return;
+    }
+    CML_LOG(Info, "failure injection: process %u registered, and the records kept for that pid %s; they are dropped", snap.pid,
+            created ? "were made for another process (another creation time)" : "cannot be matched to it (its creation time cannot be read)");
+    faults_.forget_process(snap.pid);
+}
+
 void ReloadService::on_session_changed(std::uint64_t agent_id) {
     std::shared_ptr<AgentLink> link;
     ReloadOptions options;
@@ -180,6 +216,7 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
         options = options_;
     }
     const LinkSnapshot snap = link->snapshot();
+    check_injection_identity(agent_id, snap);  // WP-44
     // The modules that should have state: enabled and loaded, with the address the agent reports.
     std::map<std::string, LoadedModule> desired;
     for (const std::string& enabled : snap.enabled) {
