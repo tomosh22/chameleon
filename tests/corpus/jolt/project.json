@@ -8,6 +8,7 @@
   "patch": "chameleon.patch",
   "args": [],
   "env": {},
+  "trace": true,
   "edits": [
     {
       "id": "app-function",
@@ -95,6 +96,19 @@
       "expect": "markers=\\S*jolt_body_is_active_v2:\\d+"
     },
     {
+      "id": "library-unity-job-system",
+      "file": "Jolt/Core/JobSystemThreadPool.cpp",
+      "replace": [
+        {
+          "find": "void JobSystemThreadPool::QueueJob(Job *inJob)\n{\n",
+          "with": "void JobSystemThreadPool::QueueJob(Job *inJob)\n{\n\tcml_corpus_marker(\"jolt_queue_job_v2\");\n"
+        }
+      ],
+      "include": "chameleon_corpus.h",
+      "include_anchor": "#include <Jolt/Core/JobSystemThreadPool.h>",
+      "expect": "markers=\\S*jolt_queue_job_v2:\\d+"
+    },
+    {
       "id": "header-fanout-update-context",
       "file": "Jolt/Physics/PhysicsUpdateContext.h",
       "replace": [
@@ -148,5 +162,60 @@
   "start_timeout_s": 90,
   "index_timeout_s": 300,
   "min_functions": 3000,
-  "expected_failures": []
+  "expected_failures": [
+    {
+      "step": "edit:vex-entry-jolt-sphere-convex-radius",
+      "compiler": "msvc",
+      "reason": "F-41.1: CML3207, the function-local statics (RTTI rtti and its guard $TSS0) of the overloads of JPH::GetRTTIOfType that JPH_IMPLEMENT_RTTI_* / JPH_IMPLEMENT_SERIALIZABLE_* define in the recompiled unity batch are refused: 'the guard variable ... has no record in the old image'",
+      "match": "CML3207.*GetRTTIOfType"
+    },
+    {
+      "step": "edit:library-unity-physics-system",
+      "compiler": "msvc",
+      "reason": "F-41.2: cl only: CML3214, the lambdas' call operators (<lambda_HASH>::operator()) of the recompiled unity batch cannot be paired with the old ones ('the lambdas of the enclosing function are not the same as in the old image')",
+      "match": "CML3214.*<lambda_"
+    },
+    {
+      "step": "edit:library-unity-body-interface",
+      "compiler": "msvc",
+      "reason": "F-41.2: cl only: CML3214, the lambdas' call operators (<lambda_HASH>::operator()) of the recompiled unity batch cannot be paired with the old ones ('the lambdas of the enclosing function are not the same as in the old image')",
+      "match": "CML3214.*<lambda_"
+    },
+    {
+      "step": "edit:header-fanout-update-context",
+      "compiler": "msvc",
+      "reason": "F-41.2: cl only: CML3214, the lambdas' call operators (<lambda_HASH>::operator()) of the recompiled unity batch cannot be paired with the old ones ('the lambdas of the enclosing function are not the same as in the old image')",
+      "match": "CML3214.*<lambda_"
+    },
+    {
+      "step": "edit:header-fanout-template-reference",
+      "compiler": "msvc",
+      "reason": "F-41.2: cl only: CML3214, the lambdas' call operators (<lambda_HASH>::operator()) of the recompiled unity batch cannot be paired with the old ones ('the lambdas of the enclosing function are not the same as in the old image')",
+      "match": "CML3214.*<lambda_"
+    },
+    {
+      "step": "edit:vex-entry-jolt-sphere-convex-radius",
+      "compiler": "clang-cl",
+      "reason": "F-41.1: CML3207, the function-local statics (RTTI rtti and its guard $TSS0) of the overloads of JPH::GetRTTIOfType that JPH_IMPLEMENT_RTTI_* / JPH_IMPLEMENT_SERIALIZABLE_* define in the recompiled unity batch are refused: 'the guard variable ... has no record in the old image'",
+      "match": "CML3207.*GetRTTIOfType"
+    },
+    {
+      "step": "edit:library-unity-physics-system",
+      "compiler": "clang-cl",
+      "reason": "F-41.3: clang-cl only: CML3214, the destructor of the local class ReductionCollideShapeCollector in PhysicsSystem::ProcessBodyPair: 1 new and 2 old functions with the same signature",
+      "match": "CML3214.*ReductionCollideShapeCollector"
+    },
+    {
+      "step": "edit:header-fanout-update-context",
+      "compiler": "clang-cl",
+      "reason": "F-41.1: CML3207, the function-local statics (RTTI rtti and its guard $TSS0) of the overloads of JPH::GetRTTIOfType that JPH_IMPLEMENT_RTTI_* / JPH_IMPLEMENT_SERIALIZABLE_* define in the recompiled unity batch are refused: 'the guard variable ... has no record in the old image'",
+      "match": "CML3207.*GetRTTIOfType"
+    },
+    {
+      "step": "edit:header-fanout-template-reference",
+      "compiler": "clang-cl",
+      "reason": "F-41.1: CML3207, the function-local statics (RTTI rtti and its guard $TSS0) of the overloads of JPH::GetRTTIOfType that JPH_IMPLEMENT_RTTI_* / JPH_IMPLEMENT_SERIALIZABLE_* define in the recompiled unity batch are refused: 'the guard variable ... has no record in the old image'",
+      "match": "CML3207.*GetRTTIOfType"
+    }
+  ]
 }

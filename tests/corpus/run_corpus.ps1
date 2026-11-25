@@ -77,7 +77,11 @@ function Invoke-Step([string]$Name, [scriptblock]$Body) {
         $msg = ($_ | Out-String).Trim()
         if ($msg.Length -gt 1500) { $msg = $msg.Substring(0, 1500) }
         $expected = $cfg.expected_failures | Where-Object { $_.step -eq $Name -and ($_.compiler -eq $Compiler -or $_.compiler -eq '*') } | Select-Object -First 1
-        if ($expected) {
+        if ($expected -and $expected.match -and ([string]$_.Exception.Message) -notmatch [string]$expected.match) {
+            # WP-41: an expected failure may name the failure (`match`, a regex over the error message): failing in another
+            # way is a failure, not the documented one.
+            Add-Result $Name 'fail' ("expected to fail with /{0}/ ({1}), failed otherwise: {2}" -f $expected.match, $expected.reason, $msg) $watch.Elapsed.TotalSeconds
+        } elseif ($expected) {
             Add-Result $Name 'expected-fail' ("{0} -- {1}" -f $expected.reason, $msg) $watch.Elapsed.TotalSeconds
         } else {
             Add-Result $Name 'fail' $msg $watch.Elapsed.TotalSeconds
