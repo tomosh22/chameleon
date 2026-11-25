@@ -220,6 +220,21 @@ struct PlanSummary {
     std::size_t fixups = 0;
 };
 
+// WP-40 (R-48 item 5, ADR-0043 rule (d)): lambdas of one enclosing function whose call operators the type records cannot
+// tell apart (the same signature but for the closure's number). Their statics were paired by that number; the pipeline
+// compares the code of the call operators with the old ones (hook_narrowing.h: pair_lambdas_by_code) and, where the code
+// says that lambdas changed places, plans again with PlanInput::closure_pairing.
+struct LambdaEntry {
+    std::string closure;        // the patch's closure, decorated, without the unit's hash: "<lambda_1>@?1??f@@YAXXZ@"
+    std::string old_closure;    // the old closure its statics were paired with
+    std::string call_operator;  // the patch's operator() ("??R<lambda_1>@?1??f@@YAXXZ@QEBA...")
+    std::vector<std::string> statics;  // the patch's statics of the lambda paired through it (guards included)
+};
+struct LambdaSet {
+    std::string function;  // display name of the enclosing function
+    std::vector<LambdaEntry> lambdas;
+};
+
 struct BindPlan {
     std::string object_name;
     std::string module_name;
@@ -247,6 +262,7 @@ struct BindPlan {
     // verified == sites; a failed planning reports the counts through `partial`.
     std::size_t imgrel_sites = 0;
     std::size_t imgrel_verified = 0;
+    std::vector<LambdaSet> lambda_sets;  // WP-40, see LambdaSet
 
     PlanSummary summary() const;
     // `BINDPLAN <label> hooks=N bind_old_data=N thunks=N new=N fixups=N` (the CI evidence line).
@@ -274,6 +290,9 @@ struct PlanInput {
     std::int64_t compiland_index = -1;
     const SymbolRegistry* registry = nullptr;    // optional
     const ProcessModules* modules = nullptr;     // optional
+    // WP-40 (rule (d)): closure of the patch -> old closure, where the code of the call operators showed that lambdas
+    // changed places (pair_lambdas_by_code). Their statics, guards and call operators are paired across the numbers.
+    std::map<std::string, std::string> closure_pairing;
 };
 
 // Builds the plan. On failure returns the first error; with `all_errors` every error is collected

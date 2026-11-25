@@ -24,7 +24,7 @@ within_s = 15
 
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ mark=1 a=100(0[2-9]\\d|[1-9]\\d\\d) b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=1 made=3\\b"
+regex = "TICK n=\\d+ mark=1 a=10(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=1 made=3\\b"
 within_s = 20
 
 [[step]]
@@ -40,12 +40,12 @@ allow_error = "CML3207|CML3600"
 # nothing was constructed again.
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ mark=[12] a=100(0[2-9]\\d|[1-9]\\d\\d) b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=1 made=3\\b"
+regex = "TICK n=\\d+ mark=[12] a=10(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=1 made=3\\b"
 within_s = 10
 
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ mark=[12] a=100\\d{3} b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=1 made=3\\b"
+regex = "TICK n=\\d+ mark=[12] a=10\\d{4} b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=1 made=3\\b"
 within_s = 10
 
 [[step]]
@@ -59,7 +59,7 @@ allow_error = "CML3601"
 
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ mark=[12] a=100\\d{3} b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=[13] made=3\\b"
+regex = "TICK n=\\d+ mark=[12] a=10\\d{4} b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=[13] made=3\\b"
 within_s = 10
 
 [[step]]

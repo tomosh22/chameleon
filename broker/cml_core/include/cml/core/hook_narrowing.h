@@ -38,6 +38,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -161,5 +162,18 @@ std::vector<std::string> bound_data_changes(const NarrowInput& input, std::size_
 
 // Never fails: whatever cannot be judged is kept. Every decision is logged at trace level.
 NarrowResult narrow_hooks(const NarrowInput& input);
+
+// WP-40 (R-48 item 5, ADR-0043 rule (d)). For every BindPlan::lambda_sets entry (lambdas of one function that the type
+// records cannot tell apart; the planner paired their statics by the compiler's numbers), each new call operator is
+// compared with each old one by the rules above, under the hypothesis that its statics are the old lambda's:
+//   1. pairs that are equivalent one-to-one are paired by that, also against the numbers (the lambdas changed places);
+//   2. if exactly one lambda is left on each side (its body changed), those two are paired;
+//   3. otherwise (several changed, or a comparison that cannot be made) the numbers stay, with the warning CML3602.
+// String literals and other fresh constants are compared by their bytes (SNAME("a") is not SNAME("b")).
+struct LambdaPairing {
+    std::map<std::string, std::string> closure_pairing;  // patch closure -> old closure, only where it is not the number's
+    std::vector<Diag> warnings;                          // CML3602
+};
+LambdaPairing pair_lambdas_by_code(const NarrowInput& input);
 
 }  // namespace cml::core

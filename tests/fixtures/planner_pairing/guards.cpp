@@ -24,7 +24,7 @@ int pp_guards_tick()
 {
     ++s_ticks;
     s_other += 3;
-    return 50000 + s_ticks + (s_other > 0 ? 0 : 1);
+    return 650000 + s_ticks + (s_other > 0 ? 0 : 1);
 }
 
 // R-48 item 2: the edit gives this function a function-local static with a dynamic initialiser. Its guard is new; until

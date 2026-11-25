@@ -2070,3 +2070,106 @@ TEST_CASE("by place (R-48 item 11): same-named block statics of an internal-link
     REQUIRE(r->warnings.size() == 1);
     CHECK(r->warnings[0].code == diag::kStaticsMatchedByOrder);
 }
+
+// ---- WP-40, rule (d): the planner's side (the sets it reports, and the pairing across numbers it is given) -----------
+
+TEST_CASE("lambda statics (rule (d)): lambdas with the same call operator are reported for the comparison of their code") {
+    SynthWorld w;
+    Types old_types;
+    old_proc(w, "`f'::`2'::<lambda_1>::operator()", 0x60, call_operator_with(old_types, 1, {}), {{"sname", 0x20}, {"$TSS0", 0x28}});
+    old_proc(w, "`f'::`2'::<lambda_2>::operator()", 0x70, call_operator_with(old_types, 2, {}), {{"sname", 0x30}, {"$TSS0", 0x38}});
+    old_types.set.add_to(w.spec.tpi);
+    w.open();
+    Types t;
+    const std::uint32_t op1 = call_operator_with(t, 1, {});
+    const std::uint32_t op2 = call_operator_with(t, 2, {});
+    StaticsObj o;
+    o.proc(call_operator_symbol(1), "`f'::`2'::<lambda_1>::operator()", false, op1);
+    o.end();
+    o.proc(call_operator_symbol(2), "`f'::`2'::<lambda_2>::operator()", false, op2);
+    o.end();
+    for (int n = 1; n <= 2; ++n) {
+        o.symbol(static_in_lambda("sname", n));
+        o.symbol(static_in_lambda("$TSS0", n));
+    }
+    Built b = o.build(t.set.debug_t());
+    auto r = plan_bind(w.input(b));
+    REQUIRE_MESSAGE(r.has_value(), err(r));
+    REQUIRE(r->lambda_sets.size() == 1);
+    const LambdaSet& set = r->lambda_sets.front();
+    REQUIRE(set.lambdas.size() == 2);
+    CHECK(set.lambdas[0].closure == "<lambda_1>@?1??f@@YAXXZ@");
+    CHECK(set.lambdas[0].old_closure == "<lambda_1>@?1??f@@YAXXZ@");
+    CHECK(set.lambdas[0].call_operator == call_operator_symbol(1));
+    CHECK(set.lambdas[1].call_operator == call_operator_symbol(2));
+    CHECK(set.lambdas[0].statics.size() == 2);  // sname and its guard (cl records both)
+    // Lambdas with different call operators are not reported (their types tell them apart).
+    CHECK(decision(*r, static_in_lambda("sname", 2)).old_address.rva == 0x3030);
+}
+
+TEST_CASE("lambda statics (rule (d)): given a pairing across the numbers, the statics, guards and call operators follow it") {
+    SUBCASE("cl: guards with records") {
+        SynthWorld w;
+        Types old_types;
+        old_proc(w, "`f'::`2'::<lambda_1>::operator()", 0x60, call_operator_with(old_types, 1, {}), {{"sname", 0x20}, {"$TSS0", 0x28}});
+        old_proc(w, "`f'::`2'::<lambda_2>::operator()", 0x70, call_operator_with(old_types, 2, {}), {{"sname", 0x30}, {"$TSS0", 0x38}});
+        old_types.set.add_to(w.spec.tpi);
+        w.open();
+        Types t;
+        const std::uint32_t op1 = call_operator_with(t, 1, {});
+        const std::uint32_t op2 = call_operator_with(t, 2, {});
+        StaticsObj o;
+        o.proc(call_operator_symbol(1), "`f'::`2'::<lambda_1>::operator()", false, op1);
+        o.end();
+        o.proc(call_operator_symbol(2), "`f'::`2'::<lambda_2>::operator()", false, op2);
+        o.end();
+        for (int n = 1; n <= 2; ++n) {
+            o.symbol(static_in_lambda("sname", n));
+            o.symbol(static_in_lambda("$TSS0", n));
+        }
+        Built b = o.build(t.set.debug_t());
+        PlanInput in = w.input(b);
+        in.closure_pairing = {{"<lambda_1>@?1??f@@YAXXZ@", "<lambda_2>@?1??f@@YAXXZ@"}, {"<lambda_2>@?1??f@@YAXXZ@", "<lambda_1>@?1??f@@YAXXZ@"}};
+        auto r = plan_bind(in);
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        CHECK(decision(*r, static_in_lambda("sname", 1)).old_address.rva == 0x3030);
+        CHECK(decision(*r, static_in_lambda("$TSS0", 1)).old_address.rva == 0x3038);
+        CHECK(decision(*r, static_in_lambda("sname", 2)).old_address.rva == 0x3020);
+        CHECK(decision(*r, static_in_lambda("$TSS0", 2)).old_address.rva == 0x3028);
+        CHECK(decision(*r, call_operator_symbol(1)).old_address.rva == 0x1070);
+        CHECK(decision(*r, call_operator_symbol(2)).old_address.rva == 0x1060);
+    }
+    SUBCASE("clang-cl: no guard records; the guards go where the layout puts the guard of the other number") {
+        // Old .bss: s_plain 0x08, lambda 0's sname 0x20 + guard 0x28, lambda 1's 0x30 + 0x38. In the patch the lambdas
+        // changed places (the code said so): lambda 0's statics are the old lambda 1's.
+        SynthWorld w;
+        w.data(w.tu(), "`anonymous namespace'::s_plain", 0x08);
+        Types types;
+        for (int n = 0; n < 2; ++n) {
+            const std::uint32_t type = types.call_operator("f::<lambda_" + std::to_string(n) + ">", ".?AV<lambda_" + std::to_string(n) + ">@?0??f@@YAXXZ@");
+            old_proc(w, "f::<lambda_" + std::to_string(n) + ">::operator()", 0x60 + 0x10 * static_cast<std::uint32_t>(n), type,
+                     {{"sname", 0x20 + 0x10 * static_cast<std::uint32_t>(n)}});
+        }
+        types.set.add_to(w.spec.tpi);
+        w.open();
+        const auto sym = [](const std::string& name, int n) { return "?" + name + "@?1???R<lambda_" + std::to_string(n) + ">@?0??f@@YAXXZ@QEBA@XZ@4HA"; };
+        SynthObj o;
+        const std::uint32_t d = o.section(".bss", kData, 0x40);
+        o.symbol("?s_plain@?A0x1@@3HA", 0x08, static_cast<std::int32_t>(d), false, false);
+        for (int n = 0; n < 2; ++n) {
+            o.symbol(sym("sname", n), 0x20 + 0x10 * static_cast<std::uint32_t>(n), static_cast<std::int32_t>(d), false, false);
+            o.symbol(sym("$TSS0", n), 0x28 + 0x10 * static_cast<std::uint32_t>(n), static_cast<std::int32_t>(d), false, false);
+        }
+        Built b = o.build();
+        PlanInput in = w.input(b);
+        in.closure_pairing = {{"<lambda_0>@?0??f@@YAXXZ@", "<lambda_1>@?0??f@@YAXXZ@"}, {"<lambda_1>@?0??f@@YAXXZ@", "<lambda_0>@?0??f@@YAXXZ@"}};
+        auto r = plan_bind(in);
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        CHECK(decision(*r, sym("sname", 0)).old_address.rva == 0x3030);
+        CHECK(decision(*r, sym("$TSS0", 0)).old_address.rva == 0x3038);
+        CHECK(decision(*r, sym("$TSS0", 0)).source == BindSource::CompilandLayout);
+        CHECK(decision(*r, sym("sname", 1)).old_address.rva == 0x3020);
+        CHECK(decision(*r, sym("$TSS0", 1)).old_address.rva == 0x3028);
+        CHECK(r->warnings.empty());
+    }
+}

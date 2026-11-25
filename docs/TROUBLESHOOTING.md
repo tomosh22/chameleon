@@ -1173,6 +1173,13 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 - **What to do:** Give the variable external linkage or take its address (the compiler then keeps it whole), or hot-restart.  
 - **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
 
+### CML3602
+
+- **Cause:** (warning) Two or more lambdas of one function hold function-local statics and cannot be told apart: their call operators have the same signature (no captures, the same parameters and return type, as with Godot's `SNAME`), and the compiler's lambda numbers are their only names. Chameleon compares the code of each new call operator with each old one (strings and other constants they use by their bytes) and pairs the lambdas by that, also when they changed places. This warning means that did not settle it: the code of two or more of them changed, or a call operator could not be compared (the message says why), so they were paired by their numbers. The reload is applied. If the edit reordered these lambdas, their statics now hold each other's values.  
+- **Message:** `Lambdas <...> of '<...>' are matched by their numbers (<...>); if you reordered them, the values of their statics may be exchanged.`  
+- **What to do:** Rename the statics, keep the order of these lambdas, or hot-restart after reordering.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
 
 ## CML4200 to CML4299
 

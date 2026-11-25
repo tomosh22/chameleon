@@ -711,6 +711,39 @@ private:
             return *first;
         }
         bind::BindPlan plan = std::move(*planned);
+        // WP-40 (R-48 item 5, ADR-0043 rule (d)): lambdas the type records cannot tell apart were paired by their numbers;
+        // their call operators' code decides. Where it shows that lambdas changed places, the unit is planned again with
+        // that pairing (once: the second plan is not compared again).
+        if (!plan.lambda_sets.empty()) {
+            NarrowInput li;
+            li.object = &object->object;
+            li.plan = &plan;
+            li.old_image = image ? &image->image : nullptr;
+            li.load_base = module_.base;
+            li.is_hooked = [this](std::uint64_t va) { return module_.is_hooked(va); };
+            li.prior_code = [this](std::uint64_t va) { return module_.code_running_at(va); };
+            LambdaPairing lambdas = pair_lambdas_by_code(li);
+            for (const Diag& w : lambdas.warnings) {
+                warn(report, "plan", w);
+            }
+            if (!lambdas.closure_pairing.empty()) {
+                in.closure_pairing = lambdas.closure_pairing;
+                errors.clear();
+                Result<bind::BindPlan> again = bind::plan_bind(in, &errors);
+                if (!again) {
+                    std::optional<Diag> first;
+                    for (const Diag& e : errors) {
+                        const Diag shown = fail("plan", e);
+                        first = first ? first : std::optional<Diag>(shown);
+                    }
+                    if (!first) {
+                        first = fail("plan", again.error());
+                    }
+                    return *first;
+                }
+                plan = std::move(*again);
+            }
+        }
         for (const Diag& w : plan.warnings) {
             warn(report, "plan", w);
         }

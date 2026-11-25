@@ -352,6 +352,19 @@ private:
     void pair_statics_by_closure(const std::string& base, std::vector<std::uint32_t>& unmatched, std::vector<const pdb::SymbolView*>& free_cands,
                                  std::map<std::uint32_t, Match>& matched, std::map<std::uint32_t, std::string>& why, std::set<std::uint32_t>& no_layout);
     ObjectSignatures& object_debug();
+    // WP-40 (R-48 item 5, rule (d)): the lambdas whose statics the closure step paired, per closure of the patch, for the
+    // pipeline's comparison of their call operators (BindPlan::lambda_sets).
+    struct LambdaNote {
+        std::string function;      // decorated function part of the closure ("?1??f@@YAXXZ@")
+        std::string display;       // the enclosing function's display name
+        std::string old_closure;   // the old closure it was paired with
+        std::string call_operator; // the patch's operator() of the closure ("" when it has none: inlined)
+        std::vector<std::string> statics;
+    };
+    std::map<std::string, LambdaNote> lambda_notes_;  // by the patch's closure ("<lambda_1>@?1??f@@YAXXZ@")
+    std::set<std::uint32_t> overridden_closure_static_;
+    void note_lambda(const Sym& sy, const std::string& base, const std::string& own_scope, const std::string& old_closure);
+    void build_lambda_sets();
     void pair_statics_by_procedure(const std::string& base, bool is_tls, const std::vector<std::uint32_t>& members, const std::vector<const pdb::SymbolView*>& cands,
                                    std::vector<std::uint32_t>& unmatched, std::vector<const pdb::SymbolView*>& free_cands, std::map<std::uint32_t, Match>& matched,
                                    std::map<std::uint32_t, std::string>& why, const std::set<std::uint32_t>& no_layout);
@@ -926,6 +939,76 @@ bool Planner::is_inlined_record(const pdb::SymbolView* v, const std::string& enc
     return comp_norm(&comp_syms_[v->parent_proc]).canonical == enclosing;
 }
 
+void Planner::note_lambda(const Sym& sy, const std::string& base, const std::string& own_scope, const std::string& old_closure) {
+    const std::size_t first = old_closure.find('@');
+    const std::size_t own_first = own_scope.find('@');
+    if (first == std::string::npos || own_first == std::string::npos) {
+        return;
+    }
+    const std::string function = old_closure.substr(first + 1);
+    if (own_scope.compare(own_first + 1, function.size(), function) != 0) {
+        return;
+    }
+    const std::string closure = own_scope.substr(0, own_first + 1 + function.size());
+    LambdaNote& note = lambda_notes_[closure];
+    if (note.function.empty()) {
+        note.function = function;
+        note.display = lambda_enclosing(sy.dec.display, base);
+        note.old_closure = old_closure;
+        for (const Sym& f : syms_) {
+            if (f.defined && f.dec.type == SymbolType::Function && starts_with(f.name, "??R" + closure)) {
+                note.call_operator = f.name;
+                break;
+            }
+        }
+    }
+    note.statics.push_back(sy.name);
+}
+
+// The lambdas of one enclosing function whose call operators have the same signature but for the closure's number. Their
+// statics were paired by that number; the pipeline confirms the pairing or corrects it by the code of the call operators.
+void Planner::build_lambda_sets() {
+    std::map<std::string, std::map<std::string, std::vector<std::string>>> by_function;  // function -> signature -> closures
+    for (const auto& [closure, note] : lambda_notes_) {
+        if (note.call_operator.empty()) {
+            continue;
+        }
+        const Sym* op = nullptr;
+        for (const Sym& f : syms_) {
+            if (f.name == note.call_operator) {
+                op = &f;
+                break;
+            }
+        }
+        if (op == nullptr) {
+            continue;
+        }
+        const pdb::FunctionSignature& sig = new_signature(*op);
+        by_function[note.function][sig.known ? canonical_lambda_names(sig.text) : "?" + closure].push_back(closure);
+    }
+    for (const auto& [function, by_signature] : by_function) {
+        for (const auto& [signature, closures] : by_signature) {
+            if (closures.size() < 2) {
+                continue;
+            }
+            LambdaSet set;
+            set.function = lambda_notes_[closures.front()].display;
+            for (const std::string& closure : closures) {
+                const LambdaNote& note = lambda_notes_[closure];
+                LambdaEntry e;
+                e.closure = closure;
+                e.old_closure = note.old_closure;
+                e.call_operator = note.call_operator;
+                e.statics = note.statics;
+                set.lambdas.push_back(std::move(e));
+            }
+            CML_LOG(Trace, "bind: lambdas of '%s': %zu call operators with the signature %s cannot be told apart by their types", set.function.c_str(), closures.size(),
+                    signature.c_str());
+            plan_.lambda_sets.push_back(std::move(set));
+        }
+    }
+}
+
 bool Planner::named_by_debug_record(const Sym& sy) {
     if (!debug_named_loaded_) {
         debug_named_loaded_ = true;
@@ -1077,9 +1160,27 @@ bool Planner::pair_overloads_by_signature(const std::string& group_name, std::ve
     std::vector<const pdb::FunctionSignature*> new_sig;
     std::vector<const pdb::FunctionSignature*> old_sig;
     std::string unreadable;
+    std::vector<std::unique_ptr<pdb::FunctionSignature>> renamed;  // WP-40: signatures under an overridden closure name
     for (const std::uint32_t pos : unmatched) {
         const Sym& sy = syms_[pos];
-        const pdb::FunctionSignature& sig = new_signature(sy);
+        const pdb::FunctionSignature* sigp = &new_signature(sy);
+        // WP-40 (R-48 item 5, rule (d)): this call operator's lambda is the old lambda of another number (the pipeline
+        // compared their code): it is matched under that closure's name.
+        for (const auto& [from, to] : in_.closure_pairing) {
+            if (from != to && sigp->known && starts_with(sy.name, "??R" + from)) {
+                auto copy = std::make_unique<pdb::FunctionSignature>(*sigp);
+                for (std::string* text : {&copy->text, &copy->class_unique_name}) {
+                    for (std::size_t at = text->find(from); at != std::string::npos; at = text->find(from, at + to.size())) {
+                        text->replace(at, from.size(), to);
+                    }
+                }
+                CML_LOG(Trace, "bind: overloads '%s': %s is matched as closure %s (by the code of its call operator)", group_name.c_str(), sy.name.c_str(), to.c_str());
+                sigp = copy.get();
+                renamed.push_back(std::move(copy));
+                break;
+            }
+        }
+        const pdb::FunctionSignature& sig = *sigp;
         new_sig.push_back(&sig);
         CML_LOG(Trace, "bind: overloads '%s': new %s signature=%s", group_name.c_str(), sy.name.c_str(), sig.known ? sig.text.c_str() : ("unknown (" + sig.why + ")").c_str());
         if (!sig.known && unreadable.empty()) {
@@ -1244,8 +1345,22 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
     std::vector<std::size_t> scoped;  // indices into unmatched
     std::vector<std::string> scope_text(unmatched.size());
     std::vector<std::string_view> scope(unmatched.size());
+    std::vector<std::string> own_scope(unmatched.size());   // WP-40: the scope as the patch spells it (before an override)
+    std::vector<bool> overridden(unmatched.size(), false);  // WP-40: paired with another closure than its number names
     for (std::size_t m = 0; m < unmatched.size(); ++m) {
         scope_text[m] = pdb::without_tu_discriminator(call_operator_scope(syms_[unmatched[m]].name));
+        own_scope[m] = scope_text[m];
+        // WP-40 (R-48 item 5, rule (d)): the pipeline compared the code of the call operators and found that this
+        // closure's lambda is the old lambda of ANOTHER number (they changed places): the static is looked for in that one.
+        for (const auto& [from, to] : in_.closure_pairing) {
+            if (from != to && scope_text[m].size() > from.size() && scope_text[m].compare(0, from.size(), from) == 0) {
+                scope_text[m] = to + scope_text[m].substr(from.size());
+                overridden[m] = true;
+                CML_LOG(Trace, "bind: closure statics '%s': %s: closure %s is paired with the old %s (by the code of its call operator)", base.c_str(),
+                        syms_[unmatched[m]].name.c_str(), from.c_str(), to.c_str());
+                break;
+            }
+        }
         scope[m] = scope_text[m];
         if (!scope[m].empty() && !after_first_component(scope[m]).empty()) {
             scoped.push_back(m);
@@ -1430,9 +1545,10 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
                 }
                 const pdb::SymbolView* c = free_cands[hits[m][0]];
                 const Sym* op = nullptr;
+                const std::string_view mine = own_scope[m];
                 for (const std::pair<std::uint32_t, std::string>& entry : call_operators) {
                     const std::string& text = entry.second;
-                    if (scope[m].size() > text.size() && scope[m].compare(0, text.size(), text) == 0 && scope[m][text.size()] == '@') {
+                    if (mine.size() > text.size() && mine.compare(0, text.size(), text) == 0 && mine[text.size()] == '@') {
                         op = &syms_[entry.first];
                         break;
                     }
@@ -1444,7 +1560,8 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
                 const pdb::FunctionSignature& new_sig = new_signature(*op);
                 CML_LOG(Trace, "bind: closure statics '%s': %s: call operator %s old signature=%s new signature=%s", base.c_str(), syms_[unmatched[m]].name.c_str(), op->name.c_str(),
                         old_sig.known ? old_sig.text.c_str() : "unknown", new_sig.known ? new_sig.text.c_str() : "unknown");
-                if (old_sig.known && new_sig.known && old_sig.text != new_sig.text) {
+                // (The closure's number is part of the text; with an override the numbers differ on purpose.)
+                if (old_sig.known && new_sig.known && canonical_lambda_names(old_sig.text) != canonical_lambda_names(new_sig.text)) {
                     changed_lambda = "the call operator of '" + display_name(op->name) + "' has another signature than the old one of that number (" + old_sig.text + " there, " +
                                      new_sig.text + " in the patch): the lambdas may have changed places, and a lambda's compiler-assigned number is its only other identity";
                 }
@@ -1473,7 +1590,29 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
                     CML_LOG(Trace, "bind: closure statics '%s': %s paired with the old record at rva %s (closure %s)", base.c_str(), sy.name.c_str(), hex(c->rva).c_str(),
                             ids[hits[m][0]].tail.c_str());
                     matched[unmatched[m]] = {c, BindSource::CompilandClosure};
-                    learn_delta(sy, c->rva);
+                    if (!overridden[m]) {
+                        learn_delta(sy, c->rva);
+                    } else {
+                        // A static paired across the numbers does not sit where the section's positions put its old record;
+                        // the patch's static of the lambda with the old record's number does (its twin): that one teaches the
+                        // layout, which the guards of these lambdas are placed from (settle_guards).
+                        overridden_closure_static_.insert(unmatched[m]);
+                        const std::size_t at = sy.name.find("??R");
+                        for (const auto& [from, to] : in_.closure_pairing) {
+                            if (at == std::string::npos || sy.name.compare(at + 3, from.size(), from) != 0) {
+                                continue;
+                            }
+                            const std::string twin = sy.name.substr(0, at + 3) + to + sy.name.substr(at + 3 + from.size());
+                            for (const Sym& t : syms_) {
+                                if (t.defined && t.name == twin && t.dec.section == sy.dec.section) {
+                                    learn_delta(t, c->rva);
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    note_lambda(sy, base, own_scope[m], ids[hits[m][0]].tail);
                     cand_taken[hits[m][0]] = true;
                     member_done[m] = true;
                 } else if (hits[m].size() != 1) {
@@ -2241,6 +2380,7 @@ void Planner::bridge_statics() {
     }
 
     settle_guards();
+    build_lambda_sets();
     // Anything still undecided (defensive).
     for (Sym& sy : syms_) {
         if (sy.defined && !sy.decided) {
@@ -2342,11 +2482,31 @@ void Planner::settle_guards() {
             continue;
         }
         std::string why_not;
+        // WP-40 (rule (d)): a guard of a lambda paired by the code of its call operator with the old lambda of another
+        // number sits, in the old image, where the layout puts the guard of the patch's lambda of THAT number.
+        const Sym* position = &sy;
+        for (const auto& [from, to] : in_.closure_pairing) {
+            const std::size_t at = sy.name.find("??R" + from);
+            if (from == to || at == std::string::npos) {
+                continue;
+            }
+            const std::string twin = sy.name.substr(0, at + 3) + to + sy.name.substr(at + 3 + from.size());
+            position = nullptr;
+            for (const Sym& t : syms_) {
+                if (t.defined && t.name == twin && t.dec.section == sy.dec.section) {
+                    position = &t;
+                    break;
+                }
+            }
+            break;
+        }
         const auto d = delta_.find(sy.dec.section);
-        if (sy.dec.section == 0 || d == delta_.end()) {
+        if (position == nullptr) {
+            why_not = "its lambda was paired with the old lambda of another number, and the patch has no guard of that number in the same section";
+        } else if (sy.dec.section == 0 || d == delta_.end()) {
             why_not = "no layout of its object section is known (no static matched there, or the matched ones disagree)";
         } else {
-            const std::int64_t rva = d->second + static_cast<std::int64_t>(sy.s->value);
+            const std::int64_t rva = d->second + static_cast<std::int64_t>(position->s->value);
             const auto image_section = delta_image_section_.find(sy.dec.section);
             const std::optional<pdb::SectionOffset> so =
                 rva >= 0 && rva < 0x7FFFFFFF ? pdb_.section_offset_from_rva(static_cast<std::uint32_t>(rva)) : std::nullopt;

@@ -12,11 +12,11 @@ int pp_sibling(int idx)
     ++s_sibling_calls;
     int value = 0;
     if (idx == 0) {
-        static PpObj names = pp_make(40000);
+        static PpObj names = pp_make(500000);
         names.hits += 1;
         value = names.id + names.hits;
     } else if (idx == 1) {
-        static PpObj names = pp_make(41000);
+        static PpObj names = pp_make(550000);
         names.hits += 1;
         value = names.id + names.hits;
     }

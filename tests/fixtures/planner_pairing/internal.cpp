@@ -10,11 +10,11 @@ static int pp_opts(int idx)
 {
     int value = 0;
     if (idx == 0) {
-        static PpObj names = pp_make(20000);
+        static PpObj names = pp_make(200000);
         names.hits += 1;
         value = names.id + names.hits;
     } else if (idx == 1) {
-        static PpObj names = pp_make(21000);
+        static PpObj names = pp_make(250000);
         names.hits += 1;
         value = names.id + names.hits;
     }

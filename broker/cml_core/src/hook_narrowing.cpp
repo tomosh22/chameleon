@@ -8,6 +8,8 @@
 #include <set>
 #include <unordered_map>
 
+#include "cml/core/bind_diag_ids.h"
+#include "cml/core/bind_names.h"
 #include "cml/util/format.h"
 #include "cml/util/log.h"
 
@@ -711,6 +713,191 @@ std::vector<std::string> bound_data_changes(const NarrowInput& input, std::size_
         }
     }
     return changed;
+}
+
+
+// ---- WP-40 (R-48 item 5, ADR-0043 rule (d)): lambdas told apart by the code of their call operators ----------------------
+
+namespace {
+
+enum class Equivalence : std::uint8_t { Yes, No, Unknown };
+
+// Replaces the closure `from` of a decorated name (after its "??R") by `to`.
+std::string with_closure(const std::string& name, const std::string& from, const std::string& to) {
+    const std::size_t at = name.find("??R" + from);
+    if (at == std::string::npos) {
+        return {};
+    }
+    return name.substr(0, at + 3) + to + name.substr(at + 3 + from.size());
+}
+
+}  // namespace
+
+LambdaPairing pair_lambdas_by_code(const NarrowInput& input) {
+    LambdaPairing out;
+    if (input.plan == nullptr || input.object == nullptr) {
+        return out;
+    }
+    const bind::BindPlan& plan = *input.plan;
+    for (const bind::LambdaSet& set : plan.lambda_sets) {
+        const std::size_t n = set.lambdas.size();
+        // The hooks of the call operators as planned (paired by number): the old entry of lambda j is hooks[j].
+        std::vector<const bind::HookEntry*> hook(n, nullptr);
+        for (std::size_t i = 0; i < n; ++i) {
+            for (const bind::HookEntry& h : plan.hooks) {
+                if (h.new_symbol == set.lambdas[i].call_operator) {
+                    hook[i] = &h;
+                }
+            }
+        }
+        std::vector<std::vector<Equivalence>> eq(n, std::vector<Equivalence>(n, Equivalence::Unknown));
+        std::string unknown_why;
+        bind::BindPlan hypo = plan;  // a copy whose decisions are changed per hypothesis
+        for (std::size_t i = 0; i < n; ++i) {
+            for (std::size_t j = 0; j < n; ++j) {
+                const bind::LambdaEntry& a = set.lambdas[i];
+                const bind::LambdaEntry& b = set.lambdas[j];
+                if (hook[j] == nullptr) {
+                    unknown_why = "the call operator '" + b.call_operator + "' is not hooked to an old one";
+                    continue;
+                }
+                // Hypothesis: the patch's lambda i is the old lambda j. Its statics then live where the plan put lambda j's
+                // (which it paired with old lambda j by number), and its call operator is compared with old lambda j's code.
+                hypo.decisions = plan.decisions;
+                bool same_statics = true;
+                // Every datum declared in lambda i (its statics and their guards, also the guards the planner placed by the
+                // section layout, which the closure step did not pair).
+                std::vector<std::string> statics_of_a;
+                for (const bind::SymbolDecision& d : plan.decisions) {
+                    if (d.defined && d.type == bind::SymbolType::Data && d.name.find("??R" + a.closure) != std::string::npos) {
+                        statics_of_a.push_back(d.name);
+                    }
+                }
+                for (const std::string& st : statics_of_a) {
+                    const std::string twin = i == j ? st : with_closure(st, a.closure, b.closure);
+                    const bind::SymbolDecision* dj = plan.find_decision(twin);
+                    if (dj == nullptr) {
+                        same_statics = false;
+                        break;
+                    }
+                    for (bind::SymbolDecision& d : hypo.decisions) {
+                        if (d.name == st) {
+                            d.decision = dj->decision;
+                            d.source = dj->source;
+                            d.old_address = dj->old_address;
+                        }
+                    }
+                }
+                if (!same_statics) {
+                    eq[i][j] = Equivalence::No;
+                    CML_LOG(Trace, "lambdas of '%s': %s vs old %s: not the same statics", set.function.c_str(), a.closure.c_str(), b.old_closure.c_str());
+                    continue;
+                }
+                bind::HookEntry h = *hook[j];
+                h.new_symbol = a.call_operator;
+                hypo.hooks.assign(1, h);
+                NarrowInput ni = input;
+                ni.plan = &hypo;
+                ni.enabled = true;
+                const Narrower narrower(ni);
+                const NarrowDecision d = narrower.judge(h);
+                switch (d.reason) {
+                    case NarrowReason::Unchanged: eq[i][j] = Equivalence::Yes; break;
+                    case NarrowReason::BytesDiffer:
+                    case NarrowReason::SizeDiffers:
+                    case NarrowReason::TargetChanged:
+                    case NarrowReason::TargetNew: eq[i][j] = Equivalence::No; break;
+                    default:
+                        eq[i][j] = Equivalence::Unknown;
+                        unknown_why = "the code of '" + bind::display_name(a.call_operator) + "' cannot be compared with the old lambda's: " + to_string(d.reason) +
+                                      (d.detail.empty() ? std::string() : " - " + d.detail);
+                        break;
+                }
+                CML_LOG(Trace, "lambdas of '%s': %s vs old %s: %s%s%s", set.function.c_str(), a.closure.c_str(), b.old_closure.c_str(), to_string(d.reason),
+                        d.detail.empty() ? "" : " - ", d.detail.c_str());
+            }
+        }
+        // Rule 1: one-to-one equivalence. Rule 2: one changed lambda left on each side. Rule 3: anything else by number.
+        std::vector<std::size_t> pair(n, n);
+        std::vector<bool> old_taken(n, false);
+        bool unknown = !unknown_why.empty();
+        for (std::size_t i = 0; i < n; ++i) {
+            for (std::size_t j = 0; j < n; ++j) {
+                unknown = unknown || eq[i][j] == Equivalence::Unknown;
+            }
+        }
+        if (!unknown) {
+            for (std::size_t i = 0; i < n; ++i) {
+                std::size_t row = 0;
+                std::size_t hit = n;
+                for (std::size_t j = 0; j < n; ++j) {
+                    if (eq[i][j] == Equivalence::Yes) {
+                        ++row;
+                        hit = j;
+                    }
+                }
+                std::size_t column = 0;
+                for (std::size_t k = 0; hit != n && k < n; ++k) {
+                    column += eq[k][hit] == Equivalence::Yes ? 1u : 0u;
+                }
+                if (row == 1 && column == 1) {
+                    pair[i] = hit;
+                    old_taken[hit] = true;
+                }
+            }
+        }
+        std::vector<std::size_t> new_left;
+        std::vector<std::size_t> old_left;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (pair[i] == n) {
+                new_left.push_back(i);
+            }
+            if (!old_taken[i]) {
+                old_left.push_back(i);
+            }
+        }
+        bool by_number = false;
+        if (unknown) {
+            by_number = true;
+            for (std::size_t i = 0; i < n; ++i) {
+                pair[i] = i;
+            }
+        } else if (new_left.size() == 1 && old_left.size() == 1) {
+            pair[new_left[0]] = old_left[0];  // rule 2: the one lambda whose body changed
+        } else if (!new_left.empty()) {
+            by_number = true;  // rule 3, for what is left: in the order of the numbers
+            for (std::size_t k = 0; k < new_left.size() && k < old_left.size(); ++k) {
+                pair[new_left[k]] = old_left[k];
+            }
+        }
+        std::size_t moved = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (pair[i] != i && pair[i] < n) {
+                out.closure_pairing[set.lambdas[i].closure] = set.lambdas[pair[i]].old_closure;
+                ++moved;
+                CML_LOG(Trace, "lambdas of '%s': %s is the old %s (by the code of its call operator)", set.function.c_str(), set.lambdas[i].closure.c_str(),
+                        set.lambdas[pair[i]].old_closure.c_str());
+            }
+        }
+        if (by_number) {
+            std::string left;
+            for (const std::size_t i : unknown ? std::vector<std::size_t>() : new_left) {
+                left += (left.empty() ? "" : ", ") + set.lambdas[i].closure.substr(0, set.lambdas[i].closure.find('@'));
+            }
+            if (unknown) {
+                for (const bind::LambdaEntry& e : set.lambdas) {
+                    left += (left.empty() ? "" : ", ") + e.closure.substr(0, e.closure.find('@'));
+                }
+            }
+            out.warnings.push_back(Diag::make(bind::diag::kLambdasMatchedByNumber,
+                                              "Lambdas " + left + " of '" + set.function + "' are matched by their numbers" +
+                                                  (unknown ? " (" + unknown_why + ")" : std::string(" (their code changed, so it cannot tell them apart)")) +
+                                                  "; if you reordered them, the values of their statics may be exchanged.",
+                                              "Rename the statics, keep the order of these lambdas, or hot-restart after reordering."));
+        }
+        CML_LOG(Info, "WP40-LAMBDAS function='%s' lambdas=%zu moved=%zu by_number=%d", set.function.c_str(), n, moved, by_number ? 1 : 0);
+    }
+    return out;
 }
 
 }  // namespace cml::core

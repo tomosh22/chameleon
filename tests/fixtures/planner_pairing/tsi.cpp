@@ -11,11 +11,11 @@ int pp_tsi(int idx)
 {
     int value = 0;
     if (idx == 0) {
-        static PpObj names = pp_make(10000);
+        static PpObj names = pp_make(100000);
         names.hits += 1;
         value = names.id + names.hits;
     } else if (idx == 1) {
-        static PpObj names = pp_make(11000);
+        static PpObj names = pp_make(150000);
         names.hits += 1;
         value = names.id + names.hits;
     }

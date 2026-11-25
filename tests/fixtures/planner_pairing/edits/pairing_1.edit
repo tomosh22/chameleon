@@ -21,7 +21,7 @@
  int pp_fresh()
  {
 -    return 1;
-+    static PpObj fresh = pp_make(4000);
++    static PpObj fresh = pp_make(600000);
 +    fresh.hits += 1;
 +    return fresh.id + fresh.hits;
  }
