@@ -893,8 +893,22 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
             return fail(shutting_down(new_pid), new_pid);
         }
         if (!index || !ready || index->status().state != IndexState::Ready) {
-            warn(Diag::make(rd::kReapplyFailed, "the PDB index of '" + full + "' in the new process is not ready, so its edits cannot be re-applied",
-                            "Run `reload` once its index is ready."),
+            // WP-45: the carried baselines go to the module's state (or, without one yet, to its enable): the re-apply worker restores them
+            // and reloads once the index is ready. Without that, the index would take the edited files as its baseline and a `reload`
+            // would find nothing to do.
+            std::size_t handed = 0;
+            for (const Carried& c : carried) {
+                if (path::same_path(c.path, full) && !c.baseline.originals.empty()) {
+                    CML_LOG(Trace, "restart: decision=carry-to-index-not-ready module=%s pid=%u originals=%zu", c.path.c_str(), new_pid, c.baseline.originals.size());
+                    service_.carry_to_late_module(new_agent, new_pid, c.path, c.baseline, "restart");
+                    handed += c.baseline.originals.size();
+                }
+            }
+            warn(Diag::make(rd::kReapplyFailed,
+                            "the PDB index of '" + full + "' in the new process is not ready" +
+                                (handed != 0 ? ", so its edits are re-applied when it is (" + std::to_string(handed) + " file(s))"
+                                             : std::string(", so its edits cannot be re-applied")),
+                            handed != 0 ? "Nothing to do; a CML5600 or CML5601 follows if the re-apply fails." : "Run `reload` once its index is ready."),
                  new_pid);
             continue;
         }

@@ -394,6 +394,21 @@ public:
         return exited;
     }
 
+    // WP-45: the creation time (FILETIME, 100 ns since 1601) tells a process from a later one with the same pid.
+    std::optional<std::uint64_t> creation_time(std::uint32_t pid) const override {
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (process == nullptr) {
+            return std::nullopt;
+        }
+        FILETIME created{}, exited{}, kernel{}, user{};
+        const BOOL ok = GetProcessTimes(process, &created, &exited, &kernel, &user);
+        CloseHandle(process);
+        if (!ok) {
+            return std::nullopt;
+        }
+        return (static_cast<std::uint64_t>(created.dwHighDateTime) << 32) | static_cast<std::uint64_t>(created.dwLowDateTime);
+    }
+
     Result<std::unique_ptr<RestartableProcess>> open(std::uint32_t pid, const std::uint64_t std_handles[3], std::uint32_t info_flags,
                                                      std::vector<Diag>* warnings) override {
         HANDLE process = OpenProcess(PROCESS_TERMINATE | PROCESS_DUP_HANDLE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);

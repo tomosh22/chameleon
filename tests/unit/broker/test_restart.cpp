@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <functional>
+#include <map>
 #include <optional>
 #include <set>
 #include <chrono>
@@ -199,6 +200,7 @@ public:
                                                      std::vector<Diag>* warnings) override;
     bool supports_hold() const override;
     bool has_exited(std::uint32_t pid) const override;  // WP-43
+    std::optional<std::uint64_t> creation_time(std::uint32_t pid) const override;  // WP-45
 
 private:
     Rig& rig_;
@@ -244,6 +246,8 @@ struct Rig {
     std::set<std::uint32_t> exited;         // processes the fake host reports as exited (ProcessHost::has_exited)
     // WP-45
     std::string new_process_lacks;          // a module the relaunched process has not loaded (it loads it lazily, later)
+    std::map<std::uint32_t, std::uint64_t> created;  // creation times the fake host reports (default 5000 + pid)
+    bool creation_unknown = false;          // the fake host cannot read creation times
 
     // what happened
     std::mutex mutex;
@@ -485,6 +489,15 @@ bool FakeHost::supports_hold() const {
 bool FakeHost::has_exited(std::uint32_t pid) const {
     std::lock_guard<std::mutex> lock(rig_.mutex);
     return rig_.exited.count(pid) != 0;
+}
+
+std::optional<std::uint64_t> FakeHost::creation_time(std::uint32_t pid) const {
+    std::lock_guard<std::mutex> lock(rig_.mutex);
+    if (rig_.creation_unknown) {
+        return std::nullopt;
+    }
+    const auto it = rig_.created.find(pid);
+    return it != rig_.created.end() ? it->second : 5000u + pid;
 }
 
 Result<std::unique_ptr<RestartableProcess>> FakeHost::open(std::uint32_t pid, const std::uint64_t std_handles[3], std::uint32_t info_flags,
@@ -2027,4 +2040,52 @@ TEST_CASE("WP-45 review 5: an agent that disconnects keeps its process's carries
         other->register_process(100, "another-token", {kExe}, {kExe});
         CHECK_FALSE(rig.service.has_carry_for_testing(100, kOther));
     }
+    SUBCASE("final review 1: the same exe with the same command line, the pid reused: another creation time, dropped") {
+        Rig rig;
+        rig.service.carry_to_late_module(1, 100, kOther, edited_baseline("c:\\app\\src\\other.cpp"), "disable");
+        rig.service.detach(1);  // still in teardown: has_exited says no
+        CHECK(rig.service.has_carry_for_testing(100, kOther));
+        {
+            std::lock_guard<std::mutex> lock(rig.mutex);
+            rig.created[100] = 777777;  // a new process got pid 100
+        }
+        auto other = std::make_shared<SimAgent>(rig.service, 8);
+        rig.new_agents.push_back(other);
+        other->register_process(100, "", {kExe, kDll, kOther}, {kExe});  // same token (none), same command line
+        CHECK_FALSE(rig.service.has_carry_for_testing(100, kOther));
+    }
+    SUBCASE("final review 1: a creation time that cannot be read is no proof: dropped") {
+        Rig rig;
+        rig.service.carry_to_late_module(1, 100, kOther, edited_baseline("c:\\app\\src\\other.cpp"), "reload");
+        rig.service.detach(1);
+        {
+            std::lock_guard<std::mutex> lock(rig.mutex);
+            rig.creation_unknown = true;
+        }
+        auto again = std::make_shared<SimAgent>(rig.service, 7);
+        rig.new_agents.push_back(again);
+        again->register_process(100, "", {kExe, kDll, kOther}, {kExe});
+        CHECK_FALSE(rig.service.has_carry_for_testing(100, kOther));
+    }
+}
+
+TEST_CASE("restart (WP-45 final review 3): a module enabled in time whose index is not ready gets its edits re-applied once it is") {
+    QuietLogs quiet;
+    Rig rig;
+    const std::shared_ptr<ModuleState> plugin = rig.service.module_state(1, kDll);
+    REQUIRE(plugin != nullptr);
+    {
+        std::lock_guard<std::mutex> lock(plugin->mutex);
+        plugin->carried_in = edited_baseline("c:\\app\\src\\plugin.cpp");
+    }
+    // The broker enables plugin.dll in the new process in time, but its index never gets ready (no PDB behind it here): CML5810.
+    Result<Value> result = rig.service.restart(args_for(100, 10000, 1500));
+    REQUIRE_MESSAGE(result.has_value(), result.error().format());
+    CHECK(has_diag(rig, "warning", "CML5810", "re-applied when it is (1 file(s))"));
+    // The baseline went to the state; the worker takes it once the index is done. This index fails, so that is a CML5601, not silence.
+    for (int i = 0; i < 1000 && rig.service.reapply_pending() != 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(rig.service.reapply_pending() == 0);
+    CHECK(has_diag(rig, "warning", "CML5601", "plugin.cpp"));
 }

@@ -107,6 +107,12 @@ public:
         (void)pid;
         return false;
     }
+    // WP-45: when process `pid` was created (any monotonic stamp the host can read for a running process; on Windows the FILETIME of
+    // GetProcessTimes); nullopt when it cannot be read. With the pid it tells one process from a later one that reuses the pid.
+    virtual std::optional<std::uint64_t> creation_time(std::uint32_t pid) const {
+        (void)pid;
+        return std::nullopt;
+    }
 };
 
 // The real thing on Windows; null elsewhere.

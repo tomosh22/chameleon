@@ -376,11 +376,26 @@ struct Rig {
     }
 
     // Enables app.exe in the session and waits for its index.
+    // WP-45: the agent registers (Hello) without enabling anything yet; enable() then skips its Hello.
+    bool said_hello = false;
+    void hello() {
+        ipc::Hello h;
+        h.request_id = 1;
+        h.pid = kPid;
+        session.on_message(h);
+        link->publish(session);
+        service->on_session_changed(1);
+        said_hello = true;
+    }
+
     void enable() {
-        ipc::Hello hello;
-        hello.request_id = 1;
-        hello.pid = kPid;
-        session.on_message(hello);
+        if (!said_hello) {
+            ipc::Hello hello;
+            hello.request_id = 1;
+            hello.pid = kPid;
+            session.on_message(hello);
+            said_hello = true;
+        }
         ipc::ModuleList list;
         list.request_id = 2;
         list.modules.push_back({kModuleBase, 0x4000, exe});
@@ -3427,6 +3442,7 @@ TEST_CASE("WP-45: a baseline a restart hands over is re-applied when the module 
     }
 
     SUBCASE("the module is not enabled yet (CML5809): its enable re-applies the edit") {
+        rig.hello();  // the new process has registered (the restart hands over only then)
         rig.service->carry_to_late_module(1, kPid, rig.exe, carried, "restart");
         CHECK(rig.service->has_carry_for_testing(kPid, rig.exe));
         rig.enable();
@@ -3451,6 +3467,7 @@ TEST_CASE("WP-45: a baseline a restart hands over is re-applied when the module 
         CHECK_FALSE(rig.service->has_carry_for_testing(kPid, rig.exe));
     }
     SUBCASE("a kept baseline goes with its process") {
+        rig.hello();
         rig.service->carry_to_late_module(1, kPid, rig.exe, carried, "restart");
         rig.enable();
         wait_idle(rig);
@@ -3565,6 +3582,13 @@ TEST_CASE("WP-45 review 6: a carry stored while a dropped instance's baseline wa
     // finds no state: here through another connection of the same pid that has none).
     auto other = std::make_shared<AgentLink>(3, [](const ipc::Message&) { return Result<void>(); });
     rig.service->attach(other);
+    Session other_session{3, "0.1.0"};
+    ipc::Hello hello;
+    hello.request_id = 1;
+    hello.pid = kPid;
+    other_session.on_message(hello);
+    other->publish(other_session);
+    rig.service->on_session_changed(3);  // registered: the carry is kept for its process
     rig.service->carry_to_late_module(3, kPid, rig.exe, edited("c:\\proj\\b.cpp", 0x20), "restart");
     REQUIRE(rig.service->has_carry_for_testing(kPid, rig.exe));
 
@@ -3612,6 +3636,45 @@ TEST_CASE("WP-45 review 2: an instance that goes away before its re-apply ran is
     CHECK(count_diag_id(rig, "CML5600") == 0);
     // Its carry was handed on (to its next instance), not lost.
     CHECK(rig.service->has_carry_for_testing(kPid, gone));
+}
+
+namespace {
+
+// A process host that can tell nothing: no restart, no exit, no creation time (ProcessHost's defaults).
+class BlindHost final : public ProcessHost {
+public:
+    Result<std::unique_ptr<RestartableProcess>> open(std::uint32_t, const std::uint64_t[3], std::uint32_t, std::vector<Diag>*) override {
+        return Diag::make(5805, "not in this test", "x");
+    }
+};
+
+}  // namespace
+
+TEST_CASE("WP-45 final review 2: no carry is kept for an agent that is gone or has not registered") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.service->set_process_host(std::make_shared<BlindHost>());  // creation times cannot be read (also on Windows)
+    // The agent is gone (never attached, or detached since).
+    rig.service->carry_to_late_module(99, kPid, rig.exe, edited("c:\\proj\\a.cpp", 0x10), "restart");
+    CHECK_FALSE(rig.service->has_carry_for_testing(kPid, rig.exe));
+    // Attached, but no Hello yet: no process to keep it for.
+    rig.service->carry_to_late_module(1, kPid, rig.exe, edited("c:\\proj\\a.cpp", 0x10), "restart");
+    CHECK_FALSE(rig.service->has_carry_for_testing(kPid, rig.exe));
+    // Registered: kept (here without a process host, so its creation time is unknown) ...
+    rig.hello();
+    rig.service->carry_to_late_module(1, kPid, rig.exe, edited("c:\\proj\\a.cpp", 0x10), "restart");
+    CHECK(rig.service->has_carry_for_testing(kPid, rig.exe));
+    // ... and a carry whose process identity is not proven is dropped when the next agent registers with that pid.
+    auto next = std::make_shared<AgentLink>(4, [](const ipc::Message&) { return Result<void>(); });
+    rig.service->attach(next);
+    Session next_session{4, "0.1.0"};
+    ipc::Hello hello;
+    hello.request_id = 1;
+    hello.pid = kPid;
+    next_session.on_message(hello);
+    next->publish(next_session);
+    rig.service->on_session_changed(4);
+    CHECK_FALSE(rig.service->has_carry_for_testing(kPid, rig.exe));
 }
 
 #if defined(_WIN32)

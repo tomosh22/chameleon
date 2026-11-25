@@ -179,6 +179,11 @@ private:
     struct AgentEntry {
         std::shared_ptr<AgentLink> link;
         std::map<std::string, std::shared_ptr<ModuleState>> modules;  // normalised path -> state
+        // WP-45: set once, when the agent has registered (Hello): which process it is (restart token, command line, creation time read
+        // through the process host) and whether the creation time could be read.
+        bool registered = false;
+        std::string identity;
+        bool identity_known = false;
     };
     struct Target {
         std::shared_ptr<AgentLink> link;
@@ -226,13 +231,18 @@ private:
         BaselineSnapshot snapshot;
         std::uint64_t live_base = 0;
         std::string origin;  // "reload" (the module was loaded again), "disable", "restart"
-        // The process it is for (restart token and command line, as its agent reported them; empty when not known): a later agent with
-        // the same pid but another identity is another program run, and the carry is dropped then.
+        // The process it is for: restart token, command line and creation time (AgentEntry::identity of the agent that stored it), and
+        // whether the creation time was known. Another agent that registers with the pid keeps it only on a proven match.
         std::string identity;
+        bool identity_known = false;
+        std::uint64_t agent_id = 0;  // the agent that stored it (or took it over on a proven match)
     };
-    // Drops the carries of `pid`. `only_other_than`: only those recorded for another process identity (empty: all). Needs mutex_.
-    void drop_carries_locked(std::uint32_t pid, const std::string* only_other_than, const char* why);
-    std::shared_ptr<ProcessHost> process_host_;  // guarded by mutex_: whether a process has exited (detach)
+    // Drops every carry of `pid`. Needs mutex_.
+    void drop_carries_locked(std::uint32_t pid, const char* why);
+    // An agent registered with `pid`: the carries other agents stored for it stay only when both identities are known and equal (the
+    // same process, reconnected); the others are dropped (logged at info, with the module and the files). Needs mutex_.
+    void check_carries_on_register_locked(std::uint32_t pid, std::uint64_t agent_id, const std::string& identity, bool identity_known);
+    std::shared_ptr<ProcessHost> process_host_;  // guarded by mutex_: whether a process has exited (detach), its creation time
     using InstanceKey = std::pair<std::uint32_t, std::string>;  // pid, normalised path
     std::map<InstanceKey, Carry> carries_;                       // guarded by mutex_
     std::map<InstanceKey, std::uint64_t> instances_;             // guarded by mutex_: instances made so far (ModuleState::instance)

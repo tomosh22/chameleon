@@ -86,9 +86,11 @@ std::string file_list(const std::vector<std::string>& files) {
     return out.empty() ? std::string("(none)") : out;
 }
 
-// Which process an agent is: its restart token and command line (with the pid, what the broker can tell processes apart by).
-std::string process_identity(const LinkSnapshot& snap) {
-    return snap.restart_token + "\n" + snap.command_line;
+// Which process an agent is: its restart token, its command line and its creation time (read by the broker through the process host;
+// empty when it cannot be read). With the pid, the creation time is what tells a process from a later one that reuses the pid; the
+// token and the command line only add to it.
+std::string process_identity(const LinkSnapshot& snap, const std::optional<std::uint64_t>& created) {
+    return snap.restart_token + "\n" + snap.command_line + "\n" + (created ? std::to_string(*created) : std::string());
 }
 
 }  // namespace
@@ -207,7 +209,7 @@ void ReloadService::detach(std::uint64_t agent_id) {
         }
         std::lock_guard<std::mutex> lock(mutex_);
         if (exited) {
-            drop_carries_locked(gone.pid, nullptr, "the process has exited");
+            drop_carries_locked(gone.pid, "the process has exited");
         } else if (gone.handshaken) {
             CML_LOG(Trace, "reenable: decision=keep-carries pid=%u reason=%s", gone.pid, host == nullptr ? "exit-unknown" : "process-running");
         }
@@ -226,6 +228,8 @@ void ReloadService::detach(std::uint64_t agent_id) {
 void ReloadService::on_session_changed(std::uint64_t agent_id) {
     std::shared_ptr<AgentLink> link;
     ReloadOptions options;
+    std::shared_ptr<ProcessHost> host;
+    bool registered = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto it = agents_.find(agent_id);
@@ -234,9 +238,19 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
         }
         link = it->second.link;
         options = options_;
+        host = process_host_;
+        registered = it->second.registered;
     }
     const LinkSnapshot snap = link->snapshot();
-    const std::string identity = process_identity(snap);  // WP-45
+    // WP-45: which process this agent is (restart token, command line, creation time), determined once, when it has registered. Without
+    // a creation time the identity is not proven, and nothing kept for its pid by another agent can be given to it.
+    std::string identity;
+    bool identity_known = false;
+    if (!registered && snap.handshaken) {
+        const std::optional<std::uint64_t> created = host != nullptr && snap.pid != 0 ? host->creation_time(snap.pid) : std::nullopt;
+        identity = process_identity(snap, created);
+        identity_known = created.has_value();
+    }
     // The modules that should have state: enabled and loaded, with the address the agent reports.
     std::map<std::string, LoadedModule> desired;
     for (const std::string& enabled : snap.enabled) {
@@ -261,11 +275,16 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
             return;
         }
         AgentEntry& entry = it->second;
-        // WP-45: carries kept for this pid by another process (its agent disconnected without the exit being seen, and the pid is in use
-        // again) are not for this one.
-        if (snap.handshaken) {
-            drop_carries_locked(snap.pid, &identity, "another process now has this pid");
+        // WP-45: when the agent registers, what other agents kept for its pid stays only if this is provably the same process (an agent
+        // that reconnected to it); a process that reuses the pid gets none of it.
+        if (!entry.registered && snap.handshaken) {
+            entry.registered = true;
+            entry.identity = identity;
+            entry.identity_known = identity_known;
+            check_carries_on_register_locked(snap.pid, agent_id, identity, identity_known);
         }
+        identity = entry.identity;
+        identity_known = entry.identity_known;
         // WP-45: a kept baseline of a disabled module whose image has gone since is not "live" any more: the next instance is a fresh
         // image that runs the original code, so the edits must be re-applied there.
         for (auto& c : carries_) {
@@ -328,6 +347,8 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
         carry.path = state->path;
         carry.snapshot = std::move(*left);
         carry.identity = identity;
+        carry.identity_known = identity_known;
+        carry.agent_id = agent_id;
     }
     const bool any_dropped = !dropped.empty();
     dropped.clear();  // joins their threads
@@ -454,15 +475,22 @@ void ReloadService::carry_to_late_module(std::uint64_t agent_id, std::uint32_t p
     {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto agent = agents_.find(agent_id);
-        std::string identity;
-        if (agent != agents_.end()) {
-            if (const auto m = agent->second.modules.find(key); m != agent->second.modules.end()) {
-                existing = m->second;
+        if (agent == agents_.end() || !agent->second.registered) {
+            // The agent is gone (or never registered): there is no process to keep the edits for. Said at info, so the loss is visible.
+            std::vector<std::string> names;
+            for (const auto& original : snapshot.originals) {
+                names.push_back(original.first);
             }
-            if (agent->second.link != nullptr) {
-                const LinkSnapshot snap = agent->second.link->snapshot();
-                identity = snap.handshaken ? process_identity(snap) : std::string();
-            }
+            CML_LOG(Info, "module %s in process %u: its agent is gone, so the session's edits of %s are not kept for it (they come back with the "
+                          "next edit of those files, or a restart)",
+                    module_path.c_str(), pid, file_list(names).c_str());
+            CML_LOG(Trace, "reenable: decision=drop-carry module=%s pid=%u reason=agent-gone origin=%s", module_path.c_str(), pid, origin.c_str());
+            return;
+        }
+        const std::string identity = agent->second.identity;
+        const bool identity_known = agent->second.identity_known;
+        if (const auto m = agent->second.modules.find(key); m != agent->second.modules.end()) {
+            existing = m->second;
         }
         if (!existing) {
             Carry& carry = carries_[InstanceKey{pid, key}];
@@ -475,6 +503,8 @@ void ReloadService::carry_to_late_module(std::uint64_t agent_id, std::uint32_t p
             carry.live_base = 0;
             carry.origin = origin;
             carry.identity = identity;
+            carry.identity_known = identity_known;
+            carry.agent_id = agent_id;
         }
     }
     if (!existing) {
@@ -517,16 +547,41 @@ std::vector<std::pair<std::string, BaselineSnapshot>> ReloadService::kept_baseli
     return out;
 }
 
-void ReloadService::drop_carries_locked(std::uint32_t pid, const std::string* only_other_than, const char* why) {
+void ReloadService::drop_carries_locked(std::uint32_t pid, const char* why) {
     for (auto c = carries_.begin(); c != carries_.end();) {
-        const bool drop = c->first.first == pid &&
-                          (only_other_than == nullptr || (!c->second.identity.empty() && c->second.identity != *only_other_than));
-        if (drop) {
+        if (c->first.first == pid) {
             CML_LOG(Trace, "reenable: decision=drop-carry module=%s pid=%u reason=%s", c->second.path.c_str(), pid, why);
             c = carries_.erase(c);
         } else {
             ++c;
         }
+    }
+}
+
+void ReloadService::check_carries_on_register_locked(std::uint32_t pid, std::uint64_t agent_id, const std::string& identity, bool identity_known) {
+    for (auto c = carries_.begin(); c != carries_.end();) {
+        if (c->first.first != pid || c->second.agent_id == agent_id) {
+            ++c;
+            continue;
+        }
+        // Kept only on a proven match: both creation times known and equal (with the token and the command line). An unproven match
+        // may be another program run with the same pid, whose image runs the original code: an adopted baseline would hide the edits.
+        const bool same = identity_known && c->second.identity_known && c->second.identity == identity;
+        if (same) {
+            CML_LOG(Trace, "reenable: decision=keep-carry module=%s pid=%u reason=same-process agent=%llu", c->second.path.c_str(), pid,
+                    static_cast<unsigned long long>(agent_id));
+            c->second.agent_id = agent_id;
+            ++c;
+            continue;
+        }
+        std::vector<std::string> names;
+        for (const auto& original : c->second.snapshot.originals) {
+            names.push_back(original.first);
+        }
+        CML_LOG(Info, "module %s: the session's edits of %s kept for process %u are dropped: the agent that registered with that pid is %s", c->second.path.c_str(),
+                file_list(names).c_str(), pid, identity_known && c->second.identity_known ? "another process" : "not provably the same process");
+        CML_LOG(Trace, "reenable: decision=drop-carry module=%s pid=%u reason=%s", c->second.path.c_str(), pid, identity_known && c->second.identity_known ? "other-process" : "identity-unproven");
+        c = carries_.erase(c);
     }
 }
 
