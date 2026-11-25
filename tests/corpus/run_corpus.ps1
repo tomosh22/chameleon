@@ -1,6 +1,6 @@
 # WP-26: runs Chameleon against one open-source project built with one compiler (docs/wp/WP-26.md).
 #
-#   pwsh tests/corpus/run_corpus.ps1 -Project raylib|imgui|godot -Compiler msvc|clang-cl `
+#   pwsh tests/corpus/run_corpus.ps1 -Project raylib|imgui|godot|jolt -Compiler msvc|clang-cl `
 #        -ChameleonBin <build>/bin -WorkDir <dir> [-CxxPath <full path of cl / clang-cl>] [-ReloadBudgetMsPerTu <ms>]
 #
 # Steps (each is a row of the pass/fail matrix, <WorkDir>/out-<project>-<compiler>/matrix.json):
@@ -10,6 +10,7 @@
 #   decode     cml_lde_probe: the hook installer's instruction-length decoder over every function entry of the PDB
 #   enable     broker + the application with the agent: module enabled, PDB index ready, frames printed
 #   edit:<id>  one edit of project.json, `reload`, the change is observable, the application keeps running
+#              (`entry_vex`, WP-41: first the named function's entry in the built image must start with a VEX/EVEX prefix)
 #   refused:<id>  the deliberately unsupported edit is refused with its diagnostic and the application keeps running
 #   reload-budget (WP-39, only with -ReloadBudgetMsPerTu): every accepted reload took at most that many ms of
 #              `total - compile` per recompiled translation unit. Every cell prints the stage timings of each accepted
@@ -18,7 +19,7 @@
 # Exit code 1 when a step failed (an `expected_failure` of project.json is asserted and counts as passed).
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet('raylib', 'imgui', 'godot')][string]$Project,
+    [Parameter(Mandatory)][ValidateSet('raylib', 'imgui', 'godot', 'jolt')][string]$Project,
     [Parameter(Mandatory)][ValidateSet('msvc', 'clang-cl')][string]$Compiler,
     [Parameter(Mandatory)][string]$ChameleonBin,
     [Parameter(Mandatory)][string]$WorkDir,
@@ -302,6 +303,31 @@ function Restore-File([string]$Path) {
     }
 }
 
+# WP-41: an edit with `entry_vex` names a function (a substring of exactly one decorated public of the PDB) whose first
+# instruction in the built image must carry a VEX or EVEX prefix (C4, C5, 62), so that the edit hooks a VEX entry. Read from
+# the image file before the edit, not assumed from the source.
+function Assert-EntryVex([string]$Name) {
+    $hits = @(& (Join-Path $ChameleonBin 'cml_pdb_dump.exe') $script:ExePath --publics $Name | ForEach-Object { [string]$_ } | Where-Object { $_ -match ' rva=\d+ ' })
+    if ($hits.Count -ne 1) { throw "entry_vex ${Name}: $($hits.Count) publics with an RVA match, expected 1: $($hits -join '; ')" }
+    $rva = [uint32]([regex]::Match($hits[0], ' rva=(\d+) ').Groups[1].Value)
+    $img = [System.IO.File]::ReadAllBytes($script:ExePath)
+    $pe = [BitConverter]::ToInt32($img, 0x3c)
+    $sections = [BitConverter]::ToUInt16($img, $pe + 6)
+    $table = $pe + 24 + [BitConverter]::ToUInt16($img, $pe + 20)
+    for ($i = 0; $i -lt $sections; $i++) {
+        $h = $table + 40 * $i
+        $va = [BitConverter]::ToUInt32($img, $h + 12)
+        $rawSize = [BitConverter]::ToUInt32($img, $h + 16)
+        if ($rva -ge $va -and $rva -lt $va + $rawSize) {
+            $at = [BitConverter]::ToUInt32($img, $h + 20) + ($rva - $va)
+            $bytes = (@($img[$at..($at + 7)]) | ForEach-Object { $_.ToString('x2') }) -join ' '
+            if (@(0xC4, 0xC5, 0x62) -notcontains $img[$at]) { throw ("entry_vex {0}: the entry at rva 0x{1:x} starts with {2}, not with a VEX/EVEX prefix ({3})" -f $Name, $rva, $bytes, $hits[0]) }
+            return ("entry of {0} at rva 0x{1:x} starts with a VEX/EVEX instruction: {2}" -f $Name, $rva, $bytes)
+        }
+    }
+    throw ("entry_vex {0}: rva 0x{1:x} lies in no section of the image" -f $Name, $rva)
+}
+
 function Apply-Edit($edit) {
     $path = Join-Path $src $edit.file
     if (-not (Test-Path $path)) { throw "edit $($edit.id): $($edit.file) does not exist" }
@@ -394,6 +420,8 @@ if ($built) {
                     if ($script:App.HasExited) { throw "the application had already exited (code $($script:App.ExitCode))" }
                     $editPath = Join-Path $src $edit.file
                     $keep = $false   # a refused or failed edit is undone, or every later reload would retry it
+                    $vexNote = ''
+                    if ($edit.entry_vex) { $vexNote = Assert-EntryVex ([string]$edit.entry_vex); Write-Host $vexNote }   # WP-41, before the edit
                     Apply-Edit $edit
                     try {
                     $from = (Get-CorpusLines).Count
@@ -422,7 +450,7 @@ if ($built) {
                         $line = Wait-Corpus $edit.expect $from $cfg.observe_timeout_s
                         Add-ReloadTiming $edit.id $r.result   # WP-39: the stages of this reload; throws on a missing stage
                         $t = $r.result.timing_ms
-                        "reload {0:N1}s wall, total {1} ms (compile {2}, link {3}, load {4}, hooks {5}); patched={6} hooks={7}; observed: {8}" -f $wall, $t.total, $t.compile, $t.link, $t.load, $t.hooks, $r.result.patched, $r.result.hooks_installed, $line
+                        "reload {0:N1}s wall, total {1} ms (compile {2}, link {3}, load {4}, hooks {5}); patched={6} hooks={7}; observed: {8}{9}" -f $wall, $t.total, $t.compile, $t.link, $t.load, $t.hooks, $r.result.patched, $r.result.hooks_installed, $line, $(if ($vexNote) { "; $vexNote" } else { '' })
                     }
                     } finally {
                         if (-not $keep) { Restore-File $editPath }

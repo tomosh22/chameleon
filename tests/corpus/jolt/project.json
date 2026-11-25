@@ -1,0 +1,138 @@
+{
+  "name": "jolt",
+  "repo": "https://github.com/jrouwe/JoltPhysics.git",
+  "tag": "v5.7.0",
+  "commit": "cf16769bb0ede9c45d57d06068ff0689e9702f5c",
+  "license": "MIT (HelloWorld/HelloWorld.cpp: CC0-1.0)",
+  "support_dir": ".",
+  "patch": "chameleon.patch",
+  "args": [],
+  "env": {},
+  "edits": [
+    {
+      "id": "app-function",
+      "file": "HelloWorld/HelloWorld.cpp",
+      "replace": [
+        {
+          "find": "\tg_CmlCorpusAppFrames = g_CmlCorpusAppFrames + 1;\n}",
+          "with": "\tcml_corpus_marker(\"jolt_app_frame_v2\");\n\tg_CmlCorpusAppFrames = g_CmlCorpusAppFrames + 1;\n}"
+        }
+      ],
+      "expect": "markers=\\S*jolt_app_frame_v2:\\d+"
+    },
+    {
+      "id": "vex-entry",
+      "file": "HelloWorld/HelloWorld.cpp",
+      "entry_vex": "CmlCorpusVexScale",
+      "replace": [
+        {
+          "find": "CML_CORPUS_NOINLINE void CmlCorpusVexScale(float *ioValues, float inScale)\n{\n",
+          "with": "CML_CORPUS_NOINLINE void CmlCorpusVexScale(float *ioValues, float inScale)\n{\n\tcml_corpus_marker(\"jolt_vex_scale_v2\");\n"
+        }
+      ],
+      "expect": "markers=\\S*jolt_vex_scale_v2:\\d+"
+    },
+    {
+      "id": "header-inline-support",
+      "file": "chameleon_corpus.h",
+      "replace": [
+        {
+          "find": "    return 1;",
+          "with": "    return 2;"
+        }
+      ],
+      "expect": "inline=2 "
+    },
+    {
+      "id": "template-support",
+      "file": "chameleon_corpus.h",
+      "replace": [
+        {
+          "find": "static_cast<T>(2)",
+          "with": "static_cast<T>(3)"
+        }
+      ],
+      "expect": "tmpl=64 "
+    },
+    {
+      "id": "library-unity-physics-system",
+      "file": "Jolt/Physics/PhysicsSystem.cpp",
+      "replace": [
+        {
+          "find": "EPhysicsUpdateError PhysicsSystem::Update(float inDeltaTime, int inCollisionSteps, TempAllocator *inTempAllocator, JobSystem *inJobSystem)\n{\n",
+          "with": "EPhysicsUpdateError PhysicsSystem::Update(float inDeltaTime, int inCollisionSteps, TempAllocator *inTempAllocator, JobSystem *inJobSystem)\n{\n\tcml_corpus_marker(\"jolt_physics_update_v2\");\n"
+        }
+      ],
+      "include": "chameleon_corpus.h",
+      "include_anchor": "#include <Jolt/Physics/PhysicsSystem.h>",
+      "expect": "markers=\\S*jolt_physics_update_v2:\\d+"
+    },
+    {
+      "id": "library-unity-body-interface",
+      "file": "Jolt/Physics/Body/BodyInterface.cpp",
+      "replace": [
+        {
+          "find": "bool BodyInterface::IsActive(const BodyID &inBodyID) const\n{\n",
+          "with": "bool BodyInterface::IsActive(const BodyID &inBodyID) const\n{\n\tcml_corpus_marker(\"jolt_body_is_active_v2\");\n"
+        }
+      ],
+      "include": "chameleon_corpus.h",
+      "include_anchor": "#include <Jolt/Physics/Body/BodyInterface.h>",
+      "expect": "markers=\\S*jolt_body_is_active_v2:\\d+"
+    },
+    {
+      "id": "header-fanout-update-context",
+      "file": "Jolt/Physics/PhysicsUpdateContext.h",
+      "replace": [
+        {
+          "find": "{ const int max_concurrency = PhysicsUpdateContext::cMaxConcurrency;",
+          "with": "{ cml_corpus_marker(\"jolt_max_concurrency_v2\"); const int max_concurrency = PhysicsUpdateContext::cMaxConcurrency;"
+        }
+      ],
+      "include": "chameleon_corpus.h",
+      "include_anchor": "#include <Jolt/Physics/Body/BodyPair.h>",
+      "expect": "markers=\\S*jolt_max_concurrency_v2:\\d+"
+    },
+    {
+      "id": "header-fanout-template-reference",
+      "file": "Jolt/Core/Reference.h",
+      "replace": [
+        {
+          "find": "\tinline void\t\t\t\tAddRef() const\n\t{\n",
+          "with": "\tinline void\t\t\t\tAddRef() const\n\t{\n\t\tcml_corpus_marker(\"jolt_ref_add_ref_v2\");\n"
+        }
+      ],
+      "include": "chameleon_corpus.h",
+      "include_anchor": "#include <Jolt/Core/Atomics.h>",
+      "expect": "markers=\\S*jolt_ref_add_ref_v2:\\d+"
+    },
+    {
+      "id": "unsupported-new-thread-local",
+      "file": "HelloWorld/HelloWorld.cpp",
+      "replace": [
+        {
+          "find": "static void TraceImpl(const char *inFMT, ...)\n{\n",
+          "with": "static void TraceImpl(const char *inFMT, ...)\n{\n\tstatic thread_local int cml_corpus_tls = 0;\n\tcml_corpus_tls++;\n"
+        }
+      ],
+      "expect_error": "CML3400"
+    },
+    {
+      "id": "precompiled-header-vec4",
+      "file": "Jolt/Math/Vec4.inl",
+      "replace": [
+        {
+          "find": "JPH_NAMESPACE_BEGIN\n",
+          "with": "JPH_NAMESPACE_BEGIN\n\n// Chameleon corpus (WP-41): an edit of a header of the precompiled header Jolt/Jolt.h\n"
+        }
+      ],
+      "expect_error": "CML5550"
+    }
+  ],
+  "reload_timeout_s": 1200,
+  "observe_timeout_s": 60,
+  "start_timeout_s": 90,
+  "index_timeout_s": 300,
+  "min_functions": 3000,
+  "expected_failures": []
+}

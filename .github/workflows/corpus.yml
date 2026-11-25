@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'run one project only (raylib, imgui, godot); empty or all runs every cell'
+        description: 'run one project only (raylib, imgui, godot, jolt); empty or all runs every cell'
         required: false
         default: 'all'
   pull_request:
@@ -51,7 +51,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           ONLY: ${{ inputs.only }}
         run: |
-          cells='[{"project":"raylib","compiler":"msvc"},{"project":"raylib","compiler":"clang-cl"},{"project":"imgui","compiler":"msvc"},{"project":"imgui","compiler":"clang-cl"},{"project":"godot","compiler":"msvc"}]'
+          cells='[{"project":"raylib","compiler":"msvc"},{"project":"raylib","compiler":"clang-cl"},{"project":"imgui","compiler":"msvc"},{"project":"imgui","compiler":"clang-cl"},{"project":"godot","compiler":"msvc"},{"project":"jolt","compiler":"msvc"},{"project":"jolt","compiler":"clang-cl"}]'
           if [ "$EVENT" = "push" ]; then
             cells=$(echo "$cells" | jq -c 'map(select(.project != "godot"))')
           elif [ -n "$ONLY" ] && [ "$ONLY" != "all" ]; then
