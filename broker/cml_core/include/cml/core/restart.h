@@ -75,7 +75,12 @@ public:
     virtual Result<void> terminate(std::uint32_t timeout_ms) = 0;
     // Starts the new process; returns its pid. The standard handles of the old process are handed on. WP-43: may be called again after
     // it failed (the broker tries twice); what it needs (the copied handles) is kept until it succeeds or the object is destroyed.
+    // A failure must not leave a process behind: if the attempt created one and a later step of it failed, the host terminates that
+    // process before it returns the failure, and relaunch_created_process() says so; the broker then does NOT try again (it never starts
+    // a second copy of the application).
     virtual Result<std::uint32_t> relaunch(const RelaunchSpec& spec) = 0;
+    // WP-43: after a failed relaunch(): whether that attempt had created a process (which it terminated). False: no process existed.
+    virtual bool relaunch_created_process() const { return false; }
     // The exit code of the relaunched process once it has exited.
     virtual std::optional<std::uint32_t> relaunched_exit_code() = 0;
     // WP-34: lets a process that relaunch() created suspended (spec.suspended) run. Calling it again, or for a process that was
@@ -160,6 +165,9 @@ public:
     void set_relaunch_retry_delay_for_testing(std::chrono::milliseconds delay) { relaunch_retry_delay_ = delay; }
     // WP-43: whether a restart that did not finish its work in process `pid` is remembered for it (tests).
     bool has_unfinished_for_testing(std::uint32_t pid);
+    // WP-43: the agent of process `pid` disconnected (the process exited, or its agent was destroyed): what an unfinished restart left
+    // for that pid is dropped, so it can never apply to another process that gets the same pid later.
+    void process_gone(std::uint32_t pid);
     // WP-43: a `restart-resume` for held process `pid` has been received and is waiting for the restart thread (tests).
     bool resume_requested_for_testing(std::uint32_t pid);
 
@@ -171,6 +179,7 @@ private:
     };
     // WP-43: what a restart could not do in its new process: modules it did not enable again, baselines it did not restore.
     struct Unfinished {
+        std::string token;  // CML_RESTART_TOKEN of the process it is for: a process with the same pid but another token is another process
         std::vector<ipc::RestartModule> modules;
         std::vector<Carried> carried;
     };

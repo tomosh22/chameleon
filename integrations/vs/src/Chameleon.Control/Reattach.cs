@@ -375,6 +375,13 @@ namespace Chameleon.Control
                 {
                     _log("reattach: the broker had resumed pid " + newPid + " already (" + answer.Error.Message + ")");   // its hold time passed first: harmless
                 }
+                else if (answer.Error != null && answer.Error.Id == "CML5820")
+                {
+                    // WP-43 (R-40): the broker took the request but did not confirm the resume in time (an older broker says CML5817 for this,
+                    // which the branch below reports as a failed resume, as before). Nothing is known to have failed.
+                    _log("reattach: the broker did not confirm in time that pid " + newPid + " runs: " + answer.Error.ToString());
+                    ReportRestartProblem(oldPid, newPid, ClientDiagnostics.ResumeUnconfirmed(newPid, answer.Error.Message, _settings.RestartHoldMs));
+                }
                 else
                 {
                     _log("reattach: restart-resume for pid " + newPid + " was refused: " + (answer.Error != null ? answer.Error.ToString() : "no detail"));

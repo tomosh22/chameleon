@@ -182,12 +182,14 @@ public:
     Result<std::uint32_t> relaunch(const RelaunchSpec& spec) override;
     std::optional<std::uint32_t> relaunched_exit_code() override;
     Result<void> resume() override;  // WP-34
+    bool relaunch_created_process() const override { return created_on_failure_; }  // WP-43
 
 private:
     Rig& rig_;
     bool suspended_ = false;  // created suspended and not resumed yet: the new process has not "run" (it does not register)
     RelaunchSpec spec_;
     std::uint32_t pid_ = 0;   // WP-43: the pid relaunch() handed out (200, then 201, ... for chained restarts)
+    bool created_on_failure_ = false;  // WP-43: the last failed relaunch() had created a process (and terminated it)
 };
 
 class FakeHost final : public ProcessHost {
@@ -231,7 +233,8 @@ struct Rig {
     std::vector<ipc::RestartModule> reported_modules{{1, kExe}, {1, kDll}};
     // WP-43
     bool refused_after_hooks = false;       // with prepare_status: the refusal says the hooks ran (stage pre-restart-hooks)
-    int fail_launch_times = 0;              // the first N relaunch() calls fail (the broker tries twice)
+    int fail_launch_times = 0;              // the first N relaunch() calls fail before a process exists (the broker tries twice)
+    bool fail_launch_after_create = false;  // the first relaunch() creates the process, a later step fails, the host terminates it
     int launch_calls = 0;
     int resume_delay_ms = 0;                // resume() takes this long (the restart thread confirms late)
     std::atomic<std::uint32_t> next_pid{200};  // the pid of the next relaunched process
@@ -410,8 +413,14 @@ Result<void> FakeProcess::terminate(std::uint32_t) {
 Result<std::uint32_t> FakeProcess::relaunch(const RelaunchSpec& spec) {
     rig_.note(spec.suspended ? "relaunch suspended" : "relaunch");
     ++rig_.launch_calls;
+    created_on_failure_ = false;
     if (rig_.fail_launch || rig_.launch_calls <= rig_.fail_launch_times) {
         return Diag::make(restart::diag::kLaunchFailed, "CreateProcessW failed", "x");
+    }
+    if (rig_.fail_launch_after_create && rig_.launch_calls == 1) {
+        rig_.note("terminate created");  // what a host does when a step after CreateProcess fails: no process is left behind
+        created_on_failure_ = true;
+        return Diag::make(restart::diag::kLaunchFailed, "a step after CreateProcessW failed", "x");
     }
     {
         std::lock_guard<std::mutex> lock(rig_.mutex);
@@ -1690,4 +1699,51 @@ TEST_CASE("restart injection: an armed stage fires only for the pid it was armed
     }
     CHECK(restart_group == std::vector<std::string>{"pre-restart-hooks", "restart-terminate", "restart-relaunch", "restart-hold", "restart-registration",
                                                      "restart-reenable", "restart-reapply"});
+}
+
+// ---- WP-43: what is retried, and what an unfinished restart's record applies to --------------------------------------------------
+
+TEST_CASE("restart: an attempt that created the new process and then failed is never repeated (no second copy)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.service.restart_coordinator_for_testing()->set_relaunch_retry_delay_for_testing(std::chrono::milliseconds(1));
+    rig.fail_launch_after_create = true;
+    Result<Value> result = rig.service.restart(args_for(100, 10000));
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().code == restart::diag::kLaunchFailed);
+    CHECK(result.error().message.find("no second attempt") != std::string::npos);
+    CHECK(rig.launch_calls == 1);                      // retried only when no process was created (see the CML5822 test)
+    CHECK(logged_contains(rig, "terminate created"));  // the host did not leave the created process behind
+    CHECK_FALSE(has_warning(rig, "CML5822"));
+}
+
+TEST_CASE("restart: an unfinished restart's record is dropped when that process's agent disconnects (exit, DestroyAgent)") {
+    QuietLogs quiet;
+    Rig rig;
+    REQUIRE(rig.service.faults().arm(ipc::fault::Stage::RestartRegistration, 1, std::nullopt).has_value());
+    REQUIRE_FALSE(rig.service.restart(args_for(100, 10000)).has_value());
+    REQUIRE(wait_until([&] { return rig.service.link_for_pid(200) != nullptr; }));
+    CHECK(rig.service.restart_coordinator_for_testing()->has_unfinished_for_testing(200));
+    rig.service.detach(rig.service.link_for_pid(200)->agent_id());  // what the connection server does when the pipe ends
+    CHECK_FALSE(rig.service.restart_coordinator_for_testing()->has_unfinished_for_testing(200));
+}
+
+TEST_CASE("restart: an unfinished restart's record never applies to another process with the same pid (another restart token)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.new_registers = false;  // the process the restart started never registers (it exits, say) ...
+    Result<Value> result = rig.service.restart(args_for(100, 10000, 200));
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().code == restart::diag::kNoRegistration);
+    CHECK(rig.service.restart_coordinator_for_testing()->has_unfinished_for_testing(200));
+    // ... and an unrelated process gets pid 200 and registers without that restart's token.
+    SimAgent stranger(rig.service, 40);
+    stranger.on_request = [&](const ipc::Message& m) { rig.new_handles(stranger, m); };
+    stranger.register_process(200, "", {kExe, kDll, kOther}, {kExe});
+    rig.new_registers = true;
+    Result<Value> again = rig.service.restart(args_for(200, 10000));
+    REQUIRE_MESSAGE(again.has_value(), again.error().format());
+    CHECK_FALSE(rig.service.restart_coordinator_for_testing()->has_unfinished_for_testing(200));
+    std::lock_guard<std::mutex> lock(rig.mutex);
+    CHECK(rig.reenabled.empty());  // plugin.dll of the earlier restart was not asked for in the stranger's restart
 }

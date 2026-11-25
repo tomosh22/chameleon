@@ -602,6 +602,25 @@ namespace Chameleon.Control.Tests
         }
 
         [Fact]
+        public async Task AnUnconfirmedResumeOfANewerBrokerIsReportedAsSuchAndAnOlderBrokersCml5817AsAFailedResume()
+        {
+            var rig = new Rig();
+            var unconfirmed = new ControlResponse { Ok = false, Error = new BrokerError { Id = "CML5820", Message = "the restart did not confirm within 10000 ms that process 200 runs", Action = "x" } };
+            await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume(unconfirmed));
+            ChameleonDiagnostic d = Assert.Single(rig.Reported);
+            Assert.Equal("CML5997", d.Id);
+            Assert.Contains("did not confirm in time", d.Message);
+            Assert.Contains("still requested", d.Action);
+
+            var older = new Rig();   // a broker from before WP-43 answers the same situation with CML5817
+            var failed = new ControlResponse { Ok = false, Error = new BrokerError { Id = "CML5817", Message = "the restart did not confirm within 10 s that process 200 runs", Action = "x" } };
+            await older.Coordinator.OnRestartingAsync(100, 200, older.Resume(failed));
+            ChameleonDiagnostic e = Assert.Single(older.Reported);
+            Assert.Equal("CML5997", e.Id);
+            Assert.Contains("CML5817", e.Message);
+        }
+
+        [Fact]
         public void OnlyARestartThisExtensionAskedToHoldIsClaimedByItsToken()
         {
             var rig = new Rig();

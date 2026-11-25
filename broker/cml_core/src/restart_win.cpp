@@ -115,6 +115,11 @@ public:
         return Result<void>();
     }
 
+    // WP-43: every failure this returns happens BEFORE CreateProcessW created a process (attribute list, CreateProcessW itself), so
+    // relaunch_created_process() stays false and the broker may try again. Once CreateProcessW succeeded nothing here can fail (the
+    // watchdog is optional and only logged).
+    bool relaunch_created_process() const override { return false; }
+
     Result<std::uint32_t> relaunch(const RelaunchSpec& spec) override {
         const auto fail = [](const std::string& why) {
             return Diag::make(rd::kLaunchFailed, why, "Check that the image still exists and can be started.");

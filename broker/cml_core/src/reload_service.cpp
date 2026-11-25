@@ -133,6 +133,7 @@ void ReloadService::attach(std::shared_ptr<AgentLink> link) {
 
 void ReloadService::detach(std::uint64_t agent_id) {
     AgentEntry entry;
+    std::shared_ptr<RestartCoordinator> coordinator;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto it = agents_.find(agent_id);
@@ -141,6 +142,14 @@ void ReloadService::detach(std::uint64_t agent_id) {
         }
         entry = std::move(it->second);
         agents_.erase(it);
+        coordinator = restart_;
+    }
+    // WP-43: an unfinished restart's record for this process must not outlive it (its pid may be reused).
+    if (coordinator != nullptr && entry.link != nullptr) {
+        const LinkSnapshot snap = entry.link->snapshot();
+        if (snap.handshaken && snap.pid != 0) {
+            coordinator->process_gone(snap.pid);
+        }
     }
     entry.modules.clear();  // index threads are joined here, outside the lock
     rearm_save_watcher();

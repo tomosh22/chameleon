@@ -176,6 +176,13 @@ bool RestartCoordinator::resume_requested_for_testing(std::uint32_t pid) {
     return hold->release_requested;
 }
 
+void RestartCoordinator::process_gone(std::uint32_t pid) {
+    if (has_unfinished_for_testing(pid)) {
+        CML_LOG(Info, "restart: process %u is gone; what its unfinished restart left is dropped", pid);
+    }
+    forget_unfinished(pid);
+}
+
 bool RestartCoordinator::has_unfinished_for_testing(std::uint32_t pid) {
     std::lock_guard<std::mutex> lock(unfinished_mutex_);
     return unfinished_.find(pid) != unfinished_.end();
@@ -365,6 +372,13 @@ Result<Value> RestartCoordinator::restart(const Value& args, const std::function
     // done now: those modules are enabled again in the new process and their baselines go along with this restart's.
     // A copy: it is forgotten only once the old process is gone (a restart refused before that leaves it for the next one).
     std::optional<Unfinished> unfinished = peek_unfinished(old_pid);
+    if (unfinished && unfinished->token != old_snap.restart_token) {
+        // The pid was reused by another process (the record is dropped when its agent disconnects; this catches a process that exited
+        // before it ever registered).
+        CML_LOG(Info, "restart: process %u is not the one an unfinished restart started (another restart token); its record is dropped", old_pid);
+        forget_unfinished(old_pid);
+        unfinished.reset();
+    }
     if (unfinished) {
         for (const ipc::RestartModule& m : unfinished->modules) {
             const bool listed = std::any_of(modules.begin(), modules.end(), [&](const ipc::RestartModule& have) { return path::same_path(have.path, m.path); });
@@ -435,6 +449,7 @@ Result<Value> RestartCoordinator::restart(const Value& args, const std::function
     // What a restart that ends after the old process is gone hands to the next restart of the new one.
     const auto unfinished_for = [&](const std::vector<ipc::RestartModule>& not_done) {
         Unfinished u;
+        u.token = token;
         u.modules = not_done;
         for (const Carried& c : carried) {
             const bool affected = std::any_of(not_done.begin(), not_done.end(), [&](const ipc::RestartModule& m) {
@@ -487,7 +502,16 @@ Result<Value> RestartCoordinator::restart(const Value& args, const std::function
             first_attempt = attempt.error();
         }
     }
+    if (!launched && process->relaunch_created_process()) {
+        // The attempt had created a process and a later step of it failed; the host terminated it. Never start a second copy.
+        return fail(Diag::make(rd::kLaunchFailed,
+                               "process " + std::to_string(old_pid) + " was terminated; the new one was created but could not be started (" + first_attempt->message +
+                                   "), so it was terminated and no second attempt is made",
+                               "Start the application yourself; its agent registers again by itself."),
+                    old_pid);
+    }
     if (!launched) {
+        // No process exists (CreateProcess failed, or the injected failure took the place of the attempt): try once more.
         if (first_attempt->code == ipc::fault::ids::kRestartRelaunch) {
             first_attempt->message += "; process " + std::to_string(old_pid) + " is gone, trying once more to start the new one";
             warn(*first_attempt, old_pid);
