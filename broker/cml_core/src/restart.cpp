@@ -193,11 +193,6 @@ void RestartCoordinator::process_gone(std::uint32_t pid, std::optional<bool> exi
     forget_unfinished(pid);
 }
 
-std::optional<std::uint64_t> RestartCoordinator::process_creation_time(std::uint32_t pid) const {
-    const std::shared_ptr<ProcessHost> h = host();
-    return h != nullptr ? h->creation_time(pid) : std::nullopt;
-}
-
 bool RestartCoordinator::process_exited(std::uint32_t pid) {
     const std::shared_ptr<ProcessHost> h = host();
     bool exited = h != nullptr && h->has_exited(pid);
@@ -237,7 +232,9 @@ Result<Value> RestartCoordinator::restart(const Value& args, const std::function
     // arrives meanwhile is refused busy (CML5304).
     // R-51: the locks are taken here, under the failure-injection gate (an inject-failure that is arming waits for it, or sees this
     // restart as running), and held until finish_injection below has run, so no arming can slip in while this restart cleans up.
+#if defined(CML_FAULT_INJECTION)
     std::unique_lock<std::mutex> gate(service_.faults().gate());
+#endif
     std::unique_lock<std::mutex> only_one(mutex_, std::try_to_lock);
     std::unique_ptr<ExclusiveRun> no_reloads = service_.lock_reloads();  // the run lock of reloads and reverts (shows as running)
     const bool locked = only_one.owns_lock() && no_reloads != nullptr;
@@ -245,7 +242,9 @@ Result<Value> RestartCoordinator::restart(const Value& args, const std::function
     if (locked) {
         active_scope.emplace(active_);
     }
+#if defined(CML_FAULT_INJECTION)
     gate.unlock();
+#endif
 
     std::uint32_t ran_for = 0;
     bool terminated = false;

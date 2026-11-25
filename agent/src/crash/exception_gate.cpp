@@ -206,6 +206,7 @@ LONG ExceptionGate::on_exception(PEXCEPTION_POINTERS info) {
     }
     // WP-44: the stage exception-hold. A fault this handler would hold is passed on, as when every slot is taken: one lock-free
     // decrement of a constant-initialised counter and one atomic increment (no allocation, no lock, no log); the agent thread reports it.
+#if defined(CML_FAULT_INJECTION)
     if (fault::consume(ipc::fault::Stage::ExceptionHold)) {
         injected_passes_.fetch_add(1, std::memory_order_acq_rel);
         if (const HANDLE notify = notify_.load(std::memory_order_acquire)) {
@@ -213,6 +214,7 @@ LONG ExceptionGate::on_exception(PEXCEPTION_POINTERS info) {
         }
         return EXCEPTION_CONTINUE_SEARCH;
     }
+#endif
     Slot* slot = claim_slot();
     if (slot == nullptr) {
         overflow_.fetch_add(1, std::memory_order_acq_rel);
@@ -331,6 +333,7 @@ namespace {
 
 // WP-44: the stages exception-continue, exception-leave and exception-reexecute. Asked once the thread is claimed (so only an action for a
 // held thread uses an arming up); the caller gives the claim back, so the thread stays held.
+#if defined(CML_FAULT_INJECTION)
 std::optional<Diag> injected_action_failure(Action action) {
     ipc::fault::Stage stage = ipc::fault::Stage::Count;
     switch (action) {
@@ -346,6 +349,7 @@ std::optional<Diag> injected_action_failure(Action action) {
     return Diag::make(info.diag_id, std::string("injected failure at the stage '") + info.name + "' (" + info.where + ")",
                       "This failure was requested with the control command inject-failure; send the action again: without it the action is carried out.");
 }
+#endif
 
 }  // namespace
 
@@ -355,10 +359,12 @@ Result<void> ExceptionGate::resolve(std::uint32_t id, Action action) {
         return Diag::make(ids::kUnknownException, "no thread is held for exception " + std::to_string(id),
                           "It was answered already, or its process went through a reconnect; query `exceptions` for the open ones.");
     }
+#if defined(CML_FAULT_INJECTION)
     if (std::optional<Diag> injected = injected_action_failure(action)) {
         finish_claim(slot, static_cast<std::int32_t>(Action::None));  // the thread stays held
         return *injected;
     }
+#endif
     if (action == Action::Leave) {
         Result<void> left = compute_leave(slot->context, &slot->out_context, slot->stack_low, slot->stack_high);
         if (!left) {
@@ -376,10 +382,12 @@ Result<void> ExceptionGate::resolve_reexecute(std::uint32_t id, const ReexecuteP
         return Diag::make(ids::kUnknownException, "no thread is held for exception " + std::to_string(id),
                           "It was answered already, or its process went through a reconnect; query `exceptions` for the open ones.");
     }
+#if defined(CML_FAULT_INJECTION)
     if (std::optional<Diag> injected = injected_action_failure(Action::Reexecute)) {
         finish_claim(slot, static_cast<std::int32_t>(Action::None));  // the thread stays held
         return *injected;
     }
+#endif
     Result<void> built = compute_reexecute(slot->context, plan, &slot->out_context, slot->stack_low, slot->stack_high);
     if (!built) {
         finish_claim(slot, static_cast<std::int32_t>(Action::None));  // the thread stays held

@@ -159,10 +159,12 @@ bool Agent::flush_exceptions(ipc::PipeConnection& connection) {
     if (overflow != 0) {
         CML_LOG(Warn, "CML%u: %u faults found no free crash-handler slot and were passed on", crash::ids::kSlotsFull, overflow);
     }
+#if defined(CML_FAULT_INJECTION)
     if (const std::uint32_t injected = gate.take_injected_count(); injected != 0) {
         CML_LOG(Warn, "CML%u: injected failure at the stage 'exception-hold': %u fault(s) were passed on instead of held (the application's own handler or "
                 "the system saw them)", ipc::fault::ids::kAgentExceptionHold, injected);
     }
+#endif
     crash::Held held;
     while (gate.take_new(&held)) {
         ipc::Exception message;

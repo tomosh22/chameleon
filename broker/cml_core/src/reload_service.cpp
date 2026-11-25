@@ -142,7 +142,6 @@ void ReloadService::detach(std::uint64_t agent_id) {
         }
         entry = std::move(it->second);
         agents_.erase(it);
-        identity_checked_.erase(agent_id);  // WP-44
         coordinator = restart_;
     }
     // WP-43: an unfinished restart's record for this process must not outlive it (its pid may be reused). R-51: neither must what
@@ -153,12 +152,14 @@ void ReloadService::detach(std::uint64_t agent_id) {
         const LinkSnapshot snap = entry.link->snapshot();
         if (snap.handshaken && snap.pid != 0) {
             std::optional<bool> exited;
+#if defined(CML_FAULT_INJECTION)
             if (coordinator != nullptr && !cancel_.cancelled() && faults_.has_process_records(snap.pid)) {
                 exited = coordinator->process_exited(snap.pid);
                 if (*exited) {
                     faults_.forget_process(snap.pid);
                 }
             }
+#endif
             if (coordinator != nullptr) {
                 coordinator->process_gone(snap.pid, exited);
             }
@@ -168,40 +169,16 @@ void ReloadService::detach(std::uint64_t agent_id) {
     rearm_save_watcher();
 }
 
-std::optional<std::uint64_t> ReloadService::process_creation_time(std::uint32_t pid) const {
+#if defined(CML_FAULT_INJECTION)
+bool ReloadService::process_exited(std::uint32_t pid) {
     std::shared_ptr<RestartCoordinator> coordinator;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         coordinator = restart_;
     }
-    return coordinator != nullptr ? coordinator->process_creation_time(pid) : std::nullopt;
+    return coordinator != nullptr && coordinator->process_exited(pid);
 }
-
-void ReloadService::check_injection_identity(std::uint64_t agent_id, const LinkSnapshot& snap) {
-    // WP-44 (R-51): records kept for a pid whose process was never seen to exit (a slow exit, a broker that stopped) must not apply to a
-    // new process that got the same pid. Once per connection, when its agent has registered: the records stay only if they were made for
-    // a process with this creation time.
-    if (!snap.handshaken || snap.pid == 0) {
-        return;
-    }
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!identity_checked_.insert(agent_id).second) {
-            return;
-        }
-    }
-    if (!faults_.has_process_records(snap.pid)) {
-        return;
-    }
-    const std::optional<std::uint64_t> created = process_creation_time(snap.pid);
-    if (faults_.records_belong_to(snap.pid, created)) {
-        CML_LOG(Trace, "failure injection: process %u registered again; its records are its own (same creation time)", snap.pid);
-        return;
-    }
-    CML_LOG(Info, "failure injection: process %u registered, and the records kept for that pid %s; they are dropped", snap.pid,
-            created ? "were made for another process (another creation time)" : "cannot be matched to it (its creation time cannot be read)");
-    faults_.forget_process(snap.pid);
-}
+#endif
 
 void ReloadService::on_session_changed(std::uint64_t agent_id) {
     std::shared_ptr<AgentLink> link;
@@ -216,7 +193,6 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
         options = options_;
     }
     const LinkSnapshot snap = link->snapshot();
-    check_injection_identity(agent_id, snap);  // WP-44
     // The modules that should have state: enabled and loaded, with the address the agent reports.
     std::map<std::string, LoadedModule> desired;
     for (const std::string& enabled : snap.enabled) {
@@ -702,10 +678,14 @@ Result<Value> ReloadService::revert(const Value& args) {
     // A revert and a reload never overlap: both change the hooks and the broker's per-module patch list. R-51: the run lock is taken
     // here, under the failure-injection gate, and held until finish_injection below has run (an inject-failure sees the revert running
     // until then); revert_impl refuses busy after checking its arguments when it could not be taken.
+#if defined(CML_FAULT_INJECTION)
     std::unique_lock<std::mutex> gate(faults_.gate());
+#endif
     std::optional<ExclusiveRun> exclusive;
     exclusive.emplace(reload_mutex_, running_);
+#if defined(CML_FAULT_INJECTION)
     gate.unlock();
+#endif
     std::vector<std::uint32_t> pids;
     std::map<std::uint32_t, std::string> outcomes;
     Result<Value> result = revert_impl(args, exclusive->acquired(), &pids, &outcomes);
@@ -917,7 +897,9 @@ std::optional<Diag> ReloadService::apply_compile_on_save(bool on) {
             SaveWatcherHooks hooks;
             hooks.tracked_files = [this] { return tracked_files(); };
             hooks.reload = [this] { return reload_for_save(); };
+#if defined(CML_FAULT_INJECTION)
             hooks.faults = &faults_;  // WP-44: the group "watch"
+#endif
             hooks.report = [this](const Diag& d, const char* severity) {
                 if (events_ != nullptr) {
                     events_->publish(make_diag_event(d, severity, "watch"));

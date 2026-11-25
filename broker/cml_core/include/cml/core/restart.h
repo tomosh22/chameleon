@@ -107,12 +107,6 @@ public:
         (void)pid;
         return false;
     }
-    // WP-44: the creation time of process `pid` (FILETIME ticks on Windows), which tells a reused pid from the process it was; nullopt
-    // when it cannot be read.
-    virtual std::optional<std::uint64_t> creation_time(std::uint32_t pid) const {
-        (void)pid;
-        return std::nullopt;
-    }
 };
 
 // The real thing on Windows; null elsewhere.
@@ -189,8 +183,6 @@ public:
     // WP-44 (R-51): whether process `pid` has exited, by the host (false without one, or when it cannot tell). A process not seen as
     // exited at once is looked at again for the bounded time above.
     bool process_exited(std::uint32_t pid);
-    // WP-44: ProcessHost::creation_time of the current host (nullopt without one).
-    std::optional<std::uint64_t> process_creation_time(std::uint32_t pid) const;
     void set_exit_recheck_for_testing(std::chrono::milliseconds total, std::chrono::milliseconds step) {
         exit_recheck_ = total;
         exit_recheck_step_ = step;

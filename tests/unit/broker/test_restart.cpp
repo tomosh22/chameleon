@@ -200,7 +200,6 @@ public:
                                                      std::vector<Diag>* warnings) override;
     bool supports_hold() const override;
     bool has_exited(std::uint32_t pid) const override;  // WP-43
-    std::optional<std::uint64_t> creation_time(std::uint32_t pid) const override;  // WP-44
 
 private:
     Rig& rig_;
@@ -247,7 +246,6 @@ struct Rig {
     // WP-44 (R-51)
     std::map<std::uint32_t, int> exited_after_checks;     // pid -> has_exited answers false this many times, then true (a late handle)
     std::atomic<int> exit_checks{0};                      // has_exited calls
-    std::map<std::uint32_t, std::uint64_t> created;       // pid -> creation time the fake host reports (absent: cannot be read)
     std::function<void(const ipc::ArmFault&)> on_arm;     // runs when the old agent receives ArmFault, before it answers
     std::vector<ipc::ArmFault> arms;                      // ArmFault messages the old agent received
 
@@ -494,12 +492,6 @@ FakeProcess::~FakeProcess() {
 
 bool FakeHost::supports_hold() const {
     return rig_.hold_supported;
-}
-
-std::optional<std::uint64_t> FakeHost::creation_time(std::uint32_t pid) const {
-    std::lock_guard<std::mutex> lock(rig_.mutex);
-    const auto it = rig_.created.find(pid);
-    return it != rig_.created.end() ? std::optional<std::uint64_t>(it->second) : std::nullopt;
 }
 
 bool FakeHost::has_exited(std::uint32_t pid) const {
@@ -1978,14 +1970,10 @@ TEST_CASE("restart injection (R-51 3, WP-44 fix round): a pipe that breaks while
     QuietLogs quiet;
     Rig rig;
     rig.service.restart_coordinator_for_testing()->set_exit_recheck_for_testing(std::chrono::milliseconds(50), std::chrono::milliseconds(5));
-    {
-        std::lock_guard<std::mutex> lock(rig.mutex);
-        rig.created[100] = 7;
-    }
     REQUIRE(inject_failure(rig.service, stage_args("pre-restart-hooks", 100)).has_value());
     rig.service.detach(1);  // the pipe broke; process 100 runs on (the host never reports it as exited), its agent stays armed
     CHECK(rig.service.faults().has_process_records(100));
-    // It reconnects: the same process (same creation time) keeps its records. A broker that shuts down then detaches every connection;
+    // It reconnects and keeps its records. A broker that shuts down then detaches every connection;
     // the processes keep their armings, so the records stay (even if the host said otherwise: nothing is decided while the broker goes).
     SimAgent again(rig.service, 60);
     again.register_process(100, "", {kExe}, {kExe});
@@ -1999,54 +1987,24 @@ TEST_CASE("restart injection (R-51 3, WP-44 fix round): a pipe that breaks while
     CHECK(rig.service.faults().take_agent_armed(ipc::fault::Stage::PreRestartHooks, 100));
 }
 
-TEST_CASE("restart injection (WP-44 re-review): records of a pid whose exit was not seen are dropped when another process registers with it") {
-    QuietLogs quiet;
-    Rig rig;
-    rig.service.restart_coordinator_for_testing()->set_exit_recheck_for_testing(std::chrono::milliseconds(20), std::chrono::milliseconds(5));
-    {
-        std::lock_guard<std::mutex> lock(rig.mutex);
-        rig.created[100] = 7;
-    }
-    REQUIRE(inject_failure(rig.service, stage_args("pre-restart-hooks", 100)).has_value());
-    rig.service.detach(1);  // the exit is not seen in time (a slow exit): the records stay
-    REQUIRE(rig.service.faults().has_process_records(100));
-    {
-        std::lock_guard<std::mutex> lock(rig.mutex);
-        rig.created[100] = 8;  // another process got pid 100
-    }
-    SimAgent reused(rig.service, 61);
-    reused.on_request = [&reused](const ipc::Message& m) {  // answers ArmFault like an agent with injection
-        if (const auto* arm = std::get_if<ipc::ArmFault>(&m)) {
-            ipc::Reply reply;
-            reply.request_id = arm->request_id;
-            reused.to_broker(reply);
-        }
-    };
-    reused.register_process(100, "", {kExe}, {kExe});
-    CHECK_FALSE(rig.service.faults().has_process_records(100));  // before: they stayed and would be reported as injection_disarmed
-    CHECK(finish_injection(rig.service, "restart", 100, std::string()).empty());
-
-    // A creation time that cannot be read drops them too.
-    REQUIRE(inject_failure(rig.service, stage_args("pre-restart-hooks", 100)).has_value());
-    rig.service.detach(61);
-    REQUIRE(rig.service.faults().has_process_records(100));
-    {
-        std::lock_guard<std::mutex> lock(rig.mutex);
-        rig.created.erase(100);
-    }
-    SimAgent unknown(rig.service, 62);
-    unknown.register_process(100, "", {kExe}, {kExe});
-    CHECK_FALSE(rig.service.faults().has_process_records(100));
-}
-
-TEST_CASE("restart injection (WP-44 re-review): none with the pid of a process whose agent is gone clears its records; an unknown pid is CML5961") {
+TEST_CASE("restart injection (WP-44 re-review): none with the pid of an exited process without an agent clears its records; a live one is CML5961") {
     QuietLogs quiet;
     Rig rig;
     rig.service.restart_coordinator_for_testing()->set_exit_recheck_for_testing(std::chrono::milliseconds(20), std::chrono::milliseconds(5));
     REQUIRE(inject_failure(rig.service, stage_args("pre-restart-hooks", 100)).has_value());
-    rig.service.detach(1);
+    rig.service.detach(1);  // the exit was not seen (the process runs on, or exits slowly): the records stay
     REQUIRE(rig.service.faults().has_process_records(100));
-    Result<Value> cleared = inject_failure(rig.service, stage_args("none", 100));  // before: CML5961, no agent for 100
+    // While the process lives (disconnected, but its agent is still armed), none for it is refused and the records stay.
+    Result<Value> live = inject_failure(rig.service, stage_args("none", 100));
+    REQUIRE_FALSE(live.has_value());
+    CHECK(live.error().id() == "CML5961");
+    CHECK(rig.service.faults().has_process_records(100));
+    // Once the host confirms the exit, none for it clears them (round 1: CML5961 for good, the records stayed until a global none).
+    {
+        std::lock_guard<std::mutex> lock(rig.mutex);
+        rig.exited.insert(100);
+    }
+    Result<Value> cleared = inject_failure(rig.service, stage_args("none", 100));
     REQUIRE_MESSAGE(cleared.has_value(), cleared.error().format());
     CHECK_FALSE(cleared->get_bool("armed", true));
     CHECK_FALSE(rig.service.faults().has_process_records(100));

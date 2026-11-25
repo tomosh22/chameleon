@@ -288,6 +288,7 @@ void ExceptionService::on_exception(const std::shared_ptr<AgentLink>& link, std:
             event.body.get_string("code").c_str(), event.body.get_string("address").c_str(), event.body.get_string("function").c_str());
     // WP-44: the stage exception-report. The report fails: a diag instead of the `exception` event. The thread stays held and pending, so
     // a client that asks `exceptions` can still decide what happens to it.
+#if defined(CML_FAULT_INJECTION)
     if (std::optional<Diag> injected = service_->faults().hit(ipc::fault::Stage::ExceptionReport, pid)) {
         Diag d = *injected;
         d.message += ": exception " + std::to_string(exception.exception_id) + " of process " + std::to_string(pid) + " (thread " +
@@ -299,6 +300,7 @@ void ExceptionService::on_exception(const std::shared_ptr<AgentLink>& link, std:
         }
         return;
     }
+#endif
     if (events_ != nullptr) {
         events_->publish(event);
     }
@@ -363,6 +365,9 @@ Result<Value> ExceptionService::action(const Value& args) {
     // WP-44: an action for a held thread is an operation of the failure-injection group "exception-action": it starts under the gate, so
     // an inject-failure for that group is refused while it runs, and at its end what is still armed for the process is disarmed
     // (finish_injection), whether it fired or not.
+#if !defined(CML_FAULT_INJECTION)
+    return act(link, pid, key, name, kind, exception_id, offer);
+#else
     {
         std::lock_guard<std::mutex> gate(service_->faults().gate());
         service_->faults().begin_operation("exception-action");
@@ -377,6 +382,7 @@ Result<Value> ExceptionService::action(const Value& args) {
         set_injection_disarmed(*outcome, unused);
     }
     return outcome;
+#endif
 }
 
 Result<Value> ExceptionService::act(const std::shared_ptr<AgentLink>& link, std::uint32_t pid, const Key& key, const std::string& name,

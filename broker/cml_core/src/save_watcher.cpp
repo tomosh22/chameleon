@@ -174,6 +174,7 @@ void SaveWatcher::on_batch(const watch::ChangeBatch& batch) {
     FaultInjector* const faults = relevant ? hooks_.faults : nullptr;
     // It counts as running (under the gate, like restart, revert and exception-action), so an inject-failure of a watch stage is refused
     // until the batch has disarmed what is left for it: an arming made meanwhile could otherwise be used up, or disarmed, by this batch.
+#if defined(CML_FAULT_INJECTION)
     struct Operation {
         FaultInjector* faults;
         explicit Operation(FaultInjector* f) : faults(f) {
@@ -191,7 +192,12 @@ void SaveWatcher::on_batch(const watch::ChangeBatch& batch) {
         Operation& operator=(const Operation&) = delete;
     } operation(faults);
     const auto injected = [&](ipc::fault::Stage stage) { return faults != nullptr ? faults->hit(stage, 0) : std::optional<Diag>(); };
+#endif
     const auto finish = [&] {
+#if !defined(CML_FAULT_INJECTION)
+        (void)faults;
+        return;
+#else
         if (faults == nullptr) {
             return;
         }
@@ -211,8 +217,10 @@ void SaveWatcher::on_batch(const watch::ChangeBatch& batch) {
         if (hooks_.report) {
             hooks_.report(d, "warning");
         }
+#endif
     };
     bool overflow = batch.overflow;
+#if defined(CML_FAULT_INJECTION)
     if (std::optional<Diag> lost = injected(ipc::fault::Stage::WatchDebounce)) {
         // The debounced batch is lost: what the watcher does after lost events, it does now (every tracked file is re-checked).
         Diag d = *lost;
@@ -231,6 +239,7 @@ void SaveWatcher::on_batch(const watch::ChangeBatch& batch) {
         finish();
         return;
     }
+#endif
     // Lost events, real or injected (watch-debounce): reported, and every tracked file is re-checked by the reload below.
     if (overflow && batch.lost_roots.empty()) {
         CML_LOG(Warn, "compile-on-save: file events were lost; every tracked file is re-checked");
@@ -245,7 +254,9 @@ void SaveWatcher::on_batch(const watch::ChangeBatch& batch) {
         return;
     }
     CML_LOG(Debug, "compile-on-save: %zu tracked file(s) saved; reloading", hits);
+#if defined(CML_FAULT_INJECTION)
     bool first_attempt = true;
+#endif
     for (;;) {
         if (stopping_.load()) {
             finish();
@@ -253,6 +264,7 @@ void SaveWatcher::on_batch(const watch::ChangeBatch& batch) {
         }
         reloads_.fetch_add(1);
         SaveWatcherHooks::ReloadResult r = SaveWatcherHooks::ReloadResult::Done;
+#if defined(CML_FAULT_INJECTION)
         std::optional<Diag> failed_reload = first_attempt ? injected(ipc::fault::Stage::WatchReload) : std::nullopt;
         first_attempt = false;
         if (failed_reload) {
@@ -261,7 +273,9 @@ void SaveWatcher::on_batch(const watch::ChangeBatch& batch) {
                 hooks_.report(*failed_reload, "error");
             }
             r = SaveWatcherHooks::ReloadResult::Failed;  // the watcher's own error path: CML5505 follows
-        } else {
+        } else
+#endif
+        {
             r = hooks_.reload ? hooks_.reload() : SaveWatcherHooks::ReloadResult::Done;
         }
         if (r == SaveWatcherHooks::ReloadResult::Done) {
