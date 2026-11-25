@@ -1,0 +1,12 @@
+--- a/sibling.cpp
++++ b/sibling.cpp
+@@ -13,7 +13,9 @@
+     int value = 0;
+     if (idx == 0) {
+         static PpObj names = pp_make(500000);
++        static PpObj extra = pp_make(570000);
+         names.hits += 1;
++        extra.hits += 1;
+         value = names.id + names.hits;
+     } else if (idx == 1) {
+         static PpObj names = pp_make(550000);

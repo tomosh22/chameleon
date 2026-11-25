@@ -19,8 +19,11 @@
 //   4. that instruction has no RIP-relative operand, no 67 prefix (the address would be truncated to 32 bits) and no
 //      fs/gs override (the address would be relative to that segment base); its memory operand has a base register
 //      (`[index*scale+disp32]` and the absolute `[disp32]` have no register that could hold __ImageBase); and it is not
-//      a `lea` with a 32-bit or 16-bit destination (8D without REX.W), which truncates the computed address: with the
-//      patch above the module the displacement is negative, and the zero-extended result is 4 GiB off;
+//      a `lea` with a 32-bit or 16-bit destination (8D without REX.W). With the base register holding __ImageBase such a
+//      lea of the full address already truncates in the original code; what it can validly compute is an RVA, as in
+//      `lea r32,[index+sym@IMGREL]` (a 32-bit sum of the image-relative offset), and retargeting would turn that into
+//      the low 32 bits of `target - patch_base + index`, which is not the old RVA. The rule protects that RVA arithmetic
+//      (WP-40 wording, R-50; the rule is unchanged);
 //   5. every relocation the sweep passes on the way (and the site's own) is EXACTLY the 32-bit displacement of one
 //      decoded instruction, or lies wholly inside its immediate. A relocation that starts in one instruction and ends
 //      in another, or covers prefix, opcode, ModRM or SIB bytes, means the sweep ran into data (a jump table) or lost
@@ -53,7 +56,7 @@ enum class SiteVerdict : std::uint8_t {
     Address32,        // the instruction has a 67 prefix
     SegmentFsGs,      // the instruction has an fs or gs override
     NoBaseRegister,   // the operand is `[index*scale+disp32]` or `[disp32]`: no base register that could hold __ImageBase
-    LeaTruncates,     // a `lea` with a 32-bit or 16-bit destination: the address it computes is truncated
+    LeaTruncates,     // a `lea` with a 32-bit or 16-bit destination: it computes a 32-bit image-relative value
 };
 
 const char* to_string(SiteVerdict v) noexcept;

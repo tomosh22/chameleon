@@ -58,3 +58,7 @@ foreach(_cml_m10 imgrel)
         add_subdirectory(${_cml_m10})
     endif()
 endforeach()
+
+# Wave 11 fixture directories (ADR-0043), one line per fixture.
+add_subdirectory(planner_pairing)     # WP-40
+add_subdirectory(planner_pairing_o2)  # WP-40 (/O2 /Ob2)

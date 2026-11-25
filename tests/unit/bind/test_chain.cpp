@@ -2,6 +2,7 @@
 // slots, other modules' exports) and the bridge from the object's decorated names of statics to the
 // PDB's records (ADR-0010).
 #include <string>
+#include <vector>
 
 #include "cml/core/bind_diag_ids.h"
 #include "cml/core/bind_plan.h"
@@ -336,7 +337,10 @@ TEST_CASE("statics: cl records the guard variable in the PDB: it is matched by n
     CHECK(r->warnings.empty());
 }
 
-TEST_CASE("statics: when the layout changed the guard is NOT guessed - it is new, with a warning") {
+TEST_CASE("statics: when the layout changed the guard is NOT guessed - and the bound static is not given a fresh one either (CML3600)") {
+    // WP-40 (ADR-0043, R-48 item 6): until WP-40 the guard became new with the warning CML3211 and the reload went on; the
+    // static `g` is bound to the running process's (constructed) object, so its constructor ran a second time over live
+    // state. Now the plan is refused.
     SynthWorld w = basic_world(false);
     w.data(w.tu(), "`anonymous namespace'::s_calls", 0x10);
     w.proc_with_statics(w.tu(), "statics_value", 0x50, {{"g", 0x20}});
@@ -348,12 +352,17 @@ TEST_CASE("statics: when the layout changed the guard is NOT guessed - it is new
     o.symbol("?g@?1??statics_value@@YAHXZ@4UGuarded@@A", 0x20, sec, false, false);
     o.symbol("?$TSS0@?1??statics_value@@YAHXZ@4HA", 0x24, sec, false, false);
     Built b = o.build();
-    auto r = plan_bind(w.input(b));
-    REQUIRE_MESSAGE(r.has_value(), err(r));
-    CHECK(find(*r, "?$TSS0@?1??statics_value@@YAHXZ@4HA")->decision == DecisionKind::PatchNewData);
-    REQUIRE(r->warnings.size() == 1);
-    CHECK(r->warnings[0].code == diag::kGuardUnmatched);
-    CHECK(r->warnings[0].message.find("TSS0") != std::string::npos);
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    auto r = plan_bind(w.input(b), &errors, &partial);
+    REQUIRE_FALSE(r.has_value());
+    REQUIRE(errors.size() == 1);
+    CHECK(errors[0].code == diag::kGuardMismatch);
+    CHECK(errors[0].message.find("TSS0") != std::string::npos);
+    CHECK(errors[0].message.find("no layout of its object section is known") != std::string::npos);
+    CHECK(find(partial, "?g@?1??statics_value@@YAHXZ@4UGuarded@@A")->decision == DecisionKind::BindOldData);
+    CHECK(find(partial, "?$TSS0@?1??statics_value@@YAHXZ@4HA")->decision == DecisionKind::PatchNewData);
+    CHECK(partial.warnings.empty());  // no CML3211 next to the error
 }
 
 TEST_CASE("statics: static functions are matched to S_LPROC32 and hooked") {
