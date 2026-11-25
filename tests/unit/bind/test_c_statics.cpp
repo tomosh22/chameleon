@@ -42,9 +42,10 @@ TEST_CASE("c statics (clang-cl): 'platform.0', 'next.counter' and a plain file s
     w.open();
     SynthObj o;
     const std::int32_t sec = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
-    o.symbol("counter_total", 0x10, sec, false, false);
-    o.symbol("platform.0", 0x20, sec, false, false);
-    o.symbol("next.counter", 0x30, sec, false, false);
+    const std::uint32_t total_sym = o.symbol("counter_total", 0x10, sec, false, false);
+    const std::uint32_t platform_sym = o.symbol("platform.0", 0x20, sec, false, false);
+    const std::uint32_t counter_sym = o.symbol("next.counter", 0x30, sec, false, false);
+    o.debug_records_for({total_sym, platform_sym, counter_sym});  // (WP-40) as clang-cl's object records them: whole variables
     Built b = o.build();
     auto r = plan_bind(w.input(b));
     REQUIRE_MESSAGE(r.has_value(), err(r));
@@ -69,8 +70,9 @@ TEST_CASE("c statics (clang-cl): a uniquified local 'next.counter.1' binds to th
     w.open();
     SynthObj o;
     const std::int32_t sec = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
-    o.symbol("counter", 0x10, sec, false, false);
-    o.symbol("next.counter.1", 0x30, sec, false, false);
+    const std::uint32_t file_counter = o.symbol("counter", 0x10, sec, false, false);
+    const std::uint32_t local_counter = o.symbol("next.counter.1", 0x30, sec, false, false);
+    o.debug_records_for({file_counter, local_counter});  // (WP-40) the uniquified local is a whole variable with a record
     Built b = o.build();
     auto r = plan_bind(w.input(b));
     REQUIRE_MESSAGE(r.has_value(), err(r));

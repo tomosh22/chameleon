@@ -104,6 +104,17 @@ public:
         s.relocations.push_back(r);
     }
 
+    // WP-40: a `.debug$S` section whose SECREL relocations name `symbols` (raw indices), as the data records (S_LDATA32,
+    // S_GDATA32, ...) of a compiler's object do. The planner reads only the relocations: which data symbols a debug record
+    // names (a piece of a split aggregate is named by none).
+    std::uint32_t debug_records_for(const std::vector<std::uint32_t>& symbols) {
+        const std::uint32_t sec = section(".debug$S", 0x42100040u, static_cast<std::uint32_t>(8 * symbols.size() + 4));
+        for (std::size_t i = 0; i < symbols.size(); ++i) {
+            reloc(sec, static_cast<std::uint32_t>(4 + 8 * i), symbols[i], coff::RelocType::SecRel);
+        }
+        return sec;
+    }
+
     coff::ObjectModel& model() { return m_; }
 
     Built build() {

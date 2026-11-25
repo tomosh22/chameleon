@@ -717,7 +717,11 @@ private:
         // WP-36 evidence: image-relative references to old data in this object, and how many were proved displacements.
         report.imgrel_sites += plan.imgrel_sites;
         report.imgrel_verified += plan.imgrel_verified;
-        CML_LOG(Info, "%s", plan.imgrel_line(in.object_name).c_str());
+        // (WP-40, R-50: at Info only for an object that has such references; the counters of the reload answer, which cmltest
+        // and the corpus read, do not depend on this line. The planner itself logs it at Debug for every object.)
+        if (plan.imgrel_sites != 0) {
+            CML_LOG(Info, "%s", plan.imgrel_line(in.object_name).c_str());
+        }
         NarrowInput ni;
         ni.object = &object->object;
         ni.plan = &plan;

@@ -1,0 +1,83 @@
+# Scenario `planner_pairing_o2` (WP-40, ADR-0043): the fixture built with /O2 /Ob2 in every cell.
+#   mark_2 recompiles lambdas.cpp (R-48 item 1). clang-cl inlined the three lambdas and recorded their statics `sname` in
+#   o2_step() itself: the planner finds them there and places them (and their guards) by the layout of their section, so the
+#   reload applies and every static keeps counting from where it was (a, b, c in their own ranges, made stays 3). Until
+#   WP-40 the statics were new and their guards bound to the old ones: the patched code used objects that were never
+#   constructed (zero ids). The step allows a refusal (CML3207 / CML3600) for a compiler that records them otherwise; what
+#   it never allows is a value outside its range, a re-initialisation, or a fault.
+#   parts_3 recompiles parts.cpp (R-48 item 4): clang-cl split the internal array into `s_parts.0` .. `.2`, of which no
+#   debug record exists: refused (CML3601); cl keeps it whole and the reload applies (pm 1 -> 3). Either way `parts` never
+#   drops (until WP-40 the counters restarted from 0 under clang-cl).
+# cmltest prints `RELOAD-OUTCOME applied|refused id=...` for both reloads (the evidence of the cell).
+name = "planner_pairing_o2"
+description = "fixture planner_pairing_o2 (/O2 /Ob2): inlined lambdas' statics keep their values or the reload is refused; a split aggregate is refused"
+fixture = "planner_pairing_o2"
+timeout_s = 240
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_planner_pairing_o2.exe"
+within_s = 15
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ mark=1 a=100(0[2-9]\\d|[1-9]\\d\\d) b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=1 made=3\\b"
+within_s = 20
+
+[[step]]
+kind = "edit"
+patch = "edits/mark_2.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+allow_error = "CML3207|CML3600"
+
+# Applied (mark=2) or refused (mark=1): either way the three statics are the old ones (each at least 20 above its id) and
+# nothing was constructed again.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ mark=[12] a=100(0[2-9]\\d|[1-9]\\d\\d) b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=1 made=3\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ mark=[12] a=100\\d{3} b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=1 made=3\\b"
+within_s = 10
+
+[[step]]
+kind = "edit"
+patch = "edits/parts_3.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+allow_error = "CML3601"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ mark=[12] a=100\\d{3} b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=[13] made=3\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_monotonic"
+key = "a"
+min_samples = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "b"
+min_samples = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "c"
+min_samples = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "parts"
+min_samples = 20

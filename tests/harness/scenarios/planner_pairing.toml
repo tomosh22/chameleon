@@ -1,0 +1,122 @@
+# Scenario `planner_pairing` (WP-40, ADR-0043, R-48): the bind-planner pairing defects that end in a pairing, then two
+# that end in a refusal. Every value is an object's id plus its count (pairing.h), so the leading digits say which object
+# it is and a re-initialised object restarts just above its id.
+#
+# 1. pairing_1 edits four translation units at once and must reload:
+#    * scope.cpp (item 3): a new file-scope `static int helper(int)` is used by pp_scope_local() (local 10 -> 7000) and
+#      the old PpScope::helper keeps its code (member stays 2; until WP-40 it was hooked onto the new function: 1000);
+#    * guards.cpp (item 2): pp_fresh() gets a new guarded static, which must be constructed (fresh 1 -> 4001..; made 8 -> 9);
+#    * tsi.cpp (item 7, /Zc:threadSafeInit-) and internal.cpp (item 11): two same-named block statics each, which keep
+#      counting (s0, s1, i0, i1) while their marks become 2. Under cl both pairs are matched by their place (warning
+#      CML3570; until WP-40 both were refused under cl), under clang-cl by the layout of their section.
+# 2. swap_2 swaps two lambdas with different call operators (item 5): refused (CML3214 for the call operators, CML3207 for
+#    their statics). swap_back_3 undoes the edit (the file is the baseline again).
+# 3. sibling_4 adds a guarded static next to an old one in a block (item 8, refusal kept): refused (cl: CML3207 from the
+#    by-place step; clang-cl: CML3207 or CML3600).
+# The program never faults and no value ever drops, over the whole run.
+name = "planner_pairing"
+description = "fixture planner_pairing: pairing_1 reloads with every static kept; swap_2 and sibling_4 are refused"
+fixture = "planner_pairing"
+timeout_s = 300
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_planner_pairing.exe"
+within_s = 15
+
+# Every static fetched at least 20 times before the first reload.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ member=2 local=10 fresh=1 gt=500(2\\d|[3-9]\\d|\\d{3}) s0=100(2\\d|[3-9]\\d|\\d\\d\\d) s1=110(2\\d|[3-9]\\d|\\d\\d\\d) sm=1 i0=200(2\\d|[3-9]\\d|\\d\\d\\d) i1=210(2\\d|[3-9]\\d|\\d\\d\\d) im=1 la=300(2\\d|[3-9]\\d|\\d\\d\\d) lb=310(2\\d|[3-9]\\d|\\d\\d\\d) n0=400(2\\d|[3-9]\\d|\\d\\d\\d) n1=410(2\\d|[3-9]\\d|\\d\\d\\d) made=8\\b"
+within_s = 20
+
+[[step]]
+kind = "edit"
+patch = "edits/pairing_1.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+
+# The new code runs; the old member function kept its own code; the new static was constructed (made 9); the four block
+# statics are the old ones (each at least 20 above its id).
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ member=2 local=7000 fresh=40\\d\\d gt=500(2\\d|[3-9]\\d|\\d{3}) s0=100(2\\d|[3-9]\\d|\\d\\d\\d) s1=110(2\\d|[3-9]\\d|\\d\\d\\d) sm=2 i0=200(2\\d|[3-9]\\d|\\d\\d\\d) i1=210(2\\d|[3-9]\\d|\\d\\d\\d) im=2 la=300(2\\d|[3-9]\\d|\\d\\d\\d) lb=310(2\\d|[3-9]\\d|\\d\\d\\d) n0=400(2\\d|[3-9]\\d|\\d\\d\\d) n1=410(2\\d|[3-9]\\d|\\d\\d\\d) made=9\\b"
+within_s = 10
+
+[[step]]
+kind = "edit"
+patch = "edits/swap_2.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_error = "CML3214|CML3207"
+
+[[step]]
+kind = "edit"
+patch = "edits/swap_back_3.edit"
+
+[[step]]
+kind = "edit"
+patch = "edits/sibling_4.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_error = "CML3207|CML3600"
+
+# The refused reloads changed nothing: the program of pairing_1 keeps running with every static.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ member=2 local=7000 fresh=40\\d\\d gt=500\\d+ s0=100\\d\\d s1=110\\d\\d sm=2 i0=200\\d\\d i1=210\\d\\d im=2 la=300\\d\\d lb=310\\d\\d n0=400\\d\\d n1=410\\d\\d made=9\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_monotonic"
+key = "gt"
+min_samples = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "s0"
+min_samples = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "s1"
+min_samples = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "i0"
+min_samples = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "i1"
+min_samples = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "la"
+min_samples = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "lb"
+min_samples = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "n0"
+min_samples = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "n1"
+min_samples = 20

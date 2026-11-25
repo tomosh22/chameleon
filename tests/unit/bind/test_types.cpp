@@ -1571,7 +1571,9 @@ TEST_CASE("statics of one name in two blocks: a layout that predicts an old reco
     REQUIRE_FALSE(r.has_value());
     REQUIRE(errors.size() == 1);
     CHECK(errors[0].id() == "CML3207");
-    CHECK_MESSAGE(contains(errors[0].message, "places other statics named 'names' of 'SceneTree::get_argument_options' and no old one at its offset; the layout decides"), errors[0].message);
+    // (WP-40, R-48 item 10: the reason names the static whose prediction decided, and where it put it.)
+    CHECK_MESSAGE(contains(errors[0].message, "on the old record at rva 0x3020 and places no old static named 'names' of 'SceneTree::get_argument_options' at the offset of this one; the layout decides"),
+                  errors[0].message);
     CHECK(decision(partial, kNames4).source == BindSource::CompilandRva);
     CHECK(decision(partial, kNames4).old_address.rva == 0x3020);
     CHECK(decision(partial, kNames8).decision != DecisionKind::BindOldData);
@@ -1802,4 +1804,269 @@ TEST_CASE("a function-local static in block 11 or later is the old static, not a
     CHECK(decision(*r, table_int).decision == DecisionKind::BindOldData);
     CHECK(decision(*r, table_int).old_address.rva == 0x3010);
     CHECK(r->new_globals.empty());
+}
+
+// ---- WP-40 (ADR-0043, R-48 items 5..11): what the type reader and the by-place step still got wrong ----------------
+
+namespace {
+
+// A call operator of closure <lambda_n> of f() returning int with the parameter list `args`.
+std::uint32_t call_operator_with(Types& t, int n, const std::vector<std::uint32_t>& args) {
+    const std::uint32_t cls = t.set.add(tp::kLfClass, tp::lf_udt("f::<lambda_" + std::to_string(n) + ">", closure_unique(n), true));
+    const std::uint32_t const_cls = t.set.add(tp::kLfModifier, tp::lf_modifier(cls, 1));
+    const std::uint32_t this_ptr = t.set.add(tp::kLfPointer, tp::lf_pointer(const_cls, tp::kPtr64 | 0x400));
+    const std::uint32_t list = t.args(args);
+    return t.set.add(tp::kLfMFunction, tp::lf_mfunction(tp::kTInt, cls, this_ptr, list, static_cast<std::uint16_t>(args.size())));
+}
+
+}  // namespace
+
+TEST_CASE("lambda statics (R-48 item 5): two lambdas that changed places are told apart by their call operators' signatures") {
+    // f() holds `[]() {...}` (lambda 1) and `[](int) {...}` (lambda 2), each with `sname`; the edit swaps the two
+    // expressions, so the compiler numbers them the other way round. main: both statics paired by their (unchanged)
+    // numbers, i.e. exchanged.
+    const auto run = [](bool swapped, std::vector<cml::Diag>& errors, BindPlan& partial) {
+        SynthWorld w;
+        Types old_types;
+        const std::uint32_t op1 = call_operator_with(old_types, 1, {});
+        const std::uint32_t op2 = call_operator_with(old_types, 2, {tp::kTInt});
+        old_proc(w, "`f'::`2'::<lambda_1>::operator()", 0x60, op1, {{"sname", 0x20}, {"$TSS0", 0x28}});
+        old_proc(w, "`f'::`2'::<lambda_2>::operator()", 0x70, op2, {{"sname", 0x30}, {"$TSS0", 0x38}});
+        old_types.set.add_to(w.spec.tpi);
+        w.open();
+        Types t;
+        // The closure names stay <lambda_1> / <lambda_2>: only the signatures can say which lambda is which.
+        const std::uint32_t new_op1 = call_operator_with(t, 1, swapped ? std::vector<std::uint32_t>{tp::kTInt} : std::vector<std::uint32_t>{});
+        const std::uint32_t new_op2 = call_operator_with(t, 2, swapped ? std::vector<std::uint32_t>{} : std::vector<std::uint32_t>{tp::kTInt});
+        StaticsObj o;
+        o.proc(call_operator_symbol(1), "`f'::`2'::<lambda_1>::operator()", false, new_op1);
+        o.end();
+        o.proc(call_operator_symbol(2), "`f'::`2'::<lambda_2>::operator()", false, new_op2);
+        o.end();
+        for (int n = 1; n <= 2; ++n) {
+            o.symbol(static_in_lambda("sname", n));
+            o.symbol(static_in_lambda("$TSS0", n));
+        }
+        Built b = o.build(t.set.debug_t());
+        auto r = plan_bind(w.input(b), &errors, &partial);
+        if (r) {
+            partial = *r;
+        }
+        return r.has_value();
+    };
+    SUBCASE("swapped: refused (CML3207), nothing paired by number") {
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        REQUIRE_FALSE(run(true, errors, partial));
+        REQUIRE_FALSE(errors.empty());
+        bool named = false;
+        for (const cml::Diag& e : errors) {
+            // CML3207 for the statics; the call operators themselves no longer pair by signature either (CML3214).
+            CHECK((e.id() == "CML3207" || e.id() == "CML3214"));
+            named = named || (e.id() == "CML3207" && contains(e.message, "has another signature than the old one of that number"));
+        }
+        CHECK(named);
+        for (int n = 1; n <= 2; ++n) {
+            CHECK(decision(partial, static_in_lambda("sname", n)).decision != DecisionKind::BindOldData);
+            CHECK(decision(partial, static_in_lambda("$TSS0", n)).decision != DecisionKind::BindOldData);
+        }
+    }
+    SUBCASE("in place: paired by closure as before") {
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        REQUIRE(run(false, errors, partial));
+        CHECK(decision(partial, static_in_lambda("sname", 1)).old_address.rva == 0x3020);
+        CHECK(decision(partial, static_in_lambda("sname", 2)).old_address.rva == 0x3030);
+        CHECK(decision(partial, static_in_lambda("sname", 2)).source == BindSource::CompilandClosure);
+    }
+}
+
+TEST_CASE("lambda statics (R-48 item 6): paired by closure, but their section layout contradicts itself: refused, not given fresh guards") {
+    // clang-cl: the two lambdas' statics lie the other way round in the patch's .bss. The closure step pairs both; the
+    // two pairs disagree on the section layout, which is dropped, so no guard can be placed. main: two CML3211 (fresh
+    // guards), plan accepted: both bound `sname` constructed a second time on their next use.
+    SynthWorld w;
+    Types types;
+    for (int n = 0; n < 2; ++n) {
+        const std::uint32_t type = types.call_operator("f::<lambda_" + std::to_string(n) + ">", ".?AV<lambda_" + std::to_string(n) + ">@?0??f@@YAXXZ@");
+        old_proc(w, "f::<lambda_" + std::to_string(n) + ">::operator()", 0x60 + 0x10 * static_cast<std::uint32_t>(n), type,
+                 {{"sname", 0x20 + 0x10 * static_cast<std::uint32_t>(n)}});
+    }
+    types.set.add_to(w.spec.tpi);
+    w.open();
+    const auto sym = [](const std::string& name, int n) { return "?" + name + "@?1???R<lambda_" + std::to_string(n) + ">@?0??f@@YAXXZ@QEBA@XZ@4HA"; };
+    SynthObj o;
+    const std::uint32_t d = o.section(".bss", kData, 0x40);
+    for (int n = 0; n < 2; ++n) {
+        const std::uint32_t at = 0x30 - 0x10 * static_cast<std::uint32_t>(n);  // lambda 0 at 0x30, lambda 1 at 0x20
+        o.symbol(sym("sname", n), at, static_cast<std::int32_t>(d), false, false);
+        o.symbol(sym("$TSS0", n), at + 8, static_cast<std::int32_t>(d), false, false);
+    }
+    Built b = o.build();
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    auto r = plan_bind(w.input(b), &errors, &partial);
+    REQUIRE_FALSE(r.has_value());
+    REQUIRE(errors.size() == 2);
+    for (const cml::Diag& e : errors) {
+        CHECK(e.code == diag::kGuardMismatch);
+        CHECK(contains(e.message, "no layout of its object section is known"));
+    }
+    CHECK(decision(partial, sym("sname", 0)).source == BindSource::CompilandClosure);
+    CHECK(partial.warnings.empty());
+}
+
+TEST_CASE("by place (R-48 item 7): cl's `$S1` guards of /Zc:threadSafeInit- pair by place too, instead of refusing themselves") {
+    // Without thread-safe statics cl guards each block with a bitmask `$S1` (one name per block, so two `$S1` in one
+    // function). main: the `$S1` pair reached the by-place step, whose guard scan found each member as "a guard of its
+    // block" without a binding and refused it (CML3207), and the two `names` with it.
+    const char* const s1_4 = "?$S1@?4??get_argument_options@SceneTree@@UEBAXH@Z@4IA";
+    const char* const s1_8 = "?$S1@?8??get_argument_options@SceneTree@@UEBAXH@Z@4IA";
+    SynthWorld w;
+    tp::Records& s = w.tu().symbols;
+    s.proc(0x1110, "SceneTree::get_argument_options", SynthWorld::kTextSec, 0x40, 0x20);
+    s.block();
+    s.data(0x110C, "names", SynthWorld::kDataSec, 0x10, tp::kTInt);
+    s.data(0x110C, "$S1", SynthWorld::kDataSec, 0x18, tp::kTInt);
+    s.end();
+    s.block();
+    s.data(0x110C, "names", SynthWorld::kDataSec, 0x20, tp::kTInt);
+    s.data(0x110C, "$S1", SynthWorld::kDataSec, 0x28, tp::kTInt);
+    s.end();
+    s.end();
+    w.pub_func(kOptions, 0x40);
+    w.open();
+    StaticsObj o;
+    o.proc(kOptions, "SceneTree::get_argument_options");
+    o.block();
+    o.local(kNames4, "names");
+    o.local(s1_4, "$S1");
+    o.end();
+    o.block();
+    o.local(kNames8, "names");
+    o.local(s1_8, "$S1");
+    o.end();
+    o.end();
+    Built b = o.build(some_debug_t());
+    auto r = plan_bind(w.input(b));
+    REQUIRE_MESSAGE(r.has_value(), err(r));
+    CHECK(decision(*r, kNames4).old_address.rva == 0x3010);
+    CHECK(decision(*r, kNames8).old_address.rva == 0x3020);
+    CHECK(decision(*r, s1_4).source == BindSource::CompilandProcedure);
+    CHECK(decision(*r, s1_4).old_address.rva == 0x3018);
+    CHECK(decision(*r, s1_8).old_address.rva == 0x3028);
+    std::size_t order_warnings = 0;
+    for (const cml::Diag& warning : r->warnings) {
+        order_warnings += warning.code == diag::kStaticsMatchedByOrder ? 1u : 0u;
+    }
+    CHECK(order_warnings == 2);  // the `names` and the `$S1`, each a pairing by place
+}
+
+TEST_CASE("by place (R-48 item 8, refusal kept): an unbound guard of a NEW static in the block refuses the pairing") {
+    // The edit adds a guarded `extra` to the first block of get_argument_options. Its guard `$TSS2` has no record. cl
+    // numbers guards per function, so whether `$TSS2` is extra's (sound) or the guard of the old `names` while `extra`
+    // took names's old number (a new static would then never be constructed) cannot be told from the names. Kept refused,
+    // on purpose; this passes on main as well.
+    const char* const extra = "?extra@?4??get_argument_options@SceneTree@@UEBAXH@Z@4HA";
+    const char* const guard_extra = "?$TSS2@?4??get_argument_options@SceneTree@@UEBAXH@Z@4HA";
+    SynthWorld w;
+    old_options(w);
+    w.open();
+    StaticsObj o;
+    o.proc(kOptions, "SceneTree::get_argument_options");
+    o.block();
+    o.local(kNames4, "names");
+    o.local(kGuard0, "$TSS0");
+    o.local(extra, "extra");
+    o.local(guard_extra, "$TSS2");
+    o.end();
+    o.block();
+    o.local(kNames8, "names");
+    o.local(kGuard1, "$TSS1");
+    o.end();
+    o.end();
+    Built b = o.build(some_debug_t());
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+    bool guard_reason = false;
+    for (const cml::Diag& e : errors) {
+        CHECK(e.id() == "CML3207");
+        guard_reason = guard_reason || contains(e.message, "$TSS2");
+    }
+    CHECK(guard_reason);
+    CHECK(decision(partial, kNames4).decision != DecisionKind::BindOldData);
+}
+
+TEST_CASE("by place (R-48 item 9): the guards of statics refused for another reason get no CML3211 next to the CML3207") {
+    // clang-cl shape (no guard records, every static in a section of its own: no layout). The edit adds a third `names`
+    // block: the counts differ. main: the three CML3207 and, from pass C, three CML3211 for their guards.
+    SynthWorld w;
+    w.proc_with_statics(w.tu(), "SceneTree::get_argument_options", 0x40, {{"names", 0x10}, {"names", 0x20}}, 0x20);
+    w.pub_func(kOptions, 0x40);
+    w.open();
+    StaticsObj o;
+    o.proc(kOptions, "SceneTree::get_argument_options");
+    for (const char* const block : {"?4?", "?8?", "?9?"}) {
+        const std::string scope = std::string(block) + "?get_argument_options@SceneTree@@UEBAXH@Z@4";
+        o.local("?names@" + scope + "HB", "names");
+        o.symbol("?$TSS0@" + scope + "HA");
+    }
+    o.end();
+    Built b = o.build(some_debug_t());
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+    REQUIRE(errors.size() == 3);
+    for (const cml::Diag& e : errors) {
+        CHECK(e.id() == "CML3207");
+        CHECK(contains(e.message, "declares 3 of them in the patch and 2 in the old image"));
+    }
+    for (const cml::Diag& warning : partial.warnings) {
+        CHECK_MESSAGE(warning.code != diag::kGuardUnmatched, warning.message);
+    }
+}
+
+TEST_CASE("by place (R-48 item 11): same-named block statics of an internal-linkage function pair under cl's qualified record names") {
+    // cl records the statics of a function with internal linkage under a qualified name ("`opts'::`2'::names"). main:
+    // the by-place step compared the whole name with "names", found none ("declares 0 of them") and refused.
+    const char* const opts = "?opts@@YAHH@Z";
+    const char* const names_a = "?names@?1??opts@@YAHH@Z@4HB";
+    const char* const names_b = "?names@?2??opts@@YAHH@Z@4HB";
+    const char* const guard_a = "?$TSS0@?1??opts@@YAHH@Z@4HA";
+    const char* const guard_b = "?$TSS1@?2??opts@@YAHH@Z@4HA";
+    SynthWorld w;
+    tp::Records& s = w.tu().symbols;
+    s.proc(0x110F, "opts", SynthWorld::kTextSec, 0x40, 0x20);
+    s.block();
+    s.data(0x110C, "`opts'::`2'::names", SynthWorld::kDataSec, 0x10, tp::kTInt);
+    s.data(0x110C, "`opts'::`2'::$TSS0", SynthWorld::kDataSec, 0x18, tp::kTInt);
+    s.end();
+    s.block();
+    s.data(0x110C, "`opts'::`3'::names", SynthWorld::kDataSec, 0x20, tp::kTInt);
+    s.data(0x110C, "`opts'::`3'::$TSS1", SynthWorld::kDataSec, 0x28, tp::kTInt);
+    s.end();
+    s.end();
+    w.open();
+    StaticsObj o;
+    o.proc(opts, "opts", false);
+    o.block();
+    o.local(names_a, "`opts'::`2'::names");
+    o.local(guard_a, "`opts'::`2'::$TSS0");
+    o.end();
+    o.block();
+    o.local(names_b, "`opts'::`3'::names");
+    o.local(guard_b, "`opts'::`3'::$TSS1");
+    o.end();
+    o.end();
+    Built b = o.build(some_debug_t());
+    auto r = plan_bind(w.input(b));
+    REQUIRE_MESSAGE(r.has_value(), err(r));
+    CHECK(decision(*r, names_a).source == BindSource::CompilandProcedure);
+    CHECK(decision(*r, names_a).old_address.rva == 0x3010);
+    CHECK(decision(*r, names_b).old_address.rva == 0x3020);
+    CHECK(decision(*r, guard_a).old_address.rva == 0x3018);
+    CHECK(decision(*r, guard_b).old_address.rva == 0x3028);
+    REQUIRE(r->warnings.size() == 1);
+    CHECK(r->warnings[0].code == diag::kStaticsMatchedByOrder);
 }

@@ -811,7 +811,7 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 
 ### CML3211
 
-- **Cause:** Function-local static guard not found in the old image.  
+- **Cause:** Function-local static guard not found in the old image (warning). Since WP-40 only for a guard whose block has no static in the patch at all; a guard of a static bound to the running process that cannot be found is the error `CML3600`, and the guard of a new static is new without a warning.  
 - **Message:** `guard variable '<...>' of a function-local static was not found in the old image; the patch gets a fresh guard`  
 - **What to do:** Keep the layout of the statics in this source file unchanged, or hot-restart if the static must not be initialised again.  
 - **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
@@ -1155,6 +1155,22 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 - **Cause:** (warning) Several function-local statics of one name in one function, declared in different blocks (`if (i == 0) { static const T names = ...; } else { static const T names = ...; }`), were matched to the running program's copies by their order in the function. Nothing else tells them apart: they have one name, one scope and one type, and the layout of their object section is not known (under cl every function-local static is a section of its own; where a layout is known it places them and this warning is not raised). The reload is applied; the function has the same number of them as before, each with the same type and in the same block. If the edit swapped two of those blocks or replaced one, the statics now hold each other's values.  
 - **Message:** `Function-local statics '<...>' of '<...>' (<...>) are matched by their order in the function; if you reordered or replaced blocks that declare them, their values may be exchanged.`  
 - **What to do:** Rename one of them, or hot-restart after reordering.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3600
+
+- **Cause:** A guard variable (`$TSS0`, or cl's `$S1` under `/Zc:threadSafeInit-`) of a function-local static cannot be bound consistently with the statics of its block. A guard says whether its static was constructed: bound to the old guard while its static is new, the patch would use an object that was never constructed; given a fresh guard while its static is bound to the running process, the old object would be constructed a second time over live state. Raised (1) when a block has both statics bound to the running process and new ones, and a guard without a record in the old image (compilers number the guards of a function, so which guard is whose cannot be told; a new static declared in front of an old one takes the old one's number); (2) when every static of the block is bound but its guard has no record (clang-cl records none) and the layout of the object section cannot place it: no layout is known (no static there was matched, or the matched ones disagree, for instance after statics were reordered), or it would put the guard outside the translation unit's contribution to the old image, into another image section, or onto a variable the old image records. Until WP-40 case (2) was the warning `CML3211` and the reload went on.  
+- **Message:** `the guard variable <...> in <...> guards statics of one block of which some are bound to the running process (<...>) and some are new (<...>); which guard belongs to which static cannot be told, so either an old static would be constructed again or a new one never`  
+- **Message:** `the guard variable <...> in <...> cannot be bound to the old guard of <...>, which is bound to the running process: <...>; with a fresh guard the old object would be constructed a second time`  
+- **What to do:** Declare the new static in a block of its own (or in another function), keep the statics of this source file in their order, or hot-restart.  
+  Other variants of the advice: Keep the statics of this source file in their order (do not add or remove statics in front of them), or hot-restart.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3601
+
+- **Cause:** clang-cl with optimisation (`/O2`) split an internal-linkage aggregate (a `static` or anonymous-namespace array or struct) into separate variables named `<name>.0`, `<name>.1`, ... The debug information of such a piece is a fragment, which CodeView does not record: neither the old PDB nor the patch object says where the old piece is. Until WP-40 the patch got fresh, zero-initialised pieces without a word, so the state of the aggregate was reset by every reload of its source file. A piece that the patch object's own debug records name is a whole variable (LLVM's uniquifier, or a piece that covers the whole aggregate) and is bound as usual.  
+- **Message:** `static data <...> in <...> is piece <...> of '<...>', which the compiler split into separate variables; the debug information records no piece, so the old piece in the running process cannot be found and a reload would reset it`  
+- **What to do:** Give the variable external linkage or take its address (the compiler then keeps it whole), or hot-restart.  
 - **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
 
 

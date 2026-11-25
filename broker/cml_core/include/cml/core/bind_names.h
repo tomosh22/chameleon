@@ -54,6 +54,12 @@ CStaticName c_static_name(std::string_view object_name);
 //   "$..." (cl's "$SG", "$LN") and "__real@" / "__xmm@" constants.
 bool is_compiler_generated_data_name(std::string_view name);
 
+// WP-40 (R-48 item 4): a name with a trailing ".<digits>" behind a name of a variable: a decorated name
+// ("?s_last@?A0x520C9D4F@@3PAHA.0") or a C identifier ("s_last.1", "next.counter.1"). clang-cl names the pieces of an
+// aggregate it split (SROA of a global) like that, and LLVM's uniquifier writes the same suffix; the planner tells the
+// two apart by the debug records of the object, not by the name.
+bool is_split_piece_name(std::string_view name);
+
 // True when the name contains a scope that only exists inside one TU: an anonymous namespace
 // ("?A0x<hash>") or a function scope ("?<digit>??"). Only such names can denote a TU-private
 // entity, which is what resolution step (2) looks up.

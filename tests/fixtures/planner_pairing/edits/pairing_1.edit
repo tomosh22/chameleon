@@ -1,0 +1,45 @@
+--- a/scope.cpp
++++ b/scope.cpp
+@@ -8,7 +8,12 @@
+     return v + 1;
+ }
+ 
++static int helper(int v)
++{
++    return v * 1000;
++}
++
+ int pp_scope_local()
+ {
+-    return 10;
++    return helper(7);
+ }
+--- a/guards.cpp
++++ b/guards.cpp
+@@ -32,5 +32,7 @@
+ // never have been constructed.
+ int pp_fresh()
+ {
+-    return 1;
++    static PpObj fresh = pp_make(4000);
++    fresh.hits += 1;
++    return fresh.id + fresh.hits;
+ }
+--- a/tsi.cpp
++++ b/tsi.cpp
+@@ -25,5 +25,5 @@
+ int pp_tsi_mark()
+ {
+     ++s_tsi_calls;
+-    return s_tsi_calls > 0 ? 1 : 0;
++    return s_tsi_calls > 0 ? 2 : 0;
+ }
+--- a/internal.cpp
++++ b/internal.cpp
+@@ -29,5 +29,5 @@
+ int pp_internal_mark()
+ {
+     ++s_internal_calls;
+-    return s_internal_calls > 0 ? 1 : 0;
++    return s_internal_calls > 0 ? 2 : 0;
+ }

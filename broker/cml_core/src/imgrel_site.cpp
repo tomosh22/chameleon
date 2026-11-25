@@ -47,14 +47,19 @@ InsnLayout parse_layout(const std::uint8_t* insn, std::size_t length, std::uint8
     if (insn == nullptr || length == 0 || length > kMaxInstruction) {
         return out;
     }
-    // Prefixes, as the decoder reads them: a REX prefix only counts when it is the last one.
+    // Prefixes, as the decoder reads them: a REX prefix only counts when it is the last one. (WP-40, R-50: what was seen at
+    // all is kept as well; a VEX/EVEX prefix after any REX or after 66/F2/F3/F0 is invalid, wherever they stood.)
     std::size_t i = 0;
     std::uint8_t rex = 0;
+    bool rex_seen = false;
+    bool simd_prefix_seen = false;
     for (; i < length; ++i) {
         if (is_legacy_prefix(insn[i])) {
             rex = 0;
+            simd_prefix_seen = simd_prefix_seen || insn[i] == 0x66 || insn[i] == 0xF2 || insn[i] == 0xF3 || insn[i] == 0xF0;
         } else if ((insn[i] & 0xF0) == 0x40) {
             rex = insn[i];
+            rex_seen = true;
         } else {
             break;
         }
@@ -67,8 +72,8 @@ InsnLayout parse_layout(const std::uint8_t* insn, std::size_t length, std::uint8
     const std::uint8_t first = insn[i];
     if (first == 0xC4 || first == 0xC5 || first == 0x62) {
         // VEX (C5 + 1 byte, C4 + 2 bytes) or EVEX (62 + 3 bytes), then the opcode, then ModRM. In 64-bit mode these bytes
-        // are never LES/LDS/BOUND. A REX prefix before them is invalid.
-        if (rex != 0) {
+        // are never LES/LDS/BOUND. A REX prefix before them is invalid, and so is 66, F2, F3 or F0.
+        if (rex_seen || simd_prefix_seen) {
             return out;
         }
         out.vex = true;
@@ -203,11 +208,17 @@ const SiteProver::Sweep& SiteProver::sweep_from(std::uint32_t start) {
         std::lower_bound(fields_.begin(), fields_.end(), start, [](const RelocField& f, std::uint32_t v) { return f.offset < v; }) - fields_.begin());
     std::uint64_t off = start;
     bool stopped = false;
-    // A relocation that begins before the function and reaches into it: the function does not start on a boundary.
-    if (fi > 0 && static_cast<std::uint64_t>(fields_[fi - 1].offset) + fields_[fi - 1].width > start) {
-        s.stop = SiteVerdict::RanIntoData;
-        s.stop_reason = "the relocation at +" + hex(fields_[fi - 1].offset) + " reaches into the function that starts at +" + hex(start);
-        stopped = true;
+    // A relocation that begins before the function and reaches into it: the function does not start on a boundary. (WP-40,
+    // R-50: every relocation that starts less than 8 bytes, the widest field, before the start is looked at, not only the
+    // last one; one of a type whose width is not known counts as reaching in, as it stops the sweep inside a function.)
+    for (std::size_t k = fi; !stopped && k > 0 && static_cast<std::uint64_t>(fields_[k - 1].offset) + 8 > start; --k) {
+        const RelocField& f = fields_[k - 1];
+        if (f.width == 0 || static_cast<std::uint64_t>(f.offset) + f.width > start) {
+            s.stop = SiteVerdict::RanIntoData;
+            s.stop_reason = "the relocation at +" + hex(f.offset) + (f.width == 0 ? " (of a type whose width is not known)" : std::string()) +
+                            " reaches into the function that starts at +" + hex(start);
+            stopped = true;
+        }
     }
     while (!stopped && off < limit) {
         const lde::DecodeResult r = lde::decode_instruction(base + off, static_cast<std::size_t>(limit - off));
@@ -339,7 +350,7 @@ SiteCheck SiteProver::check(std::uint32_t site) {
     }
     if (insn.layout.lea && !insn.layout.rex_w) {
         c.verdict = SiteVerdict::LeaTruncates;
-        c.reason = where + " is a lea with a 32-bit or 16-bit destination: the address it computes is truncated";
+        c.reason = where + " is a lea with a 32-bit or 16-bit destination: it computes a 32-bit image-relative value, which retargeting would change";
         return c;
     }
     c.verdict = SiteVerdict::Displacement;
