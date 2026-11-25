@@ -168,6 +168,10 @@ public:
     std::size_t reapply_pending() const noexcept { return reapply_pending_.load(); }
     // The baselines kept for process `pid` (path, baseline) of modules that are not enabled now; a restart carries them along.
     std::vector<std::pair<std::string, BaselineSnapshot>> kept_baselines(std::uint32_t pid) const;
+    // What a module's state hands on (to its next instance, or through a restart): the index's baseline (Ready) with the baseline it was
+    // given and has not restored yet (ModuleState::carried_in) under it; only carried_in while its index is not Ready; nullopt without
+    // either.
+    std::optional<BaselineSnapshot> leaving_baseline(ModuleState& state) const;
     // Tests: whether a baseline is kept for (pid, path), and whether that one is for an image that is still loaded.
     bool has_carry_for_testing(std::uint32_t pid, const std::string& module_path, bool* live = nullptr) const;
 
@@ -222,7 +226,13 @@ private:
         BaselineSnapshot snapshot;
         std::uint64_t live_base = 0;
         std::string origin;  // "reload" (the module was loaded again), "disable", "restart"
+        // The process it is for (restart token and command line, as its agent reported them; empty when not known): a later agent with
+        // the same pid but another identity is another program run, and the carry is dropped then.
+        std::string identity;
     };
+    // Drops the carries of `pid`. `only_other_than`: only those recorded for another process identity (empty: all). Needs mutex_.
+    void drop_carries_locked(std::uint32_t pid, const std::string* only_other_than, const char* why);
+    std::shared_ptr<ProcessHost> process_host_;  // guarded by mutex_: whether a process has exited (detach)
     using InstanceKey = std::pair<std::uint32_t, std::string>;  // pid, normalised path
     std::map<InstanceKey, Carry> carries_;                       // guarded by mutex_
     std::map<InstanceKey, std::uint64_t> instances_;             // guarded by mutex_: instances made so far (ModuleState::instance)
@@ -233,11 +243,12 @@ private:
         std::optional<BaselineSnapshot> restore;  // restored by the worker (the state existed before the carry arrived); else the index applied it
         std::vector<std::string> files;           // the files with accepted edits, for the log and a failure
         std::string origin;
+        std::uint64_t generation = 0;             // the module's generation when it was queued (a reload since may have applied it)
     };
     void queue_reapply(ReapplyItem item);
     void reapply_loop();
     void reapply_one(const ReapplyItem& item);
-    std::optional<BaselineSnapshot> leaving_baseline(ModuleState& state) const;
+    bool reapply_stopping() const;
     mutable std::mutex reapply_mutex_;  // guards the members below
     std::condition_variable reapply_changed_;
     std::deque<ReapplyItem> reapply_queue_;

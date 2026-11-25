@@ -354,6 +354,10 @@ std::size_t Installer::forget_range(std::uint64_t base, std::uint64_t size) {
     if (size == 0) {
         return 0;
     }
+    // A Record owns nothing beyond itself: the hook is a jump written into the module's own bytes (its padding or its entry) straight to
+    // the replacement, with no trampoline, no near-allocated slot and no other bookkeeping (the patch images and their reservation are
+    // the loader's, which keeps them for the session). So dropping the records is all there is to release; repeated FreeLibrary
+    // cycles leak nothing here.
     std::lock_guard<std::mutex> lock(mutex_);
     const std::uint64_t end = base + size;
     const auto first = std::remove_if(records_.begin(), records_.end(), [&](const Record& r) {

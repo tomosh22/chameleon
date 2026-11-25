@@ -20,6 +20,7 @@
 #include "cml/core/control_server.h"
 #include "cml/core/process_registry.h"
 #include "cml/core/reload_service.h"
+#include "cml/core/restart.h"
 #include "cml/core/revert.h"
 #include "cml/proc/diag_ids.h"
 #include "cml/util/log.h"
@@ -117,6 +118,7 @@ struct Rig {
     bool compile_warning = false;               // the fake compiler reports a warning
     std::vector<std::string> compile_outputs;   // output_object of every compile request
     std::atomic<int> compile_calls{0};
+    std::atomic<bool> block_until_cancel{false};  // WP-45: the fake compiler runs until the broker cancels it
     std::atomic<int> link_calls{0};
     std::atomic<int> resolve_calls{0};
     std::vector<std::byte> second_object;       // what the "compiler" produces for main.cpp (compiland 1), when set
@@ -185,12 +187,20 @@ struct Rig {
 
         PipelineEnv env;
         env.compile_all = [this](const std::vector<toolchain::CompileRequest>& requests_in, std::vector<toolchain::CompileOutcome>& outcomes, unsigned,
-                                 toolchain::CancelToken*, const std::function<void(std::size_t)>& on_done) {
+                                 toolchain::CancelToken* cancel, const std::function<void(std::size_t)>& on_done) {
             std::vector<Result<void>> results;
             for (std::size_t i = 0; i < requests_in.size(); ++i) {
                 ++compile_calls;
                 if (compile_hook) {
                     compile_hook();
+                }
+                // WP-45: a compiler that runs until the broker cancels it (like the real driver, which kills its processes).
+                while (block_until_cancel.load() && (cancel == nullptr || !cancel->cancelled())) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                if (cancel != nullptr && cancel->cancelled()) {
+                    results.emplace_back(Diag::make(2200, "the compile was cancelled", "x"));
+                    continue;
                 }
                 outcomes[i].object_path = requests_in[i].output_object;
                 outcomes[i].compiler_used = "C:\\VC\\bin\\cl.exe";
@@ -3177,6 +3187,15 @@ TEST_CASE("static libraries (WP-26b): CML5921 is raised once for an edit, on eve
 #if defined(_WIN32)
 namespace {
 
+// A process host that cannot restart anything and reports every process as exited (WP-45: detach drops the carries then).
+class ExitedHost final : public ProcessHost {
+public:
+    Result<std::unique_ptr<RestartableProcess>> open(std::uint32_t, const std::uint64_t[3], std::uint32_t, std::vector<Diag>*) override {
+        return Diag::make(5805, "not in this test", "x");
+    }
+    bool has_exited(std::uint32_t) const override { return true; }
+};
+
 // A message of the agent of the rig's first process, then what the connection thread does after it.
 void agent_says(Rig& rig, const ipc::Message& m) {
     rig.session.on_message(m);
@@ -3438,6 +3457,7 @@ TEST_CASE("WP-45: a baseline a restart hands over is re-applied when the module 
         unload_exe(rig);
         CHECK(rig.service->has_carry_for_testing(kPid, rig.exe));
         CHECK(rig.service->kept_baselines(kPid).size() == 1);
+        rig.service->set_process_host(std::make_shared<ExitedHost>());  // the process has exited when its agent disconnects
         rig.service->detach(1);
         CHECK_FALSE(rig.service->has_carry_for_testing(kPid, rig.exe));
     }
@@ -3503,3 +3523,142 @@ TEST_CASE("WP-45: SourceBaseline::adopt takes stamps and originals over as they 
         CHECK(b.sweep().changed == std::vector<std::string>{file});  // differs from the original: it is re-applied
     }
 }
+
+// ---- WP-45, review round 1 ----------------------------------------------------------------------------------------------------
+
+namespace {
+
+BaselineSnapshot edited(const std::string& file, std::uint64_t original_hash) {
+    BaselineSnapshot b;
+    b.originals[file] = FileStamp{original_hash, 10, 1};
+    b.stamps[file] = FileStamp{original_hash + 1, 12, 2};
+    return b;
+}
+
+void say(Rig& rig, const ipc::Message& m) {
+    rig.session.on_message(m);
+    rig.link->publish(rig.session);
+    rig.service->on_session_changed(1);
+}
+
+std::size_t count_diag_id(Rig& rig, const std::string& id) {
+    std::lock_guard<std::mutex> lock(rig.events->mutex);
+    std::size_t n = 0;
+    for (const Event& e : rig.events->events) {
+        n += (e.name == "diag" && e.body.get_string("id") == id) ? 1 : 0;
+    }
+    return n;
+}
+
+}  // namespace
+
+TEST_CASE("WP-45 review 6: a carry stored while a dropped instance's baseline was being taken is merged with it, not replaced") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    // The exe's instance was given a baseline (a.cpp) to re-apply.
+    {
+        std::lock_guard<std::mutex> lock(rig.module->mutex);
+        rig.module->carried_in = edited("c:\\proj\\a.cpp", 0x10);
+    }
+    // In the moment the service's lock is free during the drop, a restart hands over b.cpp for the same pid and module (carry_to_late_module
+    // finds no state: here through another connection of the same pid that has none).
+    auto other = std::make_shared<AgentLink>(3, [](const ipc::Message&) { return Result<void>(); });
+    rig.service->attach(other);
+    rig.service->carry_to_late_module(3, kPid, rig.exe, edited("c:\\proj\\b.cpp", 0x20), "restart");
+    REQUIRE(rig.service->has_carry_for_testing(kPid, rig.exe));
+
+    ipc::ModuleUnloaded unloaded;
+    unloaded.module = {kModuleBase, 0x4000, rig.exe};
+    say(rig, unloaded);
+    const auto kept = rig.service->kept_baselines(kPid);
+    REQUIRE(kept.size() == 1);
+    CHECK(kept[0].second.originals.count("c:\\proj\\a.cpp") == 1);  // the dropped instance's
+    CHECK(kept[0].second.originals.count("c:\\proj\\b.cpp") == 1);  // and the restart's
+    bool live = true;
+    CHECK(rig.service->has_carry_for_testing(kPid, rig.exe, &live));
+    CHECK_FALSE(live);
+}
+
+TEST_CASE("WP-45 review 2: an instance that goes away before its re-apply ran is abandoned, not reported (no CML5601)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    const std::string gone = "C:\\app\\gone.dll";  // no PDB behind it: its index fails
+    // The worker is busy with an earlier item that waits for the run lock (held here).
+    std::unique_ptr<ExclusiveRun> held = rig.service->lock_reloads();
+    REQUIRE(held != nullptr);
+    rig.service->carry_to_late_module(1, kPid, rig.exe, edited("c:\\proj\\x.cpp", 0x30), "restart");
+    rig.service->carry_to_late_module(1, kPid, gone, edited("c:\\proj\\gone.cpp", 0x40), "restart");
+    ipc::ModuleLoaded loaded;
+    loaded.module = {0x180000000ull, 0x10000, gone};
+    say(rig, loaded);
+    ipc::EnableModule enable;
+    enable.request_id = 30;
+    enable.path = gone;
+    say(rig, enable);
+    REQUIRE(rig.service->module_state(1, gone) != nullptr);
+    CHECK(rig.service->reapply_pending() == 2);
+    ipc::ModuleUnloaded unloaded;
+    unloaded.module = loaded.module;
+    say(rig, unloaded);  // gone.dll is freed again before the worker got to it
+    CHECK(rig.service->module_state(1, gone) == nullptr);
+    held.reset();
+    for (int i = 0; i < 1000 && rig.service->reapply_pending() != 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(rig.service->reapply_pending() == 0);
+    CHECK(count_diag_id(rig, "CML5601") == 0);
+    CHECK(count_diag_id(rig, "CML5600") == 0);
+    // Its carry was handed on (to its next instance), not lost.
+    CHECK(rig.service->has_carry_for_testing(kPid, gone));
+}
+
+#if defined(_WIN32)
+TEST_CASE("WP-45 review 7: a reload that applied the restored edits before the worker got the run lock is not repeated") {
+    QuietLogs quiet;
+    Rig rig(false, std::string(), false, true);
+    rig.enable();
+    rig.write_logic(22);
+    REQUIRE(rig.reload().has_value());
+    REQUIRE(rig.compile_calls == 1);
+    unload_exe(rig);
+    std::unique_ptr<ExclusiveRun> held = rig.service->lock_reloads();  // the worker will wait for it
+    REQUIRE(held != nullptr);
+    load_exe(rig);
+    const std::shared_ptr<ModuleState> again = current_state(rig);
+    REQUIRE(again->index->wait(30000));
+    // A reload (here under the held lock, as a save or another command would get it first) applies the restored edit ...
+    Value args = Value::object();
+    args.set("timeout_ms", Value::integer(30000));
+    Result<Value> first = rig.service->reload_locked(args);
+    REQUIRE_MESSAGE(first.has_value(), first.error().format());
+    CHECK(first->get_integer("patched") == 1);
+    held.reset();
+    wait_idle(rig);
+    // ... and the worker sees the generation moved and does not reload again.
+    CHECK(rig.compile_calls == 2);
+    CHECK(generation_of(*again) == 1);
+    CHECK(count_diag_id(rig, "CML5600") == 0);
+}
+
+TEST_CASE("WP-45 review 4: a broker that shuts down while the re-apply worker reloads returns promptly, without a CML5600") {
+    QuietLogs quiet;
+    Rig rig(false, std::string(), false, true);
+    rig.enable();
+    rig.write_logic(22);
+    REQUIRE(rig.reload().has_value());
+    unload_exe(rig);
+    rig.block_until_cancel = true;  // the re-apply's compile runs until the broker cancels it
+    load_exe(rig);
+    for (int i = 0; i < 3000 && rig.compile_calls.load() < 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    REQUIRE(rig.compile_calls.load() == 2);
+    const auto start = std::chrono::steady_clock::now();
+    rig.service.reset();  // the destructor: stop flag, cancel, join
+    const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    CHECK(took < 10000);
+    CHECK(count_diag_id(rig, "CML5600") == 0);
+}
+#endif  // _WIN32

@@ -451,13 +451,10 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
     // preparation and with reloads held off, so every patch applied to the old process is in it.
     std::vector<Carried> carried;
     for (const std::shared_ptr<ModuleState>& state : service_.module_states(old_snap.agent_id)) {
-        std::shared_ptr<ModuleIndex> index;
-        {
-            std::lock_guard<std::mutex> lock(state->mutex);
-            index = state->index;
-        }
-        if (index && index->status().state == IndexState::Ready) {
-            carried.push_back(Carried{state->path, index->baseline_snapshot()});
+        // WP-45: the index's baseline (Ready) with what the state was given to re-apply and has not restored yet (a re-apply that is
+        // queued behind this restart's run lock), or only the latter while its index is not ready.
+        if (std::optional<BaselineSnapshot> baseline = service_.leaving_baseline(*state)) {
+            carried.push_back(Carried{state->path, std::move(*baseline)});
         }
     }
     // WP-45: a module of the old process that is not enabled at the moment (it was freed, or disabled) left its baseline in the
@@ -825,22 +822,24 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
         }
         missing = missing_in(new_link->snapshot());
     }
-    // WP-45: the carried baselines of a module that is not enabled yet; they are re-applied when the new process enables it.
-    const auto carried_of = [&](const ipc::RestartModule& m) {
-        std::vector<const Carried*> out;
-        for (const Carried& c : carried) {
-            if (path::same_path(m.path, c.path) || path::matches_module(m.path, c.path) || path::matches_module(c.path, m.path)) {
-                out.push_back(&c);
+    // WP-45: which missing module each carried baseline belongs to, so that its edited files are counted once (in the CML5809 of the
+    // first module it matches: the matching is by name in both directions, so one baseline can match several entries).
+    std::vector<std::size_t> owner(carried.size(), missing.size());
+    for (std::size_t k = 0; k < carried.size(); ++k) {
+        for (std::size_t i = 0; i < missing.size() && owner[k] == missing.size(); ++i) {
+            const std::string& m = missing[i].path;
+            if (path::same_path(m, carried[k].path) || path::matches_module(m, carried[k].path) || path::matches_module(carried[k].path, m)) {
+                owner[k] = i;
             }
         }
-        return out;
-    };
+    }
     Value not_enabled = Value::array();
-    for (const ipc::RestartModule& m : missing) {
+    for (std::size_t i = 0; i < missing.size(); ++i) {
+        const ipc::RestartModule& m = missing[i];
         not_enabled.push(Value::string(m.path));
         std::size_t edited = 0;
-        for (const Carried* c : carried_of(m)) {
-            edited += c->baseline.originals.size();
+        for (std::size_t k = 0; k < carried.size(); ++k) {
+            edited += owner[k] == i ? carried[k].baseline.originals.size() : 0;
         }
         warn(Diag::make(rd::kModuleNotEnabled, "module '" + m.path + "' is not enabled in the new process (pid " + std::to_string(new_pid) + ")" +
                             (reenable_injected ? left_running : std::string()) +
@@ -854,16 +853,15 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
 
     // The enabled modules of the new process, and their PDB indexes.
     const LinkSnapshot new_snap = new_link->snapshot();
-    // WP-45 (F-42.3): a module the new process enables only later (it loads it lazily) gets the session's edits when it is enabled.
-    // One that was enabled since `missing` was computed is in new_snap and is restored below, like the others.
-    for (const ipc::RestartModule& m : missing) {
-        for (const Carried* c : carried_of(m)) {
-            const bool enabled_now = std::any_of(new_snap.enabled.begin(), new_snap.enabled.end(), [&](const std::string& full) { return path::same_path(full, c->path); });
-            CML_LOG(Trace, "restart: decision=%s module=%s pid=%u originals=%zu", enabled_now ? "restore-now" : "carry-to-late-enable", c->path.c_str(), new_pid,
-                    c->baseline.originals.size());
-            if (!enabled_now) {
-                service_.carry_to_late_module(new_agent, new_pid, c->path, c->baseline, "restart");
-            }
+    // WP-45 (F-42.3): every carried baseline of a module the new process has not enabled (a module it loads lazily, one the restart
+    // could not enable, and one the old process had freed or disabled, whose baseline the service kept) goes to the new process: its
+    // enable re-applies the edits. Each once. A module enabled since `missing` was computed is in new_snap and is restored below.
+    for (const Carried& c : carried) {
+        const bool enabled_now = std::any_of(new_snap.enabled.begin(), new_snap.enabled.end(), [&](const std::string& full) { return path::same_path(full, c.path); });
+        CML_LOG(Trace, "restart: decision=%s module=%s pid=%u originals=%zu", enabled_now ? "restore-now" : "carry-to-late-enable", c.path.c_str(), new_pid,
+                c.baseline.originals.size());
+        if (!enabled_now) {
+            service_.carry_to_late_module(new_agent, new_pid, c.path, c.baseline, "restart");
         }
     }
     Value enabled_json = Value::array();

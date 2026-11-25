@@ -1874,8 +1874,13 @@ TEST_CASE("restart (WP-45): the edits of a module the new process loads later ar
     REQUIRE(result->find("not_enabled")->items().size() == 1);
     CHECK(result->find("not_enabled")->items()[0].as_string() == kOther);
     CHECK(has_diag(rig, "warning", "CML5809", "re-applied when it is enabled"));
-    // Handed to the new process (pid 200). (The old process's record goes when its agent disconnects; the scripted one does not.)
+    // Handed to the new process (pid 200). (The old process's record goes when its agent disconnects and the process has exited; the
+    // scripted one does neither by itself.)
     CHECK(rig.service.has_carry_for_testing(200, kOther));
+    {
+        std::lock_guard<std::mutex> lock(rig.mutex);
+        rig.exited.insert(100);
+    }
     rig.service.detach(1);
     CHECK_FALSE(rig.service.has_carry_for_testing(100, kOther));
     CHECK(rig.service.has_carry_for_testing(200, kOther));
@@ -1914,4 +1919,112 @@ TEST_CASE("restart (WP-45): a module without accepted edits that is not enabled 
     CHECK(has_diag(rig, "warning", "CML5809"));
     CHECK_FALSE(has_diag(rig, "warning", "CML5809", "re-applied"));
     CHECK_FALSE(rig.service.has_carry_for_testing(200, kOther));
+}
+
+namespace {
+
+BaselineSnapshot edited_baseline(const std::string& file) {
+    BaselineSnapshot b;
+    b.originals[file] = FileStamp{0x11, 10, 1};
+    b.stamps[file] = FileStamp{0x22, 12, 2};
+    return b;
+}
+
+}  // namespace
+
+TEST_CASE("restart (WP-45 review 1): a kept baseline of a module the old process had freed travels even when it is not in the module list") {
+    QuietLogs quiet;
+    Rig rig;
+    // other.dll was edited, reloaded and freed before the restart: it is not enabled, so it is in neither the agent's module list nor
+    // `missing`; only the service's kept baseline knows its edits.
+    rig.service.carry_to_late_module(1, 100, kOther, edited_baseline("c:\\app\\src\\other.cpp"), "reload");
+    rig.new_process_lacks = kOther;
+    Result<Value> result = rig.service.restart(args_for(100, 10000));
+    REQUIRE_MESSAGE(result.has_value(), result.error().format());
+    CHECK(result->find("not_enabled")->items().empty());  // nothing the application had enabled is missing
+    CHECK(rig.service.has_carry_for_testing(200, kOther));  // ... and the new process still gets the edits when it enables other.dll
+}
+
+TEST_CASE("restart (WP-45 review 3): a baseline a state was given and has not restored yet travels with the restart") {
+    QuietLogs quiet;
+    Rig rig;
+    // plugin.dll's re-apply is queued behind the restart's run lock: its state holds the baseline (carried_in), its index has not
+    // restored it (here: the index never gets ready at all).
+    const std::shared_ptr<ModuleState> plugin = rig.service.module_state(1, kDll);
+    REQUIRE(plugin != nullptr);
+    {
+        std::lock_guard<std::mutex> lock(plugin->mutex);
+        plugin->carried_in = edited_baseline("c:\\app\\src\\plugin.cpp");
+    }
+    rig.new_process_lacks = kDll;  // the new process loads it later
+    Result<Value> result = rig.service.restart(args_for(100, 10000));
+    REQUIRE_MESSAGE(result.has_value(), result.error().format());
+    REQUIRE(result->find("not_enabled")->items().size() == 1);
+    CHECK(has_diag(rig, "warning", "CML5809", "1 file(s) are re-applied when it is enabled"));
+    CHECK(rig.service.has_carry_for_testing(200, kDll));
+    const auto kept = rig.service.kept_baselines(200);
+    REQUIRE(kept.size() == 1);
+    CHECK(kept[0].second.originals.count("c:\\app\\src\\plugin.cpp") == 1);
+}
+
+TEST_CASE("restart (WP-45 review 8): a baseline that matches several missing modules is counted once and handed over once") {
+    QuietLogs quiet;
+    Rig rig;
+    const std::shared_ptr<ModuleState> plugin = rig.service.module_state(1, kDll);
+    REQUIRE(plugin != nullptr);
+    {
+        std::lock_guard<std::mutex> lock(plugin->mutex);
+        plugin->carried_in = edited_baseline("c:\\app\\src\\plugin.cpp");
+    }
+    // The application reported plugin.dll twice: by its full path and by its name.
+    rig.reported_modules.push_back(ipc::RestartModule{1, "plugin.dll"});
+    rig.new_process_lacks = kDll;
+    Result<Value> result = rig.service.restart(args_for(100, 10000));
+    REQUIRE_MESSAGE(result.has_value(), result.error().format());
+    REQUIRE(result->find("not_enabled")->items().size() == 2);
+    int counted = 0;
+    {
+        std::lock_guard<std::mutex> lock(rig.events->mutex);
+        for (const Event& e : rig.events->events) {
+            if (e.name == "diag" && e.body.get_string("id") == "CML5809" && e.body.get_string("message").find("re-applied when it is enabled") != std::string::npos) {
+                ++counted;
+            }
+        }
+    }
+    CHECK(counted == 1);
+    CHECK(rig.service.kept_baselines(200).size() == 1);
+}
+
+TEST_CASE("WP-45 review 5: an agent that disconnects keeps its process's carries unless the process has exited or another process has the pid") {
+    QuietLogs quiet;
+    SUBCASE("the process still runs (the pipe broke, the agent reconnects): kept, and the reconnected agent has them") {
+        Rig rig;
+        rig.service.carry_to_late_module(1, 100, kOther, edited_baseline("c:\\app\\src\\other.cpp"), "reload");
+        rig.service.detach(1);
+        CHECK(rig.service.has_carry_for_testing(100, kOther));
+        auto again = std::make_shared<SimAgent>(rig.service, 7);
+        rig.new_agents.push_back(again);  // lives as long as the rig
+        again->register_process(100, "", {kExe, kDll, kOther}, {kExe});  // the same process: same token, same command line
+        CHECK(rig.service.has_carry_for_testing(100, kOther));
+    }
+    SUBCASE("the process has exited: dropped at the disconnect") {
+        Rig rig;
+        rig.service.carry_to_late_module(1, 100, kOther, edited_baseline("c:\\app\\src\\other.cpp"), "reload");
+        {
+            std::lock_guard<std::mutex> lock(rig.mutex);
+            rig.exited.insert(100);
+        }
+        rig.service.detach(1);
+        CHECK_FALSE(rig.service.has_carry_for_testing(100, kOther));
+    }
+    SUBCASE("the exit was not seen, and another process registers with the pid: dropped then") {
+        Rig rig;
+        rig.service.carry_to_late_module(1, 100, kOther, edited_baseline("c:\\app\\src\\other.cpp"), "reload");
+        rig.service.detach(1);
+        CHECK(rig.service.has_carry_for_testing(100, kOther));
+        auto other = std::make_shared<SimAgent>(rig.service, 8);
+        rig.new_agents.push_back(other);
+        other->register_process(100, "another-token", {kExe}, {kExe});
+        CHECK_FALSE(rig.service.has_carry_for_testing(100, kOther));
+    }
 }
