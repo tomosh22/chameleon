@@ -145,13 +145,21 @@ void ReloadService::detach(std::uint64_t agent_id) {
         coordinator = restart_;
     }
     // WP-43: an unfinished restart's record for this process must not outlive it (its pid may be reused). R-51: neither must what
-    // inject-failure armed in its agent: a new process with the same pid would report it as `injection_disarmed`.
+    // inject-failure armed in its agent (a new process with the same pid would report it as `injection_disarmed`), but only once the
+    // process has really exited: a pipe that broke, or a broker that shuts down (cancel()), leaves the agent armed, so the records
+    // (and the persisted ones) stay.
     if (entry.link != nullptr) {
         const LinkSnapshot snap = entry.link->snapshot();
         if (snap.handshaken && snap.pid != 0) {
-            faults_.forget_process(snap.pid);
+            std::optional<bool> exited;
+            if (coordinator != nullptr && !cancel_.cancelled() && faults_.has_process_records(snap.pid)) {
+                exited = coordinator->process_exited(snap.pid);
+                if (*exited) {
+                    faults_.forget_process(snap.pid);
+                }
+            }
             if (coordinator != nullptr) {
-                coordinator->process_gone(snap.pid);
+                coordinator->process_gone(snap.pid, exited);
             }
         }
     }

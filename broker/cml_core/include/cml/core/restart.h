@@ -178,7 +178,11 @@ public:
     // process with the restart token it was made for, so a reused pid never gets it.
     // R-51: on Windows the pipe can break before the process handle is signalled, so a process that is not seen as exited at once is
     // looked at again for a short, bounded time (set_exit_recheck_for_testing; default 500 ms in 25 ms steps) before the record is kept.
-    void process_gone(std::uint32_t pid);
+    // `exited`: what the caller found out already with process_exited (not asked again).
+    void process_gone(std::uint32_t pid, std::optional<bool> exited = std::nullopt);
+    // WP-44 (R-51): whether process `pid` has exited, by the host (false without one, or when it cannot tell). A process not seen as
+    // exited at once is looked at again for the bounded time above.
+    bool process_exited(std::uint32_t pid);
     void set_exit_recheck_for_testing(std::chrono::milliseconds total, std::chrono::milliseconds step) {
         exit_recheck_ = total;
         exit_recheck_step_ = step;

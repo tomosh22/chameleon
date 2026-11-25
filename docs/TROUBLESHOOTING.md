@@ -2944,8 +2944,8 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 
 ### CML5978
 
-- **Cause:** `inject-failure` was asked to arm a stage of the restart (or the revert) while a restart (or a reload or revert) runs. A restart or revert stage is armed for the next operation of its process only; arming it in the middle of one could fail a step that must not fail (the undo of a revert's re-pointing, say).  
-- **Message:** `the stage '<name>' cannot be armed while a restart runs` (or `... while a reload or revert runs`)  
+- **Cause:** `inject-failure` was asked to arm a stage of the restart (or the revert) while a restart (or a reload or revert) runs. A restart or revert stage is armed for the next operation of its process only; arming it in the middle of one could fail a step that must not fail (the undo of a revert's re-pointing, say).   WP-44: the same holds for the stages of `exception-action` while an `exception-action` runs, and for the watch stages while a batch of saves is handled (the operation counts as running until it has disarmed what is left for it).  
+- **Message:** `the stage '<name>' cannot be armed while a restart runs` (or `... while a reload or revert runs`, `... while an exception-action runs`, `... while a batch of saves of the compile-on-save watcher runs`)  
 - **What to do:** Wait for the operation to finish (control command `wait`), then arm the stage.  
 - **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
 

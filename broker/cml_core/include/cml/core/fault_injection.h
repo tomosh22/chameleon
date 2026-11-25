@@ -67,8 +67,13 @@ public:
     // WP-43: which agent stages inject-failure armed in which process, so that the end of an operation can disarm them there.
     void note_agent_armed(ipc::fault::Stage stage, std::uint32_t pid, bool persist = false);
     bool take_agent_armed(ipc::fault::Stage stage, std::uint32_t pid);
-    // R-51: the agent of process `pid` is gone: its records are dropped, so a new process that reuses the pid never reports them.
+    // R-51: process `pid` has exited (ReloadService::detach asks the process host): its records, persisted ones included, are dropped,
+    // so a new process that reuses the pid never reports them.
     void forget_process(std::uint32_t pid);
+    bool has_process_records(std::uint32_t pid) const;
+    // WP-44: {"stage":"none","pid":N}: the broker stages that can fire for N (armed for N or for every process) and N's agent records;
+    // the armings and persisted entries of other processes stay.
+    void disarm_process(std::uint32_t pid);
 
     // R-51: see the top of the file. Taken by inject_failure (for a stage with an end-of-operation cleanup) and by the operations
     // while they start; never held while an operation runs.

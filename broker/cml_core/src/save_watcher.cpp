@@ -172,6 +172,24 @@ void SaveWatcher::on_batch(const watch::ChangeBatch& batch) {
     relevant = relevant || hits != 0;
     // WP-44: a batch that would start a reload is the operation of the failure-injection group "watch" (an irrelevant batch is not).
     FaultInjector* const faults = relevant ? hooks_.faults : nullptr;
+    // It counts as running (under the gate, like restart, revert and exception-action), so an inject-failure of a watch stage is refused
+    // until the batch has disarmed what is left for it: an arming made meanwhile could otherwise be used up, or disarmed, by this batch.
+    struct Operation {
+        FaultInjector* faults;
+        explicit Operation(FaultInjector* f) : faults(f) {
+            if (faults != nullptr) {
+                std::lock_guard<std::mutex> gate(faults->gate());
+                faults->begin_operation("watch");
+            }
+        }
+        ~Operation() {
+            if (faults != nullptr) {
+                faults->end_operation("watch");
+            }
+        }
+        Operation(const Operation&) = delete;
+        Operation& operator=(const Operation&) = delete;
+    } operation(faults);
     const auto injected = [&](ipc::fault::Stage stage) { return faults != nullptr ? faults->hit(stage, 0) : std::optional<Diag>(); };
     const auto finish = [&] {
         if (faults == nullptr) {
@@ -213,10 +231,8 @@ void SaveWatcher::on_batch(const watch::ChangeBatch& batch) {
         finish();
         return;
     }
-    if (overflow && !batch.overflow) {
-        CML_LOG(Trace, "compile-on-save: the injected loss of the batch re-checks every tracked file");
-    }
-    if (batch.overflow && batch.lost_roots.empty()) {
+    // Lost events, real or injected (watch-debounce): reported, and every tracked file is re-checked by the reload below.
+    if (overflow && batch.lost_roots.empty()) {
         CML_LOG(Warn, "compile-on-save: file events were lost; every tracked file is re-checked");
         if (hooks_.report) {
             hooks_.report(Diag::make(wd::kOverflow, "the directory watcher lost events (buffer overflow)",

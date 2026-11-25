@@ -181,10 +181,19 @@ bool RestartCoordinator::has_unfinished(std::uint32_t pid) {
     return unfinished_.find(pid) != unfinished_.end();
 }
 
-void RestartCoordinator::process_gone(std::uint32_t pid) {
+void RestartCoordinator::process_gone(std::uint32_t pid, std::optional<bool> exited_known) {
     if (!has_unfinished(pid)) {
         return;
     }
+    if (!(exited_known ? *exited_known : process_exited(pid))) {
+        CML_LOG(Info, "restart: the agent of process %u disconnected, the process has not exited; what its unfinished restart left is kept", pid);
+        return;
+    }
+    CML_LOG(Info, "restart: process %u has exited; what its unfinished restart left is dropped", pid);
+    forget_unfinished(pid);
+}
+
+bool RestartCoordinator::process_exited(std::uint32_t pid) {
     const std::shared_ptr<ProcessHost> h = host();
     bool exited = h != nullptr && h->has_exited(pid);
     if (h != nullptr && !exited) {
@@ -198,12 +207,7 @@ void RestartCoordinator::process_gone(std::uint32_t pid) {
         CML_LOG(Trace, "restart: process %u %s after its agent disconnected (looked again for up to %lld ms)", pid, exited ? "has exited" : "still runs",
                 static_cast<long long>(exit_recheck_.count()));
     }
-    if (!exited) {
-        CML_LOG(Info, "restart: the agent of process %u disconnected, the process has not exited; what its unfinished restart left is kept", pid);
-        return;
-    }
-    CML_LOG(Info, "restart: process %u has exited; what its unfinished restart left is dropped", pid);
-    forget_unfinished(pid);
+    return exited;
 }
 
 bool RestartCoordinator::has_unfinished_for_testing(std::uint32_t pid) {

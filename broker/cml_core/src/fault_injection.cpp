@@ -24,7 +24,7 @@ namespace {
 // WP-44: the groups whose operations disarm what is still armed for them at their end (finish_injection). An arming of such a group
 // is recorded and its operation's start is ordered against it (FaultInjector::gate()).
 bool has_cleanup(const std::string& group) {
-    return group == "restart" || group == "revert" || group == "exception-action";
+    return group == "restart" || group == "revert" || group == "exception-action" || group == "watch";
 }
 
 }  // namespace
@@ -154,6 +154,31 @@ void FaultInjector::forget_process(std::uint32_t pid) {
     if (persisted) {
         (void)save_locked();
     }
+}
+
+bool FaultInjector::has_process_records(std::uint32_t pid) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (std::size_t i = 0; i < fault::kStageCount; ++i) {
+        if (agent_armed_[i].count(pid) != 0 || agent_persist_[i].count(pid) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void FaultInjector::disarm_process(std::uint32_t pid) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (Arming& a : armed_) {
+        if (a.remaining != 0 && (!a.pid || *a.pid == pid)) {
+            a = Arming{};
+        }
+    }
+    for (std::size_t i = 0; i < fault::kStageCount; ++i) {
+        agent_armed_[i].erase(pid);
+        agent_persist_[i].erase(pid);
+    }
+    CML_LOG(Trace, "failure injection: everything that could fire for process %u is disarmed; other processes' armings stay", pid);
+    (void)save_locked();
 }
 
 void FaultInjector::begin_operation(const char* group) {
@@ -354,7 +379,8 @@ std::vector<Diag> FaultInjector::load_state() {
             const std::int64_t count = e.get_integer("count");
             const std::int64_t pid = e.get_integer("pid");
             if (info == nullptr || info->agent_side || count < 1 || count > static_cast<std::int64_t>(fault::kMaxCount) || pid < 0 || pid > 0xFFFFFFFFll ||
-                (std::string(info->group) != "reload" && count != 1)) {
+                (std::string(info->group) != "reload" && count != 1) || (std::string(info->group) == "watch" && pid != 0)) {
+                // (A watch stage is not per process: with a pid it would never fire or be disarmed, as inject-failure says.)
                 broken("a broker entry names no stage of the broker, or has a bad count or pid");
                 return problems;
             }
@@ -552,8 +578,13 @@ Result<Value> inject_failure(ReloadService& service, const Value& args) {
     Value processes = Value::array();
 
     if (stage_name == fault::kDisarm) {
-        // Disarm everything that can be disarmed, then say which agents could not be. WP-44: the persisted armings go as well.
-        service.faults().disarm_all();
+        // Disarm everything that can be disarmed, then say which agents could not be. WP-44: the persisted armings go as well; with a
+        // pid only what can fire for that process (the other processes' armings and records stay).
+        if (pid) {
+            service.faults().disarm_process(*pid);
+        } else {
+            service.faults().disarm_all();
+        }
         std::vector<std::uint32_t> failed;
         std::string reasons;
         for (const std::shared_ptr<AgentLink>& link : targets) {
@@ -594,6 +625,12 @@ Result<Value> inject_failure(ReloadService& service, const Value& args) {
         return Diag::make(fault::ids::kBadRequest, "the stage '" + stage_name + "' belongs to the compile-on-save watcher, which is not per process: 'pid' cannot be given",
                           "Send the stage without 'pid'.");
     }
+    if (persist && info->agent_side && !has_cleanup(group)) {
+        // The arming lives in the agent process, which keeps it across a broker restart by itself; the broker keeps nothing for it.
+        return Diag::make(fault::ids::kBadRequest,
+                          "'persist' does not apply to the stage '" + stage_name + "': it is armed in the agent process, which keeps it across a broker restart by itself",
+                          "Send the stage without 'persist'. It applies to the broker's stages and to the agent stages of the restart, the revert and exception-action.");
+    }
     if (persist && !service.faults().has_state_file()) {
         return Diag::make(fault::ids::kPersist,
                           "the arming of '" + stage_name + "' cannot be kept across a broker restart: this broker writes no log file to keep it next to",
@@ -607,10 +644,14 @@ Result<Value> inject_failure(ReloadService& service, const Value& args) {
     if (cleanup) {
         gate = std::unique_lock<std::mutex>(service.faults().gate());
         const bool busy = (group == "restart" && service.restart_active()) || (group == "revert" && service.reload_running()) ||
-                          (group == "exception-action" && service.faults().operation_running("exception-action"));
+                          (group == "exception-action" && service.faults().operation_running("exception-action")) ||
+                          (group == "watch" && service.faults().operation_running("watch"));
         if (busy) {
-            const char* what = group == "restart" ? "restart" : group == "revert" ? "reload or revert" : "exception-action";
-            return Diag::make(fault::ids::kInjectBusy, "the stage '" + stage_name + "' cannot be armed while a " + what + " runs",
+            const char* what = group == "restart"            ? "a restart"
+                               : group == "revert"           ? "a reload or revert"
+                               : group == "exception-action" ? "an exception-action"
+                                                             : "a batch of saves of the compile-on-save watcher";
+            return Diag::make(fault::ids::kInjectBusy, "the stage '" + stage_name + "' cannot be armed while " + what + " runs",
                               "Wait for it to finish (control command `wait`), then arm the stage.");
         }
     }
@@ -628,9 +669,6 @@ Result<Value> inject_failure(ReloadService& service, const Value& args) {
                                       "Arm it right after the module is enabled and before its first reload, or start a new process.");
                 }
             }
-        }
-        if (group == "exception") {
-            service.faults().disarm(fault::Stage::ExceptionReport);  // WP-44: one arming of the group at a time
         }
         // R-51: recorded before the agents are asked, so an operation that ends afterwards always finds the record.
         if (cleanup) {
@@ -655,15 +693,18 @@ Result<Value> inject_failure(ReloadService& service, const Value& args) {
             armed.push_back(link);
             processes.push(Value::integer(link->snapshot().pid));
         }
-    } else {
         if (group == "exception") {
-            // WP-44: one arming of the group at a time: exception-hold goes in the agents this arming applies to.
+            service.faults().disarm(fault::Stage::ExceptionReport);  // WP-44: one arming of the group at a time (once this one stands)
+        }
+    } else {
+        if (Result<void> r = service.faults().arm(info->stage, count, pid, persist); !r) {
+            return r.error();
+        }
+        if (group == "exception") {
+            // WP-44: one arming of the group at a time: once this one stands, exception-hold goes in the agents it applies to.
             for (const std::shared_ptr<AgentLink>& link : targets) {
                 (void)arm_agent(*link, fault::info(fault::Stage::ExceptionHold).name, 0);
             }
-        }
-        if (Result<void> r = service.faults().arm(info->stage, count, pid, persist); !r) {
-            return r.error();
         }
     }
     CML_LOG(Trace, "failure injection: inject-failure armed '%s' (group %s)%s", stage_name.c_str(), group.c_str(), persist ? " with persist" : "");

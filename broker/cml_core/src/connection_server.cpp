@@ -220,11 +220,13 @@ Result<ServerExit> ConnectionServer::run() {
     }
     ReloadService service(options_.pipeline_env != nullptr ? *options_.pipeline_env : native, &events_, options_.session_dir);
     shared.service = &service;
+#if defined(CML_FAULT_INJECTION)
     // WP-44: what inject-failure armed with persist in an earlier broker is armed again.
     service.faults().set_state_file(options_.fault_state_file);
     for (const Diag& problem : service.faults().load_state()) {
         events_.publish(make_diag_event(problem, "warning", "inject"));
     }
+#endif
     ExceptionService exceptions(&service, &events_);
     shared.exceptions = &exceptions;
     service.set_option_observer([&exceptions](const std::string& name) {

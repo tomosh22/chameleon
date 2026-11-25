@@ -11,6 +11,7 @@
 
 #include "../pdb/test_util.h"
 #include "cml/core/fault_injection.h"
+#include "cml/core/reload_service.h"
 #include "cml/core/save_watcher.h"
 #include "cml/core/source_baseline.h"
 #include "cml/util/log.h"
@@ -566,6 +567,7 @@ TEST_CASE("save watcher injection (WP-44): watch-debounce loses the batch; the w
     rig.save();
     REQUIRE(wait_until([&] { return rig.reloads.load() > before; }));  // the reload still runs
     CHECK(rig.has(5980, "warning"));
+    CHECK(rig.has(5501, "warning"));  // the lost-events path itself (fix round: it was skipped)
     CHECK(rig.faults.armed(ipc::fault::Stage::WatchDebounce) == 0);
 }
 
@@ -618,5 +620,49 @@ TEST_CASE("save watcher injection (WP-44): a stage the batch does not reach is d
     rig.save();
     REQUIRE(wait_until([&] { return rig.reloads.load() > before; }));
     CHECK_FALSE(rig.has(5982, "error"));
+}
+TEST_CASE("save watcher injection (WP-44 fix round): a watch stage cannot be armed while a batch runs (CML5978); afterwards it can") {
+    QuietLogs quiet;
+    testpdb::TempDir dir;
+    ReloadService service(PipelineEnv{}, nullptr, dir.subdir("session"));  // holds the injector and answers inject-failure
+    FakeFactory fake;
+    std::atomic<int> reloads{0};
+    std::mutex m;
+    std::optional<Result<ipc::json::Value>> during;
+    std::atomic<bool> running_inside{false};
+    SaveWatcherHooks hooks;
+    hooks.tracked_files = [] { return std::vector<std::string>{"c:\\p\\a.cpp"}; };
+    hooks.reload = [&] {
+        if (++reloads == 2) {  // the save's batch (the first one is the sweep after arming)
+            running_inside = service.faults().operation_running("watch");
+            ipc::json::Value args = ipc::json::Value::object();
+            args.set("stage", ipc::json::Value::string("watch-reload"));
+            std::lock_guard<std::mutex> lock(m);
+            during.emplace(inject_failure(service, args));
+        }
+        return SaveWatcherHooks::ReloadResult::Done;
+    };
+    hooks.faults = &service.faults();
+    SaveWatcher w(hooks, fast(fake.factory()));
+    w.rearm();
+    REQUIRE(wait_until([&] { return reloads.load() >= 1; }));
+    std::this_thread::sleep_for(100ms);
+    w.inject(modified("c:\\p\\a.cpp"));
+    REQUIRE(wait_until([&] {
+        std::lock_guard<std::mutex> lock(m);
+        return during.has_value();
+    }));
+    REQUIRE(wait_until([&] { return !service.faults().operation_running("watch"); }));
+    CHECK(running_inside.load());
+    {
+        std::lock_guard<std::mutex> lock(m);
+        REQUIRE_FALSE(during->has_value());  // before the fix it was armed, and the running batch then disarmed it as unused
+        CHECK(during->error().id() == "CML5978");
+    }
+    ipc::json::Value args = ipc::json::Value::object();
+    args.set("stage", ipc::json::Value::string("watch-reload"));
+    CHECK(inject_failure(service, args).has_value());
+    CHECK(service.faults().armed(ipc::fault::Stage::WatchReload) == 1);
+    w.stop();
 }
 #endif

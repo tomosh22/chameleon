@@ -20,6 +20,7 @@
 #include "cml/core/control_server.h"
 #include "cml/core/process_registry.h"
 #include "cml/core/reload_service.h"
+#include "cml/core/restart.h"
 #include "cml/core/revert.h"
 #include "cml/proc/diag_ids.h"
 #include "cml/util/log.h"
@@ -2134,14 +2135,120 @@ TEST_CASE("revert injection (R-51 1): while a revert disarms what is left for it
     CHECK_FALSE(rig.service->faults().take_agent_armed(ipc::fault::Stage::RevertRestore, kPid));
 }
 
-TEST_CASE("revert injection (R-51 3): an agent that disconnects takes its armings along; a later process with its pid reports none") {
+namespace {
+
+// WP-44: a process host that only answers has_exited (the revert tests do not restart anything).
+class ExitHost final : public ProcessHost {
+public:
+    Result<std::unique_ptr<RestartableProcess>> open(std::uint32_t, const std::uint64_t*, std::uint32_t, std::vector<Diag>*) override {
+        return Diag::make(5805, "not in this test", "none");
+    }
+    bool has_exited(std::uint32_t pid) const override {
+        std::lock_guard<std::mutex> lock(mutex);
+        return exited.count(pid) != 0;
+    }
+    mutable std::mutex mutex;
+    std::set<std::uint32_t> exited;
+};
+
+std::shared_ptr<ExitHost> install_exit_host(Rig& rig) {
+    auto host = std::make_shared<ExitHost>();
+    rig.service->set_process_host(host);
+    rig.service->restart_coordinator_for_testing()->set_exit_recheck_for_testing(std::chrono::milliseconds(30), std::chrono::milliseconds(5));
+    return host;
+}
+
+}  // namespace
+
+TEST_CASE("revert injection (R-51 3): an agent whose process exited takes its armings along; a later process with its pid reports none") {
     QuietLogs quiet;
     Rig rig;
     rig.enable();
+    const std::shared_ptr<ExitHost> host = install_exit_host(rig);
     REQUIRE(inject_failure(*rig.service, inject_args("revert-repoint")).has_value());
+    {
+        std::lock_guard<std::mutex> lock(host->mutex);
+        host->exited.insert(kPid);
+    }
     rig.service->detach(1);
     CHECK(finish_injection(*rig.service, "revert", kPid, std::string()).empty());  // before R-51: {"revert-repoint"}, a phantom
 }
+
+TEST_CASE("fault injection (WP-44 fix round): a persisted agent arming survives a graceful broker stop, and a pipe that breaks") {
+    QuietLogs quiet;
+    testpdb::TempDir logs;
+    const std::string state = logs.file("b.log.fault-injection.json");
+    {
+        Rig rig;
+        rig.service->faults().set_state_file(state);
+        rig.enable();
+        const std::shared_ptr<ExitHost> host = install_exit_host(rig);
+        Value keep = inject_args("revert-repoint");
+        keep.set("persist", Value::boolean(true));
+        REQUIRE(inject_failure(*rig.service, keep).has_value());
+        rig.service->detach(1);  // the pipe broke; the process runs on
+        CHECK(std::filesystem::exists(state));
+        rig.service->attach(rig.link);  // it reconnects
+        {
+            std::lock_guard<std::mutex> lock(host->mutex);
+            host->exited.insert(kPid);  // whatever the host says while the broker goes
+        }
+        rig.service->cancel();   // the broker stops: cancel, then every connection is detached
+        rig.service->detach(1);  // before the fix this dropped the record and rewrote the state file without it
+        CHECK(std::filesystem::exists(state));
+    }
+    Rig restarted;
+    restarted.service->faults().set_state_file(state);
+    CHECK(restarted.service->faults().load_state().empty());
+    CHECK(restarted.service->faults().take_agent_armed(ipc::fault::Stage::RevertRepoint, kPid));  // the next revert still disarms it
+}
+
+TEST_CASE("fault injection (WP-44 fix round): none with a pid clears that process only; the others' armings and persisted entries stay") {
+    QuietLogs quiet;
+    testpdb::TempDir logs;
+    const std::string state = logs.file("b.log.fault-injection.json");
+    Rig rig;
+    rig.service->faults().set_state_file(state);
+    rig.enable();
+    rig.enable2();
+    Value keep = inject_args("revert-repoint");
+    keep.set("persist", Value::boolean(true));
+    REQUIRE(inject_failure(*rig.service, keep).has_value());  // both processes
+    Value other = inject_args("link", 0, static_cast<int>(kPid + 1));
+    other.set("persist", Value::boolean(true));
+    REQUIRE(inject_failure(*rig.service, other).has_value());  // a broker stage for the second process only
+    REQUIRE(inject_failure(*rig.service, inject_args("compile")).has_value());  // a broker stage for every process
+    REQUIRE(inject_failure(*rig.service, inject_args("none", 0, static_cast<int>(kPid))).has_value());
+    CHECK(rig.faults_left("compile") == 0);  // it could fire for kPid
+    CHECK(rig.faults_left("link") == 1);     // armed for the other process: stays
+    CHECK_FALSE(rig.service->faults().take_agent_armed(ipc::fault::Stage::RevertRepoint, kPid));
+    // The other process's record and persisted entries are still there (before the fix every record and the whole file went).
+    Rig restarted;
+    restarted.service->faults().set_state_file(state);
+    CHECK(restarted.service->faults().load_state().empty());
+    CHECK(restarted.faults_left("link") == 1);
+    CHECK(restarted.service->faults().take_agent_armed(ipc::fault::Stage::RevertRepoint, kPid + 1));
+    CHECK_FALSE(restarted.service->faults().take_agent_armed(ipc::fault::Stage::RevertRepoint, kPid));
+    CHECK(rig.service->faults().take_agent_armed(ipc::fault::Stage::RevertRepoint, kPid + 1));
+}
+
+TEST_CASE("fault injection (WP-44 fix round): persist is refused for an agent stage the broker keeps nothing for") {
+    QuietLogs quiet;
+    testpdb::TempDir logs;
+    Rig rig;
+    rig.service->faults().set_state_file(logs.file("b.log.fault-injection.json"));
+    rig.enable();
+    for (const char* stage : {"patch-load", "exception-hold"}) {
+        CAPTURE(stage);
+        Value keep = inject_args(stage);
+        keep.set("persist", Value::boolean(true));
+        Result<Value> refused = inject_failure(*rig.service, keep);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().id() == "CML5960");
+    }
+    CHECK(rig.seen<ipc::ArmFault>().empty());  // nothing was armed
+}
+
 
 TEST_CASE("revert injection (R-51 4): a revert across processes decides per process which agent stage fired") {
     QuietLogs quiet;
@@ -2257,7 +2364,8 @@ TEST_CASE("fault injection (WP-44): a state file that cannot be used arms nothin
     testpdb::TempDir logs;
     const std::string state = logs.file("b.log.fault-injection.json");
     for (const char* text : {"not json", R"({"version":2,"broker":[]})", R"({"version":1,"broker":[{"stage":"patch-load","count":1}]})",
-                             R"({"version":1,"broker":[{"stage":"restart-hold","count":2}]})", R"({"version":1,"agent":[{"stage":"link","pid":5}]})"}) {
+                             R"({"version":1,"broker":[{"stage":"restart-hold","count":2}]})", R"({"version":1,"agent":[{"stage":"link","pid":5}]})",
+                             R"({"version":1,"broker":[{"stage":"watch-reload","count":1,"pid":5}]})"}) {
         CAPTURE(text);
         {
             std::ofstream out(state, std::ios::binary | std::ios::trunc);

@@ -58,6 +58,8 @@ struct Rig {
                 const bool is_action = std::holds_alternative<ipc::ExceptionAction>(message);
                 if (is_action) {
                     status = action_status;
+                } else if (std::holds_alternative<ipc::ArmFault>(message)) {
+                    status = arm_status;
                 }
                 std::lock_guard<std::mutex> lock(mutex);
                 answerers.emplace_back([this, id = *id, status, is_action] {
@@ -143,6 +145,7 @@ struct Rig {
     std::vector<ipc::Message> sent;
     std::vector<std::thread> answerers;
     std::atomic<std::uint32_t> action_status{0};
+    std::atomic<std::uint32_t> arm_status{0};    // WP-44: the status of the agent's answer to ArmFault
     std::function<void()> before_action_answer;  // WP-44: runs on the answering thread before the agent answers ExceptionAction
 
     std::vector<ipc::ArmFault> arms() {
@@ -576,6 +579,21 @@ TEST_CASE("exceptions injection (WP-44): the group exception keeps one arming; a
     CHECK(arms[0].count == 0);
     CHECK(arms[1].count == 1);
     CHECK(arms[2].count == 0);
+}
+
+TEST_CASE("exceptions injection (WP-44 fix round): the other stage of the group exception is disarmed only once the new arming stands") {
+    QuietLogs quiet;
+    Rig rig;
+    handshake(rig);
+    REQUIRE(inject_failure(rig.service, stage("exception-report")).has_value());
+    rig.arm_status = 4654;  // the agent refuses to arm exception-hold
+    Result<Value> refused = inject_failure(rig.service, stage("exception-hold"));
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().id() == "CML5962");
+    CHECK(rig.service.faults().armed(ipc::fault::Stage::ExceptionReport) == 1);  // before the fix it was disarmed first: nothing stayed armed
+    rig.arm_status = 0;
+    REQUIRE(inject_failure(rig.service, stage("exception-hold")).has_value());
+    CHECK(rig.service.faults().armed(ipc::fault::Stage::ExceptionReport) == 0);
 }
 
 TEST_CASE("exceptions injection (WP-44): an action stage applies to the next action only; one that is not reached is disarmed and listed") {

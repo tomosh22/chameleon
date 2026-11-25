@@ -1951,15 +1951,40 @@ TEST_CASE("restart injection (R-51 2): a restart that starts while inject-failur
     CHECK(rig.arms[1].count == 0);
 }
 
-TEST_CASE("restart injection (R-51 3): what was armed in an agent is forgotten when it disconnects; a new process with that pid never reports it") {
+TEST_CASE("restart injection (R-51 3): what was armed in an agent is forgotten when the process exits; a new process with that pid never reports it") {
     QuietLogs quiet;
     Rig rig;
     REQUIRE(inject_failure(rig.service, stage_args("pre-restart-hooks", 100)).has_value());
-    rig.service.detach(1);  // process 100's agent goes (the process exited)
+    {
+        std::lock_guard<std::mutex> lock(rig.mutex);
+        rig.exited.insert(100);
+    }
+    rig.service.detach(1);  // process 100's agent goes, and the process has exited
     SimAgent reused(rig.service, 50);
     reused.register_process(100, "", {kExe}, {kExe});  // another process that got pid 100
     CHECK(finish_injection(rig.service, "restart", 100, std::string()).empty());  // before R-51: {"pre-restart-hooks"}
     CHECK_FALSE(rig.service.faults().take_agent_armed(ipc::fault::Stage::PreRestartHooks, 100));
+}
+
+TEST_CASE("restart injection (R-51 3, WP-44 fix round): a pipe that breaks while the process runs, or a broker that shuts down, keeps the records") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.service.restart_coordinator_for_testing()->set_exit_recheck_for_testing(std::chrono::milliseconds(50), std::chrono::milliseconds(5));
+    REQUIRE(inject_failure(rig.service, stage_args("pre-restart-hooks", 100)).has_value());
+    rig.service.detach(1);  // the pipe broke; process 100 runs on (the host never reports it as exited), its agent stays armed
+    CHECK(rig.service.faults().take_agent_armed(ipc::fault::Stage::PreRestartHooks, 100));
+    // A broker that shuts down detaches every connection; the processes keep their armings, so the records stay (even if the host said
+    // otherwise: nothing is decided while the broker goes).
+    rig.service.faults().note_agent_armed(ipc::fault::Stage::PreRestartHooks, 100);
+    SimAgent again(rig.service, 60);
+    again.register_process(100, "", {kExe}, {kExe});
+    {
+        std::lock_guard<std::mutex> lock(rig.mutex);
+        rig.exited.insert(100);
+    }
+    rig.service.cancel();
+    rig.service.detach(60);
+    CHECK(rig.service.faults().take_agent_armed(ipc::fault::Stage::PreRestartHooks, 100));
 }
 #endif
 
