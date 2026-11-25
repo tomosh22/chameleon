@@ -927,4 +927,45 @@ LambdaPairing pair_lambdas_by_code(const NarrowInput& input) {
     return out;
 }
 
+std::vector<Diag> prove_bitmask_guards(const NarrowInput& input) {
+    std::vector<Diag> out;
+    if (input.plan == nullptr) {
+        return out;
+    }
+    const bind::BindPlan& plan = *input.plan;
+    for (const bind::BitmaskGuard& bg : plan.bitmask_guards) {
+        std::string why;
+        const bind::HookEntry* hook = nullptr;
+        for (const bind::HookEntry& h : plan.hooks) {
+            if (!bg.function.empty() && h.new_symbol == bg.function) {
+                hook = &h;
+                break;
+            }
+        }
+        if (bg.function.empty()) {
+            why = "the function it belongs to cannot be read from its name";
+        } else if (hook == nullptr) {
+            why = "'" + bind::display_name(bg.function) + "' is not the old version of a function of the running program (new, or not found)";
+        } else if (input.object == nullptr || input.old_image == nullptr) {
+            why = "the old code of '" + bind::display_name(bg.function) + "' is not available";
+        } else {
+            NarrowInput ni = input;
+            ni.enabled = true;
+            const Narrower narrower(ni);
+            const NarrowDecision d = narrower.judge(*hook);
+            if (d.reason == NarrowReason::Unchanged) {
+                CML_LOG(Info, "WP40-BITMASK guard=%s function='%s' proven=unchanged%s", bg.guard.c_str(), bind::display_name(bg.function).c_str(), d.from_prior ? " (against an earlier patch)" : "");
+                continue;
+            }
+            why = "the code of '" + bind::display_name(bg.function) + "' changed (" + to_string(d.reason) + (d.detail.empty() ? std::string() : ": " + d.detail) + ")";
+        }
+        CML_LOG(Info, "WP40-BITMASK guard=%s function='%s' proven=refused", bg.guard.c_str(), bg.function.empty() ? "?" : bind::display_name(bg.function).c_str());
+        out.push_back(Diag::make(bind::diag::kGuardMismatch,
+                                 "the bitmask guard '" + bg.guard + "' (no thread-safe statics) cannot be bound to the running program's: its bits go to the function's dynamically initialised statics in the order they are reached, which only an unchanged function proves to be as before, and " +
+                                     why + "; with the old bitmask a static could be constructed again or never",
+                                 "Leave this function unchanged while the program runs (edit other functions of the file), or hot-restart."));
+    }
+    return out;
+}
+
 }  // namespace cml::core

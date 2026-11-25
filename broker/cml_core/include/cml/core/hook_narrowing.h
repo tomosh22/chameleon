@@ -178,4 +178,12 @@ struct LambdaPairing {
 };
 LambdaPairing pair_lambdas_by_code(const NarrowInput& input);
 
+// WP-40 (second high review, ADR-0043 ruling). For every BindPlan::bitmask_guards entry (a `$S<n>` bitmask bound to the old
+// bitmask): the bits are handed out to the function's dynamically initialised statics in the order they are reached, so
+// the old bitmask fits only while those statics are the same set in the same order. That is proven when the function's
+// code is unchanged (the comparison above, with the plan's decisions: the same bits tested and set, on the same statics);
+// otherwise, or when it cannot be compared, the result holds a CML3600 for the bitmask. Logs
+// `WP40-BITMASK guard=... function=... proven=unchanged|refused`.
+std::vector<Diag> prove_bitmask_guards(const NarrowInput& input);
+
 }  // namespace cml::core

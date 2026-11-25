@@ -302,6 +302,25 @@ bool guard_covers(std::string_view guard, std::string_view name) noexcept {
     return rest.substr(0, scope.size()) == scope;
 }
 
+// WP-40 (second high review): is `guard` a bitmask `?$S<n>@<scope>@4IA`, and the decorated name of the function whose
+// statics it guards ("?$S1@?1??f@@YAHXZ@4IA" -> "?f@@YAHXZ"; a lambda's: "??R<lambda_0>@?0??f@@YAXXZ@QEBA@XZ"). Empty when
+// `guard` is not a bitmask or its scope cannot be read.
+std::string bitmask_function(std::string_view guard) {
+    if (guard.size() < 8 || guard.compare(0, 3, "?$S") != 0 || guard[3] < '0' || guard[3] > '9' || guard.substr(guard.size() - 4) != "@4IA") {
+        return {};
+    }
+    const std::size_t at = guard.find('@');
+    if (at == std::string_view::npos || guard.size() < at + 1 + 4) {
+        return {};
+    }
+    const std::string_view scope = guard.substr(at + 1, guard.size() - at - 1 - 4);  // "?1??f@@YAHXZ"
+    const std::size_t block = block_prefix_length(scope);
+    if (block == 0 || block + 1 >= scope.size() || scope[block] != '?') {
+        return {};
+    }
+    return std::string(scope.substr(block + 1));
+}
+
 class Planner {
 public:
     Planner(const PlanInput& in, BindPlan* partial) : in_(in), obj_(*in.object), pdb_(*in.module_pdb), partial_(partial) {}
@@ -1535,23 +1554,16 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
         old_inlined += inlined ? 1u : 0u;
         old_of_function += (inlined || by_name[c] || by_closure_name[c]) ? 1u : 0u;
     }
-    // Records directly in the function are first of all the function's OWN statics of the name (the patch declares them
-    // there too); only what is left over can be an inlined lambda's.
-    // But only when every lambda static of the patch has a record in a call operator: then what is in the function itself
-    // is the function's own (as many as the patch declares there, at most). Otherwise a record in the function may be the
-    // own static's or an inlined lambda's, which nothing tells apart: the function's own statics of the name (pass A does
-    // not pair them by name, see bridge_statics) and the lambdas' are all left to the layout, and only if the counts
-    // agree (WP-40 review: an own static that is new must not take an inlined lambda's live record).
+    // A record directly in the function may be the function's own static's or an inlined lambda's, which nothing tells
+    // apart. The function's own statics of the name are refused (pass A, own_static_lambda_risk: WP-40 second high review,
+    // ADR-0043 ruling; until then a record in the function was taken for the own static's whenever every lambda static of
+    // the patch had a record in a call operator, so a new own static could take a removed inlined lambda's live record).
+    // They are still counted here, so that the lambdas' statics are left to the layout only if the counts agree.
     std::size_t own_in_patch = 0;
     if (old_inlined != 0 && !enclosing.empty()) {
         const std::string own = enclosing + "::" + base;
         for (const Sym& s : syms_) {
             own_in_patch += s.defined && s.is_static && s.dec.type == SymbolType::Data && canonical_lambda_names(s.dec.display) == own ? 1u : 0u;
-        }
-        const std::size_t in_operators = old_of_function - old_inlined;
-        if (in_operators == scoped.size() && old_inlined <= own_in_patch) {
-            old_of_function -= old_inlined;
-            old_inlined = 0;
         }
     }
     if (old_inlined != 0) {
@@ -2255,22 +2267,87 @@ void Planner::bridge_statics() {
             }
         }
     }
-    const auto own_static_of_lambda_function = [&](const Group& g) {
-        if (g.is_func || g.encl.empty() || g.encl == "operator()" || g.display.empty()) {
-            return false;
+    // WP-40 (second high review, ADR-0043 ruling): a static of a function `f` itself whose name is the name of a static of
+    // one of f's lambdas, in the patch or in the old image, inlined or not, pairs only when every record it could pair
+    // with is provably f's own. A record directly in f is the own static's or an inlined lambda's (clang-cl /O2 records
+    // the static of an inlined lambda in the caller, under the same name), and nothing in the records tells which; so
+    // such a static is refused (CML3207), never paired. (A lambda that the compiler inlined everywhere and that the patch
+    // deleted leaves no record that names it: that case is not seen here, see docs/wp/WP-40.md.)
+    // Returns why the static is at risk ("" when it is not).
+    bool old_lambda_statics_done = false;
+    std::map<std::string, const pdb::SymbolView*> old_lambda_statics;  // "<function>|<name>" -> a record
+    const auto own_static_lambda_risk = [&](const Group& g) -> std::string {
+        if (g.is_func || g.encl.empty() || g.encl == "operator()" || g.display.empty() || is_guard_variable("?" + g.base + "@")) {
+            return {};
         }
         const std::string canonical = canonical_lambda_names(g.display);
         const std::string suffix = "::" + g.base;
         if (canonical.size() <= suffix.size() || canonical.compare(canonical.size() - suffix.size(), suffix.size(), suffix) != 0) {
-            return false;
+            return {};
         }
-        return lambda_static_functions.count(canonical.substr(0, canonical.size() - suffix.size()) + "|" + g.base) != 0;
+        const std::string function = canonical.substr(0, canonical.size() - suffix.size());
+        if (lambda_static_functions.count(function + "|" + g.base) != 0) {
+            return "a lambda of '" + function + "' in the patch has a static named '" + g.base + "'";
+        }
+        if (!ensure_compiland_symbols()) {
+            return "the old records of compiland " + std::to_string(ci_) + " cannot be read";
+        }
+        if (!old_lambda_statics_done) {
+            // Once per object: "<function>|<name>" for every old record of a lambda's static (in a call operator of the
+            // function's lambda, or named so).
+            old_lambda_statics_done = true;
+            const std::string op = "::<lambda>::operator()";
+            for (const pdb::SymbolView& v : comp_syms_) {
+                if (!pdb::is_data_kind(v.kind)) {
+                    continue;
+                }
+                std::string scope;
+                if (v.parent_proc != pdb::kNoSymbol && v.parent_proc < comp_syms_.size()) {
+                    const std::string& parent = comp_norm(&comp_syms_[v.parent_proc]).canonical;
+                    if (parent.size() > op.size() && parent.compare(parent.size() - op.size(), op.size(), op) == 0) {
+                        scope = parent.substr(0, parent.size() - op.size());
+                    }
+                }
+                const std::string& own = comp_norm(&v).canonical;
+                const std::string tail = op + "::" + comp_last(&v);
+                if (scope.empty() && own.size() > tail.size() && own.compare(own.size() - tail.size(), tail.size(), tail) == 0) {
+                    scope = own.substr(0, own.size() - tail.size());
+                }
+                if (!scope.empty()) {
+                    old_lambda_statics.emplace(scope + "|" + comp_last(&v), &v);
+                }
+            }
+        }
+        const auto hit = old_lambda_statics.find(function + "|" + g.base);
+        if (hit != old_lambda_statics.end()) {
+            const pdb::SymbolView& v = *hit->second;
+            return "a lambda of '" + function + "' in the old image has a static named '" + g.base + "' (the record at rva " + hex(v.rva) + " in '" +
+                   std::string(v.parent_proc != pdb::kNoSymbol && v.parent_proc < comp_syms_.size() ? comp_syms_[v.parent_proc].name : v.name) + "')";
+        }
+        return {};
     };
 
     // Pass A: unambiguous name matches (also learns the section deltas).
     for (auto& [key, g] : groups) {
         const std::vector<const pdb::SymbolView*> cands =
             static_candidates(g.base, g.encl, g.is_func, g.display, g.is_tls ? 1 : 0, g.is_func && g.members.size() == 1 ? syms_[g.members.front()].name : std::string());
+        if (!cands.empty()) {
+            const std::string risk = own_static_lambda_risk(g);
+            if (!risk.empty()) {
+                for (const std::uint32_t pos : g.members) {
+                    Sym& sy = syms_[pos];
+                    CML_LOG(Info, "WP40-OWN-STATIC static='%s' refused (%s)", sy.dec.display.c_str(), risk.c_str());
+                    error(diag::kAmbiguousStatic,
+                          "static data '" + sy.dec.display + "' (" + sy.name + ") in " + in_.object_name + " cannot be paired with the " + std::to_string(cands.size()) +
+                              " record(s) named '" + g.base + "' of its function in compiland " + std::to_string(ci_) + ": " + risk +
+                              ", and a record of that name in the function may be that lambda's (a compiler records the static of an inlined lambda in the function it was inlined into), so none is provably this static's",
+                          "Rename the static (or the lambda's static), or hot-restart.");
+                    sy.diagnosed = true;
+                    decide(sy, DecisionKind::PatchNewData, BindSource::None, sy.dec.type, {}, "own static named like a static of a lambda of its function (CML3207)");
+                }
+                continue;
+            }
+        }
         if (cands.empty()) {
             for (const std::uint32_t pos : g.members) {
                 Sym& sy = syms_[pos];
@@ -2285,7 +2362,7 @@ void Planner::bridge_statics() {
         // (WP-40: a record of a lambda's static found in the procedure that inlined the lambda is not identified by its
         // name; see static_candidates.)
         const std::string enclosing = g.is_func || g.encl != "operator()" ? std::string() : lambda_enclosing(g.display, g.base);
-        if (g.members.size() == 1 && cands.size() == 1 && !is_inlined_record(cands.front(), enclosing) && !own_static_of_lambda_function(g)) {
+        if (g.members.size() == 1 && cands.size() == 1 && !is_inlined_record(cands.front(), enclosing)) {
             matched[g.members.front()] = {cands.front(), BindSource::CompilandStatic};
             if (!g.is_func) {
                 learn_delta(syms_[g.members.front()], cands.front()->rva);
@@ -2645,6 +2722,18 @@ void Planner::settle_guards() {
               "Keep the statics of this source file in their order (do not add or remove statics in front of them), or hot-restart.");
         sy.diagnosed = true;
         decide(sy, DecisionKind::PatchNewData, BindSource::None, SymbolType::Data, {}, "guard of a bound static that cannot be found (CML3600)");
+    }
+    // WP-40 (second high review, ADR-0043 ruling): a bitmask bound to the old one, by its record or by the layout, is right
+    // only while the function hands out its bits as before (the same dynamically initialised statics in the same order).
+    // Nothing in the records shows that; the pipeline proves it from the function's code (BitmaskGuard) or refuses.
+    for (const Sym& sy : syms_) {
+        if (sy.defined && sy.decided && !sy.diagnosed && sy.dec.decision == DecisionKind::BindOldData && is_guard_variable(sy.name)) {
+            const std::string function = bitmask_function(sy.name);
+            if (!function.empty() || (sy.name.size() > 3 && sy.name.compare(0, 3, "?$S") == 0 && sy.name[3] >= '0' && sy.name[3] <= '9')) {
+                plan_.bitmask_guards.push_back({sy.name, function});
+                CML_LOG(Trace, "bind: bitmask guard %s is bound to the old one: the code of '%s' must be unchanged", sy.name.c_str(), function.c_str());
+            }
+        }
     }
 }
 

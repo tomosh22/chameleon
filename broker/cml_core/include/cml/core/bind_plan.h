@@ -235,6 +235,16 @@ struct LambdaSet {
     std::vector<LambdaEntry> lambdas;
 };
 
+// WP-40 (second high review, ADR-0043 ruling): a bitmask guard `$S<n>` (no thread-safe statics) the plan binds to the
+// old bitmask. Its bits go to the function's dynamically initialised statics in the order they are reached, so the old
+// bitmask is right only when those statics are the same set in the same order as in the old image. The records cannot
+// show that (a static made constant-initialised keeps its record); the code of the function can: the pipeline proves
+// that `function` is unchanged (hook_narrowing.h: prove_bitmask_guards), or refuses the reload (CML3600).
+struct BitmaskGuard {
+    std::string guard;     // decorated name of the bitmask
+    std::string function;  // decorated name of the function whose statics it guards ("" when it cannot be read)
+};
+
 struct BindPlan {
     std::string object_name;
     std::string module_name;
@@ -263,6 +273,7 @@ struct BindPlan {
     std::size_t imgrel_sites = 0;
     std::size_t imgrel_verified = 0;
     std::vector<LambdaSet> lambda_sets;  // WP-40, see LambdaSet
+    std::vector<BitmaskGuard> bitmask_guards;  // WP-40, see BitmaskGuard
 
     PlanSummary summary() const;
     // `BINDPLAN <label> hooks=N bind_old_data=N thunks=N new=N fixups=N` (the CI evidence line).

@@ -88,6 +88,13 @@
   "start_timeout_s": 90,
   "index_timeout_s": 300,
   "min_functions": 500,
-  "expected_failures": [],
+  "expected_failures": [
+    {
+      "step": "edit:header-inline-raymath",
+      "compiler": "clang-cl",
+      "match": "CML3601[\\s\\S]*rprand_state",
+      "reason": "WP-40 (R-48 item 4, ADR-0043 ruling): clang-cl splits rcore.c's file-scope 'rprand_state' into the pieces rprand_state.0..3 and records none of them in the PDB, so the running program's pieces cannot be found; the reload is refused with CML3601 (before WP-40 it went on and reset the generator's state silently). cl keeps the variable whole and this edit reloads (docs/wp/WP-40.md)"
+    }
+  ],
   "trace": true
 }

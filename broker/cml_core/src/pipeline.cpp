@@ -752,6 +752,26 @@ private:
                 plan = std::move(*again);
             }
         }
+        // WP-40 (second high review, ADR-0043 ruling): a `$S<n>` bitmask bound to the old one only while its function's
+        // code is unchanged (the bits follow the order of its dynamically initialised statics); otherwise CML3600.
+        if (!plan.bitmask_guards.empty()) {
+            NarrowInput bi;
+            bi.object = &object->object;
+            bi.plan = &plan;
+            bi.old_image = image ? &image->image : nullptr;
+            bi.load_base = module_.base;
+            bi.is_hooked = [this](std::uint64_t va) { return module_.is_hooked(va); };
+            bi.prior_code = [this](std::uint64_t va) { return module_.code_running_at(va); };
+            const std::vector<Diag> unproven = prove_bitmask_guards(bi);
+            if (!unproven.empty()) {
+                std::optional<Diag> first;
+                for (const Diag& e : unproven) {
+                    const Diag shown = fail("plan", e);
+                    first = first ? first : std::optional<Diag>(shown);
+                }
+                return *first;
+            }
+        }
         for (const Diag& w : plan.warnings) {
             warn(report, "plan", w);
         }

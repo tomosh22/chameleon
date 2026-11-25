@@ -462,10 +462,14 @@ TEST_CASE("inlined lambdas: a record in the function is the own static's or an i
         BindPlan partial;
         REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
         CHECK(count_code(errors, diag::kAmbiguousStatic) >= 1);
-        CHECK(contains(errors[0].message, "(1 there, some of them inlined, 2 in the patch, 1 of them declared in the function itself)"));
+        CHECK(contains(errors[0].message, "a lambda of 'ls_step' in the patch has a static named 'sname'"));
+        CHECK(decision(partial, "?sname@?1??ls_step@@YAHXZ@4ULsName@@A").decision != DecisionKind::BindOldData);
         // (the same holds when the own static is the OLD one and the lambda is new: the records cannot tell the two apart)
     }
-    SUBCASE("the function's own static and an inlined lambda's, both old, as many records as statics: placed by the layout") {
+    SUBCASE("the function's own static and an inlined lambda's, both old, as many records as statics: refused (ADR-0043 ruling)") {
+        // Until the second high review: placed by the layout. Which of the two records is the own static's is not provable
+        // (the same records are left when an inlined lambda was deleted and an own static of its name declared), so the
+        // own static is refused: an over-refusal the ruling accepts.
         SynthWorld w = basic_world(false);
         w.data(w.tu(), "`anonymous namespace'::s_count", 0x10);
         w.proc_with_statics(w.tu(), "ls_step", 0x60, {{"sname", 0x20}, {"sname", 0x30}});
@@ -473,16 +477,56 @@ TEST_CASE("inlined lambdas: a record in the function is the own static's or an i
         SynthObj o;
         object(o, true, true);
         Built b = o.build();
-        auto r = plan_bind(w.input(b));
-        REQUIRE_MESSAGE(r.has_value(), err(r));
-        CHECK(decision(*r, "?sname@?1??ls_step@@YAHXZ@4ULsName@@A").old_address.rva == 0x3020);
-        CHECK(decision(*r, "?sname@?1??ls_step@@YAHXZ@4ULsName@@A").source == BindSource::CompilandRva);
-        CHECK(decision(*r, lambda_static("sname", 0)).old_address.rva == 0x3030);
-        CHECK(decision(*r, lambda_guard(0)).old_address.rva == 0x3038);
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+        CHECK(count_code(errors, diag::kAmbiguousStatic) >= 1);
+        CHECK(decision(partial, "?sname@?1??ls_step@@YAHXZ@4ULsName@@A").decision != DecisionKind::BindOldData);
     }
-    SUBCASE("no lambda with a static of that name in the patch: the own static pairs by name as before") {
+    SUBCASE("L1 in its operator(), L2 inlined; the patch deletes L2 and declares the function's own static in its place: refused") {
+        // The old image: <lambda_0>'s `sname` in its own operator() (0x3040), <lambda_1>'s inlined into ls_step (0x3020).
+        // The patch: <lambda_0> and a new `ls_step::sname`. Until the review the record in ls_step was taken for the own
+        // static's (every lambda static of the patch had a record in a call operator) and the new own static took
+        // <lambda_1>'s live object.
+        SynthWorld w = basic_world(false);
+        w.data(w.tu(), "`anonymous namespace'::s_count", 0x10);
+        w.proc_with_statics(w.tu(), "ls_step", 0x60, {{"sname", 0x20}});
+        w.proc_with_statics(w.tu(), "ls_step::<lambda_0>::operator()", 0x90, {{"sname", 0x40}});
+        w.open();
+        SynthObj o;
+        object(o, true, true);
+        Built b = o.build();
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+        CHECK(count_code(errors, diag::kAmbiguousStatic) >= 1);
+        const SymbolDecision own = decision(partial, "?sname@?1??ls_step@@YAHXZ@4ULsName@@A");
+        CHECK(own.decision != DecisionKind::BindOldData);
+        CHECK_FALSE(own.old_address.rva == 0x3020);
+    }
+    SUBCASE("the patch deletes the lambda and declares the function's own static of its static's name: refused, not bound to the lambda's") {
+        // cl /O2 records the inlined lambda's `sname` in its operator() and in ls_step at one address (0x3040). The patch
+        // has no lambda any more and a new `ls_step::sname`. Until the review pass A paired it by name with the record in
+        // ls_step: the lambda's live object. (This test asserted that pairing, as "the own static pairs by name".)
+        SynthWorld w = basic_world(false);
+        w.proc_with_statics(w.tu(), "ls_step", 0x60, {{"sname", 0x40}});
+        w.proc_with_statics(w.tu(), "ls_step::<lambda_0>::operator()", 0x90, {{"sname", 0x40}});
+        w.open();
+        SynthObj o;
+        object(o, true, false);
+        Built b = o.build();
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+        REQUIRE(errors.size() == 1);
+        CHECK(errors[0].code == diag::kAmbiguousStatic);
+        CHECK(contains(errors[0].message, "a lambda of 'ls_step' in the old image has a static named 'sname'"));
+        CHECK(decision(partial, "?sname@?1??ls_step@@YAHXZ@4ULsName@@A").decision != DecisionKind::BindOldData);
+    }
+    SUBCASE("no lambda of the function has a static of that name, in the patch or in the old image: the own static pairs by name") {
         SynthWorld w = basic_world(false);
         w.proc_with_statics(w.tu(), "ls_step", 0x60, {{"sname", 0x20}});
+        w.proc_with_statics(w.tu(), "ls_step::<lambda_0>::operator()", 0x90, {{"other", 0x40}});
         w.open();
         SynthObj o;
         object(o, true, false);
@@ -524,6 +568,10 @@ TEST_CASE("guards: a `$S1` bitmask (no thread-safe statics) guards the statics o
         CHECK(decision(*r, s1).source == BindSource::CompilandLayout);
         CHECK(decision(*r, s1).old_address.rva == 0x301C);
         CHECK(r->warnings.empty());
+        // (ADR-0043 ruling, second high review: only if the code of f() is unchanged, which the pipeline proves.)
+        REQUIRE(r->bitmask_guards.size() == 1);
+        CHECK(r->bitmask_guards[0].guard == s1);
+        CHECK(r->bitmask_guards[0].function == "?f@@YAHXZ");
     }
     SUBCASE("a new static in block 1, a bound one in block 2: CML3600 (the bitmask was made new: the bound one constructed again)") {
         SynthWorld w = basic_world(false);
