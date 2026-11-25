@@ -1207,7 +1207,7 @@ never constructed. A wrong pairing is the worst outcome the product has, so R-48
 | WP-43 | R-40, R-42 (restart, revert) | Restart-hold follow-ups; failure injection in restart and revert | `wp/43-restart-injection` | high (restart, process start-up) |
 | WP-44 | R-42 (rest), R-49 | Failure injection in the crash handler and the watcher; persistent arming | `wp/44-injection-rest` | high (crash handler) |
 
-WP-40..WP-43 start together; WP-44 starts when the first of them merges (at most four at once).
+WP-40..WP-43 start together; WP-45 (added during the wave, below) and then WP-44 start as slots free (at most four at once).
 
 **Ranges.** WP-40: CML3600–3629 (planner). WP-41: CML5000–5049. WP-42: CML5050–5099 (both for fixes their corpus finds, in
 any component, after asking the orchestrator if the fix is outside the corpus driver). WP-43: CML5820–5839 (restart),
@@ -1289,6 +1289,24 @@ nits.
 **Acceptance.** Scenarios for the new stages in all 8 cells; a test for persistent arming across a broker restart.
 **Directories:** `agent/src/crash`, `broker/cml_core` (exception service, save watcher, fault injection), `core/cml_pe`
 (R-49), `tests/harness`.
+
+### WP-45: re-apply session edits to re-loaded and late-enabled modules (from WP-42's corpus findings)
+
+**Added during the wave.** WP-42's DLL-plugin corpus project found three product defects, two of them silent:
+- F-42.1: a module that is unloaded and loaded again (FreeLibrary/LoadLibrary at the same base) gets a new module state
+  whose baseline is the edited file on disk; the session's edits are not re-applied and the old code runs with no diagnostic.
+- F-42.2: the new state's patch counter restarts at 0, so its first patch is written to the path of the earlier instance's
+  patch DLL, which is still loaded: the link fails (LNK1104, CML3350).
+- F-42.3: after a hot-restart, edits of a module that the new process loads only later (CML5809) are never re-applied.
+
+**Decision.** A module instance enabled after the session already has accepted edits for its sources (a reload of the
+same module, or a late load after a hot-restart) gets those edits re-applied as part of its enable, the same way
+hot-restart re-applies them; a failure to re-apply is a diagnostic naming the module and the files, never silence. Patch
+work directories are unique per module instance (not per module name), so no path can collide with a loaded patch.
+Review: high (module state, broker restart). Range CML5600–5619. Acceptance: the three asserted expected failures of the
+`godot-gdextension` corpus cell flip to pass (removed from `expected_failures`), the repro `tests/corpus/repro/f42_plugin_reload`
+becomes a cmltest scenario in all 8 matrix cells, and unit tests cover each path. It starts before WP-44 when the first
+wave-11 slot frees, because silent loss of edits outranks the remaining injection gaps.
 
 ### Shared files and merge order
 
