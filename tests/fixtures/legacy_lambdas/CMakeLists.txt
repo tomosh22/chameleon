@@ -4,8 +4,8 @@
 # otherwise). clang-cl numbers its lambdas whatever the standard, so in the clang-cl cells this is an ordinary lambda fixture.
 #
 #   lambdas.cpp  three functions, each calling a lambda that holds a static counter (ids 100000, 200000, 300000)
-#   edits/       mark_1 (an edit elsewhere in the file: every lambda unchanged), body_2 (one lambda's body changes),
-#                insert_3 (a lambda added in front of the others); scenario tests/harness/scenarios/legacy_lambdas.toml.
+#   edits/       mark_1 (an edit elsewhere in the file: every lambda unchanged), body_2 (one lambda's body changes: cl renames it),
+#                two_3 (two lambdas change), insert_4 (a lambda added in front); scenario tests/harness/scenarios/legacy_lambdas.toml.
 cml_add_fixture(legacy_lambdas SOURCES main.cpp lambdas.cpp)
 set_target_properties(fixture_legacy_lambdas_objs PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 if(MSVC AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
@@ -14,5 +14,5 @@ endif()
 
 add_test(NAME fixture.legacy_lambdas.runs COMMAND fixture_legacy_lambdas --ticks 3)
 set_tests_properties(fixture.legacy_lambdas.runs PROPERTIES
-    PASS_REGULAR_EXPRESSION "TICK n=2 mark=1 a=100003 b=200003 c=300003 made=3"
+    PASS_REGULAR_EXPRESSION "TICK n=2 cc=[a-z]+ mark=1 a=100003 b=200003 c=300003 made=3"
     TIMEOUT 30)

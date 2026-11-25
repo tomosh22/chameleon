@@ -246,14 +246,16 @@ struct BitmaskGuard {
 };
 
 // WP-46 (F-41.2, ADR-0043 ruling D1): a lambda that cl's legacy lambda processor (C++17 without /permissive-, /Zc:lambda-)
-// names by a hash, `<lambda_<32 hex digits>>`, in no scope: the hash is the closure's only identity, and how cl derives it is
-// not documented. Its functions (call operator, invoker) and statics were paired by that name, so the pipeline proves the
-// pairing by code (hook_narrowing.h: prove_hashed_lambdas): every function's new code must be the old code it is hooked to
-// (under the plan, so its statics are the old lambda's), except at most one changed lambda (ADR-0043 rule (d)). Otherwise
-// CML3630. Functions with external linkage (paired by their public decorated name, like any external function) are not
-// listed.
+// names by a hash, `<lambda_<32 hex digits>>`, in no scope. The hash depends on the lambda's own code (CI, fixture
+// legacy_lambdas: editing a lambda renames it; moving it does not). Its functions (call operator, invoker) and statics were
+// paired by that name, or, for the one lambda left unmatched on each side (an edited lambda), by elimination; the pipeline
+// proves the pairing by code (hook_narrowing.h: prove_hashed_lambdas): every name-matched function's new code must be the old
+// code it is hooked to (under the plan, so its statics are the old lambda's); one changed lambda is allowed (ADR-0043 rule
+// (d)), and that is the eliminated one when there is one. Otherwise CML3630. Functions with external linkage (paired by their
+// public decorated name, like any external function) are not listed.
 struct HashedLambda {
     std::string closure;                  // "<lambda_9c7f...>"
+    std::string old_closure;              // WP-46 round 2: the old closure it was paired with by elimination ("" when by its name)
     std::vector<std::string> functions;   // the patch's static functions of the closure that are hooked to old ones
     std::vector<std::string> statics;     // the patch's statics of the closure bound to old ones (guards included)
 };

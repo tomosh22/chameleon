@@ -74,7 +74,8 @@ public:
     }
 
     // The plan: every lambda paired with the old one of its hash name. `unhooked`: that lambda's call operator has no hook.
-    std::vector<Diag> run(std::uint32_t old_size = 16, int unhooked = -1) {
+    // `eliminated`: that lambda was paired by elimination (its name changed with its code; WP-46 round 2).
+    std::vector<Diag> run(std::uint32_t old_size = 16, int unhooked = -1, int eliminated = -1) {
         built_ = obj_.build();
         BindPlan plan;
         plan.object_name = "unity_12_cxx.obj";
@@ -112,6 +113,7 @@ public:
             }
             HashedLambda hl;
             hl.closure = kHashes[nw.n];
+            hl.old_closure = nw.n == eliminated ? std::string("<lambda_00000000000000000000000000000000>") : std::string();
             hl.functions = {op.name};
             hl.statics = {slot.name};
             plan.hashed_lambdas.push_back(hl);
@@ -234,5 +236,40 @@ TEST_CASE("hashed lambdas by code (WP-46): a lambda whose code cannot be compare
         REQUIRE(errors.size() == 1);
         CHECK(contains(errors[0].message, "is not hooked to an old function"));
         CHECK(contains(errors[0].message, kHashes[1]));
+    }
+}
+
+TEST_CASE("hashed lambdas by code (WP-46 round 2): the lambda paired by elimination is the one changed lambda; every other must be unchanged") {
+    QuietLogs quiet;
+    SUBCASE("the others are unchanged: proven") {
+        World w;
+        old_three(w);
+        w.new_lambda(0, 1000);
+        w.new_lambda(1, 2001);  // the edited lambda (renamed by cl, paired with the old one left)
+        w.new_lambda(2, 3000);
+        CHECK(w.run(16, -1, 1).empty());
+    }
+    SUBCASE("another lambda whose name was kept changed too: CML3630") {
+        World w;
+        old_three(w);
+        w.new_lambda(0, 1001);
+        w.new_lambda(1, 2001);
+        w.new_lambda(2, 3000);
+        const std::vector<Diag> errors = w.run(16, -1, 1);
+        REQUIRE(errors.size() == 1);
+        CHECK(errors[0].code == diag::kHashedLambdasUnproven);
+        CHECK(contains(errors[0].message, "one lambda was paired by elimination"));
+        CHECK(contains(errors[0].message, kHashes[0]));
+    }
+    SUBCASE("the eliminated lambda's call operator is not hooked: CML3630") {
+        World w;
+        old_three(w);
+        w.new_lambda(0, 1000);
+        w.new_lambda(1, 2001);
+        w.new_lambda(2, 3000);
+        const std::vector<Diag> errors = w.run(16, 1, 1);
+        REQUIRE(errors.size() == 1);
+        CHECK(contains(errors[0].message, "paired by elimination"));
+        CHECK(contains(errors[0].message, "is not hooked to the old one"));
     }
 }

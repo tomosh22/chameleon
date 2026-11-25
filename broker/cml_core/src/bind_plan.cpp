@@ -517,6 +517,14 @@ private:
     std::string inlined_lambda_risk(const std::string& member);
     // WP-46 (F-41.2): BindPlan::hashed_lambdas, and CML3630 for a hashed lambda's static that no hooked function vouches for.
     void note_hashed_lambdas();
+    // The closure pairing the planner follows: PlanInput::closure_pairing (rule (d)) plus the hash-named lambda paired by
+    // elimination (pair_hashed_by_elimination).
+    std::map<std::string, std::string> closure_pairing_;
+    // WP-46 (F-41.2, round 2 ruling): cl's legacy hash depends on the lambda's own body, so an edited lambda is renamed. When
+    // exactly one static hash-named closure is left unmatched on each side, they are paired (closure_pairing_); any other
+    // leftover with a static, or any static leftover at all, is CML3630.
+    std::map<std::string, std::string> eliminated_;  // patch closure "<lambda_X>" -> old closure "<lambda_Y>"
+    void pair_hashed_by_elimination();
 
     // ---- helpers ----
     void fatal(Diag d) {
@@ -1447,6 +1455,137 @@ std::string Planner::inlined_lambda_risk(const std::string& member) {
     return {};
 }
 
+void Planner::pair_hashed_by_elimination() {
+    closure_pairing_ = in_.closure_pairing;
+    struct Side {
+        bool external = false;   // its call operator has external linkage (a lambda of an inline function)
+        bool statics = false;    // it has function-local statics
+        std::string op;          // the call operator's decorated name (patch) / display name (old)
+        const pdb::SymbolView* proc = nullptr;  // old: the call operator's procedure
+    };
+    std::map<std::string, Side> new_side;  // "<lambda_X>" (scope-less hash closures only)
+    for (const Sym& sy : syms_) {
+        if (!sy.defined) {
+            continue;
+        }
+        const std::string c = hashed_closure(sy.name);
+        if (c.empty()) {
+            continue;
+        }
+        if (sy.dec.type == SymbolType::Function && starts_with(sy.name, "??R" + c + "@@")) {
+            Side& s = new_side[c];
+            s.external = s.external || !sy.is_static;
+            s.op = sy.name;
+        } else if (sy.dec.type == SymbolType::Data && sy.name.find("???R" + c + "@@") != std::string::npos) {
+            new_side[c].statics = true;
+        }
+    }
+    if (new_side.empty() || !ensure_compiland_symbols()) {
+        return;
+    }
+    std::map<std::string, Side> old_side;
+    for (const pdb::SymbolView& v : comp_syms_) {
+        if (pdb::is_proc_kind(v.kind) && starts_with(v.name, "<lambda_") && comp_last(&v) == "operator()") {
+            const std::string c = hashed_closure(v.name);
+            if (!c.empty() && v.name.size() > c.size() + 1 && v.name.compare(c.size(), 2, "::") == 0) {
+                Side& s = old_side[c];
+                s.op = std::string(v.name);
+                s.proc = &v;
+            }
+        }
+    }
+    for (const pdb::SymbolView& v : comp_syms_) {
+        if (pdb::is_data_kind(v.kind) && v.parent_proc != pdb::kNoSymbol && v.parent_proc < comp_syms_.size()) {
+            const std::string c = hashed_closure(comp_syms_[v.parent_proc].name);
+            const auto it = old_side.find(c);
+            if (!c.empty() && it != old_side.end()) {
+                it->second.statics = true;
+            }
+        }
+    }
+    for (auto& [c, s] : old_side) {
+        if (s.proc != nullptr && s.proc->rva != pdb::kNoRva) {
+            const Result<std::vector<pdb::SymbolView>> pubs = pdb_.publics_at_rva(s.proc->rva);
+            s.external = pubs && !pubs->empty();
+        }
+    }
+    // What is left on each side after the names are matched. A lambda with external linkage pairs by its public name; one
+    // that has no partner of its name (an inline function's lambda that is new, or gone) only counts when it has statics:
+    // they would be fresh while an old lambda's statics vanished (round 2 ruling, points 2 and 3).
+    // Static (internal-linkage) lambdas left over always count: the set rule refuses them anyway, and one on each side is the
+    // edited lambda. External ones (lambdas of inline functions, which pair by their public name and are otherwise new or gone)
+    // count only where statics could be lost: a new one with statics while an old one with statics vanished.
+    std::vector<std::string> new_left;
+    std::vector<std::string> old_left;
+    std::vector<std::string> new_external;  // external, with statics, no old function of its name anywhere
+    std::vector<std::string> old_external;  // external, with statics, not defined by the patch
+    bool new_statics = false;
+    bool old_statics = false;
+    for (const auto& [c, s] : new_side) {
+        if (old_side.count(c) != 0) {
+            continue;
+        }
+        if (s.external) {
+            bool has_public = false;
+            if (!s.op.empty()) {
+                const Result<std::vector<pdb::SymbolView>> pubs = pdb_.find_public(s.op);
+                has_public = pubs && !pubs->empty();
+            }
+            if (!has_public && s.statics) {
+                new_external.push_back(c);
+                new_statics = true;
+            }
+            continue;  // otherwise paired by its public name (its old function is in another unit), or nothing to lose
+        }
+        new_left.push_back(c);
+        new_statics = new_statics || s.statics;
+    }
+    for (const auto& [c, s] : old_side) {
+        if (new_side.count(c) != 0 || (s.proc != nullptr && taken_by_public(*s.proc))) {
+            continue;
+        }
+        if (s.external) {
+            if (s.statics) {
+                old_external.push_back(c);
+                old_statics = true;
+            }
+            continue;
+        }
+        old_left.push_back(c);
+        old_statics = old_statics || s.statics;
+    }
+    const bool external_left = new_statics && old_statics && (!new_external.empty() || !old_external.empty());
+    if (external_left) {
+        new_left.insert(new_left.end(), new_external.begin(), new_external.end());
+        old_left.insert(old_left.end(), old_external.begin(), old_external.end());
+    }
+    if (new_left.empty() && old_left.empty()) {
+        return;
+    }
+    const auto names = [](const std::vector<std::string>& list) {
+        std::string text;
+        for (std::size_t i = 0; i < list.size() && i < 8; ++i) {
+            text += (text.empty() ? "" : ", ") + list[i];
+        }
+        return list.size() > 8 ? text + " and " + std::to_string(list.size() - 8) + " more" : text;
+    };
+    if (new_left.size() == 1 && old_left.size() == 1 && !external_left) {
+        eliminated_[new_left[0]] = old_left[0];
+        closure_pairing_[new_left[0] + "@@"] = old_left[0] + "@@";
+        CML_LOG(Info, "WP46-ELIMINATION object=%s new=%s old=%s (the one lambda left on each side; proven only if every other lambda is unchanged)", in_.object_name.c_str(),
+                new_left[0].c_str(), old_left[0].c_str());
+        return;
+    }
+    CML_LOG(Info, "WP46-ELIMINATION object=%s new_left=%zu old_left=%zu external=%d refused", in_.object_name.c_str(), new_left.size(), old_left.size(), external_left ? 1 : 0);
+    error(diag::kHashedLambdasUnproven,
+          "the lambdas of " + in_.object_name +
+              " are named by a hash of their own code (cl's legacy lambda processor), and after their names are matched " + std::to_string(new_left.size()) +
+              " lambda(s) of the patch (" + (new_left.empty() ? std::string("none") : names(new_left)) + ") and " + std::to_string(old_left.size()) +
+              " of the old image (" + (old_left.empty() ? std::string("none") : names(old_left)) +
+              ") are left; only one changed lambda on each side can be paired (by elimination), so which old lambda (and which old statics) each new one is cannot be told",
+          "Change at most one lambda of this file per reload (adding or removing a lambda counts), compile with /Zc:lambda (the default under /std:c++20), or hot-restart.");
+}
+
 void Planner::note_hashed_lambdas() {
     std::map<std::string, HashedLambda> by_closure;
     for (const Sym& sy : syms_) {
@@ -1464,6 +1603,8 @@ void Planner::note_hashed_lambdas() {
         }
         HashedLambda& h = by_closure[closure];
         h.closure = closure;
+        const auto eliminated = eliminated_.find(closure);
+        h.old_closure = eliminated == eliminated_.end() ? std::string() : eliminated->second;
         (hooked ? h.functions : h.statics).push_back(sy.name);
     }
     for (auto& [closure, h] : by_closure) {
@@ -1512,7 +1653,7 @@ bool Planner::pair_overloads_by_signature(const std::string& group_name, std::ve
         const pdb::FunctionSignature* sigp = &new_signature(sy);
         // WP-40 (R-48 item 5, rule (d)): this call operator's lambda is the old lambda of another number (the pipeline
         // compared their code): it is matched under that closure's name.
-        for (const auto& [from, to] : in_.closure_pairing) {
+        for (const auto& [from, to] : closure_pairing_) {
             if (from != to && sigp->known && starts_with(plain_name(sy), "??R" + from)) {
                 auto copy = std::make_unique<pdb::FunctionSignature>(*sigp);
                 copy->class_unique_name = pdb::without_tu_discriminator(copy->class_unique_name);
@@ -1627,16 +1768,24 @@ bool Planner::pair_overloads_by_signature(const std::string& group_name, std::ve
         if (closure.empty()) {
             continue;
         }
-        if (taken_by_public(*free_cands[c])) {
-            CML_LOG(Trace, "bind: overloads '%s': old record '%s' at rva %s is replaced by an external definition of the patch (its public): not in the set of lambdas", group_name.c_str(),
-                    std::string(free_cands[c]->name).c_str(), hex(free_cands[c]->rva).c_str());
+        // (Round 2: cl's hash of a lambda follows its code, so an edited external lambda of a hash-named set is renamed: its old
+        // function is not defined by the patch at all. Such an old function has a public and pairs, or not, by that name; it is
+        // never one of the static call operators of this set. Its statics are pair_hashed_by_elimination's concern.)
+        bool external_hashed = false;
+        if (!hashed_closure(closure).empty() && free_cands[c]->rva != pdb::kNoRva) {
+            const Result<std::vector<pdb::SymbolView>> pubs = pdb_.publics_at_rva(free_cands[c]->rva);
+            external_hashed = pubs && !pubs->empty();
+        }
+        if (external_hashed || taken_by_public(*free_cands[c])) {
+            CML_LOG(Trace, "bind: overloads '%s': old record '%s' at rva %s has external linkage (%s): not in the set of lambdas", group_name.c_str(),
+                    std::string(free_cands[c]->name).c_str(), hex(free_cands[c]->rva).c_str(), external_hashed ? "a public at its address" : "the patch defines its public");
             ++taken_by_public_count;
             continue;
         }
         old_closures[function_of_closure(closure)].insert(closure);
     }
     if (taken_by_public_count != 0) {
-        CML_LOG(Info, "WP46-PUBLIC-LAMBDAS group='%s' old=%zu taken-by-public=%zu", group_name.c_str(), old_sig.size(), taken_by_public_count);
+        CML_LOG(Info, "WP46-PUBLIC-LAMBDAS group='%s' old=%zu external=%zu", group_name.c_str(), old_sig.size(), taken_by_public_count);
     }
     // WP-46 (D1 evidence): for closures cl names by a hash, how the two sets compare (do the hashes of unchanged lambdas
     // stay when lambdas are added or removed?).
@@ -1750,7 +1899,7 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
         own_scope[m] = scope_text[m];
         // WP-40 (R-48 item 5, rule (d)): the pipeline compared the code of the call operators and found that this
         // closure's lambda is the old lambda of ANOTHER number (they changed places): the static is looked for in that one.
-        for (const auto& [from, to] : in_.closure_pairing) {
+        for (const auto& [from, to] : closure_pairing_) {
             if (from != to && scope_text[m].size() > from.size() && scope_text[m].compare(0, from.size(), from) == 0) {
                 scope_text[m] = to + scope_text[m].substr(from.size());
                 overridden[m] = true;
@@ -2010,7 +2159,7 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
                         // A static paired across the numbers does not sit where the section's positions put its old record;
                         // the patch's static of the lambda with the old record's number does (its twin): that one teaches the
                         // layout, which the guards of these lambdas are placed from (settle_guards).
-                        for (const auto& [from, to] : in_.closure_pairing) {
+                        for (const auto& [from, to] : closure_pairing_) {
                             if (from == to || !in_closure(sy, from)) {
                                 continue;
                             }
@@ -2499,6 +2648,8 @@ void Planner::bridge_statics() {
         std::vector<std::uint32_t> members;  // positions in syms_
     };
     std::map<std::string, Group> groups;
+    // WP-46 (F-41.2): an edited hash-named lambda has a new name; it is paired with the one old lambda left, or refused.
+    pair_hashed_by_elimination();
     for (std::size_t pos = 0; pos < syms_.size(); ++pos) {
         Sym& sy = syms_[pos];
         if (!sy.defined || sy.decided || !sy.is_static) {
@@ -3009,7 +3160,7 @@ void Planner::settle_guards() {
         // WP-40 (rule (d)): a guard of a lambda paired by the code of its call operator with the old lambda of another
         // number sits, in the old image, where the layout puts the guard of the patch's lambda of THAT number.
         const Sym* position = &sy;
-        for (const auto& [from, to] : in_.closure_pairing) {
+        for (const auto& [from, to] : closure_pairing_) {
             if (from == to || !in_closure(sy, from)) {
                 continue;
             }

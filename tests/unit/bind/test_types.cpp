@@ -2682,7 +2682,9 @@ TEST_CASE("hash-named lambdas (F-41.2, WP-46): an old call operator an external 
             CHECK(h.functions[0] == hashed_op(h.closure));
         }
     }
-    SUBCASE("the patch has no kHash2 any more: the set changed, nothing is paired by the hash names (CML3214)") {
+    SUBCASE("the patch no longer defines the external kHash2 (edited and renamed, or gone; it has no statics): the static ones still pair") {
+        // (Round 2: an external lambda of a hash-named set never takes part in the set of static call operators; an edited one
+        // is renamed, so its old function is not defined by the patch at all. It has no statics here, so nothing can be lost.)
         SynthWorld w;
         hashed_world(w);
         Types t;
@@ -2690,15 +2692,10 @@ TEST_CASE("hash-named lambdas (F-41.2, WP-46): an old call operator an external 
         o.function(hashed_op(kHash1), t.call_operator(kHash1, hashed_unique(kHash1)), false);
         o.function(hashed_op(kHash3), t.call_operator(kHash3, hashed_unique(kHash3)), false);
         Built b = o.build(t.set.debug_t());
-        std::vector<cml::Diag> errors;
-        BindPlan partial;
-        REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
-        REQUIRE(errors.size() == 2);
-        for (const cml::Diag& e : errors) {
-            CHECK(e.code == diag::kAmbiguousOverloads);
-            CHECK(contains(e.message, "the lambdas of the enclosing function are not the same as in the old image (3 call operator(s) there, 2 in the patch)"));
-        }
-        CHECK(partial.hooks.empty());
+        auto r = plan_bind(w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        CHECK(decision(*r, hashed_op(kHash1)).old_address.rva == 0x1060);
+        CHECK(decision(*r, hashed_op(kHash3)).old_address.rva == 0x1080);
     }
     SUBCASE("a lambda added: the set changed (CML3214), also where every old name is still there") {
         SynthWorld w;
@@ -2714,9 +2711,12 @@ TEST_CASE("hash-named lambdas (F-41.2, WP-46): an old call operator an external 
         std::vector<cml::Diag> errors;
         BindPlan partial;
         REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
-        CHECK(errors.size() == 3);
-        for (const cml::Diag& e : errors) {
-            CHECK(e.code == diag::kAmbiguousOverloads);
+        REQUIRE(errors.size() == 4);
+        // (Round 2: first the leftover of the name matching, a lambda on one side only, then the set rule for each.)
+        CHECK(errors[0].code == diag::kHashedLambdasUnproven);
+        CHECK(contains(errors[0].message, "1 lambda(s) of the patch (" + added + ") and 0 of the old image (none) are left"));
+        for (std::size_t k = 1; k < errors.size(); ++k) {
+            CHECK(errors[k].code == diag::kAmbiguousOverloads);
         }
         CHECK(decision(partial, hashed_op(kHash1)).decision != DecisionKind::PatchHooked);
     }
@@ -2743,4 +2743,145 @@ TEST_CASE("hash-named lambdas (F-41.2, WP-46): a static paired by the hash name 
     CHECK(contains(errors[0].message, "belongs to lambda '" + kHash1 + "', which the compiler names by a hash"));
     CHECK(decision(partial, sname).decision != DecisionKind::BindOldData);
     CHECK(partial.hashed_lambdas.empty());
+}
+
+// ---- WP-46 round 2: cl's hash depends on the lambda's own code (CI, fixture legacy_lambdas: editing a lambda renamed its
+// closure, `WP46-HASH-SET ... old=3 new=3 common=2`). The one lambda left on each side after the names are matched is paired
+// by elimination (the pipeline then requires every name-matched lambda to be unchanged); anything else is refused (CML3630).
+namespace {
+const std::string kEdited1 = "<lambda_e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1>";
+const std::string kEdited3 = "<lambda_e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3>";
+std::string hashed_static(const std::string& closure) { return "?c@?1???R" + closure + "@@QEBAHXZ@4HA"; }
+std::string hashed_guard(const std::string& closure) { return "?$TSS0@?1???R" + closure + "@@QEBAHXZ@4HA"; }
+
+// The old compiland (cl): static call operators of kHash1 (text 0x60, `c` at data 0x20, its guard 0x28) and kHash3 (0x80,
+// 0x30, 0x38); with `external`, also kHash2's call operator (0x70, external: a public) with `c` at 0x40 and its guard 0x48.
+void hashed_statics_world(SynthWorld& w, bool external = false) {
+    Types old_types;
+    old_proc(w, kHash1 + "::operator()", 0x60, old_types.call_operator(kHash1, hashed_unique(kHash1)), {{"c", 0x20}, {"$TSS0", 0x28}});
+    old_proc(w, kHash3 + "::operator()", 0x80, old_types.call_operator(kHash3, hashed_unique(kHash3)), {{"c", 0x30}, {"$TSS0", 0x38}});
+    if (external) {
+        old_proc(w, kHash2 + "::operator()", 0x70, old_types.call_operator(kHash2, hashed_unique(kHash2)), {{"c", 0x40}, {"$TSS0", 0x48}});
+        w.pub_func(hashed_op(kHash2), 0x70);
+    }
+    old_types.set.add_to(w.spec.tpi);
+    w.open();
+}
+// The patch: these static lambdas (call operator, `c` and its guard, each a COMDAT as cl emits them); `external_closure`:
+// one more, with external linkage.
+Built hashed_statics_object(const std::vector<std::string>& closures, const std::string& external_closure = {}) {
+    Types t;
+    TypedObj o;
+    const auto lambda = [&](const std::string& closure, bool external) {
+        if (external) {
+            o.obj.function(hashed_op(closure), true);
+        } else {
+            o.function(hashed_op(closure), t.call_operator(closure, hashed_unique(closure)), false);
+        }
+        for (const std::string& name : {hashed_static(closure), hashed_guard(closure)}) {
+            const std::uint32_t sec = o.obj.section(".bss", kDataComdat, 8, coff::ComdatSelection::Any);
+            o.obj.symbol(name, 0, static_cast<std::int32_t>(sec), false, false);
+        }
+    };
+    for (const std::string& closure : closures) {
+        lambda(closure, false);
+    }
+    if (!external_closure.empty()) {
+        lambda(external_closure, true);
+    }
+    return o.build(t.set.debug_t());
+}
+}  // namespace
+
+TEST_CASE("hash-named lambdas (WP-46 round 2): the one edited lambda is paired by elimination, its static and guard with the old ones") {
+    // kHash3's body was edited, so cl named it kEdited3. main: CML3214 for both call operators ("3 call operator(s)..." / the
+    // set changed) and CML3207 for the statics; the edit could not be reloaded.
+    SynthWorld w;
+    hashed_statics_world(w);
+    Built b = hashed_statics_object({kHash1, kEdited3});
+    auto r = plan_bind(w.input(b));
+    REQUIRE_MESSAGE(r.has_value(), err(r));
+    const SymbolDecision op = decision(*r, hashed_op(kEdited3));
+    CHECK(op.decision == DecisionKind::PatchHooked);
+    CHECK(op.source == BindSource::CompilandSignature);
+    CHECK(op.old_address.rva == 0x1080);
+    CHECK(decision(*r, hashed_static(kEdited3)).decision == DecisionKind::BindOldData);
+    CHECK(decision(*r, hashed_static(kEdited3)).old_address.rva == 0x3030);
+    CHECK(decision(*r, hashed_guard(kEdited3)).decision == DecisionKind::BindOldData);
+    CHECK(decision(*r, hashed_guard(kEdited3)).old_address.rva == 0x3038);
+    // The name-matched lambda keeps its own old objects.
+    CHECK(decision(*r, hashed_op(kHash1)).old_address.rva == 0x1060);
+    CHECK(decision(*r, hashed_static(kHash1)).old_address.rva == 0x3020);
+    CHECK(decision(*r, hashed_guard(kHash1)).old_address.rva == 0x3028);
+    // Both are left to the proof by code; the eliminated one says which old lambda it was paired with.
+    REQUIRE(r->hashed_lambdas.size() == 2);
+    for (const HashedLambda& h : r->hashed_lambdas) {
+        CHECK(h.old_closure == (h.closure == kEdited3 ? kHash3 : std::string()));
+    }
+}
+
+TEST_CASE("hash-named lambdas (WP-46 round 2): two edited lambdas, or a lambda added or removed, are refused (CML3630), nothing bound") {
+    const auto refused = [](SynthWorld& w, Built& b, const std::string& left) {
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+        REQUIRE_FALSE(errors.empty());
+        CHECK(errors[0].code == diag::kHashedLambdasUnproven);
+        CHECK_MESSAGE(contains(errors[0].message, left), errors[0].message);
+        for (const SymbolDecision& d : partial.decisions) {
+            if (d.type == SymbolType::Data && d.defined && d.name.find("<lambda_") != std::string::npos) {
+                CHECK_MESSAGE(d.decision != DecisionKind::BindOldData, d.name);
+            }
+        }
+    };
+    SUBCASE("both lambdas edited") {
+        SynthWorld w;
+        hashed_statics_world(w);
+        Built b = hashed_statics_object({kEdited1, kEdited3});
+        refused(w, b, "2 lambda(s) of the patch (" + kEdited1 + ", " + kEdited3 + ") and 2 of the old image (" + kHash1 + ", " + kHash3 + ") are left");
+    }
+    SUBCASE("one lambda removed") {
+        SynthWorld w;
+        hashed_statics_world(w);
+        Built b = hashed_statics_object({kHash1});
+        refused(w, b, "0 lambda(s) of the patch (none) and 1 of the old image (" + kHash3 + ") are left");
+    }
+}
+
+TEST_CASE("hash-named lambdas (WP-46 round 2): an edited lambda with external linkage and statics is refused, its statics never fresh") {
+    // kHash2 (an inline function's lambda, external, with `c`) was edited: the patch defines it as kEdited1, a public name the
+    // old image has nowhere. main: kEdited1 is a new function whose `c` and guard are fresh (the running program's kHash2
+    // statics are left behind: a silent reset). Round 2 ruling, points 2 and 3: refused.
+    SynthWorld w;
+    hashed_statics_world(w, true);
+    Built b = hashed_statics_object({kHash1, kHash3}, kEdited1);
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+    REQUIRE_FALSE(errors.empty());
+    CHECK(errors[0].code == diag::kHashedLambdasUnproven);
+    CHECK_MESSAGE(contains(errors[0].message, "1 lambda(s) of the patch (" + kEdited1 + ") and 1 of the old image (" + kHash2 + ") are left"), errors[0].message);
+}
+
+TEST_CASE("hash-named lambdas (WP-46 round 2): an external lambda without statics that is new or gone pairs as before (by its public name)") {
+    SynthWorld w;
+    Types old_types;
+    old_proc(w, kHash1 + "::operator()", 0x60, old_types.call_operator(kHash1, hashed_unique(kHash1)), {{"c", 0x20}, {"$TSS0", 0x28}});
+    old_proc(w, kHash2 + "::operator()", 0x70, old_types.call_operator(kHash2, hashed_unique(kHash2)));
+    w.pub_func(hashed_op(kHash2), 0x70);
+    old_types.set.add_to(w.spec.tpi);
+    w.open();
+    Types t;
+    TypedObj o;
+    o.function(hashed_op(kHash1), t.call_operator(kHash1, hashed_unique(kHash1)), false);
+    for (const std::string& name : {hashed_static(kHash1), hashed_guard(kHash1)}) {
+        const std::uint32_t sec = o.obj.section(".bss", kDataComdat, 8, coff::ComdatSelection::Any);
+        o.obj.symbol(name, 0, static_cast<std::int32_t>(sec), false, false);
+    }
+    o.obj.function(hashed_op(kEdited1), true);  // an inline function's lambda, new or renamed, without statics
+    Built b = o.build(t.set.debug_t());
+    auto r = plan_bind(w.input(b));
+    REQUIRE_MESSAGE(r.has_value(), err(r));
+    CHECK(decision(*r, hashed_static(kHash1)).old_address.rva == 0x3020);
+    CHECK(decision(*r, hashed_op(kEdited1)).decision == DecisionKind::PatchNewFunction);
 }

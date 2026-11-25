@@ -1,21 +1,25 @@
-# Scenario `legacy_lambdas` (WP-46, ADR-0043 ruling D1, F-41.2): the fixture is built with cl's legacy lambda processor (C++17,
-# /Zc:lambda-), which names every closure `<lambda_<hash>>` in no scope, as Jolt's unity batches are. Every value is a
-# lambda's static: its 6-digit id plus its count, so a re-initialised counter restarts just above its id; made counts the
-# constructions and stays 3.
+# Scenario `legacy_lambdas` (WP-46, ADR-0043 rulings D1 and round 2, F-41.2): the fixture is built with cl's legacy lambda
+# processor (C++17, /Zc:lambda-), which names every closure `<lambda_<hash>>` in no scope, as Jolt's unity batches are. The
+# hash follows the lambda's own code (CI on 4c15feb: editing a lambda renamed its closure, `WP46-HASH-SET ... common=2`; an
+# edit elsewhere kept every name, `common=3`). Every value is a lambda's static: its 6-digit id plus its count (an edit adds
+# an offset to what a lambda returns), so a re-initialised counter restarts just above its id; made counts the
+# constructions and stays 3. The fixture prints `cc=cl` or `cc=clang`, so one step can expect cl's refusal and clang-cl's
+# reload (clang-cl numbers its lambdas, whatever the standard).
 #
-# 1. mark_1 changes ll_mark() only. cl: the three lambdas pair by their hash names and the pipeline proves it by their code
-#    (broker log `WP46-HASHED-LAMBDAS ... unchanged=3 changed=0 ... proven=unchanged`); applied, mark 1 -> 2.
-# 2. body_2 changes the body of the second lambda (b counts by 2). cl: one changed lambda, the one the edit changed (rule
-#    (d)): `proven=one-changed`, applied; every counter keeps its value.
-# 3. insert_3 adds a lambda in front of the three. The set of lambdas changed, so under cl the hash names pair nothing
-#    (CML3214); the broker's `WP46-HASH-SET ... old=3 new=4 common=N` line is the evidence of whether cl's hash names of the
-#    unchanged lambdas stayed (common=3) or moved. clang-cl numbers its lambdas and refuses with CML3207 / CML3214 or applies.
+# 1. mark_1 changes ll_mark() only. cl: the three lambdas keep their names and their code proves them
+#    (`WP46-HASHED-LAMBDAS ... unchanged=3 ... proven=unchanged`); applied, mark 1 -> 2.
+# 2. body_2 changes the second lambda (b + 50000). cl renames it: the one lambda left on each side is paired by elimination
+#    (`WP46-ELIMINATION ... new=<lambda_..> old=<lambda_..>`), the two others are proven unchanged (`proven=by-elimination`);
+#    applied, b continues its count 50000 higher (never re-initialised).
+# 3. two_3 changes the first and the third lambda (a, c + 70000). cl: three lambdas are left on each side (b is still the
+#    renamed one): refused (CML3630), a and c keep their old code. clang-cl: applied.
+# 4. insert_4 adds a lambda in front of the others: cl refuses (CML3630); clang-cl reloads or refuses (CML3207 / CML3214).
 #    Either way no counter leaves its range and nothing is constructed again.
 # cmltest prints `RELOAD-OUTCOME applied|refused id=...` and the broker's WP46 lines after each reload step.
 name = "legacy_lambdas"
-description = "fixture legacy_lambdas (cl legacy lambda names): an edit elsewhere and an edited lambda reload with every static kept; an added lambda reloads or is refused"
+description = "fixture legacy_lambdas (cl legacy lambda names): an edit elsewhere and one edited lambda reload with every static kept; two edited lambdas and an added one are refused under cl"
 fixture = "legacy_lambdas"
-timeout_s = 240
+timeout_s = 300
 
 [[step]]
 kind = "launch"
@@ -27,7 +31,7 @@ within_s = 15
 
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ mark=1 a=10(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) b=20\\d{4} c=30\\d{4} made=3\\b"
+regex = "TICK n=\\d+ cc=(cl|clang) mark=1 a=10(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) b=20\\d{4} c=30\\d{4} made=3\\b"
 within_s = 20
 
 [[step]]
@@ -40,7 +44,7 @@ within_s = 120
 
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ mark=2 a=10(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) b=20\\d{4} c=30\\d{4} made=3\\b"
+regex = "TICK n=\\d+ cc=(cl|clang) mark=2 a=10(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) b=20\\d{4} c=30\\d{4} made=3\\b"
 within_s = 10
 
 [[step]]
@@ -51,23 +55,39 @@ patch = "edits/body_2.edit"
 kind = "reload"
 within_s = 120
 
+# The new code runs (b + 50000) on the old counter (at least 20 counts: not constructed again).
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ mark=2 a=10(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) b=20\\d{4} c=30\\d{4} made=3\\b"
+regex = "TICK n=\\d+ cc=(cl|clang) mark=2 a=10\\d{4} b=25(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) c=30\\d{4} made=3\\b"
 within_s = 10
 
 [[step]]
 kind = "edit"
-patch = "edits/insert_3.edit"
+patch = "edits/two_3.edit"
 
 [[step]]
 kind = "reload"
 within_s = 120
-allow_error = "CML3214|CML3207|CML3630|CML3600"
+allow_error = "CML3630"
+
+# cl: refused, the old code of a and c runs; clang-cl: applied, a and c 70000 higher. Never re-initialised.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ (cc=cl mark=2 a=10\\d{4} b=25\\d{4} c=30\\d{4}|cc=clang mark=2 a=17(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) b=25\\d{4} c=37\\d{4}) made=3\\b"
+within_s = 10
+
+[[step]]
+kind = "edit"
+patch = "edits/insert_4.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+allow_error = "CML3630|CML3214|CML3207|CML3600"
 
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ mark=2 a=10(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) b=20\\d{4} c=30\\d{4} made=3\\b"
+regex = "TICK n=\\d+ (cc=cl mark=2 a=10\\d{4} b=25\\d{4} c=30\\d{4}|cc=clang mark=2 a=17\\d{4} b=25\\d{4} c=37\\d{4}) made=3\\b"
 within_s = 10
 
 [[step]]
