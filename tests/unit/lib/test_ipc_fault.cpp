@@ -68,14 +68,14 @@ TEST_CASE("ArmFault: round trip, description, trailing bytes and long names are 
     }
 }
 
-TEST_CASE("fault stages (WP-43): the groups are reload, restart and revert, in that order, and the new stages' ids are in WP-43's ranges") {
+TEST_CASE("fault stages (WP-43, WP-44): the groups come in table order, and the new stages' ids are in their WPs' ranges") {
     namespace f = ipc::fault;
     std::vector<std::string> order;
     std::size_t reload = 0;
     for (const f::StageInfo& s : f::kStages) {
         CAPTURE(s.name);
         const std::string group = s.group;
-        CHECK((group == "reload" || group == "restart" || group == "revert"));
+        CHECK((group == "reload" || group == "restart" || group == "revert" || group == "exception" || group == "exception-action" || group == "watch"));
         if (order.empty() || order.back() != group) {
             order.push_back(group);
         }
@@ -83,16 +83,30 @@ TEST_CASE("fault stages (WP-43): the groups are reload, restart and revert, in t
             ++reload;
             continue;
         }
+        const bool wp44 = group == "exception" || group == "exception-action" || group == "watch";
         if (s.agent_side) {
-            CHECK((s.diag_id >= 4657 && s.diag_id <= 4679));
+            CHECK((wp44 ? (s.diag_id >= 4661 && s.diag_id <= 4699) : (s.diag_id >= 4657 && s.diag_id <= 4679)));
         } else {
-            CHECK((s.diag_id >= 5972 && s.diag_id <= 5978));
+            CHECK((wp44 ? (s.diag_id >= 5979 && s.diag_id <= 5984) : (s.diag_id >= 5972 && s.diag_id <= 5978)));
         }
     }
-    CHECK(order == std::vector<std::string>{"reload", "restart", "revert"});  // each group in one block: the table is appended to
-    CHECK(reload == 11);                                                       // WP-28's stages, unchanged
+    // Each group in one block: the table is appended to.
+    CHECK(order == std::vector<std::string>{"reload", "restart", "revert", "exception", "exception-action", "watch"});
+    CHECK(reload == 11);  // WP-28's stages, unchanged
     CHECK(f::info(f::Stage::PostPatchHooks).group == std::string("reload"));
     CHECK(f::find_stage("restart-hold")->stage == f::Stage::RestartHold);
+    // WP-44: the watcher's stages are the broker's (the watcher is not per process), the hold and the actions the agent's.
+    CHECK_FALSE(f::info(f::Stage::WatchReload).agent_side);
+    CHECK_FALSE(f::info(f::Stage::ExceptionReport).agent_side);
+    CHECK(f::info(f::Stage::ExceptionHold).agent_side);
+    CHECK(f::find_stage("exception-reexecute")->diag_id == f::ids::kAgentExceptionReexecute);
+    // The ids of WP-44 that are not stages are inside its range and distinct from the stages'.
+    for (const std::uint32_t other : {f::ids::kWatchDisarmed, f::ids::kPersist}) {
+        CHECK((other >= 5979 && other <= 5984));
+        for (const f::StageInfo& s : f::kStages) {
+            CHECK(s.diag_id != other);
+        }
+    }
 }
 
 TEST_CASE("fault stages: a table row per stage, in pipeline order, with unique names and ids inside the WP-28 ranges") {
@@ -119,13 +133,16 @@ TEST_CASE("fault stages: a table row per stage, in pipeline order, with unique n
     // The agent has exactly the four stages of the brief in the reload's pipeline (WP-28), and WP-43's four in the restart and the revert.
     std::vector<std::string> agent;
     std::vector<std::string> agent_wp43;
+    std::vector<std::string> agent_wp44;
     for (const f::StageInfo& s : f::kStages) {
         if (s.agent_side) {
-            (std::string(s.group) == "reload" ? agent : agent_wp43).push_back(s.name);
+            const std::string group = s.group;
+            (group == "reload" ? agent : (group == "restart" || group == "revert") ? agent_wp43 : agent_wp44).push_back(s.name);
         }
     }
     CHECK(agent == std::vector<std::string>{"reservation", "patch-load", "hook-install", "post-patch-hooks"});
     CHECK(agent_wp43 == std::vector<std::string>{"pre-restart-hooks", "revert-repoint", "revert-restore", "revert-uncommit"});
+    CHECK(agent_wp44 == std::vector<std::string>{"exception-hold", "exception-continue", "exception-leave", "exception-reexecute"});
     // The other ids of the ranges are distinct from the stages'.
     for (const std::uint32_t other : {f::ids::kAgentBadArm, f::ids::kAgentNotCompiledIn, f::ids::kBadRequest, f::ids::kNoSuchProcess, f::ids::kArmRefused}) {
         CHECK(ids.insert(other).second);

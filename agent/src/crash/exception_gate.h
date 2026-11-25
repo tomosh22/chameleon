@@ -150,6 +150,12 @@ public:
     std::size_t held_count() const noexcept;
     // Faults that found no free slot since the last call (they were passed on).
     std::uint32_t take_overflow_count() noexcept { return overflow_.exchange(0, std::memory_order_acq_rel); }
+    // WP-44: faults passed on by the failure-injection stage exception-hold since the last call. The stages exception-continue,
+    // exception-leave and exception-reexecute make resolve() / resolve_reexecute() refuse with CML4662 / 4663 / 4664 once the thread is
+    // claimed (it stays held).
+#if defined(CML_FAULT_INJECTION)
+    std::uint32_t take_injected_count() noexcept { return injected_passes_.exchange(0, std::memory_order_acq_rel); }
+#endif
 
     // The context a Leave resumes with: `in` unwound one frame (RtlVirtualUnwind; a function without unwind information is a
     // leaf, whose return address is at RSP), RAX = 0, XMM0 = 0. Public so a test can check it without a fault.
@@ -227,6 +233,9 @@ private:
     std::atomic<HANDLE> notify_{nullptr};
     std::atomic<std::uint32_t> next_id_{1};
     std::atomic<std::uint32_t> overflow_{0};
+#if defined(CML_FAULT_INJECTION)
+    std::atomic<std::uint32_t> injected_passes_{0};  // WP-44
+#endif
     std::atomic<int> active_table_{0};
     mutable RangeTable tables_[2];  // readers is bumped by const lookups
     std::atomic<DWORD> ignored_threads_[kMaxIgnoredThreads] = {};

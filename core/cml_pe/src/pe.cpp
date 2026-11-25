@@ -896,6 +896,10 @@ Result<std::vector<std::byte>> read_file(const std::string& path) {
 }
 
 namespace {
+// R-49: the furthest into a file that read_file_headers follows e_lfanew. The headers after it are at most 20 + 0xFFFF + 0xFFFF * 40
+// bytes, so a read is bounded by about 3.6 MiB whatever the file says.
+constexpr std::uint64_t kMaxNtHeadersOffset = 1024 * 1024;
+
 // How many leading bytes Image::parse reads, as far as the first `b.size()` bytes of the file can tell: the DOS header,
 // then the NT headers up to the end of the file header, then the optional header and the section table.
 std::uint64_t header_extent(ByteSpan b) noexcept {
@@ -937,6 +941,31 @@ Result<std::vector<std::byte>> read_file_headers(const std::string& path) {
         }
         if (!f) {
             return make_diag(1300, format("failed while reading '%s'", path.c_str()), "Check that the file is not locked or truncated.");
+        }
+        if (pass == 0 && data.size() < file_size) {
+            // R-49: the first block is only a prefix of the file. What Image::parse would say about the DOS header or e_lfanew must name
+            // the FILE's size, not the block's, and a corrupt e_lfanew must not make this read most of the file: such files are refused
+            // here, with the path in front like load_image_file words it.
+            const ByteSpan head(data.data(), data.size());
+            if (rd16(head, 0) != 0x5A4D) {
+                return make_diag(1301, format("%s: not a PE image: missing 'MZ' DOS header in %llu bytes", path.c_str(), static_cast<unsigned long long>(file_size)),
+                                 "Pass a .exe or .dll produced by the linker.");
+            }
+            const std::uint64_t lfanew = rd32(head, 0x3C);
+            if (lfanew + 4 + kFileHeaderSize + 2 > file_size) {
+                return make_diag(1302,
+                                 format("%s: e_lfanew 0x%X puts the NT headers outside the %llu-byte image", path.c_str(), static_cast<unsigned>(lfanew),
+                                        static_cast<unsigned long long>(file_size)),
+                                 "The image is truncated or corrupt.");
+            }
+            if (lfanew > kMaxNtHeadersOffset) {
+                return make_diag(1302,
+                                 format("%s: e_lfanew 0x%X puts the NT headers more than %u KiB into the %llu-byte file; a linker puts them within the first "
+                                        "few KiB, so the image is taken as corrupt",
+                                        path.c_str(), static_cast<unsigned>(lfanew), static_cast<unsigned>(kMaxNtHeadersOffset / 1024),
+                                        static_cast<unsigned long long>(file_size)),
+                                 "The image is truncated or corrupt; build it again.");
+            }
         }
         const std::uint64_t need = std::min(file_size, header_extent(ByteSpan(data.data(), data.size())));
         if (need <= want) {

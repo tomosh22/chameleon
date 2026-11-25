@@ -1,0 +1,87 @@
+# Scenario `crash_reexecute_inject` (WP-44, ADR-0043, R-42): the failure-injection stage exception-reexecute.
+#
+# fixture crash_reexecute, its stages 1 and 2 (see crash_reexecute.toml): step(nullptr, 13, 2.75) faults, the patch fix_step.edit makes
+# `reexecute` offered. With exception-reexecute armed the agent refuses the re-execute with CML4664 before the thread is touched; the
+# thread stays held, and the next `reexecute` runs the new step() with the original arguments.
+name = "crash_reexecute_inject"
+description = "fixture crash_reexecute: an injected refusal of re-execute keeps the thread held; the next re-execute runs the fixed step()"
+fixture = "crash_reexecute"
+timeout_s = 300
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ stage=0 result=\\d+ seen_k=\\d+ seen_scale=0\\.500 opt=-1"
+within_s = 20
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_crash_reexecute.exe"
+within_s = 30
+
+[[step]]
+kind = "watch_exceptions"
+
+[[step]]
+kind = "signal_fixture"
+
+[[step]]
+kind = "expect_stdout"
+regex = "ARMED"
+within_s = 10
+
+[[step]]
+kind = "expect_exception"
+code = "0xC0000005"
+function = "step"
+lacks = "reexecute"
+reason = "CML5900"
+within_s = 30
+
+[[step]]
+kind = "edit"
+patch = "edits/fix_step.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+
+[[step]]
+kind = "expect_exception_updated"
+offers = "reexecute"
+within_s = 30
+
+# ---- exception-reexecute: refused before the thread is touched; it stays held ----
+[[step]]
+kind = "inject_failure"
+stage = "exception-reexecute"
+
+[[step]]
+kind = "exception_action"
+action = "reexecute"
+expect_error = "CML4664"
+
+[[step]]
+kind = "expect_pending_exceptions"
+count = 1
+
+# The next re-execute runs the new body with the ORIGINAL arguments.
+[[step]]
+kind = "exception_action"
+action = "reexecute"
+
+[[step]]
+kind = "expect_pending_exceptions"
+count = 0
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ stage=1 result=102756 seen_k=13 seen_scale=2\\.750 opt=-1"
+within_s = 15
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ stage=2 result=10\\d{4} seen_k=\\d+ seen_scale=0\\.500 opt=-1"
+within_s = 15

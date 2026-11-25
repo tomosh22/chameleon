@@ -176,7 +176,17 @@ public:
     // WP-43: the agent of process `pid` disconnected. What an unfinished restart left for that pid is dropped when the process has
     // exited (ProcessHost::has_exited); a pipe that broke while the process runs keeps it. Either way the record applies only to a
     // process with the restart token it was made for, so a reused pid never gets it.
-    void process_gone(std::uint32_t pid);
+    // R-51: on Windows the pipe can break before the process handle is signalled, so a process that is not seen as exited at once is
+    // looked at again for a short, bounded time (set_exit_recheck_for_testing; default 500 ms in 25 ms steps) before the record is kept.
+    // `exited`: what the caller found out already with process_exited (not asked again).
+    void process_gone(std::uint32_t pid, std::optional<bool> exited = std::nullopt);
+    // WP-44 (R-51): whether process `pid` has exited, by the host (false without one, or when it cannot tell). A process not seen as
+    // exited at once is looked at again for the bounded time above.
+    bool process_exited(std::uint32_t pid);
+    void set_exit_recheck_for_testing(std::chrono::milliseconds total, std::chrono::milliseconds step) {
+        exit_recheck_ = total;
+        exit_recheck_step_ = step;
+    }
     // WP-43: a `restart-resume` for held process `pid` has been received and is waiting for the restart thread (tests).
     bool resume_requested_for_testing(std::uint32_t pid);
 
@@ -193,7 +203,8 @@ private:
         std::vector<Carried> carried;
     };
     void remember_unfinished(std::uint32_t pid, Unfinished unfinished);
-    Result<ipc::json::Value> restart_impl(const ipc::json::Value& args, const std::function<bool()>& client_gone, std::uint32_t* ran_for,
+    // `locked`: restart() holds the run locks (R-51: it keeps them until the end-of-restart failure-injection cleanup has run).
+    Result<ipc::json::Value> restart_impl(const ipc::json::Value& args, const std::function<bool()>& client_gone, bool locked, std::uint32_t* ran_for,
                                           bool* old_terminated);
     bool has_unfinished(std::uint32_t pid);
     std::optional<Unfinished> peek_unfinished(std::uint32_t pid);
@@ -227,6 +238,8 @@ private:
     std::deque<std::uint32_t> ended_order_;             // the same pids, oldest first (eviction)
     std::chrono::milliseconds confirm_wait_{10000};
     std::chrono::milliseconds relaunch_retry_delay_{250};
+    std::chrono::milliseconds exit_recheck_{500};      // R-51
+    std::chrono::milliseconds exit_recheck_step_{25};
 
     // WP-43: unfinished restarts by the pid of the process they started (the last 16).
     std::mutex unfinished_mutex_;

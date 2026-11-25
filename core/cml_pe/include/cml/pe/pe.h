@@ -328,6 +328,9 @@ Result<std::vector<std::byte>> read_file(const std::string& path);  // CML1300
 // file. Image::parse on the result gives the same headers, and the same diagnostics, as on the whole file; an Image parsed
 // from it answers header questions only (file and optional header, data directory entries, section table), not what lives
 // in a section (exports, imports, the debug directory...). CML1300 like read_file.
+// R-49: for a file longer than the first block, what can be told from that block is refused here, with the path and the FILE's size in
+// the message (the block's size would mislead): no 'MZ' (CML1301), an e_lfanew beyond the end of the file or more than 1 MiB into it
+// (CML1302). So a corrupt e_lfanew never makes it read more than a few MiB.
 Result<std::vector<std::byte>> read_file_headers(const std::string& path);
 
 // An on-disk Image together with the bytes it views.

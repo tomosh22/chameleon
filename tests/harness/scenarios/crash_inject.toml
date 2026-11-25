@@ -1,0 +1,139 @@
+# Scenario `crash_inject` (WP-44, ADR-0043, R-42): failure injection in the crash handler (groups "exception", "exception-action").
+#
+# fixture crash --seh: the store runs under the application's own __try/__except, and every signal makes the page inaccessible again.
+#   * exception-hold (agent): the first fault is passed on instead of held, as without Chameleon: the application's own handler sees it
+#     (`PASSED_ON`), recovers and carries on; nothing is pending. The agent logs CML4661.
+#   * exception-report (broker): the second fault is held, but its `exception` event is not published: the diag CML5979 instead. The
+#     thread stays held; `exceptions` lists it (and expect_pending_exceptions makes it the current exception).
+#   * exception-continue, exception-leave (agent): each action is refused with its own id before the thread is touched; it stays held.
+#   * The patch (edits/fix_cell.edit) repairs the page from the helper thread, and an action without injection resumes the thread.
+# The program keeps ticking throughout. exception-reexecute is in crash_reexecute_inject (it needs the re-execute fixture).
+name = "crash_inject"
+description = "fixture crash --seh: a fault passed on to the application's handler, a held thread that is not reported, actions refused; the next action works"
+fixture = "crash"
+fixture_args = "--seh"
+timeout_s = 300
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ cell=\\d+ armed=0"
+within_s = 20
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_crash.exe"
+within_s = 30
+
+[[step]]
+kind = "watch_exceptions"
+
+# ---- exception-hold: the fault is passed on; the application's own handler sees it ----
+[[step]]
+kind = "inject_failure"
+stage = "exception-hold"
+
+[[step]]
+kind = "signal_fixture"
+
+[[step]]
+kind = "expect_stdout"
+regex = "ARMED"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "PASSED_ON n=\\d+ code=0xC0000005"
+within_s = 10
+
+[[step]]
+kind = "expect_pending_exceptions"
+count = 0
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ cell=[1-9]\\d+ armed=1"
+within_s = 10
+
+# ---- exception-report: the next fault is held, but not reported (CML5979); `exceptions` still lists it ----
+[[step]]
+kind = "inject_failure"
+stage = "exception-report"
+
+[[step]]
+kind = "signal_fixture"
+
+[[step]]
+kind = "expect_stdout"
+regex = "ARMED again"
+within_s = 10
+
+[[step]]
+kind = "expect_diag"
+id = "CML5979"
+within_s = 30
+
+[[step]]
+kind = "expect_pending_exceptions"
+count = 1
+
+# ---- exception-continue, exception-leave: refused before the thread is touched; it stays held ----
+[[step]]
+kind = "inject_failure"
+stage = "exception-continue"
+
+[[step]]
+kind = "exception_action"
+action = "continue"
+expect_error = "CML4662"
+
+[[step]]
+kind = "expect_pending_exceptions"
+count = 1
+
+[[step]]
+kind = "inject_failure"
+stage = "exception-leave"
+
+[[step]]
+kind = "exception_action"
+action = "leave"
+expect_error = "CML4663"
+
+[[step]]
+kind = "expect_pending_exceptions"
+count = 1
+
+# ---- the patch fixes the page; continue without injection resumes the thread ----
+[[step]]
+kind = "edit"
+patch = "edits/fix_cell.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+
+[[step]]
+kind = "expect_stdout"
+regex = "REPAIRED"
+within_s = 20
+
+[[step]]
+kind = "exception_action"
+action = "continue"
+
+[[step]]
+kind = "expect_pending_exceptions"
+count = 0
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ cell=[1-9]\\d+ armed=1"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ cell=[1-9]\\d+ armed=1"
+within_s = 10
