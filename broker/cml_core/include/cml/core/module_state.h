@@ -96,6 +96,10 @@ struct ModuleState {
     std::string name;  // file name ("fixture_basic.exe")
     std::uint64_t base = 0;
     std::uint64_t size = 0;
+    // WP-45: which instance of this module (path) in its process this state is, from 1: a module freed and loaded again, or
+    // disabled and enabled again, is a new instance. Names the patch work directory, so that no patch of a new instance is written
+    // to the path of an earlier instance's patch DLL, which stays loaded (F-42.2). Set before the state is shared.
+    std::uint64_t instance = 1;
     std::shared_ptr<ModuleIndex> index;
     SharedRegistry registry;
 
@@ -109,6 +113,9 @@ struct ModuleState {
     std::uint64_t generation = 0;                   // patches applied to this module
     std::uint64_t patch_counter = 0;                // names patch files (also counts failed attempts; never goes back)
     std::vector<PatchBatch> batches;                // live patches, oldest first (WP-22)
+    // WP-45: the baseline of an earlier instance this one was given to re-apply (ReloadService). Kept so that this instance, should
+    // it go away before the re-apply ran, hands the same edits on to the next one.
+    std::optional<BaselineSnapshot> carried_in;
 
     bool is_hooked(std::uint64_t old_va);
 

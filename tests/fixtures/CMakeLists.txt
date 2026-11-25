@@ -63,3 +63,4 @@ endforeach()
 add_subdirectory(planner_pairing)     # WP-40
 add_subdirectory(planner_pairing_o2)  # WP-40 (/O2 /Ob2)
 add_subdirectory(legacy_lambdas)      # WP-46 (cl legacy lambda processor, C++17)
+add_subdirectory(plugin_reload)       # WP-45

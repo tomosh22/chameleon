@@ -62,6 +62,13 @@ struct ModuleIndexSpec {
     std::function<void(const ModuleAudit&)> on_audit;
     // WP-26b: called once from the worker thread when the index is built and archive members were skipped (CML5920).
     std::function<void(const Diag&)> on_skipped_archive_members;
+    // WP-45: the source baseline an earlier instance of the same module left (it was freed and loaded again, or a hot-restart
+    // carried it to a module the new process enabled late). Applied right after the baseline is taken, before the index is Ready,
+    // so every reload that sees the index sees it: SourceBaseline::restore (the files patched before count as changed again and
+    // the next reload re-applies them), or SourceBaseline::adopt when `carried_live` (the same image was disabled and enabled
+    // again; it still runs the patches). carried_files() says how many files it covered.
+    std::optional<BaselineSnapshot> carried;
+    bool carried_live = false;
 };
 
 // WP-26b: a compiland that cannot be reloaded although its object is real (no build environment, missing source file).
@@ -128,6 +135,8 @@ public:
     // WP-21 (hot-restart): the baseline state to carry to the relaunched process, and its application there. Requires Ready.
     BaselineSnapshot baseline_snapshot() const { return baseline_.session_snapshot(); }
     std::size_t restore_session_baseline(const BaselineSnapshot& snapshot) { return baseline_.restore(snapshot); }
+    // WP-45: the files of spec.carried this index applied (restored, or adopted when carried_live); 0 without a carried baseline.
+    std::size_t carried_files() const { return carried_files_.load(std::memory_order_acquire); }
     // WP-22: the stamps the baseline holds for these files now, and the undo of an accept() (the stamps go back as they were).
     std::map<std::string, FileStamp> baseline_stamps(const std::vector<std::string>& files) const { return baseline_.stamps_of(files); }
     void restore_baseline(const std::map<std::string, FileStamp>& stamps) { baseline_.accept(stamps); }
@@ -175,6 +184,7 @@ private:
     std::vector<SkippedCompiland> skipped_;                               // guarded by mutex_
     std::set<std::uint32_t> skipped_set_;                                 // guarded by mutex_: their indices
     std::atomic<bool> cancel_{false};
+    std::atomic<std::size_t> carried_files_{0};  // WP-45
     std::thread worker_;
 };
 

@@ -402,6 +402,64 @@ TEST_CASE("re-pointing rewrites only the jump target and keeps the first hook's 
     }
 }
 
+TEST_CASE("WP-45: forget_range drops the records of an unloaded module; a hook of the image loaded again is a first install") {
+    for (const bool padded : {true, false}) {
+        INFO((padded ? "strategy 1" : "strategy 2"));
+        // One arena (so every jump is in reach). The plugin's image is the range around old_fn: freed, then mapped again at the same
+        // base. other_fn stands for another module, which stays loaded.
+        Arena arena;
+        const Placed old_fn = arena.place_padded(cl_release(0), padded ? 8 : 0, 16);
+        const Placed other_fn = arena.place_padded(cl_release(0), 8, 16);
+        const Placed new_1 = arena.place_padded(lea_ret(100), 8, 8);
+        const Placed new_2 = arena.place_padded(lea_ret(200), 8, 8);
+        arena.seal();
+        const std::uint64_t image_base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(old_fn.entry - kBefore));
+        const std::uint64_t image_size = static_cast<std::uint64_t>(kBefore + kAfter);
+        REQUIRE(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(other_fn.entry)) >= image_base + image_size);
+        const Bytes original = around(old_fn);
+        Installer installer;
+        HookOutcome outcome;
+        REQUIRE(install_one(installer, old_fn.entry, new_1.entry, "fn", &outcome).ok());
+        REQUIRE(install_one(installer, other_fn.entry, new_1.entry, "other", &outcome).ok());
+        CHECK(old_fn.as_int()(1) == 101);
+        CHECK(installer.hook_count() == 2);
+
+        // FreeLibrary + LoadLibrary at the same base: the fresh image has its original bytes where the jump was.
+        arena.unseal();
+        std::memcpy(old_fn.entry - kBefore, original.data(), original.size());
+        arena.seal();
+        CHECK(old_fn.as_int()(1) == 1);
+
+        // Without forgetting, the installer would take the stale record for a live hook and plan a re-point of a jump that is gone.
+        // Nothing is written then (the batch fails before the window).
+        const BatchResult stale = install_one(installer, old_fn.entry, new_2.entry, "fn", &outcome);
+        CHECK_FALSE(stale.ok());
+        CHECK(stale.diag.code == ids::kCodeChanged);
+        CHECK(around(old_fn) == original);
+
+        // The agent forgets the unloaded range: only the records inside it go.
+        CHECK(installer.forget_range(image_base, image_size) == 1);
+        CHECK(installer.hook_count() == 1);
+        CHECK_FALSE(installer.find(old_fn.entry, nullptr));
+        HookInfo kept;
+        REQUIRE(installer.find(other_fn.entry, &kept));
+        CHECK(kept.replacement == new_1.entry);
+        CHECK(other_fn.as_int()(1) == 101);
+        CHECK(installer.forget_range(image_base, 0) == 0);
+
+        // The re-apply to the new image is planned as a first install, with the new image's bytes as its original.
+        const BatchResult fresh = install_one(installer, old_fn.entry, new_2.entry, "fn", &outcome);
+        REQUIRE_MESSAGE(fresh.ok(), fresh.diag.format());
+        CHECK(outcome.status == HookStatus::Installed);
+        CHECK(outcome.strategy == (padded ? Strategy::PaddingTwoByte : Strategy::FiveByte));
+        CHECK(old_fn.as_int()(1) == 201);
+        REQUIRE(revert_one(installer, old_fn.entry, "fn", nullptr).ok());
+        CHECK(around(old_fn) == original);
+        REQUIRE(revert_one(installer, other_fn.entry, "other", nullptr).ok());
+        CHECK(other_fn.as_int()(1) == 1);
+    }
+}
+
 TEST_CASE("a batch is all or nothing") {
     Arena arena;
     const Placed good_1 = arena.place_padded(cl_release(0), 8, 8);
