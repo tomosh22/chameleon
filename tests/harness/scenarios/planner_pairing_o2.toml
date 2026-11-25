@@ -1,16 +1,18 @@
 # Scenario `planner_pairing_o2` (WP-40, ADR-0043): the fixture built with /O2 /Ob2 in every cell.
-#   mark_2 recompiles lambdas.cpp (R-48 item 1). clang-cl inlined the three lambdas and recorded their statics `sname` in
+#   parts_1 recompiles parts.cpp (R-48 item 4): clang-cl split the internal array into `s_parts.0` .. `.2`, of which no
+#   debug record exists: refused (CML3601); cl keeps it whole and the reload applies (pm 1 -> 3). Either way `parts` never
+#   drops (until WP-40 the counters restarted from 0 under clang-cl). parts_back_2 undoes the edit, so that the next reload
+#   does not compile it again where it was refused (where it was applied, the next reload compiles the original: pm 1).
+#   mark_3 recompiles lambdas.cpp (R-48 item 1). clang-cl inlined the three lambdas and recorded their statics `sname` in
 #   o2_step() itself: the planner finds them there and places them (and their guards) by the layout of their section, so the
 #   reload applies and every static keeps counting from where it was (a, b, c in their own ranges, made stays 3). Until
 #   WP-40 the statics were new and their guards bound to the old ones: the patched code used objects that were never
-#   constructed (zero ids). The step allows a refusal (CML3207 / CML3600) for a compiler that records them otherwise; what
-#   it never allows is a value outside its range, a re-initialisation, or a fault.
-#   parts_3 recompiles parts.cpp (R-48 item 4): clang-cl split the internal array into `s_parts.0` .. `.2`, of which no
-#   debug record exists: refused (CML3601); cl keeps it whole and the reload applies (pm 1 -> 3). Either way `parts` never
-#   drops (until WP-40 the counters restarted from 0 under clang-cl).
+#   constructed. cl emits the call operators too and records each static twice (in its operator() and in o2_step(), at one
+#   address): paired by closure. The step allows a refusal (CML3207 / CML3600) for a compiler that records them otherwise;
+#   what it never allows is a value outside its range, a re-initialisation, or a fault.
 # cmltest prints `RELOAD-OUTCOME applied|refused id=...` for both reloads (the evidence of the cell).
 name = "planner_pairing_o2"
-description = "fixture planner_pairing_o2 (/O2 /Ob2): inlined lambdas' statics keep their values or the reload is refused; a split aggregate is refused"
+description = "fixture planner_pairing_o2 (/O2 /Ob2): a split aggregate is refused; inlined lambdas' statics keep their values or the reload is refused"
 fixture = "planner_pairing_o2"
 timeout_s = 240
 
@@ -29,7 +31,25 @@ within_s = 20
 
 [[step]]
 kind = "edit"
-patch = "edits/mark_2.edit"
+patch = "edits/parts_1.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+allow_error = "CML3601"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ mark=1 a=10(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=[13] made=3\\b"
+within_s = 10
+
+[[step]]
+kind = "edit"
+patch = "edits/parts_back_2.edit"
+
+[[step]]
+kind = "edit"
+patch = "edits/mark_3.edit"
 
 [[step]]
 kind = "reload"
@@ -46,20 +66,6 @@ within_s = 10
 [[step]]
 kind = "expect_stdout"
 regex = "TICK n=\\d+ mark=[12] a=10\\d{4} b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=1 made=3\\b"
-within_s = 10
-
-[[step]]
-kind = "edit"
-patch = "edits/parts_3.edit"
-
-[[step]]
-kind = "reload"
-within_s = 120
-allow_error = "CML3601"
-
-[[step]]
-kind = "expect_stdout"
-regex = "TICK n=\\d+ mark=[12] a=10\\d{4} b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=[13] made=3\\b"
 within_s = 10
 
 [[step]]

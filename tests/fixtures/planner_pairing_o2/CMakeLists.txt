@@ -4,8 +4,8 @@
 #   lambdas.cpp  R-48 item 1: three lambdas with a static `sname` each, inlined into o2_step(); clang-cl records the
 #                statics in o2_step() itself and no guard at all
 #   parts.cpp    R-48 item 4: an internal-linkage array that clang-cl splits into `s_parts.0`, `.1`, `.2`
-#   edits/       mark_2 (lambdas.cpp; the statics keep their values, or the reload is refused), parts_3 (parts.cpp;
-#                clang-cl: refused with CML3601, cl: reloads); scenario tests/harness/scenarios/planner_pairing_o2.toml.
+#   edits/       parts_1 (parts.cpp; clang-cl: refused with CML3601, cl: reloads), parts_back_2, mark_3 (lambdas.cpp;
+#                the statics keep their values, or the reload is refused); scenario tests/harness/scenarios/planner_pairing_o2.toml.
 if(MSVC)
     # /O2 and /RTC1 cannot be combined (D8016), and the Debug configuration's /Od and /Ob0 must not win over /O2 /Ob2 (the
     # same as fixture `optimised`).

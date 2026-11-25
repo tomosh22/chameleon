@@ -2,23 +2,27 @@
 # that end in a refusal. Every value is an object's 6-digit id plus its count (pairing.h), so the two leading digits say
 # which object it is and a re-initialised object restarts just above its id.
 #
-# 1. pairing_1 edits four translation units at once and must reload:
+# 1. pairing_1 edits three translation units at once and must reload:
 #    * scope.cpp (item 3): a new file-scope `static int helper(int)` is used by pp_scope_local() (local 10 -> 7000) and
 #      the old PpScope::helper keeps its code (member stays 2; until WP-40 it was hooked onto the new function: 1000);
 #    * guards.cpp (item 2): pp_fresh() gets a new guarded static, which must be constructed (fresh 1 -> 6000nn; made 10 -> 11);
-#    * tsi.cpp (item 7, /Zc:threadSafeInit-) and internal.cpp (item 11): two same-named block statics each, which keep
-#      counting (s0, s1, i0, i1) while their marks become 2. Under cl both pairs are matched by their place (warning
-#      CML3570; until WP-40 both were refused under cl), under clang-cl by the layout of their section.
-# 2. twins_2 swaps two lambdas with the same call operator (item 5, ADR-0043 rule (d)): the code of their call operators
+#    * internal.cpp (item 11): two same-named block statics of an internal-linkage function keep counting (i0, i1) while its
+#      mark becomes 2. Under cl they are matched by their place (warning CML3570; until WP-40 refused under cl), under
+#      clang-cl by the layout of their section.
+# 2. tsi_2 (item 7, /Zc:threadSafeInit-): clang-cl places the two statics and their bitmask guard by the section layout
+#    (applied, sm 1 -> 2); cl writes one `$S1` bitmask for the function without a record and in a section of its own, so
+#    the old bitmask cannot be found: refused (CML3207). Either way the statics keep their values. tsi_back_3 undoes the
+#    edit (refused: the file is the baseline again; applied: the next reload compiles the original again, sm back to 1).
+# 3. twins_4 swaps two lambdas with the same call operator (item 5, ADR-0043 rule (d)): the code of their call operators
 #    shows which old lambda each is, and the statics follow the code: ta stays in 400000's range, tb in 450000's (paired by
 #    number each would show the other's range); nothing is constructed again (made 11).
-# 3. swap_3 swaps two lambdas with different call operators (item 5): refused (CML3214 for the call operators, CML3207 for
-#    their statics). swap_back_4 undoes the edit (the file is the baseline again).
-# 4. sibling_5 adds a guarded static next to an old one in a block (item 8, refusal kept): refused (cl: CML3207 from the
+# 4. swap_5 swaps two lambdas with different call operators (item 5): refused (CML3214 for the call operators, CML3207 for
+#    their statics). swap_back_6 undoes the edit.
+# 5. sibling_7 adds a guarded static next to an old one in a block (item 8, refusal kept): refused (cl: CML3207 from the
 #    by-place step; clang-cl: CML3207 or CML3600).
 # The program never faults and no value ever drops, over the whole run.
 name = "planner_pairing"
-description = "fixture planner_pairing: pairing_1 and twins_2 reload with every static kept; swap_3 and sibling_5 are refused"
+description = "fixture planner_pairing: pairing_1 and twins_4 reload with every static kept; tsi_2 reloads or is refused; swap_5 and sibling_7 are refused"
 fixture = "planner_pairing"
 timeout_s = 300
 
@@ -44,16 +48,33 @@ patch = "edits/pairing_1.edit"
 kind = "reload"
 within_s = 120
 
-# The new code runs; the old member function kept its own code; the new static was constructed (made 11); the four block
-# statics are the old ones (each at least 20 above its id).
+# The new code runs; the old member function kept its own code; the new static was constructed (made 11).
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ member=2 local=7000 fresh=60\\d{4} gt=65(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) s0=10(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) s1=15(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) sm=2 i0=20(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) i1=25(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) im=2 la=30(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) lb=35(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) ta=40(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) tb=45(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) n0=50(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) n1=55(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) made=11\\b"
+regex = "TICK n=\\d+ member=2 local=7000 fresh=60\\d{4} gt=65(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) s0=10(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) s1=15(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) sm=1 i0=20(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) i1=25(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) im=2 la=30(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) lb=35(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) ta=40(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) tb=45(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) n0=50(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) n1=55(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) made=11\\b"
 within_s = 10
 
 [[step]]
 kind = "edit"
-patch = "edits/twins_2.edit"
+patch = "edits/tsi_2.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+allow_error = "CML3207|CML3600"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ member=2 local=7000 fresh=60\\d{4} gt=65(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) s0=10(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) s1=15(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) sm=[12] i0=20(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) i1=25(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) im=2 la=30(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) lb=35(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) ta=40(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) tb=45(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) n0=50(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) n1=55(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) made=11\\b"
+within_s = 10
+
+[[step]]
+kind = "edit"
+patch = "edits/tsi_back_3.edit"
+
+[[step]]
+kind = "edit"
+patch = "edits/twins_4.edit"
 
 [[step]]
 kind = "reload"
@@ -61,12 +82,12 @@ within_s = 120
 
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ member=2 local=7000 fresh=60\\d{4} gt=65(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) s0=10(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) s1=15(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) sm=2 i0=20(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) i1=25(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) im=2 la=30(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) lb=35(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) ta=40(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) tb=45(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) n0=50(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) n1=55(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) made=11\\b"
+regex = "TICK n=\\d+ member=2 local=7000 fresh=60\\d{4} gt=65(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) s0=10(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) s1=15(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) sm=1 i0=20(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) i1=25(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) im=2 la=30(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) lb=35(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) ta=40(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) tb=45(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) n0=50(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) n1=55(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) made=11\\b"
 within_s = 10
 
 [[step]]
 kind = "edit"
-patch = "edits/swap_3.edit"
+patch = "edits/swap_5.edit"
 
 [[step]]
 kind = "reload"
@@ -75,21 +96,21 @@ expect_error = "CML3214|CML3207"
 
 [[step]]
 kind = "edit"
-patch = "edits/swap_back_4.edit"
+patch = "edits/swap_back_6.edit"
 
 [[step]]
 kind = "edit"
-patch = "edits/sibling_5.edit"
+patch = "edits/sibling_7.edit"
 
 [[step]]
 kind = "reload"
 within_s = 120
 expect_error = "CML3207|CML3600"
 
-# The refused reloads changed nothing: the program of twins_2 keeps running with every static.
+# The refused reloads changed nothing: the program keeps running with every static.
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ member=2 local=7000 fresh=60\\d{4} gt=65\\d{4} s0=10\\d{4} s1=15\\d{4} sm=2 i0=20\\d{4} i1=25\\d{4} im=2 la=30\\d{4} lb=35\\d{4} ta=40\\d{4} tb=45\\d{4} n0=50\\d{4} n1=55\\d{4} made=11\\b"
+regex = "TICK n=\\d+ member=2 local=7000 fresh=60\\d{4} gt=65\\d{4} s0=10\\d{4} s1=15\\d{4} sm=1 i0=20\\d{4} i1=25\\d{4} im=2 la=30\\d{4} lb=35\\d{4} ta=40\\d{4} tb=45\\d{4} n0=50\\d{4} n1=55\\d{4} made=11\\b"
 within_s = 10
 
 [[step]]

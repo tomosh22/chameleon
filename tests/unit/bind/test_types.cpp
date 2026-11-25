@@ -2173,3 +2173,29 @@ TEST_CASE("lambda statics (rule (d)): given a pairing across the numbers, the st
         CHECK(r->warnings.empty());
     }
 }
+
+TEST_CASE("inlined lambdas under cl /O2 /Ob2: a static recorded both in its operator() and in the caller is one variable") {
+    // CI (cl 19.44, fixture planner_pairing_o2, head 020866a): cl emits the call operators AND inlines them, and records each
+    // lambda's statics in both procedures at the same address. main of WP-40's first push counted them twice ("6 there,
+    // some of them inlined, 3 in the patch") and refused the reload; they pair by closure.
+    LambdaWorld lw;
+    lw.lambda(1, 0x60, 0x20);
+    lw.lambda(2, 0x70, 0x30);
+    old_proc(lw.w, "f", 0x40, lw.types.fn(tp::kTVoid, {}), {{"sname", 0x20}, {"$TSS0", 0x28}, {"sname", 0x30}, {"$TSS0", 0x38}});
+    lw.open();
+    SynthObj o;
+    for (int n = 1; n <= 2; ++n) {
+        for (const char* name : {"sname", "$TSS0"}) {
+            const std::uint32_t sec = o.section(".bss", kDataComdat, 8, coff::ComdatSelection::Any);
+            o.symbol(static_in_lambda(name, n), 0, static_cast<std::int32_t>(sec), false, false);
+        }
+    }
+    Built b = o.build();
+    auto r = plan_bind(lw.w.input(b));
+    REQUIRE_MESSAGE(r.has_value(), err(r));
+    CHECK(decision(*r, static_in_lambda("sname", 1)).source == BindSource::CompilandClosure);
+    CHECK(decision(*r, static_in_lambda("sname", 1)).old_address.rva == 0x3020);
+    CHECK(decision(*r, static_in_lambda("$TSS0", 1)).old_address.rva == 0x3028);
+    CHECK(decision(*r, static_in_lambda("sname", 2)).old_address.rva == 0x3030);
+    CHECK(decision(*r, static_in_lambda("$TSS0", 2)).old_address.rva == 0x3038);
+}

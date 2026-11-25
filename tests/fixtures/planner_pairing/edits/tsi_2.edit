@@ -1,0 +1,9 @@
+--- a/tsi.cpp
++++ b/tsi.cpp
+@@ -25,5 +25,5 @@
+ int pp_tsi_mark()
+ {
+     ++s_tsi_calls;
+-    return s_tsi_calls > 0 ? 1 : 0;
++    return s_tsi_calls > 0 ? 2 : 0;
+ }

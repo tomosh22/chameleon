@@ -8,8 +8,8 @@
 #   swap.cpp      item 5: two lambdas with different call operators swap places: refused
 #   twins.cpp     item 5, rule (d): two lambdas with the same call operator swap places: paired by their code
 #   sibling.cpp   item 8 (refusal kept): a new guarded static next to an old one in a block: refused
-#   edits/        pairing_1 (scope, guards, tsi, internal: reloads), twins_2 (reloads, statics keep their values),
-#                 swap_3 (refused), swap_back_4 (undoes swap_3), sibling_5 (refused);
+#   edits/        pairing_1 (scope, guards, internal: reloads), tsi_2 (clang-cl: reloads; cl: refused), tsi_back_3,
+#                 twins_4 (reloads, statics keep their values), swap_5 (refused), swap_back_6, sibling_7 (refused);
 #                 scenario tests/harness/scenarios/planner_pairing.toml.
 cml_add_fixture(planner_pairing SOURCES main.cpp scope.cpp guards.cpp tsi.cpp internal.cpp swap.cpp twins.cpp sibling.cpp)
 if(MSVC)
