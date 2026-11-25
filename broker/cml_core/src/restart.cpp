@@ -459,7 +459,7 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
     }
     // WP-45: a module of the old process that is not enabled at the moment (it was freed, or disabled) left its baseline in the
     // service; it travels too, so the new process gets those edits when it enables the module.
-    for (auto& kept : service_.kept_baselines(old_pid)) {
+    for (auto& kept : service_.kept_baselines(old_snap.agent_id, old_pid)) {
         const bool have = std::any_of(carried.begin(), carried.end(), [&](const Carried& c) { return path::same_path(c.path, kept.first); });
         CML_LOG(Trace, "restart: decision=%s module=%s pid=%u originals=%zu", have ? "kept-baseline-ignored" : "kept-baseline-carried", kept.first.c_str(), old_pid,
                 kept.second.originals.size());
@@ -833,35 +833,75 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
             }
         }
     }
-    Value not_enabled = Value::array();
-    for (std::size_t i = 0; i < missing.size(); ++i) {
-        const ipc::RestartModule& m = missing[i];
-        not_enabled.push(Value::string(m.path));
-        std::size_t edited = 0;
-        for (std::size_t k = 0; k < carried.size(); ++k) {
-            edited += owner[k] == i ? carried[k].baseline.originals.size() : 0;
-        }
-        warn(Diag::make(rd::kModuleNotEnabled, "module '" + m.path + "' is not enabled in the new process (pid " + std::to_string(new_pid) + ")" +
-                            (reenable_injected ? left_running : std::string()) +
-                            (edited != 0 ? "; the session's edits of its " + std::to_string(edited) + " file(s) are re-applied when it is enabled" : std::string()),
-                        "It may not be loaded yet; enable it from the application once it is."),
-             new_pid);
-    }
     if (!missing.empty()) {
         remember_unfinished(new_pid, unfinished_for(missing));  // WP-43: the next restart of the new process asks for them again
     }
+    // "a.cpp, b.cpp" (base names, at most five).
+    const auto names_of = [](const BaselineSnapshot& b) {
+        std::string out;
+        std::size_t shown = 0;
+        for (const auto& original : b.originals) {
+            if (shown == 5) {
+                out += ", and " + std::to_string(b.originals.size() - shown) + " more";
+                break;
+            }
+            out += (shown == 0 ? "" : ", ") + std::string(path::base_name(std::string_view(original.first)));
+            ++shown;
+        }
+        return out;
+    };
 
     // The enabled modules of the new process, and their PDB indexes.
     const LinkSnapshot new_snap = new_link->snapshot();
     // WP-45 (F-42.3): every carried baseline of a module the new process has not enabled (a module it loads lazily, one the restart
     // could not enable, and one the old process had freed or disabled, whose baseline the service kept) goes to the new process: its
-    // enable re-applies the edits. Each once. A module enabled since `missing` was computed is in new_snap and is restored below.
-    for (const Carried& c : carried) {
+    // enable re-applies the edits. Each once. A module enabled since `missing` was computed is in new_snap and is restored below. The
+    // service takes it only for the agent registered for new_pid now, with a proven identity; what it did not take is said below.
+    enum class Fate { Kept, RestoredHere, Lost };
+    std::vector<Fate> fate(carried.size(), Fate::Kept);
+    for (std::size_t k = 0; k < carried.size(); ++k) {
+        const Carried& c = carried[k];
         const bool enabled_now = std::any_of(new_snap.enabled.begin(), new_snap.enabled.end(), [&](const std::string& full) { return path::same_path(full, c.path); });
         CML_LOG(Trace, "restart: decision=%s module=%s pid=%u originals=%zu", enabled_now ? "restore-now" : "carry-to-late-enable", c.path.c_str(), new_pid,
                 c.baseline.originals.size());
-        if (!enabled_now) {
-            service_.carry_to_late_module(new_agent, new_pid, c.path, c.baseline, "restart");
+        if (enabled_now) {
+            fate[k] = Fate::RestoredHere;
+        } else if (!c.baseline.originals.empty() && !service_.carry_to_late_module(new_agent, new_pid, c.path, c.baseline, "restart")) {
+            fate[k] = Fate::Lost;
+        }
+    }
+    Value not_enabled = Value::array();
+    for (std::size_t i = 0; i < missing.size(); ++i) {
+        const ipc::RestartModule& m = missing[i];
+        not_enabled.push(Value::string(m.path));
+        std::size_t edited = 0;
+        std::string lost;
+        for (std::size_t k = 0; k < carried.size(); ++k) {
+            if (owner[k] != i || carried[k].baseline.originals.empty()) {
+                continue;
+            }
+            if (fate[k] == Fate::Lost) {
+                lost += (lost.empty() ? "" : ", ") + names_of(carried[k].baseline);
+            } else {
+                edited += carried[k].baseline.originals.size();
+            }
+        }
+        warn(Diag::make(rd::kModuleNotEnabled, "module '" + m.path + "' is not enabled in the new process (pid " + std::to_string(new_pid) + ")" +
+                            (reenable_injected ? left_running : std::string()) +
+                            (edited != 0 ? "; the session's edits of its " + std::to_string(edited) + " file(s) are re-applied when it is enabled" : std::string()) +
+                            (!lost.empty() ? "; the session's edits of " + lost + " were NOT carried to it (the agent of the new process changed)" : std::string()),
+                        lost.empty() ? "It may not be loaded yet; enable it from the application once it is."
+                                     : "It may not be loaded yet; enable it from the application once it is, then edit the files named here again and reload."),
+             new_pid);
+    }
+    // A kept baseline of a module that is not in the module list (the old process had freed or disabled it) that could not be carried.
+    for (std::size_t k = 0; k < carried.size(); ++k) {
+        if (fate[k] == Fate::Lost && owner[k] == missing.size()) {
+            warn(Diag::make(rd::kReapplyFailed,
+                            "the session's edits of " + names_of(carried[k].baseline) + " (module '" + carried[k].path + "') were NOT carried to the new process (pid " +
+                                std::to_string(new_pid) + "): the agent of the new process changed",
+                            "Once the application enables that module, edit the files named here again and reload."),
+                 new_pid);
         }
     }
     Value enabled_json = Value::array();
@@ -897,18 +937,31 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
             // and reloads once the index is ready. Without that, the index would take the edited files as its baseline and a `reload`
             // would find nothing to do.
             std::size_t handed = 0;
+            std::string lost;
             for (const Carried& c : carried) {
                 if (path::same_path(c.path, full) && !c.baseline.originals.empty()) {
                     CML_LOG(Trace, "restart: decision=carry-to-index-not-ready module=%s pid=%u originals=%zu", c.path.c_str(), new_pid, c.baseline.originals.size());
-                    service_.carry_to_late_module(new_agent, new_pid, c.path, c.baseline, "restart");
-                    handed += c.baseline.originals.size();
+                    if (service_.carry_to_late_module(new_agent, new_pid, c.path, c.baseline, "restart")) {
+                        handed += c.baseline.originals.size();
+                    } else {
+                        lost += (lost.empty() ? "" : ", ") + names_of(c.baseline);
+                    }
                 }
             }
-            warn(Diag::make(rd::kReapplyFailed,
-                            "the PDB index of '" + full + "' in the new process is not ready" +
-                                (handed != 0 ? ", so its edits are re-applied when it is (" + std::to_string(handed) + " file(s))"
-                                             : std::string(", so its edits cannot be re-applied")),
-                            handed != 0 ? "Nothing to do; a CML5600 or CML5601 follows if the re-apply fails." : "Run `reload` once its index is ready."),
+            std::string text = "the PDB index of '" + full + "' in the new process is not ready";
+            if (handed != 0) {
+                text += ", so its edits are re-applied when it is (" + std::to_string(handed) + " file(s))";
+            }
+            if (!lost.empty()) {
+                text += std::string(handed != 0 ? "; " : ", so ") + "the session's edits of " + lost + " were NOT carried (the agent of the new process changed)";
+            }
+            if (handed == 0 && lost.empty()) {
+                text += ", so its edits cannot be re-applied";
+            }
+            warn(Diag::make(rd::kReapplyFailed, text,
+                            !lost.empty() ? "Once its index is ready, edit the files named here again and reload."
+                            : handed != 0 ? "Nothing to do; a CML5600 or CML5601 follows if the re-apply fails."
+                                          : "Run `reload` once its index is ready."),
                  new_pid);
             continue;
         }

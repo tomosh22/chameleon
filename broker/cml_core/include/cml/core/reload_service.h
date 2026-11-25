@@ -162,12 +162,22 @@ public:
     // The restart hands over the baseline of a module the new process did not enable in time (CML5809): when process `pid` (agent
     // `agent_id`) enables `module_path` later, its edits are re-applied. When the module has a state already (it was enabled just
     // now), the re-apply starts at once. `origin` names the cause in the log and in a failure ("restart").
-    void carry_to_late_module(std::uint64_t agent_id, std::uint32_t pid, const std::string& module_path, const BaselineSnapshot& snapshot,
+    // The baseline goes to the agent registered for `pid` now: `agent_id` itself, or an agent that reconnected to the same process (proven
+    // identity, creation time included). Returns whether it was kept (or queued for a state that exists); false: dropped, logged at info
+    // with the module and the files (no such agent, or not provably the same process). The caller says so in its diagnostic.
+    bool carry_to_late_module(std::uint64_t agent_id, std::uint32_t pid, const std::string& module_path, const BaselineSnapshot& snapshot,
                               const std::string& origin);
     // Re-applies queued or running (part of `wait idle`). A `reload` that arrives meanwhile waits for them instead of being busy.
     std::size_t reapply_pending() const noexcept { return reapply_pending_.load(); }
-    // The baselines kept for process `pid` (path, baseline) of modules that are not enabled now; a restart carries them along.
-    std::vector<std::pair<std::string, BaselineSnapshot>> kept_baselines(std::uint32_t pid) const;
+    // The baselines kept for process `pid` (path, baseline) of modules that are not enabled now; a restart of the process that agent
+    // `agent_id` is carries them along. Only carries stored by that process (that agent, or one provably the same process) are returned;
+    // the others are dropped (logged at info).
+    std::vector<std::pair<std::string, BaselineSnapshot>> kept_baselines(std::uint64_t agent_id, std::uint32_t pid);
+    // Tests: called in on_session_changed after a dropped state left the service's map and before its baseline is kept (the moment
+    // another thread can hand over a carry for the same module).
+    void set_drop_hook_for_testing(std::function<void()> hook);
+    // Tests: every baseline kept for `pid`, whoever stored it (nothing is dropped).
+    std::vector<std::pair<std::string, BaselineSnapshot>> kept_baselines_for_testing(std::uint32_t pid) const;
     // What a module's state hands on (to its next instance, or through a restart): the index's baseline (Ready) with the baseline it was
     // given and has not restored yet (ModuleState::carried_in) under it; only carried_in while its index is not Ready; nullopt without
     // either.
@@ -239,6 +249,21 @@ private:
     };
     // Drops every carry of `pid`. Needs mutex_.
     void drop_carries_locked(std::uint32_t pid, const char* why);
+    // Which process each agent that ever registered is (kept after it disconnects, so a later agent can be compared with it), and the
+    // agent that registered last for each pid. Guarded by mutex_.
+    struct AgentIdentity {
+        std::uint32_t pid = 0;
+        std::string identity;
+        bool known = false;  // the creation time could be read
+    };
+    std::map<std::uint64_t, AgentIdentity> identities_;
+    std::map<std::uint32_t, std::uint64_t> registered_by_pid_;
+    std::function<void()> drop_hook_;  // guarded by mutex_ (set_drop_hook_for_testing)
+    // Agents `a` and `b` are provably the same process: the same agent, or both identities known (creation time read) and equal.
+    bool proven_same_locked(std::uint64_t a, std::uint64_t b) const;
+    // A carry may be consumed, merged into or handed to a restart by `agent_id` only if the agent that stored it is provably the same
+    // process. False (and logged at info, with the module and the files: the caller drops the carry) otherwise. Needs mutex_.
+    bool carry_usable_locked(const Carry& carry, std::uint32_t pid, std::uint64_t agent_id, const char* what) const;
     // An agent registered with `pid`: the carries other agents stored for it stay only when both identities are known and equal (the
     // same process, reconnected); the others are dropped (logged at info, with the module and the files). Needs mutex_.
     void check_carries_on_register_locked(std::uint32_t pid, std::uint64_t agent_id, const std::string& identity, bool identity_known);

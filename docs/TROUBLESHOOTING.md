@@ -2553,7 +2553,7 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 ### CML5810
 
 - **Cause:** (warning) the session's edits could not be re-applied to the new process.  
-- **Message:** `the PDB index of '<...>' in the new process is not ready, so its edits are re-applied when it is (<n> file(s))` (WP-45: the broker re-applies them once the index is ready; CML5600 or CML5601 follows if that fails), or `... is not ready, so its edits cannot be re-applied` when the module had no edits to carry  
+- **Message:** `the PDB index of '<...>' in the new process is not ready, so its edits are re-applied when it is (<n> file(s))` (WP-45: the broker re-applies them once the index is ready; CML5600 or CML5601 follows if that fails), or `... is not ready, so its edits cannot be re-applied` when the module had no edits to carry; `... the session's edits of <files> were NOT carried (the agent of the new process changed)` when another agent registered for the new process's pid during the restart and is not provably the same process (also for a module the old process had freed: `the session's edits of <files> (module '<...>') were NOT carried to the new process`)  
 - **What to do:** Nothing to do when the message says the edits are re-applied; otherwise run 'reload' once its index is ready.  
   Other variants of the advice: Fix the error and run 'reload'.  
 - **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`

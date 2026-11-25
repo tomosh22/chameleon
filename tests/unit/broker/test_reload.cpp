@@ -3473,7 +3473,7 @@ TEST_CASE("WP-45: a baseline a restart hands over is re-applied when the module 
         wait_idle(rig);
         unload_exe(rig);
         CHECK(rig.service->has_carry_for_testing(kPid, rig.exe));
-        CHECK(rig.service->kept_baselines(kPid).size() == 1);
+        CHECK(rig.service->kept_baselines_for_testing(kPid).size() == 1);
         rig.service->set_process_host(std::make_shared<ExitedHost>());  // the process has exited when its agent disconnects
         rig.service->detach(1);
         CHECK_FALSE(rig.service->has_carry_for_testing(kPid, rig.exe));
@@ -3578,24 +3578,18 @@ TEST_CASE("WP-45 review 6: a carry stored while a dropped instance's baseline wa
         std::lock_guard<std::mutex> lock(rig.module->mutex);
         rig.module->carried_in = edited("c:\\proj\\a.cpp", 0x10);
     }
-    // In the moment the service's lock is free during the drop, a restart hands over b.cpp for the same pid and module (carry_to_late_module
-    // finds no state: here through another connection of the same pid that has none).
-    auto other = std::make_shared<AgentLink>(3, [](const ipc::Message&) { return Result<void>(); });
-    rig.service->attach(other);
-    Session other_session{3, "0.1.0"};
-    ipc::Hello hello;
-    hello.request_id = 1;
-    hello.pid = kPid;
-    other_session.on_message(hello);
-    other->publish(other_session);
-    rig.service->on_session_changed(3);  // registered: the carry is kept for its process
-    rig.service->carry_to_late_module(3, kPid, rig.exe, edited("c:\\proj\\b.cpp", 0x20), "restart");
-    REQUIRE(rig.service->has_carry_for_testing(kPid, rig.exe));
-
+    // In the moment the service's lock is free during the drop (the state has left the map, its baseline is not kept yet), a restart
+    // hands over b.cpp for the same process and module: carry_to_late_module finds no state and stores it.
+    bool handed = false;
+    rig.service->set_drop_hook_for_testing([&] {
+        handed = rig.service->carry_to_late_module(1, kPid, rig.exe, edited("c:\\proj\\b.cpp", 0x20), "restart");
+    });
     ipc::ModuleUnloaded unloaded;
     unloaded.module = {kModuleBase, 0x4000, rig.exe};
     say(rig, unloaded);
-    const auto kept = rig.service->kept_baselines(kPid);
+    rig.service->set_drop_hook_for_testing({});
+    CHECK(handed);
+    const auto kept = rig.service->kept_baselines_for_testing(kPid);
     REQUIRE(kept.size() == 1);
     CHECK(kept[0].second.originals.count("c:\\proj\\a.cpp") == 1);  // the dropped instance's
     CHECK(kept[0].second.originals.count("c:\\proj\\b.cpp") == 1);  // and the restart's
@@ -3603,7 +3597,6 @@ TEST_CASE("WP-45 review 6: a carry stored while a dropped instance's baseline wa
     CHECK(rig.service->has_carry_for_testing(kPid, rig.exe, &live));
     CHECK_FALSE(live);
 }
-
 TEST_CASE("WP-45 review 2: an instance that goes away before its re-apply ran is abandoned, not reported (no CML5601)") {
     QuietLogs quiet;
     Rig rig;
@@ -3676,6 +3669,57 @@ TEST_CASE("WP-45 final review 2: no carry is kept for an agent that is gone or h
     rig.service->on_session_changed(4);
     CHECK_FALSE(rig.service->has_carry_for_testing(kPid, rig.exe));
 }
+
+TEST_CASE("WP-45 final ruling 1: a carry a stale agent leaves after another agent registered with its pid is never taken") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.service->set_process_host(std::make_shared<BlindHost>());  // creation times cannot be read: no identity is proven
+    rig.enable();
+    {
+        std::lock_guard<std::mutex> lock(rig.module->mutex);
+        rig.module->carried_in = edited("c:\\proj\\a.cpp", 0x10);
+    }
+    // A new process got the pid (the old one is still in teardown; its agent's connection has not closed yet).
+    auto next = std::make_shared<AgentLink>(3, [](const ipc::Message&) { return Result<void>(); });
+    rig.service->attach(next);
+    Session next_session{3, "0.1.0"};
+    ipc::Hello hello;
+    hello.request_id = 1;
+    hello.pid = kPid;
+    next_session.on_message(hello);
+    next->publish(next_session);
+    rig.service->on_session_changed(3);
+    // The old agent's queued ModuleUnloaded arrives now: what its instance leaves is not kept.
+    ipc::ModuleUnloaded unloaded;
+    unloaded.module = {kModuleBase, 0x4000, rig.exe};
+    say(rig, unloaded);
+    CHECK_FALSE(rig.service->has_carry_for_testing(kPid, rig.exe));
+    // A late hand-over through the old agent is refused (and says so: false), as is one to an agent of another process.
+    CHECK_FALSE(rig.service->carry_to_late_module(1, kPid, rig.exe, edited("c:\\proj\\b.cpp", 0x20), "restart"));
+    CHECK_FALSE(rig.service->has_carry_for_testing(kPid, rig.exe));
+    // The new process's own enable of the exe takes nothing.
+    ipc::ModuleList list;
+    list.request_id = 2;
+    list.modules.push_back({kModuleBase, 0x4000, rig.exe});
+    next_session.on_message(list);
+    ipc::EnableModule enable;
+    enable.request_id = 3;
+    enable.path = rig.exe;
+    next_session.on_message(enable);
+    next->publish(next_session);
+    rig.service->on_session_changed(3);
+    const std::shared_ptr<ModuleState> fresh = rig.service->module_state(3, rig.exe);
+    REQUIRE(fresh != nullptr);
+    {
+        std::lock_guard<std::mutex> lock(fresh->mutex);
+        CHECK_FALSE(fresh->carried_in.has_value());
+    }
+    CHECK(rig.service->reapply_pending() == 0);
+    // Its own hand-overs are taken.
+    CHECK(rig.service->carry_to_late_module(3, kPid, "C:\\app\\later.dll", edited("c:\\proj\\later.cpp", 0x30), "restart"));
+    CHECK(rig.service->has_carry_for_testing(kPid, "C:\\app\\later.dll"));
+}
+
 
 #if defined(_WIN32)
 TEST_CASE("WP-45 review 7: a reload that applied the restored edits before the worker got the run lock is not repeated") {

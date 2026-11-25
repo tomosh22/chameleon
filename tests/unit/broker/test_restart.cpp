@@ -248,6 +248,8 @@ struct Rig {
     std::string new_process_lacks;          // a module the relaunched process has not loaded (it loads it lazily, later)
     std::map<std::uint32_t, std::uint64_t> created;  // creation times the fake host reports (default 5000 + pid)
     bool creation_unknown = false;          // the fake host cannot read creation times
+    std::uint32_t reconnect_pid = 0;        // when the broker asks to re-enable, another agent registers with this pid ...
+    std::string reconnect_token;            // ... and this restart token
 
     // what happened
     std::mutex mutex;
@@ -352,6 +354,18 @@ struct Rig {
             for (const ipc::RestartModule& module : ask->modules) {
                 reenabled.push_back(module);
             }
+        }
+        if (reconnect_pid != 0) {
+            // WP-45: while the restart runs, another agent registers for the new process's pid (here: not provably the same process).
+            const std::uint32_t pid = reconnect_pid;
+            reconnect_pid = 0;
+            std::shared_ptr<SimAgent> other;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                other = std::make_shared<SimAgent>(service, next_agent_id++);
+                new_agents.push_back(other);
+            }
+            other->register_process(pid, reconnect_token, {kExe}, {kExe});
         }
         // Like the real agent: each module becomes an EnableModule request of the application, then Reply.
         for (const ipc::RestartModule& module : ask->modules) {
@@ -1878,7 +1892,7 @@ TEST_CASE("restart (WP-45): the edits of a module the new process loads later ar
     left.originals["c:\\app\\src\\other.cpp"] = FileStamp{0x11, 10, 1};
     left.stamps["c:\\app\\src\\other.cpp"] = FileStamp{0x22, 12, 2};
     rig.service.carry_to_late_module(1, 100, kOther, left, "reload");
-    REQUIRE(rig.service.kept_baselines(100).size() == 1);
+    REQUIRE(rig.service.kept_baselines_for_testing(100).size() == 1);
     rig.reported_modules.push_back(ipc::RestartModule{1, kOther});
     rig.new_process_lacks = kOther;  // the new process loads it lazily: not yet when the restart runs (CML5809)
 
@@ -1975,7 +1989,7 @@ TEST_CASE("restart (WP-45 review 3): a baseline a state was given and has not re
     REQUIRE(result->find("not_enabled")->items().size() == 1);
     CHECK(has_diag(rig, "warning", "CML5809", "1 file(s) are re-applied when it is enabled"));
     CHECK(rig.service.has_carry_for_testing(200, kDll));
-    const auto kept = rig.service.kept_baselines(200);
+    const auto kept = rig.service.kept_baselines_for_testing(200);
     REQUIRE(kept.size() == 1);
     CHECK(kept[0].second.originals.count("c:\\app\\src\\plugin.cpp") == 1);
 }
@@ -2005,7 +2019,7 @@ TEST_CASE("restart (WP-45 review 8): a baseline that matches several missing mod
         }
     }
     CHECK(counted == 1);
-    CHECK(rig.service.kept_baselines(200).size() == 1);
+    CHECK(rig.service.kept_baselines_for_testing(200).size() == 1);
 }
 
 TEST_CASE("WP-45 review 5: an agent that disconnects keeps its process's carries unless the process has exited or another process has the pid") {
@@ -2088,4 +2102,49 @@ TEST_CASE("restart (WP-45 final review 3): a module enabled in time whose index 
     }
     CHECK(rig.service.reapply_pending() == 0);
     CHECK(has_diag(rig, "warning", "CML5601", "plugin.cpp"));
+}
+
+TEST_CASE("restart (WP-45 final ruling 2): edits the service could not keep are named as not carried in CML5809, never claimed as re-applied") {
+    QuietLogs quiet;
+    Rig rig;
+    const std::shared_ptr<ModuleState> plugin = rig.service.module_state(1, kDll);
+    REQUIRE(plugin != nullptr);
+    {
+        std::lock_guard<std::mutex> lock(plugin->mutex);
+        plugin->carried_in = edited_baseline("c:\\app\\src\\plugin.cpp");
+    }
+    rig.new_process_lacks = kDll;
+    // Between the new process's registration and the hand-over another agent registers with its pid, not provably the same process.
+    rig.reconnect_pid = 200;
+    rig.reconnect_token = "another-token";
+    Result<Value> result = rig.service.restart(args_for(100, 10000));
+    REQUIRE_MESSAGE(result.has_value(), result.error().format());
+    REQUIRE(result->find("not_enabled")->items().size() == 1);
+    CHECK(has_diag(rig, "warning", "CML5809", "plugin.cpp were NOT carried"));
+    CHECK_FALSE(has_diag(rig, "warning", "CML5809", "re-applied when it is enabled"));
+    CHECK_FALSE(rig.service.has_carry_for_testing(200, kDll));
+}
+
+TEST_CASE("WP-45 final ruling 2: a hand-over goes to the agent registered for the pid now, only with a proven identity") {
+    QuietLogs quiet;
+    SUBCASE("the process reconnected (same creation time): taken by the new agent") {
+        Rig rig;
+        auto again = std::make_shared<SimAgent>(rig.service, 7);
+        rig.new_agents.push_back(again);
+        again->register_process(100, "", {kExe, kDll, kOther}, {kExe});  // agent 1's process, reconnected
+        CHECK(rig.service.carry_to_late_module(1, 100, kOther, edited_baseline("c:\\app\\src\\other.cpp"), "restart"));
+        CHECK(rig.service.has_carry_for_testing(100, kOther));
+    }
+    SUBCASE("another process registered with the pid: refused, and the caller hears so") {
+        Rig rig;
+        {
+            std::lock_guard<std::mutex> lock(rig.mutex);
+            rig.created[100] = 424242;
+        }
+        auto other = std::make_shared<SimAgent>(rig.service, 8);
+        rig.new_agents.push_back(other);
+        other->register_process(100, "", {kExe, kDll, kOther}, {kExe});
+        CHECK_FALSE(rig.service.carry_to_late_module(1, 100, kOther, edited_baseline("c:\\app\\src\\other.cpp"), "restart"));
+        CHECK_FALSE(rig.service.has_carry_for_testing(100, kOther));
+    }
 }
