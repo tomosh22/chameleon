@@ -137,9 +137,13 @@ void Agent::apply_install_hooks(const ipc::InstallHooks& request) {
             }
         }
     }
-    // `injectable`: only a reload's own InstallHooks may be failed by the hook-install stage, never a revert, a quiet re-point or
-    // the rollback below.
-    hook::BatchResult batch = revert ? installer.revert(specs.data(), count, outcomes) : installer.install(specs.data(), count, outcomes, !quiet);
+    // Failure injection: only a reload's own InstallHooks may be failed by the hook-install stage, never a revert, a quiet re-point or
+    // the rollback below. WP-43: a revert's requests have stages of their own (revert-restore for the original bytes, revert-repoint for
+    // the re-pointing to an older patch). The broker's undo of a re-pointing is a quiet request too: the broker disarms revert-repoint in this
+    // agent (ArmFault, count 0) before it sends the undo, and refuses to arm a revert stage while a revert runs, so the undo is never
+    // injectable (docs/wp/WP-43.md).
+    const ipc::fault::Stage inject = revert ? ipc::fault::Stage::RevertRestore : quiet ? ipc::fault::Stage::RevertRepoint : ipc::fault::Stage::HookInstall;
+    hook::BatchResult batch = revert ? installer.revert(specs.data(), count, outcomes, inject) : installer.install(specs.data(), count, outcomes, inject);
 
     // WP-28 (stage post-patch-hooks): the hooks are installed, but nothing has been committed and the application's post-patch
     // hooks have not run. Take the hooks out again (functions that were hooked to an earlier patch go back to that patch, the

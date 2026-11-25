@@ -133,6 +133,7 @@ void ReloadService::attach(std::shared_ptr<AgentLink> link) {
 
 void ReloadService::detach(std::uint64_t agent_id) {
     AgentEntry entry;
+    std::shared_ptr<RestartCoordinator> coordinator;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto it = agents_.find(agent_id);
@@ -141,6 +142,14 @@ void ReloadService::detach(std::uint64_t agent_id) {
         }
         entry = std::move(it->second);
         agents_.erase(it);
+        coordinator = restart_;
+    }
+    // WP-43: an unfinished restart's record for this process must not outlive it (its pid may be reused).
+    if (coordinator != nullptr && entry.link != nullptr) {
+        const LinkSnapshot snap = entry.link->snapshot();
+        if (snap.handshaken && snap.pid != 0) {
+            coordinator->process_gone(snap.pid);
+        }
     }
     entry.modules.clear();  // index threads are joined here, outside the lock
     rearm_save_watcher();
@@ -279,12 +288,18 @@ std::shared_ptr<ModuleState> ReloadService::module_state(std::uint64_t agent_id,
 // ---- hot-restart (WP-21) --------------------------------------------------------------------------------------
 
 void ReloadService::set_process_host(std::shared_ptr<ProcessHost> host) {
+    // WP-43 (R-40): the coordinator is made once and keeps its holds, its unfinished restarts and its shutdown flag; only its host is
+    // replaced. A restart that runs (or holds a process) meanwhile keeps the host it started with, and `restart-resume` and cancel() still
+    // reach it. (Replacing the coordinator stranded a held process in the old one until hold_ms.)
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!host) {
-        restart_.reset();
+    if (restart_ == nullptr) {
+        if (!host) {
+            return;
+        }
+        restart_ = std::make_shared<RestartCoordinator>(*this, events_, std::move(host));
         return;
     }
-    restart_ = std::make_shared<RestartCoordinator>(*this, events_, std::move(host));
+    restart_->set_host(std::move(host));
 }
 
 void ReloadService::set_restart_trace_for_testing(std::function<void(const std::string&)> trace) {
@@ -294,9 +309,14 @@ void ReloadService::set_restart_trace_for_testing(std::function<void(const std::
     }
 }
 
+std::shared_ptr<RestartCoordinator> ReloadService::restart_coordinator_for_testing() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return restart_;
+}
+
 bool ReloadService::restart_available() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return restart_ != nullptr;
+    return restart_ != nullptr && restart_->has_host();
 }
 
 void ReloadService::cancel() {
@@ -317,7 +337,7 @@ Result<Value> ReloadService::restart(const Value& args, const std::function<bool
         std::lock_guard<std::mutex> lock(mutex_);
         coordinator = restart_;
     }
-    if (coordinator == nullptr) {
+    if (coordinator == nullptr || !coordinator->has_host()) {
         return Diag::make(restart::diag::kUnavailable, "this broker cannot restart processes on this system",
                           "Restart the application yourself; hot-restart needs the Windows broker.");
     }
@@ -630,6 +650,23 @@ Result<Value> ReloadService::run_reload(const Value& args, bool automatic, bool 
 // ---- revert (WP-22) -------------------------------------------------------------------------------------------
 
 Result<Value> ReloadService::revert(const Value& args) {
+    std::vector<std::uint32_t> pids;
+    std::string outcome;
+    Result<Value> result = revert_impl(args, &pids, &outcome);
+    // WP-43: an armed revert stage applies to this revert only, whether it fired or not.
+    Value names = Value::array();
+    for (const std::uint32_t p : pids) {
+        for (const std::string& n : finish_injection(*this, "revert", p, outcome + (result ? std::string() : result.error().format()))) {
+            names.push(Value::string(n));
+        }
+    }
+    if (result && !names.items().empty()) {
+        result->set("injection_disarmed", std::move(names));
+    }
+    return result;
+}
+
+Result<Value> ReloadService::revert_impl(const Value& args, std::vector<std::uint32_t>* pids, std::string* outcome) {
     std::uint32_t pid = 0;
     std::uint32_t timeout_ms = 60000;
     std::optional<Diag> error;
@@ -662,6 +699,15 @@ Result<Value> ReloadService::revert(const Value& args) {
     }
 
     const std::vector<Target> list = targets(pid, module);
+    for (const Target& t : list) {
+        const std::uint32_t p = t.link->snapshot().pid;
+        if (std::find(pids->begin(), pids->end(), p) == pids->end()) {
+            pids->push_back(p);
+        }
+    }
+    if (pid != 0 && pids->empty()) {
+        pids->push_back(pid);
+    }
     RevertOptions revert_options;
     revert_options.timeout_ms = options().hooks_timeout_ms;
     revert_options.deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);  // one deadline for every module and step
@@ -684,6 +730,7 @@ Result<Value> ReloadService::revert(const Value& args) {
         const std::uint32_t target_pid = t.link->snapshot().pid;
         Result<RevertReport> r = revert_module(*t.link, *t.module, scope, revert_options);
         if (!r) {
+            *outcome += r.error().format() + "\n";
             CML_LOG(Warn, "revert: %s", r.error().format().c_str());
             if (events_ != nullptr) {
                 events_->publish(make_diag_event(r.error(), "error", "revert", target_pid));
@@ -701,6 +748,7 @@ Result<Value> ReloadService::revert(const Value& args) {
             continue;
         }
         for (const Diag& w : r->warnings) {
+            *outcome += w.format() + "\n";
             CML_LOG(Warn, "revert: %s", w.format().c_str());
             if (events_ != nullptr) {
                 events_->publish(make_diag_event(w, "warning", "revert", r->pid));

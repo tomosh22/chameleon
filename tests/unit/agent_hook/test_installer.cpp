@@ -631,6 +631,63 @@ TEST_CASE("failure injection (WP-28): hook-install fails only an injectable inst
 }
 #endif
 
+#if defined(CML_FAULT_INJECTION)
+TEST_CASE("failure injection (WP-43): revert-repoint fails only a re-pointing install, revert-restore only a revert; inside the window, nothing written") {
+    namespace fi = cml::agent::fault;
+    namespace f = cml::ipc::fault;
+    struct Disarm {
+        ~Disarm() { fi::disarm_all(); }
+    } disarm;
+    NaturalFn volatile call = natural_orig;
+    const std::uint8_t* const entry = static_cast<const std::uint8_t*>(address_of(&natural_orig));
+    const Bytes before = snapshot(entry - kBefore, kBefore + kAfter);
+    Installer installer;
+    std::vector<HookOutcome> out;
+    const HookRequest to_1{address_of(&natural_orig), address_of(&natural_new_1), "natural_orig"};
+    const HookRequest to_2{address_of(&natural_orig), address_of(&natural_new_2), "natural_orig"};
+    REQUIRE(installer.install(&to_1, 1, out).ok());
+    CHECK(call(5) == 1006);
+    const Bytes hooked = snapshot(entry - kBefore, kBefore + kAfter);
+
+    fi::arm(f::Stage::RevertRepoint, 1);
+    fi::arm(f::Stage::RevertRestore, 1);
+    // A reload's install (stage hook-install, not armed) and a plain install leave both stages alone.
+    REQUIRE(installer.install(&to_2, 1, out, true).ok());
+    REQUIRE(installer.install(&to_1, 1, out).ok());
+    CHECK(fi::armed(f::Stage::RevertRepoint) == 1);
+    CHECK(fi::armed(f::Stage::RevertRestore) == 1);
+    CHECK(call(5) == 1006);
+
+    // The re-pointing of a revert fails inside the window: still patch 1, the bytes unchanged.
+    const BatchResult repoint = installer.install(&to_2, 1, out, f::Stage::RevertRepoint);
+    CHECK_FALSE(repoint.ok());
+    CHECK(repoint.diag.code == f::ids::kAgentRevertRepoint);
+    CHECK(repoint.diag.message.find("revert-repoint") != std::string::npos);
+    CHECK(fi::armed(f::Stage::RevertRepoint) == 0);
+    CHECK(fi::armed(f::Stage::RevertRestore) == 1);
+    CHECK(call(5) == 1006);
+    CHECK(snapshot(entry - kBefore, kBefore + kAfter) == hooked);
+
+    // The restoring of a revert fails the same way: the hook stays.
+    const BatchResult restore = installer.revert(&to_1, 1, out, f::Stage::RevertRestore);
+    CHECK_FALSE(restore.ok());
+    CHECK(restore.diag.code == f::ids::kAgentRevertRestore);
+    CHECK(restore.diag.message.find("revert-restore") != std::string::npos);
+    CHECK(fi::armed(f::Stage::RevertRestore) == 0);
+    CHECK(call(5) == 1006);
+    CHECK(snapshot(entry - kBefore, kBefore + kAfter) == hooked);
+    CHECK(protection_of(entry) == PAGE_EXECUTE_READ);
+
+    // Used up: the next re-pointing and the next revert work.
+    REQUIRE(installer.install(&to_2, 1, out, f::Stage::RevertRepoint).ok());
+    CHECK(call(5) == 1007);
+    const BatchResult reverted = installer.revert(&to_1, 1, out, f::Stage::RevertRestore);
+    REQUIRE_MESSAGE(reverted.ok(), reverted.diag.format());
+    CHECK(call(5) == 1005);
+    CHECK(snapshot(entry - kBefore, kBefore + kAfter) == before);
+}
+#endif
+
 TEST_CASE("300 hooks are applied in a single stop of the world") {
     Arena arena(16);
     std::vector<Placed> olds;

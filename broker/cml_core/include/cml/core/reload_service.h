@@ -85,6 +85,8 @@ public:
     //   -> {"reverted":[{"pid","module","generation","batches","patches","hooks_restored","hooks_repointed"}],"generation":N}
     //   plus, when only some modules could be reverted, "partial":true and "failed":[{"pid","module","id","message"}] (CML5854)
     Result<ipc::json::Value> revert(const ipc::json::Value& args);
+    // (WP-43: at the end of every revert the "revert" stages still armed for its processes are disarmed; the answer lists those that did
+    // not fire as `injection_disarmed`.)
     // {"for"?:"idle"|"index", "timeout_ms"?:N}
     Result<ipc::json::Value> wait(const ipc::json::Value& args);
     // {"name":s, "value":s|n|b}
@@ -122,6 +124,8 @@ public:
     void set_process_host(std::shared_ptr<ProcessHost> host);
     bool restart_available() const;
     void set_restart_trace_for_testing(std::function<void(const std::string&)> trace);
+    // WP-43: the restart coordinator (null without a process host ever set), for the knobs of its tests.
+    std::shared_ptr<RestartCoordinator> restart_coordinator_for_testing() const;
     // {"pid"?:N, "timeout_ms"?:N, "hold_new"?:bool, "hold_ms"?:N}. `client_gone` (optional) reports that the requesting client has
     // disconnected; a restart that holds a process then resumes it at once (WP-34).
     Result<ipc::json::Value> restart(const ipc::json::Value& args, const std::function<bool()>& client_gone = {});
@@ -180,6 +184,7 @@ private:
     std::vector<std::future<void>> retiring_;  // stopped save watchers finishing a reload
     WatcherFactory watcher_factory_;
 
+    Result<ipc::json::Value> revert_impl(const ipc::json::Value& args, std::vector<std::uint32_t>* pids, std::string* outcome);
     std::shared_ptr<RestartCoordinator> restart_;  // guarded by mutex_; restart() works on a copy
     std::mutex observer_mutex_;
     OptionObserver option_observer_;

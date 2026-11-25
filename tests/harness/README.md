@@ -60,6 +60,7 @@ within_s = 60                  # default 60
 kind = "expect_diag"           # a `diag` event with this id; needs capability "diag-events"
 id = "CML3101"
 within_s = 10
+expect_text = "CML4660"        # optional (WP-43): the event's message must contain this
 
 [[step]]
 kind = "set_option"            # control command `set-option` (WP-14); needs capability "set-option"
@@ -131,6 +132,24 @@ again (`not_enabled`), re-applying the session's edits failed (`reapply_error`),
 checks of `expect_stdout` refer to the relaunched process. The relaunched process writes into the same output file (the
 broker hands the standard handles on), so `expect_stdout` keeps reading one stream; the cursor of the restarted process is
 set to the end of the output when the step starts, so what the pre-restart hooks and the new process print comes after it.
+
+WP-43 (scenario `restart_inject`) adds keys for failure injection in the restart:
+
+```toml
+hold_new = true                 # restart {hold_new}: the step resumes the held process when `restarting` (with its token) arrives,
+hold_ms = 10000                 #   from a second control connection; hold_ms 1..60000 (default 10000)
+expect_restarting = false       # with hold_new: no `restarting` may arrive (the hold could not be kept); default true
+expect_error = "CML5804"        # the restart must be refused with this id; nothing of a result is checked then
+expect_error_text = "CML4657"   # ... and the refusal's message must contain this
+expect_warning = "CML5973"      # a warning diag event with this id must come with the restart
+expect_reapply_error = "CML5977"  # reapply_error of the result must carry this id (instead of failing the step)
+expect_not_enabled = "fixture_hot_restart.exe"  # not_enabled of the result must list a module of this name (instead of failing)
+```
+
+Before it sends `restart` the step waits (up to 60 s) until `status` lists the process: a process that a failed restart left
+running registers by itself a moment later. After an expected refusal the supervisor follows the process that runs: the old one
+when the refusal names it (the restart failed before the termination), else the new process named by the `pid` of the refusal's
+`diag` event. The `revert` step takes `expect_error_text` as well.
 
 Step added by WP-28 (failure injection, needs the broker capability `fault-injection`):
 

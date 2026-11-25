@@ -115,6 +115,7 @@ namespace Chameleon.Control.Tests
                     Assert.Equal(ClientDiagIds.PipeLost, ex.Diagnostic.Id);
                     Assert.Contains("no answer", ex.Diagnostic.Message);
                     Assert.Contains("What to do", ex.Diagnostic.ToString());
+                    Assert.True(ex.TimedOut);   // WP-43: told apart from a dropped connection
 
                     ControlResponse again = await client.CallAsync("reload", null, 5000, CancellationToken.None);
                     Assert.True(again.Ok);
@@ -139,6 +140,7 @@ namespace Chameleon.Control.Tests
 
                     ControlException ex = await Assert.ThrowsAsync<ControlException>(() => pending);
                     Assert.Equal(ClientDiagIds.PipeLost, ex.Diagnostic.Id);
+                    Assert.False(ex.TimedOut);   // WP-43
                     Assert.Same(lost.Task, await Task.WhenAny(lost.Task, Task.Delay(5000)));
                     ChameleonDiagnostic diagnostic = await lost.Task;
                     Assert.Equal(ClientDiagIds.PipeLost, diagnostic.Id);

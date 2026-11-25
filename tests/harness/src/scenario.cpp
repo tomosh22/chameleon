@@ -93,7 +93,7 @@ std::string Step::describe() const {
             out += " " + key + " (at least " + std::to_string(min_samples) + " samples)";
             break;
         case StepKind::ExpectDiag:
-            out += " " + id + " within " + std::to_string(within_s) + " s";
+            out += " " + id + (expect_error_text.empty() ? std::string() : " mentioning " + expect_error_text) + " within " + std::to_string(within_s) + " s";
             break;
         case StepKind::SetOption:
             out += " " + option + " = " +
@@ -108,10 +108,17 @@ std::string Step::describe() const {
             out += " " + event + " within " + std::to_string(within_s) + " s";
             break;
         case StepKind::Restart:
-            out += " within " + std::to_string(within_s) + " s";
+            out += (hold_new ? " held" : "") + std::string(" within ") + std::to_string(within_s) + " s";
             if (has_result_value) {
                 out += " expecting " + result_key + "=" + std::to_string(result_value);
             }
+            if (!expect_error.empty()) {
+                out += " expecting the refusal " + expect_error;
+            }
+            if (!expect_warning.empty()) {
+                out += " expecting the warning " + expect_warning;
+            }
+            break;
         case StepKind::WatchExceptions:
             break;
         case StepKind::ExpectException:
@@ -411,7 +418,7 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
     }
     if (*kind == "expect_diag") {
         step.kind = StepKind::ExpectDiag;
-        cml::Result<void> keys = only_keys(table, {"kind", "id", "within_s", "expect_file", "expect_line", "expect_column"}, "an expect_diag step");
+        cml::Result<void> keys = only_keys(table, {"kind", "id", "within_s", "expect_file", "expect_line", "expect_column", "expect_text"}, "an expect_diag step");
         if (!keys) return keys.error();
         cml::Result<std::string> id = require_string(table, "id", "an expect_diag step");
         if (!id) return id.error();
@@ -424,6 +431,12 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
         step.within_s = *within;
         cml::Result<void> where = parse_location(table, step);
         if (!where) return where.error();
+        if (const toml::Value* text = table.find("expect_text")) {  // WP-43: a substring of the event's message
+            if (text->kind != toml::Value::Kind::String || text->text.empty()) {
+                return invalid(text->line, "'expect_text' must be a non-empty string");
+            }
+            step.expect_error_text = text->text;
+        }
         return step;
     }
     if (*kind == "expect_monotonic") {
@@ -499,7 +512,7 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
     }
     if (*kind == "revert") {
         step.kind = StepKind::Revert;
-        cml::Result<void> keys = only_keys(table, {"kind", "scope", "within_s", "expect_error"}, "a revert step");
+        cml::Result<void> keys = only_keys(table, {"kind", "scope", "within_s", "expect_error", "expect_error_text"}, "a revert step");
         if (!keys) return keys.error();
         if (const toml::Value* scope = table.find("scope")) {
             if (scope->kind != toml::Value::Kind::String || (scope->text != "last" && scope->text != "all")) {
@@ -515,6 +528,12 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
                                std::all_of(ee->text.begin() + 3, ee->text.end(), [](char c) { return c >= '0' && c <= '9'; });
             if (!shape) return invalid(ee->line, "'expect_error' must look like CML5850");
             step.expect_error = ee->text;
+        }
+        if (const toml::Value* text = table.find("expect_error_text")) {  // WP-43
+            if (text->kind != toml::Value::Kind::String || text->text.empty() || step.expect_error.empty()) {
+                return invalid(text->line, "'expect_error_text' must be a non-empty string and needs expect_error");
+            }
+            step.expect_error_text = text->text;
         }
         return step;
     }
