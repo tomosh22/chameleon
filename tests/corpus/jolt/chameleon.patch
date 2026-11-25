@@ -1,0 +1,86 @@
+diff --git a/HelloWorld/HelloWorld.cpp b/HelloWorld/HelloWorld.cpp
+index 5836e65..59f87b6 100644
+--- a/HelloWorld/HelloWorld.cpp
++++ b/HelloWorld/HelloWorld.cpp
+@@ -23,6 +23,10 @@
+ #include <iostream>
+ #include <cstdarg>
+ #include <thread>
++#include <chrono>
++#include <immintrin.h>
++
++#include "chameleon_corpus.h" // Chameleon corpus (WP-41)
+ 
+ // Disable common warnings triggered by Jolt, you can use JPH_SUPPRESS_WARNING_PUSH / JPH_SUPPRESS_WARNING_POP to store and restore the warning state
+ JPH_SUPPRESS_WARNINGS
+@@ -208,9 +212,32 @@ public:
+ 	}
+ };
+ 
++// Chameleon corpus (WP-41): a function of the application's own translation unit that runs once per frame (an edit target)
++int g_CmlCorpusAppFrames = 0;
++void CmlCorpusAppFrame()
++{
++	g_CmlCorpusAppFrames = g_CmlCorpusAppFrames + 1;
++}
++
++// Chameleon corpus (WP-41): a leaf function that runs once per frame and whose first instruction is VEX-encoded under
++// /arch:AVX2 (vbroadcastss); an edit target. The corpus driver checks the first byte of its entry in the built image.
++#ifdef _MSC_VER
++	#define CML_CORPUS_NOINLINE __declspec(noinline)
++#else
++	#define CML_CORPUS_NOINLINE __attribute__((noinline))
++#endif
++float g_CmlCorpusVexValues[8] = { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f };
++CML_CORPUS_NOINLINE void CmlCorpusVexScale(float *ioValues, float inScale)
++{
++	const __m256 scale = _mm256_set1_ps(inScale);
++	_mm256_storeu_ps(ioValues, _mm256_mul_ps(_mm256_loadu_ps(ioValues), scale));
++}
++
+ // Program entry point
+ int main(int argc, char** argv)
+ {
++	cml_corpus_init(); // Chameleon corpus (WP-41)
++
+ 	// Register allocation hook. In this example we'll just let Jolt use malloc / free but you can override these if you want (see Memory.h).
+ 	// This needs to be done before any other Jolt function is called.
+ 	RegisterDefaultAllocator();
+@@ -331,21 +358,35 @@ int main(int argc, char** argv)
+ 
+ 	// Now we're ready to simulate the body, keep simulating until it goes to sleep
+ 	uint step = 0;
+-	while (body_interface.IsActive(sphere_id))
++	for (;;) // Chameleon corpus (WP-41): run until the corpus driver stops the process; the sphere is dropped again whenever it sleeps
+ 	{
++		if (!body_interface.IsActive(sphere_id))
++		{
++			body_interface.SetPositionAndRotation(sphere_id, RVec3(0.0_r, 2.0_r, 0.0_r), Quat::sIdentity(), EActivation::Activate);
++			body_interface.SetLinearVelocity(sphere_id, Vec3(0.0f, -5.0f, 0.0f));
++		}
++
+ 		// Next step
+ 		++step;
+ 
+ 		// Output current position and velocity of the sphere
+ 		RVec3 position = body_interface.GetCenterOfMassPosition(sphere_id);
+ 		Vec3 velocity = body_interface.GetLinearVelocity(sphere_id);
+-		cout << "Step " << step << ": Position = (" << position.GetX() << ", " << position.GetY() << ", " << position.GetZ() << "), Velocity = (" << velocity.GetX() << ", " << velocity.GetY() << ", " << velocity.GetZ() << ")" << endl;
++		if (step % 600 == 1) // Chameleon corpus (WP-41): every 10 s, not every step
++			cout << "Step " << step << ": Position = (" << position.GetX() << ", " << position.GetY() << ", " << position.GetZ() << "), Velocity = (" << velocity.GetX() << ", " << velocity.GetY() << ", " << velocity.GetZ() << ")" << endl;
+ 
+ 		// If you take larger steps than 1 / 60th of a second you need to do multiple collision steps in order to keep the simulation stable. Do 1 collision step per 1 / 60th of a second (round up).
+ 		const int cCollisionSteps = 1;
+ 
+ 		// Step the world
+ 		physics_system.Update(cDeltaTime, cCollisionSteps, &temp_allocator, &job_system);
++
++		// Chameleon corpus (WP-41): one frame
++		cml_corpus_frame();
++		CmlCorpusAppFrame();
++		CmlCorpusVexScale(g_CmlCorpusVexValues, 1.0f);
++		RefConst<Shape> cml_corpus_shape = body_interface.GetShape(sphere_id); // a reference per frame: RefTarget<Shape>::AddRef / Release (Jolt/Core/Reference.h)
++		this_thread::sleep_for(chrono::milliseconds(16));
+ 	}
+ 
+ 	// Remove the sphere from the physics system. Note that the sphere itself keeps all of its state and can be re-added at any time.
