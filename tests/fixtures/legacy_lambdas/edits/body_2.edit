@@ -1,11 +1,11 @@
 --- a/lambdas.cpp
 +++ b/lambdas.cpp
-@@ -34,7 +34,7 @@
-     return []() {
-         static LlCounter c = ll_make(200000);
+@@ -40,7 +40,7 @@
+     auto lambda = [id]() {
+         static LlCounter c = ll_make(id);
          c.hits += 1;
 -        return c.id + c.hits;
 +        return c.id + c.hits + 50000;
-     }();
+     };
+     return lambda();
  }
- 

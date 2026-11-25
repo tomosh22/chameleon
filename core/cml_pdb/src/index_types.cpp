@@ -2,6 +2,7 @@
 // object compiled with /Zi, opened for its types only.
 
 #include <chrono>
+#include <map>
 #include <cstring>
 #include <set>
 #include <string>
@@ -97,10 +98,10 @@ Result<const std::vector<ClosureClass>*> PdbIndex::closure_classes() const {
         if (tpi == nullptr) {
             impl_->closures_error = error.code != 0 ? error : Diag::make(diag::kBadTypeStream, "The TPI stream of '" + impl_->path + "' cannot be read.", "Rebuild the module with full debug information.");
         } else {
-            std::set<std::string> seen;
+            std::map<std::string, std::size_t> seen;  // unique name -> position in closures
             const auto start = std::chrono::steady_clock::now();
             // One walk of the stream; the chunks it reads are not kept (the signature reader keeps only what it looks up).
-            const bool complete = tpi->walk([&](std::uint32_t, const TypeRecord& record) {
+            const bool complete = tpi->walk([&](std::uint32_t index, const TypeRecord& record) {
                 if (record.kind != 0x1504 && record.kind != 0x1505) {  // LF_CLASS, LF_STRUCTURE
                     return;
                 }
@@ -110,8 +111,13 @@ Result<const std::vector<ClosureClass>*> PdbIndex::closure_classes() const {
                     return;
                 }
                 std::string plain = without_tu_discriminator(unique);
-                if (seen.insert(plain).second) {
-                    impl_->closures.push_back({std::string(name), std::move(plain)});
+                const bool forward = record.body_len >= 4 && (static_cast<std::uint32_t>(record.body[2]) & 0x80u) != 0;  // property: fwdref
+                const auto [at, added] = seen.emplace(plain, impl_->closures.size());
+                if (added) {
+                    impl_->closures.push_back({std::string(name), std::move(plain), 0});
+                }
+                if (!forward && impl_->closures[at->second].definition == 0) {
+                    impl_->closures[at->second].definition = index;
                 }
             });
             if (!complete) {
@@ -130,6 +136,31 @@ Result<const std::vector<ClosureClass>*> PdbIndex::closure_classes() const {
         return *impl_->closures_error;
     }
     return &impl_->closures;
+}
+
+std::optional<std::uint64_t> PdbIndex::type_size(std::uint32_t index) const {
+    const TypeSource& source = types();
+    return type_size_of(source, index, [this](const std::string& unique) -> std::optional<std::uint64_t> {
+        std::lock_guard<std::mutex> lock(impl_->udt_sizes_mutex);
+        if (!impl_->udt_sizes_built) {
+            impl_->udt_sizes_built = true;
+            const TypeStream* tpi = impl_->type_stream(true);
+            impl_->udt_sizes_ok = tpi != nullptr && tpi->walk([&](std::uint32_t, const TypeRecord& record) {
+                std::string_view name;
+                std::string_view u;
+                const std::optional<std::uint64_t> size = udt_definition_size(record);
+                if (size && udt_record_names(record, name, u) && !u.empty()) {
+                    impl_->udt_sizes.emplace(without_tu_discriminator(u), *size);
+                }
+            });
+            CML_LOG(Info, "WP46-UDT-SIZES pdb='%s' definitions=%zu complete=%d", impl_->path.c_str(), impl_->udt_sizes.size(), impl_->udt_sizes_ok ? 1 : 0);
+        }
+        if (!impl_->udt_sizes_ok) {
+            return std::nullopt;
+        }
+        const auto it = impl_->udt_sizes.find(unique);
+        return it == impl_->udt_sizes.end() ? std::nullopt : std::optional<std::uint64_t>(it->second);
+    });
 }
 
 TypeStreamStats PdbIndex::type_stream_stats(bool tpi) const {
@@ -179,6 +210,10 @@ Result<std::unique_ptr<TypeServerPdb>> TypeServerPdb::open(const std::string& pd
 
 bool TypeServerPdb::find_type(std::uint32_t index, TypeRecord& out) const {
     return impl_->tpi->find(index, out);
+}
+
+bool TypeServerPdb::walk_types(const std::function<void(std::uint32_t index, const TypeRecord& record)>& visit) const {
+    return impl_->tpi->walk(visit);
 }
 
 bool TypeServerPdb::find_id(std::uint32_t index, TypeRecord& out) const {

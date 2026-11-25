@@ -626,7 +626,8 @@ const char* const kO2OwnGuard = "?$TSS0@?1??o2_step@@YAXXZ@4HA";
 // The old o2_step with one record `sname` (data 0x20) and the closure class of its lambda in the TPI. `compiler` is the
 // compiland's S_COMPILE3 version; `with_operator`: the lambda's call operator is a procedure of the compiland (not inlined);
 // `closure_function`: the function the closure belongs to.
-SynthWorld o2_world(const std::string& compiler, bool with_operator, const std::string& closure_function = "?o2_step@@YAXXZ") {
+SynthWorld o2_world(const std::string& compiler, bool with_operator, const std::string& closure_function = "?o2_step@@YAXXZ",
+                    const std::string& closure_name = "o2_step::<lambda_0>") {
     SynthWorld w = basic_world(false);
     tp::Module& tu = w.tu();
     tu.symbols = tp::Records();
@@ -636,8 +637,8 @@ SynthWorld o2_world(const std::string& compiler, bool with_operator, const std::
     w.proc(w.tu(), "helper", 0x40, 0x10, true);
     tp::TypeSet types;
     const std::string unique = ".?AV<lambda_0>@?0?" + closure_function + "@";
-    const std::uint32_t forward = types.add(tp::kLfClass, tp::lf_udt("o2_step::<lambda_0>", unique, true));
-    types.add(tp::kLfClass, tp::lf_udt("o2_step::<lambda_0>", unique, false, 1));
+    const std::uint32_t forward = types.add(tp::kLfClass, tp::lf_udt(closure_name, unique, true));
+    types.add(tp::kLfClass, tp::lf_udt(closure_name, unique, false, 1));
     const std::uint32_t this_ptr = types.add(tp::kLfPointer, tp::lf_pointer(forward, tp::kPtr64 | 0x400));
     const std::uint32_t args = types.add(tp::kLfArgList, tp::lf_arglist({}));
     const std::uint32_t op_type = types.add(tp::kLfMFunction, tp::lf_mfunction(tp::kTInt, forward, this_ptr, args, 0));
@@ -684,7 +685,7 @@ TEST_CASE("R-54 (WP-46): an own static named like the static of a lambda clang-c
         CHECK(decision(*r, kO2Own).old_address.rva == 0x3020);
     }
     SUBCASE("clang-cl, the closure belongs to another function: pairs by name") {
-        SynthWorld w = o2_world("clang version 18.1.3 (https://github.com/llvm/llvm-project)", false, "?o2_other@@YAXXZ");
+        SynthWorld w = o2_world("clang version 18.1.3 (https://github.com/llvm/llvm-project)", false, "?o2_other@@YAXXZ", "o2_other::<lambda_0>");
         Built b = o2_own_static_object();
         auto r = plan_bind(w.input(b));
         REQUIRE_MESSAGE(r.has_value(), err(r));
@@ -697,4 +698,57 @@ TEST_CASE("R-54 (WP-46): an own static named like the static of a lambda clang-c
         REQUIRE_MESSAGE(r.has_value(), err(r));
         CHECK(decision(*r, kO2Own).old_address.rva == 0x3020);
     }
+}
+
+TEST_CASE("R-54 (WP-46 review): the static's function is read from its parsed name, never from a guessed \"@4\" in its type") {
+    // The type of the static holds a back-reference "@4@": 6b0a7de cut the scope at the last "@4", got the wrong function,
+    // found no closure of it and paired the static with the inlined lambda's record.
+    SynthWorld w = o2_world("clang version 18.1.3 (https://github.com/llvm/llvm-project)", false);
+    SynthObj o;
+    const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+    const std::string own = "?sname@?1??o2_step@@YAXXZ@4PEAV?$vec@H@4@A";
+    o.symbol(own, 0x20, bss, false, false);
+    Built b = o.build();
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+    REQUIRE(errors.size() == 1);
+    CHECK(errors[0].code == diag::kAmbiguousStatic);
+    CHECK(decision(partial, own).decision != DecisionKind::BindOldData);
+}
+
+TEST_CASE("R-54 (WP-46 review): a static of a lambda's call operator, and an inner lambda inlined into that operator") {
+    // clang inlines a lambda into the lambda that calls it as well: the old outer call operator records the inner lambda's
+    // static `sname`, and the patch (inner lambda deleted) declares a static `sname` of the outer call operator itself.
+    // 6b0a7de did not look at the statics of call operators and paired it with the inner lambda's record.
+    SynthWorld w = basic_world(false);
+    tp::Module& tu = w.tu();
+    tu.symbols = tp::Records();
+    tu.symbols.objname(tu.name);
+    tu.symbols.compile3(1, 0, 0xD0, "clang version 18.1.3 (https://github.com/llvm/llvm-project)");
+    tp::TypeSet types;
+    const std::string outer = ".?AV<lambda_0>@?0??o2_step@@YAXXZ@";
+    const std::uint32_t outer_fwd = types.add(tp::kLfClass, tp::lf_udt("o2_step::<lambda_0>", outer, true));
+    types.add(tp::kLfClass, tp::lf_udt("o2_step::<lambda_0>", outer, false, 1));
+    types.add(tp::kLfClass, tp::lf_udt("o2_step::<lambda_0>::operator()::<lambda_1>", ".?AV<lambda_1>@?0???R<lambda_0>@?0??o2_step@@YAXXZ@QEBA@XZ@", false, 1));
+    const std::uint32_t this_ptr = types.add(tp::kLfPointer, tp::lf_pointer(outer_fwd, tp::kPtr64 | 0x400));
+    const std::uint32_t args = types.add(tp::kLfArgList, tp::lf_arglist({}));
+    const std::uint32_t op_type = types.add(tp::kLfMFunction, tp::lf_mfunction(tp::kTVoid, outer_fwd, this_ptr, args, 0));
+    types.add_to(w.spec.tpi);
+    w.tu().symbols.proc(0x110F, "o2_step::<lambda_0>::operator()", SynthWorld::kTextSec, 0x60, 0x10, 0, op_type);
+    w.tu().symbols.data(0x110C, "sname", SynthWorld::kDataSec, 0x20);
+    w.tu().symbols.end();
+    w.open();
+    SynthObj o;
+    const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+    const std::string own = "?sname@?1???R<lambda_0>@?0??o2_step@@YAXXZ@QEBA@XZ@4UO2Name@@A";
+    o.symbol(own, 0x20, bss, false, false);
+    Built b = o.build();
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+    REQUIRE(errors.size() == 1);
+    CHECK(errors[0].code == diag::kAmbiguousStatic);
+    CHECK_MESSAGE(contains(errors[0].message, "o2_step::<lambda_0>::operator()::<lambda_1>"), errors[0].message);
+    CHECK(decision(partial, own).decision != DecisionKind::BindOldData);
 }

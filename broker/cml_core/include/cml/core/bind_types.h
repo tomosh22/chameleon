@@ -59,6 +59,11 @@ public:
     std::optional<std::uint64_t> function_of_static(std::uint32_t section, std::uint32_t value, bool* several = nullptr);
     // The canonical text of a type of the object (cml::pdb::canonical_type). nullopt with `why` when unreadable.
     std::optional<std::string> type_text(std::uint32_t type_index, std::string* why);
+    // WP-46 (F-41.2 review): the functions, as (section << 32) | offset, whose procedure records have a local variable of the
+    // class with this unique name (without the unit's discriminator; through modifiers, never through a pointer).
+    std::vector<std::uint64_t> functions_with_local(const std::string& unique);
+    // WP-46: the layout of the class with this unique name (pdb::udt_layout of its definition record). nullopt with `why`.
+    std::optional<std::string> class_layout(const std::string& unique, std::string* why);
 
     // Where the types came from; NotRead before the first at().
     ObjectTypeOrigin origin() const noexcept { return origin_; }
@@ -74,6 +79,7 @@ private:
         bool computed = false;
         pdb::FunctionSignature signature;
         ProcStatics statics;
+        std::vector<std::uint32_t> local_types;  // WP-46
     };
 
     void load();

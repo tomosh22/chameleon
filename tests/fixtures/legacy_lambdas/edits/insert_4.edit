@@ -1,6 +1,6 @@
 --- a/lambdas.cpp
 +++ b/lambdas.cpp
-@@ -20,6 +20,11 @@
+@@ -23,6 +23,11 @@
      return c;
  }
  
@@ -11,4 +11,4 @@
 +
  int ll_a()
  {
-     return []() {
+     int id = 100000;

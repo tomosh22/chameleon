@@ -192,8 +192,13 @@ bool TypeStream::walk(const std::function<void(std::uint32_t index, const TypeRe
         if (cached != loaded_.end()) {
             chunk = &cached->second;
         } else {
+            // (load() counts what it reads as kept: chunks, bytes loaded and copied. This chunk is not kept, so none of it
+            // stays in the statistics, which describe what the stream holds.)
+            const TypeStreamStats before = stats_;
             load(entry, scratch);
-            stats_.chunks_loaded -= scratch.bad ? 0u : 1u;  // (load() counts a good chunk as kept; this one is not)
+            stats_.chunks_loaded = before.chunks_loaded;
+            stats_.bytes_loaded = before.bytes_loaded;
+            stats_.bytes_copied = before.bytes_copied;
         }
         if (chunk->bad) {
             return false;

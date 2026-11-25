@@ -1,5 +1,8 @@
 // WP-46 (F-41.2): with cl's legacy lambda processor every lambda of this file is named `<lambda_<hash>>`, in no scope. The
-// statics `c` live in the lambdas; a reload must keep each counter in its own range and never construct one again.
+// statics `c` live in the lambdas; a reload must keep each counter in its own range and never construct one again. Each
+// lambda is a named local of its function and captures its id: the planner pairs an edited (renamed) lambda only with the
+// evidence that it is the old one (the same enclosing function, read from the local's type, the same capture, the same
+// statics and call operator).
 #include "legacy.h"
 
 namespace {
@@ -22,29 +25,35 @@ static LlCounter ll_make(int id)
 
 int ll_a()
 {
-    return []() {
-        static LlCounter c = ll_make(100000);
+    int id = 100000;
+    auto lambda = [id]() {
+        static LlCounter c = ll_make(id);
         c.hits += 1;
         return c.id + c.hits;
-    }();
+    };
+    return lambda();
 }
 
 int ll_b()
 {
-    return []() {
-        static LlCounter c = ll_make(200000);
+    int id = 200000;
+    auto lambda = [id]() {
+        static LlCounter c = ll_make(id);
         c.hits += 1;
         return c.id + c.hits;
-    }();
+    };
+    return lambda();
 }
 
 int ll_c()
 {
-    return []() {
-        static LlCounter c = ll_make(300000);
+    int id = 300000;
+    auto lambda = [id]() {
+        static LlCounter c = ll_make(id);
         c.hits += 1;
         return c.id + c.hits;
-    }();
+    };
+    return lambda();
 }
 
 int ll_made()

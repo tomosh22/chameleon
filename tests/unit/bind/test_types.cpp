@@ -1103,6 +1103,14 @@ public:
         records_.data(kind, name, 0, 0, type);
     }
     void local(const std::string& decorated, const std::string& name, std::uint32_t type = tp::kTInt) { record(symbol(decorated), name, type); }
+    // WP-46: an S_LOCAL (a local variable of the procedure, not a static).
+    void variable(std::uint32_t type, const std::string& name) {
+        tp::Bytes b;
+        tp::put32(b, type);
+        tp::put16(b, 0);
+        tp::putstr(b, name);
+        records_.add(0x113E, b);
+    }
 
     Built build(const tp::Bytes& debug_t) {
         add_debug(".debug$T", debug_t);
@@ -2601,7 +2609,7 @@ TEST_CASE("destructor of a local class (F-41.3, WP-46): the deleting destructor'
         REQUIRE_MESSAGE(r.has_value(), err(r));
         const SymbolDecision d = decision(*r, kLocalDtor);
         CHECK(d.decision == DecisionKind::PatchHooked);
-        CHECK(d.source == BindSource::CompilandSignature);
+        CHECK((d.source == BindSource::CompilandStatic || d.source == BindSource::CompilandSignature));  // (since the review: by name in pass A, the one record left)
         CHECK(d.old_address.rva == 0x1060);
         for (const HookEntry& h : r->hooks) {
             CHECK(h.old_va != SynthWorld::kBase + 0x1000 + deleting_at);  // nothing is hooked onto the old deleting destructor
@@ -2793,12 +2801,139 @@ Built hashed_statics_object(const std::vector<std::string>& closures, const std:
 }
 }  // namespace
 
-TEST_CASE("hash-named lambdas (WP-46 round 2): the one edited lambda is paired by elimination, its static and guard with the old ones") {
-    // kHash3's body was edited, so cl named it kEdited3. main: CML3214 for both call operators ("3 call operator(s)..." / the
-    // set changed) and CML3207 for the statics; the edit could not be reloaded.
+// WP-46 review (high, item 1): being the only lambda left on each side is no evidence that two lambdas are one. The
+// elimination needs the same enclosing function (the one procedure with a local of the closure's type, on both sides), the
+// same closure layout (its captures), the same statics (names and types) and the same call operator signature.
+namespace {
+struct ClosureTypes {
+    std::uint32_t forward = 0;
+    std::uint32_t op = 0;
+};
+// A closure class capturing one member of `member` (forward reference, field list, definition) and its `int () const` call
+// operator.
+ClosureTypes closure_types(Types& t, const std::string& closure, std::uint32_t member, std::uint16_t size = 4) {
+    ClosureTypes c;
+    const std::string unique = hashed_unique(closure);
+    c.forward = t.set.add(tp::kLfClass, tp::lf_udt(closure, unique, true));
+    tp::Bytes fields;
+    tp::put16(fields, 0x150D);  // LF_MEMBER
+    tp::put16(fields, 3);       // public
+    tp::put32(fields, member);
+    tp::put16(fields, 0);       // offset 0
+    tp::putstr(fields, "base");
+    while (fields.size() % 4 != 0) {
+        fields.push_back(static_cast<std::uint8_t>(0xF0 + (4 - fields.size() % 4)));
+    }
+    const std::uint32_t list = t.set.add(0x1203, fields);  // LF_FIELDLIST
+    tp::Bytes def;
+    tp::put16(def, 1);
+    tp::put16(def, 0x200);
+    tp::put32(def, list);
+    tp::put32(def, 0);
+    tp::put32(def, 0);
+    tp::put16(def, size);
+    tp::putstr(def, closure);
+    tp::putstr(def, unique);
+    t.set.add(tp::kLfClass, def);
+    const std::uint32_t const_cls = t.set.add(tp::kLfModifier, tp::lf_modifier(c.forward, 1));
+    const std::uint32_t this_ptr = t.set.add(tp::kLfPointer, tp::lf_pointer(const_cls, tp::kPtr64 | 0x400));
+    const std::uint32_t args = t.args({});
+    c.op = t.set.add(tp::kLfMFunction, tp::lf_mfunction(tp::kTInt, c.forward, this_ptr, args, 0));
+    return c;
+}
+
+// The old compiland (cl): kHash1's call operator (text 0x60; `c` 0x20, `$TSS0` 0x28) held by ll_a (0xA0), kHash3's (0x80;
+// 0x30, 0x38) held by ll_b (0xC0); ll_g (0xE0) holds none. Each closure captures one int.
+void evidence_world(SynthWorld& w) {
+    Types t;
+    const std::uint32_t holder = t.fn(tp::kTInt, {});
+    const ClosureTypes c1 = closure_types(t, kHash1, tp::kTInt);
+    const ClosureTypes c3 = closure_types(t, kHash3, tp::kTInt);
+    old_proc(w, kHash1 + "::operator()", 0x60, c1.op, {{"c", 0x20}, {"$TSS0", 0x28}});
+    old_proc(w, kHash3 + "::operator()", 0x80, c3.op, {{"c", 0x30}, {"$TSS0", 0x38}});
+    tp::Records& s = w.tu().symbols;
+    const auto held = [&](const std::string& display, std::uint32_t at, std::uint32_t closure) {
+        s.proc(0x1110, display, SynthWorld::kTextSec, at, 0x10, 0, holder);
+        if (closure != 0) {
+            tp::Bytes b;
+            tp::put32(b, closure);
+            tp::put16(b, 0);
+            tp::putstr(b, "lambda");
+            s.add(0x113E, b);  // S_LOCAL
+        }
+        s.end();
+    };
+    held("ll_a", 0xA0, c1.forward);
+    held("ll_b", 0xC0, c3.forward);
+    held("ll_g", 0xE0, 0);
+    w.pub_func("?ll_a@@YAHXZ", 0xA0);
+    w.pub_func("?ll_b@@YAHXZ", 0xC0);
+    w.pub_func("?ll_g@@YAHXZ", 0xE0);
+    t.set.add_to(w.spec.tpi);
+    w.open();
+}
+
+// The patch: kHash1 unchanged in ll_a, and the edited lambda `edited` (member type `member`, static `name`) held by `holder`.
+struct EditedLambda {
+    std::string holder = "ll_b";
+    std::uint32_t member = tp::kTInt;
+    std::string name = "c";
+    bool local = true;  // the holder has a local of the closure's type
+};
+Built evidence_object(const EditedLambda& e) {
+    Types t;
+    const std::uint32_t holder = t.fn(tp::kTInt, {});
+    const ClosureTypes c1 = closure_types(t, kHash1, tp::kTInt);
+    const ClosureTypes c3 = closure_types(t, kEdited3, e.member);
+    StaticsObj o;
+    const auto lambda = [&](const std::string& closure, const ClosureTypes& c, const std::string& name) {
+        o.proc(hashed_op(closure), closure + "::operator()", false, c.op);
+        o.local("?" + name + "@?1???R" + closure + "@@QEBAHXZ@4HA", name);
+        o.local(hashed_guard(closure), "$TSS0");
+        o.end();
+    };
+    lambda(kHash1, c1, "c");
+    lambda(kEdited3, c3, e.name);
+    const auto held = [&](const std::string& display, std::uint32_t closure) {
+        o.proc("?" + display + "@@YAHXZ", display, true, holder);
+        if (closure != 0) {
+            o.variable(closure, "lambda");
+        }
+        o.end();
+    };
+    held("ll_a", c1.forward);
+    held(e.holder, e.local ? c3.forward : 0);
+    if (e.holder != "ll_b") {
+        held("ll_b", 0);
+    }
+    return o.build(t.set.debug_t());
+}
+
+void refused_without_evidence(const EditedLambda& e, const std::string& reason) {
     SynthWorld w;
-    hashed_statics_world(w);
-    Built b = hashed_statics_object({kHash1, kEdited3});
+    evidence_world(w);
+    Built b = evidence_object(e);
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+    REQUIRE_FALSE(errors.empty());
+    CHECK(errors[0].code == diag::kHashedLambdasUnproven);
+    CHECK_MESSAGE(contains(errors[0].message, "cannot be shown to be the same lambda: " + reason), errors[0].message);
+    CHECK(decision(partial, hashed_op(kEdited3)).decision != DecisionKind::PatchHooked);
+    for (const SymbolDecision& d : partial.decisions) {
+        if (d.type == SymbolType::Data && d.defined && d.name.find(kEdited3) != std::string::npos) {
+            CHECK_MESSAGE(d.decision != DecisionKind::BindOldData, d.name);
+        }
+    }
+}
+}  // namespace
+
+TEST_CASE("hash-named lambdas (WP-46 round 2): the one edited lambda is paired by elimination, its static and guard with the old ones") {
+    // kHash3's body was edited, so cl named it kEdited3: held by ll_b on both sides, the same capture, the same static, the
+    // same call operator. main: CML3214 for both call operators (the set changed) and CML3207 for the statics.
+    SynthWorld w;
+    evidence_world(w);
+    Built b = evidence_object(EditedLambda());
     auto r = plan_bind(w.input(b));
     REQUIRE_MESSAGE(r.has_value(), err(r));
     const SymbolDecision op = decision(*r, hashed_op(kEdited3));
@@ -2817,6 +2952,30 @@ TEST_CASE("hash-named lambdas (WP-46 round 2): the one edited lambda is paired b
     REQUIRE(r->hashed_lambdas.size() == 2);
     for (const HashedLambda& h : r->hashed_lambdas) {
         CHECK(h.old_closure == (h.closure == kEdited3 ? kHash3 : std::string()));
+    }
+}
+
+TEST_CASE("hash-named lambdas (WP-46 review): the two lambdas left are paired only with the evidence that they are one (CML3630 otherwise)") {
+    SUBCASE("removed from ll_b, added to ll_g: another enclosing function") {
+        // 6b0a7de: paired by elimination; the lambda of ll_g took the live static of ll_b's lambda.
+        EditedLambda e;
+        e.holder = "ll_g";
+        refused_without_evidence(e, "the lambda is held by 'll_g' in the patch and by 'll_b' in the old image");
+    }
+    SUBCASE("another capture (the closure's layout)") {
+        EditedLambda e;
+        e.member = tp::kTDouble;
+        refused_without_evidence(e, "the closures have different layouts");
+    }
+    SUBCASE("another static") {
+        EditedLambda e;
+        e.name = "d";
+        refused_without_evidence(e, "their call operators have different statics");
+    }
+    SUBCASE("the enclosing function is not recorded (no local of the closure's type)") {
+        EditedLambda e;
+        e.local = false;
+        refused_without_evidence(e, "the function that holds the lambda is not known on both sides (0 procedure(s) of the patch and 1 of the old image");
     }
 }
 
@@ -2884,4 +3043,207 @@ TEST_CASE("hash-named lambdas (WP-46 round 2): an external lambda without static
     REQUIRE_MESSAGE(r.has_value(), err(r));
     CHECK(decision(*r, hashed_static(kHash1)).old_address.rva == 0x3020);
     CHECK(decision(*r, hashed_op(kEdited1)).decision == DecisionKind::PatchNewFunction);
+}
+
+TEST_CASE("hash-named lambdas (WP-46 review): a static call operator that identical-code folding shares with an external function stays in the set") {
+    // The linker folded kHash1's call operator with the external `inline_fn` (one address, the public of inline_fn there), and
+    // the patch defines inline_fn. 6b0a7de dropped kHash1's old record from the set because a public sits at its address: the
+    // sets then differed ({kHash3} against {kHash1, kHash3}) while the record stayed a candidate. Only the call operator's own
+    // public takes a record out of the set.
+    SynthWorld w;
+    Types old_types;
+    old_proc(w, kHash1 + "::operator()", 0x60, old_types.call_operator(kHash1, hashed_unique(kHash1)));
+    old_proc(w, kHash3 + "::operator()", 0x80, old_types.call_operator(kHash3, hashed_unique(kHash3)));
+    w.pub_func("?inline_fn@@YAXXZ", 0x60);
+    old_types.set.add_to(w.spec.tpi);
+    w.open();
+    Types t;
+    TypedObj o;
+    o.function(hashed_op(kHash1), t.call_operator(kHash1, hashed_unique(kHash1)), false);
+    o.function(hashed_op(kHash3), t.call_operator(kHash3, hashed_unique(kHash3)), false);
+    o.obj.function("?inline_fn@@YAXXZ", true);
+    Built b = o.build(t.set.debug_t());
+    auto r = plan_bind(w.input(b));
+    REQUIRE_MESSAGE(r.has_value(), err(r));
+    CHECK(decision(*r, hashed_op(kHash1)).source == BindSource::CompilandSignature);
+    CHECK(decision(*r, hashed_op(kHash1)).old_address.rva == 0x1060);
+    CHECK(decision(*r, hashed_op(kHash3)).old_address.rva == 0x1080);
+}
+
+// ---- WP-46 review (item 3): the layout a guard without a record is placed from ------------------------------------------
+namespace {
+const char* const kGf = "?gf@@YAHXZ";
+const char* const kGfStatic = "?s@?1??gf@@YAHXZ@4HA";
+const char* const kGfGuard = "?$TSS0@?1??gf@@YAHXZ@4HA";
+}  // namespace
+
+TEST_CASE("guards without a record (WP-46 review): one static paired by its function does not teach the layout of its section") {
+    // clang-cl. The old image: two overloads gf() and gf(int) with a static `s` each; gf()'s `s` at data 0x10, its guard (no
+    // record) at 0x14. The patch removed gf(int)'s static and inserted an unguarded file-scope static `x` between gf()'s `s`
+    // and its guard: `s` 0x10, `x` 0x14, the guard 0x18. `s` (one member, two records of the name) pairs by its function;
+    // 6b0a7de learned the section's layout from it alone and placed the guard at 0x3018, which is not the old guard.
+    SynthWorld w;
+    tp::Records& s = w.tu().symbols;
+    s.proc(0x1110, "gf", SynthWorld::kTextSec, 0x40, 0x20);
+    s.data(0x110C, "s", SynthWorld::kDataSec, 0x10, tp::kTInt);
+    s.end();
+    s.proc(0x1110, "gf", SynthWorld::kTextSec, 0x60, 0x20);
+    s.data(0x110C, "s", SynthWorld::kDataSec, 0x30, tp::kTInt);
+    s.end();
+    w.pub_func(kGf, 0x40);
+    w.pub_func("?gf@@YAHH@Z", 0x60);
+    w.open();
+    StaticsObj o;
+    const std::uint32_t bss = o.obj.section(".bss", kData, 0x40);
+    const std::uint32_t st = o.obj.symbol(kGfStatic, 0x10, static_cast<std::int32_t>(bss), false, false);
+    o.obj.symbol("?x@?A0x1@@3HA", 0x14, static_cast<std::int32_t>(bss), false, false);
+    o.obj.symbol(kGfGuard, 0x18, static_cast<std::int32_t>(bss), false, false);
+    o.proc(kGf, "gf");
+    o.record(st, "s");
+    o.end();
+    Built b = o.build(some_debug_t());
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+    REQUIRE(errors.size() == 1);
+    CHECK(errors[0].code == diag::kGuardMismatch);
+    CHECK(contains(errors[0].message, "no layout of its object section is known"));
+    CHECK(decision(partial, kGfGuard).decision != DecisionKind::BindOldData);
+}
+
+TEST_CASE("guards without a record (WP-46 review): a guard is never placed inside a variable or onto a guard the old image records") {
+    SUBCASE("inside another variable's extent (not at its start)") {
+        // Two statics paired by their functions agree on the layout (delta 0x3000); the guard of the first lands at 0x3022,
+        // inside the old 8-byte `wide` at 0x3020. 6b0a7de compared start addresses only and placed it there.
+        SynthWorld w;
+        Types old_types;
+        const std::uint32_t wide_type = old_types.set.add(tp::kLfArray, tp::lf_array(tp::kTInt, 8));
+        tp::Records& s = w.tu().symbols;
+        s.proc(0x1110, "ga", SynthWorld::kTextSec, 0x40, 0x10);
+        s.data(0x110C, "a", SynthWorld::kDataSec, 0x10, tp::kTInt);
+        s.end();
+        s.proc(0x1110, "gb", SynthWorld::kTextSec, 0x60, 0x10);
+        s.data(0x110C, "b", SynthWorld::kDataSec, 0x30, tp::kTInt);
+        s.end();
+        w.tu().symbols.data(0x110C, "`anonymous namespace'::wide2", SynthWorld::kDataSec, 0x20, wide_type);
+        w.pub_func("?ga@@YAHXZ", 0x40);
+        w.pub_func("?gb@@YAHXZ", 0x60);
+        old_types.set.add_to(w.spec.tpi);
+        w.open();
+        StaticsObj o;
+        const std::uint32_t bss = o.obj.section(".bss", kData, 0x40);
+        const std::uint32_t sa = o.obj.symbol("?a@?1??ga@@YAHXZ@4HA", 0x10, static_cast<std::int32_t>(bss), false, false);
+        o.obj.symbol("?$TSS0@?1??ga@@YAHXZ@4HA", 0x22, static_cast<std::int32_t>(bss), false, false);
+        const std::uint32_t sb = o.obj.symbol("?b@?1??gb@@YAHXZ@4HA", 0x30, static_cast<std::int32_t>(bss), false, false);
+        o.obj.symbol("?$TSS0@?1??gb@@YAHXZ@4HA", 0x34, static_cast<std::int32_t>(bss), false, false);
+        o.proc("?ga@@YAHXZ", "ga");
+        o.record(sa, "a");
+        o.end();
+        o.proc("?gb@@YAHXZ", "gb");
+        o.record(sb, "b");
+        o.end();
+        Built b = o.build(some_debug_t());
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+        REQUIRE(errors.size() == 1);
+        CHECK(errors[0].code == diag::kGuardMismatch);
+        CHECK_MESSAGE(contains(errors[0].message, "where the old image records '`anonymous namespace'::wide2' (0x3020..0x3028)"), errors[0].message);
+        CHECK(decision(partial, "?$TSS0@?1??ga@@YAHXZ@4HA").decision != DecisionKind::BindOldData);
+        // The guard of the second static is placed: 0x3034 overlaps nothing.
+        CHECK(decision(partial, "?$TSS0@?1??gb@@YAHXZ@4HA").old_address.rva == 0x3034);
+    }
+    SUBCASE("onto another function's recorded guard (guards were skipped by their name)") {
+        // The layout learned from `s_count` (pass A) puts the guard of gf's `s` at 0x3018, where the old image records the guard
+        // `$TSS0` of another function. 6b0a7de skipped records named `$...` and bound it there.
+        SynthWorld w;
+        w.data(w.tu(), "`anonymous namespace'::s_count", 0x08);
+        tp::Records& s = w.tu().symbols;
+        s.proc(0x1110, "gf", SynthWorld::kTextSec, 0x40, 0x20);
+        s.data(0x110C, "s", SynthWorld::kDataSec, 0x10, tp::kTInt);
+        s.end();
+        s.proc(0x1110, "other", SynthWorld::kTextSec, 0x60, 0x20);
+        s.data(0x110C, "$TSS0", SynthWorld::kDataSec, 0x18, tp::kTInt);
+        s.end();
+        w.pub_func(kGf, 0x40);
+        w.open();
+        StaticsObj o;
+        const std::uint32_t bss = o.obj.section(".bss", kData, 0x40);
+        o.obj.symbol("?s_count@?A0x1@@3HA", 0x08, static_cast<std::int32_t>(bss), false, false);
+        const std::uint32_t st = o.obj.symbol(kGfStatic, 0x10, static_cast<std::int32_t>(bss), false, false);
+        o.obj.symbol(kGfGuard, 0x18, static_cast<std::int32_t>(bss), false, false);
+        o.proc(kGf, "gf");
+        o.record(st, "s");
+        o.end();
+        Built b = o.build(some_debug_t());
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+        REQUIRE(errors.size() == 1);
+        CHECK(errors[0].code == diag::kGuardMismatch);
+        CHECK_MESSAGE(contains(errors[0].message, "where the old image records '$TSS0'"), errors[0].message);
+        CHECK(decision(partial, kGfGuard).decision != DecisionKind::BindOldData);
+    }
+}
+
+TEST_CASE("hash-named lambdas (WP-46 review): only the closure's own functions and statics are attributed to it") {
+    SUBCASE("a function that only mentions the closure (apply<lambda>) does not vouch for the lambda's static") {
+        // The patch's lambda kHash1 has no call operator of its own (inlined); its static pairs by the hash name. A static
+        // function `apply(<lambda>)` is hooked by its name. 6b0a7de counted apply as a function of the closure: the static was
+        // left to a "proof" by apply's code, which says nothing about the lambda.
+        SynthWorld w;
+        Types old_types;
+        old_proc(w, kHash1 + "::operator()", 0x60, old_types.call_operator(kHash1, hashed_unique(kHash1)), {{"sname", 0x20}});
+        w.proc(w.tu(), "apply", 0x90, 0x10, true);
+        old_types.set.add_to(w.spec.tpi);
+        w.open();
+        StaticsObj o;
+        const std::string sname = "?sname@?1???R" + kHash1 + "@@QEBAHXZ@4HA";
+        o.symbol(sname);
+        o.obj.function("?apply@@YAHV" + kHash1 + "@@@Z", false);
+        Built b = o.build(some_debug_t());
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+        REQUIRE(errors.size() == 1);
+        CHECK(errors[0].code == diag::kHashedLambdasUnproven);
+        CHECK(decision(partial, sname).decision != DecisionKind::BindOldData);
+    }
+    SUBCASE("a static whose type is the closure is not one of the closure's statics") {
+        // `static auto g_closure = []{...};` at file scope: its type names the closure. 6b0a7de took it for a static of the
+        // closure, found no hooked function of it and refused the reload (CML3630).
+        SynthWorld w = basic_world(false);
+        w.data(w.tu(), "`anonymous namespace'::g_closure", 0x10);
+        w.open();
+        SynthObj o;
+        const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x20));
+        const std::string closure_static = "?g_closure@?A0x1@@3V" + kHash1 + "@@A";
+        o.symbol(closure_static, 0x10, bss, false, false);
+        Built b = o.build();
+        auto r = plan_bind(w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        CHECK(decision(*r, closure_static).old_address.rva == 0x3010);
+        CHECK(r->hashed_lambdas.empty());
+    }
+}
+
+TEST_CASE("destructor of a local class (WP-46 review): a lone old record that is the deleting destructor is not paired by name in pass A") {
+    // The old compiland records only the scalar deleting destructor under the destructor's name (the destructor itself was
+    // inlined into it). 6b0a7de: one member, one candidate, paired by the name: the new `??1` hooked onto the old `??_G`.
+    SynthWorld w;
+    Types old_types;
+    const std::uint32_t type = old_types.fn(tp::kTVoid, {});
+    tp::Records& s = w.tu().symbols;
+    s.proc(0x110F, kLocalDtorDisplay, SynthWorld::kTextSec, 0x80, 0x10, 0, type);
+    s_local(s, "this", 0x0603);
+    s_local(s, "should_call_delete", tp::kTInt);
+    s.end();
+    old_types.set.add_to(w.spec.tpi);
+    w.open();
+    Built b = local_destructor_object();
+    auto r = plan_bind(w.input(b));
+    REQUIRE_MESSAGE(r.has_value(), err(r));
+    const SymbolDecision d = decision(*r, kLocalDtor);
+    CHECK(d.decision == DecisionKind::PatchNewFunction);
+    CHECK(r->hooks.empty());
 }

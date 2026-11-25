@@ -1053,6 +1053,7 @@ TEST_CASE("types: closure_classes lists every lambda class of the TPI once, with
         REQUIRE((*list)->size() == 3);
         CHECK((**list)[0].name == "o2_step::<lambda_0>");
         CHECK((**list)[0].unique == ".?AV<lambda_0>@?0??o2_step@@YAXXZ@");
+        CHECK((**list)[0].definition == 0x1002);  // the definition, not the forward reference 0x1000
         CHECK((**list)[1].unique == ".?AV<lambda_1>@?1??f@@YAXXZ@");
         CHECK((**list)[2].unique == ".?AU<lambda_0b7c44cbca6a0337bec371af34c9af94>@@");
         const auto again = idx->closure_classes();
@@ -1080,6 +1081,8 @@ TEST_CASE("types: closure_classes lists every lambda class of the TPI once, with
             const TypeStreamStats st = idx->type_stream_stats(true);
             CHECK(st.chunks > 4);
             CHECK(st.chunks_loaded == 0);
+            CHECK(st.bytes_loaded == 0);  // (review: the walk read them for itself only)
+            CHECK(st.bytes_copied == 0);
         }
         // The table claims a record boundary inside a record: that chunk is bad, so the walk is incomplete.
         Bytes lying = spec.tpi.index_offsets(4);
@@ -1099,4 +1102,114 @@ TEST_CASE("types: closure_classes lists every lambda class of the TPI once, with
         REQUIRE_FALSE(list.has_value());
         CHECK(list.error().code == dg::kBadTypeStream);
     }
+}
+
+// ---- WP-46 review: sizes, class layouts and the types of locals -------------------------------------------------------
+
+TEST_CASE("types: type_size knows simple types, pointers, arrays and classes, a forward reference through its definition") {
+    TempDir dir;
+    TypeSet types;
+    const std::uint32_t fwd = types.add(kLfClass, lf_udt("Rtti", ".?AVRtti@@", true));
+    const std::uint32_t ptr = types.add(kLfPointer, lf_pointer(kTInt));
+    const std::uint32_t arr = types.add(kLfArray, lf_array(kTInt, 16));
+    const std::uint32_t cnst = types.add(kLfModifier, lf_modifier(fwd, 1));
+    types.add(kLfClass, lf_udt("Rtti", ".?AVRtti@@", false, 24));
+    const std::uint32_t lonely = types.add(kLfClass, lf_udt("Lonely", ".?AVLonely@@", true));
+    Spec spec = spec_with({{0x110F, "f", 0x1000}});
+    types.add_to(spec.tpi);
+    const auto idx = open_spec(dir, spec);
+    CHECK(idx->type_size(kTInt) == std::optional<std::uint64_t>(4));
+    CHECK(idx->type_size(kTDouble) == std::optional<std::uint64_t>(8));
+    CHECK(idx->type_size(ptr) == std::optional<std::uint64_t>(8));
+    CHECK(idx->type_size(arr) == std::optional<std::uint64_t>(16));
+    CHECK(idx->type_size(fwd) == std::optional<std::uint64_t>(24));
+    CHECK(idx->type_size(cnst) == std::optional<std::uint64_t>(24));
+    CHECK_FALSE(idx->type_size(lonely).has_value());  // no definition: unknown, never 0
+}
+
+TEST_CASE("types: udt_layout renders a definition's size and data members; a forward reference is unreadable") {
+    TempDir dir;
+    TypeSet types;
+    Bytes fields;
+    put16(fields, 0x150D);  // LF_MEMBER int at 0
+    put16(fields, 3);
+    put32(fields, kTInt);
+    put16(fields, 0);
+    putstr(fields, "a");
+    while (fields.size() % 4 != 0) {
+        fields.push_back(static_cast<std::uint8_t>(0xF0 + (4 - fields.size() % 4)));
+    }
+    put16(fields, 0x150D);  // LF_MEMBER double at 8
+    put16(fields, 3);
+    put32(fields, kTDouble);
+    put16(fields, 8);
+    putstr(fields, "b");
+    while (fields.size() % 4 != 0) {
+        fields.push_back(static_cast<std::uint8_t>(0xF0 + (4 - fields.size() % 4)));
+    }
+    const std::uint32_t list = types.add(0x1203, fields);
+    Bytes def;
+    put16(def, 2);
+    put16(def, 0x200);
+    put32(def, list);
+    put32(def, 0);
+    put32(def, 0);
+    put16(def, 16);
+    putstr(def, "<lambda_0>");
+    putstr(def, ".?AV<lambda_0>@?0??f@@YAXXZ@");
+    const std::uint32_t defined = types.add(kLfClass, def);
+    const std::uint32_t fwd = types.add(kLfClass, lf_udt("<lambda_0>", ".?AV<lambda_0>@?0??f@@YAXXZ@", true));
+    Spec spec = spec_with({{0x110F, "f", 0x1000}});
+    types.add_to(spec.tpi);
+    const auto idx = open_spec(dir, spec);
+    const std::optional<std::string> layout = cml::pdb::udt_layout(idx->types(), defined);
+    REQUIRE(layout.has_value());
+    CHECK(*layout == "size=16;0:t74;8:t41");
+    std::string why;
+    CHECK_FALSE(cml::pdb::udt_layout(idx->types(), fwd, &why).has_value());
+    CHECK(why.find("forward reference") != std::string::npos);
+    CHECK(cml::pdb::class_unique_name_of(idx->types(), fwd) == ".?AV<lambda_0>@?0??f@@YAXXZ@");
+}
+
+TEST_CASE("types: compiland_local_types lists each procedure's own locals, not an inlined call's") {
+    TempDir dir;
+    Spec s;
+    s.sections = {{".text", 0x1000, 0x1000, 0x1000, 0x60000020}};
+    Module m;
+    m.name = "C:\\proj\\obj\\logic.cpp.obj";
+    m.symbols.objname(m.name);
+    const auto local = [&](std::uint32_t type, const std::string& name) {
+        Bytes b;
+        put32(b, type);
+        put16(b, 0);
+        putstr(b, name);
+        m.symbols.add(0x113E, b);
+    };
+    m.symbols.proc(0x1110, "f", 1, 0x100, 0x20, 0, 0);
+    local(0x1234, "lambda");
+    m.symbols.block();
+    local(0x1235, "inner");
+    m.symbols.end();
+    m.symbols.add(0x114D, Bytes(12, 0));  // S_INLINESITE
+    local(0x9999, "inlinee_local");
+    m.symbols.add(0x114E, Bytes());       // S_INLINESITE_END
+    m.symbols.end();
+    m.symbols.proc(0x1110, "g", 1, 0x200, 0x20, 0, 0);
+    Bytes regrel;
+    put32(regrel, 0x20);
+    put32(regrel, 0x1236);
+    put16(regrel, 335);
+    putstr(regrel, "x");
+    m.symbols.add(0x1111, regrel);  // S_REGREL32 (cl at /Od)
+    m.symbols.end();
+    s.modules.push_back(std::move(m));
+    const auto idx = open_spec(dir, s);
+    const auto uses = idx->compiland_local_types(0);
+    REQUIRE_MESSAGE(uses.has_value(), (uses.has_value() ? std::string() : uses.error().format()));
+    REQUIRE(uses->size() == 3);
+    CHECK((*uses)[0].proc_rva == 0x1100);
+    CHECK((*uses)[0].type_index == 0x1234);
+    CHECK((*uses)[1].type_index == 0x1235);
+    CHECK((*uses)[2].proc_rva == 0x1200);
+    CHECK((*uses)[2].type_index == 0x1236);
 }
