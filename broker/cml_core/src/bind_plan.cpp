@@ -1449,8 +1449,18 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
         // cl at /O2 /Ob2 records the static of an inlined lambda twice: in the lambda's own operator() (which it also
         // emits) and in the calling procedure, at the same address (CI, cl 19.44: "6 there, 3 in the patch"). A record in
         // the caller at the address of a record in a call operator is that same variable, not an inlined lambda's.
+        // Only an equal RVA makes them one variable; a record in the caller at any other address stays an inlined lambda's
+        // (counted, and the count decides as before).
         for (std::size_t o = 0; inlined && o < free_cands.size(); ++o) {
-            inlined = !(o != c && free_cands[o]->rva == free_cands[c]->rva && (by_name[o] || by_closure_name[o] || !ids[o].tail.empty()));
+            if (o != c && free_cands[o]->rva == free_cands[c]->rva && (by_name[o] || by_closure_name[o] || !ids[o].tail.empty())) {
+                inlined = false;
+                CML_LOG(Info, "WP40-INLINED function='%s' statics=%s same-variable caller_rva=%s operator_rva=%s operator='%s'", enclosing.c_str(), base.c_str(),
+                        hex(free_cands[c]->rva).c_str(), hex(free_cands[o]->rva).c_str(), std::string(free_cands[o]->parent_name).c_str());
+            }
+        }
+        if (inlined) {
+            CML_LOG(Info, "WP40-INLINED function='%s' statics=%s inlined-record caller_rva=%s (no record of a call operator at that address)", enclosing.c_str(), base.c_str(),
+                    hex(free_cands[c]->rva).c_str());
         }
         old_inlined += inlined ? 1u : 0u;
         old_of_function += (inlined || by_name[c] || by_closure_name[c]) ? 1u : 0u;

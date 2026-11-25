@@ -2199,3 +2199,29 @@ TEST_CASE("inlined lambdas under cl /O2 /Ob2: a static recorded both in its oper
     CHECK(decision(*r, static_in_lambda("sname", 2)).old_address.rva == 0x3030);
     CHECK(decision(*r, static_in_lambda("$TSS0", 2)).old_address.rva == 0x3038);
 }
+
+TEST_CASE("inlined lambdas under cl /O2 /Ob2: a caller's record at ANOTHER address than the operator's is not the same variable") {
+    // Only an equal RVA makes the caller's record the operator's static; otherwise it counts as an inlined lambda's static,
+    // the counts disagree (4 old, 2 in the patch) and the statics are refused, as before.
+    LambdaWorld lw;
+    lw.lambda(1, 0x60, 0x20);
+    lw.lambda(2, 0x70, 0x30);
+    old_proc(lw.w, "f", 0x40, lw.types.fn(tp::kTVoid, {}), {{"sname", 0x40}, {"$TSS0", 0x48}, {"sname", 0x50}, {"$TSS0", 0x58}});
+    lw.open();
+    SynthObj o;
+    for (int n = 1; n <= 2; ++n) {
+        for (const char* name : {"sname", "$TSS0"}) {
+            const std::uint32_t sec = o.section(".bss", kDataComdat, 8, coff::ComdatSelection::Any);
+            o.symbol(static_in_lambda(name, n), 0, static_cast<std::int32_t>(sec), false, false);
+        }
+    }
+    Built b = o.build();
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    REQUIRE_FALSE(plan_bind(lw.w.input(b), &errors, &partial).has_value());
+    REQUIRE_FALSE(errors.empty());
+    for (const cml::Diag& e : errors) {
+        CHECK(e.id() == "CML3207");
+        CHECK(contains(e.message, "are not the same as in the old image (4 there, some of them inlined, 2 in the patch)"));
+    }
+}
