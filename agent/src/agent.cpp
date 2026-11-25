@@ -757,6 +757,11 @@ bool Agent::poll_modules(ipc::PipeConnection& connection) {
     std::vector<ipc::ModuleEntry> current = to_entries(*modules);
     const ModuleDelta delta = diff_modules(known_modules_, current);
     for (const ipc::ModuleEntry& module : delta.unloaded) {
+        // WP-45: the hooks of an unloaded image went with it. Forget their records BEFORE the broker hears of the unload, so a re-apply to
+        // the image loaded again (often at the same base) is planned as a first install, never as a re-point of a jump that is gone.
+        const std::size_t dropped = hook::process_installer().forget_range(module.base, module.size);
+        CML_LOG(Debug, "module unloaded: base=0x%llx size=0x%llx hook_records_dropped=%llu", static_cast<unsigned long long>(module.base),
+                static_cast<unsigned long long>(module.size), static_cast<unsigned long long>(dropped));
         if (!send_message(connection, ipc::ModuleUnloaded{module})) {
             return false;
         }

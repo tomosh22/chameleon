@@ -92,6 +92,11 @@ public:
     // content it had in the original binary, so the next sweep finds the edit again. Files this baseline does not track
     // are ignored. Returns how many files will count as changed if their content differs from the original.
     std::size_t restore(const BaselineSnapshot& snapshot);
+    // WP-45. Applied to the freshly taken baseline of a module that was disabled and enabled again while its image stayed loaded:
+    // the image still runs the patches, so the stamps and the originals of the earlier state are taken over as they are (an edit
+    // that was saved but not reloaded stays pending; nothing that was patched counts as changed). Files this baseline does not
+    // track are ignored. Returns how many originals were taken over.
+    std::size_t adopt(const BaselineSnapshot& snapshot);
 
     std::size_t size() const;
     bool tracks(const std::string& path) const;

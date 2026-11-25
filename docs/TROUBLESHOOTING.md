@@ -2319,6 +2319,20 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 
 ## CML5600 to CML5699
 
+### CML5600
+
+- **Cause:** (warning) a module instance enabled after the session accepted edits for its sources (a DLL freed and loaded again, or a module a hot-restarted process enabled late) could not get those edits re-applied: the reload that re-applies them failed. The instance runs its original code.  
+- **Message:** `module '<...>' (process <...>) runs its original code: re-applying the session's edits of <files> failed: <the reload's diagnostic>`  
+- **What to do:** Fix the error and run `reload`; the edits stay pending until a reload applies them.  
+- **Raised by:** `broker/cml_core/include/cml/core/reenable_diag_ids.h`
+
+### CML5601
+
+- **Cause:** (warning) a module instance enabled after the session accepted edits for its sources could not get those edits re-applied because its PDB index failed. The instance runs its original code.  
+- **Message:** `module '<...>' (process <...>) runs its original code: the session's edits of <files> were not re-applied because its PDB index failed: <the index's diagnostic>`  
+- **What to do:** Fix what the index diagnostic says, then run `reload` (or load the module again).  
+- **Raised by:** `broker/cml_core/include/cml/core/reenable_diag_ids.h`
+
 ### CML5650
 
 - **Cause:** a hook record points outside its image: skipped.  
@@ -2600,8 +2614,8 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 ### CML5810
 
 - **Cause:** (warning) the session's edits could not be re-applied to the new process.  
-- **Message:** `the PDB index of '<...>' in the new process is not ready, so its edits cannot be re-applied`  
-- **What to do:** Run 'reload' once its index is ready.  
+- **Message:** `the PDB index of '<...>' in the new process is not ready, so its edits are re-applied when it is (<n> file(s))` (WP-45: the broker re-applies them once the index is ready; CML5600 or CML5601 follows if that fails), or `... is not ready, so its edits cannot be re-applied` when the module had no edits to carry; `... the session's edits of <files> were NOT carried (the agent of the new process changed)` when another agent registered for the new process's pid during the restart and is not provably the same process (also for a module the old process had freed: `the session's edits of <files> (module '<...>') were NOT carried to the new process`)  
+- **What to do:** Nothing to do when the message says the edits are re-applied; otherwise run 'reload' once its index is ready.  
   Other variants of the advice: Fix the error and run 'reload'.  
 - **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
 
