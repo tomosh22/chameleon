@@ -160,10 +160,13 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
   `-DCML_FAULT_INJECTION=OFF`; a fuzz.yml job proves that configuration builds.
   - Covered: the reload pipeline's 11 stages, the hot-restart's 7 and the revert's 3 (WP-43). An armed restart or revert stage
     applies to the next restart or revert only, whether it fired or not; unused stages are listed as `injection_disarmed`.
-  - Not covered: the crash handler and the compile-on-save watcher (WP-44).
-  - With two control clients at once, an arming made while a restart or revert is ending can be disarmed by it, or carried over to
-    a later one; a reused pid can report a phantom `injection_disarmed` (R-51, fixed by WP-44).
-  - Arming is not persistent: a broker restart forgets it.
+  - Covered too (WP-44): the crash handler (exception report, hold, the continue/leave/re-execute actions) and the compile-on-save
+    watcher (debounce, change detection, the reload it starts). The watch group, restart, revert and exception-action stages refuse
+    to arm while their operation runs (CML5978).
+  - Arming persists across a broker restart only with `inject-failure {persist:true}` (state next to `--log`; CML5984 without one).
+  - Test-harness limitations (WP-44): records of a process whose exit the broker did not see stay until a global
+    `{"stage":"none"}` (or `none` for that pid once its exit is confirmed); broker-side armings made for a pid carry over to a new
+    process that reuses it; `none` during a running cleanup operation can clear its records before the operation reports them.
   - The reservation stage fires only on a module's first patch; arming it later is refused (CML5970).
   - If an injected post-patch-hooks rollback is incomplete (CML4656), the patch image stays mapped with some hooks possibly live;
     restart the application. A later revert of that batch may report hooks it cannot find.
