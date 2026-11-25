@@ -45,4 +45,10 @@ inline constexpr std::uint32_t kSectionRelative = 3212;    // reference through 
 // WP-37 (ADR-0042: CML3570..CML3599, planner).
 inline constexpr std::uint32_t kStaticsMatchedByOrder = 3570;  // same-named statics of one function were paired by their place in it (warning)
 
+// WP-40 (ADR-0043: CML3600..CML3629, planner).
+inline constexpr std::uint32_t kGuardMismatch = 3600;  // a guard variable cannot be bound consistently with the statics of its scope (error)
+inline constexpr std::uint32_t kSplitAggregate = 3601; // a piece `name.N` of a static the compiler split, whose old piece cannot be found (error)
+inline constexpr std::uint32_t kLambdasMatchedByNumber = 3602;  // lambdas no type or code tells apart were paired by their numbers (warning)
+inline constexpr std::uint32_t kLambdasUnpairable = 3603;  // a changed lambda whose number's old lambda another new lambda is (error)
+
 }  // namespace cml::core::bind::diag

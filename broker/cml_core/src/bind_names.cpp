@@ -504,6 +504,18 @@ bool is_compiler_generated_data_name(std::string_view n) {
     return false;
 }
 
+bool is_split_piece_name(std::string_view n) {
+    const std::size_t dot = n.rfind('.');
+    if (dot == std::string_view::npos || dot == 0 || dot + 1 >= n.size() || !all_digits(n.substr(dot + 1))) {
+        return false;
+    }
+    const std::string_view head = n.substr(0, dot);
+    if (head[0] == '?') {
+        return head.size() > 1 && head.find('.') == std::string_view::npos;
+    }
+    return !is_compiler_generated_data_name(n) && !c_static_name(n).base.empty();
+}
+
 std::string_view call_operator_scope(std::string_view d) {
     // '?' <identifier> '@' '?' <number> '?' <nested decorated name>, the nested name being "??R<class>...".
     if (d.size() < 2 || d[0] != '?') {

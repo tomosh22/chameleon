@@ -1,0 +1,9 @@
+--- a/lambdas.cpp
++++ b/lambdas.cpp
+@@ -48,5 +48,5 @@
+ 
+ int o2_mark()
+ {
+-    return 1;
++    return 2;
+ }

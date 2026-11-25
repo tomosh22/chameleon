@@ -220,6 +220,31 @@ struct PlanSummary {
     std::size_t fixups = 0;
 };
 
+// WP-40 (R-48 item 5, ADR-0043 rule (d)): lambdas of one enclosing function whose call operators the type records cannot
+// tell apart (the same signature but for the closure's number). Their statics were paired by that number; the pipeline
+// compares the code of the call operators with the old ones (hook_narrowing.h: pair_lambdas_by_code) and, where the code
+// says that lambdas changed places, plans again with PlanInput::closure_pairing.
+struct LambdaEntry {
+    std::string closure;        // the patch's closure, decorated, without the unit's hash: "<lambda_1>@?1??f@@YAXXZ@"
+    std::string old_closure;    // the old closure its statics were paired with
+    std::string call_operator;  // the patch's operator() ("??R<lambda_1>@?1??f@@YAXXZ@QEBA...")
+    std::vector<std::string> statics;  // the patch's statics of the lambda paired through it (guards included)
+};
+struct LambdaSet {
+    std::string function;  // display name of the enclosing function
+    std::vector<LambdaEntry> lambdas;
+};
+
+// WP-40 (second high review, ADR-0043 ruling): a bitmask guard `$S<n>` (no thread-safe statics) the plan binds to the
+// old bitmask. Its bits go to the function's dynamically initialised statics in the order they are reached, so the old
+// bitmask is right only when those statics are the same set in the same order as in the old image. The records cannot
+// show that (a static made constant-initialised keeps its record); the code of the function can: the pipeline proves
+// that `function` is unchanged (hook_narrowing.h: prove_bitmask_guards), or refuses the reload (CML3600).
+struct BitmaskGuard {
+    std::string guard;     // decorated name of the bitmask
+    std::string function;  // decorated name of the function whose statics it guards ("" when it cannot be read)
+};
+
 struct BindPlan {
     std::string object_name;
     std::string module_name;
@@ -247,6 +272,8 @@ struct BindPlan {
     // verified == sites; a failed planning reports the counts through `partial`.
     std::size_t imgrel_sites = 0;
     std::size_t imgrel_verified = 0;
+    std::vector<LambdaSet> lambda_sets;  // WP-40, see LambdaSet
+    std::vector<BitmaskGuard> bitmask_guards;  // WP-40, see BitmaskGuard
 
     PlanSummary summary() const;
     // `BINDPLAN <label> hooks=N bind_old_data=N thunks=N new=N fixups=N` (the CI evidence line).
@@ -274,6 +301,9 @@ struct PlanInput {
     std::int64_t compiland_index = -1;
     const SymbolRegistry* registry = nullptr;    // optional
     const ProcessModules* modules = nullptr;     // optional
+    // WP-40 (rule (d)): closure of the patch -> old closure, where the code of the call operators showed that lambdas
+    // changed places (pair_lambdas_by_code). Their statics, guards and call operators are paired across the numbers.
+    std::map<std::string, std::string> closure_pairing;
 };
 
 // Builds the plan. On failure returns the first error; with `all_errors` every error is collected

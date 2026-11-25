@@ -651,6 +651,16 @@ private:
         return StepOutcome::pass(detail + " in " + built_.source_dir.string());
     }
 
+    // WP-40: is `id` one of the '|'-separated ids of `list`?
+    static bool one_of(const std::string& id, const std::string& list) {
+        for (std::size_t at = 0; at < list.size(); at += 8) {
+            if (list.compare(at, 7, id) == 0 && id.size() == 7) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     StepOutcome reload(const Step& step) {
         const std::uint32_t limit_ms = std::min<std::uint32_t>(static_cast<std::uint32_t>(step.within_s) * 1000u, remaining_ms());
         if (limit_ms == 0) {
@@ -673,7 +683,7 @@ private:
                 return StepOutcome::fail(cml::ids::kReloadFailed, "the reload succeeded, expected the refusal " + step.expect_error);
             }
             const ipc::ControlDiag& d = *response->diag;
-            if (d.id != step.expect_error) {
+            if (!one_of(d.id, step.expect_error)) {
                 return StepOutcome::fail(cml::ids::kReloadFailed, "the reload was refused with " + d.id + ": " + d.message + ", expected " + step.expect_error);
             }
             if (step.expect_line != 0) {
@@ -686,7 +696,18 @@ private:
         }
         if (!response->ok) {
             const ipc::ControlDiag& d = *response->diag;
+            if (!step.allow_error.empty() && one_of(d.id, step.allow_error)) {
+                // WP-40: either outcome is right here; say which one it was (the evidence line of the scenario).
+                std::printf("RELOAD-OUTCOME refused id=%s fixture=%s compiler=%s config=%s\n", d.id.c_str(), scenario_.fixture.c_str(), report_.compiler.c_str(),
+                            options_.config.c_str());
+                std::fflush(stdout);
+                return StepOutcome::pass("reload refused, which this step allows: " + d.id + ": " + d.message);
+            }
             return StepOutcome::fail(cml::ids::kReloadFailed, "reload failed: " + d.id + ": " + d.message + " What to do: " + d.action);
+        }
+        if (!step.allow_error.empty()) {
+            std::printf("RELOAD-OUTCOME applied fixture=%s compiler=%s config=%s\n", scenario_.fixture.c_str(), report_.compiler.c_str(), options_.config.c_str());
+            std::fflush(stdout);
         }
         // The per-stage timing line is part of the evidence (the broker logs the same line): print it.
         const std::string timing = response->result.get_string("timing");

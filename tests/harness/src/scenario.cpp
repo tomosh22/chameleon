@@ -80,6 +80,9 @@ std::string Step::describe() const {
             if (!expect_error.empty()) {
                 out += " expecting the refusal " + expect_error;
             }
+            if (!allow_error.empty()) {
+                out += " allowing the refusal " + allow_error;
+            }
             break;
         case StepKind::SignalFixture:
             break;
@@ -381,7 +384,7 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
     }
     if (*kind == "reload") {
         step.kind = StepKind::Reload;
-        cml::Result<void> keys = only_keys(table, {"kind", "within_s", "expect_result_key", "expect_result_value", "expect_error", "expect_file", "expect_line", "expect_column"}, "a reload step");
+        cml::Result<void> keys = only_keys(table, {"kind", "within_s", "expect_result_key", "expect_result_value", "expect_error", "allow_error", "expect_file", "expect_line", "expect_column"}, "a reload step");
         if (!keys) return keys.error();
         cml::Result<int> within = int_in_range(table, "within_s", 60, 1, 3600);
         if (!within) return within.error();
@@ -402,12 +405,29 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
             step.result_value = rv->integer;
             step.has_result_value = true;
         }
+        // One id ("CML5550") or, WP-40, alternatives separated by '|' ("CML3207|CML3600").
+        const auto ids_shape = [](const toml::Value& v) {
+            if (v.kind != toml::Value::Kind::String || v.text.empty() || (v.text.size() + 1) % 8 != 0) {
+                return false;
+            }
+            for (std::size_t at = 0; at < v.text.size(); at += 8) {
+                if (v.text.compare(at, 3, "CML") != 0 || !std::all_of(v.text.begin() + static_cast<std::ptrdiff_t>(at) + 3, v.text.begin() + static_cast<std::ptrdiff_t>(at) + 7,
+                                                                      [](char c) { return c >= '0' && c <= '9'; }) ||
+                    (at + 7 < v.text.size() && v.text[at + 7] != '|')) {
+                    return false;
+                }
+            }
+            return true;
+        };
         if (const toml::Value* ee = table.find("expect_error")) {
-            const bool shape = ee->kind == toml::Value::Kind::String && ee->text.size() == 7 && ee->text.compare(0, 3, "CML") == 0 &&
-                               std::all_of(ee->text.begin() + 3, ee->text.end(), [](char c) { return c >= '0' && c <= '9'; });
-            if (!shape) return invalid(ee->line, "'expect_error' must look like CML5550");
+            if (!ids_shape(*ee)) return invalid(ee->line, "'expect_error' must look like CML5550 (or CML3207|CML3600)");
             if (rk != nullptr) return invalid(ee->line, "'expect_error' and 'expect_result_key' exclude each other");
             step.expect_error = ee->text;
+        }
+        if (const toml::Value* ae = table.find("allow_error")) {
+            if (!ids_shape(*ae)) return invalid(ae->line, "'allow_error' must look like CML3207 (or CML3207|CML3601)");
+            if (rk != nullptr || !step.expect_error.empty()) return invalid(ae->line, "'allow_error' excludes 'expect_error' and 'expect_result_key'");
+            step.allow_error = ae->text;
         }
         cml::Result<void> where = parse_location(table, step);
         if (!where) return where.error();

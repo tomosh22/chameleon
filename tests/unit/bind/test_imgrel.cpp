@@ -280,11 +280,72 @@ TEST_CASE("imgrel prover: a relocation that straddles an instruction boundary st
     }
 }
 
+TEST_CASE("imgrel prover (WP-40, R-50): every relocation just before a function start is looked at, one of unknown width reaches in") {
+    // main looked only at the LAST relocation before the start, and one of unknown width (0) counted as reaching nowhere.
+    {
+        // A relocation that reaches into the function, followed by one of unknown width that starts before the function.
+        Code c;
+        c.emit({0, 0, 0, 0, 0, 0});
+        c.fields.push_back(RelocField{3, 4});  // 3..7: reaches 1 byte into the function at 6
+        c.fields.push_back(RelocField{5, 1});  // the last one before the start, wholly before it
+        const std::uint32_t f = c.emit({0x90, 0x90});
+        const std::uint32_t site = c.emit_reloc({0x8B, 0x84, 0x87, 0, 0, 0, 0}, 3);
+        c.starts = {f};
+        const SiteCheck k = c.check(site);
+        CHECK(k.verdict == SiteVerdict::RanIntoData);
+        CHECK(contains(k.reason, "the relocation at +0x3 reaches into the function"));
+    }
+    {
+        // A relocation of unknown width right before the start.
+        Code c;
+        c.emit({0, 0, 0, 0});
+        c.fields.push_back(RelocField{3, 0});
+        const std::uint32_t f = c.emit({0x90});
+        const std::uint32_t site = c.emit_reloc({0x8B, 0x84, 0x87, 0, 0, 0, 0}, 3);
+        c.starts = {f};
+        const SiteCheck k = c.check(site);
+        CHECK(k.verdict == SiteVerdict::RanIntoData);
+        CHECK(contains(k.reason, "of a type whose width is not known"));
+    }
+    {
+        // Relocations 8 bytes or more before the start (and of known width, ending before it) do not matter.
+        Code c;
+        c.emit({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0});
+        c.fields.push_back(RelocField{0, 0});
+        c.fields.push_back(RelocField{4, 4});
+        const std::uint32_t f = c.emit({0x90});
+        const std::uint32_t site = c.emit_reloc({0x8B, 0x84, 0x87, 0, 0, 0, 0}, 3);
+        c.starts = {f};
+        CHECK(c.check(site).proved());
+    }
+}
+
+TEST_CASE("imgrel layout (WP-40, R-50): a VEX or EVEX prefix after any REX or after 66/F2/F3/F0 is not located") {
+    const auto layout = [](std::initializer_list<int> insn, int disp_offset, int disp_size) {
+        std::vector<std::uint8_t> bytes;
+        for (const int v : insn) {
+            bytes.push_back(static_cast<std::uint8_t>(v));
+        }
+        return parse_layout(bytes.data(), bytes.size(), static_cast<std::uint8_t>(disp_offset), static_cast<std::uint8_t>(disp_size));
+    };
+    // vmovd xmm0,[rdi+rax*4+d32] is C5 F9 6E 84 87 d32; ModRM at 3, displacement at 5.
+    CHECK(layout({0xC5, 0xF9, 0x6E, 0x84, 0x87, 0, 0, 0, 0}, 5, 4).known);
+    CHECK(layout({0x2E, 0xC5, 0xF9, 0x6E, 0x84, 0x87, 0, 0, 0, 0}, 6, 4).known);  // a segment prefix is allowed
+    // main: a REX followed by a legacy prefix was forgotten ("rex" was reset), so these were located.
+    CHECK_FALSE(layout({0x48, 0x2E, 0xC5, 0xF9, 0x6E, 0x84, 0x87, 0, 0, 0, 0}, 7, 4).known);
+    CHECK_FALSE(layout({0x48, 0xC5, 0xF9, 0x6E, 0x84, 0x87, 0, 0, 0, 0}, 6, 4).known);
+    CHECK_FALSE(layout({0x66, 0xC5, 0xF9, 0x6E, 0x84, 0x87, 0, 0, 0, 0}, 6, 4).known);
+    CHECK_FALSE(layout({0xF3, 0xC5, 0xF9, 0x6E, 0x84, 0x87, 0, 0, 0, 0}, 6, 4).known);
+    CHECK_FALSE(layout({0xF0, 0x62, 0xF1, 0x7D, 0x48, 0x6F, 0x84, 0x87, 0, 0, 0, 0}, 8, 4).known);
+}
+
 // ---- review of PR #67: what the first version accepted and must not ---------------------------------------------
 
 TEST_CASE("imgrel prover: lea with a 32-bit or 16-bit destination truncates the address and is refused; lea r64 is proved") {
-    // lea eax,[rdi+rcx*4+sym@IMGREL] zero-extends a truncated sum: with the patch above the module the displacement is
-    // negative and `add rax, rdi` afterwards lands 4 GiB away from the old data.
+    // `lea r32,[index+sym@IMGREL]` computes an RVA in 32 bits, which is valid in the original code; retargeting the
+    // displacement would turn it into low32(target - patch_base + index), which is not the old RVA. (WP-40, R-50: the
+    // wording; the rule is unchanged. A 32-bit lea of the full address through a register that holds __ImageBase
+    // truncates in the original code already.)
     const auto verdict_of = [](std::initializer_list<int> insn, std::uint32_t field_at) {
         Code c;
         lea_image_base(c);

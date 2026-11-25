@@ -8,6 +8,9 @@
 #include <set>
 #include <unordered_map>
 
+#include "cml/core/bind_diag_ids.h"
+#include "cml/core/bind_names.h"
+#include "cml/pdb/type_records.h"
 #include "cml/util/format.h"
 #include "cml/util/log.h"
 
@@ -711,6 +714,258 @@ std::vector<std::string> bound_data_changes(const NarrowInput& input, std::size_
         }
     }
     return changed;
+}
+
+
+// ---- WP-40 (R-48 item 5, ADR-0043 rule (d)): lambdas told apart by the code of their call operators ----------------------
+
+namespace {
+
+enum class Equivalence : std::uint8_t { Yes, No, Unknown };
+
+// Replaces the closure `from` of a decorated name (after its "??R") by `to`.
+std::string with_closure(const std::string& name, const std::string& from, const std::string& to) {
+    const std::size_t at = name.find("??R" + from);
+    if (at == std::string::npos) {
+        return {};
+    }
+    return name.substr(0, at + 3) + to + name.substr(at + 3 + from.size());
+}
+
+}  // namespace
+
+LambdaPairing pair_lambdas_by_code(const NarrowInput& input) {
+    LambdaPairing out;
+    if (input.plan == nullptr || input.object == nullptr) {
+        return out;
+    }
+    const bind::BindPlan& plan = *input.plan;
+    for (const bind::LambdaSet& set : plan.lambda_sets) {
+        const std::size_t n = set.lambdas.size();
+        // The hooks of the call operators as planned (paired by number): the old entry of lambda j is hooks[j].
+        std::vector<const bind::HookEntry*> hook(n, nullptr);
+        for (std::size_t i = 0; i < n; ++i) {
+            for (const bind::HookEntry& h : plan.hooks) {
+                if (h.new_symbol == set.lambdas[i].call_operator) {
+                    hook[i] = &h;
+                }
+            }
+        }
+        std::vector<std::vector<Equivalence>> eq(n, std::vector<Equivalence>(n, Equivalence::Unknown));
+        std::string unknown_why;
+        bind::BindPlan hypo = plan;  // a copy whose decisions are changed per hypothesis
+        // The closures are named without the translation unit's discriminator ("?A0x<hash>@" of an anonymous namespace):
+        // the decorated names are compared in that spelling (WP-40 review).
+        std::map<std::string, const bind::SymbolDecision*> by_plain_name;
+        for (const bind::SymbolDecision& d : plan.decisions) {
+            if (d.defined && d.type == bind::SymbolType::Data) {
+                by_plain_name.emplace(pdb::without_tu_discriminator(d.name), &d);
+            }
+        }
+        for (std::size_t i = 0; i < n; ++i) {
+            for (std::size_t j = 0; j < n; ++j) {
+                const bind::LambdaEntry& a = set.lambdas[i];
+                const bind::LambdaEntry& b = set.lambdas[j];
+                if (hook[j] == nullptr) {
+                    unknown_why = "the call operator '" + b.call_operator + "' is not hooked to an old one";
+                    continue;
+                }
+                // Hypothesis: the patch's lambda i is the old lambda j. Its statics then live where the plan put lambda j's
+                // (which it paired with old lambda j by number), and its call operator is compared with old lambda j's code.
+                hypo.decisions = plan.decisions;
+                bool same_statics = true;
+                // Every datum declared in lambda i (its statics and their guards, also the guards the planner placed by the
+                // section layout, which the closure step did not pair).
+                std::vector<std::pair<std::string, std::string>> statics_of_a;  // (decorated, plain)
+                for (const auto& [plain, d] : by_plain_name) {
+                    if (plain.find("??R" + a.closure) != std::string::npos) {
+                        statics_of_a.emplace_back(d->name, plain);
+                    }
+                }
+                for (const auto& [st, plain] : statics_of_a) {
+                    const std::string twin = i == j ? plain : with_closure(plain, a.closure, b.closure);
+                    const auto found = by_plain_name.find(twin);
+                    const bind::SymbolDecision* dj = found == by_plain_name.end() ? nullptr : found->second;
+                    if (dj == nullptr) {
+                        same_statics = false;
+                        break;
+                    }
+                    for (bind::SymbolDecision& d : hypo.decisions) {
+                        if (d.name == st) {
+                            d.decision = dj->decision;
+                            d.source = dj->source;
+                            d.old_address = dj->old_address;
+                        }
+                    }
+                }
+                if (!same_statics) {
+                    eq[i][j] = Equivalence::No;
+                    CML_LOG(Trace, "lambdas of '%s': %s vs old %s: not the same statics", set.function.c_str(), a.closure.c_str(), b.old_closure.c_str());
+                    continue;
+                }
+                bind::HookEntry h = *hook[j];
+                h.new_symbol = a.call_operator;
+                hypo.hooks.assign(1, h);
+                NarrowInput ni = input;
+                ni.plan = &hypo;
+                ni.enabled = true;
+                const Narrower narrower(ni);
+                const NarrowDecision d = narrower.judge(h);
+                switch (d.reason) {
+                    case NarrowReason::Unchanged: eq[i][j] = Equivalence::Yes; break;
+                    case NarrowReason::BytesDiffer:
+                    case NarrowReason::SizeDiffers:
+                    case NarrowReason::TargetChanged:
+                    case NarrowReason::TargetNew: eq[i][j] = Equivalence::No; break;
+                    default:
+                        eq[i][j] = Equivalence::Unknown;
+                        unknown_why = "the code of '" + bind::display_name(a.call_operator) + "' cannot be compared with the old lambda's: " + to_string(d.reason) +
+                                      (d.detail.empty() ? std::string() : " - " + d.detail);
+                        break;
+                }
+                CML_LOG(Trace, "lambdas of '%s': %s vs old %s: %s%s%s", set.function.c_str(), a.closure.c_str(), b.old_closure.c_str(), to_string(d.reason),
+                        d.detail.empty() ? "" : " - ", d.detail.c_str());
+            }
+        }
+        // Rule 1: one-to-one equivalence. Rule 2: one changed lambda left on each side. Rule 3: anything else by number.
+        std::vector<std::size_t> pair(n, n);
+        std::vector<bool> old_taken(n, false);
+        bool unknown = !unknown_why.empty();
+        for (std::size_t i = 0; i < n; ++i) {
+            for (std::size_t j = 0; j < n; ++j) {
+                unknown = unknown || eq[i][j] == Equivalence::Unknown;
+            }
+        }
+        if (!unknown) {
+            for (std::size_t i = 0; i < n; ++i) {
+                std::size_t row = 0;
+                std::size_t hit = n;
+                for (std::size_t j = 0; j < n; ++j) {
+                    if (eq[i][j] == Equivalence::Yes) {
+                        ++row;
+                        hit = j;
+                    }
+                }
+                std::size_t column = 0;
+                for (std::size_t k = 0; hit != n && k < n; ++k) {
+                    column += eq[k][hit] == Equivalence::Yes ? 1u : 0u;
+                }
+                if (row == 1 && column == 1) {
+                    pair[i] = hit;
+                    old_taken[hit] = true;
+                }
+            }
+        }
+        std::vector<std::size_t> new_left;
+        std::vector<std::size_t> old_left;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (pair[i] == n) {
+                new_left.push_back(i);
+            }
+            if (!old_taken[i]) {
+                old_left.push_back(i);
+            }
+        }
+        bool by_number = false;
+        std::vector<std::size_t> by_number_lambdas;  // the new lambdas paired by their number (rule 3)
+        std::vector<std::size_t> taken_number;       // the new lambdas whose number's old lambda another one took (refused)
+        if (unknown) {
+            by_number = true;
+            for (std::size_t i = 0; i < n; ++i) {
+                pair[i] = i;
+                by_number_lambdas.push_back(i);
+            }
+        } else if (new_left.size() == 1 && old_left.size() == 1) {
+            pair[new_left[0]] = old_left[0];  // rule 2: the one lambda whose body changed
+        } else if (!new_left.empty()) {
+            // Rule 3 (the orchestrator's ruling): what is left pairs by its NUMBER. Where the old lambda of that number was
+            // already taken by a code-equivalent new one, nothing can be said about this one: refused.
+            by_number = true;
+            for (const std::size_t i : new_left) {
+                if (!old_taken[i]) {
+                    pair[i] = i;
+                    old_taken[i] = true;
+                    by_number_lambdas.push_back(i);
+                } else {
+                    taken_number.push_back(i);
+                }
+            }
+        }
+        const auto names_of = [&](const std::vector<std::size_t>& which) {
+            std::string text;
+            for (const std::size_t i : which) {
+                text += (text.empty() ? "" : ", ") + set.lambdas[i].closure.substr(0, set.lambdas[i].closure.find('@'));
+            }
+            return text;
+        };
+        if (!taken_number.empty()) {
+            out.errors.push_back(Diag::make(bind::diag::kLambdasUnpairable,
+                                            "Lambdas " + names_of(taken_number) + " of '" + set.function +
+                                                "' cannot be matched to the running program's lambdas: their code changed, and the old lambda of their number is another new lambda's (by the code of its call operator), so the values of their statics would go to the wrong lambda",
+                                            "Keep the order of these lambdas while you edit them, rename their statics, or hot-restart."));
+            CML_LOG(Info, "WP40-LAMBDAS function='%s' lambdas=%zu refused=%zu", set.function.c_str(), n, taken_number.size());
+            continue;
+        }
+        std::size_t moved = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (pair[i] != i && pair[i] < n) {
+                out.closure_pairing[set.lambdas[i].closure] = set.lambdas[pair[i]].old_closure;
+                ++moved;
+                CML_LOG(Trace, "lambdas of '%s': %s is the old %s (by the code of its call operator)", set.function.c_str(), set.lambdas[i].closure.c_str(),
+                        set.lambdas[pair[i]].old_closure.c_str());
+            }
+        }
+        if (by_number && !by_number_lambdas.empty()) {
+            out.warnings.push_back(Diag::make(bind::diag::kLambdasMatchedByNumber,
+                                              "Lambdas " + names_of(by_number_lambdas) + " of '" + set.function + "' are matched by their numbers" +
+                                                  (unknown ? " (" + unknown_why + ")" : std::string(" (their code changed, so it cannot tell them apart)")) +
+                                                  "; if you reordered them, the values of their statics may be exchanged.",
+                                              "Rename the statics, keep the order of these lambdas, or hot-restart after reordering."));
+        }
+        CML_LOG(Info, "WP40-LAMBDAS function='%s' lambdas=%zu moved=%zu by_number=%d", set.function.c_str(), n, moved, by_number ? 1 : 0);
+    }
+    return out;
+}
+
+std::vector<Diag> prove_bitmask_guards(const NarrowInput& input) {
+    std::vector<Diag> out;
+    if (input.plan == nullptr) {
+        return out;
+    }
+    const bind::BindPlan& plan = *input.plan;
+    for (const bind::BitmaskGuard& bg : plan.bitmask_guards) {
+        std::string why;
+        const bind::HookEntry* hook = nullptr;
+        for (const bind::HookEntry& h : plan.hooks) {
+            if (!bg.function.empty() && h.new_symbol == bg.function) {
+                hook = &h;
+                break;
+            }
+        }
+        if (bg.function.empty()) {
+            why = "the function it belongs to cannot be read from its name";
+        } else if (hook == nullptr) {
+            why = "'" + bind::display_name(bg.function) + "' is not the old version of a function of the running program (new, or not found)";
+        } else if (input.object == nullptr || input.old_image == nullptr) {
+            why = "the old code of '" + bind::display_name(bg.function) + "' is not available";
+        } else {
+            NarrowInput ni = input;
+            ni.enabled = true;
+            const Narrower narrower(ni);
+            const NarrowDecision d = narrower.judge(*hook);
+            if (d.reason == NarrowReason::Unchanged) {
+                CML_LOG(Info, "WP40-BITMASK guard=%s function='%s' proven=unchanged%s", bg.guard.c_str(), bind::display_name(bg.function).c_str(), d.from_prior ? " (against an earlier patch)" : "");
+                continue;
+            }
+            why = "the code of '" + bind::display_name(bg.function) + "' changed (" + to_string(d.reason) + (d.detail.empty() ? std::string() : ": " + d.detail) + ")";
+        }
+        CML_LOG(Info, "WP40-BITMASK guard=%s function='%s' proven=refused", bg.guard.c_str(), bg.function.empty() ? "?" : bind::display_name(bg.function).c_str());
+        out.push_back(Diag::make(bind::diag::kGuardMismatch,
+                                 "the bitmask guard '" + bg.guard + "' (no thread-safe statics) cannot be bound to the running program's: its bits go to the function's dynamically initialised statics in the order they are reached, which only an unchanged function proves to be as before, and " +
+                                     why + "; with the old bitmask a static could be constructed again or never",
+                                 "Leave this function unchanged while the program runs (edit other functions of the file), or hot-restart."));
+    }
+    return out;
 }
 
 }  // namespace cml::core
