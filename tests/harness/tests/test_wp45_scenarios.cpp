@@ -46,7 +46,7 @@ std::size_t find(const Scenario& s, std::size_t from, StepKind kind, const std::
 TEST_CASE("scenario plugin_reload (WP-45): the edit survives FreeLibrary + LoadLibrary, a second edit links, a failed re-apply is CML5600") {
     const Scenario s = load("plugin_reload.toml");
     CHECK(s.fixture == "plugin_reload");
-    CHECK(count(s, StepKind::SignalFixture) == 3);  // load, free + load, free + load
+    CHECK(count(s, StepKind::SignalFixture) == 4);  // load, free + load, free + load inside one poll (WP-48), free + load
     // F-42.1: after the second load (gen=2) the edited value, without a reload in between.
     const std::size_t edit2 = find(s, 0, StepKind::Edit, "value_2");
     const std::size_t reloaded = find(s, edit2, StepKind::ExpectStdout, "value=2 loaded=1 gen=2");
@@ -63,7 +63,7 @@ TEST_CASE("scenario plugin_reload (WP-45): the edit survives FreeLibrary + LoadL
     const std::size_t diag = find(s, edit3, StepKind::ExpectDiag, "CML5600");
     REQUIRE(diag < s.steps.size());
     CHECK(s.steps[diag].expect_error_text == "fixture_plugin_reload_plugin.dll");
-    CHECK(find(s, diag, StepKind::ExpectStdout, "value=1 loaded=1 gen=3") < s.steps.size());
+    CHECK(find(s, diag, StepKind::ExpectStdout, "value=1 loaded=1 gen=4") < s.steps.size());
 }
 
 TEST_CASE("scenario plugin_late_load (WP-45): a restart hands the plugin's edit over, it is re-applied when the plugin is loaded later") {

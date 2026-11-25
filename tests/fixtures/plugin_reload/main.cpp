@@ -1,13 +1,16 @@
 // Fixture `plugin_reload` (WP-45): a host that loads a plugin DLL at run time, long after its agent sent the module list, frees it
 // and loads it again (the reduction of the corpus project godot-gdextension, tests/corpus/repro/f42_plugin_reload). See CMakeLists.txt.
 //
-//   --ticks N        stop after N lines (ctest); default: run until killed
-//   --agent          create the agent next to the exe and enable this exe (also in a process the broker relaunched)
+//   --ticks N              stop after N lines (ctest); default: run until killed
+//   --agent                create the agent next to the exe and enable this exe (also in a process the broker relaunched)
+//   --quick-reload-at G    (WP-48) the free + load that makes generation G loads again at once, with nothing in between
 //
 // Every time the file named by CML_FIXTURE_SIGNAL_FILE appears (the scenario's `signal_fixture` step) the host deletes it and:
 //   * when the plugin is not loaded: LoadLibraryW, then EnableModule for it;
 //   * when it is loaded: FreeLibrary, 2 s (longer than the agent's 500 ms module poll, so the broker sees it go), LoadLibraryW,
-//     EnableModule again.
+//     EnableModule again. For generation G of --quick-reload-at there is no pause: FreeLibrary and LoadLibraryW follow each other
+//     well inside one agent poll (the gap is printed, gap_ms=), so a module-list diff cannot see it (R-53); only the loader's
+//     notifications can.
 #include <windows.h>
 
 #include <cstdio>
@@ -63,11 +66,14 @@ int main(int argc, char** argv)
 {
     long max_ticks = -1;
     bool use_agent = false;
+    long quick_generation = -1;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--ticks") == 0 && i + 1 < argc) {
             max_ticks = std::strtol(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--agent") == 0) {
             use_agent = true;
+        } else if (std::strcmp(argv[i], "--quick-reload-at") == 0 && i + 1 < argc) {
+            quick_generation = std::strtol(argv[++i], nullptr, 10);
         }
     }
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -103,15 +109,34 @@ int main(int argc, char** argv)
     bool plugin_reported = true;
     for (long n = 0; max_ticks < 0 || n < max_ticks; ++n) {
         if (consume_signal(signal_file)) {
+            const bool quick = generation + 1 == quick_generation;
+            void* old_base = nullptr;
+            LARGE_INTEGER freed_at = {};
             if (plugin != nullptr) {
                 value = nullptr;
+                old_base = static_cast<void*>(plugin);
                 const BOOL freed = FreeLibrary(plugin);
+                QueryPerformanceCounter(&freed_at);
                 plugin = nullptr;
                 const bool gone = GetModuleHandleW(plugin_path.c_str()) == nullptr;
-                std::printf("UNLOADED gen=%d freed=%d gone=%d\n", generation, freed ? 1 : 0, gone ? 1 : 0);
-                Sleep(2000);
+                if (!quick) {
+                    std::printf("UNLOADED gen=%d freed=%d gone=%d\n", generation, freed ? 1 : 0, gone ? 1 : 0);
+                    Sleep(2000);
+                } else {
+                    // WP-48: nothing between FreeLibrary and LoadLibraryW (the line is printed after the load, see below).
+                    plugin = LoadLibraryW(plugin_path.c_str());
+                    LARGE_INTEGER loaded_at = {};
+                    LARGE_INTEGER frequency = {};
+                    QueryPerformanceCounter(&loaded_at);
+                    QueryPerformanceFrequency(&frequency);
+                    const long long gap_ms = (loaded_at.QuadPart - freed_at.QuadPart) * 1000 / (frequency.QuadPart != 0 ? frequency.QuadPart : 1);
+                    std::printf("UNLOADED gen=%d freed=%d gone=%d quick=1\n", generation, freed ? 1 : 0, gone ? 1 : 0);
+                    std::printf("QUICK gap_ms=%lld same_base=%d\n", gap_ms, static_cast<void*>(plugin) == old_base ? 1 : 0);
+                }
             }
-            plugin = LoadLibraryW(plugin_path.c_str());
+            if (plugin == nullptr) {
+                plugin = LoadLibraryW(plugin_path.c_str());
+            }
             ++generation;
             value = plugin != nullptr ? reinterpret_cast<ValueFn>(reinterpret_cast<void*>(GetProcAddress(plugin, "plugin_value"))) : nullptr;
             std::printf("LOADED gen=%d ok=%d base=%p\n", generation, value != nullptr ? 1 : 0, static_cast<void*>(plugin));

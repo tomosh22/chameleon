@@ -16,7 +16,7 @@
 // allows, or throw. This code is portable (no Win32) so it can be unit-tested and fuzzed anywhere.
 //
 // Requests carry a `request_id` chosen by the sender; the answer (Welcome or Reply) repeats it.
-// Events (ModuleLoaded, ModuleUnloaded, Log) have no id and no answer.
+// Events (ModuleLoaded, ModuleUnloaded, ModuleEvents, Log) have no id and no answer.
 
 #include <cstddef>
 #include <cstdint>
@@ -38,6 +38,19 @@ inline constexpr std::uint32_t kMaxHooksPerRequest = 16384; // entries in one In
 inline constexpr std::uint16_t kMessageVersion = 1;         // payload layout version of every type
 inline constexpr std::uint32_t kProtocolVersion = 1;        // exchanged in Hello / Welcome
 
+// WP-48 (ADR-0044): the agent's wire ABI, sent in Hello::agent_abi_version. It versions what the agent sends and understands on
+// the pipe; CML_AGENT_ABI_VERSION in Chameleon_API.h versions the C interface between the application and cml_agent.dll and is
+// a separate number (ADR-0034: it stays 2, so applications need not be rebuilt). Both were 2 until WP-48.
+//   2  every agent before WP-48: module changes as ModuleLoaded / ModuleUnloaded from a module-list diff every 500 ms.
+//   3  the agent records the loader's notifications and reports them as ModuleEvents, in order: a FreeLibrary + LoadLibrary
+//      between two polls is an unload and a load, never "no change". It sends ModuleEvents only to a broker whose Welcome
+//      answered with agent_abi_version 3 or more; to an older broker it sends the same events as ModuleUnloaded / ModuleLoaded.
+// A broker accepts both (an agent that sends 2, or 0 as test agents do, keeps the module-list diff and gets CML5621).
+inline constexpr std::uint32_t kAgentAbiSnapshots = 2;
+inline constexpr std::uint32_t kAgentAbiModuleEvents = 3;
+inline constexpr std::uint32_t kAgentAbiVersion = kAgentAbiModuleEvents;  // what an agent of this build announces
+inline constexpr std::uint32_t kMaxModuleEvents = 16384;                  // events in one ModuleEvents
+
 // Stable message ids. Every family of plan section 4.13 has its ids reserved now; only the ones
 // marked "implemented" have payloads in this work package. Never renumber.
 enum class MessageType : std::uint16_t {
@@ -52,6 +65,7 @@ enum class MessageType : std::uint16_t {
     DisableModule = 0x0012,   // implemented  agent -> broker (request, answered by Reply)
     ModuleLoaded = 0x0013,    // implemented  agent -> broker (event)
     ModuleUnloaded = 0x0014,  // implemented  agent -> broker (event)
+    ModuleEvents = 0x0015,    // implemented (WP-48)  agent -> broker (event): ordered loads and unloads from the loader
 
     // Address space (WP-08).
     ReserveRange = 0x0020,  // implemented  broker -> agent (request, answered by ReserveRangeResult)
@@ -118,6 +132,10 @@ struct Welcome {
     std::uint32_t protocol_version = kProtocolVersion;
     std::uint64_t agent_id = 0;    // broker-assigned, unique per broker run
     std::string broker_version;    // "0.1.0"
+    // WP-48: the agent ABI the broker speaks with this agent (kAgentAbiModuleEvents: it accepts ModuleEvents). An optional
+    // trailing field, written only when not 0, and a broker writes it only to an agent whose Hello announced 3 or more: an
+    // older agent's decoder rejects trailing bytes. 0 (absent) is a broker before WP-48.
+    std::uint32_t agent_abi_version = 0;
 };
 
 struct ModuleEntry {
@@ -151,6 +169,36 @@ struct ModuleLoaded {
 
 struct ModuleUnloaded {
     ModuleEntry module;
+};
+
+// WP-48 (ADR-0044): the module loads and unloads the agent saw since its previous report, in the order they happened. Agent ->
+// broker event (no id, no answer), sent only to a broker that answered Hello with agent_abi_version >= kAgentAbiModuleEvents.
+// The broker applies the events one at a time and lets the reload service see the module list after each one, so an unload
+// and a load of the same image at the same base are two changes (the WP-45 re-enable path: the state is dropped and its
+// baseline kept, then the new instance takes it over and the session's edits are re-applied), never "no change".
+enum class ModuleEventKind : std::uint32_t { Loaded = 1, Unloaded = 2 };
+
+struct ModuleEvent {
+    ModuleEventKind kind = ModuleEventKind::Loaded;
+    // The agent's per-process sequence number of the loader notification (1, 2, ...; increasing within a process). 0 for an
+    // event the agent derived from a module-list diff instead (see kModuleEventsResync) or inferred (an unload of what was at a
+    // base before a load there).
+    std::uint64_t seq = 0;
+    ModuleEntry module;
+};
+
+// Bit flags of ModuleEvents::flags. Unknown bits are rejected by the decoder.
+// Resync: some of the events come from a diff of the module list, not from the loader: the agent lost notifications (its ring
+// was full), could not resolve one, or found its list and the process's disagreeing. `reason` names the agent's diagnostic.
+// A module freed and loaded again at the same base in that time is not seen (the broker warns, CML5620).
+inline constexpr std::uint32_t kModuleEventsResync = 1u;
+inline constexpr std::uint32_t kModuleEventsKnownFlags = kModuleEventsResync;
+
+struct ModuleEvents {
+    std::uint32_t flags = 0;
+    std::uint32_t reason = 0;  // with kModuleEventsResync: the agent's diagnostic id (CML4721..CML4723); otherwise 0
+    std::uint64_t lost = 0;    // notifications the agent's ring dropped since its previous ModuleEvents
+    std::vector<ModuleEvent> events;
 };
 
 struct Log {
@@ -530,7 +578,7 @@ struct ArmFault {
 };
 
 using Message = std::variant<Hello, Welcome, ModuleList, EnableModule, DisableModule, ModuleLoaded,
-                             ModuleUnloaded, Log, Reply, ReserveRange, ReleaseRange, LoadPatch,
+                             ModuleUnloaded, ModuleEvents, Log, Reply, ReserveRange, ReleaseRange, LoadPatch,
                              PatchLoaded, ApplyFixups, RunInitializers, ReserveRangeResult, InstallHooks,
                              HooksInstalled, CompileEvent, Exception, ExceptionAction, ExceptionConfig, Restart, RestartInfo,
                              ReenableModules, RestartCancel, Reexecute, ArmFault>;

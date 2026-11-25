@@ -623,6 +623,9 @@ public:
     // Closes the current connection (the agent will reconnect).
     void hang_up() { SetEvent(hangup_event_); }
 
+    // WP-48: the agent ABI the next Welcome answers with (0: none, like a broker before WP-48; 3: ModuleEvents).
+    std::atomic<std::uint32_t> welcome_abi{0};
+
     std::size_t connections() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return sessions_.size();
@@ -783,6 +786,7 @@ private:
             welcome.request_id = hello->request_id;
             welcome.agent_id = 1;
             welcome.broker_version = "scripted";
+            welcome.agent_abi_version = welcome_abi.load();  // WP-48: 0 = a broker before WP-48
             return send(pipe, welcome);
         }
         std::uint64_t id = 0;
@@ -996,6 +1000,152 @@ TEST_CASE("a module loaded just before an EnableModule is known to the broker, e
     noise.join();
     CHECK(failures == 0);
     cml::DestroyAgent(agent);
+}
+
+// --- WP-48 (ADR-0044): the agent sees every module load and unload ---------------------------------------------------------------
+
+namespace {
+
+bool names_dummy(const std::string& path) {
+    std::string lower;
+    for (const char c : path) {
+        lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    const std::string name = "cml_test_dummy_module.dll";
+    return lower.size() >= name.size() && lower.compare(lower.size() - name.size(), name.size(), name) == 0;
+}
+
+// The module changes of the dummy DLL the agent reported, in order, one letter each: 'L' loaded, 'U' unloaded (from ModuleEvents or
+// from ModuleLoaded / ModuleUnloaded), up to the index-th EnableModule of the dummy. `events_seen` counts ModuleEvents messages and
+// `seqs` collects their sequence numbers.
+std::string dummy_changes(const std::vector<cml::ipc::Message>& messages, int enables, std::size_t* events_seen = nullptr,
+                          std::vector<std::uint64_t>* seqs = nullptr) {
+    namespace ipc = cml::ipc;
+    std::string out;
+    int seen_enables = 0;
+    for (const ipc::Message& m : messages) {
+        if (const auto* enable = std::get_if<ipc::EnableModule>(&m); enable != nullptr && names_dummy(enable->path)) {
+            if (++seen_enables == enables) {
+                break;
+            }
+        } else if (const auto* loaded = std::get_if<ipc::ModuleLoaded>(&m); loaded != nullptr && names_dummy(loaded->module.path)) {
+            out.push_back('L');
+        } else if (const auto* unloaded = std::get_if<ipc::ModuleUnloaded>(&m); unloaded != nullptr && names_dummy(unloaded->module.path)) {
+            out.push_back('U');
+        } else if (const auto* events = std::get_if<ipc::ModuleEvents>(&m)) {
+            if (events_seen != nullptr) {
+                ++*events_seen;
+            }
+            for (const ipc::ModuleEvent& e : events->events) {
+                if (names_dummy(e.module.path)) {
+                    out.push_back(e.kind == ipc::ModuleEventKind::Loaded ? 'L' : 'U');
+                    if (seqs != nullptr) {
+                        seqs->push_back(e.seq);
+                    }
+                }
+            }
+        }
+    }
+    return out;
+}
+
+// Loads the dummy, enables it, then frees and loads it again with nothing in between (well inside one 500 ms poll) and enables it
+// again: the agent polls before it sends a request, so everything it reports about the two loads is on the wire before the second
+// EnableModule.
+void free_and_load_inside_one_poll(cml::Agent& agent) {
+    const std::wstring dummy = exe_directory() + L"\\cml_test_dummy_module.dll";
+    cml::Reply reply;
+    HMODULE module = LoadLibraryW(dummy.c_str());
+    REQUIRE(module != nullptr);
+    cml::Request r = agent.EnableModule(dummy);
+    REQUIRE(agent.WaitForRequest(r, 20000, &reply) == CML_STATUS_OK);
+    REQUIRE(FreeLibrary(module));
+    REQUIRE(GetModuleHandleW(dummy.c_str()) == nullptr);
+    module = LoadLibraryW(dummy.c_str());
+    REQUIRE(module != nullptr);
+    r = agent.EnableModule(dummy);
+    REQUIRE(agent.WaitForRequest(r, 20000, &reply) == CML_STATUS_OK);
+    FreeLibrary(module);
+}
+
+}  // namespace
+
+TEST_CASE("WP-48: a DLL freed and loaded again inside one poll reaches a broker of ABI 3 as an unload and a load in ModuleEvents") {
+    const std::string pipe = unique_pipe_name("events");
+    ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));
+    ScriptedBroker broker(pipe);
+    broker.welcome_abi.store(cml::ipc::kAgentAbiModuleEvents);
+    REQUIRE(broker.ready());
+    cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str());
+    REQUIRE(agent.IsValid());
+    REQUIRE(wait_until([&] { return agent.IsConnected(); }, 20000));
+    free_and_load_inside_one_poll(agent);
+    cml::DestroyAgent(agent);
+
+    const std::vector<cml::ipc::Message> messages = broker.messages(0);
+    REQUIRE_FALSE(messages.empty());
+    REQUIRE(std::holds_alternative<cml::ipc::Hello>(messages[0]));
+    CHECK(std::get<cml::ipc::Hello>(messages[0]).agent_abi_version == cml::ipc::kAgentAbiModuleEvents);
+    std::size_t events_seen = 0;
+    std::vector<std::uint64_t> seqs;
+    // Before the first enable: the load. Between the two enables: the unload and the load (a module-list diff sees nothing there).
+    CHECK(dummy_changes(messages, 1) == "L");
+    CHECK(dummy_changes(messages, 2, &events_seen, &seqs) == "LUL");
+    CHECK(events_seen >= 2);
+    REQUIRE(seqs.size() == 3);
+    CHECK(seqs[0] != 0);
+    CHECK(seqs[0] < seqs[1]);  // the loader's order, numbered
+    CHECK(seqs[1] < seqs[2]);
+    CHECK(broker.count(0, [](const cml::ipc::Message& m) { return std::holds_alternative<cml::ipc::ModuleLoaded>(m); }) == 0);
+}
+
+TEST_CASE("WP-48: to a broker before WP-48 (no ABI in Welcome) the same events go as ModuleUnloaded and ModuleLoaded") {
+    const std::string pipe = unique_pipe_name("events_old");
+    ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));
+    ScriptedBroker broker(pipe);  // welcome_abi 0
+    REQUIRE(broker.ready());
+    cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str());
+    REQUIRE(agent.IsValid());
+    REQUIRE(wait_until([&] { return agent.IsConnected(); }, 20000));
+    free_and_load_inside_one_poll(agent);
+    cml::DestroyAgent(agent);
+
+    std::size_t events_seen = 0;
+    CHECK(dummy_changes(broker.messages(0), 2, &events_seen) == "LUL");
+    CHECK(events_seen == 0);  // never a message type the old broker does not know
+}
+
+TEST_CASE("WP-48: without loader notifications the agent falls back to the module-list diff and says so (CML4720)") {
+    const std::string pipe = unique_pipe_name("events_off");
+    ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));
+    ScopedEnv off(L"CML_TEST_NO_LOADER_NOTIFICATIONS", L"1");
+    ScriptedBroker broker(pipe);
+    broker.welcome_abi.store(cml::ipc::kAgentAbiModuleEvents);
+    REQUIRE(broker.ready());
+    cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str());
+    REQUIRE(agent.IsValid());
+    REQUIRE(wait_until([&] { return agent.IsConnected(); }, 20000));
+    const auto said_4720 = [&broker] {
+        for (const cml::ipc::Message& m : broker.messages(0)) {
+            if (const auto* log = std::get_if<cml::ipc::Log>(&m); log != nullptr && log->text.find("CML4720") != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    };
+    CHECK(wait_until(said_4720, 20000));  // a warning: forwarded to the broker log
+    // Loads and unloads the poll sees are still reported, the old way.
+    const std::wstring dummy = exe_directory() + L"\\cml_test_dummy_module.dll";
+    HMODULE module = LoadLibraryW(dummy.c_str());
+    REQUIRE(module != nullptr);
+    cml::Reply reply;
+    const cml::Request r = agent.EnableModule(dummy);
+    REQUIRE(agent.WaitForRequest(r, 20000, &reply) == CML_STATUS_OK);
+    FreeLibrary(module);
+    cml::DestroyAgent(agent);
+    std::size_t events_seen = 0;
+    CHECK(dummy_changes(broker.messages(0), 1, &events_seen) == "L");
+    CHECK(events_seen == 0);
 }
 
 TEST_CASE("the broker's working directory") {

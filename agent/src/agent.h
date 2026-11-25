@@ -5,8 +5,9 @@
 //   1. connects to the broker pipe (auto-starting cml_broker.exe --headless when it is not
 //      running), retrying with bounded back-off for as long as the agent lives;
 //   2. sends Hello, receives Welcome, sends the module list;
-//   3. serves queued requests (EnableModule / DisableModule) and reports module changes by
-//      polling the module list;
+//   3. serves queued requests (EnableModule / DisableModule) and reports module changes: the loader's notifications,
+//      recorded by a callback in a lock-free ring and drained by the module poll (WP-48), with the module list as the
+//      fallback and the check (module_diff.h);
 //   4. on connection loss fails the requests that were in flight and starts over at 1.
 // Application threads never wait for any of this: their calls only touch the request table.
 
@@ -19,6 +20,7 @@
 #include <cstdint>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -31,6 +33,8 @@
 #include "cml/ipc/pipe.h"
 #include "cml/util/result.h"
 #include "hook/installer.h"
+#include "module_diff.h"
+#include "module_ring.h"
 #include "sync_queue.h"
 
 namespace cml::agent {
@@ -143,6 +147,8 @@ public:
     // How long an answer may wait to be collected before the agent drops it (ms).
     static constexpr std::uint64_t kAnswerIdleMs = 10ull * 60ull * 1000ull;
     std::size_t active_calls_for_testing() const noexcept { return static_cast<std::size_t>(active_calls_.load()); }
+    // WP-48: whether the loader notifications are registered (false: the module-list diff only, CML4720).
+    bool module_notifications_for_testing() const noexcept { return module_ring_ != nullptr; }
 
 private:
     // Request table invariants (all under mutex_):
@@ -184,11 +190,23 @@ private:
     bool try_connect(ipc::PipeConnection& out, ConnectState& state);
     bool run_session(ipc::PipeConnection& connection);  // true if it got as far as being registered
     bool handshake(ipc::PipeConnection& connection);
-    bool send_module_list(ipc::PipeConnection& connection);
+    // `session_start`: the first list of a session. What the ring holds from before it is dropped (the list covers it); a list sent
+    // again later (refused, or after a failed enumeration) leaves the ring alone.
+    bool send_module_list(ipc::PipeConnection& connection, bool session_start);
     void serve(ipc::PipeConnection& connection);
     bool flush_outgoing(ipc::PipeConnection& connection);
     bool flush_logs(ipc::PipeConnection& connection);
     bool poll_modules(ipc::PipeConnection& connection);
+    // WP-48 (ADR-0044): loader notifications. register_module_notifications (start) creates the ring and registers the callback;
+    // without them (CML4720) poll_modules keeps the module-list diff. unregister_module_notifications (stop, after the agent thread
+    // has ended): once LdrUnregisterDllNotification returns no callback runs any more, so the ring may be freed afterwards.
+    void register_module_notifications();
+    void unregister_module_notifications();
+    std::vector<DrainedEvent> drain_module_ring();
+    // Sends what one poll found: forget_range for every unloaded image first (WP-45), then a ModuleEvents (a broker that speaks
+    // agent ABI 3) or the same events as ModuleUnloaded / ModuleLoaded (an older broker).
+    bool send_module_report(ipc::PipeConnection& connection, const ModulePollReport& report);
+    bool poll_by_snapshot(ipc::PipeConnection& connection, const std::vector<ipc::ModuleEntry>& current);
     bool send_message(ipc::PipeConnection& connection, const ipc::Message& message);
     void handle_message(const ipc::Message& message);
     void complete(std::uint64_t request_id, std::uint32_t status, std::string text);
@@ -319,8 +337,15 @@ private:
     std::mutex connection_mutex_;  // guards active_connection_
     ipc::PipeConnection* active_connection_ = nullptr;
 
+    // WP-48: the loader notification ring (null: notifications unavailable) and the registration's cookie. The callback writes the
+    // ring under the loader lock; the agent thread is its only consumer.
+    std::unique_ptr<ModuleRing> module_ring_;
+    void* notification_cookie_ = nullptr;
+
     // Agent thread only.
-    std::vector<ipc::ModuleEntry> known_modules_;
+    ModuleTrackState module_track_;     // what the broker was told about the modules (WP-48: and a pending disagreement)
+    std::uint64_t ring_lost_seen_ = 0;  // ModuleRing::lost() as of the last drain
+    bool broker_events_ = false;        // the broker's Welcome accepts ModuleEvents (agent ABI 3)
     ULONGLONG last_module_poll_ = 0;
     std::uint64_t polled_seq_ = 0;  // queue_seq_ as of the last module poll
     // Back-off state, agent thread only (see run() and poll_modules()).

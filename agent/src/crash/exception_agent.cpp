@@ -58,8 +58,8 @@ void Agent::refresh_exception_ranges() {
     ranges_dirty_.store(false, std::memory_order_release);
     const std::vector<std::string> enabled = enabled_module_paths();
     std::vector<crash::Range> ranges;
-    ranges.reserve(known_modules_.size() + 8);
-    for (const ipc::ModuleEntry& module : known_modules_) {
+    ranges.reserve(module_track_.known.size() + 8);
+    for (const ipc::ModuleEntry& module : module_track_.known) {
         for (const std::string& path : enabled) {
             if (same_module(path, module.path)) {
                 ranges.push_back(crash::Range{module.base, module.size, false});
@@ -182,7 +182,7 @@ bool Agent::flush_exceptions(ipc::PipeConnection& connection) {
             const crash::Frame& f = held.frames[i];
             message.frames.push_back(ipc::ExceptionFrame{f.rip, f.entry_rsp, f.rsp, f.rbp, f.r13, f.function_start});
         }
-        for (const ipc::ModuleEntry& module : known_modules_) {
+        for (const ipc::ModuleEntry& module : module_track_.known) {
             if (module.base == held.module_base) {
                 message.module_path = module.path;
                 break;

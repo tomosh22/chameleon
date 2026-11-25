@@ -10,6 +10,9 @@
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
+#include <memory>
+#include <new>
+#include <optional>
 #include <utility>
 
 #include "agent_log.h"
@@ -25,6 +28,8 @@
 #include "hook/user_hook_ids.h"
 #include "loader/patch_loader.h"
 #include "module_diff.h"
+#include "module_event_ids.h"
+#include "module_ring.h"
 
 namespace cml::agent {
 
@@ -49,6 +54,9 @@ constexpr std::uint32_t kMaxBackoffMs = 1000;
 constexpr int kEnumerateAttempts = 3;        // tries to list the loaded modules before sending what we have
 constexpr DWORD kEnumerateRetryMs = 20;
 constexpr DWORD kReconnectPauseMs = 200;   // pause after a session that was up, before reconnecting
+// WP-48: one ModuleEvents carries at most this many events, and about this many payload bytes (a resync can report every module).
+constexpr std::size_t kMaxEventsPerMessage = 1024;
+constexpr std::size_t kMaxEventBytesPerMessage = 512u * 1024u;
 
 // FU-01: the two agent diagnostics the public header names (CML_STATUS_NOT_RUNNING, CML_STATUS_QUEUE_FULL) are the ids used here.
 static_assert(CML_STATUS_NOT_RUNNING == static_cast<int>(ids::kRequestCancelled), "public status and agent diagnostic differ");
@@ -101,6 +109,57 @@ void fill_reply(cml_reply* reply, std::uint32_t status, const std::string& text)
     reply->message[n] = '\0';
     reply->message_length = static_cast<std::uint32_t>(n);
     reply->status = static_cast<cml_status>(status);
+}
+
+// --- WP-48: loader notifications (LdrRegisterDllNotification, documented on MSDN; the types are declared here as documented, the
+// SDK headers do not have them) ------------------------------------------------------------------------------------------------
+
+struct LoaderUnicodeString {
+    USHORT Length;  // bytes, no terminator
+    USHORT MaximumLength;
+    PWSTR Buffer;
+};
+// LDR_DLL_NOTIFICATION_DATA: the Loaded and Unloaded members of the union have this same layout.
+struct LoaderNotificationData {
+    ULONG Flags;
+    const LoaderUnicodeString* FullDllName;
+    const LoaderUnicodeString* BaseDllName;
+    PVOID DllBase;
+    ULONG SizeOfImage;
+};
+constexpr ULONG kLoaderReasonLoaded = 1;    // LDR_DLL_NOTIFICATION_REASON_LOADED
+constexpr ULONG kLoaderReasonUnloaded = 2;  // LDR_DLL_NOTIFICATION_REASON_UNLOADED
+using LoaderNotificationFn = VOID(NTAPI*)(ULONG reason, const LoaderNotificationData* data, PVOID context);
+using LdrRegisterDllNotificationFn = LONG(NTAPI*)(ULONG flags, LoaderNotificationFn callback, PVOID context, PVOID* cookie);
+using LdrUnregisterDllNotificationFn = LONG(NTAPI*)(PVOID cookie);
+static_assert(sizeof(wchar_t) == sizeof(char16_t), "UTF-16 paths are copied as they are");
+
+template <class Fn>
+Fn resolve_ntdll(const char* name) {
+    const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    return ntdll == nullptr ? nullptr : reinterpret_cast<Fn>(reinterpret_cast<void (*)()>(GetProcAddress(ntdll, name)));
+}
+
+// The notification callback. It runs under the loader lock, on the thread that loads or unloads the DLL, so it ONLY appends to the
+// preallocated lock-free ring (module_ring.h): it never calls the loader, allocates, takes a lock, logs or waits. A full ring
+// drops the event and counts it; the agent thread's next poll then completes its report from the module list (CML4721).
+VOID NTAPI on_loader_notification(ULONG reason, const LoaderNotificationData* data, PVOID context) {
+    auto* ring = static_cast<ModuleRing*>(context);
+    if (ring == nullptr || data == nullptr || (reason != kLoaderReasonLoaded && reason != kLoaderReasonUnloaded)) {
+        return;
+    }
+    const auto base = reinterpret_cast<std::uint64_t>(data->DllBase);
+    const std::uint64_t size = data->SizeOfImage;
+    const LoaderUnicodeString* name = data->FullDllName;
+    const char16_t* path = name != nullptr ? reinterpret_cast<const char16_t*>(name->Buffer) : nullptr;
+    const std::size_t units = name != nullptr && name->Buffer != nullptr ? name->Length / sizeof(wchar_t) : 0;
+    const std::uint32_t kind = reason == kLoaderReasonLoaded ? kRawEventLoaded : kRawEventUnloaded;
+    const bool patch = base != 0 && base == g_patch_image_in_flight.load(std::memory_order_acquire);
+    ring->push([&](RawModuleEvent& slot, std::uint64_t seq) { fill_raw_event(slot, seq, kind, base, size, path, units, patch); });
+}
+
+const char* event_kind_name(ipc::ModuleEventKind kind) {
+    return kind == ipc::ModuleEventKind::Loaded ? "load" : "unload";
 }
 
 }  // namespace
@@ -225,6 +284,7 @@ Result<void> Agent::start() {
     logs_forwarded_ = true;
     CML_LOG(Info, "agent starting: mode=%s pipe=%s broker=%s", synchronized() ? "synchronized" : "immediate",
             pipe_name_.c_str(), proc::utf8_from_wide(broker_path_).c_str());
+    register_module_notifications();  // WP-48: before the agent thread exists, so its first module list is covered
 
     const std::uintptr_t handle = _beginthreadex(nullptr, 0, &Agent::thread_entry, this, 0, nullptr);
     if (handle == 0) {
@@ -252,6 +312,7 @@ void Agent::stop() {
         CloseHandle(thread_);
         thread_ = nullptr;
     }
+    unregister_module_notifications();  // WP-48: the agent thread (the ring's consumer) has ended
     stop_compile_worker();
     if (logs_forwarded_) {
         set_log_forwarding(false);
@@ -510,11 +571,12 @@ bool Agent::run_session(ipc::PipeConnection& connection) {
     if (stopping_.load(std::memory_order_acquire)) {
         connection.cancel();  // stop() ran before the connection was registered
     }
-    known_modules_.clear();
+    module_track_ = ModuleTrackState{};
+    broker_events_ = false;
     last_module_poll_ = GetTickCount64();
     polled_seq_ = 0;  // a new broker knows no modules: every queued request polls first
     full_list_pending_ = false;
-    const bool established = handshake(connection) && send_module_list(connection);
+    const bool established = handshake(connection) && send_module_list(connection, /*session_start=*/true);
     if (established) {
         queue_reenables(false);
         connected_.store(true, std::memory_order_release);
@@ -560,7 +622,8 @@ bool Agent::send_message(ipc::PipeConnection& connection, const ipc::Message& me
 bool Agent::handshake(ipc::PipeConnection& connection) {
     ipc::Hello hello;
     hello.request_id = next_id_.fetch_add(1, std::memory_order_relaxed);
-    hello.agent_abi_version = CML_AGENT_ABI_VERSION;
+    // WP-48: the wire ABI (ipc::kAgentAbiVersion, 3: ModuleEvents), not CML_AGENT_ABI_VERSION (the C interface, ADR-0034).
+    hello.agent_abi_version = ipc::kAgentAbiVersion;
     hello.pid = proc::current_process_id();
     hello.mode = synchronized() ? ipc::AgentMode::Synchronized : ipc::AgentMode::Immediate;
     hello.agent_path = agent_path_;
@@ -609,8 +672,11 @@ bool Agent::handshake(ipc::PipeConnection& connection) {
                         welcome->protocol_version);
                 return false;
             }
-            CML_LOG(Info, "registered with broker %s as agent #%llu", welcome->broker_version.c_str(),
-                    static_cast<unsigned long long>(welcome->agent_id));
+            // WP-48: ModuleEvents only to a broker that said it takes them; an older one gets the same events one message each.
+            broker_events_ = module_ring_ != nullptr && welcome->agent_abi_version >= ipc::kAgentAbiModuleEvents;
+            CML_LOG(Info, "registered with broker %s as agent #%llu (module changes: %s)", welcome->broker_version.c_str(),
+                    static_cast<unsigned long long>(welcome->agent_id),
+                    module_ring_ == nullptr ? "module-list diff" : (broker_events_ ? "loader events, ModuleEvents" : "loader events, one message each"));
             return true;
         }
         if (const auto* reply = std::get_if<ipc::Reply>(&received->message)) {
@@ -624,10 +690,18 @@ bool Agent::handshake(ipc::PipeConnection& connection) {
     }
 }
 
-bool Agent::send_module_list(ipc::PipeConnection& connection) {
+bool Agent::send_module_list(ipc::PipeConnection& connection, bool session_start) {
     ipc::ModuleList list;
     list.request_id = next_id_.fetch_add(1, std::memory_order_relaxed);
     const std::uint64_t seq_mark = queue_seq_.load(std::memory_order_acquire);
+    if (session_start && module_ring_ != nullptr) {
+        // WP-48: the new broker knows nothing yet; the list taken next covers everything the ring holds so far. Drained BEFORE the
+        // list is taken, so a change during it stays in the ring and is reported by the next poll (a load the list has as well is
+        // redundant there, see track_modules).
+        const std::size_t dropped = drain_module_ring().size();
+        ring_lost_seen_ = module_ring_->lost();
+        CML_LOG(Debug, "module events: %llu from before the session dropped (the module list covers them)", static_cast<unsigned long long>(dropped));
+    }
     Result<std::vector<proc::ModuleInfo>> modules = enumerate_loaded_modules();
     for (int attempt = 1; !modules && attempt < kEnumerateAttempts; ++attempt) {
         CML_LOG(Debug, "%s", modules.error().format().c_str());
@@ -643,7 +717,7 @@ bool Agent::send_module_list(ipc::PipeConnection& connection) {
         // stays as it is, so the next flush polls again, and the next poll sends the difference.
         CML_LOG(Warn, "cannot enumerate the loaded modules (%s); sending the list we have",
                 modules.error().format().c_str());
-        list.modules = known_modules_;
+        list.modules = module_track_.known;
     }
     {
         // Register before sending so the Reply cannot race the registration.
@@ -665,7 +739,8 @@ bool Agent::send_module_list(ipc::PipeConnection& connection) {
     if (!send_message(connection, list)) {
         return false;
     }
-    known_modules_ = list.modules;
+    module_track_.known = list.modules;
+    module_track_.suspect.reset();
     ranges_dirty_.store(true, std::memory_order_release);
     last_module_poll_ = GetTickCount64();
     if (modules) {
@@ -744,18 +819,82 @@ bool Agent::poll_modules(ipc::PipeConnection& connection) {
         }
     }
     if (full_list_pending_ && GetTickCount64() >= full_list_not_before_) {
-        return send_module_list(connection);  // the broker refused (or we could not build) the last full list
+        return send_module_list(connection, /*session_start=*/false);  // the broker refused (or we could not build) the last full list
     }
     // Everything queued before this point was queued after the modules it refers to were loaded,
-    // so the snapshot taken now covers it.
+    // so the snapshot taken now covers it (and, with loader notifications, so does the ring: the callback ran before LoadLibrary
+    // returned).
     const std::uint64_t seq_mark = queue_seq_.load(std::memory_order_acquire);
-    Result<std::vector<proc::ModuleInfo>> modules = enumerate_loaded_modules();
-    if (!modules) {
-        CML_LOG(Debug, "%s", modules.error().format().c_str());
-        return true;  // a failed snapshot is not a connection problem; try again next time
+    if (module_ring_ == nullptr) {
+        Result<std::vector<proc::ModuleInfo>> modules = enumerate_loaded_modules();
+        if (!modules) {
+            CML_LOG(Debug, "%s", modules.error().format().c_str());
+            return true;  // a failed snapshot is not a connection problem; try again next time
+        }
+        if (!poll_by_snapshot(connection, to_entries(*modules))) {
+            return false;
+        }
+        polled_seq_ = seq_mark;
+        return true;
     }
-    std::vector<ipc::ModuleEntry> current = to_entries(*modules);
-    const ModuleDelta delta = diff_modules(known_modules_, current);
+    // WP-48: the loader's events, in order, checked against the module list taken right after them.
+    const std::vector<DrainedEvent> drained = drain_module_ring();
+    const std::uint64_t lost_total = module_ring_->lost();
+    const std::uint64_t lost = lost_total - ring_lost_seen_;
+    ring_lost_seen_ = lost_total;
+    Result<std::vector<proc::ModuleInfo>> modules = enumerate_loaded_modules();
+    std::vector<ipc::ModuleEntry> snapshot;
+    if (modules) {
+        snapshot = to_entries(*modules);
+    } else {
+        CML_LOG(Debug, "%s", modules.error().format().c_str());
+    }
+    const bool quiet = !module_ring_->has_pending();
+    const ModulePollReport report = track_modules(module_track_, drained, lost, modules ? &snapshot : nullptr, quiet);
+    if (!drained.empty()) {
+        CML_LOG(Debug, "module events: drained=%llu (seq %llu..%llu) reported=%llu patch_images=%llu redundant=%llu lost=%llu",
+                static_cast<unsigned long long>(drained.size()), static_cast<unsigned long long>(drained.front().seq),
+                static_cast<unsigned long long>(drained.back().seq), static_cast<unsigned long long>(report.events.size()),
+                static_cast<unsigned long long>(report.patch_events), static_cast<unsigned long long>(report.redundant),
+                static_cast<unsigned long long>(lost));
+    }
+    switch (report.resync_reason) {
+        case 0:
+            break;
+        case module_events::ids::kRingOverflow:
+            CML_LOG(Warn, "CML%u: %llu loader notification(s) did not fit the agent's ring (%llu slots); the module changes of this poll "
+                          "are completed from the module list, so a module freed and loaded again in that time may run its original code",
+                    module_events::ids::kRingOverflow, static_cast<unsigned long long>(lost), static_cast<unsigned long long>(kModuleRingCapacity));
+            break;
+        case module_events::ids::kPathUnresolved:
+            CML_LOG(Warn, "CML%u: a module with a path longer than %llu characters was loaded and unloaded again before the agent could read "
+                          "its path; the module changes of this poll are completed from the module list",
+                    module_events::ids::kPathUnresolved, static_cast<unsigned long long>(kRawPathUnits));
+            break;
+        default:
+            CML_LOG(Warn, "CML%u: the agent's module events and the process's module list disagreed twice in a row; the list is taken as "
+                          "the truth (%llu change(s) reported from it)",
+                    module_events::ids::kListDisagrees, static_cast<unsigned long long>(report.events.size()));
+            break;
+    }
+    if (report.need_full_list) {
+        full_list_pending_ = true;  // no list to complete the report from: send the whole list at the next poll
+        full_list_not_before_ = 0;
+    }
+    if (!send_module_report(connection, report)) {
+        return false;
+    }
+    if (!report.events.empty()) {
+        ranges_dirty_.store(true, std::memory_order_release);
+    }
+    if (!report.need_full_list) {
+        polled_seq_ = seq_mark;
+    }
+    return true;
+}
+
+bool Agent::poll_by_snapshot(ipc::PipeConnection& connection, const std::vector<ipc::ModuleEntry>& current) {
+    const ModuleDelta delta = diff_modules(module_track_.known, current);
     for (const ipc::ModuleEntry& module : delta.unloaded) {
         // WP-45: the hooks of an unloaded image went with it. Forget their records BEFORE the broker hears of the unload, so a re-apply to
         // the image loaded again (often at the same base) is planned as a first install, never as a re-point of a jump that is gone.
@@ -771,12 +910,125 @@ bool Agent::poll_modules(ipc::PipeConnection& connection) {
             return false;
         }
     }
-    known_modules_ = std::move(current);
-    if (!delta.loaded.empty() || !delta.unloaded.empty()) {
+    module_track_.known = current;
+    if (!delta.empty()) {
         ranges_dirty_.store(true, std::memory_order_release);
     }
-    polled_seq_ = seq_mark;
     return true;
+}
+
+bool Agent::send_module_report(ipc::PipeConnection& connection, const ModulePollReport& report) {
+    if (report.events.empty() && report.resync_reason == 0) {
+        return true;
+    }
+    for (const ipc::ModuleEvent& event : report.events) {
+        if (event.kind != ipc::ModuleEventKind::Unloaded) {
+            continue;
+        }
+        // WP-45: forget the hook records of the image BEFORE the broker hears of the unload (see poll_by_snapshot). With loader events
+        // this also covers an unload followed by a load at the same base inside one poll, which the module list never shows.
+        const std::size_t dropped = hook::process_installer().forget_range(event.module.base, event.module.size);
+        CML_LOG(Debug, "module unloaded: base=0x%llx size=0x%llx seq=%llu hook_records_dropped=%llu",
+                static_cast<unsigned long long>(event.module.base), static_cast<unsigned long long>(event.module.size),
+                static_cast<unsigned long long>(event.seq), static_cast<unsigned long long>(dropped));
+    }
+    if (!broker_events_) {
+        for (const ipc::ModuleEvent& event : report.events) {
+            const bool sent = event.kind == ipc::ModuleEventKind::Unloaded ? send_message(connection, ipc::ModuleUnloaded{event.module})
+                                                                            : send_message(connection, ipc::ModuleLoaded{event.module});
+            if (!sent) {
+                return false;
+            }
+        }
+        return true;
+    }
+    std::size_t next = 0;
+    bool first = true;
+    while (first || next < report.events.size()) {
+        ipc::ModuleEvents message;
+        if (report.resync_reason != 0) {
+            message.flags = ipc::kModuleEventsResync;
+            message.reason = report.resync_reason;
+        }
+        message.lost = first ? report.lost : 0;
+        std::size_t bytes = 0;
+        while (next < report.events.size() && message.events.size() < kMaxEventsPerMessage &&
+               (message.events.empty() || bytes + report.events[next].module.path.size() + 32 <= kMaxEventBytesPerMessage)) {
+            bytes += report.events[next].module.path.size() + 32;
+            CML_LOG(Trace, "module event: %s seq=%llu base=0x%llx path=%s", event_kind_name(report.events[next].kind),
+                    static_cast<unsigned long long>(report.events[next].seq), static_cast<unsigned long long>(report.events[next].module.base),
+                    report.events[next].module.path.c_str());
+            message.events.push_back(report.events[next++]);
+        }
+        if (!send_message(connection, message)) {
+            return false;
+        }
+        first = false;
+    }
+    return true;
+}
+
+void Agent::register_module_notifications() {
+    if (const std::optional<std::string> off = proc::get_env("CML_TEST_NO_LOADER_NOTIFICATIONS"); off && !off->empty() && *off != "0") {
+        CML_LOG(Warn, "CML%u: loader notifications are switched off (test option CML_TEST_NO_LOADER_NOTIFICATIONS); module changes are seen "
+                      "by a module-list diff every 500 ms, so a module freed and loaded again in between keeps running its original code",
+                module_events::ids::kNotificationsUnavailable);
+        return;
+    }
+    const auto register_fn = resolve_ntdll<LdrRegisterDllNotificationFn>("LdrRegisterDllNotification");
+    if (register_fn == nullptr || resolve_ntdll<LdrUnregisterDllNotificationFn>("LdrUnregisterDllNotification") == nullptr) {
+        CML_LOG(Warn, "CML%u: LdrRegisterDllNotification is not available; module changes are seen by a module-list diff every 500 ms, so "
+                      "a module freed and loaded again in between keeps running its original code",
+                module_events::ids::kNotificationsUnavailable);
+        return;
+    }
+    std::unique_ptr<ModuleRing> ring(new (std::nothrow) ModuleRing());
+    if (ring == nullptr) {
+        CML_LOG(Warn, "CML%u: no memory for the loader notification ring; module changes are seen by a module-list diff every 500 ms",
+                module_events::ids::kNotificationsUnavailable);
+        return;
+    }
+    PVOID cookie = nullptr;
+    const LONG status = register_fn(0, &on_loader_notification, ring.get(), &cookie);
+    if (status < 0 || cookie == nullptr) {
+        CML_LOG(Warn, "CML%u: LdrRegisterDllNotification failed (NTSTATUS 0x%08lx); module changes are seen by a module-list diff every "
+                      "500 ms, so a module freed and loaded again in between keeps running its original code",
+                module_events::ids::kNotificationsUnavailable, static_cast<unsigned long>(status));
+        return;
+    }
+    notification_cookie_ = cookie;
+    module_ring_ = std::move(ring);
+    CML_LOG(Debug, "loader notifications registered (ring of %llu events)", static_cast<unsigned long long>(kModuleRingCapacity));
+}
+
+void Agent::unregister_module_notifications() {
+    if (notification_cookie_ == nullptr) {
+        return;
+    }
+    const auto unregister_fn = resolve_ntdll<LdrUnregisterDllNotificationFn>("LdrUnregisterDllNotification");
+    const LONG status = unregister_fn != nullptr ? unregister_fn(notification_cookie_) : -1;
+    notification_cookie_ = nullptr;
+    if (status < 0) {
+        // The callback may still be called with this ring: it must outlive the process (the agent DLL is never unloaded either).
+        CML_LOG(Warn, "LdrUnregisterDllNotification failed (NTSTATUS 0x%08lx); the notification ring is kept", static_cast<unsigned long>(status));
+        static_cast<void>(module_ring_.release());
+        return;
+    }
+    // Once LdrUnregisterDllNotification has returned no callback runs with this ring any more (it takes the lock the loader holds
+    // while it calls the callbacks), so it can go.
+    module_ring_.reset();
+}
+
+std::vector<DrainedEvent> Agent::drain_module_ring() {
+    std::vector<DrainedEvent> drained;
+    if (module_ring_ == nullptr) {
+        return drained;
+    }
+    RawModuleEvent raw;
+    while (module_ring_->pop(raw)) {
+        drained.push_back(to_drained(raw));
+    }
+    return drained;
 }
 
 bool Agent::same_module(const std::string& a, const std::string& b) {
@@ -1054,7 +1306,10 @@ void Agent::serve(ipc::PipeConnection& connection) {
         if (!flush_outgoing(connection) || !flush_replies(connection) || !flush_logs(connection) || !flush_exceptions(connection)) {
             return;
         }
-        if (GetTickCount64() - last_module_poll_ >= kModulePollMs && !poll_modules(connection)) {
+        // WP-48: a ring that is half full is drained at once (the agent thread wakes at least every kReceiveSliceMs), so a burst of
+        // loads does not have to wait for the 500 ms poll and is less likely to overflow it.
+        const bool ring_filling = module_ring_ != nullptr && module_ring_->size_approx() >= kModuleRingCapacity / 2;
+        if ((ring_filling || GetTickCount64() - last_module_poll_ >= kModulePollMs) && !poll_modules(connection)) {
             return;
         }
         Result<ipc::PipeConnection::Received> received = connection.receive(kReceiveSliceMs, wake_event_);
