@@ -87,7 +87,7 @@ fixtures" to "works on your project".
 
 1. **Wave 10 (Eng), done (ADR-0042):** WP-36 = R-01, WP-37 = R-02 + R-03, WP-38 = R-04 + the decoder part of R-41,
    WP-39 = R-13 (plus WP-39b).
-   **Wave 11 (Eng), in progress (ADR-0043):** WP-40 = R-48 + R-50 (planner pairing defects, first because they can pair
+   **Wave 11 (Eng), done (ADR-0043):** WP-40 = R-48 + R-50 (planner pairing defects, first because they can pair
    wrong state), WP-41 and WP-42 = R-06 (corpus), WP-43 = R-40 + R-42 (restart, revert), WP-44 = rest of R-42 + R-49 + R-51.
 2. **In parallel (User):** R-10 dogfooding, R-11 and R-12 checklists, R-30/R-31 decisions.
 3. **Then:** fixes from R-10 as they come; R-46, R-47.
