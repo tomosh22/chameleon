@@ -1237,6 +1237,13 @@ inlined lambda's static keeps its value or that the reload is refused, and that 
 the goldens and the corpus stay green. Directories: `broker/cml_core` (planner, names), `tests/unit/bind`, `tests/fixtures`,
 `tests/harness/scenarios`.
 
+**Ruling during WP-40 (item 5, lambdas that cannot be told apart).** Within one enclosing function, lambdas whose call
+operators have the same signature and no captures (Godot's `SNAME`) are paired by code equivalence: each new call operator
+with the old one that the unchanged-function comparator (WP-25) finds identical, one-to-one, even when that contradicts the
+compiler's numbering (a swap of two lines). If exactly one lambda is left on each side, those two pair. Otherwise, or where
+the comparator cannot decide, they pair by number with a warning (CML3600–3629) naming the function. The comparator must
+tell apart bodies that differ only in a string literal, or step one is not used.
+
 ### WP-41: corpus, an `/arch:AVX2`, unity-built, static-library project (R-06)
 
 **Decision.** Add a fourth corpus project that is built with `/arch:AVX2`, as a set of static libraries, with CMake's unity
