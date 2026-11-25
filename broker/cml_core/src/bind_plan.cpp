@@ -537,6 +537,10 @@ private:
     // operator procedure `old_op`): the same enclosing function, the same layout, the same statics and the same call operator
     // signature are required. "" when they all agree.
     std::string elimination_problem(const std::string& fresh, const std::string& old, const Sym& op, const pdb::SymbolView& old_op);
+    // WP-46 (final review): why a closure paired by elimination cannot be: state of a user of the closure that is not one of
+    // its members (a static of `run<<lambda>>`, data whose name holds the closure) would be renamed with it, i.e. constructed
+    // again while the old one is abandoned. "" when no such state exists on either side.
+    std::string closure_user_state(const std::string& fresh, const std::string& old);
 
     // ---- helpers ----
     void fatal(Diag d) {
@@ -1701,6 +1705,42 @@ std::string Planner::elimination_problem(const std::string& fresh, const std::st
     return {};
 }
 
+std::string Planner::closure_user_state(const std::string& fresh, const std::string& old) {
+    // The patch: writable data whose decorated name holds the new closure without being a static of its call operator: a
+    // function-local static (or guard) of a template over it (`?r@?1???$run@V<lambda_X>@@...`), or a variable whose type is it.
+    // Its name changed with the closure's, so it would be a new variable. Read-only data (vtables, RTTI of such templates) is
+    // a fresh copy anyway and holds no state.
+    for (const Sym& sy : syms_) {
+        if (!sy.defined || sy.dec.type != SymbolType::Data || sy.dec.section == 0 || sy.name.find(fresh) == std::string::npos) {
+            continue;
+        }
+        const SecInfo& sec = secs_[sy.dec.section - 1];
+        if (sec.runtime_table || (sec.sec->characteristics & coff::scn::MemWrite) == 0 || hashed_closure_static(sy.name) == fresh) {
+            continue;
+        }
+        CML_LOG(Info, "WP46-ELIMINATION object=%s new=%s user-state=%s refused", in_.object_name.c_str(), fresh.c_str(), sy.name.c_str());
+        return "the patch's data " + describe(sy) + " belongs to a user of the lambda (a template over it, or a variable of its type), whose name changes with the lambda's: it would be constructed again and the running one abandoned";
+    }
+    // The old image: data recorded in a procedure that names the old closure without being one of its members
+    // ("run<<lambda_Y>>" holds `r`; the closure's own members are "<lambda_Y>::operator()", "<lambda_Y>::<lambda_invoker_cdecl>").
+    if (!ensure_compiland_symbols()) {
+        return "the old records of compiland " + std::to_string(ci_) + " cannot be read";
+    }
+    for (const pdb::SymbolView& v : comp_syms_) {
+        if (!pdb::is_data_kind(v.kind)) {
+            continue;
+        }
+        const std::string_view owner = v.parent_proc != pdb::kNoSymbol && v.parent_proc < comp_syms_.size() ? comp_syms_[v.parent_proc].name : v.name;
+        if (owner.find(old) == std::string_view::npos || starts_with(owner, old + "::")) {
+            continue;
+        }
+        CML_LOG(Info, "WP46-ELIMINATION object=%s old=%s user-state=%s in '%s' refused", in_.object_name.c_str(), old.c_str(), std::string(v.name).c_str(), std::string(owner).c_str());
+        return "the old image's static '" + std::string(v.name) + "' of '" + std::string(owner) +
+               "' belongs to a user of the lambda (a template over it), whose name changes with the lambda's: its state would be abandoned and constructed again";
+    }
+    return {};
+}
+
 void Planner::pair_hashed_by_elimination() {
     closure_pairing_ = in_.closure_pairing;
     struct Side {
@@ -1824,8 +1864,11 @@ void Planner::pair_hashed_by_elimination() {
                 break;
             }
         }
-        const std::string problem = op == nullptr || gone.proc == nullptr ? std::string("one of them has no call operator")
-                                                                          : elimination_problem(new_left[0], old_left[0], *op, *gone.proc);
+        std::string problem = op == nullptr || gone.proc == nullptr ? std::string("one of them has no call operator")
+                                                                    : elimination_problem(new_left[0], old_left[0], *op, *gone.proc);
+        if (problem.empty()) {
+            problem = closure_user_state(new_left[0], old_left[0]);
+        }
         if (!problem.empty()) {
             CML_LOG(Info, "WP46-ELIMINATION object=%s new=%s old=%s refused (%s)", in_.object_name.c_str(), new_left[0].c_str(), old_left[0].c_str(), problem.c_str());
             error(diag::kHashedLambdasUnproven,

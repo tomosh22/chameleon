@@ -2846,7 +2846,9 @@ ClosureTypes closure_types(Types& t, const std::string& closure, std::uint32_t m
 
 // The old compiland (cl): kHash1's call operator (text 0x60; `c` 0x20, `$TSS0` 0x28) held by ll_a (0xA0), kHash3's (0x80;
 // 0x30, 0x38) held by ll_b (0xC0); ll_g (0xE0) holds none. Each closure captures one int.
-void evidence_world(SynthWorld& w) {
+// `run_template` (final review): 1 the old image also has an instance `run<kHash3>` of a template over the lambda, 2 with a
+// static `r` of it.
+void evidence_world(SynthWorld& w, int run_template = 0) {
     Types t;
     const std::uint32_t holder = t.fn(tp::kTInt, {});
     const ClosureTypes c1 = closure_types(t, kHash1, tp::kTInt);
@@ -2868,6 +2870,9 @@ void evidence_world(SynthWorld& w) {
     held("ll_a", 0xA0, c1.forward);
     held("ll_b", 0xC0, c3.forward);
     held("ll_g", 0xE0, 0);
+    if (run_template != 0) {
+        old_proc(w, "run<" + kHash3 + ">", 0x100, holder, run_template == 2 ? std::vector<std::pair<std::string, std::uint32_t>>{{"r", 0x40}} : std::vector<std::pair<std::string, std::uint32_t>>{});
+    }
     w.pub_func("?ll_a@@YAHXZ", 0xA0);
     w.pub_func("?ll_b@@YAHXZ", 0xC0);
     w.pub_func("?ll_g@@YAHXZ", 0xE0);
@@ -2881,6 +2886,7 @@ struct EditedLambda {
     std::uint32_t member = tp::kTInt;
     std::string name = "c";
     bool local = true;  // the holder has a local of the closure's type
+    int run_template = 0;  // (final review) 1: the patch has run<kEdited3>, a template over the lambda; 2: with a static `r`
 };
 Built evidence_object(const EditedLambda& e) {
     Types t;
@@ -2907,6 +2913,14 @@ Built evidence_object(const EditedLambda& e) {
     held(e.holder, e.local ? c3.forward : 0);
     if (e.holder != "ll_b") {
         held("ll_b", 0);
+    }
+    if (e.run_template != 0) {
+        const std::string run = "??$run@V" + kEdited3 + "@@@@YAHV" + kEdited3 + "@@@Z";
+        o.proc(run, "run<" + kEdited3 + ">", false, holder);
+        if (e.run_template == 2) {
+            o.local("?r@?1?" + run + "@4URegistry@@A", "r");
+        }
+        o.end();
     }
     return o.build(t.set.debug_t());
 }
@@ -3355,4 +3369,36 @@ TEST_CASE("hash-named lambdas (WP-46 second review): a template that takes the l
     CHECK_MESSAGE(contains(errors[0].message, "the function that holds the lambda is not known on both sides"), errors[0].message);
     CHECK(decision(partial, hashed_op(kEdited3)).decision != DecisionKind::PatchHooked);
     CHECK(decision(partial, hashed_static(kEdited3)).decision != DecisionKind::BindOldData);
+}
+
+TEST_CASE("hash-named lambdas (WP-46 final review): a template over the edited lambda with a static of its own refuses the elimination") {
+    // `template <class F> int run(F f) { static Registry r = make_registry(); return f(); }`, called with the edited lambda. The
+    // instance's name holds the closure: run<kHash3> in the old image, run<kEdited3> in the patch. fd383e5 paired the lambdas
+    // and left the renamed instance's `r` new: make_registry() would run a second time and the running `r` be abandoned.
+    SUBCASE("with the static: CML3630, naming it") {
+        SynthWorld w;
+        evidence_world(w, 2);
+        EditedLambda e;
+        e.run_template = 2;
+        Built b = evidence_object(e);
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+        REQUIRE_FALSE(errors.empty());
+        CHECK(errors[0].code == diag::kHashedLambdasUnproven);
+        CHECK_MESSAGE(contains(errors[0].message, "belongs to a user of the lambda (a template over it, or a variable of its type)"), errors[0].message);
+        CHECK(contains(errors[0].message, "?r@?1???$run@V" + kEdited3));
+        CHECK(decision(partial, hashed_op(kEdited3)).decision != DecisionKind::PatchHooked);
+    }
+    SUBCASE("without a static: a new instance, no state; the lambdas are still paired by elimination") {
+        SynthWorld w;
+        evidence_world(w, 1);
+        EditedLambda e;
+        e.run_template = 1;
+        Built b = evidence_object(e);
+        auto r = plan_bind(w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        CHECK(decision(*r, hashed_op(kEdited3)).old_address.rva == 0x1080);
+        CHECK(decision(*r, hashed_static(kEdited3)).old_address.rva == 0x3030);
+    }
 }
