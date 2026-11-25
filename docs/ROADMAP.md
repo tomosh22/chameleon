@@ -79,6 +79,7 @@ fixtures" to "works on your project".
 | R-52 | **A refused multi-compiland reload is partly applied (F-41.4, WP-41).** The pipeline plans and applies compilands one at a time (`pipeline.cpp`, `for (Unit& u : units)`) and stops at the first refusal, so the compilands before it stay patched while the reply is `ok:false`. After a refused header edit, the process runs the new inline code in some compilands and the old code in the others, and the files on disk need not match either. Evidence: corpus jolt/msvc `header-fanout-update-context` on e43d5c7 (job 138912904419): `patch_applied ... generation 7, hooks 26` before the CML3214 for batch 14. Direction: plan (and link) every unit before applying any, so a refusal applies nothing; `revert` of the batch is the stop-gap. | WP-41 (#69) |
 | R-53 | **A module freed and loaded again within one agent module poll (500 ms) is invisible.** The agent diffs module snapshots, so a FreeLibrary + LoadLibrary at the same base between two polls looks like no change: the new image runs its original code, the broker keeps the old state, and nothing is re-applied or reported. Direction: an agent-side load/unload notification (for example `LdrRegisterDllNotification`) or comparing the image's timestamp/checksum or a load counter in each snapshot. Needs an agent change. | WP-45 (#73) |
 | R-54 | **An own static can take a fully inlined, deleted lambda's static (clang-cl -O2).** With no `operator()` procedure left in the old image, the planner cannot see that a record named `x` directly in `f` belonged to `f`'s lambda; an edit that deletes the lambda and declares `static x` in `f` binds it to the lambda's live object. Needs closure classes from the TPI (by name) or the caller's `S_INLINESITE`s in `cml_pdb`. Assigned to WP-46. | WP-40 (#72) |
+| R-55 | **A hot-restart of the Godot editor takes over two minutes** (131–167 s in the godot-gdextension corpus cell, before and after WP-45). Not measured by stage. | WP-45 (#73) corpus logs |
 
 ---
 
@@ -90,5 +91,6 @@ fixtures" to "works on your project".
    wrong state), WP-41 and WP-42 = R-06 (corpus), WP-43 = R-40 + R-42 (restart, revert), WP-44 = rest of R-42 + R-49 + R-51.
 2. **In parallel (User):** R-10 dogfooding, R-11 and R-12 checklists, R-30/R-31 decisions.
 3. **Then:** fixes from R-10 as they come; R-46, R-47.
+   **Wave 12 (Eng), proposed (ADR-0044):** WP-47 = R-52, WP-48 = R-53, WP-49 = R-46, WP-50 = R-47 + R-55.
 4. **Before first sale (User + Eng):** R-32, R-33, R-34, R-35.
 5. **After GA:** R-20 / R-21 per the positioning decision, R-23 research.

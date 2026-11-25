@@ -1379,3 +1379,58 @@ predates WP-40 and does not hold its merge. Queue order: WP-45, WP-46, then WP-4
   merges main and re-runs the corpus.
 - CI capacity is the bottleneck (a `ci` run took over an hour in wave 10 with four branches pushing). Agents batch commits,
   push once per fix round, and hand back while their runs are queued; the orchestrator resumes them.
+
+## ADR-0044 Wave 12: reload atomicity, module-load visibility, reload cost (WP-47..WP-50)
+
+**Date:** 2026-11-25 · **Status:** Proposed (accepted when wave 11 closes)
+
+Wave 11 (ADR-0043) closed R-06, R-40, R-42, R-48, R-49, R-50, R-51 and R-54 (WP-46, pending merge). The roadmap's next step is
+"fixes from R-10 as they come; R-46, R-47"; R-10 (dogfooding) has produced no findings yet. Wave 11 itself found two correctness
+gaps, R-52 and R-53; a correctness gap outranks cost, so they lead.
+
+| WP | Roadmap | Title | Branch | Review |
+|---|---|---|---|---|
+| WP-47 | R-52 | A refused multi-compiland reload applies nothing | `wp/47-atomic-reload` | high (pipeline, hooks) |
+| WP-48 | R-53 | The agent sees every module load and unload | `wp/48-module-events` | high (agent) |
+| WP-49 | R-46 | Hook narrowing verifies jump tables in a function's own code | `wp/49-jump-tables` | high (hook narrowing) |
+| WP-50 | R-47, R-55 | First-reload cost and hot-restart time in large projects | `wp/50-reload-cost` | medium |
+
+### WP-47: a refused multi-compiland reload applies nothing (R-52)
+
+**Decision.** A reload plans, links and verifies every compiland before it applies any: a refusal (any planner, link or
+narrowing diagnostic) of one compiland leaves the running process unchanged and the reply `ok:false` names the refused unit. The
+apply phase (load, fix-ups, initialisers, hooks) then runs per compiland as today; a failure *during* apply rolls back the units
+already applied in that reload (the WP-22 batch revert). Range CML3650–3669. **Acceptance:** a cmltest scenario with a header edit
+over three compilands, the third refused, shows no `patch_applied` and the old values in all three, in all 8 cells; the Jolt and
+raylib corpus cells stay green; a unit test per failure point (plan, link, narrowing, apply); and the
+F-41.4 evidence (`patch_applied` before a refusal) no longer appears in any corpus log.
+
+### WP-48: the agent sees every module load and unload (R-53)
+
+**Decision.** The agent registers for loader notifications (`LdrRegisterDllNotification`, documented in the Windows SDK) and
+records each load and unload with a per-process sequence number, so a FreeLibrary + LoadLibrary inside one poll is reported as an
+unload and a load. The notification callback only appends to a preallocated lock-free ring and never calls the loader or
+allocates; the existing poll drains it. The snapshot diff stays as the fallback. A new message type is needed (`ModuleEvents`),
+so `agent_abi_version` is bumped by one with a broker that still accepts the old agent (falls back to snapshots). Range
+CML4700–4719 (agent), CML5620–5629 (broker). **Acceptance:** the `plugin_reload` fixture gains a step that frees and loads the
+DLL within 50 ms; the edit is re-applied in all 8 cells; WP10-REPEAT stays 25/25.
+
+### WP-49: hook narrowing verifies jump tables (R-46)
+
+**Decision.** A jump table in a function's own code (cl `/Od` switch: ADDR32NB entries to labels in the same function) is
+compared entry by entry, relative to the function start, instead of making the function "unverifiable". A table whose entries
+leave the function, or that cannot be bounded, stays unverifiable. **Acceptance:** the WP-39 benchmark project's one-function
+edit hooks only the edited function (was 274 of 275); unit tests with cl `/Od` switch objects; `hooks_dropped` grows in the
+corpus logs and no corpus cell regresses.
+
+### WP-50: first-reload cost and hot-restart time (R-47, R-55)
+
+**Decision.** Measure before changing: agent-side timestamps for `InstallHooks`, and a breakdown of a Godot hot-restart
+(131–167 s in the godot-gdextension cell: process start, registration, PDB index, re-apply). Then fix what the measurement
+shows, within the broker and the agent's logging. R-55 is added to the roadmap: *a hot-restart of the Godot editor takes over two
+minutes*. **Acceptance:** the breakdown lines in CI for both; the first reload in the WP-39 benchmark within 300 ms of later ones;
+the Godot hot-restart under 60 s, or a measured, documented reason why not.
+
+WP-47..WP-50 start together (four at once). Shared file: `broker/cml_core/src/pipeline.cpp` (WP-47 and WP-49); whoever merges
+second merges main and re-runs. Rules as in ADR-0043: one PR per WP, CI on the Windows matrix is the only acceptance, the
+orchestrator reads the logs; "refuse what cannot be proven" stands.
