@@ -1177,6 +1177,17 @@ functions. The decision is reversed **together with** a reference check, which i
   needs no workflow change), the timing part of `tests/corpus/run_corpus.ps1`, `.github/workflows/corpus.yml`.
   Broker code only for a fix under point 3.
 
+**Rulings (WP-46 round 1 findings):** F-41.2 is a counting defect, not changing names: cl's `<lambda_HASH>` closures (the
+legacy lambda processor, `/std:c++17` without `/permissive-`) have no enclosing scope, so the planner compared one pseudo-function
+holding every closure of the TU, old side including call operators already paired by their public names. Fix: leave publicly paired
+old call operators out of the comparison. Because how cl derives the hash is undocumented, every pairing of a hash-named closure is
+proven by code (the WP-25 comparator, rule (d)'s single changed pair allowed) or refused (CML3630); a cl `/std:c++17` fixture with an
+edit that inserts a lambda shows on CI whether the names shift. F-41.3: drop the scalar deleting destructor (`??_G`, a parameter
+`should_call_delete`) from destructor candidates. F-41.1 under clang-cl: a guard without a record does not block pairing by place
+only in a compiland that records no guards; its placement is then decided by `settle_guards` from the layout statics paired by place
+teach, or refused (CML3600). R-54: a lazy TPI closure lookup in `cml_pdb`; an own static of a function that had a closure with no
+`operator()` procedure is refused (CML3207), including when that lambda had no static (accepted over-refusal).
+
 ### Shared files and merge order
 
 - `tests/corpus/run_corpus.ps1`: WP-38 owns the decoder step, WP-39 the timing output; WP-36 and WP-37 change only
