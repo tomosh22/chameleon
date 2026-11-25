@@ -1,6 +1,6 @@
 # WP-26: runs Chameleon against one open-source project built with one compiler (docs/wp/WP-26.md).
 #
-#   pwsh tests/corpus/run_corpus.ps1 -Project raylib|imgui|godot -Compiler msvc|clang-cl `
+#   pwsh tests/corpus/run_corpus.ps1 -Project raylib|imgui|godot|godot-gdextension -Compiler msvc|clang-cl `
 #        -ChameleonBin <build>/bin -WorkDir <dir> [-CxxPath <full path of cl / clang-cl>] [-ReloadBudgetMsPerTu <ms>]
 #
 # Steps (each is a row of the pass/fail matrix, <WorkDir>/out-<project>-<compiler>/matrix.json):
@@ -8,9 +8,15 @@
 #   build      the project's build.ps1 with the flags of docs/BUILD_REQUIREMENTS.md
 #   check      cml_broker check (WP-18) must pass on the build
 #   decode     cml_lde_probe: the hook installer's instruction-length decoder over every function entry of the PDB
+#              (both also for every module of project.json extra_modules, as check:<file> / decode:<file>)
 #   enable     broker + the application with the agent: module enabled, PDB index ready, frames printed
 #   edit:<id>  one edit of project.json, `reload`, the change is observable, the application keeps running
 #   refused:<id>  the deliberately unsupported edit is refused with its diagnostic and the application keeps running
+#   signal:<id>, check:<id>  (WP-42) an edit of kind "signal" writes a file the application polls (`write`), then waits
+#              for the `expect` line(s), a marker count that grows (`expect_grows`) and, with `wait_module`, a module of
+#              the process (path regex) that is enabled with its PDB index ready; kind "check" only observes.
+#   restart:<id>  (WP-42) hot-restart (`restart` on the control pipe): asserts `expect_diag`, `expect_not_enabled` (a
+#              path regex in the result's not_enabled), `expect_reapplied`, then follows the new pid.
 #   reload-budget (WP-39, only with -ReloadBudgetMsPerTu): every accepted reload took at most that many ms of
 #              `total - compile` per recompiled translation unit. Every cell prints the stage timings of each accepted
 #              reload as `WP39-<PROJECT> edit=<id> total_ms=... compile_ms=... rest_ms=... budget_ms=...` (also in the
@@ -18,7 +24,7 @@
 # Exit code 1 when a step failed (an `expected_failure` of project.json is asserted and counts as passed).
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet('raylib', 'imgui', 'godot')][string]$Project,
+    [Parameter(Mandatory)][ValidateSet('raylib', 'imgui', 'godot', 'godot-gdextension')][string]$Project,
     [Parameter(Mandatory)][ValidateSet('msvc', 'clang-cl')][string]$Compiler,
     [Parameter(Mandatory)][string]$ChameleonBin,
     [Parameter(Mandatory)][string]$WorkDir,
@@ -34,16 +40,26 @@ $ChameleonBin = (Resolve-Path $ChameleonBin).Path
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 $WorkDir = (Resolve-Path $WorkDir).Path
 $cfg = Get-Content (Join-Path $here "$Project/project.json") -Raw | ConvertFrom-Json
+if ($cfg.base_project) {
+    # WP-42: a project built on another one's checkout takes its pin and patch from that project's project.json (one place,
+    # so they cannot drift from the files the other project's build cache is keyed on) and its checkout src-<base>.
+    $baseCfg = Get-Content (Join-Path $here "$($cfg.base_project)/project.json") -Raw | ConvertFrom-Json
+    foreach ($key in 'repo', 'tag', 'commit', 'support_dir') { $cfg | Add-Member -Force -NotePropertyName $key -NotePropertyValue $baseCfg.$key }
+    $cfg | Add-Member -Force -NotePropertyName 'patch' -NotePropertyValue "../$($cfg.base_project)/$($baseCfg.patch)"
+    $cfg | Add-Member -Force -NotePropertyName 'src_dir' -NotePropertyValue "src-$($cfg.base_project)"
+}
 $out = Join-Path $WorkDir "out-$Project-$Compiler"
 New-Item -ItemType Directory -Force -Path $out | Out-Null
 $src = Join-Path $WorkDir "src-$Project"
 $buildDir = Join-Path $WorkDir "build-$Project-$Compiler"
 if ($Project -eq 'godot') { $src = Join-Path $WorkDir "src-godot" }   # one checkout (and one scons build tree) per cell
+if ($cfg.src_dir) { $src = Join-Path $WorkDir $cfg.src_dir }         # WP-42: base_project, a checkout shared with another project
 $latin1 = [System.Text.Encoding]::GetEncoding(28591)
 $script:Matrix = New-Object System.Collections.Generic.List[object]
 $script:Originals = @{}
 $script:Prev = @{}
 $script:ExePath = $null
+$script:ExtraModules = @()   # WP-42: further modules build.ps1 produced (objects with path), named in project.json extra_modules
 $script:Broker = $null
 $script:App = $null
 $script:Ctl = $null
@@ -76,7 +92,11 @@ function Invoke-Step([string]$Name, [scriptblock]$Body) {
         $msg = ($_ | Out-String).Trim()
         if ($msg.Length -gt 1500) { $msg = $msg.Substring(0, 1500) }
         $expected = $cfg.expected_failures | Where-Object { $_.step -eq $Name -and ($_.compiler -eq $Compiler -or $_.compiler -eq '*') } | Select-Object -First 1
-        if ($expected) {
+        if ($expected -and $expected.match -and ([string]$_.Exception.Message) -notmatch [string]$expected.match) {
+            # WP-41: an expected failure may name the failure (`match`, a regex over the error message): failing in another
+            # way is a failure, not the documented one.
+            Add-Result $Name 'fail' ("expected to fail with /{0}/ ({1}), failed otherwise: {2}" -f $expected.match, $expected.reason, $msg) $watch.Elapsed.TotalSeconds
+        } elseif ($expected) {
             Add-Result $Name 'expected-fail' ("{0} -- {1}" -f $expected.reason, $msg) $watch.Elapsed.TotalSeconds
         } else {
             Add-Result $Name 'fail' $msg $watch.Elapsed.TotalSeconds
@@ -148,7 +168,7 @@ function Wait-Corpus([string]$Regex, [int]$From, [int]$TimeoutSec) {
         for ($i = $From; $i -lt $lines.Count; $i++) {
             if ($lines[$i] -match $Regex) { return $lines[$i] }
         }
-        if ($script:App -and $script:App.HasExited) { throw "the application exited (code $($script:App.ExitCode)) while waiting for /$Regex/" }
+        if ($script:App -and $script:App.HasExited) { throw "the application exited (code $(Get-AppExitCode)) while waiting for /$Regex/" }
         Start-Sleep -Milliseconds 250
     }
     $tail = (Get-CorpusLines | Select-Object -Last 3) -join ' | '
@@ -160,6 +180,90 @@ function Get-BrokerCaps {
     if ($null -eq $raw) { throw 'no answer to status on the control pipe (connection closed or timeout)' }
     Write-Host "status: $raw"
     return ($raw | ConvertFrom-Json)
+}
+
+# The exit code of the application, or '?' (a process found by pid after a hot-restart was not started by this script).
+function Get-AppExitCode { try { [string]$script:App.ExitCode } catch { '?' } }
+
+# WP-42: the count of marker $Name in a CORPUS line (0 when it is not listed).
+function Get-MarkerCount([string]$Line, [string]$Name) {
+    $m = [regex]::Match($Line, 'markers=(\S*)')
+    if (-not $m.Success) { return [int64]0 }
+    foreach ($pair in $m.Groups[1].Value.Split(',')) {
+        $i = $pair.LastIndexOf(':')
+        if ($i -gt 0 -and $pair.Substring(0, $i) -eq $Name) { return [int64]$pair.Substring($i + 1) }
+    }
+    return [int64]0
+}
+
+# WP-42: waits until a CORPUS line after line index $From shows marker $Name with a higher count than the newest CORPUS
+# line before $From (the edited code runs now, not only before).
+function Wait-MarkerGrows([string]$Name, [int]$From, [int]$TimeoutSec) {
+    $lines = Get-CorpusLines
+    $base = [int64]0
+    for ($i = [Math]::Min($From, $lines.Count) - 1; $i -ge 0; $i--) {
+        if ($lines[$i] -like 'CORPUS frame=*') { $base = Get-MarkerCount $lines[$i] $Name; break }
+    }
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        $lines = Get-CorpusLines
+        for ($i = $From; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -like 'CORPUS frame=*' -and (Get-MarkerCount $lines[$i] $Name) -gt $base) { return $lines[$i] }
+        }
+        if ($script:App -and $script:App.HasExited) { throw "the application exited (code $(Get-AppExitCode)) while waiting for marker $Name to grow" }
+        Start-Sleep -Milliseconds 250
+    }
+    $tail = (Get-CorpusLines | Select-Object -Last 2) -join ' | '
+    throw "marker $Name did not grow past $base within ${TimeoutSec}s; last lines: $tail"
+}
+
+# WP-42: the modules the broker lists for the application's process (status), as objects with path, enabled, index.
+function Get-AppModules {
+    $raw = $script:Ctl.Call('status', $null, 30000)
+    if ($null -eq $raw) { throw 'no answer to status on the control pipe (connection closed or timeout)' }
+    $st = $raw | ConvertFrom-Json
+    $proc = @($st.result.processes | Where-Object { [int]$_.pid -eq $script:App.Id }) | Select-Object -First 1
+    if ($null -eq $proc) { return @() }
+    return @($proc.modules)
+}
+
+# WP-42: waits until a module of the application's process whose path matches $Regex is enabled and its PDB index ready.
+function Wait-ModuleReady([string]$Regex, [int]$TimeoutSec) {
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $last = 'not listed'
+    while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        $m = @(Get-AppModules | Where-Object { $_.path -match $Regex }) | Select-Object -First 1
+        if ($m) {
+            $state = if ($m.index) { [string]$m.index.state } else { 'none' }
+            $last = "enabled=$($m.enabled) index=$state $(if ($m.index) { $m.index.message })"
+            if ($m.enabled -and $state -eq 'ready') { return "$($m.path) enabled, index ready" }
+            if ($state -eq 'failed') { throw "module /$Regex/: index failed: $last" }
+        }
+        if ($script:App.HasExited) { throw "the application exited (code $(Get-AppExitCode)) while waiting for module /$Regex/" }
+        Start-Sleep -Milliseconds 1000
+    }
+    throw "module /$Regex/ of pid $($script:App.Id) not enabled with a ready index within ${TimeoutSec}s ($last)"
+}
+
+# WP-42: the step name of an entry of `edits`.
+function Get-EditStepName($e) {
+    switch ([string]$e.kind) {
+        'signal' { return "signal:$($e.id)" }
+        'check' { return "check:$($e.id)" }
+        'restart' { return "restart:$($e.id)" }
+    }
+    if ($e.expect_error) { return "refused:$($e.id)" }
+    return "edit:$($e.id)"
+}
+
+# WP-42: writes the file an edit of kind signal/restart names ({work} is the work directory), for the application to read.
+function Write-Signal($edit) {
+    if (-not $edit.write) { return }
+    $path = ([string]$edit.write.file).Replace('{work}', $WorkDir)
+    # Written to a temporary file and renamed over the control file, so the application never reads half of it.
+    [System.IO.File]::WriteAllText("$path.tmp", [string]$edit.write.text)
+    [System.IO.File]::Move("$path.tmp", $path, $true)
+    Write-Host "signal: wrote '$($edit.write.text)' to $path"
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -216,11 +320,14 @@ if ($fetched) {
 # ---------------------------------------------------------------------------------------------------------------------
 # check (WP-18) and decode (plan section 11)
 # ---------------------------------------------------------------------------------------------------------------------
-if ($built) {
-    Invoke-Step 'check' {
-        $log = Join-Path $out 'check.txt'
+# One module: the executable's steps are `check` / `decode`; a module of $script:ExtraModules (WP-42) gets
+# `check:<file>` / `decode:<file>`, its own logs and its own minimum function count.
+function Test-Module([string]$ModulePath, [string]$Suffix, [string]$MinFunctions) {
+    $tag = if ($Suffix) { "-$Suffix" } else { '' }
+    Invoke-Step $(if ($Suffix) { "check:$Suffix" } else { 'check' }) {
+        $log = Join-Path $out "check$tag.txt"
         Remove-Item $log -ErrorAction SilentlyContinue
-        & (Join-Path $ChameleonBin 'cml_broker.exe') check --verbose $script:ExePath *>&1 | Tee-Object -FilePath $log | Out-Host
+        & (Join-Path $ChameleonBin 'cml_broker.exe') check --verbose $ModulePath *>&1 | Tee-Object -FilePath $log | Out-Host
         $rc = $LASTEXITCODE
         $text = Get-Content $log -Raw
         $ids = ([regex]::Matches($text, 'CML\d{4}') | ForEach-Object { $_.Value } | Sort-Object -Unique) -join ','
@@ -229,10 +336,10 @@ if ($built) {
         "exit 0, $warn WARN, ids: $ids"
     } | Out-Null
 
-    Invoke-Step 'decode' {
-        $log = Join-Path $out 'decode.txt'
+    Invoke-Step $(if ($Suffix) { "decode:$Suffix" } else { 'decode' }) {
+        $log = Join-Path $out "decode$tag.txt"
         Remove-Item $log -ErrorAction SilentlyContinue
-        $probeArgs = @($script:ExePath, '--quiet', '--fail-on-unknown-opcode', '--min-functions', [string]$cfg.min_functions)
+        $probeArgs = @($ModulePath, '--quiet', '--fail-on-unknown-opcode', '--min-functions', $MinFunctions)
         & (Join-Path $ChameleonBin 'cml_lde_probe.exe') @probeArgs *>&1 | Tee-Object -FilePath $log | Out-Host
         $rc = $LASTEXITCODE
         $text = Get-Content $log -Raw
@@ -249,9 +356,24 @@ if ($built) {
         }
         $summary
     } | Out-Null
+}
+
+if ($built) {
+    Test-Module $script:ExePath '' ([string]$cfg.min_functions)
+    # WP-42: the modules project.json names in extra_modules (file, min_functions), wherever build.ps1 put them.
+    foreach ($em in @($cfg.extra_modules | Where-Object { $_ })) {
+        $extra = @($script:ExtraModules | Where-Object { (Split-Path $_.path -Leaf) -ieq $em.file }) | Select-Object -First 1
+        if ($null -eq $extra) {
+            Add-Result "check:$($em.file)" 'fail' 'build.ps1 did not list this module in $script:ExtraModules' 0
+            Skip-Step "decode:$($em.file)" 'module not built'
+            continue
+        }
+        Test-Module $extra.path $em.file ([string]$em.min_functions)
+    }
 } else {
     Skip-Step 'check' 'build failed'
     Skip-Step 'decode' 'build failed'
+    foreach ($em in @($cfg.extra_modules | Where-Object { $_ })) { Skip-Step "check:$($em.file)" 'build failed'; Skip-Step "decode:$($em.file)" 'build failed' }
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -382,16 +504,84 @@ if ($built) {
         }
         if (-not $ran) {
             $skipped = @($cfg.edits | Where-Object { -not $_.compiler -or $_.compiler -eq $Compiler })
-            foreach ($e in $skipped) { Skip-Step $(if ($e.expect_error) { "refused:$($e.id)" } else { "edit:$($e.id)" }) 'enable failed' }
+            foreach ($e in $skipped) { Skip-Step (Get-EditStepName $e) 'enable failed' }
             Skip-Step 'still-running' 'enable failed'
             if (@($skipped | Where-Object { $_.final }).Count -gt 0) { Skip-Step 'still-running-final' 'enable failed' }
         } else {
+            # WP-42: kind "signal" / "check": write the file the application polls (signal), then observe.
+            $doSignal = {
+                param($edit)
+                Invoke-Step (Get-EditStepName $edit) {
+                    if ($script:App.HasExited) { throw "the application had already exited (code $(Get-AppExitCode))" }
+                    $timeout = if ($edit.timeout_s) { [int]$edit.timeout_s } else { [int]$cfg.observe_timeout_s }
+                    if ($edit.absent_before) {
+                        $present = @(Get-AppModules | Where-Object { $_.path -match $edit.absent_before })
+                        if ($present.Count -gt 0) { throw "module /$($edit.absent_before)/ is already loaded before the signal: $($present[0].path)" }
+                    }
+                    $from = (Get-CorpusLines).Count
+                    Write-Signal $edit
+                    $seen = @()
+                    foreach ($rx in @($edit.expect | Where-Object { $_ })) { $seen += (Wait-Corpus $rx $from $timeout) }
+                    foreach ($mk in @($edit.expect_grows | Where-Object { $_ })) { $seen += (Wait-MarkerGrows $mk $from $timeout) }
+                    $mod = if ($edit.wait_module) { Wait-ModuleReady $edit.wait_module $cfg.index_timeout_s } else { '' }
+                    "{0}{1}observed: {2}" -f $mod, $(if ($mod) { '; ' } else { '' }), ($seen | Select-Object -Last 1)
+                } | Out-Null
+            }
+            # WP-42: kind "restart": hot-restart (WP-21) of the application through the control pipe.
+            $doRestart = {
+                param($edit)
+                Invoke-Step (Get-EditStepName $edit) {
+                    if ($script:App.HasExited) { throw "the application had already exited (code $(Get-AppExitCode))" }
+                    $caps = Get-BrokerCaps
+                    if ($caps.result.capabilities -notcontains 'restart') { throw 'the broker lacks the capability restart' }
+                    Write-Signal $edit
+                    $from = (Get-CorpusLines).Count
+                    $script:Ctl.Events.Clear()
+                    $oldPid = $script:App.Id
+                    $regMs = [int]$cfg.index_timeout_s * 1000
+                    $resp = $script:Ctl.Call('restart', ('{"pid":' + $oldPid + ',"timeout_ms":120000,"registration_timeout_ms":' + $regMs + '}'), $regMs + 180000)
+                    if ($null -eq $resp) { throw "no reply to restart within $([int]($regMs / 1000) + 180)s" }
+                    $script:Ctl.Pump(1500)
+                    Add-Content -Path (Join-Path $out 'reloads.jsonl') -Value ($resp)
+                    Write-Host "restart response: $resp"
+                    Write-Host "events: $(@($script:Ctl.Events | ForEach-Object { if ($_.Length -gt 400) { $_.Substring(0, 400) } else { $_ } }) -join ' || ')"
+                    $r = $resp | ConvertFrom-Json
+                    if (-not $r.ok) { throw "restart failed: $resp" }
+                    $newPid = [int]$r.result.new_pid
+                    $proc = Get-Process -Id $newPid -ErrorAction SilentlyContinue
+                    if ($null -eq $proc) { throw "the restarted process (pid $newPid) is not running" }
+                    $script:App = $proc
+                    if ($edit.expect_diag) {
+                        $diagSeen = ($resp -match $edit.expect_diag) -or (@($script:Ctl.Events | Where-Object { $_ -match $edit.expect_diag }).Count -gt 0)
+                        if (-not $diagSeen) { throw "the restart reported no $($edit.expect_diag): $resp" }
+                    }
+                    if ($edit.expect_not_enabled) {
+                        if (@($r.result.not_enabled | Where-Object { $_ -match $edit.expect_not_enabled }).Count -eq 0) {
+                            throw "not_enabled names no module matching /$($edit.expect_not_enabled)/: $(@($r.result.not_enabled) -join ', ')"
+                        }
+                    }
+                    if ($edit.expect_reapplied) {
+                        if ($r.result.reapply_error) { throw "re-applying the session's edits failed: $($r.result.reapply_error | ConvertTo-Json -Compress)" }
+                        if ([int]$r.result.reapplied_files -lt 1 -or [int]$r.result.patched -lt 1) { throw "the restart re-applied nothing (reapplied_files=$($r.result.reapplied_files), patched=$($r.result.patched))" }
+                    }
+                    # The old process printed on until it was terminated: look only after the new process's AGENT line.
+                    Wait-Corpus 'AGENT (enabled=\d|create failed)' $from $cfg.start_timeout_s | Out-Null
+                    $lines = Get-CorpusLines
+                    $k = $from
+                    while ($k -lt $lines.Count -and $lines[$k] -notmatch 'AGENT (enabled=\d|create failed)') { $k++ }
+                    if ($lines[$k] -notmatch 'enabled=1') { throw "the agent of the new process did not enable the module: $($lines[$k])" }
+                    $line = Wait-Corpus $(if ($edit.expect) { $edit.expect } else { 'CORPUS frame=' }) ($k + 1) $cfg.start_timeout_s
+                    "restart {0} ms: pid {1} -> {2}; not_enabled: {3}; reapplied_files={4} patched={5}; observed: {6}" -f $r.result.restart_ms, $oldPid, $newPid, (@($r.result.not_enabled) -join ', '), $r.result.reapplied_files, $r.result.patched, $line
+                } | Out-Null
+            }
             $doEdit = {
                 param($edit)
+                if ($edit.kind -eq 'signal' -or $edit.kind -eq 'check') { & $doSignal $edit; return }
+                if ($edit.kind -eq 'restart') { & $doRestart $edit; return }
                 $refused = [bool]$edit.expect_error
                 $name = if ($refused) { "refused:$($edit.id)" } else { "edit:$($edit.id)" }
                 Invoke-Step $name {
-                    if ($script:App.HasExited) { throw "the application had already exited (code $($script:App.ExitCode))" }
+                    if ($script:App.HasExited) { throw "the application had already exited (code $(Get-AppExitCode))" }
                     $editPath = Join-Path $src $edit.file
                     $keep = $false   # a refused or failed edit is undone, or every later reload would retry it
                     Apply-Edit $edit
@@ -430,7 +620,7 @@ if ($built) {
                 } | Out-Null
             }
             $stillRunning = {
-                if ($script:App.HasExited) { throw "the application exited (code $($script:App.ExitCode))" }
+                if ($script:App.HasExited) { throw "the application exited (code $(Get-AppExitCode))" }
                 $before = (Get-CorpusLines).Count
                 Wait-Corpus 'CORPUS frame=' $before 20 | Out-Null
                 'frames still printed after the last edit'
@@ -447,7 +637,7 @@ if ($built) {
         Stop-Session
         Restore-Originals
         Report-Crash
-        foreach ($f in 'broker.log', 'app.stderr.txt') {
+        foreach ($f in 'broker.log', 'app.stderr.txt', 'app.stdout.txt') {
             $p = Join-Path $out $f
             if ((Test-Path $p) -and $script:Failed) { Write-Host "---- tail of $f"; Get-Content $p -Tail 40 | Out-Host }
         }
