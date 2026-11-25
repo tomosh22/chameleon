@@ -248,12 +248,18 @@ TEST_CASE("plan_watch_roots: never climbs above min_depth") {
 }
 
 TEST_CASE("ChangeDispatcher delivers one batch per burst on its own thread") {
+    // The pushes of the first burst are 5 ms apart and the quiet window is 400 ms, so the burst stays one batch
+    // unless the runner stalls the pushing thread for 80 times the spacing. Even then nothing may be lost or mixed:
+    // every batch before b.cpp's push holds a.cpp only, and b.cpp arrives in a batch of its own, because the test
+    // waits for all of a.cpp to be delivered (two quiet windows after the last push) before it pushes b.cpp.
+    // (A 40 ms window was too tight for a loaded CI runner: a stall split the burst and the rest of a.cpp was
+    // delivered together with b.cpp, which is correct coalescing but not what the old assertion expected.)
     std::mutex m;
     std::condition_variable cv;
     std::vector<ChangeBatch> batches;
     CoalesceOptions options;
-    options.quiet = 40ms;
-    options.max_wait = 2000ms;
+    options.quiet = 400ms;
+    options.max_wait = 5000ms;
     ChangeDispatcher d(options, [&](const ChangeBatch& b) {
         std::lock_guard<std::mutex> lock(m);
         batches.push_back(b);
@@ -267,11 +273,20 @@ TEST_CASE("ChangeDispatcher delivers one batch per burst on its own thread") {
         std::unique_lock<std::mutex> lock(m);
         REQUIRE(cv.wait_for(lock, 10s, [&] { return !batches.empty(); }));
     }
+    std::this_thread::sleep_for(2 * options.quiet);  // anything of the first burst still pending is delivered now
+    std::size_t before_b = 0;
+    {
+        std::lock_guard<std::mutex> lock(m);
+        before_b = batches.size();
+        for (const ChangeBatch& batch : batches) {
+            CHECK(batch.present == std::vector<std::string>{watch_key(kDir + "a.cpp")});
+        }
+        MESSAGE("first burst delivered in " << before_b << " batch(es); 1 unless the runner stalled for 400 ms");
+    }
     d.push(ev(FsAction::Modified, "b.cpp"));
     {
         std::unique_lock<std::mutex> lock(m);
-        REQUIRE(cv.wait_for(lock, 10s, [&] { return batches.size() >= 2; }));
-        CHECK(batches[0].present == std::vector<std::string>{watch_key(kDir + "a.cpp")});
-        CHECK(batches[1].present == std::vector<std::string>{watch_key(kDir + "b.cpp")});
+        REQUIRE(cv.wait_for(lock, 10s, [&] { return batches.size() > before_b; }));
+        CHECK(batches[before_b].present == std::vector<std::string>{watch_key(kDir + "b.cpp")});
     }
 }
