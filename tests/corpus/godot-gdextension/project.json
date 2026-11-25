@@ -1,0 +1,148 @@
+{
+  "name": "godot-gdextension",
+  "repo": "https://github.com/godotengine/godot.git",
+  "tag": "4.5.1-stable",
+  "commit": "f62fdbde15035c5576dad93e586201f4d41ef0cb",
+  "license": "MIT",
+  "src_dir": "src-godot",
+  "support_dir": "platform/windows",
+  "patch": "../godot/chameleon.patch",
+  "godot_cpp": {
+    "repo": "https://github.com/godotengine/godot-cpp.git",
+    "tag": "godot-4.5-stable",
+    "commit": "e83fd0904c13356ed1d4c3d09f8bb9132bdc6b77",
+    "license": "MIT"
+  },
+  "args": [
+    "--headless",
+    "--max-fps",
+    "30",
+    "--path",
+    "{work}/gdext/project",
+    "--script",
+    "res://main.gd",
+    "--",
+    "--ctl={work}/gdext_ctl.txt"
+  ],
+  "env": {},
+  "edits": [
+    {
+      "id": "plugin-load-lazily",
+      "kind": "signal",
+      "absent_before": "corpus_plugin\\.dll$",
+      "write": { "file": "{work}/gdext_ctl.txt", "text": "loaded 1" },
+      "expect": [
+        "markers=\\S*plugin_init:1\\b",
+        "markers=\\S*plugin_enabled_ok:1\\b"
+      ],
+      "wait_module": "corpus_plugin\\.dll$"
+    },
+    {
+      "id": "plugin-function",
+      "file": "../gdext/src/corpus_plugin.cpp",
+      "replace": [
+        {
+          "find": "    corpus_plugin_marker(\"plugin_tick\");\n",
+          "with": "    corpus_plugin_marker(\"plugin_tick\");\n    corpus_plugin_marker(\"plugin_tick_v2\");\n"
+        }
+      ],
+      "expect": "markers=\\S*plugin_tick_v2:\\d+"
+    },
+    {
+      "id": "host-calls-plugin",
+      "file": "core/extension/gdextension.cpp",
+      "replace": [
+        {
+          "find": "\t\tGDExtensionCallError ce{ GDEXTENSION_CALL_OK, 0, 0 };\n",
+          "with": "\t\tcml_corpus_marker(\"godot_gdext_call_v2\");\n\t\tGDExtensionCallError ce{ GDEXTENSION_CALL_OK, 0, 0 };\n"
+        }
+      ],
+      "include": "platform/windows/chameleon_corpus.h",
+      "expect": "markers=\\S*godot_gdext_call_v2:\\d+"
+    },
+    {
+      "id": "plugin-unload-load",
+      "kind": "signal",
+      "write": { "file": "{work}/gdext_ctl.txt", "text": "loaded 2" },
+      "expect": [
+        "markers=\\S*plugin_deinit:1\\b",
+        "markers=\\S*plugin_init:2\\b",
+        "markers=\\S*plugin_image_fresh:2\\b",
+        "markers=\\S*plugin_enabled_ok:2\\b"
+      ],
+      "wait_module": "corpus_plugin\\.dll$"
+    },
+    {
+      "id": "host-edit-after-plugin-reload",
+      "kind": "check",
+      "expect_grows": "godot_gdext_call_v2",
+      "timeout_s": 30
+    },
+    {
+      "id": "plugin-edit-survives-reload",
+      "kind": "check",
+      "expect_grows": "plugin_tick_v2",
+      "timeout_s": 30
+    },
+    {
+      "id": "plugin-function-after-reload",
+      "file": "../gdext/src/corpus_plugin.cpp",
+      "replace": [
+        {
+          "find": "    corpus_plugin_marker(\"plugin_tick\");\n",
+          "with": "    corpus_plugin_marker(\"plugin_tick\");\n    corpus_plugin_marker(\"plugin_tick_v3\");\n"
+        }
+      ],
+      "expect": "markers=\\S*plugin_tick_v3:\\d+"
+    },
+    {
+      "id": "hot-restart-lazy-plugin",
+      "kind": "restart",
+      "write": { "file": "{work}/gdext_ctl.txt", "text": "keep" },
+      "expect_diag": "CML5809",
+      "expect_not_enabled": "corpus_plugin\\.dll$",
+      "expect_reapplied": true
+    },
+    {
+      "id": "plugin-load-after-restart",
+      "kind": "signal",
+      "absent_before": "corpus_plugin\\.dll$",
+      "write": { "file": "{work}/gdext_ctl.txt", "text": "loaded 3" },
+      "expect": [
+        "markers=\\S*plugin_init:1\\b",
+        "markers=\\S*plugin_enabled_ok:1\\b"
+      ],
+      "wait_module": "corpus_plugin\\.dll$"
+    },
+    {
+      "id": "host-edit-reapplied-after-restart",
+      "kind": "check",
+      "expect_grows": "godot_gdext_call_v2",
+      "timeout_s": 30
+    },
+    {
+      "id": "plugin-edits-reapplied-after-restart",
+      "kind": "check",
+      "expect_grows": "plugin_tick_v3",
+      "timeout_s": 30
+    },
+    {
+      "id": "plugin-function-after-restart",
+      "file": "../gdext/src/corpus_plugin.cpp",
+      "replace": [
+        {
+          "find": "    corpus_plugin_marker(\"plugin_tick\");\n",
+          "with": "    corpus_plugin_marker(\"plugin_tick\");\n    corpus_plugin_marker(\"plugin_tick_v4\");\n"
+        }
+      ],
+      "expect": "markers=\\S*plugin_tick_v4:\\d+"
+    }
+  ],
+  "reload_timeout_s": 900,
+  "observe_timeout_s": 120,
+  "start_timeout_s": 600,
+  "index_timeout_s": 1800,
+  "min_functions": 50000,
+  "plugin_min_functions": 1000,
+  "expected_failures": []
+}

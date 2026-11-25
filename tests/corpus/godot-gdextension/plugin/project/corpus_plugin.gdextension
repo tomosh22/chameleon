@@ -1,0 +1,11 @@
+; WP-42 corpus plugin. Not listed in .godot/extension_list.cfg, so Godot does not load it at start-up: main.gd loads
+; it with GDExtensionManager.load_extension() when the corpus driver says so. Not reloadable (no temp copy of the DLL).
+[configuration]
+
+entry_symbol = "corpus_plugin_library_init"
+compatibility_minimum = "4.5"
+reloadable = false
+
+[libraries]
+
+windows.x86_64 = "res://bin/corpus_plugin.dll"
