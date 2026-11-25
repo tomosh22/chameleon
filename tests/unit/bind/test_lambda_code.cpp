@@ -174,9 +174,8 @@ private:
         } else {
             c = {0xB9, static_cast<std::uint8_t>(b.id), static_cast<std::uint8_t>(b.id >> 8), static_cast<std::uint8_t>(b.id >> 16), static_cast<std::uint8_t>(b.id >> 24)};
         }
-        for (const std::uint8_t x : {0x48, 0x8D, 0x05, 0, 0, 0, 0, 0xC3}) {  // lea rax,[rip+slot]; ret
-            c.push_back(x);
-        }
+        const std::vector<std::uint8_t> tail = {0x48, 0x8D, 0x05, 0, 0, 0, 0, 0xC3};  // lea rax,[rip+slot]; ret
+        c.insert(c.end(), tail.begin(), tail.end());
         while (c.size() < 16) {
             c.push_back(0xCC);
         }
