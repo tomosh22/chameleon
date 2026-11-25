@@ -58,7 +58,11 @@ public:
 
     // ---- control commands (control thread) ----
     // {"pid"?:N, "exception_id":N, "action":"continue"|"leave"|"ignore"|"reexecute"}  ->  {pid, exception_id, action}
-    // (WP-23: "reexecute" is refused with CML5908 while it is not offered.)
+    // (WP-23: "reexecute" is refused with CML5908 while it is not offered.) WP-44: an action for a held thread ends what failure
+    // injection armed for the next action of that process (group "exception-action"); the answer lists the stages that did not fire as
+    // `injection_disarmed`.
+    // WP-44: the stage exception-report (broker) makes on_exception publish a `diag` (CML5979) instead of the `exception` event; the
+    // thread stays held and pending.
     Result<ipc::json::Value> action(const ipc::json::Value& args);
     // {"pid"?:N}  ->  {"pending":[<exception event bodies>]}
     Result<ipc::json::Value> pending(const ipc::json::Value& args) const;
@@ -102,6 +106,9 @@ private:
     class PatchListener;
 
     ipc::ExceptionConfig make_config() const;
+    // The part of action() that talks to the agent (WP-44 split it off, so action() can end the failure-injection operation around it).
+    Result<ipc::json::Value> act(const std::shared_ptr<AgentLink>& link, std::uint32_t pid, const Key& key, const std::string& name,
+                                 ipc::ExceptionActionKind kind, std::uint32_t exception_id, const reexecute::Offer& offer);
     ipc::json::Value describe(const std::shared_ptr<AgentLink>& link, std::uint32_t pid, const ipc::Exception& exception) const;
     // WP-23: the enabled modules of the agent's process.
     std::vector<std::shared_ptr<ModuleState>> modules_of(const std::shared_ptr<AgentLink>& link) const;

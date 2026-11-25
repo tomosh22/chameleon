@@ -1,6 +1,8 @@
 // Unified-diff reader and applier: the real fixture edit, CRLF files, offsets, mismatches, bad paths.
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -443,4 +445,66 @@ TEST_CASE("diff: creation of an existing file and deletion of a different file a
     cml::Result<AppliedPatch> not_a_file = apply_patch_to_tree(dir.path, "--- a/d\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n", 1);
     REQUIRE_FALSE(not_a_file.has_value());
     CHECK((not_a_file.error().code == cml::ids::kEditFailed || not_a_file.error().code == cml::ids::kPatchMismatch));
+}
+
+TEST_CASE("diff (WP-44, R-49): the directories a patch creates are reported, and putting the tree back removes them again") {
+    TempDir dir;
+    dir.write("logic.cpp", kLogic);
+    dir.write("keep/old.txt", "old\n");
+    // Two new files, two and one levels down, and one in a directory that exists.
+    const std::string patch =
+        "--- /dev/null\n+++ b/gen/deep/one.h\n@@ -0,0 +1 @@\n+one\n"
+        "--- /dev/null\n+++ b/gen/two.h\n@@ -0,0 +1 @@\n+two\n"
+        "--- /dev/null\n+++ b/keep/three.h\n@@ -0,0 +1 @@\n+three\n";
+    cml::Result<AppliedPatch> r = apply_patch_to_tree(dir.path, patch, 1);
+    REQUIRE_MESSAGE(r.has_value(), (r.has_value() ? "" : r.error().format()));
+    REQUIRE(r->created_dirs.size() == 2);
+    CHECK(r->created_dirs[0] == dir.path / "gen" / "deep");  // the deepest first
+    CHECK(r->created_dirs[1] == dir.path / "gen");
+
+    // An edit of an existing file creates none.
+    cml::Result<AppliedPatch> edit = apply_patch_to_tree(dir.path, kPatch, 1);
+    REQUIRE(edit.has_value());
+    CHECK(edit->created_dirs.empty());
+
+    std::map<fs::path, std::optional<std::string>> originals;
+    for (const AppliedPatch* applied : {&*r, &*edit}) {
+        for (std::size_t i = 0; i < applied->files.size(); ++i) {
+            originals.try_emplace(dir.path / fs::path(applied->files[i]), applied->originals[i]);
+        }
+    }
+    std::size_t restored = 0;
+    const std::string problems = restore_tree(originals, r->created_dirs, &restored);
+    CHECK(problems.empty());
+    CHECK(restored == 4);
+    CHECK_FALSE(fs::exists(dir.path / "gen"));  // before R-49 gen/ and gen/deep/ stayed behind
+    CHECK(fs::exists(dir.path / "keep" / "old.txt"));  // a directory that existed stays
+    CHECK_FALSE(fs::exists(dir.path / "keep" / "three.h"));
+    CHECK(dir.read("logic.cpp") == kLogic);
+}
+
+TEST_CASE("diff (WP-44, R-49): a created directory that holds something else stays, and is not a problem") {
+    TempDir dir;
+    cml::Result<AppliedPatch> r = apply_patch_to_tree(dir.path, "--- /dev/null\n+++ b/gen/one.h\n@@ -0,0 +1 @@\n+one\n", 1);
+    REQUIRE(r.has_value());
+    REQUIRE(r->created_dirs.size() == 1);
+    dir.write("gen/build_output.txt", "made by somebody else\n");
+    std::map<fs::path, std::optional<std::string>> originals;
+    originals.emplace(dir.path / "gen" / "one.h", std::nullopt);
+    std::size_t restored = 0;
+    CHECK(restore_tree(originals, r->created_dirs, &restored).empty());
+    CHECK(restored == 1);
+    CHECK(fs::exists(dir.path / "gen" / "build_output.txt"));
+    CHECK_FALSE(fs::exists(dir.path / "gen" / "one.h"));
+
+    // A patch whose write fails half way hands its created directories back too.
+    TempDir dir2;
+    dir2.write("a.txt", "one\n");
+    AppliedPatch partial;
+    const std::string failing =
+        "--- /dev/null\n+++ b/made/x.txt\n@@ -0,0 +1 @@\n+x\n"
+        "--- /dev/null\n+++ b/a.txt/new.txt\n@@ -0,0 +1 @@\n+hello\n";
+    REQUIRE_FALSE(apply_patch_to_tree(dir2.path, failing, 1, &partial).has_value());
+    REQUIRE(partial.created_dirs.size() == 1);
+    CHECK(partial.created_dirs[0] == dir2.path / "made");
 }

@@ -15,6 +15,7 @@
 // hunk and the first line that differs; nothing is written unless every hunk of every file applies.
 
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -58,6 +59,9 @@ struct AppliedPatch {
     // WP-39: what each file of `files` held before the patch (no value: the patch created it). The runner uses it to put an
     // external source tree back after the run; for a scratch copy of a fixture nobody reads it.
     std::vector<std::optional<std::string>> originals;
+    // WP-44 (R-49): the directories the patch created for its new files (absolute, the deepest first). Putting an external tree back
+    // removes them again (restore_tree).
+    std::vector<std::filesystem::path> created_dirs;
 };
 
 // Parses `patch_text` and applies it to the tree below `root` (like `patch -p<strip>`). Paths that
@@ -68,5 +72,12 @@ struct AppliedPatch {
 // back. It is left empty when the function succeeds or fails before the first write.
 cml::Result<AppliedPatch> apply_patch_to_tree(const std::filesystem::path& root, std::string_view patch_text, int strip = 1,
                                               AppliedPatch* partial = nullptr);
+
+// WP-44 (R-49): puts a tree that patches edited in place back: each file of `originals` gets its content again (no value: the patch
+// created it, it is removed), then each directory of `created_dirs` is removed, the deepest first, when it is empty (a directory that
+// holds something else stays, and is not a problem). Returns the problems, "; "-separated ("" when there were none); `restored` counts
+// the files put back.
+std::string restore_tree(const std::map<std::filesystem::path, std::optional<std::string>>& originals, const std::vector<std::filesystem::path>& created_dirs,
+                         std::size_t* restored);
 
 }  // namespace cmltest

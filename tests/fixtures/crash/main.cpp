@@ -17,6 +17,7 @@ namespace {
 
 bool g_armed = false;
 bool g_leave_mode = false;
+bool g_seh_mode = false;  // WP-44: the application handles a fault the crash handler passes on (failure injection, exception-hold)
 wchar_t g_signal_file[4096] = L"";
 
 void set_cell_access(DWORD protection)
@@ -39,6 +40,19 @@ void helper()
     }
 }
 
+// WP-44 (--seh): the application's own structured exception handler around the store. A fault the crash handler passes on reaches
+// it, as it would without Chameleon; the code of the fault is returned in `code` (0: no fault). No C++ objects in here (__try).
+int guarded_store(int value, DWORD* code)
+{
+    *code = 0;
+    __try {
+        return cell_store(value);
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        *code = EXCEPTION_ACCESS_VIOLATION;
+        return -1;
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -46,6 +60,9 @@ int main(int argc, char** argv)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--leave") == 0) {
             g_leave_mode = true;
+        }
+        if (std::strcmp(argv[i], "--seh") == 0) {
+            g_seh_mode = true;
         }
     }
     GetEnvironmentVariableW(L"CML_FIXTURE_SIGNAL_FILE", g_signal_file, 4096);
@@ -62,8 +79,26 @@ int main(int argc, char** argv)
             g_armed = true;
             set_cell_access(PAGE_NOACCESS);
             std::printf("ARMED\n");
+            if (g_seh_mode) {
+                DeleteFileW(g_signal_file);  // --seh: every new signal arms the fixture again
+            }
+        } else if (g_seh_mode && g_armed && g_signal_file[0] != L'\0' && GetFileAttributesW(g_signal_file) != INVALID_FILE_ATTRIBUTES) {
+            DeleteFileW(g_signal_file);
+            set_cell_access(PAGE_NOACCESS);
+            std::printf("ARMED again\n");
         }
-        const int value = cell_store(n + 100);
+        int value = 0;
+        if (g_seh_mode) {
+            DWORD code = 0;
+            value = guarded_store(n + 100, &code);
+            if (code != 0) {
+                // The crash handler did not hold the thread: the application's own handler saw the fault, and recovers.
+                std::printf("PASSED_ON n=%d code=0x%08lX\n", n, static_cast<unsigned long>(code));
+                set_cell_access(PAGE_READWRITE);
+            }
+        } else {
+            value = cell_store(n + 100);
+        }
         if (g_leave_mode && g_armed && value == 0) {
             set_cell_access(PAGE_READWRITE);  // the application recovers from the failed store
         }

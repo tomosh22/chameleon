@@ -451,6 +451,7 @@ cml::Result<AppliedPatch> apply_patch_to_tree(const fs::path& root, std::string_
             for (std::size_t i = 0; i <= index; ++i) {
                 partial->originals.push_back(std::move(applied.originals[i]));
             }
+            partial->created_dirs = applied.created_dirs;
         }
         return why;
     };
@@ -466,7 +467,23 @@ cml::Result<AppliedPatch> apply_patch_to_tree(const fs::path& root, std::string_
                                                            "Check that the scratch directory is writable and the file is not locked by another process."));
             }
         } else {
+            // WP-44 (R-49): the directories that do not exist yet are created here; remember them (the deepest first), so that an
+            // external tree can lose them again.
+            std::vector<fs::path> missing;
+            for (fs::path dir = item.file.parent_path(); !dir.empty() && dir != dir.parent_path(); dir = dir.parent_path()) {
+                std::error_code exists_ec;
+                if (fs::exists(dir, exists_ec)) {
+                    break;
+                }
+                missing.push_back(dir);
+            }
             fs::create_directories(item.file.parent_path(), ec);
+            for (fs::path& dir : missing) {
+                std::error_code exists_ec;
+                if (fs::is_directory(dir, exists_ec)) {
+                    applied.created_dirs.push_back(std::move(dir));
+                }
+            }
             std::ofstream out(item.file, std::ios::binary | std::ios::trunc);
             out.write(item.content.data(), static_cast<std::streamsize>(item.content.size()));
             out.close();
@@ -476,7 +493,49 @@ cml::Result<AppliedPatch> apply_patch_to_tree(const fs::path& root, std::string_
             }
         }
     }
+    // The deepest first, whichever file created them.
+    std::sort(applied.created_dirs.begin(), applied.created_dirs.end(),
+              [](const fs::path& a, const fs::path& b) { return a.native().size() > b.native().size(); });
     return applied;
+}
+
+std::string restore_tree(const std::map<fs::path, std::optional<std::string>>& originals, const std::vector<fs::path>& created_dirs, std::size_t* restored) {
+    std::string problems;
+    std::size_t count = 0;
+    for (const auto& entry : originals) {
+        std::error_code ec;
+        if (!entry.second) {
+            fs::remove(entry.first, ec);  // the patch created the file
+        } else {
+            std::ofstream out(entry.first, std::ios::binary | std::ios::trunc);
+            out.write(entry.second->data(), static_cast<std::streamsize>(entry.second->size()));
+            out.close();
+            if (!out) {
+                ec = std::make_error_code(std::errc::io_error);
+            }
+        }
+        if (ec) {
+            problems += (problems.empty() ? "" : "; ") + entry.first.string() + " (" + ec.message() + ")";
+        } else {
+            ++count;
+        }
+    }
+    std::vector<fs::path> dirs = created_dirs;
+    std::sort(dirs.begin(), dirs.end(), [](const fs::path& a, const fs::path& b) { return a.native().size() > b.native().size(); });
+    dirs.erase(std::unique(dirs.begin(), dirs.end()), dirs.end());
+    for (const fs::path& dir : dirs) {
+        std::error_code ec;
+        if (fs::is_directory(dir, ec) && fs::is_empty(dir, ec)) {
+            fs::remove(dir, ec);
+            if (ec) {
+                problems += (problems.empty() ? "" : "; ") + dir.string() + " (" + ec.message() + ")";
+            }
+        }
+    }
+    if (restored != nullptr) {
+        *restored = count;
+    }
+    return problems;
 }
 
 }  // namespace cmltest

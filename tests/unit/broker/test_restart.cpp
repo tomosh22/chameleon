@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <functional>
+#include <map>
 #include <optional>
 #include <set>
 #include <chrono>
@@ -242,6 +243,11 @@ struct Rig {
     std::uint64_t next_agent_id = 2;
     std::vector<std::shared_ptr<SimAgent>> new_agents;  // every relaunched process's agent (new_agent is the newest)
     std::set<std::uint32_t> exited;         // processes the fake host reports as exited (ProcessHost::has_exited)
+    // WP-44 (R-51)
+    std::map<std::uint32_t, int> exited_after_checks;     // pid -> has_exited answers false this many times, then true (a late handle)
+    std::atomic<int> exit_checks{0};                      // has_exited calls
+    std::function<void(const ipc::ArmFault&)> on_arm;     // runs when the old agent receives ArmFault, before it answers
+    std::vector<ipc::ArmFault> arms;                      // ArmFault messages the old agent received
 
     // what happened
     std::mutex mutex;
@@ -282,6 +288,20 @@ struct Rig {
     }
 
     void old_handles(const ipc::Message& m) {
+        if (const auto* arm = std::get_if<ipc::ArmFault>(&m)) {  // WP-44: the old agent answers ArmFault like an agent with injection
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                arms.push_back(*arm);
+            }
+            if (on_arm) {
+                on_arm(*arm);
+            }
+            ipc::Reply reply;
+            reply.request_id = arm->request_id;
+            reply.message = arm->count == 0 ? "disarmed" : "armed";
+            old_agent->to_broker(reply);
+            return;
+        }
         if (const auto* cancel = std::get_if<ipc::RestartCancel>(&m)) {
             std::lock_guard<std::mutex> lock(mutex);
             cancels.push_back(cancel->request_id);
@@ -475,7 +495,14 @@ bool FakeHost::supports_hold() const {
 }
 
 bool FakeHost::has_exited(std::uint32_t pid) const {
+    ++rig_.exit_checks;
     std::lock_guard<std::mutex> lock(rig_.mutex);
+    if (const auto late = rig_.exited_after_checks.find(pid); late != rig_.exited_after_checks.end()) {
+        if (late->second-- <= 0) {
+            return true;
+        }
+        return false;
+    }
     return rig_.exited.count(pid) != 0;
 }
 
@@ -1845,3 +1872,179 @@ TEST_CASE("restart injection: a restart stage cannot be armed while a restart ru
     CHECK(inject_failure(rig.service, args).has_value());  // and afterwards it can
 }
 #endif
+
+// ---- WP-44 (R-51): races and stale records of WP-43's failure injection ----------------------------------------------------------
+
+#if defined(CML_FAULT_INJECTION)
+namespace {
+
+Value stage_args(const char* stage, std::uint32_t pid = 0) {
+    Value args = Value::object();
+    args.set("stage", Value::string(stage));
+    if (pid != 0) {
+        args.set("pid", Value::integer(pid));
+    }
+    return args;
+}
+
+}  // namespace
+
+TEST_CASE("restart injection (R-51 1): while a restart disarms what is left for it, inject-failure is refused busy, so no new arming is swallowed") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.fail_open = true;  // refused after the preparation, before the termination: the old agent stays and is disarmed at the end
+    REQUIRE(inject_failure(rig.service, stage_args("pre-restart-hooks", 100)).has_value());
+    std::optional<Result<Value>> during_cleanup;
+    rig.on_arm = [&](const ipc::ArmFault& arm) {
+        if (arm.count == 0 && !during_cleanup) {
+            // The restart's end-of-operation ArmFault: a client arms the next restart's stage right now.
+            during_cleanup.emplace(inject_failure(rig.service, stage_args("pre-restart-hooks", 100)));
+        }
+    };
+    Result<Value> result = rig.service.restart(args_for(100, 10000));
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().code == restart::diag::kOpenFailed);
+    REQUIRE(during_cleanup.has_value());
+    REQUIRE_FALSE(during_cleanup->has_value());  // before R-51 it was told armed:true, and the ending restart then disarmed it
+    CHECK(during_cleanup->error().id() == "CML5978");
+    // Nothing is left over: the next restart starts with nothing armed for process 100.
+    CHECK_FALSE(rig.service.faults().take_agent_armed(ipc::fault::Stage::PreRestartHooks, 100));
+    // Once the restart has ended the arming goes through, and is recorded.
+    rig.on_arm = nullptr;
+    REQUIRE(inject_failure(rig.service, stage_args("pre-restart-hooks", 100)).has_value());
+    CHECK(rig.service.faults().take_agent_armed(ipc::fault::Stage::PreRestartHooks, 100));
+}
+
+TEST_CASE("restart injection (R-51 2): a restart that starts while inject-failure arms an agent waits for it and finds the record at its end") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.fail_open = true;
+    std::thread restarter;
+    std::atomic<bool> restart_done{false};
+    std::optional<Result<Value>> restarted;
+    std::atomic<bool> restart_started_early{false};
+    rig.on_arm = [&](const ipc::ArmFault& arm) {
+        if (arm.count != 1 || restarter.joinable()) {
+            return;
+        }
+        // While the agent is being armed (the record is made before the ArmFault), a restart of the process is asked for.
+        restarter = std::thread([&] {
+            restarted.emplace(rig.service.restart(args_for(100, 10000)));
+            restart_done = true;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        // It has not started: it waits for the arming (before R-51 it ran through here, before the record existed).
+        restart_started_early = rig.service.restart_active() || restart_done.load();
+    };
+    Result<Value> armed = inject_failure(rig.service, stage_args("pre-restart-hooks", 100));
+    REQUIRE_MESSAGE(armed.has_value(), armed.error().format());
+    REQUIRE(restarter.joinable());
+    restarter.join();
+    CHECK_FALSE(restart_started_early.load());
+    REQUIRE(restarted.has_value());
+    REQUIRE_FALSE(restarted->has_value());
+    // The restart's end found the record and disarmed the stage in the agent: no stale record carries over.
+    CHECK_FALSE(rig.service.faults().take_agent_armed(ipc::fault::Stage::PreRestartHooks, 100));
+    std::lock_guard<std::mutex> lock(rig.mutex);
+    REQUIRE(rig.arms.size() == 2);
+    CHECK(rig.arms[0].count == 1);
+    CHECK(rig.arms[1].count == 0);
+}
+
+TEST_CASE("restart injection (R-51 3): what was armed in an agent is forgotten when the process exits; a new process with that pid never reports it") {
+    QuietLogs quiet;
+    Rig rig;
+    REQUIRE(inject_failure(rig.service, stage_args("pre-restart-hooks", 100)).has_value());
+    {
+        std::lock_guard<std::mutex> lock(rig.mutex);
+        rig.exited.insert(100);
+    }
+    rig.service.detach(1);  // process 100's agent goes, and the process has exited
+    SimAgent reused(rig.service, 50);
+    reused.register_process(100, "", {kExe}, {kExe});  // another process that got pid 100
+    CHECK(finish_injection(rig.service, "restart", 100, std::string()).empty());  // before R-51: {"pre-restart-hooks"}
+    CHECK_FALSE(rig.service.faults().take_agent_armed(ipc::fault::Stage::PreRestartHooks, 100));
+}
+
+TEST_CASE("restart injection (R-51 3, WP-44 fix round): a pipe that breaks while the process runs, or a broker that shuts down, keeps the records") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.service.restart_coordinator_for_testing()->set_exit_recheck_for_testing(std::chrono::milliseconds(50), std::chrono::milliseconds(5));
+    REQUIRE(inject_failure(rig.service, stage_args("pre-restart-hooks", 100)).has_value());
+    rig.service.detach(1);  // the pipe broke; process 100 runs on (the host never reports it as exited), its agent stays armed
+    CHECK(rig.service.faults().has_process_records(100));
+    // It reconnects and keeps its records. A broker that shuts down then detaches every connection;
+    // the processes keep their armings, so the records stay (even if the host said otherwise: nothing is decided while the broker goes).
+    SimAgent again(rig.service, 60);
+    again.register_process(100, "", {kExe}, {kExe});
+    CHECK(rig.service.faults().has_process_records(100));
+    {
+        std::lock_guard<std::mutex> lock(rig.mutex);
+        rig.exited.insert(100);
+    }
+    rig.service.cancel();
+    rig.service.detach(60);
+    CHECK(rig.service.faults().take_agent_armed(ipc::fault::Stage::PreRestartHooks, 100));
+}
+
+TEST_CASE("restart injection (WP-44 re-review): none with the pid of an exited process without an agent clears its records; a live one is CML5961") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.service.restart_coordinator_for_testing()->set_exit_recheck_for_testing(std::chrono::milliseconds(20), std::chrono::milliseconds(5));
+    REQUIRE(inject_failure(rig.service, stage_args("pre-restart-hooks", 100)).has_value());
+    rig.service.detach(1);  // the exit was not seen (the process runs on, or exits slowly): the records stay
+    REQUIRE(rig.service.faults().has_process_records(100));
+    // While the process lives (disconnected, but its agent is still armed), none for it is refused and the records stay.
+    Result<Value> live = inject_failure(rig.service, stage_args("none", 100));
+    REQUIRE_FALSE(live.has_value());
+    CHECK(live.error().id() == "CML5961");
+    CHECK(rig.service.faults().has_process_records(100));
+    // Once the host confirms the exit, none for it clears them (round 1: CML5961 for good, the records stayed until a global none).
+    {
+        std::lock_guard<std::mutex> lock(rig.mutex);
+        rig.exited.insert(100);
+    }
+    Result<Value> cleared = inject_failure(rig.service, stage_args("none", 100));
+    REQUIRE_MESSAGE(cleared.has_value(), cleared.error().format());
+    CHECK_FALSE(cleared->get_bool("armed", true));
+    CHECK_FALSE(rig.service.faults().has_process_records(100));
+    Result<Value> unknown = inject_failure(rig.service, stage_args("none", 4242));  // nothing armed or recorded for it
+    REQUIRE_FALSE(unknown.has_value());
+    CHECK(unknown.error().id() == "CML5961");
+}
+#endif
+
+TEST_CASE("restart (R-51 5): a disconnect is looked at again for a short while, so a process whose handle is signalled late loses its record") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.register_delay_ms = 700;  // registers after the budget: CML5808 and an unfinished-restart record for 200
+    REQUIRE_FALSE(rig.service.restart(args_for(100, 10000, 200)).has_value());
+    REQUIRE(wait_until([&] { return rig.service.link_for_pid(200) != nullptr; }));
+    const std::shared_ptr<RestartCoordinator> coordinator = rig.service.restart_coordinator_for_testing();
+    REQUIRE(coordinator->has_unfinished_for_testing(200));
+    coordinator->set_exit_recheck_for_testing(std::chrono::milliseconds(2000), std::chrono::milliseconds(5));
+    {
+        std::lock_guard<std::mutex> lock(rig.mutex);
+        rig.exited_after_checks[200] = 3;  // the pipe broke first; the handle is signalled at the fourth look
+    }
+    rig.exit_checks = 0;
+    rig.service.detach(rig.service.link_for_pid(200)->agent_id());
+    CHECK_FALSE(coordinator->has_unfinished_for_testing(200));  // before R-51 the one look said "runs" and the record stayed
+    CHECK(rig.exit_checks.load() == 4);
+}
+
+TEST_CASE("restart (R-51 5): a process that keeps running after its pipe broke keeps its record; the second look is bounded") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.register_delay_ms = 700;
+    REQUIRE_FALSE(rig.service.restart(args_for(100, 10000, 200)).has_value());
+    REQUIRE(wait_until([&] { return rig.service.link_for_pid(200) != nullptr; }));
+    const std::shared_ptr<RestartCoordinator> coordinator = rig.service.restart_coordinator_for_testing();
+    coordinator->set_exit_recheck_for_testing(std::chrono::milliseconds(150), std::chrono::milliseconds(10));
+    const auto t0 = std::chrono::steady_clock::now();
+    rig.service.detach(rig.service.link_for_pid(200)->agent_id());
+    const long long took = ms_since(t0);
+    CHECK(coordinator->has_unfinished_for_testing(200));
+    CHECK(took >= 140);
+    CHECK(took < 2000);
+}
