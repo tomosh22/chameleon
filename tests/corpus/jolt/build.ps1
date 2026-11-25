@@ -1,4 +1,5 @@
-# Dot-sourced by tests/corpus/run_corpus.ps1 (variables: $src $buildDir $Compiler $Config $CxxPath $repo $here $out $WorkDir).
+# Dot-sourced by tests/corpus/run_corpus.ps1 (variables: $src $buildDir $Compiler $Config $CxxPath $repo $here $out $WorkDir
+# $ChameleonBin).
 # Builds Jolt Physics v5.7.0 (MIT) and its HelloWorld with tests/corpus/jolt/CMakeLists.txt and the flags of
 # tests/corpus/common/CorpusFlags.cmake, then checks the three properties this corpus project exists for (ADR-0043, WP-41)
 # in the build tree, so that a change of Jolt or of CMake that drops one fails the build step instead of passing unnoticed:
@@ -38,3 +39,13 @@ foreach ($lib in 'jolt/Jolt.lib', 'jolt_corpus_support.lib') {
 }
 Write-Host ("JOLT-BUILD compiler={0} build_s={1:N0} processors={2} compile_commands={3} jolt_unity_batches={4} arch=AVX2 static_libs=Jolt.lib,jolt_corpus_support.lib" -f `
         $Compiler, $buildSeconds, [Environment]::ProcessorCount, $db.Count, $batches)
+
+# The function entries for which the hook decoder had to decode a VEX/EVEX instruction (the probe's LDE-VEX lines, at most
+# 400, without --quiet), Jolt's printed: the candidates for an edit of a Jolt function with `entry_vex` (project.json).
+# Information only; the decode step of the driver judges the decoder.
+$vexLog = Join-Path $out 'lde-vex.txt'
+& (Join-Path $ChameleonBin 'cml_lde_probe.exe') $script:ExePath *> $vexLog
+$vexLines = @(Select-String -Path $vexLog -Pattern '^LDE-VEX ' | ForEach-Object { $_.Line })
+$joltVex = @($vexLines | Where-Object { $_ -like 'LDE-VEX JPH::*' })
+Write-Host ("LDE-VEX: {0} lines listed by the probe, {1} of them JPH:: functions (first 60 below, all in lde-vex.txt)" -f $vexLines.Count, $joltVex.Count)
+$joltVex | Select-Object -First 60 | ForEach-Object { Write-Host $_ }

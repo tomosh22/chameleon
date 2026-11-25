@@ -11,6 +11,11 @@ project(chameleon_corpus_jolt CXX)
 
 include("${CML_COMMON_DIR}/CorpusFlags.cmake")
 
+# Jolt's headers need C++17 (std::string_view, std::align_val_t). Jolt.cmake sets it only in Jolt's own directory, and cl and
+# clang-cl default to C++14, so the two targets of this directory ask for it too.
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 # The three properties of this corpus project (ADR-0043, WP-41). build.ps1 checks each in the build tree.
 set(CMAKE_UNITY_BUILD ON)              # every target below and Jolt's; CMake's default batch size (8)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)  # build.ps1 reads /arch:AVX2 and the unity sources from it

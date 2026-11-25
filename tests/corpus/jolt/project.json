@@ -33,6 +33,20 @@
       "expect": "markers=\\S*jolt_vex_scale_v2:\\d+"
     },
     {
+      "id": "vex-entry-jolt-sphere-convex-radius",
+      "file": "Jolt/Physics/Collision/Shape/SphereShape.cpp",
+      "entry_vex": "GetConvexRadius@SphereNoConvex@SphereShape@JPH@@",
+      "replace": [
+        {
+          "find": "\tvirtual float\tGetConvexRadius() const override\n\t{\n\t\treturn mRadius;\n\t}\n",
+          "with": "\tvirtual float\tGetConvexRadius() const override\n\t{\n\t\tcml_corpus_marker(\"jolt_sphere_convex_radius_v2\");\n\t\treturn mRadius;\n\t}\n"
+        }
+      ],
+      "include": "chameleon_corpus.h",
+      "include_anchor": "#include <Jolt/Physics/Collision/Shape/SphereShape.h>",
+      "expect": "markers=\\S*jolt_sphere_convex_radius_v2:\\d+"
+    },
+    {
       "id": "header-inline-support",
       "file": "chameleon_corpus.h",
       "replace": [
