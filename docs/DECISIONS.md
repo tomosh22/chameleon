@@ -1207,7 +1207,7 @@ never constructed. A wrong pairing is the worst outcome the product has, so R-48
 | WP-43 | R-40, R-42 (restart, revert) | Restart-hold follow-ups; failure injection in restart and revert | `wp/43-restart-injection` | high (restart, process start-up) |
 | WP-44 | R-42 (rest), R-49 | Failure injection in the crash handler and the watcher; persistent arming | `wp/44-injection-rest` | high (crash handler) |
 
-WP-40..WP-43 start together; WP-45 (added during the wave, below) and then WP-44 start as slots free (at most four at once).
+WP-40..WP-43 start together; WP-45 and WP-46 (added during the wave, below) and then WP-44 start as slots free (at most four at once).
 
 **Ranges.** WP-40: CML3600–3629 (planner). WP-41: CML5000–5049. WP-42: CML5050–5099 (both for fixes their corpus finds, in
 any component, after asking the orchestrator if the fix is outside the corpus driver). WP-43: CML5820–5839 (restart),
@@ -1307,6 +1307,17 @@ Review: high (module state, broker restart). Range CML5600–5619. Acceptance: t
 `godot-gdextension` corpus cell flip to pass (removed from `expected_failures`), the repro `tests/corpus/repro/f42_plugin_reload`
 becomes a cmltest scenario in all 8 matrix cells, and unit tests cover each path. It starts before WP-44 when the first
 wave-11 slot frees, because silent loss of edits outranks the remaining injection gaps.
+
+### WP-46: planner coverage on unity builds (from WP-41's corpus findings)
+
+**Added during the wave.** The Jolt corpus cells (WP-41) show three safe refusals that make whole unity batches of library
+code unreloadable: F-41.1, statics of a set of overloads of one free function (`GetRTTIOfType`, one per class from an RTTI
+macro) refused with CML3207; F-41.2, under cl every unity batch with lambdas refused with CML3214 because the lambdas "are
+not the same as in the old image"; F-41.3, under clang-cl the implicit destructor of a function-local class refused as an
+ambiguous overload. **Decision:** after WP-40 merges (it brings the code-equivalence pairing of lambdas that F-41.2 needs),
+a planner package makes these pair correctly or narrows the refusal to the members that are really ambiguous, under ADR-0042's
+rule that a wrong pairing is never acceptable. Review: high. Range CML3630–3649. Acceptance: the Jolt cells' F-41.n
+expected failures flip to pass. Queue order: WP-45, WP-46, then WP-44.
 
 ### Shared files and merge order
 
