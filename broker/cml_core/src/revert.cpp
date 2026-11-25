@@ -7,6 +7,8 @@
 
 #include "cml/core/pipeline_diag_ids.h"
 #include "cml/core/revert_diag_ids.h"
+#include "cml/ipc/fault_stages.h"
+#include "cml/ipc/messages.h"
 #include "cml/util/log.h"
 #include "cml/util/path.h"
 
@@ -186,6 +188,18 @@ Result<RevertReport> revert_module(AgentLink& link, ModuleState& module, RevertS
                     }
                 }
                 std::vector<Diag> ignored;
+#if defined(CML_FAULT_INJECTION)
+                // WP-43: the undo is a quiet request like the re-pointing, so the agent's stage revert-repoint could fail it (armed in the
+                // meantime by somebody else). It must not be injectable: disarm that stage in the agent first (the answer does not matter;
+                // an agent without injection has nothing armed).
+                {
+                    ipc::ArmFault disarm;
+                    disarm.request_id = link.next_request_id();
+                    disarm.stage = ipc::fault::info(ipc::fault::Stage::RevertRepoint).name;
+                    disarm.count = 0;
+                    (void)link.request(ipc::Message(std::move(disarm)), 2000);
+                }
+#endif
                 Result<bool> back = send_hooks(link, ipc::kInstallHooksQuiet, std::move(undo), std::min<std::uint32_t>(options.timeout_ms, 5000), "undo of the re-pointing", &ignored);
                 if (!back) {
                     return Diag::make(rd::kRevertMixed,

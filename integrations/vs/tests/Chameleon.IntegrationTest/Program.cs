@@ -281,8 +281,10 @@ namespace Chameleon.IntegrationTest
                 Say("WP31-IT reattach=" + (attached ? "ok" : "FAILED") + " attach_pid=" + newPid + " engines=" + (calls.Count > 0 ? string.Join(",", calls[0].Engines) : "-"));
 
                 // ---- WP-34: restart {hold_new}: attach to the process before it runs, then resume ----------------------------------
-                Check(coordinator.ShouldHoldNewProcess(session.Supports(Capabilities.RestartHold)), "the extension decides to hold the new process (re-attach on, broker has restart-hold)");
                 int heldTarget = newPid;
+                // WP-43 (R-40): the decision needs the debugger on the process to be restarted.
+                Check(!coordinator.ShouldHoldNewProcess(session.Supports(Capabilities.RestartHold), 999999), "the extension does not hold a restart of a process the debugger is not attached to");
+                Check(coordinator.ShouldHoldNewProcess(session.Supports(Capabilities.RestartHold), heldTarget), "the extension decides to hold the new process (re-attach on, broker has restart-hold, debugger on pid " + heldTarget + ")");
                 // Round 1: a slow debugger (attach returns after 1.5 s). Round 2: an attach that fails. Round 3: an attach that only returns once the
                 // process runs (what a real attach to a suspended process may do): the extension resumes after its grace period (1.5 s here).
                 for (int round = 1; round <= 3; round++)
@@ -346,6 +348,9 @@ namespace Chameleon.IntegrationTest
                     {
                         // The failure comes after the resume (the attempts take longer than the grace period).
                         Check(await WaitFor(() => reattachReports.Count == reportsBefore + 1, 20000) && reattachReports.Last().Id == "CML5997", label + ": the failed attach was reported as CML5997 (" + string.Join("; ", reattachReports.Select(d => d.Id)) + ")");
+                        // WP-43 (R-40): the late attach on `restarted` fails as well (the fake debugger still fails): it is not reported again.
+                        await Task.Delay(3000);
+                        Check(reattachReports.Count == reportsBefore + 1, label + ": CML5997 was reported once for the restart (" + (reattachReports.Count - reportsBefore) + " reports)");
                     }
                     else
                     {

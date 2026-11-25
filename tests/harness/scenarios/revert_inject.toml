@@ -1,0 +1,221 @@
+# Scenario `revert_inject` (WP-43, ADR-0043, R-42): failure injection in the patch revert.
+#
+# fixture revert: value 1 -> reload 2 -> reload 3 (both patches hook compute_value). For each stage of the group "revert":
+#   * revert-repoint (agent): `revert last` re-points compute_value to patch 1; the agent fails inside the window with the threads
+#     suspended, before anything is written: CML5851 naming CML4658, value 3 stays; the next `revert last` gives 2.
+#   * revert-restore (agent): `revert all` puts the original bytes back; the same: CML5851 naming CML4659, value 2 stays; the next
+#     `revert all` gives 1.
+#   * revert-uncommit (agent): the un-commit of the reverted patch image fails: the revert itself goes through (value 1) with the
+#     warning CML5855 naming CML4660; a reload and a normal revert afterwards work.
+# The program keeps ticking throughout; a disarm check closes.
+name = "revert_inject"
+description = "fixture revert: each revert stage fails once (nothing changed, or the warning CML5855), the program keeps running, the next revert works"
+fixture = "revert"
+timeout_s = 900
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1\\b"
+within_s = 15
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_revert.exe"
+within_s = 15
+
+[[step]]
+kind = "edit"
+patch = "edits/to_b.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2\\b"
+within_s = 10
+
+[[step]]
+kind = "edit"
+patch = "edits/stacked/to_c.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=3\\b"
+within_s = 10
+
+# ---- revert-repoint -> CML5851 naming CML4658; nothing changed ----
+[[step]]
+kind = "inject_failure"
+stage = "revert-repoint"
+
+[[step]]
+kind = "revert"
+scope = "last"
+expect_error = "CML5851"
+expect_error_text = "CML4658"
+
+[[step]]
+kind = "expect_diag"
+id = "CML5851"
+expect_text = "CML4658"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=3\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=3\\b"
+within_s = 10
+
+[[step]]
+kind = "revert"
+scope = "last"
+
+[[step]]
+kind = "expect_event"
+event = "patch_reverted"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2\\b"
+within_s = 10
+
+# ---- revert-restore -> CML5851 naming CML4659; nothing changed ----
+[[step]]
+kind = "inject_failure"
+stage = "revert-restore"
+
+[[step]]
+kind = "revert"
+scope = "all"
+expect_error = "CML5851"
+expect_error_text = "CML4659"
+
+[[step]]
+kind = "expect_diag"
+id = "CML5851"
+expect_text = "CML4659"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2\\b"
+within_s = 10
+
+[[step]]
+kind = "revert"
+scope = "all"
+
+[[step]]
+kind = "expect_event"
+event = "patch_reverted"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1\\b"
+within_s = 10
+
+# ---- revert-uncommit -> the revert goes through, warning CML5855 naming CML4660 ----
+# The sources stay edited on disk and the baseline went back: the reload recompiles and brings 3 back.
+[[step]]
+kind = "reload"
+within_s = 120
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=3\\b"
+within_s = 10
+
+[[step]]
+kind = "inject_failure"
+stage = "revert-uncommit"
+
+[[step]]
+kind = "revert"
+scope = "last"
+
+[[step]]
+kind = "expect_diag"
+id = "CML5855"
+expect_text = "CML4660"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1\\b"
+within_s = 10
+
+# A reload and a normal revert afterwards.
+[[step]]
+kind = "reload"
+within_s = 120
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=3\\b"
+within_s = 10
+
+[[step]]
+kind = "revert"
+scope = "all"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1\\b"
+within_s = 10
+
+# ---- disarm: an armed revert stage is gone after "none" ----
+[[step]]
+kind = "reload"
+within_s = 120
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=3\\b"
+within_s = 10
+
+[[step]]
+kind = "inject_failure"
+stage = "revert-restore"
+
+[[step]]
+kind = "inject_failure"
+stage = "none"
+
+[[step]]
+kind = "revert"
+scope = "all"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1\\b"
+within_s = 10

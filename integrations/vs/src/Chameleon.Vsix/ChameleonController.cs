@@ -118,8 +118,8 @@ namespace Chameleon.Vsix
             }
             catch (Exception ex)
             {
-                // OnRestartingAsync resumes the process on every path itself; this is the last net.
-                ReportDiagnostic(ClientDiagnostics.ReattachFailed(oldPid, newPid, ex.Message));
+                // OnRestartingAsync resumes the process on every path itself; this is the last net. One CML5997 per restart (WP-43).
+                Reattach.ReportRestartProblem(oldPid, newPid, ClientDiagnostics.ReattachFailed(oldPid, newPid, ex.Message));
             }
         }
 
@@ -143,7 +143,7 @@ namespace Chameleon.Vsix
             }
             catch (Exception ex)
             {
-                ReportDiagnostic(ClientDiagnostics.ReattachFailed(oldPid, newPid, ex.Message));
+                Reattach.ReportRestartProblem(oldPid, newPid, ClientDiagnostics.ReattachFailed(oldPid, newPid, ex.Message));
             }
         }
 
@@ -313,7 +313,8 @@ namespace Chameleon.Vsix
             int? pid = await TargetPidAsync();   // also remembers the debugged processes while the old one is still alive
             // WP-34: with re-attach on and a broker that can hold the new process, the debugger attaches before the process runs its first
             // instruction (`restarting`, then `restart-resume`); otherwise it attaches after `restarted`, as before.
-            bool hold = Reattach.ShouldHoldNewProcess(Session.Supports(Capabilities.RestartHold));
+            // WP-43 (R-40): only when the debugger is attached to the process being restarted.
+            bool hold = Reattach.ShouldHoldNewProcess(Session.Supports(Capabilities.RestartHold), pid);
             _output.WriteLine("hot-restart" + (pid.HasValue ? " (pid " + pid.Value + ")" : "") + (hold ? ", holding the new process for the debugger" : "") + " ...");
             ControlResponse r;
             ReattachCoordinator.HoldTicket ticket = hold ? Reattach.ExpectRestarting() : null;

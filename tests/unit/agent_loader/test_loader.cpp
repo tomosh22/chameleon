@@ -20,6 +20,7 @@
 #include "cml/proc/diag_ids.h"
 #include "cml/proc/loader_diag_ids.h"
 #include "doctest.h"
+#include "fault/fault_injection.h"
 #include "heap.h"
 #include "loader/fixup_diag_ids.h"
 #include "loader/image_writer.h"
@@ -876,6 +877,55 @@ TEST_CASE("WP-22: ReleaseRange mode Uncommit hides a committed patch from hook c
     }
     REQUIRE(session.loader.unload_patch(first).has_value());
 }
+
+#if defined(CML_FAULT_INJECTION)
+TEST_CASE("WP-43: the stage revert-uncommit fails the un-commit and leaves the patch committed; the next un-commit works") {
+    namespace fi = cml::agent::fault;
+    struct Disarm {
+        ~Disarm() { fi::disarm_all(); }
+    } disarm;
+    LoaderSession session(1);
+    const std::uint64_t first = session.blocks[0].base;
+    const ipc::PatchLoaded a = session.load(make_request(first, "hook_uncommit_fault", false, false));
+    REQUIRE_MESSAGE(a.status == 0, a.message);
+    const proc::ModuleInfo host{host_base(), host_size(), "host.exe"};
+    session.loader.commit_hooked({{host_base() + 0x10, first + proto().rva_answer}}, {host});
+    ipc::ReleaseRange request;
+    request.request_id = 51;
+    request.base = first;
+    request.mode = ipc::ReleaseMode::Uncommit;
+
+    // An address that is no patch is still its own error and does not use the armed stage up.
+    fi::arm(ipc::fault::Stage::RevertUncommit, 1);
+    ipc::ReleaseRange unknown = request;
+    unknown.base = first + 0x10000000ull;
+    ipc::Message answer = session.loader.handle_request(unknown);
+    REQUIRE(std::holds_alternative<ipc::Reply>(answer));
+    CHECK(std::get<ipc::Reply>(answer).status == ids::kLoaderUnknownPatch);
+    CHECK(fi::armed(ipc::fault::Stage::RevertUncommit) == 1);
+
+    answer = session.loader.handle_request(request);
+    REQUIRE(std::holds_alternative<ipc::Reply>(answer));
+    CHECK(std::get<ipc::Reply>(answer).status == ipc::fault::ids::kAgentRevertUncommit);
+    CHECK(std::get<ipc::Reply>(answer).message.find("revert-uncommit") != std::string::npos);
+    CHECK(fi::armed(ipc::fault::Stage::RevertUncommit) == 0);
+    {
+        PatchLoader::HookLease lease = session.loader.acquire_hook_lease();
+        REQUIRE(lease.images().size() == 1);
+        CHECK(lease.images()[0].committed);  // unchanged
+    }
+    request.request_id = 52;
+    answer = session.loader.handle_request(request);
+    REQUIRE(std::holds_alternative<ipc::Reply>(answer));
+    CHECK_MESSAGE(std::get<ipc::Reply>(answer).status == 0, std::get<ipc::Reply>(answer).message);
+    {
+        PatchLoader::HookLease lease = session.loader.acquire_hook_lease();
+        REQUIRE(lease.images().size() == 1);
+        CHECK_FALSE(lease.images()[0].committed);
+    }
+    REQUIRE(session.loader.unload_patch(first).has_value());
+}
+#endif
 
 TEST_CASE("hook leases: an unload that cannot get the leases back says so, keeps the patch and hides its hooks") {
     LoaderSession session(1);

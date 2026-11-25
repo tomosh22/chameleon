@@ -1,0 +1,6 @@
+; WP-42 corpus: the Godot project the editor binary runs with --script res://main.gd (no editor, no main scene).
+config_version=5
+
+[application]
+
+config/name="chameleon-corpus-gdextension"

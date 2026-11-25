@@ -95,9 +95,17 @@ TEST_CASE("the checked-in inject_stages scenario covers every stage once, expect
             armed = nullptr;
         }
     }
+    // Every stage of the reload's pipeline (WP-43's restart and revert stages have their own scenarios, test_wp43_scenarios.cpp).
+    int reload_stages = 0;
     for (const f::StageInfo& info : f::kStages) {
+        if (std::string(info.group) != "reload") {
+            CHECK_MESSAGE(covered.count(info.name) == 0, info.name);
+            continue;
+        }
+        ++reload_stages;
         CHECK_MESSAGE(covered.count(info.name) == 1, info.name);
     }
-    CHECK(edits == static_cast<int>(f::kStageCount) + 1);  // one per stage, one for the disarm check
+    CHECK(reload_stages == 11);
+    CHECK(edits == reload_stages + 1);  // one per stage, one for the disarm check
 }
 #endif

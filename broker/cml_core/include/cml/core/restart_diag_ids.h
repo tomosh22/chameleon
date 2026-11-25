@@ -29,6 +29,11 @@ inline constexpr std::uint32_t kResumeFailed = 5817;      // the held process co
 inline constexpr std::uint32_t kBadHoldArgs = 5818;       // `hold_new` / `hold_ms` / `restart-resume` arguments invalid
 inline constexpr std::uint32_t kHoldUnavailable = 5819;   // this broker or its process host cannot hold a new process; nothing was touched
 
+// WP-43 (ADR-0043, R-40): CML5820-5839.
+inline constexpr std::uint32_t kResumeUnconfirmed = 5820; // `restart-resume`: the restart did not confirm in time that the process runs (it may still be held)
+inline constexpr std::uint32_t kShutdown = 5821;          // the broker shut down during the restart: before the termination nothing was touched, after it the new process was left running
+inline constexpr std::uint32_t kRelaunchRetried = 5822;   // (warning) the first attempt to start the new process failed; the broker tries once more
+
 // The harness's restart step uses CML5840 and CML5841 (cml_ipc/control_ids.h: kRestartStepFailed, kRestartStepMismatch).
 
 }  // namespace cml::core::restart::diag

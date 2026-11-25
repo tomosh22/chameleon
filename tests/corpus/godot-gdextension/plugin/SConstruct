@@ -1,0 +1,20 @@
+#!/usr/bin/env python
+# WP-42 corpus plugin (Chameleon's own code, MIT): a GDExtension built against godot-cpp (MIT, pinned in
+# ../project.json, fetched by ../build.ps1 into $CML_GODOT_CPP_DIR, never vendored). Run from this directory:
+#   scons platform=windows target=template_debug arch=x86_64 debug_symbols=yes
+# Output: project/bin/corpus_plugin.dll and its PDB, loaded at run time by the Godot 4.5.1 editor binary of the corpus.
+import os
+
+env = SConscript(os.path.join(os.environ["CML_GODOT_CPP_DIR"], "SConstruct"))
+
+# The build requirements of docs/BUILD_REQUIREMENTS.md. godot-cpp's own flags (/O2 /Zi /FS, /DEBUG:FULL, /MT) stay;
+# its link flag /OPT:REF is replaced. The environment is godot-cpp's, so libgodot-cpp is compiled with these flags too.
+env.AppendUnique(CCFLAGS=["/Gy"])
+env.Append(CCFLAGS=["/Ob0"])
+env["LINKFLAGS"] = [f for f in env["LINKFLAGS"] if str(f) not in ("/OPT:REF", "/OPT:ICF")]
+env.Append(LINKFLAGS=["/OPT:NOREF", "/OPT:NOICF", "/FUNCTIONPADMIN", "/INCREMENTAL:NO"])
+
+env.Append(CPPPATH=["src/"])
+library = env.SharedLibrary("project/bin/corpus_plugin.dll", source=Glob("src/*.cpp"))
+env.NoCache(library)
+Default(library)
