@@ -1093,6 +1093,25 @@ table entries break when the patch lies below the old image. Instead:
   (planner), `tests/fixtures/{static_overloads,lambda_statics}`, `tests/harness/scenarios`, `tests/unit/{pdb,bind}`,
   `tests/fuzz` (PDB target and seeds), `tests/corpus/{imgui,godot}/project.json`, `tests/corpus/repro`.
 
+**Amendment (2026-11-24, from the Godot corpus run of WP-37).** `scene/main/scene_tree.cpp` has, besides the `SNAME`
+lambdas, an ordinary function with two same-named, same-typed function-local statics in different blocks
+(`if (...) { static const Vector<StringName> names = ...; } else { static const ... names = ...; }`). Under cl every
+function-local static is in its own COMDAT section, so the layout step cannot place them, and the PDB record carries no
+block number. Ruling: such statics (data only, one procedure, one name) may be paired by their order of emission in the
+procedure, old PDB against the patch object's `.debug$S`, only when the counts are equal, the canonical types are
+pairwise equal, and the block-nesting paths agree where both sides record them. Each reload that pairs this way emits a
+warning (CML3570–3599) naming the statics, because reordering the blocks would exchange their values. This is the same
+class of residual risk as the lambda number, accepted only with the user told. Anything else stays CML3207.
+Order pairing is only the fallback for sections whose layout is unknown (cl's COMDAT section per static). Where the
+section layout of a member is known, the layout decides, with no warning; where order and a known layout disagree, the
+layout wins, and an order pairing never teaches, contradicts or erases a learned layout (high re-review of PR #64).
+Consequently CML3570 is raised only where the layout is unknown (cl); the acceptance's "warning in all 8 cells" becomes a
+per-compiler assertion in `unit.bind_fixtures` on each cell's PDB plus the `WP37-ORDER` line in the cl cells.
+Two refinements from the second re-review: the layout wins when it predicts an old record of the set (a hit or a conflict);
+when it predicts none (a miss), the order pairing applies, still without touching the learned layout. A static paired by
+order whose guard variable cannot be bound to the old guard is refused (CML3207), never given a fresh guard, because the
+initialiser would run again over live state.
+
 ### WP-38: VEX and EVEX in the hook length decoder; decoder fuzzing (R-04, R-41)
 
 **This reverses a WP-10 decision** ("no VEX, no EVEX": anything VEX-encoded is Unknown, CML4300). The reason then was
@@ -1170,3 +1189,105 @@ functions. The decision is reversed **together with** a reference check, which i
   up), without Godot, as before.
 - No fixed merge order. Each PR is reviewed at the level in the table, re-reviewed after a substantial fix round, and
   merged as a squash with the expected head sha once the orchestrator has read its CI logs.
+
+## ADR-0043 Wave 11: planner correctness, a wider corpus, restart and injection hardening (WP-40..WP-44)
+
+**Date:** 2026-11-25 · **Status:** Accepted
+
+Wave 10 (ADR-0042) closed R-01, R-02, R-03, R-04, R-13 and the decoder part of R-41. It also found pre-existing
+bind-planner defects that can pair the wrong state (R-48), one of which can make an accepted reload use an object that was
+never constructed. A wrong pairing is the worst outcome the product has, so R-48 leads this wave, ahead of the user's list
+(R-06, R-40, R-42). No R-10 (dogfooding) findings exist yet.
+
+| WP | Roadmap | Title | Branch | Review |
+|---|---|---|---|---|
+| WP-40 | R-48, R-50 | Bind-planner pairing defects | `wp/40-planner-pairing` | high (bind planner) |
+| WP-41 | R-06 | Corpus: an `/arch:AVX2`, unity-built, static-library project | `wp/41-corpus-avx2-unity` | medium |
+| WP-42 | R-06 | Corpus: a DLL-plugin architecture | `wp/42-corpus-plugins` | medium |
+| WP-43 | R-40, R-42 (restart, revert) | Restart-hold follow-ups; failure injection in restart and revert | `wp/43-restart-injection` | high (restart, process start-up) |
+| WP-44 | R-42 (rest), R-49 | Failure injection in the crash handler and the watcher; persistent arming | `wp/44-injection-rest` | high (crash handler) |
+
+WP-40..WP-43 start together; WP-44 starts when the first of them merges (at most four at once).
+
+**Ranges.** WP-40: CML3600–3629 (planner). WP-41: CML5000–5049. WP-42: CML5050–5099 (both for fixes their corpus finds, in
+any component, after asking the orchestrator if the fix is outside the corpus driver). WP-43: CML5820–5839 (restart),
+CML5972–5978 and CML4657–4679 (failure injection, broker and agent). WP-44: CML5979–5984 and CML4680–4699. No new agent
+message types without asking; `agent_abi_version` unchanged.
+
+### WP-40: bind-planner pairing defects (R-48, R-50)
+
+**Decision.** Each of the five defects WP-37 recorded (`docs/wp/WP-37.md`, "Found, not fixed") ends in a correct pairing or
+a refusal with a planner diagnostic, never in a silent wrong pairing:
+1. clang-cl `/Ob2`: a static of an inlined lambda is decided new while its guard binds by layout. A guard is never placed by
+   layout when the static of the same decorated scope was decided new (nor when it has no static at all in that scope); find
+   where clang records the inlined static (in the calling procedure) and pair it there, or refuse.
+2. A guard placed by layout on an unrelated old address when the layout happens to agree: the same rule as 1, plus the
+   guard's old address must lie inside the old compiland's contribution to that section.
+3. A new file-scope static `f` hooked onto an existing `X::f` in pass A: names must match in scope, not only in base name.
+4. clang-cl `/O2` aggregates split into `name.N`: pair the pieces with the old pieces (same `.N` suffixes and sizes) or
+   refuse; never reset silently.
+5. Two lambdas that swap places in one function exchange their statics: use the closure identity from WP-37's type reader;
+   where it cannot tell, refuse.
+6. R-50: the four WP-36 re-review nits.
+
+**Acceptance.** A unit test per defect that fails on main (quote the failing assertion in the PR) and passes after; a
+fixture or fixture function per defect built in every matrix cell, plus one fixture target compiled with clang-cl
+`/O2 /Ob2` in the clang-cl cells (cl cells build it with `/O2 /Ob2` too, where it is harmless), whose scenario shows that the
+inlined lambda's static keeps its value or that the reload is refused, and that the process never faults. `unit.bind`,
+the goldens and the corpus stay green. Directories: `broker/cml_core` (planner, names), `tests/unit/bind`, `tests/fixtures`,
+`tests/harness/scenarios`.
+
+### WP-41: corpus, an `/arch:AVX2`, unity-built, static-library project (R-06)
+
+**Decision.** Add a fourth corpus project that is built with `/arch:AVX2`, as a set of static libraries, with CMake's unity
+build (`CMAKE_UNITY_BUILD=ON`) on at least the library targets. Recommended: Jolt Physics (MIT), a sample or its
+HelloWorld, pinned by tag and commit; the agent confirms the licence and that it builds on `windows-2022` under both
+compilers within the corpus job's time limit, or proposes another permissive project with the same three properties before
+starting. Edits: a library TU that is part of a unity batch, a header included across a batch (fan-out, CML5551 and the
+64-compiland cap), a function that starts with a VEX instruction, and a template. Every failure becomes `F-n` with a reduced
+repro and an asserted expected failure, as WP-26 did; fixes are separate decisions unless trivial.
+**Acceptance.** Green corpus cells for the project under cl and clang-cl with `refused_vex=0`, every edit passing or
+asserted as `xfail` with its `F-n`, and `WP39-<PROJECT>` timing lines. LLVM (named in R-06) is deferred: a cold build of
+clang with `/Zi` does not fit the runners' time limit; say so in the WP doc with the measured estimate.
+**Directories:** `tests/corpus/<project>/`, `tests/corpus/repro/`, one matrix entry in `.github/workflows/corpus.yml`;
+`tests/corpus/run_corpus.ps1` only for generic needs (say which).
+
+### WP-42: corpus, a DLL-plugin architecture (R-06)
+
+**Decision.** Add a project in which a host loads plugin DLLs at run time with `LoadLibrary`, after the module list was
+first sent to the broker. Recommended: a Godot GDExtension from `godot-cpp` (MIT) loaded by the Godot editor that the corpus
+already builds (reuse its cache; do not change the Godot pin, patch or `build.ps1`). Edits: a plugin function, a function in
+the host that calls into the plugin, a plugin unloaded and loaded again (if the host supports it), and a hot-restart with
+the plugin loaded lazily (CML5809). Findings as in WP-41.
+**Acceptance.** A green corpus cell under cl (clang-cl if the host builds with it), every edit passing or asserted `xfail`
+with its `F-n`. **Directories:** `tests/corpus/<project>/`, `tests/corpus/repro/`, one matrix entry in `corpus.yml`.
+
+### WP-43: restart-hold follow-ups and failure injection in restart and revert (R-40, R-42)
+
+**Decision.** Fix the eight R-40 items (ROADMAP; KNOWN_LIMITATIONS "IDE integrations"). Add failure-injection stages to the
+restart path (pre-restart hooks, terminate, relaunch, hold, registration, re-enable, re-apply) and the revert path, through
+the existing `inject-failure` command and `fault-stages` list; each stage's failure must leave the application running
+(or, for restart, a new process running or a clear diagnostic and the old one intact before terminate), never a suspended
+or orphaned process.
+**Acceptance.** A cmltest scenario per new stage group (`hot_restart`, `revert` fixtures) in all 8 cells; a test per R-40
+item; the vs workflow green. **Directories:** `broker/cml_core` (restart, revert, fault injection, control server),
+`core/cml_ipc` (stage table), `agent/src` (restart, fault injection), `integrations/vs/`, `tests/harness`, `tests/fixtures`.
+
+### WP-44: failure injection in the crash handler and the watcher; persistent arming (R-42, R-49)
+
+**Decision.** Stages for the crash handler (exception report, hold, the actions continue/leave/re-execute) and the
+compile-on-save watcher (debounce, change detection, the reload it starts). Arming survives a broker restart only when the
+user asks (`inject-failure {persist:true}`), stored next to the broker's log and cleared by `{"stage":"none"}`. R-49's three
+nits.
+**Acceptance.** Scenarios for the new stages in all 8 cells; a test for persistent arming across a broker restart.
+**Directories:** `agent/src/crash`, `broker/cml_core` (exception service, save watcher, fault injection), `core/cml_pe`
+(R-49), `tests/harness`.
+
+### Shared files and merge order
+
+- `broker/cml_core/src/fault_injection.cpp` and `core/cml_ipc/.../fault_stages.h`: WP-43 and WP-44 each append their stages;
+  whoever merges second merges main and re-runs.
+- `.github/workflows/corpus.yml` and `tests/corpus/run_corpus.ps1`: WP-41 and WP-42 each add one matrix entry; the second
+  merges main and re-runs the corpus.
+- CI capacity is the bottleneck (a `ci` run took over an hour in wave 10 with four branches pushing). Agents batch commits,
+  push once per fix round, and hand back while their runs are queued; the orchestrator resumes them.
