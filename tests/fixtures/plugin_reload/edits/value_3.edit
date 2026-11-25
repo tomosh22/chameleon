@@ -1,0 +1,8 @@
+--- a/plugin.cpp
++++ b/plugin.cpp
+@@ -4,4 +4,4 @@
+ extern "C" __declspec(dllexport) int plugin_value()
+ {
+-    return 2;
++    return 3;
+ }

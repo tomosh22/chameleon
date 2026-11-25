@@ -460,6 +460,16 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
             carried.push_back(Carried{state->path, index->baseline_snapshot()});
         }
     }
+    // WP-45: a module of the old process that is not enabled at the moment (it was freed, or disabled) left its baseline in the
+    // service; it travels too, so the new process gets those edits when it enables the module.
+    for (auto& kept : service_.kept_baselines(old_pid)) {
+        const bool have = std::any_of(carried.begin(), carried.end(), [&](const Carried& c) { return path::same_path(c.path, kept.first); });
+        CML_LOG(Trace, "restart: decision=%s module=%s pid=%u originals=%zu", have ? "kept-baseline-ignored" : "kept-baseline-carried", kept.first.c_str(), old_pid,
+                kept.second.originals.size());
+        if (!have) {
+            carried.push_back(Carried{kept.first, std::move(kept.second)});
+        }
+    }
     if (unfinished) {
         // The older baseline knows what the original binary was built from (its originals); the newer one, of a process that never got the
         // old baseline restored, took the edited files as its originals. The older originals win; the newer stamps stay.
@@ -815,11 +825,26 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
         }
         missing = missing_in(new_link->snapshot());
     }
+    // WP-45: the carried baselines of a module that is not enabled yet; they are re-applied when the new process enables it.
+    const auto carried_of = [&](const ipc::RestartModule& m) {
+        std::vector<const Carried*> out;
+        for (const Carried& c : carried) {
+            if (path::same_path(m.path, c.path) || path::matches_module(m.path, c.path) || path::matches_module(c.path, m.path)) {
+                out.push_back(&c);
+            }
+        }
+        return out;
+    };
     Value not_enabled = Value::array();
     for (const ipc::RestartModule& m : missing) {
         not_enabled.push(Value::string(m.path));
+        std::size_t edited = 0;
+        for (const Carried* c : carried_of(m)) {
+            edited += c->baseline.originals.size();
+        }
         warn(Diag::make(rd::kModuleNotEnabled, "module '" + m.path + "' is not enabled in the new process (pid " + std::to_string(new_pid) + ")" +
-                            (reenable_injected ? left_running : std::string()),
+                            (reenable_injected ? left_running : std::string()) +
+                            (edited != 0 ? "; the session's edits of its " + std::to_string(edited) + " file(s) are re-applied when it is enabled" : std::string()),
                         "It may not be loaded yet; enable it from the application once it is."),
              new_pid);
     }
@@ -829,6 +854,18 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
 
     // The enabled modules of the new process, and their PDB indexes.
     const LinkSnapshot new_snap = new_link->snapshot();
+    // WP-45 (F-42.3): a module the new process enables only later (it loads it lazily) gets the session's edits when it is enabled.
+    // One that was enabled since `missing` was computed is in new_snap and is restored below, like the others.
+    for (const ipc::RestartModule& m : missing) {
+        for (const Carried* c : carried_of(m)) {
+            const bool enabled_now = std::any_of(new_snap.enabled.begin(), new_snap.enabled.end(), [&](const std::string& full) { return path::same_path(full, c->path); });
+            CML_LOG(Trace, "restart: decision=%s module=%s pid=%u originals=%zu", enabled_now ? "restore-now" : "carry-to-late-enable", c->path.c_str(), new_pid,
+                    c->baseline.originals.size());
+            if (!enabled_now) {
+                service_.carry_to_late_module(new_agent, new_pid, c->path, c->baseline, "restart");
+            }
+        }
+    }
     Value enabled_json = Value::array();
     std::size_t restored = 0;
     for (const std::string& full : new_snap.enabled) {

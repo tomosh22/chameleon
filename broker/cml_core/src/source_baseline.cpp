@@ -204,6 +204,24 @@ std::size_t SourceBaseline::restore(const BaselineSnapshot& snapshot) {
     return restored;
 }
 
+std::size_t SourceBaseline::adopt(const BaselineSnapshot& snapshot) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& entry : snapshot.stamps) {
+        const auto mine = stamps_.find(entry.first);
+        if (mine != stamps_.end()) {
+            mine->second = entry.second;
+        }
+    }
+    std::size_t adopted = 0;
+    for (const auto& entry : snapshot.originals) {
+        if (stamps_.count(entry.first) != 0) {
+            originals_[entry.first] = entry.second;
+            ++adopted;
+        }
+    }
+    return adopted;
+}
+
 std::map<std::string, FileStamp> SourceBaseline::stamps_of(const std::vector<std::string>& files) const {
     std::lock_guard<std::mutex> lock(mutex_);
     std::map<std::string, FileStamp> out;

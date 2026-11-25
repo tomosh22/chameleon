@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <iterator>
 #include <set>
 #include <thread>
 
@@ -11,6 +12,7 @@
 #include "cml/core/header_diag_ids.h"
 #include "cml/core/pipeline_diag_ids.h"
 #include "cml/core/process_registry.h"
+#include "cml/core/reenable_diag_ids.h"
 #include "cml/core/restart.h"
 #include "cml/core/restart_diag_ids.h"
 #include "cml/core/revert.h"
@@ -68,6 +70,15 @@ ReloadService::ReloadService(PipelineEnv env, EventBus* events, std::string sess
 
 ReloadService::~ReloadService() {
     cancel();
+    {
+        // WP-45: the re-apply worker ends at its next check (a reload it runs was cancelled above).
+        std::lock_guard<std::mutex> lock(reapply_mutex_);
+        reapply_stop_ = true;
+    }
+    reapply_changed_.notify_all();
+    if (reapply_thread_.joinable()) {
+        reapply_thread_.join();
+    }
     {
         std::shared_ptr<SaveWatcher> watcher;
         {
@@ -143,6 +154,14 @@ void ReloadService::detach(std::uint64_t agent_id) {
         entry = std::move(it->second);
         agents_.erase(it);
         coordinator = restart_;
+        // WP-45: what this process's module instances left is for later instances in the same process; it goes with the process
+        // (a later process with the same pid is another program run).
+        if (entry.link != nullptr) {
+            const std::uint32_t gone_pid = entry.link->snapshot().pid;
+            for (auto c = carries_.begin(); c != carries_.end();) {
+                c = c->first.first == gone_pid ? carries_.erase(c) : std::next(c);
+            }
+        }
     }
     // WP-43: an unfinished restart's record for this process must not outlive it (its pid may be reused).
     if (coordinator != nullptr && entry.link != nullptr) {
@@ -178,6 +197,11 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
             }
         }
     }
+    // WP-45: whether the image a state was made for is still loaded (same path, same base).
+    const auto image_loaded = [&snap](const std::string& module_path, std::uint64_t base) {
+        return std::any_of(snap.modules.begin(), snap.modules.end(),
+                           [&](const LoadedModule& m) { return m.base == base && path::same_path(m.path, module_path); });
+    };
     std::vector<std::shared_ptr<ModuleState>> dropped;
     std::vector<std::pair<std::string, LoadedModule>> created;
     {
@@ -187,6 +211,16 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
             return;
         }
         AgentEntry& entry = it->second;
+        // WP-45: a kept baseline of a disabled module whose image has gone since is not "live" any more: the next instance is a fresh
+        // image that runs the original code, so the edits must be re-applied there.
+        for (auto& c : carries_) {
+            if (c.first.first == snap.pid && c.second.live_base != 0 && !image_loaded(c.second.path, c.second.live_base)) {
+                CML_LOG(Trace, "reenable: decision=image-gone module=%s pid=%u base=0x%llx", c.second.path.c_str(), snap.pid,
+                        static_cast<unsigned long long>(c.second.live_base));
+                c.second.live_base = 0;
+                c.second.origin = "reload";
+            }
+        }
         for (auto m = entry.modules.begin(); m != entry.modules.end();) {
             const auto want = desired.find(m->first);
             if (want == desired.end() || want->second.base != m->second->base) {
@@ -203,10 +237,32 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
                 state->name = std::string(path::base_name(std::string_view(want.second.path)));
                 state->base = want.second.base;
                 state->size = want.second.size;
+                state->instance = ++instances_[InstanceKey{snap.pid, want.first}];  // WP-45: names its patch work directory
                 entry.modules[want.first] = state;
                 created.emplace_back(want.first, want.second);
             }
         }
+    }
+    // WP-45: what each dropped instance leaves for the next one of the same module in this process. Only a baseline with accepted
+    // edits (originals) matters; without one the next instance starts from the files as they are, as before.
+    for (const std::shared_ptr<ModuleState>& state : dropped) {
+        std::optional<BaselineSnapshot> left = leaving_baseline(*state);
+        const bool live = image_loaded(state->path, state->base);
+        if (!left || left->originals.empty()) {
+            CML_LOG(Trace, "reenable: decision=nothing-to-carry module=%s pid=%u instance=%llu", state->path.c_str(), snap.pid,
+                    static_cast<unsigned long long>(state->instance));
+            continue;
+        }
+        CML_LOG(Info, "module %s %s in process %u: its %llu edited file(s) are kept for the next time it is enabled", state->name.c_str(),
+                live ? "disabled" : "unloaded (or loaded at another address)", snap.pid, static_cast<unsigned long long>(left->originals.size()));
+        CML_LOG(Trace, "reenable: decision=carry module=%s pid=%u instance=%llu live=%d base=0x%llx originals=%zu", state->path.c_str(), snap.pid,
+                static_cast<unsigned long long>(state->instance), live ? 1 : 0, static_cast<unsigned long long>(state->base), left->originals.size());
+        std::lock_guard<std::mutex> lock(mutex_);
+        Carry& carry = carries_[InstanceKey{snap.pid, normalized_key(state->path)}];
+        carry.path = state->path;
+        carry.snapshot = std::move(*left);
+        carry.live_base = live ? state->base : 0;
+        carry.origin = live ? "disable" : "reload";
     }
     const bool any_dropped = !dropped.empty();
     dropped.clear();  // joins their threads
@@ -215,6 +271,7 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
     }
     for (const auto& c : created) {
         std::shared_ptr<ModuleState> state;
+        std::optional<Carry> carry;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             const auto it = agents_.find(agent_id);
@@ -226,10 +283,40 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
                 continue;
             }
             state = m->second;
+            // WP-45: the baseline an earlier instance of this module (or a restart) left for this process.
+            if (const auto kept = carries_.find(InstanceKey{snap.pid, c.first}); kept != carries_.end()) {
+                carry = std::move(kept->second);
+                carries_.erase(kept);
+            }
         }
         ModuleIndexSpec spec;
         spec.module_path = state->path;
         spec.baseline.track_system = options.track_system_headers;
+        std::optional<ReapplyItem> reapply;
+        if (carry) {
+            // The same image enabled again (it never went away) still runs the patches: nothing to recompile. Any other instance runs
+            // the original code: its index restores the original sources' baseline and the worker reloads it.
+            const bool same_image = carry->live_base != 0 && carry->live_base == state->base;
+            spec.carried = carry->snapshot;
+            spec.carried_live = same_image;
+            {
+                std::lock_guard<std::mutex> state_lock(state->mutex);
+                state->carried_in = carry->snapshot;
+            }
+            CML_LOG(Trace, "reenable: decision=%s module=%s pid=%u instance=%llu origin=%s originals=%zu", same_image ? "adopt" : "reapply",
+                    state->path.c_str(), snap.pid, static_cast<unsigned long long>(state->instance), carry->origin.c_str(), carry->snapshot.originals.size());
+            if (!same_image) {
+                ReapplyItem item;
+                item.agent_id = agent_id;
+                item.pid = snap.pid;
+                item.state = state;
+                for (const auto& original : carry->snapshot.originals) {
+                    item.files.push_back(original.first);
+                }
+                item.origin = carry->origin;
+                reapply = std::move(item);
+            }
+        }
         const std::string name = state->name;
         spec.on_change = [this, name](const IndexStatus& s) {
             if (s.state == IndexState::Ready) {
@@ -263,8 +350,260 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
             std::lock_guard<std::mutex> state_lock(state->mutex);  // tracked_files() reads it from the watcher's threads
             state->index = std::move(index);
         }
+        if (reapply) {
+            queue_reapply(std::move(*reapply));
+        }
         rearm_save_watcher();  // the index may have become ready before it was stored
     }
+}
+
+// ---- WP-45: re-applying the session's edits to a module enabled later --------------------------------------------------------
+
+namespace {
+
+// `older` (what an earlier instance was given) under `newer` (what this instance's index holds now): the older originals win (they
+// are what the module's binary was built from), the newer stamps stay. The rule of the restart's unfinished records (restart.cpp).
+void merge_older(BaselineSnapshot& newer, const BaselineSnapshot& older) {
+    for (const auto& original : older.originals) {
+        newer.originals[original.first] = original.second;
+    }
+    for (const auto& stamp : older.stamps) {
+        newer.stamps.emplace(stamp.first, stamp.second);
+    }
+}
+
+// "a.cpp, b.cpp" (base names; at most five, then "and N more").
+std::string file_list(const std::vector<std::string>& files) {
+    std::string out;
+    std::size_t shown = 0;
+    for (const std::string& f : files) {
+        if (shown == 5) {
+            out += ", and " + std::to_string(files.size() - shown) + " more";
+            break;
+        }
+        out += (shown == 0 ? "" : ", ") + std::string(path::base_name(std::string_view(f)));
+        ++shown;
+    }
+    return out.empty() ? std::string("(none)") : out;
+}
+
+}  // namespace
+
+std::optional<BaselineSnapshot> ReloadService::leaving_baseline(ModuleState& state) const {
+    std::shared_ptr<ModuleIndex> index;
+    std::optional<BaselineSnapshot> carried_in;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        index = state.index;
+        carried_in = state.carried_in;
+    }
+    std::optional<BaselineSnapshot> out;
+    if (index && index->status().state == IndexState::Ready) {
+        out = index->baseline_snapshot();  // the accepted edits of this instance, and what it was given (restored before Ready)
+        if (carried_in) {
+            merge_older(*out, *carried_in);  // what it was given but had not restored yet (the worker restores a late carry)
+        }
+    } else if (carried_in) {
+        out = std::move(carried_in);  // the index never got ready: hand on what this instance was given
+    }
+    return out;
+}
+
+void ReloadService::carry_to_late_module(std::uint64_t agent_id, std::uint32_t pid, const std::string& module_path, const BaselineSnapshot& snapshot,
+                                         const std::string& origin) {
+    if (snapshot.originals.empty()) {
+        return;
+    }
+    const std::string key = normalized_key(module_path);
+    std::shared_ptr<ModuleState> existing;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto agent = agents_.find(agent_id);
+        if (agent != agents_.end()) {
+            if (const auto m = agent->second.modules.find(key); m != agent->second.modules.end()) {
+                existing = m->second;
+            }
+        }
+        if (!existing) {
+            Carry& carry = carries_[InstanceKey{pid, key}];
+            if (carry.path.empty()) {
+                carry.path = module_path;
+                carry.snapshot = snapshot;
+            } else {
+                merge_older(carry.snapshot, snapshot);
+            }
+            carry.live_base = 0;
+            carry.origin = origin;
+        }
+    }
+    if (!existing) {
+        CML_LOG(Info, "module %s is not enabled in process %u yet: its %llu edited file(s) are re-applied when it is", module_path.c_str(), pid,
+                static_cast<unsigned long long>(snapshot.originals.size()));
+        CML_LOG(Trace, "reenable: decision=carry module=%s pid=%u origin=%s originals=%zu", module_path.c_str(), pid, origin.c_str(), snapshot.originals.size());
+        return;
+    }
+    // It was enabled just now, without the baseline: the worker restores it once the index is ready, then reloads.
+    CML_LOG(Trace, "reenable: decision=reapply-existing module=%s pid=%u instance=%llu origin=%s originals=%zu", module_path.c_str(), pid,
+            static_cast<unsigned long long>(existing->instance), origin.c_str(), snapshot.originals.size());
+    {
+        std::lock_guard<std::mutex> state_lock(existing->mutex);
+        if (existing->carried_in) {
+            merge_older(*existing->carried_in, snapshot);
+        } else {
+            existing->carried_in = snapshot;
+        }
+    }
+    ReapplyItem item;
+    item.agent_id = agent_id;
+    item.pid = pid;
+    item.state = existing;
+    item.restore = snapshot;
+    for (const auto& original : snapshot.originals) {
+        item.files.push_back(original.first);
+    }
+    item.origin = origin;
+    queue_reapply(std::move(item));
+}
+
+std::vector<std::pair<std::string, BaselineSnapshot>> ReloadService::kept_baselines(std::uint32_t pid) const {
+    std::vector<std::pair<std::string, BaselineSnapshot>> out;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& c : carries_) {
+        if (c.first.first == pid) {
+            out.emplace_back(c.second.path, c.second.snapshot);
+        }
+    }
+    return out;
+}
+
+bool ReloadService::has_carry_for_testing(std::uint32_t pid, const std::string& module_path, bool* live) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = carries_.find(InstanceKey{pid, normalized_key(module_path)});
+    if (it == carries_.end()) {
+        return false;
+    }
+    if (live != nullptr) {
+        *live = it->second.live_base != 0;
+    }
+    return true;
+}
+
+void ReloadService::queue_reapply(ReapplyItem item) {
+    std::lock_guard<std::mutex> lock(reapply_mutex_);
+    if (reapply_stop_) {
+        return;
+    }
+    ++reapply_pending_;
+    reapply_queue_.push_back(std::move(item));
+    if (!reapply_thread_.joinable()) {
+        reapply_thread_ = std::thread([this] { reapply_loop(); });
+    }
+    reapply_changed_.notify_all();
+}
+
+void ReloadService::reapply_loop() {
+    for (;;) {
+        ReapplyItem item;
+        {
+            std::unique_lock<std::mutex> lock(reapply_mutex_);
+            reapply_changed_.wait(lock, [this] { return reapply_stop_ || !reapply_queue_.empty(); });
+            if (reapply_stop_) {
+                reapply_pending_ -= reapply_queue_.size();
+                reapply_queue_.clear();
+                return;
+            }
+            item = std::move(reapply_queue_.front());
+            reapply_queue_.pop_front();
+        }
+        reapply_one(item);
+        --reapply_pending_;
+    }
+}
+
+void ReloadService::reapply_one(const ReapplyItem& item) {
+    const std::shared_ptr<ModuleState> state = item.state.lock();
+    if (!state) {
+        return;  // dropped already; it handed its carry on (leaving_baseline)
+    }
+    const auto stopping = [this] {
+        std::lock_guard<std::mutex> lock(reapply_mutex_);
+        return reapply_stop_;
+    };
+    const auto current = [&] { return module_state(item.agent_id, state->path) == state; };
+    const auto abandoned = [&] {
+        CML_LOG(Trace, "reenable: decision=abandoned module=%s pid=%u reason=%s", state->path.c_str(), item.pid, stopping() ? "shutdown" : "module-gone");
+    };
+    const std::string files = file_list(item.files);
+    const auto report = [&](const Diag& d) {
+        CML_LOG(Warn, "reenable: %s", d.format().c_str());
+        if (events_ != nullptr) {
+            events_->publish(make_diag_event(d, "warning", "enable", item.pid));
+        }
+    };
+    // 1. Its index (started right after the state; the carried baseline is applied in it before Ready).
+    std::shared_ptr<ModuleIndex> index;
+    for (;;) {
+        if (stopping() || !current()) {
+            abandoned();
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            index = state->index;
+        }
+        if (index && index->wait(100)) {
+            break;
+        }
+        if (!index) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    if (index->status().state != IndexState::Ready) {
+        const IndexStatus st = index->status();
+        report(Diag::make(reenable::diag::kReapplyIndexFailed,
+                          "module '" + state->name + "' (process " + std::to_string(item.pid) + ") runs its original code: the session's edits of " + files +
+                              " were not re-applied because its PDB index failed" + (st.error ? ": " + st.error->format() : std::string()),
+                          "Fix what the index diagnostic says, then run `reload` (or load the module again)."));
+        return;
+    }
+    // 2. The run lock: one reload at a time. A `reload` that arrives meanwhile waits for this one (run_reload).
+    std::unique_ptr<ExclusiveRun> run;
+    for (;;) {
+        if (stopping() || !current()) {
+            abandoned();
+            return;
+        }
+        run = lock_reloads();
+        if (run) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    // 3. The baseline (when the index did not apply it) and one reload of this module.
+    const std::size_t restored = item.restore ? index->restore_session_baseline(*item.restore) : index->carried_files();
+    if (restored == 0) {
+        CML_LOG(Info, "module %s (process %u): none of the edited files (%s) is part of this instance; nothing to re-apply", state->name.c_str(), item.pid, files.c_str());
+        return;
+    }
+    CML_LOG(Info, "module %s enabled again in process %u (instance %llu, after %s): re-applying the session's edits of %llu file(s): %s", state->name.c_str(),
+            item.pid, static_cast<unsigned long long>(state->instance), item.origin.c_str(), static_cast<unsigned long long>(restored), files.c_str());
+    Value args = Value::object();
+    args.set("pid", Value::integer(item.pid));
+    args.set("module", Value::string(state->path));
+    args.set("confirm", Value::boolean(true));  // the user confirmed these edits when they were first reloaded
+    args.set("timeout_ms", Value::integer(300000));
+    Result<Value> reloaded = run_reload(args, false, true);
+    if (!reloaded) {
+        report(Diag::make(reenable::diag::kReapplyFailed,
+                          "module '" + state->name + "' (process " + std::to_string(item.pid) + ") runs its original code: re-applying the session's edits of " + files +
+                              " failed: " + reloaded.error().format(),
+                          "Fix the error and run `reload`; the edits stay pending until a reload applies them."));
+        return;
+    }
+    CML_LOG(Info, "module %s (process %u): the session's edits were re-applied (%lld patch(es), %lld hook(s))", state->name.c_str(), item.pid,
+            static_cast<long long>(reloaded->get_integer("patched")), static_cast<long long>(reloaded->get_integer("hooks_installed")));
+    CML_LOG(Trace, "reenable: decision=reapplied module=%s pid=%u instance=%llu patched=%lld", state->path.c_str(), item.pid,
+            static_cast<unsigned long long>(state->instance), static_cast<long long>(reloaded->get_integer("patched")));
 }
 
 std::optional<IndexStatus> ReloadService::index_status(std::uint64_t agent_id, const std::string& module_path) const {
@@ -480,6 +819,14 @@ Result<Value> ReloadService::run_reload(const Value& args, bool automatic, bool 
     std::optional<ExclusiveRun> exclusive;  // WP-21: a restart holds the run lock itself (lock_reloads) and calls reload_locked()
     if (!lock_held) {
         exclusive.emplace(reload_mutex_, running_);
+        // WP-45: re-applying the edits of a module that was enabled again is part of its enable: a reload the user asks for meanwhile
+        // waits for it (within its timeout) instead of being refused busy. A save's reload stays quiet and retries.
+        const Clock::time_point give_up = Clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (!automatic && !exclusive->acquired() && reapply_pending_.load() != 0 && Clock::now() < give_up) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            exclusive.reset();
+            exclusive.emplace(reload_mutex_, running_);
+        }
     }
     if (!lock_held && !exclusive->acquired()) {
         const Diag d = Diag::make(pd::kBusy, "another reload is still running", "Wait for it to finish (control command `wait`) and try again.");
@@ -948,7 +1295,8 @@ Result<Value> ReloadService::wait(const Value& args) {
         }
     }
     if (what == "idle") {
-        while (running_.load()) {
+        // WP-45: a re-apply that is queued (its module's index still loading) or running counts as a reload.
+        while (running_.load() || reapply_pending_.load() != 0) {
             if (remaining() == 0) {
                 return Diag::make(pd::kReloadTimeout, "a reload is still running", "Raise `timeout_ms`.");
             }

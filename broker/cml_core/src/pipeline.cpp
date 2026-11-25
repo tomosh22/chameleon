@@ -657,7 +657,11 @@ private:
 
     Result<std::string> make_work_dir() {
         std::error_code ec;
-        const std::string dir = ctx_.session_dir + "/" + module_.name + "/p" + std::to_string(pid_);
+        // WP-16: per process. WP-45 (F-42.2): per instance of the module in that process, too: the patch DLLs of an instance that
+        // was freed (or disabled) stay loaded, so a later instance must never write its g<n> to their paths. The first instance
+        // keeps the plain `p<pid>`.
+        const std::string dir = ctx_.session_dir + "/" + module_.name + "/p" + std::to_string(pid_) +
+                                (module_.instance > 1 ? "-i" + std::to_string(module_.instance) : std::string());
         fs::create_directories(fs::path(dir) / "obj", ec);
         if (ec) {
             return fail("compile", Diag::make(pd::kWorkDir, "cannot create the session directory '" + dir + "': " + ec.message(),

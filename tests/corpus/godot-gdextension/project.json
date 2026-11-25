@@ -141,24 +141,5 @@
   "extra_modules": [
     { "file": "corpus_plugin.dll", "min_functions": 1000 }
   ],
-  "expected_failures": [
-    {
-      "step": "check:plugin-edit-survives-reload",
-      "compiler": "*",
-      "match": "marker plugin_tick_v2 did not grow",
-      "reason": "F-42.1: after FreeLibrary + LoadLibrary the plugin runs its original code; the broker drops the module's state and indexes the edited file as the new baseline, so the accepted edit is lost without a diagnostic (docs/wp/WP-42.md)"
-    },
-    {
-      "step": "edit:plugin-function-after-reload",
-      "compiler": "*",
-      "match": "CML3350[\\s\\S]*LNK1104",
-      "reason": "F-42.2: the first reload of the plugin after it was loaded again fails with CML3350 (LNK1104): the new module state numbers its patches from g1 again and patch_1_1.dll of the freed instance is still loaded from <session>/corpus_plugin.dll/p<pid>/g1 (docs/wp/WP-42.md)"
-    },
-    {
-      "step": "check:plugin-edits-reapplied-after-restart",
-      "compiler": "*",
-      "match": "marker plugin_tick_v2 did not grow",
-      "reason": "F-42.3: after a hot-restart the edits of a module the application enables late (CML5809) are not re-applied when it is enabled; the new process runs the plugin's original code and nothing says so (docs/wp/WP-42.md)"
-    }
-  ]
+  "expected_failures": []
 }

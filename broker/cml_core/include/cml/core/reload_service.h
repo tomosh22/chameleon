@@ -13,11 +13,21 @@
 //   * wait() blocks until the indexes are loaded and no reload runs.
 //   * set_option() changes ReloadOptions at run time and returns the previous value.
 //   * The option compile_on_save (WP-14) starts a SaveWatcher: a save of a tracked source runs a reload.
+//   * WP-45 (ADR-0043): a module instance that is enabled after the session accepted edits for its sources gets them re-applied
+//     as part of its enable, the way a hot-restart re-applies them: a module freed and loaded again (FreeLibrary + LoadLibrary,
+//     at the same base or another), and a module a hot-restarted process enables only after the restart finished (CML5809).
+//     When a module's state is dropped because its image went away, its source baseline (BaselineSnapshot) is kept for that
+//     process and path; the next instance's index starts from it (ModuleIndexSpec::carried), and a re-apply worker runs one
+//     reload of that module once its index is ready. A failure is a diagnostic naming the module and the files (CML5600,
+//     CML5601), never silence. A module that is disabled and enabled again while its image stays loaded takes the baseline over
+//     as it is (the image still runs the patches): nothing is recompiled. Each instance has its own patch work directory.
 //
 // Portable: the agent transport, compiler and linker are behind AgentLink and PipelineEnv.
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <future>
 #include <map>
@@ -25,6 +35,8 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "cml/core/agent_link.h"
@@ -146,6 +158,19 @@ public:
     Result<ipc::json::Value> reload_locked(const ipc::json::Value& args);
     std::vector<std::shared_ptr<ModuleState>> module_states(std::uint64_t agent_id) const;
 
+    // ---- WP-45: re-applying the session's edits to a module enabled later ----
+    // The restart hands over the baseline of a module the new process did not enable in time (CML5809): when process `pid` (agent
+    // `agent_id`) enables `module_path` later, its edits are re-applied. When the module has a state already (it was enabled just
+    // now), the re-apply starts at once. `origin` names the cause in the log and in a failure ("restart").
+    void carry_to_late_module(std::uint64_t agent_id, std::uint32_t pid, const std::string& module_path, const BaselineSnapshot& snapshot,
+                              const std::string& origin);
+    // Re-applies queued or running (part of `wait idle`). A `reload` that arrives meanwhile waits for them instead of being busy.
+    std::size_t reapply_pending() const noexcept { return reapply_pending_.load(); }
+    // The baselines kept for process `pid` (path, baseline) of modules that are not enabled now; a restart carries them along.
+    std::vector<std::pair<std::string, BaselineSnapshot>> kept_baselines(std::uint32_t pid) const;
+    // Tests: whether a baseline is kept for (pid, path), and whether that one is for an image that is still loaded.
+    bool has_carry_for_testing(std::uint32_t pid, const std::string& module_path, bool* live = nullptr) const;
+
 private:
     struct AgentEntry {
         std::shared_ptr<AgentLink> link;
@@ -188,6 +213,37 @@ private:
     std::shared_ptr<RestartCoordinator> restart_;  // guarded by mutex_; restart() works on a copy
     std::mutex observer_mutex_;
     OptionObserver option_observer_;
+
+    // ---- WP-45 ----
+    // The baseline an instance of a module left, for its next instance in the same process. `live_base` is the base of an image
+    // that is still loaded (the module was disabled, not freed); 0 once that image is gone (or it never was: a restart's carry).
+    struct Carry {
+        std::string path;
+        BaselineSnapshot snapshot;
+        std::uint64_t live_base = 0;
+        std::string origin;  // "reload" (the module was loaded again), "disable", "restart"
+    };
+    using InstanceKey = std::pair<std::uint32_t, std::string>;  // pid, normalised path
+    std::map<InstanceKey, Carry> carries_;                       // guarded by mutex_
+    std::map<InstanceKey, std::uint64_t> instances_;             // guarded by mutex_: instances made so far (ModuleState::instance)
+    struct ReapplyItem {
+        std::uint64_t agent_id = 0;
+        std::uint32_t pid = 0;
+        std::weak_ptr<ModuleState> state;
+        std::optional<BaselineSnapshot> restore;  // restored by the worker (the state existed before the carry arrived); else the index applied it
+        std::vector<std::string> files;           // the files with accepted edits, for the log and a failure
+        std::string origin;
+    };
+    void queue_reapply(ReapplyItem item);
+    void reapply_loop();
+    void reapply_one(const ReapplyItem& item);
+    std::optional<BaselineSnapshot> leaving_baseline(ModuleState& state) const;
+    mutable std::mutex reapply_mutex_;  // guards the members below
+    std::condition_variable reapply_changed_;
+    std::deque<ReapplyItem> reapply_queue_;
+    std::thread reapply_thread_;
+    bool reapply_stop_ = false;
+    std::atomic<std::size_t> reapply_pending_{0};  // queued + running
 
     std::mutex reload_mutex_;  // one reload at a time
     std::atomic<bool> running_{false};

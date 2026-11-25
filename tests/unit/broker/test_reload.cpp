@@ -105,6 +105,8 @@ std::vector<std::byte> make_object(const std::string& callee = {}, bool define_h
 struct Rig {
     testpdb::TempDir dir;
     std::string exe;
+    std::string logic_src = "C:\\proj\\logic.cpp";  // WP-45: a real file in `dir` with Rig(..., real_sources = true)
+    std::vector<std::string> link_dirs;             // WP-45: out_dir of every link request, in order
     std::vector<std::byte> object = make_object();
 
     // knobs of the fake compiler / linker / agent
@@ -149,11 +151,20 @@ struct Rig {
     Session session2{2, "0.1.0"};
     std::shared_ptr<ModuleState> module2;
 
-    explicit Rig(bool default_session_dir = false, const std::string& logic_flags = std::string(), bool const_symbol = false) {
+    // `real_sources` (WP-45): logic.cpp exists (in `dir`) and is the compiland's source, so the module index tracks it and the real
+    // sweep (no override) sees its edits.
+    explicit Rig(bool default_session_dir = false, const std::string& logic_flags = std::string(), bool const_symbol = false, bool real_sources = false) {
+        if (real_sources) {
+            logic_src = dir.file("logic.cpp");
+            write_logic(1);
+        }
         // basic_world() with the compiland's build environment recorded at the head of its module stream (before
         // the first proc), as the compilers do.
         SynthWorld w;
-        w.tu().symbols.envblock({{"cwd", dir.dir()}, {"cl", "C:\\VC\\bin\\cl.exe"}, {"cmd", "/c /Zi /Gy " + logic_flags + " logic.cpp"}, {"src", "C:\\proj\\logic.cpp"}});
+        w.tu().symbols.envblock({{"cwd", dir.dir()}, {"cl", "C:\\VC\\bin\\cl.exe"}, {"cmd", "/c /Zi /Gy " + logic_flags + " logic.cpp"}, {"src", logic_src}});
+        if (real_sources) {
+            w.tu().files = {logic_src};  // the compiland's file list (what the index tracks)
+        }
         w.proc(w.tu(), "compute_value", 0x10);
         w.main_obj().symbols.envblock({{"cwd", dir.dir()}, {"cl", "C:\\VC\\bin\\cl.exe"}, {"cmd", "/c /Zi /Gy main.cpp"}, {"src", "C:\\proj\\main.cpp"}});
         w.proc(w.main_obj(), "fixture_note", 0x100);
@@ -222,6 +233,7 @@ struct Rig {
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 link_bases.push_back(request.base);
+                link_dirs.push_back(request.out_dir);
             }
             toolchain::LinkedPatch lp;
             lp.dll_path = request.out_dir + "/" + request.name + ".dll";
@@ -344,6 +356,13 @@ struct Rig {
             }
         }
         return Result<void>();
+    }
+
+    // WP-45: (re)writes logic.cpp with compute_value() returning `value` (Rig(..., real_sources = true)).
+    void write_logic(int value) {
+        std::ofstream out(logic_src, std::ios::binary | std::ios::trunc);
+        // A different size for every value: the sweep's cheap test (size and time) must not see two edits as one.
+        out << "int compute_value() { return " << value << "; }\n" << std::string(static_cast<std::size_t>(value), '/') << "\n";
     }
 
     // Enables app.exe in the session and waits for its index.
@@ -3149,5 +3168,338 @@ TEST_CASE("static libraries (WP-26b): CML5921 is raised once for an edit, on eve
         Result<Value> retry = rig.reload();
         (void)retry;
         CHECK(count_diag(rig, "CML5921", "warning") == 1);
+    }
+}
+
+// ---- WP-45: the session's edits are re-applied to a module instance that is enabled later ------------------------------------
+// These need a source file the module index tracks: pdb::normalize_path makes every path a Windows one, so only on Windows.
+
+#if defined(_WIN32)
+namespace {
+
+// A message of the agent of the rig's first process, then what the connection thread does after it.
+void agent_says(Rig& rig, const ipc::Message& m) {
+    rig.session.on_message(m);
+    rig.link->publish(rig.session);
+    rig.service->on_session_changed(1);
+}
+
+void unload_exe(Rig& rig, std::uint64_t base = kModuleBase) {
+    ipc::ModuleUnloaded unloaded;
+    unloaded.module = {base, 0x4000, rig.exe};
+    agent_says(rig, unloaded);
+}
+
+void load_exe(Rig& rig, std::uint64_t base = kModuleBase) {
+    ipc::ModuleLoaded loaded;
+    loaded.module = {base, 0x4000, rig.exe};
+    agent_says(rig, loaded);
+}
+
+// `wait idle`: indexes loaded, no reload and no re-apply queued or running.
+void wait_idle(Rig& rig) {
+    Value args = Value::object();
+    args.set("for", Value::string("idle"));
+    args.set("timeout_ms", Value::integer(30000));
+    Result<Value> waited = rig.service->wait(args);
+    REQUIRE_MESSAGE(waited.has_value(), waited.error().format());
+    CHECK(rig.service->reapply_pending() == 0);
+}
+
+std::shared_ptr<ModuleState> current_state(Rig& rig) {
+    std::shared_ptr<ModuleState> state = rig.service->module_state(1, rig.exe);
+    REQUIRE(state != nullptr);
+    return state;
+}
+
+std::uint64_t generation_of(ModuleState& state) {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return state.generation;
+}
+
+// The messages of the diag events with this id.
+std::vector<std::string> diag_messages(Rig& rig, const std::string& id) {
+    std::lock_guard<std::mutex> lock(rig.events->mutex);
+    std::vector<std::string> out;
+    for (const Event& e : rig.events->events) {
+        if (e.name == "diag" && e.body.get_string("id") == id) {
+            out.push_back(e.body.get_string("message"));
+        }
+    }
+    return out;
+}
+
+std::size_t links_made(Rig& rig) {
+    std::lock_guard<std::mutex> lock(rig.mutex);
+    return rig.link_dirs.size();
+}
+
+std::string link_dir(Rig& rig, std::size_t i) {
+    std::lock_guard<std::mutex> lock(rig.mutex);
+    return rig.link_dirs.at(i);
+}
+
+}  // namespace
+
+TEST_CASE("WP-45: a module freed and loaded again gets the session's edits re-applied; its patches go to a work directory of its own") {
+    QuietLogs quiet;
+    Rig rig(false, std::string(), false, true);
+    rig.enable();
+    rig.write_logic(22);
+    Result<Value> first = rig.reload();
+    REQUIRE_MESSAGE(first.has_value(), first.error().format());
+    REQUIRE(first->get_integer("patched") == 1);
+    REQUIRE(links_made(rig) == 1);
+    CHECK(rig.compile_calls == 1);
+    const std::string pid_dir = "p" + std::to_string(kPid);
+
+    // FreeLibrary: the state goes, the baseline with the accepted edit stays for the process (F-42.1).
+    unload_exe(rig);
+    CHECK(rig.service->module_state(1, rig.exe) == nullptr);
+    bool live = true;
+    CHECK(rig.service->has_carry_for_testing(kPid, rig.exe, &live));
+    CHECK_FALSE(live);
+
+    // LoadLibrary at the same base: a new instance, which runs the original code. Its enable re-applies the edit by itself.
+    load_exe(rig);
+    wait_idle(rig);
+    const std::shared_ptr<ModuleState> again = current_state(rig);
+    CHECK(again->instance == 2);
+    CHECK(again->index->carried_files() == 1);
+    CHECK(generation_of(*again) == 1);
+    CHECK(rig.compile_calls == 2);
+    CHECK(rig.seen<ipc::InstallHooks>().size() == 2);
+    CHECK_FALSE(rig.service->has_carry_for_testing(kPid, rig.exe));
+    REQUIRE(links_made(rig) == 2);
+    // F-42.2: never the directory of the freed instance's patch DLLs (they stay loaded in the process).
+    CHECK(link_dir(rig, 1) != link_dir(rig, 0));
+    CHECK(link_dir(rig, 0).find(pid_dir + "-i") == std::string::npos);
+    CHECK(link_dir(rig, 1).find(pid_dir + "-i2") != std::string::npos);
+    CHECK(diag_messages(rig, "CML5600").empty());
+
+    // The next edit links in the new instance's directory too. (The fake compiler makes the same object for every edit: without
+    // narrowing it is loaded anyway instead of being elided as identical code, CML3450.)
+    rig.option("narrow_hooks", Value::boolean(false));
+    rig.write_logic(333);
+    Result<Value> second = rig.reload();
+    REQUIRE_MESSAGE(second.has_value(), second.error().format());
+    CHECK(second->get_integer("patched") == 1);
+    REQUIRE(links_made(rig) == 3);
+    CHECK(link_dir(rig, 2).find(pid_dir + "-i2") != std::string::npos);
+
+    // A third instance, at another base this time: the baseline (both edits accepted) goes along again, to a third directory.
+    unload_exe(rig);
+    load_exe(rig, kModuleBase + 0x100000);
+    wait_idle(rig);
+    const std::shared_ptr<ModuleState> third = current_state(rig);
+    CHECK(third->instance == 3);
+    CHECK(third->base == kModuleBase + 0x100000);
+    CHECK(generation_of(*third) == 1);
+    REQUIRE(links_made(rig) == 4);
+    CHECK(link_dir(rig, 3).find(pid_dir + "-i3") != std::string::npos);
+}
+
+TEST_CASE("WP-45: disabled and enabled again while its image stays loaded, a module keeps its baseline and nothing is recompiled") {
+    QuietLogs quiet;
+    Rig rig(false, std::string(), false, true);
+    rig.enable();
+    rig.write_logic(22);
+    REQUIRE(rig.reload().has_value());
+    REQUIRE(rig.compile_calls == 1);
+
+    ipc::DisableModule disable;
+    disable.request_id = 20;
+    disable.path = rig.exe;
+    agent_says(rig, disable);
+    bool live = false;
+    CHECK(rig.service->has_carry_for_testing(kPid, rig.exe, &live));
+    CHECK(live);
+
+    ipc::EnableModule enable;
+    enable.request_id = 21;
+    enable.path = rig.exe;
+    agent_says(rig, enable);
+    wait_idle(rig);
+    const std::shared_ptr<ModuleState> again = current_state(rig);
+    CHECK(again->instance == 2);
+    CHECK(again->index->carried_files() == 1);
+    CHECK(rig.compile_calls == 1);  // the image still runs the patch: nothing to re-apply
+    Result<Value> nothing = rig.reload();
+    REQUIRE_MESSAGE(nothing.has_value(), nothing.error().format());
+    CHECK(nothing->get_integer("patched") == 0);
+    CHECK(rig.compile_calls == 1);
+
+    // Disabled, then freed and loaded again: the image the baseline was kept for is gone, so the next instance re-applies.
+    disable.request_id = 22;
+    agent_says(rig, disable);
+    unload_exe(rig);
+    CHECK(rig.service->has_carry_for_testing(kPid, rig.exe, &live));
+    CHECK_FALSE(live);
+    load_exe(rig);
+    CHECK(rig.service->module_state(1, rig.exe) == nullptr);  // not enabled: nothing happens yet
+    enable.request_id = 23;
+    agent_says(rig, enable);
+    wait_idle(rig);
+    CHECK(rig.compile_calls == 2);
+    CHECK(generation_of(*current_state(rig)) == 1);
+}
+
+TEST_CASE("WP-45: a re-apply that fails is CML5600 naming the module and the file; the edit stays pending for the next reload") {
+    QuietLogs quiet;
+    Rig rig(false, std::string(), false, true);
+    rig.enable();
+    rig.write_logic(22);
+    REQUIRE(rig.reload().has_value());
+    unload_exe(rig);
+    rig.fail_compile = true;
+    load_exe(rig);
+    wait_idle(rig);
+    const std::vector<std::string> failed = diag_messages(rig, "CML5600");
+    REQUIRE(failed.size() == 1);
+    CHECK(failed[0].find("app.exe") != std::string::npos);
+    CHECK(failed[0].find("logic.cpp") != std::string::npos);
+    CHECK(failed[0].find("runs its original code") != std::string::npos);
+    CHECK(generation_of(*current_state(rig)) == 0);
+
+    rig.fail_compile = false;
+    Result<Value> retry = rig.reload();
+    REQUIRE_MESSAGE(retry.has_value(), retry.error().format());
+    CHECK(retry->get_integer("patched") == 1);
+    CHECK(generation_of(*current_state(rig)) == 1);
+}
+
+TEST_CASE("WP-45: a module whose index fails cannot get its edits re-applied: CML5601 names the module and the file") {
+    QuietLogs quiet;
+    Rig rig(false, std::string(), false, true);
+    rig.enable();
+    rig.write_logic(22);
+    REQUIRE(rig.reload().has_value());
+    unload_exe(rig);
+    std::error_code removed;
+    std::filesystem::remove(rig.dir.file("app.pdb"), removed);  // the new instance's index cannot open its PDB
+    REQUIRE_MESSAGE(!removed, removed.message());
+    load_exe(rig);
+    wait_idle(rig);
+    const std::vector<std::string> failed = diag_messages(rig, "CML5601");
+    REQUIRE(failed.size() == 1);
+    CHECK(failed[0].find("app.exe") != std::string::npos);
+    CHECK(failed[0].find("logic.cpp") != std::string::npos);
+}
+
+TEST_CASE("WP-45: a baseline a restart hands over is re-applied when the module is enabled later, or at once when it just was") {
+    QuietLogs quiet;
+    Rig rig(false, std::string(), false, true);
+    FileStamp original;
+    REQUIRE(stamp_file(rig.logic_src, &original));
+    rig.write_logic(22);  // the edit the previous process had applied, still on disk
+
+    // The carried baseline, keyed like the index's (taken from an index of the same module, before the edit).
+    BaselineSnapshot carried;
+    {
+        ModuleIndexSpec spec;
+        spec.module_path = rig.exe;
+        std::shared_ptr<ModuleIndex> probe = ModuleIndex::start(spec);
+        REQUIRE(probe->wait(30000));
+        REQUIRE(probe->status().state == IndexState::Ready);
+        const BaselineSnapshot now = probe->baseline_snapshot();
+        REQUIRE(now.stamps.size() == 1);
+        carried.originals[now.stamps.begin()->first] = original;
+        carried.stamps[now.stamps.begin()->first] = original;
+    }
+
+    SUBCASE("the module is not enabled yet (CML5809): its enable re-applies the edit") {
+        rig.service->carry_to_late_module(1, kPid, rig.exe, carried, "restart");
+        CHECK(rig.service->has_carry_for_testing(kPid, rig.exe));
+        rig.enable();
+        wait_idle(rig);
+        CHECK(rig.compile_calls == 1);
+        CHECK(generation_of(*current_state(rig)) == 1);
+        CHECK(current_state(rig)->index->carried_files() == 1);
+    }
+    SUBCASE("the module was enabled just before the baseline arrived: the worker restores it and reloads") {
+        rig.enable();
+        Result<Value> nothing = rig.reload();  // its index took the edited file as the baseline: nothing to do (F-42.3)
+        REQUIRE(nothing.has_value());
+        CHECK(nothing->get_integer("patched") == 0);
+        rig.service->carry_to_late_module(1, kPid, rig.exe, carried, "restart");
+        CHECK_FALSE(rig.service->has_carry_for_testing(kPid, rig.exe));
+        wait_idle(rig);
+        CHECK(rig.compile_calls == 1);
+        CHECK(generation_of(*current_state(rig)) == 1);
+    }
+    SUBCASE("a baseline without accepted edits is no carry") {
+        rig.service->carry_to_late_module(1, kPid, rig.exe, BaselineSnapshot{}, "restart");
+        CHECK_FALSE(rig.service->has_carry_for_testing(kPid, rig.exe));
+    }
+    SUBCASE("a kept baseline goes with its process") {
+        rig.service->carry_to_late_module(1, kPid, rig.exe, carried, "restart");
+        rig.enable();
+        wait_idle(rig);
+        unload_exe(rig);
+        CHECK(rig.service->has_carry_for_testing(kPid, rig.exe));
+        CHECK(rig.service->kept_baselines(kPid).size() == 1);
+        rig.service->detach(1);
+        CHECK_FALSE(rig.service->has_carry_for_testing(kPid, rig.exe));
+    }
+}
+
+TEST_CASE("WP-45: a reload asked for while a re-apply runs waits for it instead of being refused busy") {
+    QuietLogs quiet;
+    Rig rig(false, std::string(), false, true);
+    rig.enable();
+    rig.write_logic(22);
+    REQUIRE(rig.reload().has_value());
+    unload_exe(rig);
+    std::atomic<bool> release{false};
+    rig.compile_hook = [&] {
+        while (!release.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    };
+    load_exe(rig);
+    while (rig.compile_calls.load() < 2) {  // the re-apply is compiling
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        release = true;
+    });
+    Result<Value> user = rig.reload();
+    releaser.join();
+    REQUIRE_MESSAGE(user.has_value(), user.error().format());
+    CHECK(user->get_integer("patched") == 0);  // the re-apply did it
+    CHECK(diag_messages(rig, "CML5304").empty());
+    wait_idle(rig);
+}
+#endif  // _WIN32
+
+TEST_CASE("WP-45: SourceBaseline::adopt takes stamps and originals over as they are; restore marks the originals changed") {
+    testpdb::TempDir dir;
+    const std::string file = dir.file("a.cpp");
+    {
+        std::ofstream out(file, std::ios::binary);
+        out << "int a() { return 2; }\n";
+    }
+    FileStamp now;
+    REQUIRE(stamp_file(file, &now));
+    BaselineSnapshot snap;
+    snap.stamps[file] = now;                                // the patched content's stamp
+    snap.originals[file] = FileStamp{0x11, now.size, 5};    // what the binary was built from
+    snap.originals["untracked.cpp"] = FileStamp{1, 2, 3};
+    {
+        SourceBaseline b;
+        b.take({file}, BaselineOptions{}, nullptr);
+        CHECK(b.adopt(snap) == 1);
+        const BaselineSnapshot after = b.session_snapshot();
+        CHECK(after.stamps.at(file).hash == now.hash);
+        CHECK(after.originals.at(file).hash == 0x11);
+        CHECK(after.originals.count("untracked.cpp") == 0);
+        CHECK(b.sweep().changed.empty());  // the image runs this content: nothing to do
+    }
+    {
+        SourceBaseline b;
+        b.take({file}, BaselineOptions{}, nullptr);
+        CHECK(b.restore(snap) == 1);
+        CHECK(b.sweep().changed == std::vector<std::string>{file});  // differs from the original: it is re-applied
     }
 }
