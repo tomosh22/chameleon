@@ -77,6 +77,10 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
   and not enabled again; **their edits are not re-applied when they load later, and nothing says so (F-42.3, fixed by WP-45)**.
   A restart that leaves its new process running without finishing (CML5808, CML5809) remembers what it could not do for that
   process; the next `restart` of it does it. A late registration alone does not (WP-43).
+- **A reload of several compilands that is refused partway is partly applied (F-41.4, R-52).** The compilands planned before
+  the refused one stay patched although the reply is `ok:false`; after a header edit, some compilands then run its new inline code
+  and the others the old. The applied part is one batch: `revert` undoes it. Files whose compilands were not all patched are
+  compiled again at the next reload.
 - **Plugin DLLs freed and loaded again (WP-42, F-42.1/F-42.2; fixed by WP-45).** A module that is freed and loaded again
   (FreeLibrary + LoadLibrary) runs its original code: the edits patched into the earlier instance are not re-applied and no
   diagnostic says so. Its first reload afterwards can fail with CML3350 (LNK1104), because the new instance's first patch is
