@@ -2874,7 +2874,7 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 
 ### CML5972
 
-- **Cause:** Failure injection, stage `restart-terminate`: the restart failed before the old process was terminated. The process was not terminated and keeps running; its pre-restart hooks had run.  
+- **Cause:** Failure injection, stage `restart-terminate` (like every restart and revert stage, armed with count 1 for the next restart of its process; at the end of that restart it is disarmed whether it fired or not, and the answer lists an unused one in `injection_disarmed`): the restart failed before the old process was terminated. The process was not terminated and keeps running; its pre-restart hooks had run.  
 - **Message:** `injected failure at the stage 'restart-terminate' (...); process <pid> was not terminated. <n> pre-restart hook(s) ran; the process was not restarted.`  
 - **What to do:** This failure was requested with the control command `inject-failure` (failure injection, a test facility; capability `fault-injection`). Repeat the operation without arming the stage (`{"stage":"none"}` disarms every stage). Then `restart` again.  
 - **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
@@ -2912,6 +2912,13 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 - **Cause:** Failure injection, stage `restart-reapply`: the reload that re-applies the session's edits to the new process failed before it compiled. The new process runs the original code; its source baseline was restored, so the edits are pending. Reported as `reapply_error` and the warning CML5810.  
 - **Message:** `injected failure at the stage 'restart-reapply' (...)` (in CML5810: `the new process (pid <pid>) runs the original code: re-applying the session's edits failed: CML5977 ...`)  
 - **What to do:** This failure was requested with the control command `inject-failure` (failure injection, a test facility; capability `fault-injection`). Repeat the operation without arming the stage (`{"stage":"none"}` disarms every stage). Then `reload`: it applies the session's edits.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5978
+
+- **Cause:** `inject-failure` was asked to arm a stage of the restart (or the revert) while a restart (or a reload or revert) runs. A restart or revert stage is armed for the next operation of its process only; arming it in the middle of one could fail a step that must not fail (the undo of a revert's re-pointing, say).  
+- **Message:** `the stage '<name>' cannot be armed while a restart runs` (or `... while a reload or revert runs`)  
+- **What to do:** Wait for the operation to finish (control command `wait`), then arm the stage.  
 - **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
 
 ### CML5985

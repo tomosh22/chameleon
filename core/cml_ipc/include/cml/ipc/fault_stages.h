@@ -70,7 +70,9 @@ inline constexpr std::uint32_t kBindPlan = 5966;
 inline constexpr std::uint32_t kLink = 5967;
 inline constexpr std::uint32_t kPreApply = 5968;
 inline constexpr std::uint32_t kSendPatch = 5969;
-// WP-43 (ADR-0043): CML5972-5978 (broker) and CML4657-4679 (agent). CML5978 is not used yet.
+// WP-43 (ADR-0043): CML5972-5978 (broker) and CML4657-4679 (agent).
+// A stage of the groups "restart" and "revert" is armed for the NEXT restart (revert) of its process only: at the end of that operation
+// it is disarmed whether it fired or not (it never carries over to a later one), and its count must be 1.
 inline constexpr std::uint32_t kAgentPreRestartHooks = 4657;
 inline constexpr std::uint32_t kAgentRevertRepoint = 4658;
 inline constexpr std::uint32_t kAgentRevertRestore = 4659;
@@ -81,6 +83,7 @@ inline constexpr std::uint32_t kRestartHold = 5974;
 inline constexpr std::uint32_t kRestartRegistration = 5975;
 inline constexpr std::uint32_t kRestartReenable = 5976;
 inline constexpr std::uint32_t kRestartReapply = 5977;
+inline constexpr std::uint32_t kInjectBusy = 5978;           // inject-failure: a restart / revert stage while a restart / revert runs
 }  // namespace ids
 
 struct StageInfo {

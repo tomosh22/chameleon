@@ -85,6 +85,8 @@ public:
     //   -> {"reverted":[{"pid","module","generation","batches","patches","hooks_restored","hooks_repointed"}],"generation":N}
     //   plus, when only some modules could be reverted, "partial":true and "failed":[{"pid","module","id","message"}] (CML5854)
     Result<ipc::json::Value> revert(const ipc::json::Value& args);
+    // (WP-43: at the end of every revert the "revert" stages still armed for its processes are disarmed; the answer lists those that did
+    // not fire as `injection_disarmed`.)
     // {"for"?:"idle"|"index", "timeout_ms"?:N}
     Result<ipc::json::Value> wait(const ipc::json::Value& args);
     // {"name":s, "value":s|n|b}
@@ -182,6 +184,7 @@ private:
     std::vector<std::future<void>> retiring_;  // stopped save watchers finishing a reload
     WatcherFactory watcher_factory_;
 
+    Result<ipc::json::Value> revert_impl(const ipc::json::Value& args, std::vector<std::uint32_t>* pids, std::string* outcome);
     std::shared_ptr<RestartCoordinator> restart_;  // guarded by mutex_; restart() works on a copy
     std::mutex observer_mutex_;
     OptionObserver option_observer_;

@@ -176,19 +176,47 @@ bool RestartCoordinator::resume_requested_for_testing(std::uint32_t pid) {
     return hold->release_requested;
 }
 
-void RestartCoordinator::process_gone(std::uint32_t pid) {
-    if (has_unfinished_for_testing(pid)) {
-        CML_LOG(Info, "restart: process %u is gone; what its unfinished restart left is dropped", pid);
-    }
-    forget_unfinished(pid);
-}
-
-bool RestartCoordinator::has_unfinished_for_testing(std::uint32_t pid) {
+bool RestartCoordinator::has_unfinished(std::uint32_t pid) {
     std::lock_guard<std::mutex> lock(unfinished_mutex_);
     return unfinished_.find(pid) != unfinished_.end();
 }
 
+void RestartCoordinator::process_gone(std::uint32_t pid) {
+    if (!has_unfinished(pid)) {
+        return;
+    }
+    const std::shared_ptr<ProcessHost> h = host();
+    if (h == nullptr || !h->has_exited(pid)) {
+        CML_LOG(Info, "restart: the agent of process %u disconnected, the process has not exited; what its unfinished restart left is kept", pid);
+        return;
+    }
+    CML_LOG(Info, "restart: process %u has exited; what its unfinished restart left is dropped", pid);
+    forget_unfinished(pid);
+}
+
+bool RestartCoordinator::has_unfinished_for_testing(std::uint32_t pid) {
+    return has_unfinished(pid);
+}
+
 Result<Value> RestartCoordinator::restart(const Value& args, const std::function<bool()>& client_gone) {
+    std::uint32_t ran_for = 0;
+    bool terminated = false;
+    Result<Value> result = restart_impl(args, client_gone, &ran_for, &terminated);
+    if (ran_for != 0) {
+        // WP-43: an armed restart stage applies to this restart only, whether it fired or not.
+        const std::vector<std::string> unused = finish_injection(service_, "restart", ran_for, result ? std::string() : result.error().format(), !terminated);
+        if (result && !unused.empty()) {
+            Value names = Value::array();
+            for (const std::string& n : unused) {
+                names.push(Value::string(n));
+            }
+            result->set("injection_disarmed", std::move(names));
+        }
+    }
+    return result;
+}
+
+Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::function<bool()>& client_gone, std::uint32_t* ran_for, bool* old_terminated) {
     std::uint32_t pid = 0;
     std::uint32_t timeout_ms = kDefaultTimeoutMs;
     std::optional<Diag> arg_error;
@@ -310,6 +338,7 @@ Result<Value> RestartCoordinator::restart(const Value& args, const std::function
     }
     const LinkSnapshot old_snap = old_link->snapshot();
     const std::uint32_t old_pid = old_snap.pid;
+    *ran_for = old_pid;
 
     // ---- 1. the agent prepares: pre-restart hooks, launch parameters ----
     CML_LOG(Info, "restart: asking process %u to prepare", old_pid);
@@ -343,7 +372,9 @@ Result<Value> RestartCoordinator::restart(const Value& args, const std::function
         return fail(Diag::make(rd::kPrepareFailed,
                                "process " + std::to_string(old_pid) + " cannot be restarted: CML" + std::to_string(info->status) + " " + info->message +
                                    " (the process was not touched)" +
-                                   (info->hooks_run == 0 ? std::string() : "; " + std::to_string(info->hooks_run) + " pre-restart hook(s) ran"),
+                                   (info->hooks_run == 0 || info->message.find("pre-restart hook(s) ran") != std::string::npos
+                                        ? std::string()
+                                        : "; " + std::to_string(info->hooks_run) + " pre-restart hook(s) ran"),
                                "See the agent's diagnostic for what to change."),
                     old_pid);
     }
@@ -484,6 +515,7 @@ Result<Value> RestartCoordinator::restart(const Value& args, const std::function
                                "Close it yourself and start the application again."),
                     old_pid);
     }
+    *old_terminated = true;
     if (unfinished) {
         forget_unfinished(old_pid);  // the old process is gone: what was remembered for it travels with this restart now
     }

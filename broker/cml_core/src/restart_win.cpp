@@ -384,6 +384,16 @@ class WindowsProcessHost final : public ProcessHost {
 public:
     bool supports_hold() const override { return true; }
 
+    bool has_exited(std::uint32_t pid) const override {
+        HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (process == nullptr) {
+            return GetLastError() == ERROR_INVALID_PARAMETER;  // no such process; access denied and the like: cannot tell
+        }
+        const bool exited = WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
+        CloseHandle(process);
+        return exited;
+    }
+
     Result<std::unique_ptr<RestartableProcess>> open(std::uint32_t pid, const std::uint64_t std_handles[3], std::uint32_t info_flags,
                                                      std::vector<Diag>* warnings) override {
         HANDLE process = OpenProcess(PROCESS_TERMINATE | PROCESS_DUP_HANDLE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);

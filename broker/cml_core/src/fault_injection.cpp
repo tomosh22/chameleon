@@ -16,8 +16,12 @@ using ipc::json::Value;
 
 Diag FaultInjector::make_diag(fault::Stage stage) {
     const fault::StageInfo& info = fault::info(stage);
+    const std::string group = info.group;
+    const char* again = group == "restart" ? "Restart again: without it the restart succeeds."
+                        : group == "revert" ? "Revert again: without it the revert succeeds."
+                                            : "Reload again: without it the reload succeeds.";
     return Diag::make(info.diag_id, std::string("injected failure at the stage '") + info.name + "' (" + info.where + ")",
-                      "This failure was requested with the control command inject-failure; it fires once per armed pass. Reload again: without it the reload succeeds.");
+                      std::string("This failure was requested with the control command inject-failure; it fires once per armed pass. ") + again);
 }
 
 Result<void> FaultInjector::arm(fault::Stage stage, std::uint32_t count, std::optional<std::uint32_t> pid) {
@@ -35,6 +39,10 @@ Result<void> FaultInjector::arm(fault::Stage stage, std::uint32_t count, std::op
     if (count == 0 || count > fault::kMaxCount) {
         return Diag::make(fault::ids::kBadRequest, "count must be 1 to " + std::to_string(fault::kMaxCount), "Send a smaller count.");
     }
+    if (std::string(info.group) != "reload" && count != 1) {  // WP-43: armed for the next operation only
+        return Diag::make(fault::ids::kBadRequest, std::string("the stage '") + info.name + "' applies to the next " + info.group + " only: count must be 1",
+                          "Arm it again before each operation that should fail.");
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     armed_[static_cast<std::size_t>(stage)] = Arming{count, pid};
     return Result<void>();
@@ -44,6 +52,32 @@ Result<void> FaultInjector::arm(fault::Stage stage, std::uint32_t count, std::op
 void FaultInjector::disarm_all() {
     std::lock_guard<std::mutex> lock(mutex_);
     armed_ = {};
+    for (std::set<std::uint32_t>& pids : agent_armed_) {
+        pids.clear();
+    }
+}
+
+std::vector<std::string> FaultInjector::disarm_group(const char* group, std::uint32_t pid) {
+    std::vector<std::string> unused;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const fault::StageInfo& s : fault::kStages) {
+        Arming& a = armed_[static_cast<std::size_t>(s.stage)];
+        if (std::string(s.group) == group && !s.agent_side && a.remaining != 0 && (!a.pid || *a.pid == pid)) {
+            a = Arming{};
+            unused.emplace_back(s.name);
+        }
+    }
+    return unused;
+}
+
+void FaultInjector::note_agent_armed(fault::Stage stage, std::uint32_t pid) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    agent_armed_[static_cast<std::size_t>(stage)].insert(pid);
+}
+
+bool FaultInjector::take_agent_armed(fault::Stage stage, std::uint32_t pid) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return agent_armed_[static_cast<std::size_t>(stage)].erase(pid) != 0;
 }
 
 std::optional<Diag> FaultInjector::hit(fault::Stage stage, std::uint32_t pid) {
@@ -115,6 +149,39 @@ Result<void> arm_agent(AgentLink& link, const std::string& stage, std::uint32_t 
 }
 
 }  // namespace
+
+std::vector<std::string> finish_injection(ReloadService& service, const char* group, std::uint32_t pid, const std::string& outcome, bool agent_alive) {
+#if !defined(CML_FAULT_INJECTION)
+    (void)agent_alive;
+    (void)service;
+    (void)group;
+    (void)pid;
+    (void)outcome;
+    return {};
+#else
+    std::vector<std::string> unused = service.faults().disarm_group(group, pid);
+    for (const fault::StageInfo& s : fault::kStages) {
+        if (!s.agent_side || std::string(s.group) != group || !service.faults().take_agent_armed(s.stage, pid)) {
+            continue;
+        }
+        if (std::shared_ptr<AgentLink> link = agent_alive ? service.link_for_pid(pid) : nullptr) {
+            (void)arm_agent(*link, s.name, 0);  // count 0: disarm this stage (a no-op when it fired)
+        }
+        if (outcome.find("CML" + std::to_string(s.diag_id)) == std::string::npos) {
+            unused.emplace_back(s.name);
+        }
+    }
+    if (!unused.empty()) {
+        std::string names;
+        for (const std::string& n : unused) {
+            names += (names.empty() ? "" : ", ") + n;
+        }
+        CML_LOG(Warn, "failure injection: the %s of process %u did not reach the armed stage(s) %s; disarmed (an arming applies to one %s)", group, pid,
+                names.c_str(), group);
+    }
+    return unused;
+#endif
+}
 
 namespace {
 
@@ -214,6 +281,17 @@ Result<Value> inject_failure(ReloadService& service, const Value& args) {
         return Diag::make(fault::ids::kBadRequest, "unknown failure-injection stage '" + stage_name + "'",
                           "Use one of: " + known + " (see fault-stages), or \"none\" to disarm.");
     }
+    // WP-43: a restart / revert stage is armed for the next operation; arming it while one runs could fire in the middle of it (the undo
+    // of a revert's re-pointing, say).
+    const std::string group = info->group;
+    if (group != "reload" && count != 1) {
+        return Diag::make(fault::ids::kBadRequest, "the stage '" + stage_name + "' applies to the next " + group + " only: count must be 1",
+                          "Arm it again before each operation that should fail.");
+    }
+    if ((group == "restart" && service.restart_active()) || (group == "revert" && service.reload_running())) {
+        return Diag::make(fault::ids::kInjectBusy, "the stage '" + stage_name + "' cannot be armed while a " + (group == "restart" ? "restart" : "reload or revert") + " runs",
+                          "Wait for it to finish (control command `wait`), then arm the stage.");
+    }
     if (info->agent_side) {
         if (targets.empty()) {
             return Diag::make(fault::ids::kNoSuchProcess, "no agent is connected", "Start the application with the agent and wait for `status` to list it.");
@@ -240,6 +318,11 @@ Result<Value> inject_failure(ReloadService& service, const Value& args) {
             }
             armed.push_back(link);
             processes.push(Value::integer(link->snapshot().pid));
+        }
+        if (group != "reload") {
+            for (const std::shared_ptr<AgentLink>& link : armed) {
+                service.faults().note_agent_armed(info->stage, link->snapshot().pid);
+            }
         }
     } else {
         if (Result<void> r = service.faults().arm(info->stage, count, pid); !r) {

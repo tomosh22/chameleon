@@ -2068,6 +2068,43 @@ TEST_CASE("fault injection: when the agent could not take its hooks out again (C
     }
 }
 
+TEST_CASE("revert injection (WP-43): an armed revert stage the revert does not reach is disarmed in the agent at its end, never carried over") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    apply_two_patches(rig);
+    // revert-restore is armed, but `last` only re-points (both patches hook compute_value): the stage is not reached.
+    REQUIRE(inject_failure(*rig.service, inject_args("revert-restore")).has_value());
+    Result<Value> last = revert_with(rig, "last");
+    REQUIRE_MESSAGE(last.has_value(), last.error().format());
+    const Value* disarmed = last->find("injection_disarmed");
+    REQUIRE(disarmed != nullptr);
+    REQUIRE(disarmed->items().size() == 1);
+    CHECK(disarmed->items()[0].as_string() == "revert-restore");
+    const auto arms = rig.seen<ipc::ArmFault>();
+    REQUIRE(arms.size() == 2);
+    CHECK(arms[0].stage == "revert-restore");
+    CHECK(arms[0].count == 1);
+    CHECK(arms[1].stage == "revert-restore");
+    CHECK(arms[1].count == 0);  // disarmed in the agent at the end of the revert
+    // A stage that fired is disarmed too, and is not listed as unused.
+    REQUIRE(inject_failure(*rig.service, inject_args("revert-restore")).has_value());
+    rig.hooks_status = ipc::fault::ids::kAgentRevertRestore;  // the scripted agent's answer when the stage fires
+    Result<Value> all = revert_with(rig, "all");
+    REQUIRE_FALSE(all.has_value());
+    CHECK(all.error().message.find("CML4659") != std::string::npos);
+    CHECK(rig.seen<ipc::ArmFault>().size() == 4);
+    rig.hooks_status = 0;
+    Result<Value> again = revert_with(rig, "all");  // nothing armed any more: no ArmFault, nothing listed
+    REQUIRE_MESSAGE(again.has_value(), again.error().format());
+    CHECK(again->find("injection_disarmed") == nullptr);
+    CHECK(rig.seen<ipc::ArmFault>().size() == 4);
+    // A revert stage takes count 1 only.
+    Result<Value> two = inject_failure(*rig.service, inject_args("revert-uncommit", 2));
+    REQUIRE_FALSE(two.has_value());
+    CHECK(two.error().id() == "CML5960");
+}
+
 #endif  // CML_FAULT_INJECTION
 
 // ---- the control pipe's view (handle_control_line with a service) -----------------------------------------

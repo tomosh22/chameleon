@@ -101,6 +101,12 @@ public:
                                                              std::vector<Diag>* warnings) = 0;
     // WP-34: whether relaunch() honours RelaunchSpec::suspended and resume() works. Gates the capability `restart-hold`.
     virtual bool supports_hold() const { return false; }
+    // WP-43: true only when process `pid` is known to have exited (no such process, or its handle is signalled); false when it runs or
+    // cannot be told.
+    virtual bool has_exited(std::uint32_t pid) const {
+        (void)pid;
+        return false;
+    }
 };
 
 // The real thing on Windows; null elsewhere.
@@ -136,6 +142,8 @@ public:
     // (the process is resumed at once and the restart continues). Both are optional. `token` (a string of at most 64 characters) in
     // the arguments is echoed in the `restarting` event, so a client can tell its own held restart from another client's.
     Result<ipc::json::Value> restart(const ipc::json::Value& args, const std::function<bool()>& client_gone = {});
+    // WP-43: at the end of every restart of a process, the "restart" stages still armed for it are disarmed (finish_injection); the
+    // result lists those that did not fire as `injection_disarmed`.
 
     // WP-34, command `restart-resume {pid}` -> {pid, resumed:true, held_ms}. Answers once the process runs. CML5814 when no process
     // with that pid is held (it never was, or it was resumed already: the message says which), CML5818 for bad arguments. WP-43: CML5820
@@ -165,8 +173,9 @@ public:
     void set_relaunch_retry_delay_for_testing(std::chrono::milliseconds delay) { relaunch_retry_delay_ = delay; }
     // WP-43: whether a restart that did not finish its work in process `pid` is remembered for it (tests).
     bool has_unfinished_for_testing(std::uint32_t pid);
-    // WP-43: the agent of process `pid` disconnected (the process exited, or its agent was destroyed): what an unfinished restart left
-    // for that pid is dropped, so it can never apply to another process that gets the same pid later.
+    // WP-43: the agent of process `pid` disconnected. What an unfinished restart left for that pid is dropped when the process has
+    // exited (ProcessHost::has_exited); a pipe that broke while the process runs keeps it. Either way the record applies only to a
+    // process with the restart token it was made for, so a reused pid never gets it.
     void process_gone(std::uint32_t pid);
     // WP-43: a `restart-resume` for held process `pid` has been received and is waiting for the restart thread (tests).
     bool resume_requested_for_testing(std::uint32_t pid);
@@ -184,6 +193,9 @@ private:
         std::vector<Carried> carried;
     };
     void remember_unfinished(std::uint32_t pid, Unfinished unfinished);
+    Result<ipc::json::Value> restart_impl(const ipc::json::Value& args, const std::function<bool()>& client_gone, std::uint32_t* ran_for,
+                                          bool* old_terminated);
+    bool has_unfinished(std::uint32_t pid);
     std::optional<Unfinished> peek_unfinished(std::uint32_t pid);
     void forget_unfinished(std::uint32_t pid);
     std::shared_ptr<ProcessHost> host() const;

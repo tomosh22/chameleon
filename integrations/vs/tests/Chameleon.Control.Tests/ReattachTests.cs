@@ -340,21 +340,40 @@ namespace Chameleon.Control.Tests
         }
 
         [Fact]
-        public async Task AFailedAttachAndAFailedResumeOfOneRestartAreOneReport()
+        public async Task AFailedAttachIsReportedOncePerRestartAndAFailedResumeAlways()
         {
             var rig = new Rig();
             rig.Debugger.FailTimes = 99;
             rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
 
             await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume(throws: new InvalidOperationException("the request could not be sent")));
-            await rig.Coordinator.OnRestartedAsync(100, 200);
+            await rig.Coordinator.OnRestartedAsync(100, 200);   // the late attach fails too: not reported again
 
-            ChameleonDiagnostic d = Assert.Single(rig.Reported);   // before WP-43: up to three
-            Assert.Equal("CML5997", d.Id);
+            // before WP-43: three (early attach, resume, late attach); now the attach once and the resume once
+            Assert.Equal(2, rig.Reported.Count);
+            Assert.All(rig.Reported, d => Assert.Equal("CML5997", d.Id));
+            Assert.Single(rig.Reported, d => d.Message.Contains("resume the restarted process"));
+            Assert.Single(rig.Reported, d => d.Message.Contains("Could not attach"));
             // A different restart is reported again.
             rig.Debugger.Attached.Add(new DebuggedProcess(300, new[] { "Native" }));
             await rig.Coordinator.OnRestartingAsync(300, 400, rig.Resume());
-            Assert.Equal(2, rig.Reported.Count);
+            Assert.Equal(3, rig.Reported.Count);
+        }
+
+        [Fact]
+        public async Task AResumeThatTimesOutAfterTheEarlyAttachFailedIsStillReportedNamingTheFrozenProcess()
+        {
+            var rig = new Rig();
+            rig.Debugger.FailTimes = 99;
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
+            var timedOut = new ControlException(ClientDiagnostics.PipeLost("pipe", "no answer to 'restart-resume' within 20 s"), timedOut: true);
+
+            await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume(throws: timedOut));
+
+            Assert.Equal(2, rig.Reported.Count);   // the attach failure, then the resume: not swallowed by the one-per-restart rule
+            Assert.Contains("Could not attach", rig.Reported[0].Message);
+            Assert.Contains("pid 200", rig.Reported[1].Message);
+            Assert.Contains("may stay suspended", rig.Reported[1].Message);
         }
 
         [Fact]

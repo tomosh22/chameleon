@@ -126,8 +126,9 @@ namespace Chameleon.Control
         }
 
         /// <summary>
-        /// WP-43 (R-40): reports CML5997 for the restart old -> new at most once. An early attach that fails, the late attach that follows it on
-        /// `restarted`, and a resume that does not get through are one problem of one restart for the user; the later ones are only logged.
+        /// WP-43 (R-40): reports an attach failure (CML5997) for the restart old -> new at most once: the early attach that fails and the late
+        /// attach that follows it on `restarted` are one problem for the user; the repeats are only logged. A resume problem (the process may
+        /// stay suspended) is never folded into this: <see cref="ReportResumeProblem"/> always reports.
         /// </summary>
         public void ReportRestartProblem(int oldPid, int newPid, ChameleonDiagnostic diagnostic)
         {
@@ -154,6 +155,12 @@ namespace Chameleon.Control
             {
                 _log("reattach: (reported for this restart already) " + diagnostic);
             }
+        }
+
+        /// <summary>WP-43 (R-40): a `restart-resume` that failed, timed out or was not confirmed: always reported (the process may be frozen).</summary>
+        private void ReportResumeProblem(ChameleonDiagnostic diagnostic)
+        {
+            _report(diagnostic);
         }
 
         /// <summary>
@@ -380,12 +387,12 @@ namespace Chameleon.Control
                     // WP-43 (R-40): the broker took the request but did not confirm the resume in time (an older broker says CML5817 for this,
                     // which the branch below reports as a failed resume, as before). Nothing is known to have failed.
                     _log("reattach: the broker did not confirm in time that pid " + newPid + " runs: " + answer.Error.ToString());
-                    ReportRestartProblem(oldPid, newPid, ClientDiagnostics.ResumeUnconfirmed(newPid, answer.Error.Message, _settings.RestartHoldMs));
+                    ReportResumeProblem(ClientDiagnostics.ResumeUnconfirmed(newPid, answer.Error.Message, _settings.RestartHoldMs));
                 }
                 else
                 {
                     _log("reattach: restart-resume for pid " + newPid + " was refused: " + (answer.Error != null ? answer.Error.ToString() : "no detail"));
-                    ReportRestartProblem(oldPid, newPid,
+                    ReportResumeProblem(
                         ClientDiagnostics.ResumeFailed(newPid, answer.Error != null ? answer.Error.Id + " " + answer.Error.Message : "the broker refused", _settings.RestartHoldMs));
                 }
             }
@@ -394,7 +401,7 @@ namespace Chameleon.Control
                 // WP-43 (R-40): no answer in time is not a dropped connection. The broker did not resume the process for this client's
                 // disconnect (the connection is there), so it may stay suspended until the hold time passes: the user has to know.
                 _log("reattach: restart-resume for pid " + newPid + " got no answer in time: " + ex.Message);
-                ReportRestartProblem(oldPid, newPid, ClientDiagnostics.ResumeFailed(newPid, "the broker did not answer restart-resume in time; the process may stay suspended", _settings.RestartHoldMs));
+                ReportResumeProblem(ClientDiagnostics.ResumeFailed(newPid, "the broker did not answer restart-resume in time; the process may stay suspended", _settings.RestartHoldMs));
             }
             catch (ControlException ex) when (ex.Diagnostic.Id == ClientDiagIds.PipeLost)
             {
@@ -404,7 +411,7 @@ namespace Chameleon.Control
             catch (Exception ex)
             {
                 _log("reattach: restart-resume for pid " + newPid + " failed: " + ex.Message);
-                ReportRestartProblem(oldPid, newPid, ClientDiagnostics.ResumeFailed(newPid, ex.Message, _settings.RestartHoldMs));
+                ReportResumeProblem(ClientDiagnostics.ResumeFailed(newPid, ex.Message, _settings.RestartHoldMs));
             }
         }
 

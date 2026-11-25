@@ -650,6 +650,23 @@ Result<Value> ReloadService::run_reload(const Value& args, bool automatic, bool 
 // ---- revert (WP-22) -------------------------------------------------------------------------------------------
 
 Result<Value> ReloadService::revert(const Value& args) {
+    std::vector<std::uint32_t> pids;
+    std::string outcome;
+    Result<Value> result = revert_impl(args, &pids, &outcome);
+    // WP-43: an armed revert stage applies to this revert only, whether it fired or not.
+    Value names = Value::array();
+    for (const std::uint32_t p : pids) {
+        for (const std::string& n : finish_injection(*this, "revert", p, outcome + (result ? std::string() : result.error().format()))) {
+            names.push(Value::string(n));
+        }
+    }
+    if (result && !names.items().empty()) {
+        result->set("injection_disarmed", std::move(names));
+    }
+    return result;
+}
+
+Result<Value> ReloadService::revert_impl(const Value& args, std::vector<std::uint32_t>* pids, std::string* outcome) {
     std::uint32_t pid = 0;
     std::uint32_t timeout_ms = 60000;
     std::optional<Diag> error;
@@ -682,6 +699,15 @@ Result<Value> ReloadService::revert(const Value& args) {
     }
 
     const std::vector<Target> list = targets(pid, module);
+    for (const Target& t : list) {
+        const std::uint32_t p = t.link->snapshot().pid;
+        if (std::find(pids->begin(), pids->end(), p) == pids->end()) {
+            pids->push_back(p);
+        }
+    }
+    if (pid != 0 && pids->empty()) {
+        pids->push_back(pid);
+    }
     RevertOptions revert_options;
     revert_options.timeout_ms = options().hooks_timeout_ms;
     revert_options.deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);  // one deadline for every module and step
@@ -704,6 +730,7 @@ Result<Value> ReloadService::revert(const Value& args) {
         const std::uint32_t target_pid = t.link->snapshot().pid;
         Result<RevertReport> r = revert_module(*t.link, *t.module, scope, revert_options);
         if (!r) {
+            *outcome += r.error().format() + "\n";
             CML_LOG(Warn, "revert: %s", r.error().format().c_str());
             if (events_ != nullptr) {
                 events_->publish(make_diag_event(r.error(), "error", "revert", target_pid));
@@ -721,6 +748,7 @@ Result<Value> ReloadService::revert(const Value& args) {
             continue;
         }
         for (const Diag& w : r->warnings) {
+            *outcome += w.format() + "\n";
             CML_LOG(Warn, "revert: %s", w.format().c_str());
             if (events_ != nullptr) {
                 events_->publish(make_diag_event(w, "warning", "revert", r->pid));
