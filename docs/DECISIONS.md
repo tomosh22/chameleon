@@ -1396,7 +1396,7 @@ predates WP-40 and does not hold its merge. Queue order: WP-45, WP-46, then WP-4
 
 ## ADR-0044 Wave 12: reload atomicity, module-load visibility, reload cost (WP-47..WP-50)
 
-**Date:** 2026-11-25 · **Status:** Proposed (accepted when wave 11 closes)
+**Date:** 2026-11-25 · **Status:** Accepted (wave 11 closed with #75)
 
 Wave 11 (ADR-0043) closed R-06, R-40, R-42, R-48, R-49, R-50, R-51 and R-54 (WP-46, pending merge). The roadmap's next step is
 "fixes from R-10 as they come; R-46, R-47"; R-10 (dogfooding) has produced no findings yet. Wave 11 itself found two correctness

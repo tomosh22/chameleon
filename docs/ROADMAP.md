@@ -91,6 +91,6 @@ fixtures" to "works on your project".
    wrong state), WP-41 and WP-42 = R-06 (corpus), WP-43 = R-40 + R-42 (restart, revert), WP-44 = rest of R-42 + R-49 + R-51.
 2. **In parallel (User):** R-10 dogfooding, R-11 and R-12 checklists, R-30/R-31 decisions.
 3. **Then:** fixes from R-10 as they come; R-46, R-47.
-   **Wave 12 (Eng), proposed (ADR-0044):** WP-47 = R-52, WP-48 = R-53, WP-49 = R-46, WP-50 = R-47 + R-55.
+   **Wave 12 (Eng), in progress (ADR-0044):** WP-47 = R-52, WP-48 = R-53, WP-49 = R-46, WP-50 = R-47 + R-55; WP-51 = R-54 (split from WP-46).
 4. **Before first sale (User + Eng):** R-32, R-33, R-34, R-35.
 5. **After GA:** R-20 / R-21 per the positioning decision, R-23 research.
