@@ -102,7 +102,7 @@ std::string class_unique_name_of(const TypeSource& types, std::uint32_t index);
 // WP-46 (review): the size of a class / struct / union DEFINITION record (nullopt for a forward reference or another kind).
 std::optional<std::uint64_t> udt_definition_size(const TypeRecord& record);
 // WP-46 (review): the size in bytes of a type: simple types, pointers, modifiers, enums, arrays, class definitions; a forward
-// reference asks `forward` (by unique name, without the unit's discriminator). nullopt when it cannot be known.
+// reference asks `forward` (by its exact unique name, the unit's discriminator included). nullopt when it cannot be known.
 std::optional<std::uint64_t> type_size_of(const TypeSource& types, std::uint32_t index,
                                           const std::function<std::optional<std::uint64_t>(const std::string& unique)>& forward);
 
@@ -209,7 +209,7 @@ struct ObjectProc {
     bool global = false;             // S_GPROC32*
     std::string_view name;           // display name, points into the section
     std::vector<ProcStatic> statics; // the data records declared inside it, in the order the compiler emitted them
-    // WP-46: the types of its own local variables (S_LOCAL, S_REGREL32, S_BPREL32; none of an inlined call's)
+    // WP-46: the types of its own local variables (S_LOCAL without fIsParam, S_REGREL32, S_BPREL32; none of an inlined call's)
     std::vector<std::uint32_t> local_types;
     bool statics_complete = true;    // false: more than kMaxProcStatics, the rest was dropped
 };

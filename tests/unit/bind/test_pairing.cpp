@@ -657,6 +657,7 @@ Built o2_own_static_object() {
     const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
     o.symbol(kO2Own, 0x20, bss, false, false);
     o.symbol(kO2OwnGuard, 0x28, bss, false, false);
+    o.function("?o2_step@@YAXXZ");  // the function of the static (a patch always defines it)
     return o.build();
 }
 }  // namespace
@@ -708,6 +709,7 @@ TEST_CASE("R-54 (WP-46 review): the static's function is read from its parsed na
     const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
     const std::string own = "?sname@?1??o2_step@@YAXXZ@4PEAV?$vec@H@4@A";
     o.symbol(own, 0x20, bss, false, false);
+    o.function("?o2_step@@YAXXZ");
     Built b = o.build();
     std::vector<cml::Diag> errors;
     BindPlan partial;
@@ -751,4 +753,42 @@ TEST_CASE("R-54 (WP-46 review): a static of a lambda's call operator, and an inn
     CHECK(errors[0].code == diag::kAmbiguousStatic);
     CHECK_MESSAGE(contains(errors[0].message, "o2_step::<lambda_0>::operator()::<lambda_1>"), errors[0].message);
     CHECK(decision(partial, own).decision != DecisionKind::BindOldData);
+}
+
+TEST_CASE("R-54 (WP-46 second review): the function and the closure are matched whatever their display spellings") {
+    // clang-cl; the closure's TPI name and the static's display scope are spelled differently. 4092e8b compared them as raw
+    // prefixes, missed the inlined lambda, and the new own static took the lambda's live record at 0x3020.
+    const auto run = [](const std::string& proc_name, const std::string& closure_name, const std::string& unique, const std::string& function,
+                        const std::string& own) {
+        SynthWorld w = basic_world(false);
+        tp::Module& tu = w.tu();
+        tu.symbols = tp::Records();
+        tu.symbols.objname(tu.name);
+        tu.symbols.compile3(1, 0, 0xD0, "clang version 18.1.3 (https://github.com/llvm/llvm-project)");
+        tp::TypeSet types;
+        types.add(tp::kLfClass, tp::lf_udt(closure_name, unique, true));
+        types.add(tp::kLfClass, tp::lf_udt(closure_name, unique, false, 1));
+        types.add_to(w.spec.tpi);
+        w.proc_with_statics(w.tu(), proc_name, 0x60, {{"sname", 0x20}});
+        w.open();
+        SynthObj o;
+        const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+        o.symbol(own, 0x20, bss, false, false);
+        o.function(function, false);
+        Built b = o.build();
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+        REQUIRE(errors.size() == 1);
+        CHECK(errors[0].code == diag::kAmbiguousStatic);
+        CHECK_MESSAGE(contains(errors[0].message, "whose call operator the compiler inlined everywhere"), errors[0].message);
+        CHECK(decision(partial, own).decision != DecisionKind::BindOldData);
+    };
+    SUBCASE("a function in an anonymous namespace: \"(anonymous namespace)::tick\" against \"`anonymous namespace'::tick::<lambda_0>\"") {
+        run("`anonymous namespace'::tick", "`anonymous namespace'::tick::<lambda_0>", ".?AV<lambda_0>@?0??tick@?A0x1234ABCD@@YAXXZ@", "?tick@?A0x1234ABCD@@YAXXZ",
+            "?sname@?1??tick@?A0x1234ABCD@@YAXXZ@4UO2Name@@A");
+    }
+    SUBCASE("template arguments spelled with a space in the TPI: the decorated scope decides") {
+        run("tick<int>", "tick<int >::<lambda_0>", ".?AV<lambda_0>@?0???$tick@H@@YAXXZ@", "??$tick@H@@YAXXZ", "?sname@?1???$tick@H@@YAXXZ@4UO2Name@@A");
+    }
 }

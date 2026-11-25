@@ -1213,3 +1213,23 @@ TEST_CASE("types: compiland_local_types lists each procedure's own locals, not a
     CHECK((*uses)[2].proc_rva == 0x1200);
     CHECK((*uses)[2].type_index == 0x1236);
 }
+
+TEST_CASE("types: type_size keys definitions by the exact unique name; definitions of one name that disagree are unknown") {
+    TempDir dir;
+    TypeSet types;
+    // Two units' `namespace { struct State; }`: the same name, different discriminators, different sizes.
+    types.add(kLfStructure, lf_udt("`anonymous namespace'::State", ".?AUState@?A0x11111111@@", false, 8));
+    types.add(kLfStructure, lf_udt("`anonymous namespace'::State", ".?AUState@?A0x22222222@@", false, 32));
+    const std::uint32_t small = types.add(kLfStructure, lf_udt("`anonymous namespace'::State", ".?AUState@?A0x11111111@@", true));
+    const std::uint32_t large = types.add(kLfStructure, lf_udt("`anonymous namespace'::State", ".?AUState@?A0x22222222@@", true));
+    // One exact name defined twice with different sizes (a PDB that merged two definitions).
+    types.add(kLfStructure, lf_udt("Odd", ".?AUOdd@@", false, 4));
+    types.add(kLfStructure, lf_udt("Odd", ".?AUOdd@@", false, 12));
+    const std::uint32_t odd = types.add(kLfStructure, lf_udt("Odd", ".?AUOdd@@", true));
+    Spec spec = spec_with({{0x110F, "f", 0x1000}});
+    types.add_to(spec.tpi);
+    const auto idx = open_spec(dir, spec);
+    CHECK(idx->type_size(small) == std::optional<std::uint64_t>(8));
+    CHECK(idx->type_size(large) == std::optional<std::uint64_t>(32));  // 4092e8b: 8, the first definition without the discriminator
+    CHECK_FALSE(idx->type_size(odd).has_value());
+}

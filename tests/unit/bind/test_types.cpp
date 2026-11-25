@@ -1103,6 +1103,8 @@ public:
         records_.data(kind, name, 0, 0, type);
     }
     void local(const std::string& decorated, const std::string& name, std::uint32_t type = tp::kTInt) { record(symbol(decorated), name, type); }
+    // WP-46: any other record of the procedure.
+    void raw_record(std::uint16_t kind, const tp::Bytes& body) { records_.add(kind, body); }
     // WP-46: an S_LOCAL (a local variable of the procedure, not a static).
     void variable(std::uint32_t type, const std::string& name) {
         tp::Bytes b;
@@ -3246,4 +3248,111 @@ TEST_CASE("destructor of a local class (WP-46 review): a lone old record that is
     const SymbolDecision d = decision(*r, kLocalDtor);
     CHECK(d.decision == DecisionKind::PatchNewFunction);
     CHECK(r->hooks.empty());
+}
+
+TEST_CASE("guards without a record (WP-46 second review): a variable's extent is its own type's size, not a namesake's of another unit") {
+    // Two units' `namespace { struct State; }`, 8 and 32 bytes. gf's static `st` is the 32-byte one (old data 0x10..0x30); the
+    // layout pass A learned from `s_count` puts gf's guard at 0x3020, inside it. 4092e8b sized the types by their name without
+    // the unit's discriminator, took the first definition (8 bytes) and placed the guard there.
+    SynthWorld w;
+    Types old_types;
+    old_types.set.add(tp::kLfStructure, tp::lf_udt("`anonymous namespace'::State", ".?AUState@?A0x11111111@@", false, 8));
+    old_types.set.add(tp::kLfStructure, tp::lf_udt("`anonymous namespace'::State", ".?AUState@?A0x22222222@@", false, 32));
+    const std::uint32_t large = old_types.set.add(tp::kLfStructure, tp::lf_udt("`anonymous namespace'::State", ".?AUState@?A0x22222222@@", true));
+    old_types.set.add_to(w.spec.tpi);
+    w.data(w.tu(), "`anonymous namespace'::s_count", 0x08);
+    tp::Records& s = w.tu().symbols;
+    s.proc(0x1110, "gf", SynthWorld::kTextSec, 0x40, 0x20);
+    s.data(0x110C, "st", SynthWorld::kDataSec, 0x10, large);
+    s.end();
+    w.pub_func(kGf, 0x40);
+    w.open();
+    StaticsObj o;
+    const std::uint32_t bss = o.obj.section(".bss", kData, 0x40);
+    o.obj.symbol("?s_count@?A0x1@@3HA", 0x08, static_cast<std::int32_t>(bss), false, false);
+    const std::uint32_t st = o.obj.symbol("?st@?1??gf@@YAHXZ@4UState@?A0x22222222@@A", 0x10, static_cast<std::int32_t>(bss), false, false);
+    o.obj.symbol(kGfGuard, 0x20, static_cast<std::int32_t>(bss), false, false);
+    o.proc(kGf, "gf");
+    o.record(st, "st");
+    o.end();
+    Built b = o.build(some_debug_t());
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+    REQUIRE(errors.size() == 1);
+    CHECK(errors[0].code == diag::kGuardMismatch);
+    CHECK_MESSAGE(contains(errors[0].message, "where the old image records 'st' (0x3010..0x3030)"), errors[0].message);
+    CHECK(decision(partial, kGfGuard).decision != DecisionKind::BindOldData);
+}
+
+TEST_CASE("hash-named lambdas (WP-46 second review): a template that takes the lambda (run<F>(F f)) is not its enclosing function") {
+    // f() passed its lambda kHash3 to `run(lambda)`; the edit removed it there, and g() now passes a new lambda kEdited3 to run.
+    // Neither f nor g holds a local of the closure; only the instances run<kHash3> and run<kEdited3> have it, as a parameter
+    // (cl /Od writes S_REGREL32 for it, clang S_LOCAL with fIsParam). 4092e8b took the instances for the enclosing functions,
+    // found them alike canonically (run<<lambda>>) and paired the two lambdas: g's lambda bound to f's live static.
+    SynthWorld w;
+    Types t;
+    const std::uint32_t fn = t.fn(tp::kTInt, {});
+    const ClosureTypes c1 = closure_types(t, kHash1, tp::kTInt);
+    const ClosureTypes c3 = closure_types(t, kHash3, tp::kTInt);
+    old_proc(w, kHash1 + "::operator()", 0x60, c1.op, {{"c", 0x20}, {"$TSS0", 0x28}});
+    old_proc(w, kHash3 + "::operator()", 0x80, c3.op, {{"c", 0x30}, {"$TSS0", 0x38}});
+    tp::Records& s = w.tu().symbols;
+    s.proc(0x1110, "ll_a", SynthWorld::kTextSec, 0xA0, 0x10, 0, fn);
+    {
+        tp::Bytes b;
+        tp::put32(b, c1.forward);
+        tp::put16(b, 0);
+        tp::putstr(b, "lambda");
+        s.add(0x113E, b);  // S_LOCAL: ll_a holds kHash1
+    }
+    s.end();
+    s.proc(0x110F, "run<" + kHash3 + ">", SynthWorld::kTextSec, 0xC0, 0x10, 0, fn);
+    {
+        tp::Bytes b;
+        tp::put32(b, 0x10);
+        tp::put32(b, c3.forward);
+        tp::put16(b, 335);
+        tp::putstr(b, "f");
+        s.add(0x1111, b);  // S_REGREL32: the parameter of run<kHash3>
+    }
+    s.end();
+    w.pub_func("?ll_a@@YAHXZ", 0xA0);
+    t.set.add_to(w.spec.tpi);
+    w.open();
+
+    Types nt;
+    const std::uint32_t nfn = nt.fn(tp::kTInt, {});
+    const ClosureTypes n1 = closure_types(nt, kHash1, tp::kTInt);
+    const ClosureTypes n3 = closure_types(nt, kEdited3, tp::kTInt);
+    StaticsObj o;
+    for (const auto& [closure, c] : {std::pair<std::string, ClosureTypes>{kHash1, n1}, std::pair<std::string, ClosureTypes>{kEdited3, n3}}) {
+        o.proc(hashed_op(closure), closure + "::operator()", false, c.op);
+        o.local(hashed_static(closure), "c");
+        o.local(hashed_guard(closure), "$TSS0");
+        o.end();
+    }
+    o.proc("?ll_a@@YAHXZ", "ll_a", true, nfn);
+    o.variable(n1.forward, "lambda");
+    o.end();
+    o.proc("??$run@V" + kEdited3 + "@@@@YAHV" + kEdited3 + "@@@Z", "run<" + kEdited3 + ">", false, nfn);
+    {
+        // S_LOCAL with fIsParam: the parameter of run<kEdited3>
+        tp::Bytes b;
+        tp::put32(b, n3.forward);
+        tp::put16(b, 1);
+        tp::putstr(b, "f");
+        // (StaticsObj::variable writes flags 0; a parameter needs its own record)
+        o.raw_record(0x113E, b);
+    }
+    o.end();
+    Built b = o.build(nt.set.debug_t());
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+    REQUIRE_FALSE(errors.empty());
+    CHECK(errors[0].code == diag::kHashedLambdasUnproven);
+    CHECK_MESSAGE(contains(errors[0].message, "the function that holds the lambda is not known on both sides"), errors[0].message);
+    CHECK(decision(partial, hashed_op(kEdited3)).decision != DecisionKind::PatchHooked);
+    CHECK(decision(partial, hashed_static(kEdited3)).decision != DecisionKind::BindOldData);
 }

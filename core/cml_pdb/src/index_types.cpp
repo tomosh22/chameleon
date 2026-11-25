@@ -138,6 +138,10 @@ Result<const std::vector<ClosureClass>*> PdbIndex::closure_classes() const {
     return &impl_->closures;
 }
 
+namespace {
+constexpr std::uint64_t kConflictingSize = ~0ull;  // two definitions of one unique name with different sizes
+}  // namespace
+
 std::optional<std::uint64_t> PdbIndex::type_size(std::uint32_t index) const {
     const TypeSource& source = types();
     return type_size_of(source, index, [this](const std::string& unique) -> std::optional<std::uint64_t> {
@@ -149,8 +153,13 @@ std::optional<std::uint64_t> PdbIndex::type_size(std::uint32_t index) const {
                 std::string_view name;
                 std::string_view u;
                 const std::optional<std::uint64_t> size = udt_definition_size(record);
+                // (Second review: keyed by the EXACT unique name; two definitions of one name that disagree on the size make it
+                // unknown, never the first one's.)
                 if (size && udt_record_names(record, name, u) && !u.empty()) {
-                    impl_->udt_sizes.emplace(without_tu_discriminator(u), *size);
+                    const auto [at, added] = impl_->udt_sizes.emplace(std::string(u), *size);
+                    if (!added && at->second != *size) {
+                        at->second = kConflictingSize;
+                    }
                 }
             });
             CML_LOG(Info, "WP46-UDT-SIZES pdb='%s' definitions=%zu complete=%d", impl_->path.c_str(), impl_->udt_sizes.size(), impl_->udt_sizes_ok ? 1 : 0);
@@ -159,7 +168,7 @@ std::optional<std::uint64_t> PdbIndex::type_size(std::uint32_t index) const {
             return std::nullopt;
         }
         const auto it = impl_->udt_sizes.find(unique);
-        return it == impl_->udt_sizes.end() ? std::nullopt : std::optional<std::uint64_t>(it->second);
+        return it == impl_->udt_sizes.end() || it->second == kConflictingSize ? std::nullopt : std::optional<std::uint64_t>(it->second);
     });
 }
 

@@ -1460,13 +1460,51 @@ std::string Planner::inlined_lambda_risk(const std::string& member, const std::s
     if (display.size() <= suffix.size() || display.compare(display.size() - suffix.size(), suffix.size(), suffix) != 0) {
         return "the function of '" + member + "' cannot be read from its name, so a lambda of it that the compiler inlined cannot be ruled out";
     }
-    const std::string function = display.substr(0, display.size() - suffix.size());
+    const std::string function = normalized_pdb_name(display.substr(0, display.size() - suffix.size()));
+    // (Second review: the display spellings of the static's scope and of a closure's TPI name differ, "(anonymous namespace)"
+    // against "`anonymous namespace'", template arguments with or without spaces. The decorated scope is compared as well: the
+    // function's decorated name is the patch's own symbol whose name, followed by '@', begins the static's scope; a closure of
+    // that function has it, after a block prefix, in its unique name at some depth. Both in the spelling without the unit's
+    // discriminator.)
+    std::string decorated_function;
+    {
+        const std::string plain_member = pdb::without_tu_discriminator(member);
+        const std::size_t at = plain_member.find('@');
+        const std::string_view scope = at == std::string::npos ? std::string_view() : std::string_view(plain_member).substr(at + 1);
+        const std::size_t block = block_prefix_length(scope);
+        const std::string_view rest = block == 0 || block >= scope.size() || scope[block] != '?' ? std::string_view() : scope.substr(block + 1);
+        for (const Sym& f : syms_) {
+            if (!f.defined || f.dec.type != SymbolType::Function) {
+                continue;
+            }
+            const std::string& name = plain_name(f);
+            if (name.size() > decorated_function.size() && rest.size() > name.size() && rest.compare(0, name.size(), name) == 0 && rest[name.size()] == '@') {
+                decorated_function = name;
+            }
+        }
+    }
+    const auto in_function = [&](const pdb::ClosureClass& c) {
+        if (closure_in_function(normalized_pdb_name(c.name), function)) {
+            return true;
+        }
+        if (decorated_function.empty()) {
+            return false;
+        }
+        const std::string needle = decorated_function + "@";
+        for (std::size_t at = c.unique.find(needle); at != std::string::npos; at = c.unique.find(needle, at + 1)) {
+            if (at > 0 && c.unique[at - 1] == '?') {
+                return true;
+            }
+        }
+        return false;
+    };
     const Result<const std::vector<pdb::ClosureClass>*> closures = pdb_.closure_classes();
     if (!closures) {
         return "the closure classes of the old image cannot be read (" + closures.error().message + "), so a lambda of the function that the compiler inlined cannot be ruled out";
     }
+    bool risky_unknown = decorated_function.empty();
     for (const pdb::ClosureClass& c : **closures) {
-        if (!closure_in_function(c.name, function)) {
+        if (!in_function(c)) {
             continue;
         }
         if (!closures_with_proc_built_) {
@@ -1488,6 +1526,12 @@ std::string Planner::inlined_lambda_risk(const std::string& member, const std::s
         CML_LOG(Info, "WP46-R54 static=%s function=%s closure='%s' unique=%s inlined-everywhere refused", member.c_str(), function.c_str(), c.name.c_str(), c.unique.c_str());
         return "the old image has a lambda of that function ('" + c.name + "') whose call operator the compiler inlined everywhere (no procedure of it in compiland " + std::to_string(ci_) +
                "), and the statics of such a lambda are recorded in the function itself";
+    }
+    if (risky_unknown) {
+        // Neither spelling of the function could be reconciled with the closures (its decorated name is no symbol of the patch):
+        // a lambda of it cannot be ruled out.
+        CML_LOG(Info, "WP46-R54 static=%s function=%s refused (the decorated function is not a symbol of the patch)", member.c_str(), function.c_str());
+        return "the decorated name of the function of '" + member + "' is not a symbol of the patch, so its lambdas cannot be told from the closures of the old image";
     }
     return {};
 }
@@ -1574,37 +1618,64 @@ std::string Planner::elimination_problem(const std::string& fresh, const std::st
     if (!uses) {
         return "the local variables of the old compiland cannot be read (" + uses.error().message + ")";
     }
-    std::set<std::uint32_t> old_holders;
+    // (Second review: a function whose own name mentions the closure, `run<lambda>(F f)`, uses the closure (a template over
+    // it) and does not create it; canonically the old and new instances would even look alike. Such holders are left out, and
+    // parameters do not count as locals at all.)
+    std::set<std::uint32_t> old_holder_rvas;
     for (const pdb::PdbIndex::LocalTypeUse& u : *uses) {
         if (pdb::class_unique_name_of(pdb_.types(), u.type_index) == old_unique) {
-            old_holders.insert(u.proc_rva);
+            old_holder_rvas.insert(u.proc_rva);
         }
     }
-    const std::vector<std::uint64_t> new_holders = debug.functions_with_local(new_unique);
-    if (old_holders.size() != 1 || new_holders.size() != 1) {
-        return "the function that holds the lambda is not known on both sides (" + std::to_string(new_holders.size()) + " procedure(s) of the patch and " +
-               std::to_string(old_holders.size()) + " of the old image have a local variable of the closure's type)";
-    }
-    const std::uint32_t old_rva = *old_holders.begin();
-    const std::uint32_t new_section = static_cast<std::uint32_t>(new_holders.front() >> 32);
-    const std::uint32_t new_value = static_cast<std::uint32_t>(new_holders.front() & 0xFFFFFFFFull);
-    const Sym* holder = nullptr;
-    for (const Sym& f : syms_) {
-        if (f.defined && f.dec.type == SymbolType::Function && f.dec.section == new_section && f.s->value == new_value) {
-            holder = &f;
-            break;
+    std::vector<const pdb::SymbolView*> old_holders;
+    std::size_t old_users = 0;
+    for (const std::uint32_t rva : old_holder_rvas) {
+        const pdb::SymbolView* proc = nullptr;
+        for (const pdb::SymbolView& v : comp_syms_) {
+            if (pdb::is_proc_kind(v.kind) && v.rva == rva) {
+                proc = &v;
+                break;
+            }
         }
+        if (proc == nullptr) {
+            return "a procedure of the old image that holds the lambda has no record";
+        }
+        if (std::string_view(proc->name).find(old) != std::string_view::npos) {
+            ++old_users;
+            continue;
+        }
+        old_holders.push_back(proc);
     }
-    const pdb::SymbolView* old_holder = nullptr;
+    std::vector<const Sym*> holders;
+    std::size_t new_users = 0;
+    for (const std::uint64_t key : debug.functions_with_local(new_unique)) {
+        const std::uint32_t section = static_cast<std::uint32_t>(key >> 32);
+        const std::uint32_t value = static_cast<std::uint32_t>(key & 0xFFFFFFFFull);
+        const Sym* f = nullptr;
+        for (const Sym& s : syms_) {
+            if (s.defined && s.dec.type == SymbolType::Function && s.dec.section == section && s.s->value == value) {
+                f = &s;
+                break;
+            }
+        }
+        if (f == nullptr) {
+            return "a procedure of the patch that holds the lambda has no symbol";
+        }
+        if (f->name.find(fresh) != std::string::npos) {
+            ++new_users;
+            continue;
+        }
+        holders.push_back(f);
+    }
+    if (old_holders.size() != 1 || holders.size() != 1) {
+        return "the function that holds the lambda is not known on both sides (" + std::to_string(holders.size()) + " procedure(s) of the patch and " +
+               std::to_string(old_holders.size()) + " of the old image have a local variable of the closure's type, not counting " + std::to_string(new_users) + " and " +
+               std::to_string(old_users) + " that are templates over the closure)";
+    }
+    const pdb::SymbolView* old_holder = old_holders.front();
+    const std::uint32_t old_rva = old_holder->rva;
+    const Sym* holder = holders.front();
     std::size_t old_alike = 0;
-    for (const pdb::SymbolView& v : comp_syms_) {
-        if (pdb::is_proc_kind(v.kind) && v.rva == old_rva) {
-            old_holder = &v;
-        }
-    }
-    if (holder == nullptr || old_holder == nullptr) {
-        return "the function that holds the lambda has no symbol or no procedure record";
-    }
     if (holder->decided) {
         if (holder->dec.decision != DecisionKind::PatchHooked || !holder->dec.old_address.valid || holder->dec.old_address.rva != old_rva) {
             return "the lambda is held by '" + holder->dec.display + "' in the patch and by '" + std::string(old_holder->name) + "' in the old image";

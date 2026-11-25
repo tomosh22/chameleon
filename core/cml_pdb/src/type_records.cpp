@@ -531,7 +531,7 @@ std::optional<std::uint64_t> type_size_of(const TypeSource& types, std::uint32_t
                 if (!udt_names(r, names) || names.unique.empty() || !forward) {
                     return std::nullopt;
                 }
-                return forward(without_tu_discriminator(names.unique));
+                return forward(std::string(names.unique));  // (second review: exact, the unit's discriminator included)
             }
             default: return std::nullopt;
         }
@@ -807,7 +807,10 @@ Result<std::vector<ObjectProc>> read_object_procs(std::span<const std::uint8_t> 
                 if ((r.kind == kSymLocal && r.body_len >= 6) || ((r.kind == kSymRegRel32 || r.kind == kSymBpRel32) && r.body_len >= 8)) {
                     std::uint32_t proc = kNoProc;
                     bool plain = false;
-                    if (scopes.locate(proc, path, plain) && proc != kNoProc && plain && out[proc].local_types.size() < kMaxProcStatics) {
+                    // (Second review: a parameter, S_LOCAL with fIsParam, is not counted: a template that takes the closure is not
+                    // the function that creates it.)
+                    const bool parameter = r.kind == kSymLocal && (rd16(r.body + 4) & 1u) != 0;
+                    if (!parameter && scopes.locate(proc, path, plain) && proc != kNoProc && plain && out[proc].local_types.size() < kMaxProcStatics) {
                         out[proc].local_types.push_back(rd32(r.body + (r.kind == kSymLocal ? 0 : 4)));
                     }
                     return;

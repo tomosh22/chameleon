@@ -133,7 +133,7 @@ public:
     // through the TPI/IPI streams. Loads the compiland's symbols and the type streams. A function whose type cannot be read
     // still returns a ProcInfo (params_known == false); an error only when the symbol records are unreadable.
     Result<ProcInfo> proc_info(const SymbolView& proc) const;
-    // WP-46 (F-41.2 review): for every outermost procedure of a compiland, the types of its own local variables (S_LOCAL;
+    // WP-46 (F-41.2 review): for every outermost procedure of a compiland, the types of its own local variables (S_LOCAL, parameters left out;
     // S_REGREL32 and S_BPREL32 as cl writes them at /Od), at any block depth but not inside an inline site (an inlined
     // call's locals are the inlinee's). One walk of the module stream; nothing is cached. CML1413-style errors when the
     // stream cannot be read.
@@ -166,7 +166,8 @@ public:
     // TPI stream (nothing else does); the result is kept for the life of the index. CML1430 when the stream cannot be read.
     Result<const std::vector<ClosureClass>*> closure_classes() const;
     // WP-46 (review): the size in bytes of a type of the TPI: simple types, pointers, modifiers, arrays, enums, and classes,
-    // structs and unions; a forward reference is resolved through its unique name (the first call that needs one walks the
+    // structs and unions; a forward reference is resolved through its exact unique name (definitions of one name that disagree
+    // on the size: unknown; the first call that needs one walks the
     // TPI once and keeps a map of the definitions' sizes). nullopt when the size cannot be known.
     std::optional<std::uint64_t> type_size(std::uint32_t index) const;
 

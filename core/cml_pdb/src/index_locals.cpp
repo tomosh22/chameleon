@@ -515,6 +515,9 @@ Result<std::vector<PdbIndex::LocalTypeUse>> PdbIndex::compiland_local_types(std:
             continue;
         }
         if (k == S_LOCAL && n >= 6) {
+            if ((rd16(b + 4) & 1u) != 0) {
+                continue;  // (second review) a parameter (fIsParam): a template that takes the closure, not the function that creates it
+            }
             out.push_back({proc_rva, rd32(b)});
         } else if ((k == S_REGREL32 || k == S_BPREL32) && n >= 8) {
             out.push_back({proc_rva, rd32(b + 4)});
