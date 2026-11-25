@@ -1,0 +1,121 @@
+# Scenario `jump_tables` (WP-49, R-46, ADR-0044). Fixture `jump_tables` has one translation unit with two dense switches
+# (jt_dense, jt_other) and a function without one (jt_value). Every reload recompiles the whole unit; hook narrowing must keep
+# only what changed. Under cl (Debug /Od, RelWithDebInfo /O2) the jump tables live in the functions' own code and are compared
+# entry by entry; under clang-cl they live in .rdata and stay unverifiable (hooked, as before WP-49):
+#   1. jt_value 1 -> 2: cl installs one hook (both switches equal the running code); clang-cl three;
+#   2. `case 1:` and `case 2:` of jt_dense exchange their bodies: the code bytes can stay the same, only two entries of the
+#      table differ. jt_dense must be hooked (d1 50 -> 3, d2 3 -> 50): a dropped hook here would keep printing d1=50, which is
+#      the wrong-code bug the comparison must never cause. cl: one hook (jt_value equals its patch-1 record); clang-cl two;
+#   3. jt_value 2 -> 3: cl one hook (jt_dense equals the record patch 2 made of it, jump table included); clang-cl three.
+# Every reload prints `WP49-HOOKS hooks_planned=N hooks_dropped=N hooks_installed=N ...`.
+name = "jump_tables"
+description = "fixture jump_tables: functions with a jump table in their own code are compared entry by entry (cl), so one edit hooks one function; a changed case target is hooked"
+fixture = "jump_tables"
+timeout_s = 300
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ d1=50 d2=3 o=95 v=1\\b"
+within_s = 15
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_jump_tables.exe"
+within_s = 15
+
+# 1. a function without a switch changed
+[[step]]
+kind = "edit"
+patch = "edits/value_2.edit"
+
+[[step]]
+kind = "reload"
+within_s = 90
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_reload_result"
+key = "hooks_planned"
+value = 3
+
+[[step]]
+kind = "expect_reload_result"
+key = "hooks_installed"
+value = 1
+compiler = "cl"
+
+[[step]]
+kind = "expect_reload_result"
+key = "hooks_installed"
+value = 3
+compiler = "clang-cl"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ d1=50 d2=3 o=95 v=2\\b"
+within_s = 10
+
+# 2. only the jump table of jt_dense changes
+[[step]]
+kind = "edit"
+patch = "edits/stacked/swap_cases.edit"
+
+[[step]]
+kind = "reload"
+within_s = 90
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_reload_result"
+key = "hooks_installed"
+value = 1
+compiler = "cl"
+
+[[step]]
+kind = "expect_reload_result"
+key = "hooks_installed"
+value = 2
+compiler = "clang-cl"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ d1=3 d2=50 o=95 v=2\\b"
+within_s = 10
+
+# 3. jt_dense, hooked by patch 2, is compared with that patch's record
+[[step]]
+kind = "edit"
+patch = "edits/stacked/value_3.edit"
+
+[[step]]
+kind = "reload"
+within_s = 90
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_reload_result"
+key = "hooks_installed"
+value = 1
+compiler = "cl"
+
+[[step]]
+kind = "expect_reload_result"
+key = "hooks_installed"
+value = 3
+compiler = "clang-cl"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ d1=3 d2=50 o=95 v=3\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ d1=3 d2=50 o=95 v=3\\b"
+within_s = 10

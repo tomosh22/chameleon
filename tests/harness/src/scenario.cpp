@@ -68,6 +68,9 @@ std::string Step::describe() const {
             break;
         case StepKind::ExpectReloadResult:
             out += " " + key + "=" + std::to_string(result_value);
+            if (!compiler.empty()) {
+                out += " (" + compiler + " only)";
+            }
             break;
         case StepKind::Edit:
             out += " " + patch;
@@ -568,8 +571,14 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
     }
     if (*kind == "expect_reload_result") {
         step.kind = StepKind::ExpectReloadResult;
-        cml::Result<void> keys = only_keys(table, {"kind", "key", "value"}, "an expect_reload_result step");
+        cml::Result<void> keys = only_keys(table, {"kind", "key", "value", "compiler"}, "an expect_reload_result step");
         if (!keys) return keys.error();
+        if (table.find("compiler") != nullptr) {
+            cml::Result<std::string> compiler = require_string(table, "compiler", "an expect_reload_result step");
+            if (!compiler) return compiler.error();
+            if (*compiler != "cl" && *compiler != "clang-cl") return invalid(table.line, "'compiler' must be \"cl\" or \"clang-cl\"");
+            step.compiler = *compiler;
+        }
         cml::Result<std::string> key = require_string(table, "key", "an expect_reload_result step");
         if (!key) return key.error();
         if (!name_chars_ok(*key, false)) return invalid(table.line, "'key' must be a member name (letters, digits, '_', '-')");

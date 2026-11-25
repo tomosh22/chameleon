@@ -155,6 +155,131 @@ private:
         return std::nullopt;
     }
 
+    // ---- WP-49 (R-46): jump tables in the function's own code ---------------------------------------------------------
+
+    // The ADDR32NB references of a function to places inside the function itself.
+    struct LocalTargets {
+        std::map<std::uint64_t, std::uint64_t> at;     // site (offset in the section) -> target offset from the function start
+        std::map<std::uint64_t, std::string> refused;  // site -> why that reference cannot be judged (the function is hooked)
+        std::size_t tables = 0;
+        std::size_t entries = 0;
+    };
+
+    // Sorts the ADDR32NB sites of the function [start, start + len) of section `sec_index` that reach a place inside the
+    // function into `at` (a jump-table entry, or a reference to the first entry of a table) and `refused` (everything else
+    // that names a place of this section: a table whose entries leave the function, one whose end cannot be told, a
+    // reference to a place that is not a table). The caller judges each site where it meets it, in relocation order, so a
+    // function keeps the reason of its first relocation that differs. ADDR32NB sites the planner retargets to old data
+    // (WP-36) and ADDR32NB to other sections are in neither map: the other rules judge them.
+    void local_targets(const std::string& display, const coff::Section& sec, std::uint32_t sec_index, std::uint64_t start, std::uint64_t len,
+                       const std::vector<coff::ResolvedRelocation>& relocs, LocalTargets* out) const {
+        struct Ref {
+            std::uint64_t target = 0;  // offset in the section the reference reaches (symbol value + in-place addend)
+            std::uint64_t label = 0;   // the value of the symbol it names
+            std::string name;
+        };
+        std::map<std::uint64_t, Ref> refs;  // site -> reference, ADDR32NB to a place inside the function
+        bool addr32nb_at_end = false;       // an ADDR32NB right behind the function (a table may go on there)
+        const std::uint64_t end = start + len;
+        const auto refuse = [&](std::uint64_t site, std::string why) {
+            CML_LOG(Trace, "WP49-JUMPTABLE function='%s' byte=%llu verdict=unverifiable reason=%s", display.c_str(), static_cast<unsigned long long>(site - start),
+                    why.c_str());
+            out->refused.emplace(site, std::move(why));
+        };
+        for (const coff::ResolvedRelocation& r : relocs) {
+            if (r.reloc.type != coff::RelocType::Addr32Nb) {
+                continue;
+            }
+            const std::uint64_t site = r.reloc.virtual_address;
+            addr32nb_at_end = addr32nb_at_end || site == end;
+            if (site < start || site >= end || site + 4 > sec.data.size() || r.target == nullptr) {
+                continue;  // outside the function (a relocation crossing its bounds is refused by the caller)
+            }
+            if (planned_imgrel(sec_index, static_cast<std::uint32_t>(site)) || r.target->section_number != static_cast<std::int32_t>(sec_index)) {
+                continue;  // old data (WP-36) or another section (a table in .rdata, a thunk): judged by the other rules
+            }
+            const std::uint32_t addend = static_cast<std::uint32_t>(load_le(sec.data.data() + site, 4));
+            const std::uint64_t target = static_cast<std::uint32_t>(r.target->value + addend);
+            if (target < start || target >= end) {
+                refuse(site, "ADDR32NB to '" + std::string(r.target->name) + "' reaches +" + hex(target) +
+                                 " of the section, outside the function (a jump table that leaves the function)");
+                continue;
+            }
+            refs.emplace(site, Ref{target, r.target->value, std::string(r.target->name)});
+        }
+        if (refs.empty()) {
+            return;
+        }
+        // A table starts where a reference points (at its target, or at the symbol it names when it carries an offset) and an
+        // entry lies; it is the run of consecutive 4-byte entries from there.
+        std::map<std::uint64_t, std::uint64_t> tables;  // first entry -> one past the last
+        std::map<std::uint64_t, std::uint64_t> table_of;  // entry -> first entry of its table
+        const auto table_at = [&](const Ref& ref) -> std::optional<std::uint64_t> {
+            for (const std::uint64_t at : {ref.target, ref.label}) {
+                if (refs.count(at) != 0) {
+                    return at;
+                }
+            }
+            return std::nullopt;
+        };
+        for (const auto& [site, ref] : refs) {
+            const std::optional<std::uint64_t> first = table_at(ref);
+            if (!first || tables.count(*first) != 0) {
+                continue;
+            }
+            std::uint64_t q = *first;
+            while (refs.count(q) != 0) {
+                table_of.emplace(q, *first);
+                q += 4;
+            }
+            tables.emplace(*first, q);
+        }
+        // A table that runs to the end of the function with another ADDR32NB right behind it may go on outside the bytes
+        // compared: its end cannot be told.
+        std::set<std::uint64_t> unbounded;
+        for (const auto& [first, last] : tables) {
+            if (last >= end && addr32nb_at_end) {
+                unbounded.insert(first);
+            }
+        }
+        for (const auto& [site, ref] : refs) {
+            const auto entry = table_of.find(site);
+            const std::optional<std::uint64_t> loads = table_at(ref);
+            if (entry == table_of.end() && !loads) {
+                refuse(site, "ADDR32NB to '" + ref.name + "' reaches byte " + std::to_string(ref.target - start) +
+                                 " of the function, which is not the start of a jump table (no entries there)");
+                continue;
+            }
+            const std::uint64_t table = entry != table_of.end() ? entry->second : *loads;
+            if (unbounded.count(table) != 0 || (loads && unbounded.count(*loads) != 0)) {
+                refuse(site, "the jump table at byte " + std::to_string(table - start) + " runs to the end of the function and an ADDR32NB follows it: its end cannot be told");
+                continue;
+            }
+            out->at.emplace(site, ref.target - start);
+        }
+        out->tables = tables.size();
+        out->entries = table_of.size();
+        CML_LOG(Trace, "WP49-JUMPTABLE function='%s' tables=%zu entries=%zu references=%zu refused=%zu verdict=%s", display.c_str(), out->tables, out->entries,
+                refs.size() - out->entries, out->refused.size(), out->refused.empty() ? "comparable" : "unverifiable");
+    }
+
+    // R-50 (as in the WP-36 prover): a relocation that starts before the function and reaches into it, or one of a type whose
+    // width is not known less than 8 bytes before it, would leave function bytes unmasked or unexplained: not judged.
+    static std::optional<Keep> reaches_into_start(const std::vector<coff::ResolvedRelocation>& relocs, std::uint64_t start) {
+        for (const coff::ResolvedRelocation& r : relocs) {
+            const std::uint64_t site = r.reloc.virtual_address;
+            if (site >= start || start - site >= 8) {
+                continue;
+            }
+            const std::uint32_t w = reloc_width(r.reloc.type);
+            if (w == 0 || site + w > start) {
+                return Keep{NarrowReason::Unverifiable, "the relocation " + std::string(coff::reloc_type_name(r.reloc.type)) + " " + std::to_string(start - site) +
+                                                            " bytes before the function reaches into it"};
+            }
+        }
+        return std::nullopt;
+    }
+
     // nullopt: identical, drop the hook.
     std::optional<Keep> check(const bind::HookEntry& h) const {
         if (in_.object == nullptr) {
@@ -225,10 +350,35 @@ private:
                 return Keep{NarrowReason::BytesDiffer, "byte " + std::to_string(i) + " differs"};
             }
         }
+        // (After the bytes, so that a function whose bytes differ is reported as changed, as before WP-49.)
+        if (std::optional<Keep> keep = reaches_into_start(*relocs, start)) {
+            return keep;
+        }
+        LocalTargets local;
+        local_targets(h.display, *sec, dec->section, start, len, *relocs, &local);
         for (const coff::ResolvedRelocation* r : inside) {
+            if (const auto no = local.refused.find(r->reloc.virtual_address); no != local.refused.end()) {
+                return Keep{NarrowReason::Unverifiable, no->second};
+            }
+            if (const auto l = local.at.find(r->reloc.virtual_address); l != local.at.end()) {
+                // WP-49: the old linker wrote the RVA of the place in the old function; the same place relative to the start.
+                const std::uint64_t at = r->reloc.virtual_address - start;
+                const std::uint32_t old_raw = static_cast<std::uint32_t>(load_le(old_bytes->data() + at, 4));
+                const std::uint32_t old_off = old_raw - h.old_rva;
+                if (old_off != l->second) {
+                    CML_LOG(Trace, "WP49-JUMPTABLE function='%s' verdict=target-changed byte=%llu old=+%s new=+%s", h.display.c_str(), static_cast<unsigned long long>(at),
+                            hex(old_off).c_str(), hex(l->second).c_str());
+                    return Keep{NarrowReason::TargetChanged, "the jump-table reference at byte " + std::to_string(at) + " reached byte " + std::to_string(old_off) +
+                                                                 " of the old function, now byte " + std::to_string(l->second)};
+                }
+                continue;
+            }
             if (std::optional<Keep> keep = check_target(h, *sec, dec->section, start, *r, *old_bytes)) {
                 return keep;
             }
+        }
+        if (local.tables != 0) {
+            CML_LOG(Trace, "WP49-JUMPTABLE function='%s' tables=%zu entries=%zu verdict=equal", h.display.c_str(), local.tables, local.entries);
         }
         return std::nullopt;
     }
@@ -253,6 +403,11 @@ private:
         if (relocs == nullptr) {
             return Keep{NarrowReason::Unverifiable, relocs_error};
         }
+        if (std::optional<Keep> keep = reaches_into_start(*relocs, loc.start)) {
+            return keep;
+        }
+        LocalTargets local;  // WP-49
+        local_targets(loc.dec->display.empty() ? symbol : loc.dec->display, sec, loc.dec->section, loc.start, loc.len, *relocs, &local);
         out->symbol = symbol;
         out->bytes.assign(loc.len, 0);
         for (std::uint64_t i = 0; i < loc.len; ++i) {
@@ -276,7 +431,13 @@ private:
             cr.offset = static_cast<std::uint32_t>(at);
             cr.type = static_cast<std::uint16_t>(r.reloc.type);
             cr.addend = load_le(sec.data.data() + site, w);
-            if (std::optional<Keep> keep = capture_target(loc.dec->section, r, &cr.target)) {
+            if (const auto no = local.refused.find(site); no != local.refused.end()) {
+                return Keep{NarrowReason::Unverifiable, no->second};
+            }
+            if (const auto l = local.at.find(site); l != local.at.end()) {
+                cr.target.kind = CodeTarget::Kind::Local;  // WP-49: the same place of the function, wherever it lies
+                cr.target.value = l->second;
+            } else if (std::optional<Keep> keep = capture_target(loc.dec->section, r, &cr.target)) {
                 return keep;
             }
             std::memset(out->bytes.data() + at, 0, w);
@@ -383,6 +544,12 @@ private:
             }
             if (a.target.kind == CodeTarget::Kind::NewSymbol) {
                 return Keep{NarrowReason::TargetNew, "reference to the new symbol '" + a.target.name + "'"};
+            }
+            if (a.target.kind == CodeTarget::Kind::Local && b.target.kind == CodeTarget::Kind::Local && a.offset == b.offset && a.target.value != b.target.value) {
+                CML_LOG(Trace, "WP49-JUMPTABLE function='%s' verdict=target-changed byte=%u prior=+%s new=+%s", h.display.c_str(), a.offset, hex(b.target.value).c_str(),
+                        hex(a.target.value).c_str());
+                return Keep{NarrowReason::TargetChanged, "the jump-table reference at byte " + std::to_string(a.offset) + " reached byte " + std::to_string(b.target.value) +
+                                                             " of the earlier patch's function, now byte " + std::to_string(a.target.value)};
             }
             return Keep{NarrowReason::TargetChanged, "the relocation at byte " + std::to_string(a.offset) + " reaches another target than in the earlier patch"};
         }

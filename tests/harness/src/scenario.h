@@ -56,6 +56,9 @@ struct Step {
     std::string wait_for;  // Wait: "index" | "idle"
     int within_s = 10;     // ExpectStdout / ExpectModuleEnabled / Reload / ExpectDiag / ExpectEvent / Wait
     std::string key;       // ExpectMonotonic: the TICK key ("calls")
+    // ExpectReloadResult (WP-49): "cl" or "clang-cl": the expectation holds for that compiler only; a cell of the other compiler
+    // passes the step without checking (the number differs where the compilers lay out the same code differently).
+    std::string compiler;
     int min_samples = 10;  // ExpectMonotonic: at least this many samples of the key in the whole output
     // Reload: the result object of the reload command must hold this integer member (e.g. "initializers_run" = 1).
     std::string result_key;
