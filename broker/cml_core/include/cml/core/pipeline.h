@@ -6,7 +6,8 @@
 //   compile    each compiland's recorded command line is replayed with /Z7 into the session directory (parallel)
 //   plan       plan_bind() per object, then the hook list is narrowed to the functions that really changed
 //   anchor     section locators (add_anchors, incl. the plan's associative sections) and binding.obj
-//   link       one patch DLL at a fixed base inside the address space the agent reserved near the module
+//   link       one patch DLL at a fixed base inside the address space the agent reserved near the module (relinked at
+//              another base when the load finds the range taken)
 //   load       LoadPatch: the agent loads the DLL
 //   fixups     SECREL sites are pre-applied to the DLL file; the rest goes out as ApplyFixups
 //   init       RunInitializers: .CRT$XCU entries of NEW globals only
@@ -15,6 +16,13 @@
 // Every stage is timed; every failure becomes a diag event (stable id) and the returned Diag. After a failure
 // that follows a successful load the patch is unloaded (ReleaseRange UnloadPatch), so a refused reload leaves
 // the process as it was (initialisers that already ran are not undone: docs/wp/WP-12.md).
+//
+// WP-47 (ADR-0044): all or nothing over the module's compilands. plan .. fix-ups run for EVERY recompiled compiland
+// first (each planned against the ones staged before it, as if they were applied); only then load .. hooks run, per
+// compiland. A refusal while preparing applies nothing (CML3650 for a reload of several compilands); a failure while
+// applying rolls back what the reload applied (the WP-22 revert of its batch; CML3651, CML3652 when that fails too),
+// except after hooks that may still become live (CML5309 / CML4656: the reload stops there, CML3653). `patch_applied`
+// is published when the reload's compilands are live, never for one that was rolled back. docs/wp/WP-47.md.
 //
 // The external effects (compiler, linker) are in PipelineEnv so the orchestration is unit-tested on every host
 // with a scripted agent; native_pipeline_env() has the Windows implementation.

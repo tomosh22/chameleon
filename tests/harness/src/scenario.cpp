@@ -108,7 +108,7 @@ std::string Step::describe() const {
             out += " for " + wait_for + " within " + std::to_string(within_s) + " s";
             break;
         case StepKind::ExpectEvent:
-            out += " " + event + " within " + std::to_string(within_s) + " s";
+            out += " " + std::string(event_absent ? "no " : "") + event + " within " + std::to_string(within_s) + " s";
             break;
         case StepKind::Restart:
             out += (hold_new ? " held" : "") + std::string(" within ") + std::to_string(within_s) + " s";
@@ -513,12 +513,16 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
     }
     if (*kind == "expect_event") {
         step.kind = StepKind::ExpectEvent;
-        cml::Result<void> keys = only_keys(table, {"kind", "event", "within_s"}, "an expect_event step");
+        cml::Result<void> keys = only_keys(table, {"kind", "event", "within_s", "absent"}, "an expect_event step");
         if (!keys) return keys.error();
         cml::Result<std::string> event = require_string(table, "event", "an expect_event step");
         if (!event) return event.error();
         if (!name_chars_ok(*event, false)) return invalid(table.line, "'event' must be an event name (letters, digits, '_', '-')");
         step.event = *event;
+        if (const toml::Value* absent = table.find("absent")) {  // WP-47
+            if (absent->kind != toml::Value::Kind::Boolean) return invalid(absent->line, "'absent' must be true or false");
+            step.event_absent = absent->boolean;
+        }
         cml::Result<int> within = int_in_range(table, "within_s", 10, 1, 3600);
         if (!within) return within.error();
         step.within_s = *within;

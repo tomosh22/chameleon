@@ -13,12 +13,14 @@
 #include "cml/coff/anchors.h"
 #include "cml/coff/binding.h"
 #include "cml/coff/writer.h"
+#include "cml/core/atomic_reload_diag_ids.h"
 #include "cml/core/bind_diag_ids.h"
 #include "cml/core/bind_plan.h"
 #include "cml/core/module_audit.h"
 #include "cml/core/header_diag_ids.h"
 #include "cml/core/patch_image.h"
 #include "cml/core/pipeline_diag_ids.h"
+#include "cml/core/revert.h"
 #include "cml/core/static_lib_diag_ids.h"
 #include "cml/toolchain/rewrite.h"
 #include "cml/util/hash.h"
@@ -30,6 +32,7 @@ namespace cml::core {
 
 namespace fs = std::filesystem;
 namespace pd = pipeline::diag;
+namespace ar = atomic_reload::diag;
 using Clock = std::chrono::steady_clock;
 
 void StageTimes::add(const StageTimes& o) {
@@ -307,6 +310,14 @@ private:
     }
 
     std::vector<AppliedPatch> applied_;  // WP-22: the patches this run made live, oldest first
+    // WP-47: the compilands of this run after the prepare phase, in unit order (stable addresses: the overlay and the narrowing
+    // inputs point into them), and the `patch_applied` events of the applied ones, published when the reload is done.
+    struct Staged;
+    std::vector<std::unique_ptr<Staged>> staged_;
+    std::vector<Event> applied_events_;
+    const pdb::PdbIndex* pdb_ = nullptr;
+    std::string workdir_;
+    std::vector<Unit>* units_ = nullptr;
 
     Result<PatchReport> run() {
         PatchReport report;
@@ -567,27 +578,59 @@ private:
         }
         notify_compile(ipc::CompilePhase::Success);
 
-        // ---- 3.. per compiland: one patch each ---------------------------------------------------------------
+        // ---- 3. prepare every compiland, 4. apply them (WP-47, ADR-0044) -------------------------------------------
+        // Plan, narrowing with its code proofs, anchor, link and fix-ups run for EVERY compiland before any is applied, so a
+        // refusal of one leaves the process as it was. A compiland is planned against the compilands staged before it as if
+        // they were applied (their new functions and globals, hooks and code records: the overlay below). The apply (load,
+        // fix-ups, initialisers, hooks) then runs per compiland; a failure there rolls back what this reload had applied (the
+        // WP-22 revert of its batch).
         const std::uint64_t generation_before = [&] {
             std::lock_guard<std::mutex> lock(module_.mutex);
             return module_.generation;
         }();
-        std::map<std::uint32_t, bool> unit_ok;
+        pdb_ = pdb.get();
+        workdir_ = *workdir;
+        units_ = &units;
         std::optional<Diag> failure;
-        for (Unit& u : units) {
-            if (Result<void> t = check_time("plan"); !t) {
-                failure = t.error();
-                break;
+        for (std::size_t i = 0; i < units.size() && !failure; ++i) {
+            staged_.push_back(std::make_unique<Staged>());
+            staged_.back()->unit = i;
+            if (Result<void> prepared = prepare(*staged_.back(), report); !prepared) {
+                failure = refused(prepared.error());
             }
-            Result<void> applied = apply_unit(u, *pdb, *workdir, report);
-            unit_ok[u.compiland] = applied.has_value();
-            if (!applied) {
-                failure = applied.error();
-                break;
+        }
+        if (failure) {
+            release_ranges(0);
+        } else {
+            std::size_t with_effect = 0;
+            for (const std::unique_ptr<Staged>& s : staged_) {
+                with_effect += s->has_effect ? 1 : 0;
+            }
+            CML_LOG(Trace, "reload: all %zu compilands of %s are planned, linked and verified (%zu to apply); applying", staged_.size(), module_.name.c_str(), with_effect);
+            for (std::size_t i = 0; i < staged_.size() && !failure; ++i) {
+                if (!staged_[i]->has_effect) {
+                    continue;
+                }
+                if (Result<void> applied = apply(i, report); !applied) {
+                    release_ranges(i);
+                    failure = after_apply_failure(applied.error(), i, generation_before);
+                }
+            }
+            if (!failure) {
+                add_plan_counts(report);
             }
         }
 
-        // Re-baseline the files whose every compiland was patched; the others are processed again next time.
+        // Re-baseline the files whose every compiland is live (applied, or unchanged against the running code); the others are
+        // processed again next time. A compiland that loaded nothing counts only when its comparison did not rely on a compiland
+        // staged before it that was then not applied.
+        std::map<std::uint32_t, bool> unit_ok;
+        bool before_applied = true;  // every compiland with effect so far was applied
+        for (const std::unique_ptr<Staged>& s : staged_) {
+            const bool ok = s->prepared && (s->has_effect ? s->applied : (!s->after_pending || before_applied));
+            unit_ok[units[s->unit].compiland] = ok;
+            before_applied = before_applied && (!s->has_effect || s->applied);
+        }
         std::map<std::string, FileStamp> accepted;
         for (const auto& entry : swept->file_compilands) {
             bool all = true;
@@ -625,6 +668,13 @@ private:
             std::lock_guard<std::mutex> lock(module_.mutex);
             module_.batches.push_back(std::move(batch));
         }
+        // WP-47: `patch_applied` is published once the reload's compilands are live, never for one that a later failure rolled back.
+        if (ctx_.events != nullptr) {
+            for (Event& e : applied_events_) {
+                ctx_.events->publish(std::move(e));
+            }
+        }
+        applied_events_.clear();
         if (failure) {
             return *failure;
         }
@@ -670,30 +720,183 @@ private:
         return dir;
     }
 
-    // ---- one compiland ------------------------------------------------------------------------------------
-    Result<void> apply_unit(Unit& u, const pdb::PdbIndex& pdb, const std::string& workdir, PatchReport& report) {
+    // ---- WP-47: one compiland, staged ------------------------------------------------------------------------
+    // What the prepare phase made of one compiland: everything its apply needs, and what it adds to the module's state once it is
+    // applied (`hook_table`, `code`, `symbols`). Until then those are only seen through the overlay, by the compilands planned
+    // after it.
+    struct PlanCounts {
+        std::size_t hooks_planned = 0, hooks_dropped = 0, new_functions = 0, new_globals = 0, thunks = 0, imgrel_sites = 0, imgrel_verified = 0;
+        std::vector<std::string> kept;           // hooks_kept notes
+        std::vector<std::string> data_changes;   // WP-25 (a compiland that loads nothing)
+    };
+    struct Staged {  // declared with the members above
+        std::size_t unit = 0;            // index in units_
+        std::uint64_t patch_no = 0;      // names its files; kept when the compiland is prepared again after a relink
+        unsigned link_attempt = 0;       // names its DLLs (patch_<no>_<attempt>); never goes back
+        bool has_effect = false;         // false: identical to the running code, nothing to load (WP-25)
+        bool after_pending = false;      // planned while an earlier compiland with effect was staged and not yet applied
+        bool prepared = false;           // prepare() got through: planned, verified (and linked when it has effect)
+        std::unique_ptr<coff::OwnedObject> object;
+        bind::BindPlan plan;
+        std::vector<bind::HookEntry> hooks;  // narrowed: one per old entry
+        std::size_t planned = 0;         // narrowing: distinct old entries planned
+        std::size_t dropped = 0;
+        PlanCounts counts;
+        // link inputs (a relink at another base reuses them)
+        std::string patch_dir;
+        std::string anchored_path;
+        std::string binding_path;
+        std::vector<coff::SectionLocator> locators;
+        std::vector<coff::BindSymbol> binds;
+        // link outputs
+        bool linked_ok = false;          // linked, fix-ups made, its contributions computed
+        bool range_held = false;         // its slice of the reservation is used while nothing is mapped there (given back on release)
+        toolchain::LinkedPatch linked;
+        PatchFixups fixups;
+        std::vector<std::uint32_t> init_rvas;
+        std::vector<AppliedHook> hook_table;  // old entry -> new entry, index-aligned with `hooks`
+        std::vector<std::pair<std::uint64_t, std::shared_ptr<const CodeImage>>> code;  // WP-25 records, by patch address
+        std::vector<std::pair<std::string, SymbolAddress>> symbols;  // new functions and globals: the registry entries
+        std::vector<Diag> layout_warnings;    // new functions / globals without an address (published when applied)
+        // apply
+        bool mapped = false;             // LoadPatch succeeded (the slice stays used, also after an unload)
+        bool applied = false;            // committed: live in the process and in the module's state
+        bool live_unconfirmed = false;   // CML5309 / CML4656: may be live, recorded as installed, cannot be rolled back
+
+        // Back to "not prepared"; the identity (unit, patch number, DLL counter) stays.
+        void reset() {
+            Staged fresh;
+            fresh.unit = unit;
+            fresh.patch_no = patch_no;
+            fresh.link_attempt = link_attempt;
+            *this = std::move(fresh);
+        }
+        // What the overlay shows: staged with effect, linked, not yet in the module's state.
+        bool pending() const noexcept { return has_effect && linked_ok && !applied && !live_unconfirmed; }
+    };
+
+    // The registry as the compiland being planned sees it: the staged compilands' new symbols (newest first), then the module's.
+    class OverlayRegistry final : public SymbolRegistry {
+    public:
+        explicit OverlayRegistry(const Run& run) : run_(run) {}
+        std::optional<SymbolAddress> find(std::string_view name) const override {
+            for (auto s = run_.staged_.rbegin(); s != run_.staged_.rend(); ++s) {
+                if (!(*s)->pending()) {
+                    continue;
+                }
+                for (auto e = (*s)->symbols.rbegin(); e != (*s)->symbols.rend(); ++e) {
+                    if (e->first == name) {
+                        return e->second;
+                    }
+                }
+            }
+            return run_.module_.registry.find(name);
+        }
+
+    private:
+        const Run& run_;
+    };
+
+    bool staged_is_hooked(std::uint64_t va) const {
+        for (const std::unique_ptr<Staged>& s : staged_) {
+            if (s->pending()) {
+                for (const AppliedHook& h : s->hook_table) {
+                    if (h.old_entry == va) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return module_.is_hooked(va);
+    }
+    // ModuleState::code_running_at over the module's hook table and code records with the staged compilands' on top.
+    std::shared_ptr<const CodeImage> staged_code_running_at(std::uint64_t entry) const {
+        std::optional<std::uint64_t> target;
+        for (auto s = staged_.rbegin(); s != staged_.rend() && !target; ++s) {
+            if ((*s)->pending()) {
+                for (const AppliedHook& h : (*s)->hook_table) {
+                    if (h.old_entry == entry) {
+                        target = h.new_entry;  // the last staged hook of an entry wins, as it would once applied
+                    }
+                }
+            }
+        }
+        std::lock_guard<std::mutex> lock(module_.mutex);
+        if (!target) {
+            const auto hooked = module_.hooked.find(entry);
+            target = hooked != module_.hooked.end() ? hooked->second : entry;
+        }
+        for (auto s = staged_.rbegin(); s != staged_.rend(); ++s) {
+            if ((*s)->pending()) {
+                for (const auto& c : (*s)->code) {
+                    if (c.first == *target) {
+                        return c.second;
+                    }
+                }
+            }
+        }
+        const auto found = module_.code.find(*target);
+        return found != module_.code.end() ? found->second : nullptr;
+    }
+    bool any_pending() const {
+        return std::any_of(staged_.begin(), staged_.end(), [](const std::unique_ptr<Staged>& s) { return s->pending(); });
+    }
+    NarrowInput narrow_input(const Staged& s, const pe::OwnedImage* image) const {
+        NarrowInput ni;
+        ni.object = &s.object->object;
+        ni.plan = &s.plan;
+        ni.old_image = image != nullptr ? &image->image : nullptr;
+        ni.load_base = module_.base;
+        ni.is_hooked = [this](std::uint64_t va) { return staged_is_hooked(va); };
+        ni.prior_code = [this](std::uint64_t va) { return staged_code_running_at(va); };  // WP-25
+        return ni;
+    }
+    std::string unit_name(const Staged& s) const {
+        const Unit& u = (*units_)[s.unit];
+        return std::string(path::base_name(std::string_view(u.source.empty() ? u.object_name : u.source)));
+    }
+    // " (compiland 3 of 3, tu_c.cpp)" for a reload of several compilands, else nothing.
+    std::string unit_suffix(const Staged& s) const {
+        if (units_->size() < 2) {
+            return std::string();
+        }
+        return " (compiland " + std::to_string(s.unit + 1) + " of " + std::to_string(units_->size()) + ", " + unit_name(s) + ")";
+    }
+
+    // ---- prepare: plan, narrowing and its proofs, anchor, link, fix-ups -----------------------------------------
+    // Nothing here changes the process (the agent is asked for the reservation, once per module, and nothing else).
+    Result<void> prepare(Staged& s, PatchReport& report) {
+        s.reset();
+        if (Result<void> t = check_time("plan"); !t) {
+            return t;
+        }
+        Unit& u = (*units_)[s.unit];
+        const pdb::PdbIndex& pdb = *pdb_;
         Lap lap;
-        const std::uint64_t patch_no = [&] {
+        if (s.patch_no == 0) {
             std::lock_guard<std::mutex> lock(module_.mutex);
-            return ++module_.patch_counter;
-        }();
-        const std::string tag = "g" + std::to_string(patch_no);
+            s.patch_no = ++module_.patch_counter;
+        }
+        const std::string tag = "g" + std::to_string(s.patch_no);
+        s.after_pending = any_pending();
 
         // ---- plan --------------------------------------------------------------------------------------------
         Result<coff::OwnedObject> object = coff::load_object_file(u.outcome.object_path);
         if (!object) {
             return fail("plan", object.error());
         }
+        s.object = std::make_unique<coff::OwnedObject>(std::move(*object));
         std::shared_ptr<const pe::OwnedImage> image = module_image(report);
         FileProcessModules process_modules(snapshot_.modules, LoadedModule{module_.path, module_.base, module_.size}, ctx_.exports, image);
+        const OverlayRegistry registry(*this);
         bind::PlanInput in;
-        in.object = &object->object;
+        in.object = &s.object->object;
         in.object_name = std::string(path::base_name(std::string_view(u.outcome.object_path)));
         in.module_pdb = &pdb;
         in.module_name = module_.name;
         in.module_base = module_.base;
         in.compiland_index = u.compiland;
-        in.registry = &module_.registry;
+        in.registry = &registry;
         in.modules = &process_modules;
         if (const std::optional<Diag> f = injected(ipc::fault::Stage::BindPlan)) {
             return fail("plan", *f);
@@ -704,54 +907,28 @@ private:
             warn(report, "plan", skipped);
         }
         if (!planned) {
-            std::optional<Diag> first;
-            for (const Diag& e : errors) {
-                const Diag shown = fail("plan", e);
-                first = first ? first : std::optional<Diag>(shown);
-            }
-            if (!first) {
-                first = fail("plan", planned.error());
-            }
-            return *first;
+            return first_failure("plan", errors, planned.error());
         }
-        bind::BindPlan plan = std::move(*planned);
+        s.plan = std::move(*planned);
+        bind::BindPlan& plan = s.plan;
         // WP-40 (R-48 item 5, ADR-0043 rule (d)): lambdas the type records cannot tell apart were paired by their numbers;
         // their call operators' code decides. Where it shows that lambdas changed places, the unit is planned again with
         // that pairing (once: the second plan is not compared again).
         if (!plan.lambda_sets.empty()) {
-            NarrowInput li;
-            li.object = &object->object;
-            li.plan = &plan;
-            li.old_image = image ? &image->image : nullptr;
-            li.load_base = module_.base;
-            li.is_hooked = [this](std::uint64_t va) { return module_.is_hooked(va); };
-            li.prior_code = [this](std::uint64_t va) { return module_.code_running_at(va); };
+            const NarrowInput li = narrow_input(s, image.get());
             LambdaPairing lambdas = pair_lambdas_by_code(li);
             for (const Diag& w : lambdas.warnings) {
                 warn(report, "plan", w);
             }
             if (!lambdas.errors.empty()) {
-                std::optional<Diag> first;
-                for (const Diag& e : lambdas.errors) {
-                    const Diag shown = fail("plan", e);
-                    first = first ? first : std::optional<Diag>(shown);
-                }
-                return *first;
+                return first_failure("plan", lambdas.errors, lambdas.errors.front());
             }
             if (!lambdas.closure_pairing.empty()) {
                 in.closure_pairing = lambdas.closure_pairing;
                 errors.clear();
                 Result<bind::BindPlan> again = bind::plan_bind(in, &errors);
                 if (!again) {
-                    std::optional<Diag> first;
-                    for (const Diag& e : errors) {
-                        const Diag shown = fail("plan", e);
-                        first = first ? first : std::optional<Diag>(shown);
-                    }
-                    if (!first) {
-                        first = fail("plan", again.error());
-                    }
-                    return *first;
+                    return first_failure("plan", errors, again.error());
                 }
                 plan = std::move(*again);
             }
@@ -759,84 +936,52 @@ private:
         // WP-46 (F-41.2, ADR-0043 ruling D1): lambdas cl names by a hash (its legacy lambda processor) were paired by that name,
         // whose derivation is not documented; their code proves the pairing (one changed lambda allowed), otherwise CML3630.
         if (!plan.hashed_lambdas.empty()) {
-            NarrowInput hi;
-            hi.object = &object->object;
-            hi.plan = &plan;
-            hi.old_image = image ? &image->image : nullptr;
-            hi.load_base = module_.base;
-            hi.is_hooked = [this](std::uint64_t va) { return module_.is_hooked(va); };
-            hi.prior_code = [this](std::uint64_t va) { return module_.code_running_at(va); };
-            const std::vector<Diag> unproven = prove_hashed_lambdas(hi);
+            const std::vector<Diag> unproven = prove_hashed_lambdas(narrow_input(s, image.get()));
             if (!unproven.empty()) {
-                std::optional<Diag> first;
-                for (const Diag& e : unproven) {
-                    const Diag shown = fail("plan", e);
-                    first = first ? first : std::optional<Diag>(shown);
-                }
-                return *first;
+                return first_failure("plan", unproven, unproven.front());
             }
         }
         // WP-40 (second high review, ADR-0043 ruling): a `$S<n>` bitmask bound to the old one only while its function's
         // code is unchanged (the bits follow the order of its dynamically initialised statics); otherwise CML3600.
         if (!plan.bitmask_guards.empty()) {
-            NarrowInput bi;
-            bi.object = &object->object;
-            bi.plan = &plan;
-            bi.old_image = image ? &image->image : nullptr;
-            bi.load_base = module_.base;
-            bi.is_hooked = [this](std::uint64_t va) { return module_.is_hooked(va); };
-            bi.prior_code = [this](std::uint64_t va) { return module_.code_running_at(va); };
-            const std::vector<Diag> unproven = prove_bitmask_guards(bi);
+            const std::vector<Diag> unproven = prove_bitmask_guards(narrow_input(s, image.get()));
             if (!unproven.empty()) {
-                std::optional<Diag> first;
-                for (const Diag& e : unproven) {
-                    const Diag shown = fail("plan", e);
-                    first = first ? first : std::optional<Diag>(shown);
-                }
-                return *first;
+                return first_failure("plan", unproven, unproven.front());
             }
         }
         for (const Diag& w : plan.warnings) {
             warn(report, "plan", w);
         }
         // WP-36 evidence: image-relative references to old data in this object, and how many were proved displacements.
-        report.imgrel_sites += plan.imgrel_sites;
-        report.imgrel_verified += plan.imgrel_verified;
+        s.counts.imgrel_sites = plan.imgrel_sites;
+        s.counts.imgrel_verified = plan.imgrel_verified;
         // (WP-40, R-50: at Info only for an object that has such references; the counters of the reload answer, which cmltest
         // and the corpus read, do not depend on this line. The planner itself logs it at Debug for every object.)
         if (plan.imgrel_sites != 0) {
             CML_LOG(Info, "%s", plan.imgrel_line(in.object_name).c_str());
         }
-        NarrowInput ni;
-        ni.object = &object->object;
-        ni.plan = &plan;
-        ni.old_image = image ? &image->image : nullptr;
-        ni.load_base = module_.base;
-        ni.is_hooked = [this](std::uint64_t va) { return module_.is_hooked(va); };
+        NarrowInput ni = narrow_input(s, image.get());
         ni.enabled = options_.narrow_hooks;
-        ni.prior_code = [this](std::uint64_t va) { return module_.code_running_at(va); };  // WP-25
         const NarrowResult narrowed = narrow_hooks(ni);
         // After merging plan hooks that share an old entry: planned - dropped == hooks.size() == hooks installed by this patch.
-        report.hooks_planned += narrowed.planned;
-        report.hooks_dropped += narrowed.dropped;
-        report.new_functions += plan.new_functions.size();
-        report.new_globals += plan.new_globals.size();
-        report.thunks += plan.thunks.size();
+        s.planned = narrowed.planned;
+        s.dropped = narrowed.dropped;
+        s.counts.hooks_planned = narrowed.planned;
+        s.counts.hooks_dropped = narrowed.dropped;
+        s.counts.new_functions = plan.new_functions.size();
+        s.counts.new_globals = plan.new_globals.size();
+        s.counts.thunks = plan.thunks.size();
         for (const NarrowDecision& d : narrowed.decisions) {
             if (!is_dropped(d.reason) && d.reason != NarrowReason::Disabled) {
-                if (report.hooks_kept.size() < kMaxKeptNotes) {
-                    report.hooks_kept.push_back(d.display + ": " + to_string(d.reason) + (d.detail.empty() ? "" : " - " + d.detail));
-                } else {
-                    ++report.hooks_kept_more;
-                }
+                s.counts.kept.push_back(d.display + ": " + to_string(d.reason) + (d.detail.empty() ? "" : " - " + d.detail));
             }
             CML_LOG(Debug, "reload: hook %s: %s%s%s", d.display.c_str(), to_string(d.reason), d.detail.empty() ? "" : " - ", d.detail.c_str());
         }
-        const std::vector<bind::HookEntry>& hooks = narrowed.hooks;  // one per old entry
+        s.hooks = narrowed.hooks;  // one per old entry
         // WP-18, CML3104: a changed small function of an optimised compiland may be inlined into its callers (one warning per compiland).
         {
             std::vector<std::string> small_changed;  // one warning per compiland, naming the small functions
-            for (const bind::HookEntry& h : hooks) {
+            for (const bind::HookEntry& h : s.hooks) {
                 if (h.old_size != 0 && h.old_size <= kSmallFunctionBytes) {
                     small_changed.push_back(h.display);
                 }
@@ -845,26 +990,28 @@ private:
                 warn(report, "plan", std::move(*stale));
             }
         }
-        const bool has_effect = !hooks.empty() || !plan.new_functions.empty() || !plan.new_globals.empty() || !plan.initialisers.empty();
+        s.has_effect = !s.hooks.empty() || !plan.new_functions.empty() || !plan.new_globals.empty() || !plan.initialisers.empty();
         report.times.plan += lap.lap();
-        if (!has_effect) {
+        if (!s.has_effect) {
             CML_LOG(Info, "reload: %s changes no code (all %zu planned hooks are identical to the running code); nothing to load", u.source.c_str(),
                     narrowed.planned);
-            ++report.units_unchanged;  // WP-25: run() turns "every unit unchanged" into the CML3450 / CML3451 warning
             for (std::string& name : bound_data_changes(ni)) {
-                report.data_changes.push_back(std::move(name));
+                s.counts.data_changes.push_back(std::move(name));
             }
+            CML_LOG(Trace, "reload: compiland %s%s prepared: nothing to load%s", unit_name(s).c_str(), unit_suffix(s).c_str(),
+                    s.after_pending ? " (compared with a compiland staged before it)" : "");
+            s.prepared = true;
             return Result<void>();
         }
 
         // ---- anchor + binding object -----------------------------------------------------------------------
-        const std::string patch_dir = workdir + "/" + tag;
+        s.patch_dir = workdir_ + "/" + tag;
         std::error_code ec;
-        fs::create_directories(patch_dir, ec);
+        fs::create_directories(s.patch_dir, ec);
         if (ec) {
-            return fail("anchor", Diag::make(pd::kWorkDir, "cannot create '" + patch_dir + "': " + ec.message(), "Check the TEMP directory."));
+            return fail("anchor", Diag::make(pd::kWorkDir, "cannot create '" + s.patch_dir + "': " + ec.message(), "Check the TEMP directory."));
         }
-        Result<coff::ObjectModel> model = coff::ObjectModel::from_object(object->object);
+        Result<coff::ObjectModel> model = coff::ObjectModel::from_object(s.object->object);
         if (!model) {
             return fail("anchor", model.error());
         }
@@ -881,21 +1028,23 @@ private:
         if (!locators) {
             return fail("anchor", locators.error());
         }
+        s.locators = std::move(*locators);
         Result<coff::ByteVector> anchored = coff::write(*model);
         if (!anchored) {
             return fail("anchor", anchored.error());
         }
-        const std::string anchored_path = patch_dir + "/" + std::string(path::base_name(std::string_view(u.source))) + ".anchored.obj";
-        if (!write_file(anchored_path, *anchored)) {
-            return fail("anchor", Diag::make(pd::kWorkDir, "cannot write '" + anchored_path + "'", "Check free disk space and the TEMP directory."));
+        s.anchored_path = s.patch_dir + "/" + std::string(path::base_name(std::string_view(u.source))) + ".anchored.obj";
+        if (!write_file(s.anchored_path, *anchored)) {
+            return fail("anchor", Diag::make(pd::kWorkDir, "cannot write '" + s.anchored_path + "'", "Check free disk space and the TEMP directory."));
         }
-        std::vector<coff::BindSymbol> binds = plan.binding_symbols();
+        s.binds = plan.binding_symbols();
+        std::vector<coff::BindSymbol>& binds = s.binds;
         // `/INCLUDE:sym` linker directives (cl writes `/INCLUDE:_fltused` into every object that uses floating
         // point) are no relocations, so the planner never sees them; with /NODEFAULTLIB nothing defines the symbol.
         // The patch gets an unused placeholder so the link resolves it.
         // Undefined externals nothing relocates against (the same `_fltused` as an undefined symbol the /INCLUDE
         // directive forces) are invisible to the planner too.
-        for (const coff::Symbol& sym : object->object.symbols()) {
+        for (const coff::Symbol& sym : s.object->object.symbols()) {
             if (!sym.is_external() || !sym.is_undefined() || sym.name.empty()) {
                 continue;
             }
@@ -910,11 +1059,11 @@ private:
                 binds.push_back(coff::BindSymbol{name, coff::BindKind::Data});
             }
         }
-        for (const coff::Directive& dir : object->object.directives()) {
+        for (const coff::Directive& dir : s.object->object.directives()) {
             if (dir.kind != coff::DirectiveKind::Include || dir.value.empty()) {
                 continue;
             }
-            const coff::Symbol* defined = object->object.find_symbol(dir.value);
+            const coff::Symbol* defined = s.object->object.find_symbol(dir.value);
             const bool in_object = defined != nullptr && !defined->is_undefined();
             const bool bound = std::any_of(binds.begin(), binds.end(), [&](const coff::BindSymbol& b) { return b.name == dir.value; });
             if (!in_object && !bound) {
@@ -922,105 +1071,344 @@ private:
                 binds.push_back(coff::BindSymbol{dir.value, coff::BindKind::Data});
             }
         }
-        std::string binding_path;
         if (!binds.empty()) {
             Result<coff::ByteVector> binding = coff::make_binding_object(binds);
             if (!binding) {
                 return fail("anchor", binding.error());
             }
-            binding_path = patch_dir + "/binding.obj";
-            if (!write_file(binding_path, *binding)) {
-                return fail("anchor", Diag::make(pd::kWorkDir, "cannot write '" + binding_path + "'", "Check free disk space and the TEMP directory."));
+            s.binding_path = s.patch_dir + "/binding.obj";
+            if (!write_file(s.binding_path, *binding)) {
+                return fail("anchor", Diag::make(pd::kWorkDir, "cannot write '" + s.binding_path + "'", "Check free disk space and the TEMP directory."));
             }
         }
         report.times.anchor += lap.lap();
 
-        // ---- reserve address space (once per module) -----------------------------------------------------
+        // ---- reserve address space (once per module), link -----------------------------------------------------
         if (Result<void> r = ensure_reserved(); !r) {
             return r;
-        }
-
-        // ---- link, load (relink at another base when the range was taken) ------------------------------------
-        if (Result<void> t = check_time("link"); !t) {
-            return t;
         }
         if (Result<void> r = ensure_linker(u, pdb, report); !r) {
             return r;
         }
-        toolchain::LinkedPatch linked;
-        PatchFixups fixups;
-        std::vector<std::uint32_t> init_rvas;
-        std::vector<bind::FixupTriple> triples;
-        bool loaded = false;
+        if (Result<void> r = link(s, report); !r) {
+            return r;
+        }
+        CML_LOG(Trace, "reload: compiland %s%s prepared: %zu hooks, %zu new functions, %zu new globals, linked at %s%s", unit_name(s).c_str(), unit_suffix(s).c_str(),
+                s.hooks.size(), plan.new_functions.size(), plan.new_globals.size(), hex(s.linked.base).c_str(),
+                s.after_pending ? " (planned against the compilands staged before it)" : "");
+        s.prepared = true;
+        return Result<void>();
+    }
+
+    // The first of `errors` (each one published as a diag event), else `fallback`.
+    Diag first_failure(const char* stage, const std::vector<Diag>& errors, const Diag& fallback) {
+        std::optional<Diag> first;
+        for (const Diag& e : errors) {
+            const Diag shown = fail(stage, e);
+            first = first ? first : std::optional<Diag>(shown);
+        }
+        return first ? *first : fail(stage, fallback);
+    }
+
+    // Links the staged compiland at the next free base, makes its fix-ups and computes what applying it adds: the hook table, the
+    // WP-25 code records and the registry entries. Nothing is loaded. On failure its slice stays held (release_ranges gives it back).
+    Result<void> link(Staged& s, PatchReport& report) {
+        Lap lap;
+        s.linked_ok = false;
+        if (Result<void> t = check_time("link"); !t) {
+            return t;
+        }
+        std::uint64_t base = 0;
+        {
+            std::lock_guard<std::mutex> lock(module_.mutex);
+            base = module_.reservation.next_base(kMinPatchRoom);
+        }
+        if (base == 0) {
+            return fail("link", Diag::make(pd::kReserveFailed, "the reserved address space near " + module_.name + " has no room left for a patch",
+                                           "Restart the application, or free address space near the module."));
+        }
+        toolchain::LinkPatchRequest lr;
+        {
+            std::lock_guard<std::mutex> lock(module_.mutex);
+            lr.linker = *module_.linker;
+        }
+        lr.objects.push_back(toolchain::PatchObjectInput{s.anchored_path, s.locators});
+        lr.binding_object = s.binding_path;
+        lr.bindings = s.binds;
+        lr.out_dir = s.patch_dir;
+        lr.name = "patch_" + std::to_string(s.patch_no) + "_" + std::to_string(++s.link_attempt);
+        lr.base = base;
+        lr.timeout_ms = static_cast<unsigned>(std::max<std::int64_t>(1000, remaining_ms()));
+        lr.cancel = ctx_.cancel;
+        if (!env_.link_patch) {
+            return fail("link", Diag::make(pd::kStageFailed, "this broker has no linker driver", "Run the broker on Windows."));
+        }
+        if (const std::optional<Diag> f = injected(ipc::fault::Stage::Link)) {
+            return fail("link", *f);
+        }
+        toolchain::LinkTrace trace;
+        Result<toolchain::LinkedPatch> lp = env_.link_patch(lr, &trace);
+        if (!lp) {
+            CML_LOG(Error, "link failed:\n%s", trace.output.c_str());
+            return fail("link", lp.error());
+        }
+        s.linked = std::move(*lp);
+        for (const Diag& w : s.linked.warnings) {
+            warn(report, "link", w);
+        }
+        report.times.link += lap.lap();
+        {
+            std::lock_guard<std::mutex> lock(module_.mutex);
+            module_.reservation.consume(base, s.linked.image_size);
+        }
+        s.range_held = true;
+
+        // ---- fix-ups (broker side) -----------------------------------------------------------------------------
+        Result<void> prepared = prepare_fixups(s.plan, s.linked, report, &s.fixups, &s.init_rvas);
+        report.times.fixups += lap.lap();
+        if (!prepared) {
+            return prepared;
+        }
+
+        // ---- what applying it adds --------------------------------------------------------------------------------
+        s.hook_table.clear();
+        for (const bind::HookEntry& h : s.hooks) {
+            const std::optional<std::uint64_t> target = function_va(s.plan, s.linked, h.new_symbol);
+            if (!target) {
+                return fail("link", Diag::make(bind::diag::kLayoutIncomplete, "the patch layout has no address for the hooked function '" + h.display + "'",
+                                               "Report this with the bind plan."));
+            }
+            s.hook_table.push_back(AppliedHook{h.old_va, *target, h.display});
+        }
+        // WP-25: what the functions of this patch look like, so the next compiland (and the next reload) can compare with it
+        // (hooked functions: keyed by the patch entry the hook jumps to; new functions: by their own address).
+        s.code.clear();
+        {
+            const auto address_of = [&](const std::string& name) -> std::optional<std::uint64_t> {
+                const bind::SymbolDecision* d = s.plan.find_decision(name);
+                if (d == nullptr) {
+                    return std::nullopt;
+                }
+                return symbol_va(s.linked, d->section, d->value);
+            };
+            const NarrowInput ni = narrow_input(s, module_image(report).get());
+            const CodeRecorder recorder(ni);  // the maps over the plan and the resolved relocations are built once
+            const auto record_one = [&](const std::string& symbol, const std::string& display, std::uint64_t entry) {
+                std::string why;
+                std::optional<CodeImage> recorded = recorder.capture(symbol, &why);
+                if (!recorded || !finalize_code(*recorded, address_of)) {
+                    CML_LOG(Trace, "reload: the code of %s is not recorded%s%s", display.c_str(), why.empty() ? "" : ": ", why.c_str());
+                    return;
+                }
+                recorded->display = display;
+                s.code.emplace_back(entry, std::make_shared<const CodeImage>(std::move(*recorded)));
+            };
+            for (std::size_t i = 0; i < s.hook_table.size(); ++i) {
+                record_one(s.hooks[i].new_symbol, s.hooks[i].display, s.hook_table[i].new_entry);
+            }
+            for (const bind::NewFunction& f : s.plan.new_functions) {
+                if (const std::optional<std::uint64_t> va = symbol_va(s.linked, f.section, f.value)) {
+                    record_one(f.name, f.display, *va);
+                }
+            }
+        }
+        s.symbols.clear();
+        s.layout_warnings.clear();
+        const std::string origin = "patch " + std::to_string(s.patch_no);
+        for (const bind::NewFunction& f : s.plan.new_functions) {
+            if (const std::optional<std::uint64_t> va = symbol_va(s.linked, f.section, f.value)) {
+                s.symbols.emplace_back(f.name, SymbolAddress{*va, true, origin});
+            } else {
+                s.layout_warnings.push_back(Diag::make(bind::diag::kLayoutIncomplete,
+                                                       "the new function '" + f.display + "' has no address in the patch layout; later patches cannot bind to it",
+                                                       "Report this with the bind plan."));
+            }
+        }
+        for (const bind::NewGlobal& g : s.plan.new_globals) {
+            if (const std::optional<std::uint64_t> va = symbol_va(s.linked, g.section, g.value)) {
+                s.symbols.emplace_back(g.name, SymbolAddress{*va, false, origin});
+            } else {
+                s.layout_warnings.push_back(Diag::make(bind::diag::kLayoutIncomplete,
+                                                       "the new global '" + g.display + "' has no address in the patch layout; later patches cannot bind to it",
+                                                       "Report this with the bind plan."));
+            }
+        }
+        s.linked_ok = true;
+        return Result<void>();
+    }
+
+    // Gives back the slices of the reservation that the staged compilands from `first` on hold with nothing mapped, newest first
+    // (only the newest slice of a block can be given back, so the order matters).
+    void release_ranges(std::size_t first) {
+        for (std::size_t i = staged_.size(); i > first; --i) {
+            Staged& s = *staged_[i - 1];
+            if (s.range_held) {
+                give_back_range(s.linked.base, s.linked.image_size);
+                s.range_held = false;
+            }
+        }
+    }
+
+    // A compiland was refused while the reload was being prepared: nothing was applied. The refusal keeps its id; for a reload of
+    // several compilands its message names the compiland and CML3650 says that nothing of the reload was applied.
+    Diag refused(Diag d) {
+        const Staged& s = *staged_.back();
+        CML_LOG(Trace, "reload: compiland %s%s refused (%s): nothing of the reload is applied", unit_name(s).c_str(), unit_suffix(s).c_str(), d.id().c_str());
+        if (units_->size() < 2) {
+            return d;
+        }
+        std::size_t ready = 0;
+        for (std::size_t i = 0; i + 1 < staged_.size(); ++i) {
+            ready += staged_[i]->has_effect ? 1 : 0;
+        }
+        emit(Diag::make(ar::kRefusedNothingApplied,
+                        "the reload of " + module_.name + " was refused at compiland " + std::to_string(s.unit + 1) + " of " + std::to_string(units_->size()) + " (" +
+                            unit_name(s) + ", " + d.id() + "): none of its compilands was applied (" + std::to_string(ready) +
+                            " compiland(s) before it were planned and linked, none was loaded); the process runs what it ran before",
+                        "Fix what the refusal names, then reload: the whole edit is applied then. Files the reload did not apply are compiled again."),
+             "warning", "plan");
+        d.message += unit_suffix(s) + "; nothing of this reload was applied";
+        return d;
+    }
+
+    // Applying compiland `k` failed (its own patch is already unloaded, or kept when it may still become live). Rolls back what the
+    // reload applied before it, unless that patch may still become live (it cannot be rolled back) or the agent is gone.
+    Diag after_apply_failure(Diag d, std::size_t k, std::uint64_t generation_before) {
+        const Staged& s = *staged_[k];
+        std::size_t with_effect = 0;
+        for (const std::unique_ptr<Staged>& t : staged_) {
+            with_effect += t->has_effect ? 1 : 0;
+        }
+        std::size_t applied = 0;
+        for (const std::unique_ptr<Staged>& t : staged_) {
+            applied += t->applied ? 1 : 0;
+        }
+        if (s.live_unconfirmed) {
+            const std::size_t left = with_effect - applied - 1;
+            CML_LOG(Trace, "reload: compiland %s%s may still become live (%s): no roll-back; %zu applied before it, %zu not applied", unit_name(s).c_str(),
+                    unit_suffix(s).c_str(), d.id().c_str(), applied, left);
+            if (with_effect > 1) {
+                emit(Diag::make(ar::kStoppedPartly,
+                                "compiland " + std::to_string(s.unit + 1) + " of " + std::to_string(units_->size()) + " of " + module_.name + " (" + unit_name(s) + ", " + d.id() +
+                                    ") may still become live and cannot be rolled back, so the reload stopped there: " + std::to_string(applied) +
+                                    " compiland(s) before it are applied, " + std::to_string(left) + " after it are not; the process may run a part of the edit",
+                                "In synchronised mode let the application reach SyncPoint(), then reload (the files of the compilands that were not applied are compiled again), or `revert` this reload."),
+                     "warning", "hooks");
+                d.message += unit_suffix(s) + "; " + std::to_string(left) + " compiland(s) after it were not applied";
+            }
+            return d;
+        }
+        if (applied_.empty()) {
+            CML_LOG(Trace, "reload: applying compiland %s%s failed (%s) before anything of the reload was live: nothing to roll back", unit_name(s).c_str(),
+                    unit_suffix(s).c_str(), d.id().c_str());
+            if (with_effect > 1) {
+                d.message += unit_suffix(s) + "; nothing of this reload was applied";
+            }
+            return d;
+        }
+        if (link_.closed()) {
+            CML_LOG(Trace, "reload: applying compiland %s%s failed (%s) and the agent is gone: the %zu applied compiland(s) stay recorded", unit_name(s).c_str(),
+                    unit_suffix(s).c_str(), d.id().c_str(), applied_.size());
+            return d;
+        }
+        // The WP-22 revert of this reload's batch: re-points what an older patch also hooked, restores the original bytes of the rest,
+        // un-commits the images, and puts the registry, the hook table, the code records and the generation back.
+        const std::size_t count = applied_.size();
+        CML_LOG(Trace, "reload: applying compiland %s%s failed (%s): rolling back the %zu compiland(s) this reload applied", unit_name(s).c_str(), unit_suffix(s).c_str(),
+                d.id().c_str(), count);
+        {
+            PatchBatch b;
+            b.patches = std::move(applied_);
+            b.generation_before = generation_before;
+            b.reload_id = ctx_.reload_id;
+            std::lock_guard<std::mutex> lock(module_.mutex);
+            module_.batches.push_back(std::move(b));
+        }
+        applied_.clear();
+        RevertOptions ro;
+        ro.timeout_ms = options_.hooks_timeout_ms;
+        // Its own budget: the failure may be the reload's deadline.
+        ro.deadline = Clock::now() + std::chrono::milliseconds(std::max<std::int64_t>(remaining_ms(), kRollbackBudgetMs));
+        ro.only_reload = ctx_.reload_id;
+        ro.events = nullptr;  // nothing of it was announced: `patch_applied` waits for the end of the reload
+        Result<RevertReport> back = revert_module(link_, module_, RevertScope::Last, ro);
+        if (!back) {
+            // revert_module changed nothing (or reports the mixed state itself): the batch stays recorded, so `revert` can try again.
+            // Its files are not re-baselined (the batch replaced no baseline), so the next reload compiles them again.
+            for (const std::unique_ptr<Staged>& t : staged_) {
+                t->applied = false;
+            }
+            applied_events_.clear();
+            return fail("rollback", Diag::make(ar::kRollbackFailed,
+                                               "applying compiland " + std::to_string(s.unit + 1) + " of " + std::to_string(units_->size()) + " of " + module_.name + " (" +
+                                                   unit_name(s) + ") failed (" + d.format() + ") and rolling back the " + std::to_string(count) +
+                                                   " compiland(s) this reload had applied failed too (" + back.error().format() + "): the process runs a part of the edit",
+                                               "Send `revert` (scope last) to try the roll-back again, or restart the application."));
+        }
+        for (const Diag& w : back->warnings) {
+            emit(w, "warning", "rollback");
+        }
+        for (const std::unique_ptr<Staged>& t : staged_) {
+            t->applied = false;
+        }
+        applied_events_.clear();
+        emit(Diag::make(ar::kRolledBack,
+                        "applying compiland " + std::to_string(s.unit + 1) + " of " + std::to_string(units_->size()) + " of " + module_.name + " (" + unit_name(s) + ", " +
+                            d.id() + ") failed, so the " + std::to_string(count) + " compiland(s) this reload had applied were rolled back (" +
+                            std::to_string(back->hooks_restored) + " function(s) back to the original code, " + std::to_string(back->hooks_repointed) +
+                            " re-pointed at an older patch): the process runs what it ran before the reload",
+                        "Fix what the failure names, then reload: the whole edit is applied then."),
+             "warning", "rollback");
+        d.message += unit_suffix(s) + "; the " + std::to_string(count) + " compiland(s) this reload had applied were rolled back";
+        return d;
+    }
+
+    // The plan counters of the compilands, added to the report once the reload is applied (a compiland prepared twice counts once).
+    void add_plan_counts(PatchReport& report) {
+        for (const std::unique_ptr<Staged>& sp : staged_) {
+            const PlanCounts& c = sp->counts;
+            report.hooks_planned += c.hooks_planned;
+            report.hooks_dropped += c.hooks_dropped;
+            report.new_functions += c.new_functions;
+            report.new_globals += c.new_globals;
+            report.thunks += c.thunks;
+            report.imgrel_sites += c.imgrel_sites;
+            report.imgrel_verified += c.imgrel_verified;
+            for (const std::string& k : c.kept) {
+                if (report.hooks_kept.size() < kMaxKeptNotes) {
+                    report.hooks_kept.push_back(k);
+                } else {
+                    ++report.hooks_kept_more;
+                }
+            }
+            if (!sp->has_effect) {
+                ++report.units_unchanged;  // WP-25: run() turns "every unit unchanged" into the CML3450 / CML3451 warning
+                for (const std::string& n : c.data_changes) {
+                    report.data_changes.push_back(n);
+                }
+            }
+        }
+    }
+
+    // ---- apply: load, fix-ups, initialisers, hooks, commit --------------------------------------------------------
+    Result<void> apply(std::size_t k, PatchReport& report) {
+        Staged& s = *staged_[k];
+        Lap lap;
         const unsigned attempts_allowed = std::max(1u, options_.max_load_attempts);
-        for (unsigned attempt = 1; attempt <= attempts_allowed && !loaded; ++attempt) {
-            ++report.load_attempts;
-            std::uint64_t base = 0;
-            {
-                std::lock_guard<std::mutex> lock(module_.mutex);
-                base = module_.reservation.next_base(kMinPatchRoom);
-            }
-            if (base == 0) {
-                return fail("link", Diag::make(pd::kReserveFailed, "the reserved address space near " + module_.name + " has no room left for a patch",
-                                               "Restart the application, or free address space near the module."));
-            }
-            toolchain::LinkPatchRequest lr;
-            {
-                std::lock_guard<std::mutex> lock(module_.mutex);
-                lr.linker = *module_.linker;
-            }
-            lr.objects.push_back(toolchain::PatchObjectInput{anchored_path, *locators});
-            lr.binding_object = binding_path;
-            lr.bindings = binds;
-            lr.out_dir = patch_dir;
-            lr.name = "patch_" + std::to_string(patch_no) + "_" + std::to_string(attempt);
-            lr.base = base;
-            lr.timeout_ms = static_cast<unsigned>(std::max<std::int64_t>(1000, remaining_ms()));
-            lr.cancel = ctx_.cancel;
-            if (!env_.link_patch) {
-                return fail("link", Diag::make(pd::kStageFailed, "this broker has no linker driver", "Run the broker on Windows."));
-            }
-            if (const std::optional<Diag> f = injected(ipc::fault::Stage::Link)) {
-                return fail("link", *f);
-            }
-            toolchain::LinkTrace trace;
-            Result<toolchain::LinkedPatch> lp = env_.link_patch(lr, &trace);
-            if (!lp) {
-                CML_LOG(Error, "link failed:\n%s", trace.output.c_str());
-                return fail("link", lp.error());
-            }
-            linked = std::move(*lp);
-            for (const Diag& w : linked.warnings) {
-                warn(report, "link", w);
-            }
-            report.times.link += lap.lap();
-            {
-                std::lock_guard<std::mutex> lock(module_.mutex);
-                module_.reservation.consume(base, linked.image_size);
-            }
-
-            // ---- fix-ups (broker side) ---------------------------------------------------------------------
-            Result<void> prepared = prepare_fixups(plan, linked, report, &fixups, &init_rvas, &triples);
-            report.times.fixups += lap.lap();
-            if (!prepared) {
-                give_back_range(linked.base, linked.image_size);  // nothing was loaded: the address space is free again
-                return prepared;
-            }
-
-            // ---- load ------------------------------------------------------------------------------------------
+        for (unsigned attempt = 1;; ++attempt) {
             if (Result<void> t = check_time("load"); !t) {
                 return t;
             }
+            ++report.load_attempts;
             ipc::LoadPatch load;
             load.request_id = link_.next_request_id();
-            load.patch_id = patch_no;
+            load.patch_id = s.patch_no;
             ipc::PatchCandidate candidate;
-            candidate.path = linked.dll_path;
-            candidate.image_base = linked.base;
-            candidate.image_size = linked.image_size;
+            candidate.path = s.linked.dll_path;
+            candidate.image_base = s.linked.base;
+            candidate.image_size = s.linked.image_size;
             load.candidates.push_back(std::move(candidate));
             if (const std::optional<Diag> f = injected(ipc::fault::Stage::SendPatch)) {
-                give_back_range(linked.base, linked.image_size);
                 return fail("load", *f);  // LoadPatch is never sent: nothing is loaded in the application
             }
             Result<ipc::Message> answer = ask(std::move(load), options_.agent_timeout_ms, "load");
@@ -1028,13 +1416,15 @@ private:
                 if (answer.error().code == pd::kAgentRequestTimeout) {
                     // The agent works through requests in order, so an unload sent now runs after a LoadPatch that is
                     // still queued: the late load does not leave an unused patch behind.
-                    unload(linked.base);
+                    unload(s.linked.base);
+                    s.range_held = false;  // a late load may have mapped it: never handed out again
                 }
                 return answer.error();
             }
             report.times.load += lap.lap();
             std::uint32_t status = 0;
             std::string message;
+            bool loaded = false;
             if (const auto* pl = std::get_if<ipc::PatchLoaded>(&*answer)) {
                 status = pl->status;
                 message = pl->message;
@@ -1050,29 +1440,35 @@ private:
                 status = 5306;
                 message = "unexpected answer type";
             }
-            if (!loaded) {
-                if ((status == 4203 || status == 4205) && attempt < attempts_allowed) {
-                    CML_LOG(Warn, "reload: the address range at %s was taken (CML%u); relinking at another base", hex(linked.base).c_str(), status);
-                    continue;
-                }
-                give_back_range(linked.base, linked.image_size);  // the agent refused: the image is not mapped
-                return fail("load", agent_refusal("LoadPatch", status, message, pd::kLoadFailed));
+            if (loaded) {
+                s.mapped = true;
+                s.range_held = false;  // an image that was loaded keeps its slice
+                break;
             }
+            if ((status == 4203 || status == 4205) && attempt < attempts_allowed) {
+                CML_LOG(Warn, "reload: the address range at %s was taken (CML%u); relinking at another base", hex(s.linked.base).c_str(), status);
+                s.range_held = false;  // taken by something else: not ours to give back
+                if (Result<void> r = relink(k, report); !r) {
+                    return r;
+                }
+                continue;
+            }
+            return fail("load", agent_refusal("LoadPatch", status, message, pd::kLoadFailed));  // not mapped: release_ranges gives the slice back
         }
 
         // From here on a failure unloads the patch again.
-        const std::uint64_t base = linked.base;
+        const std::uint64_t base = s.linked.base;
         const auto abandon = [&] { unload(base); };
 
         // ---- apply the fix-ups ------------------------------------------------------------------------------
         {
             std::size_t sent = 0;
-            while (sent < fixups.wire.size()) {
-                const std::size_t n = std::min<std::size_t>(ipc::kMaxFixupsPerMessage, fixups.wire.size() - sent);
+            while (sent < s.fixups.wire.size()) {
+                const std::size_t n = std::min<std::size_t>(ipc::kMaxFixupsPerMessage, s.fixups.wire.size() - sent);
                 ipc::ApplyFixups req;
                 req.request_id = link_.next_request_id();
                 req.image_base = base;
-                req.fixups.assign(fixups.wire.begin() + static_cast<std::ptrdiff_t>(sent), fixups.wire.begin() + static_cast<std::ptrdiff_t>(sent + n));
+                req.fixups.assign(s.fixups.wire.begin() + static_cast<std::ptrdiff_t>(sent), s.fixups.wire.begin() + static_cast<std::ptrdiff_t>(sent + n));
                 Result<ipc::Message> answer = ask(std::move(req), options_.agent_timeout_ms, "fixups");
                 if (!answer) {
                     abandon();
@@ -1085,18 +1481,18 @@ private:
                 }
                 sent += n;
             }
-            report.fixups += fixups.wire.size();
-            report.pre_applied += fixups.pre_applied.size();
+            report.fixups += s.fixups.wire.size();
+            report.pre_applied += s.fixups.pre_applied.size();
             report.times.fixups += lap.lap();
         }
 
         // ---- initialisers of the new globals ------------------------------------------------------------------
-        report.initializers += init_rvas.size();
-        if (!init_rvas.empty()) {
+        report.initializers += s.init_rvas.size();
+        if (!s.init_rvas.empty()) {
             ipc::RunInitializers req;
             req.request_id = link_.next_request_id();
             req.image_base = base;
-            req.rvas = init_rvas;
+            req.rvas = s.init_rvas;
             Result<ipc::Message> answer = ask(std::move(req), options_.agent_timeout_ms, "init");
             if (!answer) {
                 abandon();
@@ -1107,57 +1503,16 @@ private:
                 return fail("init", agent_refusal("RunInitializers", rep != nullptr ? rep->status : 5306, rep != nullptr ? rep->message : "unexpected answer",
                                                   pd::kLoadFailed));
             }
-            report.initializers_run += init_rvas.size();
+            report.initializers_run += s.init_rvas.size();
         }
         report.times.init += lap.lap();
 
         // ---- hooks -------------------------------------------------------------------------------------------------
-        AppliedPatch applied;  // WP-22: what a revert needs; applied.hooks is also the list of the hook table entries below
-        applied.number = patch_no;
-        applied.base = base;
-        applied.dll_path = linked.dll_path;
-        // WP-25: remember what the functions of this patch look like, so the next reload of the unit can compare with it
-        // (hooked functions: keyed by the patch entry the hook jumps to; new functions: by their own address).
-        const auto record_code = [&] {
-            const auto address_of = [&](const std::string& name) -> std::optional<std::uint64_t> {
-                const bind::SymbolDecision* d = plan.find_decision(name);
-                if (d == nullptr) {
-                    return std::nullopt;
-                }
-                return symbol_va(plan, linked, name, d->section, d->value);
-            };
-            const CodeRecorder recorder(ni);  // the maps over the plan and the resolved relocations are built once
-            const auto record_one = [&](const std::string& symbol, const std::string& display, std::uint64_t entry) {
-                std::string why;
-                std::optional<CodeImage> recorded = recorder.capture(symbol, &why);
-                if (!recorded || !finalize_code(*recorded, address_of)) {
-                    CML_LOG(Trace, "reload: the code of %s is not recorded%s%s", display.c_str(), why.empty() ? "" : ": ", why.c_str());
-                    return;
-                }
-                recorded->display = display;
-                module_.record_code(entry, std::make_shared<const CodeImage>(std::move(*recorded)));
-            };
-            for (std::size_t i = 0; i < applied.hooks.size() && i < hooks.size(); ++i) {  // applied.hooks is index-aligned with hooks
-                record_one(hooks[i].new_symbol, hooks[i].display, applied.hooks[i].new_entry);
-            }
-            for (const bind::NewFunction& f : plan.new_functions) {
-                if (const std::optional<std::uint64_t> va = symbol_va(plan, linked, f.name, f.section, f.value)) {
-                    record_one(f.name, f.display, *va);
-                }
-            }
-        };
-        if (!hooks.empty()) {
+        if (!s.hook_table.empty()) {
             ipc::InstallHooks req;
             req.request_id = link_.next_request_id();
-            for (const bind::HookEntry& h : hooks) {
-                const std::optional<std::uint64_t> target = function_va(plan, linked, h.new_symbol);
-                if (!target) {
-                    abandon();
-                    return fail("hooks", Diag::make(bind::diag::kLayoutIncomplete, "the patch layout has no address for the hooked function '" + h.display + "'",
-                                                    "Report this with the bind plan."));
-                }
-                req.hooks.push_back(ipc::HookSpec{h.old_va, *target, h.display});
-                applied.hooks.push_back(AppliedHook{h.old_va, *target, h.display});
+            for (const AppliedHook& h : s.hook_table) {
+                req.hooks.push_back(ipc::HookSpec{h.old_entry, h.new_entry, h.name});
             }
             Result<ipc::Message> answer = link_.request(ipc::Message(std::move(req)), clamp_timeout(options_.hooks_timeout_ms));
             if (!answer) {
@@ -1165,14 +1520,7 @@ private:
                 // patch must then stay loaded; remember the hooks as installed so the next reload re-points them.
                 const bool timed_out = answer.error().code == pd::kAgentRequestTimeout;  // a send failure or a lost agent is a plain failure
                 if (timed_out) {
-                    {
-                        std::lock_guard<std::mutex> lock(module_.mutex);
-                        for (const AppliedHook& h : applied.hooks) {
-                            module_.hooked[h.old_entry] = h.new_entry;
-                        }
-                    }
-                    record_code();  // WP-25; takes the module lock itself
-                    applied_.push_back(std::move(applied));  // WP-22: still live (or about to be), so a revert has to know it
+                    keep_unconfirmed(s);
                     return fail("hooks", Diag::make(pd::kHooksTimeout, "the agent did not confirm the hooks in time: " + answer.error().message,
                                                     "In synchronised mode the application must call SyncPoint(); the patch stays loaded and the hooks may still apply."));
                 }
@@ -1190,78 +1538,103 @@ private:
                 // WP-28: the agent could not take every hook of this request out again; a live hook may still jump into the patch.
                 // The image must stay mapped (never free an image a live hook can target): leak it, remember the hooks as installed
                 // like after a timeout, and report the failure.
-                {
-                    std::lock_guard<std::mutex> lock(module_.mutex);
-                    for (const AppliedHook& h : applied.hooks) {
-                        module_.hooked[h.old_entry] = h.new_entry;
-                    }
-                }
-                record_code();
-                applied_.push_back(std::move(applied));
+                keep_unconfirmed(s);
                 return fail("hooks", agent_refusal("InstallHooks", done->status, done->message, pd::kHooksFailed));
             }
             if (done->status != 0) {
                 abandon();
                 return fail("hooks", agent_refusal("InstallHooks", done->status, done->message, pd::kHooksFailed));
             }
-            CML_LOG(Info, "reload: %zu hooks installed (threads stopped: %u, window %u ms, attempts %u, retries %u)", hooks.size(), done->threads, done->window_ms,
+            CML_LOG(Info, "reload: %zu hooks installed (threads stopped: %u, window %u ms, attempts %u, retries %u)", s.hook_table.size(), done->threads, done->window_ms,
                     done->attempts, done->retries);
-            report.hooks_installed += hooks.size();
+            report.hooks_installed += s.hook_table.size();
         }
         report.times.hooks += lap.lap();
+        commit(s, report);
+        return Result<void>();
+    }
 
-        // ---- commit: the process symbol registry and the hook table (plan step 9) -----------------------------------
+    // The range of compiland `k` was taken: link it again at the next free base, and prepare the staged compilands after it again,
+    // since they were planned against its addresses (its new functions and globals, its hook targets).
+    Result<void> relink(std::size_t k, PatchReport& report) {
+        release_ranges(k + 1);
+        for (std::size_t j = k + 1; j < staged_.size(); ++j) {
+            staged_[j]->reset();  // out of the overlay until prepared again
+        }
+        if (Result<void> r = link(*staged_[k], report); !r) {
+            return r;
+        }
+        for (std::size_t j = k + 1; j < staged_.size(); ++j) {
+            CML_LOG(Trace, "reload: compiland %s is prepared again: compiland %zu was relinked at %s", unit_name(*staged_[j]).c_str(), staged_[k]->unit + 1,
+                    hex(staged_[k]->linked.base).c_str());
+            if (Result<void> r = prepare(*staged_[j], report); !r) {
+                return r;
+            }
+        }
+        return Result<void>();
+    }
+
+    // The patch may be live (no confirmation in time, or the agent could not take its hooks out again): it stays mapped, its hooks are
+    // remembered as installed (so the next reload re-points them) and it is part of the reload's batch (so a revert knows it).
+    void keep_unconfirmed(Staged& s) {
         {
             std::lock_guard<std::mutex> lock(module_.mutex);
-            for (const AppliedHook& h : applied.hooks) {
+            for (const AppliedHook& h : s.hook_table) {
+                module_.hooked[h.old_entry] = h.new_entry;
+            }
+        }
+        for (const auto& c : s.code) {
+            module_.record_code(c.first, c.second);  // WP-25; takes the module lock itself
+        }
+        AppliedPatch applied;
+        applied.number = s.patch_no;
+        applied.base = s.linked.base;
+        applied.dll_path = s.linked.dll_path;
+        applied.hooks = s.hook_table;
+        applied_.push_back(std::move(applied));
+        s.live_unconfirmed = true;
+    }
+
+    // ---- commit: the process symbol registry and the hook table (plan step 9) -----------------------------------
+    void commit(Staged& s, PatchReport& report) {
+        AppliedPatch applied;  // WP-22: what a revert needs
+        applied.number = s.patch_no;
+        applied.base = s.linked.base;
+        applied.dll_path = s.linked.dll_path;
+        applied.hooks = s.hook_table;
+        {
+            std::lock_guard<std::mutex> lock(module_.mutex);
+            for (const AppliedHook& h : s.hook_table) {
                 module_.hooked[h.old_entry] = h.new_entry;
             }
             ++module_.generation;
             report.generation = module_.generation;
             ++report.patches;
         }
-        record_code();
-        for (const bind::NewFunction& f : plan.new_functions) {
-            if (const std::optional<std::uint64_t> va = symbol_va(plan, linked, f.name, f.section, f.value)) {
-                SymbolAddress a;
-                a.va = *va;
-                a.is_function = true;
-                a.origin = "patch " + std::to_string(patch_no);
-                applied.registry.push_back(RegistryUndo{f.name, module_.registry.replace(f.name, std::move(a))});
-            } else {
-                warn(report, "hooks", Diag::make(bind::diag::kLayoutIncomplete, "the new function '" + f.display + "' has no address in the patch layout; later patches cannot bind to it",
-                                                 "Report this with the bind plan."));
-            }
+        for (const auto& c : s.code) {
+            module_.record_code(c.first, c.second);  // WP-25; takes the module lock itself
         }
-        for (const bind::NewGlobal& g : plan.new_globals) {
-            if (const std::optional<std::uint64_t> va = symbol_va(plan, linked, g.name, g.section, g.value)) {
-                SymbolAddress a;
-                a.va = *va;
-                a.is_function = false;
-                a.origin = "patch " + std::to_string(patch_no);
-                applied.registry.push_back(RegistryUndo{g.name, module_.registry.replace(g.name, std::move(a))});
-            } else {
-                warn(report, "hooks", Diag::make(bind::diag::kLayoutIncomplete, "the new global '" + g.display + "' has no address in the patch layout; later patches cannot bind to it",
-                                                 "Report this with the bind plan."));
-            }
+        for (const auto& [name, address] : s.symbols) {
+            applied.registry.push_back(RegistryUndo{name, module_.registry.replace(name, address)});
+        }
+        for (const Diag& w : s.layout_warnings) {
+            warn(report, "hooks", w);
         }
         module_.prune_code();  // records of patches nothing reaches any more (superseded hooks)
         applied_.push_back(std::move(applied));
-        report.dll_path = linked.dll_path;
+        s.applied = true;
+        report.dll_path = s.linked.dll_path;
         report.patched = true;
-        if (ctx_.events != nullptr) {
-            ctx_.events->publish(make_patch_applied_event(pid_, module_.name, report.generation, hooks.size(), plan.new_functions.size(), plan.new_globals.size(),
-                                                                  narrowed.planned, narrowed.dropped));
-        }
+        applied_events_.push_back(make_patch_applied_event(pid_, module_.name, report.generation, s.hook_table.size(), s.plan.new_functions.size(),
+                                                           s.plan.new_globals.size(), s.planned, s.dropped));
         CML_LOG(Info, "reload: patch %llu of %s applied at %s (%zu hooks, %zu dropped, %zu new functions, %zu new globals, %zu fix-ups, %zu initialisers)",
-                static_cast<unsigned long long>(report.generation), module_.name.c_str(), hex(base).c_str(), hooks.size(), narrowed.dropped, plan.new_functions.size(),
-                plan.new_globals.size(), fixups.wire.size(), init_rvas.size());
-        return Result<void>();
+                static_cast<unsigned long long>(report.generation), module_.name.c_str(), hex(s.linked.base).c_str(), s.hook_table.size(), s.dropped,
+                s.plan.new_functions.size(), s.plan.new_globals.size(), s.fixups.wire.size(), s.init_rvas.size());
     }
-
     // ---- pieces -----------------------------------------------------------------------------------------------
     static constexpr std::size_t kMaxKeptNotes = 50;  // entries of PatchReport::hooks_kept
     static constexpr std::uint64_t kMinPatchRoom = 4ull << 20;  // a patch needs room for at least this much image
+    static constexpr std::int64_t kRollbackBudgetMs = 10000;      // WP-47: the least time a roll-back gets, whatever the reload has left
 
     std::shared_ptr<const pe::OwnedImage> module_image(PatchReport& report) {
         std::lock_guard<std::mutex> lock(module_.mutex);
@@ -1352,8 +1725,7 @@ private:
         }
         return std::nullopt;
     }
-    std::optional<std::uint64_t> symbol_va(const bind::BindPlan&, const toolchain::LinkedPatch& linked, const std::string&, std::uint32_t section,
-                                           std::uint32_t value) const {
+    std::optional<std::uint64_t> symbol_va(const toolchain::LinkedPatch& linked, std::uint32_t section, std::uint32_t value) const {
         if (const std::optional<std::uint64_t> s = section_va(linked, section)) {
             return *s + value;
         }
@@ -1364,11 +1736,11 @@ private:
         if (d == nullptr) {
             return std::nullopt;
         }
-        return symbol_va(plan, linked, name, d->section, d->value);
+        return symbol_va(linked, d->section, d->value);
     }
 
     Result<void> prepare_fixups(const bind::BindPlan& plan, const toolchain::LinkedPatch& linked, PatchReport& report, PatchFixups* fixups,
-                                std::vector<std::uint32_t>* init_rvas, std::vector<bind::FixupTriple>* triples) {
+                                std::vector<std::uint32_t>* init_rvas) {
         bind::PatchLayout layout;
         layout.patch_base = linked.base;
         for (const toolchain::SectionPlacement& sp : linked.sections) {
@@ -1392,8 +1764,7 @@ private:
         if (!made) {
             return fail("fixups", made.error());
         }
-        *triples = *made;
-        Result<PatchFixups> converted = to_patch_fixups(*triples, linked.base);
+        Result<PatchFixups> converted = to_patch_fixups(*made, linked.base);
         if (!converted) {
             return fail("fixups", converted.error());
         }
