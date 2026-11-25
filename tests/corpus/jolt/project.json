@@ -164,12 +164,6 @@
   "min_functions": 3000,
   "expected_failures": [
     {
-      "step": "edit:vex-entry-jolt-sphere-convex-radius",
-      "compiler": "msvc",
-      "reason": "F-41.1: CML3207, the function-local statics (RTTI rtti and its guard $TSS0) of the overloads of JPH::GetRTTIOfType that JPH_IMPLEMENT_RTTI_* / JPH_IMPLEMENT_SERIALIZABLE_* define in the recompiled unity batch are refused: 'the guard variable ... has no record in the old image'",
-      "match": "CML3207.*GetRTTIOfType"
-    },
-    {
       "step": "edit:library-unity-physics-system",
       "compiler": "msvc",
       "reason": "F-41.2: cl only: CML3214, the lambdas' call operators (<lambda_HASH>::operator()) of the recompiled unity batch cannot be paired with the old ones ('the lambdas of the enclosing function are not the same as in the old image')",

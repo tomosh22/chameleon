@@ -2071,6 +2071,122 @@ TEST_CASE("by place (R-48 item 11): same-named block statics of an internal-link
     CHECK(r->warnings[0].code == diag::kStaticsMatchedByOrder);
 }
 
+// ---- WP-40 (R-48 item 7) and F-41.1: Jolt's GetRTTIOfType overloads under cl --------------------------------------
+//
+// tests/corpus/repro/f41_1_f41_2_rtti_overloads.cpp: overloads of one free function, each with ONE guarded static `rtti`
+// (cl records it and its guard `$TSS0` in the overload's procedure). The groups "rtti" and "$TSS0" have one member per
+// overload and one record per overload, all with the same display name: pass A, the exact names and the layout (every
+// static a COMDAT of its own under cl) leave them to the by-place step, which identifies each overload's OLD procedure by
+// the address of its decorated public (unique per overload) and pairs the one static of the name there. main refused:
+// the by-place step of the "$TSS0" group scanned for "the guard of the member's block" and found the member itself, a
+// guard without a binding ("the guard variable ... $TSS0 ... of static 1 of 1 has no record in the old image", R-48 item
+// 7, F-41.1's message), and every `rtti` failed with it. clang-cl records no guard: there it stays refused (CML3207).
+namespace {
+const char* const kRttiFn[4] = {"?GetRTTIOfType@@YAPEAURtti@@PEAUShapeSettings@@@Z", "?GetRTTIOfType@@YAPEAURtti@@PEAUSphereSettings@@@Z",
+                                "?GetRTTIOfType@@YAPEAURtti@@PEAUBoxSettings@@@Z", "?GetRTTIOfType@@YAPEAURtti@@PEAUCapsuleSettings@@@Z"};
+std::string rtti_of(int n) { return std::string("?rtti@?1?") + kRttiFn[n] + "@4URtti@@A"; }
+std::string rtti_guard_of(int n) { return std::string("?$TSS0@?1?") + kRttiFn[n] + "@4HA"; }
+}  // namespace
+
+TEST_CASE("by place (R-48 item 7, F-41.1 under cl): each overload's guarded static and its guard pair with that overload's own records") {
+    // The old image: Shape at text 0x40 (rtti 0x3010, guard 0x3018), Sphere at 0x60 (0x3020, 0x3028), Box at 0x80 (0x3030,
+    // 0x3038). The patch defines them in another order (Box, Shape, Sphere): the order of the overloads plays no part.
+    SynthWorld w;
+    tp::Records& s = w.tu().symbols;
+    for (int n = 0; n < 3; ++n) {
+        const std::uint32_t at = 0x10 + 0x10 * static_cast<std::uint32_t>(n);
+        s.proc(0x1110, "GetRTTIOfType", SynthWorld::kTextSec, 0x40 + 0x20 * static_cast<std::uint32_t>(n), 0x20);
+        s.data(0x110C, "rtti", SynthWorld::kDataSec, at, tp::kTInt);
+        s.data(0x110C, "$TSS0", SynthWorld::kDataSec, at + 8, tp::kTInt);
+        s.end();
+        w.pub_func(kRttiFn[n], 0x40 + 0x20 * static_cast<std::uint32_t>(n));
+    }
+    w.open();
+    const auto overload = [](StaticsObj& o, int n) {
+        o.proc(kRttiFn[n], "GetRTTIOfType");
+        o.local(rtti_of(n), "rtti");
+        o.local(rtti_guard_of(n), "$TSS0");
+        o.end();
+    };
+    SUBCASE("the edit changed one overload's code: every static and guard keeps its own old object") {
+        StaticsObj o;
+        overload(o, 2);
+        overload(o, 0);
+        overload(o, 1);
+        Built b = o.build(some_debug_t());
+        auto r = plan_bind(w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        for (int n = 0; n < 3; ++n) {
+            const std::uint32_t at = 0x3010 + 0x10 * static_cast<std::uint32_t>(n);
+            CHECK(decision(*r, rtti_of(n)).decision == DecisionKind::BindOldData);
+            CHECK(decision(*r, rtti_of(n)).source == BindSource::CompilandProcedure);
+            CHECK(decision(*r, rtti_of(n)).old_address.rva == at);
+            // The guard is bound to its OLD RECORD (not by a layout): the live object is never constructed again.
+            CHECK(decision(*r, rtti_guard_of(n)).decision == DecisionKind::BindOldData);
+            CHECK(decision(*r, rtti_guard_of(n)).source == BindSource::CompilandProcedure);
+            CHECK(decision(*r, rtti_guard_of(n)).old_address.rva == at + 8);
+        }
+        // One static of the name per function: its function is its identity, no order is involved (no CML3570).
+        for (const cml::Diag& warning : r->warnings) {
+            CHECK(warning.code != diag::kStaticsMatchedByOrder);
+        }
+        CHECK(r->bitmask_guards.empty());
+    }
+    SUBCASE("a new overload: its static and guard are refused (no old function to take them from), never another overload's") {
+        // (As on main: the group has more members than records, and the new overload has no old procedure.)
+        StaticsObj o;
+        overload(o, 3);
+        overload(o, 0);
+        overload(o, 1);
+        overload(o, 2);
+        Built b = o.build(some_debug_t());
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+        REQUIRE_FALSE(errors.empty());
+        CHECK(contains(errors[0].message, "the function is not matched to a function of this translation unit in the old image"));
+        CHECK(decision(partial, rtti_of(3)).decision != DecisionKind::BindOldData);
+        CHECK(decision(partial, rtti_guard_of(3)).decision != DecisionKind::BindOldData);
+        for (int n = 0; n < 3; ++n) {
+            const SymbolDecision st = decision(partial, rtti_of(n));
+            CHECK((st.decision != DecisionKind::BindOldData || st.old_address.rva == 0x3010 + 0x10 * static_cast<std::uint32_t>(n)));
+            const SymbolDecision g = decision(partial, rtti_guard_of(n));
+            CHECK((g.decision != DecisionKind::BindOldData || g.old_address.rva == 0x3018 + 0x10 * static_cast<std::uint32_t>(n)));
+        }
+    }
+}
+
+TEST_CASE("by place, F-41.1 under clang-cl: the guards have no record, the overloads' statics stay refused (CML3207)") {
+    SynthWorld w;
+    tp::Records& s = w.tu().symbols;
+    for (int n = 0; n < 3; ++n) {
+        s.proc(0x1110, "GetRTTIOfType", SynthWorld::kTextSec, 0x40 + 0x20 * static_cast<std::uint32_t>(n), 0x20);
+        s.data(0x110C, "rtti", SynthWorld::kDataSec, 0x10 + 0x10 * static_cast<std::uint32_t>(n), tp::kTInt);
+        s.end();
+        w.pub_func(kRttiFn[n], 0x40 + 0x20 * static_cast<std::uint32_t>(n));
+    }
+    w.open();
+    StaticsObj o;
+    for (int n = 0; n < 3; ++n) {
+        o.proc(kRttiFn[n], "GetRTTIOfType");
+        o.local(rtti_of(n), "rtti");
+        o.end();
+        o.symbol(rtti_guard_of(n));  // clang-cl: the guard has a symbol, no record
+    }
+    Built b = o.build(some_debug_t());
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+    REQUIRE_FALSE(errors.empty());
+    for (const cml::Diag& e : errors) {
+        CHECK(e.code == diag::kAmbiguousStatic);
+    }
+    CHECK(contains(errors[0].message, "has no record in the old image"));
+    for (int n = 0; n < 3; ++n) {
+        CHECK(decision(partial, rtti_guard_of(n)).decision != DecisionKind::BindOldData);
+    }
+}
+
 // ---- WP-40, rule (d): the planner's side (the sets it reports, and the pairing across numbers it is given) -----------
 
 TEST_CASE("lambda statics (rule (d)): lambdas with the same call operator are reported for the comparison of their code") {
