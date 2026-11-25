@@ -1334,6 +1334,16 @@ installer's mutex (never with threads suspended, no allocation), called from `Ag
 test in `unit.agent_hook`. No new message, `agent_abi_version` unchanged; the agent part gets the high review. An unload and reload
 at the same base inside one module poll (500 ms) stays invisible to the agent (R-53).
 
+**Ruling (WP-44/WP-45 third reviews; ADR-0018 convergence):** both packages' third high reviews found further races in process
+identity across pid reuse. WP-44 removes its creation-time identity check for fault records (it was the source of most findings and
+compiled into release builds): `{"stage":"none","pid":N}` without an agent clears N's records only once the process host confirms N
+exited, otherwise it is refused as before; records of a process whose exit was not seen stay until a global `none` (a test-harness
+limitation in KNOWN_LIMITATIONS). WP-45 keeps its identity (restart token, command line, creation time) and closes the two remaining
+silent-loss windows: a carry is consumed, merged or handed to a restart only by the agent that stored it or one whose identity is
+proven equal, and never takes on another agent's identity; `carry_to_late_module` reports whether it kept the baseline and resolves
+the agent by pid, and CML5809/CML5810 say what actually happened. After these rounds both merge on green CI with no further review
+round; `ProcessHost::creation_time` then exists once (WP-45's).
+
 ### WP-46: planner coverage on unity builds (from WP-41's corpus findings)
 
 **Added during the wave.** The Jolt corpus cells (WP-41) show three safe refusals that make whole unity batches of library
