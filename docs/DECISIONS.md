@@ -1313,6 +1313,13 @@ Review: high (module state, broker restart). Range CML5600–5619. Acceptance: t
 becomes a cmltest scenario in all 8 matrix cells, and unit tests cover each path. It starts before WP-44 when the first
 wave-11 slot frees, because silent loss of edits outranks the remaining injection gaps.
 
+**Amended (WP-45 round 1):** the agent's hook installer never forgets the records of an unloaded module, so after FreeLibrary +
+LoadLibrary at the same base a re-apply would plan a re-point against the old jump bytes (CML4312). WP-45 may change the agent for
+this only: `hook::Installer::forget_range(base, size)` drops the records whose target lies in an unloaded module's range, under the
+installer's mutex (never with threads suspended, no allocation), called from `Agent::poll_modules` for each unloaded module; a unit
+test in `unit.agent_hook`. No new message, `agent_abi_version` unchanged; the agent part gets the high review. An unload and reload
+at the same base inside one module poll (500 ms) stays invisible to the agent (R-53).
+
 ### WP-46: planner coverage on unity builds (from WP-41's corpus findings)
 
 **Added during the wave.** The Jolt corpus cells (WP-41) show three safe refusals that make whole unity batches of library
