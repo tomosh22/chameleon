@@ -1295,6 +1295,11 @@ Each gets a unit test. They exist only in fault-injection builds, so they did no
 **Directories:** `agent/src/crash`, `broker/cml_core` (exception service, save watcher, fault injection, and for R-51 restart and
 reload service), `core/cml_pe` (R-49), `tests/harness`, `tests/unit/broker`.
 
+**Rulings (WP-44 round 1):** the persistent-arming state file is derived from `--log` in `broker/cml_cli/src/main.cpp` and loaded in
+`connection_server.{h,cpp}` (outside the listed directories, accepted: only the CLI knows the log path); TROUBLESHOOTING.md entries for
+the new ids are part of the WP. `exception-hold` (agent, CML4661) passes the fault on and is only logged by the agent, since no new
+message type is allowed: the scenario checks the fixture's own handler ran (`PASSED_ON`), which is the observable effect.
+
 ### WP-45: re-apply session edits to re-loaded and late-enabled modules (from WP-42's corpus findings)
 
 **Added during the wave.** WP-42's DLL-plugin corpus project found three product defects, two of them silent:
