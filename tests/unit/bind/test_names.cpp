@@ -116,3 +116,26 @@ TEST_CASE("initializer_target_prefix") {
     CHECK(initializer_target_prefix("??__E?x@Foo@@2HA@@YAXXZ") == "?x@Foo@@2HA");
     CHECK(initializer_target_prefix("?compute_value@@YAHXZ").empty());
 }
+
+// WP-37: cl writes the block a local entity was declared in as one digit up to block 10 and in letters from block 11 on
+// ("?L@?": Godot's SceneTree::_flush_scene_change, corpus run 45438434773). The reader knew only the digit.
+TEST_CASE("display_name: function scopes with a block number written in letters") {
+    CHECK(display_name("?sname@?1???R<lambda_1>@?L@??_flush_scene_change@SceneTree@@AEAAXXZ@QEBAAEBVStringName@@XZ@4V4@A") ==
+          "SceneTree::_flush_scene_change::<lambda_1>::operator()::sname");
+    CHECK(display_name("?$TSS0@?1???R<lambda_1>@?N@??process_timers@SceneTree@@AEAAXN_N@Z@QEBAAEBVStringName@@XZ@4HA") ==
+          "SceneTree::process_timers::<lambda_1>::operator()::$TSS0");
+    CHECK(display_name("??R<lambda_1>@?L@??_flush_scene_change@SceneTree@@AEAAXXZ@QEBAAEBVStringName@@XZ") == "SceneTree::_flush_scene_change::<lambda_1>::operator()");
+    CHECK(display_name("?x@?L@??f@@YAXXZ@4HA") == "f::x");
+    CHECK(display_name("?x@?BA@??f@@YAXXZ@4HA") == "f::x");  // block 17
+    CHECK(display_name("?x@?9??f@@YAXXZ@4HA") == "f::x");    // block 10: still a digit
+    CHECK(enclosing_function("?x@?L@??f@@YAXXZ@4HA") == "f");
+    CHECK(enclosing_function("?names@?4??get_argument_options@SceneTree@@UEBAXAEBVStringName@@H@Z@4HB") == "get_argument_options");
+    CHECK(base_identifier("?x@?L@??f@@YAXXZ@4HA") == "x");
+    CHECK(is_tu_private_name("?x@?L@??f@@YAXXZ@4HA"));
+    CHECK(is_tu_private_name("?x@?BA@??f@@YAXXZ@4HA"));
+    // Not a function scope: an anonymous namespace, a template, letters without the nested name.
+    CHECK(display_name("?g@?A0xABCDEFAB@@3HA") == "(anonymous namespace)::g");
+    CHECK(display_name("?f@?$Box@H@@QEAAXXZ") == "Box<int>::f");
+    CHECK_FALSE(is_tu_private_name("?f@?$Box@H@@QEAAXXZ"));
+    CHECK_FALSE(is_tu_private_name("?g_tick@AB@@3HA"));
+}

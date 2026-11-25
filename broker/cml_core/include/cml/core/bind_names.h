@@ -27,6 +27,13 @@ std::string base_identifier(std::string_view decorated);
 // The function a function-local static lives in ("statics_value"); empty otherwise.
 std::string enclosing_function(std::string_view decorated);
 
+// WP-37: the scope of a function-local static whose enclosing function is an operator() (a lambda's call operator).
+// "?sname@?1???R<lambda_1>@?1??f@@YAXXZ@QEBAAEBUName@@XZ@4U2@A" -> "<lambda_1>@?1??f@@YAXXZ@QEBAAEBUName@@XZ@4U2@A":
+// the text that follows "??R" of the nested function name. It BEGINS with the qualified name of the operator's class,
+// spelled exactly as that class's unique name in the type records spells it after ".?AV" (".?AV<lambda_1>@?1??f@@YAXXZ@"),
+// so a closure is recognised by a prefix comparison; nothing of the name is interpreted. Empty for any other name.
+std::string_view call_operator_scope(std::string_view decorated);
+
 // WP-26c: the identity of a C static whose object name is not Microsoft-decorated, as clang-cl spells it for a
 // translation unit compiled as C. The PDB records carry the source names ("platform", "counter"); the object's are
 //   file scope "platform"; a function-local static "next.counter"; LLVM's uniquifier appends ".<n>" when the name is

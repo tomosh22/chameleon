@@ -23,6 +23,7 @@
 #include "cml/coff/binding.h"
 #include "cml/coff/coff.h"
 #include "cml/core/bind_plan.h"
+#include "cml/core/bind_types.h"
 #include "cml/pdb/index.h"
 #include "doctest.h"
 
@@ -361,6 +362,93 @@ public:
 
 // ---- the test ---------------------------------------------------------------------------------
 
+// WP-37 evidence: where the new side's types came from, the canonical signature of every static function of the patch
+// object, and the signature and closure class of the old compiland's local procs (the two sides the planner compares).
+void emit_signatures(const std::string& tag, const BindPlan& p, const cml::pdb::PdbIndex& pdb_index, const cml::coff::Object& object) {
+    const bool wanted = tag == "static_overloads" || tag == "lambda_statics" || tag == "lambdas";
+    if (!wanted) {
+        return;
+    }
+    ObjectSignatures sigs(object, tag + " object");
+    std::size_t shown = 0;
+    for (const SymbolDecision& d : p.decisions) {
+        if (!d.defined || !d.is_static || d.type != SymbolType::Function || d.decision == DecisionKind::PatchFresh) {
+            continue;
+        }
+        const cml::pdb::FunctionSignature& s = sigs.at(d.section, d.value);
+        if (++shown <= 24) {
+            brief("SIG-NEW " + tag + " " + d.name + " -> " + (s.known ? s.text : "UNKNOWN " + s.why) + (s.member ? " | class=" + s.class_unique_name : std::string()) + " => " +
+                  to_string(d.decision) + "/" + to_string(d.source));
+        }
+    }
+    brief("WP37-TYPES-OBJECT " + tag + " source=" + to_string(sigs.origin()) + " procs=" + std::to_string(sigs.proc_records()) + " detail=" + sigs.detail());
+    auto syms = pdb_index.compiland_symbols(p.compiland_index);
+    if (syms) {
+        shown = 0;
+        for (const cml::pdb::SymbolView& v : *syms) {
+            if (v.kind == cml::pdb::SymbolKind::LocalProc && v.rva != cml::pdb::kNoRva) {
+                const cml::pdb::FunctionSignature s = pdb_index.proc_signature(v);
+                if (++shown <= 24) {
+                    brief("SIG-OLD " + tag + " '" + std::string(v.name) + "' rva=" + hex(v.rva) + (v.type_is_id ? " (id)" : "") + " -> " + (s.known ? s.text : "UNKNOWN " + s.why) +
+                          (s.member ? " | class=" + s.class_unique_name : std::string()));
+                }
+            } else if (cml::pdb::is_data_kind(v.kind) && v.parent_proc != cml::pdb::kNoSymbol && v.parent_proc < syms->size() && tag == "lambda_statics") {
+                const cml::pdb::FunctionSignature s = pdb_index.proc_signature((*syms)[v.parent_proc]);
+                if (++shown <= 48) {
+                    brief("LOCAL-OLD " + tag + " '" + std::string(v.name) + "' in '" + std::string(v.parent_name) + "' rva=" + hex(v.rva) + " closure=" +
+                          (s.known ? s.class_unique_name : "UNKNOWN " + s.why));
+                }
+            }
+        }
+    }
+    if (tag == "lambda_statics") {
+        // The function-local statics of the fixture's procedures with the blocks they sit in, as the old PDB records
+        // them (ADR-0042, amended: the planner compares this with the patch object's .debug$S).
+        if (syms) {
+            for (const cml::pdb::SymbolView& v : *syms) {
+                if (!cml::pdb::is_proc_kind(v.kind) || std::string(v.name).find("options") == std::string::npos) {
+                    continue;
+                }
+                bool complete = true;
+                const auto statics = pdb_index.proc_statics(v, &complete);
+                if (!statics) {
+                    brief("PROC-STATICS " + tag + " '" + std::string(v.name) + "' UNREADABLE " + statics.error().format());
+                    continue;
+                }
+                for (const cml::pdb::ProcStatic& local : *statics) {
+                    std::string path;
+                    for (const std::uint32_t index : local.block_path) {
+                        path += (path.empty() ? "" : ".") + std::to_string(index);
+                    }
+                    brief("PROC-STATICS " + tag + " '" + std::string(v.name) + "' static '" + local.name + "' rva=" + hex(local.rva) + " type=" + hex(local.type_index) +
+                          " block_path=" + (path.empty() ? "-" : path) + (local.plain_scopes ? "" : " (not in plain blocks)"));
+                }
+            }
+        }
+        // anon.cpp is not edited by anything: how this compiler and linker name the call operator of a lambda in a
+        // function of an anonymous namespace, and its closure class (the two spellings the planner compares).
+        for (const std::uint32_t ci : pdb_index.compilands_by_object_stem("anon")) {
+            const auto other = pdb_index.compiland_symbols(ci);
+            if (!other) {
+                continue;
+            }
+            for (const cml::pdb::SymbolView& v : *other) {
+                if (cml::pdb::is_data_kind(v.kind) && v.parent_proc != cml::pdb::kNoSymbol && v.parent_proc < other->size()) {
+                    const cml::pdb::FunctionSignature s = pdb_index.proc_signature((*other)[v.parent_proc]);
+                    brief("LOCAL-OTHER " + tag + " '" + std::string(v.name) + "' in '" + std::string(v.parent_name) + "' rva=" + hex(v.rva) + " closure=" +
+                          (s.known ? s.class_unique_name : "UNKNOWN " + s.why));
+                }
+            }
+        }
+    }
+    for (const bool tpi : {true, false}) {
+        const cml::pdb::TypeStreamStats st = pdb_index.type_stream_stats(tpi);
+        brief(std::string("TYPE-STREAM ") + tag + (tpi ? " TPI" : " IPI") + " opened=" + std::to_string(st.opened ? 1 : 0) + " sparse=" + std::to_string(st.sparse ? 1 : 0) +
+              " chunks=" + std::to_string(st.chunks) + " loaded=" + std::to_string(st.chunks_loaded) + " record_bytes=" + std::to_string(st.record_bytes) +
+              " bytes_loaded=" + std::to_string(st.bytes_loaded) + " bytes_copied=" + std::to_string(st.bytes_copied) + " lookups=" + std::to_string(st.lookups));
+    }
+}
+
 void emit_decisions(const std::string& tag, const BindPlan& p, const cml::pdb::PdbIndex& pdb_index) {
     for (const SymbolDecision& d : p.decisions) {
         if (d.decision == DecisionKind::BindOldData) {
@@ -384,7 +472,7 @@ void emit_decisions(const std::string& tag, const BindPlan& p, const cml::pdb::P
                 }
                 if (v.kind == cml::pdb::SymbolKind::LocalData || v.kind == cml::pdb::SymbolKind::LocalProc ||
                     v.kind == cml::pdb::SymbolKind::LocalThread || v.parent_proc != cml::pdb::kNoSymbol) {
-                    (tag == "statics" || (tag == "lambdas" && std::string(v.name).find("operator()") != std::string::npos) ? brief : line)("PDB-STATIC " + tag + " kind=" + cml::pdb::to_string(v.kind) + " name='" + std::string(v.name) + "' parent='" +
+                    (tag == "statics" || tag == "lambda_statics" || (tag == "lambdas" && std::string(v.name).find("operator()") != std::string::npos) ? brief : line)("PDB-STATIC " + tag + " kind=" + cml::pdb::to_string(v.kind) + " name='" + std::string(v.name) + "' parent='" +
                          std::string(v.parent_name) + "' rva=" + hex(v.rva));
                     if (++shown >= 80) {
                         break;
@@ -436,10 +524,12 @@ BindPlan plan_fixture(const std::string& name) {
         brief("BINDPLAN " + tag + " FAILED errors=" + std::to_string(errors.size()));
         brief(partial.imgrel_line(in.object_name) + " fixture=" + tag + " FAILED");
         emit_decisions(tag, partial, **pdb);
+        emit_signatures(tag, partial, **pdb, obj->object);
         FAIL("planning " << tag << " failed with " << errors.size() << " error(s); first: " << plan.error().format());
     }
     const BindPlan& p = *plan;
     emit_decisions(tag, p, **pdb);
+    emit_signatures(tag, p, **pdb, obj->object);
     const std::string summary = p.summary_line(tag);
     brief(summary);
     std::printf("%s\n", summary.c_str());
@@ -544,6 +634,59 @@ BindPlan plan_fixture(const std::string& name) {
         CHECK_MESSAGE(triples.has_value(), (triples.has_value() ? std::string() : triples.error().format()));
         if (triples) {
             CHECK(triples->size() == p.fixups.size());
+        }
+    }
+
+    // ---- WP-37: what the fixture `lambda_statics` must keep covering -------------------------------
+    if (tag == "lambda_statics") {
+        // The two `names` of LsTree::options(). cl: each is a COMDAT section of its own, no layout exists; they are
+        // paired by their place in the function and the plan says so (CML3570). clang-cl: they share a section; when
+        // its layout is known the layout places them and there is no warning, else as under cl.
+        std::size_t by_procedure = 0;
+        std::size_t by_layout = 0;
+        for (const SymbolDecision& d : p.decisions) {
+            if (d.display == "LsTree::options::names" && d.decision == DecisionKind::BindOldData) {
+                by_procedure += d.source == BindSource::CompilandProcedure ? 1u : 0u;
+                by_layout += d.source == BindSource::CompilandRva ? 1u : 0u;
+            }
+        }
+        std::size_t order_warnings = 0;
+        for (const cml::Diag& w : p.warnings) {
+            order_warnings += w.id() == "CML3570" && w.message.find("'names' of 'LsTree::options' (2)") != std::string::npos ? 1u : 0u;
+        }
+        // However the two `names` were paired, their guards must be the OLD guards (cl: by their records; clang-cl: from
+        // the section layout). A fresh guard would construct the bound old object a second time.
+        std::size_t guards = 0;
+        std::size_t guards_bound = 0;
+        for (const SymbolDecision& d : p.decisions) {
+            if (d.display.rfind("LsTree::options::$TSS", 0) == 0) {
+                ++guards;
+                guards_bound += d.decision == DecisionKind::BindOldData ? 1u : 0u;
+            }
+        }
+        brief("OPTIONS-NAMES " + tag + " by_procedure=" + std::to_string(by_procedure) + " by_layout=" + std::to_string(by_layout) + " CML3570=" + std::to_string(order_warnings) +
+              " guards=" + std::to_string(guards) + " guards_bound=" + std::to_string(guards_bound));
+        CHECK_MESSAGE((guards == 2 && guards_bound == 2), tag << ": the guards of LsTree::options::names: " << guards << " in the patch, " << guards_bound << " bound to the old image");
+        if (kIsCl) {
+            CHECK_MESSAGE(by_procedure == 2, tag << ": LsTree::options::names paired by procedure: " << by_procedure << " of 2");
+            CHECK_MESSAGE(order_warnings == 1, tag << ": CML3570 for LsTree::options: " << order_warnings);
+        } else {
+            CHECK_MESSAGE(((by_layout == 2 && order_warnings == 0) || (by_procedure == 2 && order_warnings == 1)),
+                          tag << ": LsTree::options::names: by layout " << by_layout << ", by procedure " << by_procedure << ", CML3570 " << order_warnings);
+        }
+        if (kIsCl) {
+            // cl writes the block of a local entity into its decorated name: one digit up to block 10, letters from 11
+            // on ("?L@?"). LsTree::flush() / ::timers() exist to have a lambda in such a block (Godot's
+            // SceneTree::_flush_scene_change); if the compiler stops numbering that way the fixture covers nothing.
+            std::size_t in_late_blocks = 0;
+            for (const SymbolDecision& d : p.decisions) {
+                const std::size_t at = d.name.find(">@?");
+                if (d.display.find("LsTree::") == 0 && at != std::string::npos && at + 3 < d.name.size() && d.name[at + 3] >= 'A' && d.name[at + 3] <= 'P') {
+                    ++in_late_blocks;
+                    brief("LATE-BLOCK " + tag + " " + d.name + " display=" + d.display);
+                }
+            }
+            CHECK_MESSAGE(in_late_blocks >= 2, tag << ": no lambda of LsTree in block 11 or later (symbols with a block number in letters: " << in_late_blocks << ")");
         }
     }
 
@@ -668,6 +811,9 @@ TEST_CASE("fixture lambdas: lambdas.cpp lambda_times_10") { plan_fixture("lambda
 TEST_CASE("fixture new_function: logic.cpp add_helper") { plan_fixture("new_function"); }
 TEST_CASE("fixture new_global: logic.cpp add_tracker") { plan_fixture("new_global"); }
 TEST_CASE("fixture tls: logic.cpp step_5") { plan_fixture("tls"); }
+// WP-37 (ADR-0042): overloads paired by signature, lambda-local statics by the closure class.
+TEST_CASE("fixture static_overloads: tu_a.cpp floor_plus_100 (header edit)") { plan_fixture("static_overloads"); }
+TEST_CASE("fixture lambda_statics: logic.cpp mark_2") { plan_fixture("lambda_statics"); }
 
 // WP-36 (ADR-0042): under cl with optimisation the two functions of imgrel.c address CORE, sarr and fptab as
 // `[reg + index*scale + sym@IMGREL]`. Every such site must be proved a displacement (the plan would have failed with

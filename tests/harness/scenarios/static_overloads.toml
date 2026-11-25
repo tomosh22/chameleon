@@ -1,0 +1,70 @@
+# Scenario `static_overloads` (WP-37, ADR-0042): a header with `static inline` overload sets, included by two
+# translation units (the shape of Dear ImGui's imgui_internal.h, corpus finding F-4). The PDB records every overload as
+# an S_LPROC32 with the same name; the planner pairs old and new by their canonical signature from the type records.
+# The edit changes ONLY so_floor(float): af and bf gain 100 in both translation units, while av / bv (the sibling
+# overload so_floor(const SoVec2&)) and aw (three so_weight overloads) keep their values. acalls / bcalls are
+# file-statics of the two translation units and must keep counting (a patch with its own copy would restart at 0).
+name = "static_overloads"
+description = "fixture static_overloads: af=7 bf=21 -> edit one overload in the header -> reload -> af=107 bf=121, siblings unchanged"
+fixture = "static_overloads"
+timeout_s = 180
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ af=7 av=35 aw=36 bf=21 bv=82 acalls=\\d+ bcalls=\\d+"
+within_s = 15
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_static_overloads.exe"
+within_s = 15
+
+# Let the counters reach at least 20 before the patch: a reset afterwards cannot hide.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ af=7 av=35 aw=36 bf=21 bv=82 acalls=([2-9][0-9]|[1-9][0-9]{2,}) bcalls=([2-9][0-9]|[1-9][0-9]{2,})\\b"
+within_s = 15
+
+[[step]]
+kind = "edit"
+patch = "edits/floor_plus_100.edit"
+
+[[step]]
+kind = "reload"
+within_s = 90
+
+# The header is included by both translation units.
+[[step]]
+kind = "expect_reload_result"
+key = "compiled"
+value = 2
+
+# The edited overload changed in both translation units; its sibling and the other overload set did not.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ af=107 av=35 aw=36 bf=121 bv=82 acalls=([2-9][0-9]|[1-9][0-9]{2,}) bcalls=([2-9][0-9]|[1-9][0-9]{2,})\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ af=107 av=35 aw=36 bf=121 bv=82 acalls=\\d+ bcalls=\\d+"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ af=107 av=35 aw=36 bf=121 bv=82 acalls=\\d+ bcalls=\\d+"
+within_s = 10
+
+# The call counters never went down, over the whole run.
+[[step]]
+kind = "expect_monotonic"
+key = "acalls"
+min_samples = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "bcalls"
+min_samples = 20

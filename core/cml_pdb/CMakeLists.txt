@@ -7,6 +7,9 @@ cml_add_core_library(cml_pdb
         src/index_modules.cpp
         src/index_symbols.cpp
         src/index_locals.cpp
+        src/index_types.cpp
+        src/type_records.cpp
+        src/detail/type_stream.cpp
         src/detail/counting.cpp
         src/detail/mapped_file.cpp
         src/detail/msf.cpp

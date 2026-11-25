@@ -16,6 +16,7 @@ add_library(cml_core STATIC
     src/bind_plan.cpp
     src/bind_fixups.cpp
     src/bind_json.cpp
+    src/bind_types.cpp  # WP-37: signatures of the patch object's functions (.debug$S / .debug$T / type server PDB)
     src/symbol_registry.cpp
     # WP-36 (ADR-0042): proving that an ADDR32NB site is an address displacement. It decodes instructions with the
     # agent's length decoder, which is compiled into this library UNCHANGED (same source file, the broker's flags);

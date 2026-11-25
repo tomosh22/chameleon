@@ -11,6 +11,7 @@
 
 #include "cml/pdb/diag_ids.h"
 #include "cml/pdb/index.h"
+#include "cml/pdb/type_records.h"
 #include "cml/pdb/types.h"
 
 namespace cml::pdb {

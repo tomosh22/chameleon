@@ -18,7 +18,10 @@ find_package(Git REQUIRED)
 
 set_property(GLOBAL PROPERTY CML_BIND_FIXTURE_LINES "")
 
+# cml_bind_edited_fixture(<fixture> [TU <file>])
+#   TU   the translation unit to compile when the edit changes a header (default: the file the diff names).
 function(cml_bind_edited_fixture fx)
+    cmake_parse_arguments(BE "" "TU" "" ${ARGN})
     set(src "${PROJECT_SOURCE_DIR}/tests/fixtures/${fx}")
     set(copy "${CMAKE_CURRENT_BINARY_DIR}/${fx}")
     file(GLOB edits "${src}/edits/*.edit")
@@ -42,6 +45,9 @@ function(cml_bind_edited_fixture fx)
     string(REGEX REPLACE "^\\+\\+\\+ b/" "" tu "${plus_line}")
     string(STRIP "${tu}" tu)
     string(REGEX REPLACE "[ \t].*$" "" tu "${tu}")
+    if(BE_TU)
+        set(tu "${BE_TU}")
+    endif()
 
     get_filename_component(copy_parent "${copy}" DIRECTORY)
     file(TO_NATIVE_PATH "${copy_parent}" ceiling)
@@ -77,6 +83,12 @@ endfunction()
 foreach(fx basic statics virtuals templates lambdas new_function new_global tls)
     cml_bind_edited_fixture(${fx})
 endforeach()
+
+# WP-37 (ADR-0042): static overloads (the edit changes a header: plan tu_a.cpp) and lambda-local statics. With cl these
+# objects are compiled /Zi like the fixture, so their types are in the target's compiler PDB (the type-server path); with
+# clang-cl they carry their own type records.
+cml_bind_edited_fixture(static_overloads TU tu_a.cpp)
+cml_bind_edited_fixture(lambda_statics)
 
 # WP-26c: a C fixture (statics of a C translation unit, one in an #included .c file).
 if(CMAKE_C_COMPILER_LOADED)

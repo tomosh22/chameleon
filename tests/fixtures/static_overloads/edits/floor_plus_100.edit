@@ -1,0 +1,11 @@
+--- a/overloads.h
++++ b/overloads.h
+@@ -13,7 +13,7 @@
+ // Patched by the `static_overloads` scenario: the float overload gains + 100.
+ static inline float so_floor(float f)
+ {
+-    return static_cast<float>(static_cast<int>(f));
++    return static_cast<float>(static_cast<int>(f)) + 100.0f;
+ }
+ 
+ static inline SoVec2 so_floor(const SoVec2& v)

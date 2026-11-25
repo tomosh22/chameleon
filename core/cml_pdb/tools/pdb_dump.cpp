@@ -123,7 +123,7 @@ void dump_compiland(const PdbIndex& idx, std::uint32_t i) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: cml_pdb_dump <file.pdb|image> [--summary|--compilands|--compiland <stem>|--publics <substr>|--file <path>|--rva <hex>]\n");
+        std::fprintf(stderr, "usage: cml_pdb_dump <file.pdb|image> [--summary|--compilands|--compiland <stem>|--signatures <stem>|--publics <substr>|--file <path>|--rva <hex>]\n");
         return 2;
     }
     const std::string input = argv[1];
@@ -206,6 +206,44 @@ int main(int argc, char** argv) {
         }
         for (const auto& p : *pubs) {
             std::printf("public: %s\n", sv(p.name).c_str());
+        }
+        return 0;
+    }
+    if (mode == "--signatures") {
+        // WP-37: the canonical signature of every proc of a compiland, and for function-local data the class of the
+        // enclosing member function (the identity of a lambda's closure).
+        const auto hits = idx.compilands_by_object_stem(arg);
+        if (hits.empty()) {
+            std::fprintf(stderr, "no compiland with object stem '%s'\n", arg.c_str());
+            return 1;
+        }
+        for (const std::uint32_t ci : hits) {
+            auto syms = idx.compiland_symbols(ci);
+            if (!syms) {
+                return fail(syms.error());
+            }
+            std::printf("compiland %u: %s\n", ci, sv(idx.compiland(ci).object_name).c_str());
+            for (const auto& s : *syms) {
+                if (cml::pdb::is_proc_kind(s.kind)) {
+                    const cml::pdb::FunctionSignature sig = idx.proc_signature(s);
+                    std::printf("  SIG %s '%s' type=0x%X%s -> %s", cml::pdb::to_string(s.kind), sv(s.name).c_str(), s.type_index, s.type_is_id ? " (id)" : "",
+                                sig.known ? sig.text.c_str() : ("UNKNOWN CML" + std::to_string(sig.diag_id) + ": " + sig.why).c_str());
+                    if (sig.member) {
+                        std::printf(" | class='%s' unique='%s'", sig.class_name.c_str(), sig.class_unique_name.c_str());
+                    }
+                    std::printf("\n");
+                } else if (cml::pdb::is_data_kind(s.kind) && s.parent_proc != cml::pdb::kNoSymbol && s.parent_proc < syms->size()) {
+                    const cml::pdb::FunctionSignature sig = idx.proc_signature((*syms)[s.parent_proc]);
+                    std::printf("  LOCAL %s '%s' in '%s' closure='%s'\n", cml::pdb::to_string(s.kind), sv(s.name).c_str(), sv(s.parent_name).c_str(),
+                                sig.known ? sig.class_unique_name.c_str() : "?");
+                }
+            }
+        }
+        for (const bool tpi : {true, false}) {
+            const cml::pdb::TypeStreamStats st = idx.type_stream_stats(tpi);
+            std::printf("TYPES %s opened=%d sparse=%d chunks=%u loaded=%u record_bytes=%llu bytes_loaded=%llu bytes_copied=%llu lookups=%u\n", tpi ? "TPI" : "IPI",
+                        st.opened ? 1 : 0, st.sparse ? 1 : 0, st.chunks, st.chunks_loaded, static_cast<unsigned long long>(st.record_bytes),
+                        static_cast<unsigned long long>(st.bytes_loaded), static_cast<unsigned long long>(st.bytes_copied), st.lookups);
         }
         return 0;
     }
