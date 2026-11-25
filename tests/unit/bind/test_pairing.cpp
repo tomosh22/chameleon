@@ -431,25 +431,132 @@ TEST_CASE("split aggregates: read-only pieces stay fresh copies; the names that 
     CHECK(decision(*r, "?k_table@?A0x1@@3QBHB.0").decision == DecisionKind::PatchFresh);
 }
 
-TEST_CASE("inlined lambdas: a record of the function's OWN static of that name is not taken for an inlined lambda's") {
-    // ls_step() has its own `static LsName sname` (recorded in ls_step) and the edit adds a lambda with a static of the same
-    // name. The own static keeps its record; the lambda's is new, as before WP-40 (and its guard is new with it).
-    SynthWorld w = basic_world(false);
-    w.data(w.tu(), "`anonymous namespace'::s_count", 0x10);
-    w.proc_with_statics(w.tu(), "ls_step", 0x60, {{"sname", 0x20}});
-    w.open();
-    SynthObj o;
-    const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x50));
-    o.symbol("?s_count@?A0x1@@3HA", 0x10, bss, false, false);
-    o.symbol("?sname@?1??ls_step@@YAHXZ@4ULsName@@A", 0x20, bss, false, false);
-    o.symbol("?$TSS0@?1??ls_step@@YAHXZ@4HA", 0x28, bss, false, false);
-    o.symbol(lambda_static("sname", 0), 0x30, bss, false, false);
-    o.symbol(lambda_guard(0), 0x38, bss, false, false);
-    Built b = o.build();
-    auto r = plan_bind(w.input(b));
-    REQUIRE_MESSAGE(r.has_value(), err(r));
-    CHECK(decision(*r, "?sname@?1??ls_step@@YAHXZ@4ULsName@@A").old_address.rva == 0x3020);
-    CHECK(decision(*r, "?$TSS0@?1??ls_step@@YAHXZ@4HA").old_address.rva == 0x3028);
-    CHECK(decision(*r, lambda_static("sname", 0)).decision == DecisionKind::PatchNewData);
-    CHECK(decision(*r, lambda_guard(0)).decision == DecisionKind::PatchNewData);
+TEST_CASE("inlined lambdas: a record in the function is the own static's or an inlined lambda's; only the counts and the layout decide") {
+    // WP-40 review: a record "sname" directly in ls_step() can be ls_step's own static or the static of a lambda that
+    // clang-cl inlined there. Its name does not say which, so the function's own statics of that name are not paired by
+    // name in pass A, and the lambdas' and the function's statics of the name are left to the section layout only if the
+    // old records of the function and its lambdas are as many as the patch's statics of both.
+    const auto object = [](SynthObj& o, bool own, bool lambda) {
+        const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x50));
+        o.symbol("?s_count@?A0x1@@3HA", 0x10, bss, false, false);
+        if (own) {
+            o.symbol("?sname@?1??ls_step@@YAHXZ@4ULsName@@A", 0x20, bss, false, false);
+            o.symbol("?$TSS0@?1??ls_step@@YAHXZ@4HA", 0x28, bss, false, false);
+        }
+        if (lambda) {
+            o.symbol(lambda_static("sname", 0), own ? 0x30 : 0x20, bss, false, false);
+            o.symbol(lambda_guard(0), own ? 0x38 : 0x28, bss, false, false);
+        }
+    };
+    SUBCASE("clang-cl -O2: the own static is NEW, the old record is the inlined lambda's: refused, never bound to it") {
+        // main of WP-40's first rounds: pass A bound the new `ls_step::sname` to the lambda's live record (0x3020) and the
+        // lambda's static was declared new.
+        SynthWorld w = basic_world(false);
+        w.data(w.tu(), "`anonymous namespace'::s_count", 0x10);
+        w.proc_with_statics(w.tu(), "ls_step", 0x60, {{"sname", 0x20}});
+        w.open();
+        SynthObj o;
+        object(o, true, true);
+        Built b = o.build();
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+        CHECK(count_code(errors, diag::kAmbiguousStatic) >= 1);
+        CHECK(contains(errors[0].message, "(1 there, some of them inlined, 2 in the patch, 1 of them declared in the function itself)"));
+        // (the same holds when the own static is the OLD one and the lambda is new: the records cannot tell the two apart)
+    }
+    SUBCASE("the function's own static and an inlined lambda's, both old, as many records as statics: placed by the layout") {
+        SynthWorld w = basic_world(false);
+        w.data(w.tu(), "`anonymous namespace'::s_count", 0x10);
+        w.proc_with_statics(w.tu(), "ls_step", 0x60, {{"sname", 0x20}, {"sname", 0x30}});
+        w.open();
+        SynthObj o;
+        object(o, true, true);
+        Built b = o.build();
+        auto r = plan_bind(w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        CHECK(decision(*r, "?sname@?1??ls_step@@YAHXZ@4ULsName@@A").old_address.rva == 0x3020);
+        CHECK(decision(*r, "?sname@?1??ls_step@@YAHXZ@4ULsName@@A").source == BindSource::CompilandRva);
+        CHECK(decision(*r, lambda_static("sname", 0)).old_address.rva == 0x3030);
+        CHECK(decision(*r, lambda_guard(0)).old_address.rva == 0x3038);
+    }
+    SUBCASE("no lambda with a static of that name in the patch: the own static pairs by name as before") {
+        SynthWorld w = basic_world(false);
+        w.proc_with_statics(w.tu(), "ls_step", 0x60, {{"sname", 0x20}});
+        w.open();
+        SynthObj o;
+        object(o, true, false);
+        Built b = o.build();
+        auto r = plan_bind(w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        CHECK(decision(*r, "?sname@?1??ls_step@@YAHXZ@4ULsName@@A").source == BindSource::CompilandStatic);
+    }
 }
+
+// ---- WP-40 review: a bitmask guard `$S1` guards every block of its function -----------------------------------------
+
+TEST_CASE("guards: a `$S1` bitmask (no thread-safe statics) guards the statics of every block of its function") {
+    // cl /Zc:threadSafeInit- and clang-cl -fno-threadsafe-statics write ONE `?$S1@?1??f@@YAHXZ@4IA` per function, in the
+    // scope of its first block (CI, cl 19.44; clang 18 locally). Until the review only the statics of that first block were
+    // counted as its statics.
+    const auto world = [](SynthWorld& w, const std::vector<std::pair<std::string, std::uint32_t>>& records) {
+        w.data(w.tu(), "`anonymous namespace'::s_a", 0x10);
+        w.proc_with_statics(w.tu(), "f", 0x50, records);
+        w.open();
+    };
+    const char* const k1 = "?k@?1??f@@YAHXZ@4HA";  // block 1
+    const char* const n2 = "?n@?2??f@@YAHXZ@4HA";  // block 2
+    const char* const m3 = "?m@?3??f@@YAHXZ@4HA";  // block 3
+    const char* const s1 = "?$S1@?1??f@@YAHXZ@4IA";
+    SUBCASE("statics only in later blocks, all bound: the bitmask is placed by the layout (it was a fresh one, CML3211)") {
+        SynthWorld w = basic_world(false);
+        world(w, {{"n", 0x14}, {"m", 0x18}});
+        SynthObj o;
+        const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+        o.symbol("?s_a@?A0x1@@3HA", 0x10, bss, false, false);
+        o.symbol(n2, 0x14, bss, false, false);
+        o.symbol(m3, 0x18, bss, false, false);
+        o.symbol(s1, 0x1C, bss, false, false);
+        Built b = o.build();
+        auto r = plan_bind(w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        CHECK(decision(*r, s1).decision == DecisionKind::BindOldData);
+        CHECK(decision(*r, s1).source == BindSource::CompilandLayout);
+        CHECK(decision(*r, s1).old_address.rva == 0x301C);
+        CHECK(r->warnings.empty());
+    }
+    SUBCASE("a new static in block 1, a bound one in block 2: CML3600 (the bitmask was made new: the bound one constructed again)") {
+        SynthWorld w = basic_world(false);
+        world(w, {{"n", 0x18}});
+        SynthObj o;
+        const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+        o.symbol("?s_a@?A0x1@@3HA", 0x10, bss, false, false);
+        o.symbol(k1, 0x14, bss, false, false);  // new
+        o.symbol(n2, 0x18, bss, false, false);  // bound
+        o.symbol(s1, 0x1C, bss, false, false);
+        Built b = o.build();
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+        REQUIRE(errors.size() == 1);
+        CHECK(errors[0].code == diag::kGuardMismatch);
+        CHECK(decision(partial, n2).decision == DecisionKind::BindOldData);
+        CHECK(decision(partial, s1).decision != DecisionKind::BindOldData);
+    }
+    SUBCASE("a bound static in block 1, a new one in block 2: CML3600 (the new one got the old bitmask, whose bit may be set)") {
+        SynthWorld w = basic_world(false);
+        world(w, {{"k", 0x14}});
+        SynthObj o;
+        const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+        o.symbol("?s_a@?A0x1@@3HA", 0x10, bss, false, false);
+        o.symbol(k1, 0x14, bss, false, false);  // bound
+        o.symbol(n2, 0x18, bss, false, false);  // new
+        o.symbol(s1, 0x1C, bss, false, false);
+        Built b = o.build();
+        std::vector<cml::Diag> errors;
+        REQUIRE_FALSE(plan_bind(w.input(b), &errors).has_value());
+        REQUIRE(errors.size() == 1);
+        CHECK(errors[0].code == diag::kGuardMismatch);
+    }
+}
+

@@ -726,6 +726,14 @@ private:
             for (const Diag& w : lambdas.warnings) {
                 warn(report, "plan", w);
             }
+            if (!lambdas.errors.empty()) {
+                std::optional<Diag> first;
+                for (const Diag& e : lambdas.errors) {
+                    const Diag shown = fail("plan", e);
+                    first = first ? first : std::optional<Diag>(shown);
+                }
+                return *first;
+            }
             if (!lambdas.closure_pairing.empty()) {
                 in.closure_pairing = lambdas.closure_pairing;
                 errors.clear();

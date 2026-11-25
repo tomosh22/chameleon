@@ -1175,9 +1175,16 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 
 ### CML3602
 
-- **Cause:** (warning) Two or more lambdas of one function hold function-local statics and cannot be told apart: their call operators have the same signature (no captures, the same parameters and return type, as with Godot's `SNAME`), and the compiler's lambda numbers are their only names. Chameleon compares the code of each new call operator with each old one (strings and other constants they use by their bytes) and pairs the lambdas by that, also when they changed places. This warning means that did not settle it: the code of two or more of them changed, or a call operator could not be compared (the message says why), so they were paired by their numbers. The reload is applied. If the edit reordered these lambdas, their statics now hold each other's values.  
+- **Cause:** (warning) Two or more lambdas of one function hold function-local statics and cannot be told apart: their call operators have the same signature (no captures, the same parameters and return type, as with Godot's `SNAME`), and the compiler's lambda numbers are their only names. Chameleon compares the code of each new call operator with each old one (strings and other constants they use by their bytes) and pairs the lambdas by that, also when they changed places. This warning means that did not settle it: the code of two or more of them changed, or a call operator could not be compared (the message says why), so those were paired by their numbers (where the old lambda of a number was taken by another new lambda, the reload is refused instead: `CML3603`). The reload is applied. If the edit reordered these lambdas, their statics now hold each other's values.  
 - **Message:** `Lambdas <...> of '<...>' are matched by their numbers (<...>); if you reordered them, the values of their statics may be exchanged.`  
 - **What to do:** Rename the statics, keep the order of these lambdas, or hot-restart after reordering.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
+### CML3603
+
+- **Cause:** Lambdas of one function that cannot be told apart by their types (see `CML3602`) were compared by the code of their call operators. A lambda whose code changed is matched by its number, but here the old lambda of that number is already another new lambda's (their code is the same): the changed lambda has no old lambda left that it can be said to be, and pairing it with one by guesswork could give its statics another lambda's values. The reload is refused.  
+- **Message:** `Lambdas <...> of '<...>' cannot be matched to the running program's lambdas: their code changed, and the old lambda of their number is another new lambda's (by the code of its call operator), so the values of their statics would go to the wrong lambda`  
+- **What to do:** Keep the order of these lambdas while you edit them, rename their statics, or hot-restart.  
 - **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
 
 

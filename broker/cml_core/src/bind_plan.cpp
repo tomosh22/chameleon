@@ -256,6 +256,52 @@ std::vector<std::string> scope_components(const std::string& n) {
     return out;
 }
 
+// WP-40: the length of the block prefix "?<n>?" / "?<letters>@?" of a local scope ("?1??f@@YAXXZ@4" -> 2), 0 when none.
+std::size_t block_prefix_length(std::string_view scope) noexcept {
+    if (scope.size() < 3 || scope[0] != '?') {
+        return 0;
+    }
+    if (scope[1] >= '0' && scope[1] <= '9') {
+        return scope[2] == '?' ? 2 : 0;
+    }
+    std::size_t k = 1;
+    while (k < scope.size() && scope[k] >= 'A' && scope[k] <= 'P') {
+        ++k;
+    }
+    return k > 1 && k + 1 < scope.size() && scope[k] == '@' && scope[k + 1] == '?' ? k + 1 : 0;
+}
+
+// WP-40: does the guard variable `guard` (`?$TSS0@<scope>@4HA`, `?$S1@<scope>@4IA`) guard the static `name`? A thread-safe guard
+// `$TSSn` belongs to the statics of its own block (`?<id>@<scope>@4...`). A bitmask `$S<n>` (cl's /Zc:threadSafeInit-,
+// clang-cl's -fno-threadsafe-statics) is ONE per function, written in the scope of its first block: it guards the statics
+// of every block of that function.
+bool guard_covers(std::string_view guard, std::string_view name) noexcept {
+    const std::size_t at = guard.find('@');
+    if (at == std::string_view::npos || guard.size() < at + 5 || guard.compare(0, 2, "?$") != 0) {
+        return false;
+    }
+    const std::string_view tail = guard.substr(guard.size() - 4);
+    if (tail != "@4HA" && tail != "@4IA") {
+        return false;
+    }
+    const std::string_view scope = guard.substr(at + 1, guard.size() - at - 3);  // "<scope>@4"
+    const std::size_t name_at = name.find('@');
+    if (name.empty() || name[0] != '?' || name_at == std::string_view::npos) {
+        return false;
+    }
+    const std::string_view rest = name.substr(name_at + 1);
+    if (guard[2] == 'S') {
+        const std::size_t g_block = block_prefix_length(scope);
+        const std::size_t s_block = block_prefix_length(rest);
+        if (g_block == 0 || s_block == 0) {
+            return false;
+        }
+        const std::string_view function = scope.substr(g_block);
+        return rest.substr(s_block).substr(0, function.size()) == function;
+    }
+    return rest.substr(0, scope.size()) == scope;
+}
+
 class Planner {
 public:
     Planner(const PlanInput& in, BindPlan* partial) : in_(in), obj_(*in.object), pdb_(*in.module_pdb), partial_(partial) {}
@@ -362,8 +408,14 @@ private:
         std::vector<std::string> statics;
     };
     std::map<std::string, LambdaNote> lambda_notes_;  // by the patch's closure ("<lambda_1>@?1??f@@YAXXZ@")
-    std::set<std::uint32_t> overridden_closure_static_;
     void note_lambda(const Sym& sy, const std::string& base, const std::string& own_scope, const std::string& old_closure);
+    // WP-40: closures are named without the translation unit's discriminator (pdb::without_tu_discriminator: the hash in
+    // "?A0x<hash>@" of an anonymous namespace), on both sides; decorated names of the patch are compared in that spelling too.
+    std::vector<std::string> plain_names_;
+    const std::string& plain_name(const Sym& sy);
+    bool in_closure(const Sym& sy, const std::string& closure);  // "??R" + closure occurs in its (plain) name
+    // The symbol of the same section whose plain name is sy's with closure `from` replaced by `to` (its twin of that number).
+    const Sym* closure_twin(const Sym& sy, const std::string& from, const std::string& to);
     void build_lambda_sets();
     void pair_statics_by_procedure(const std::string& base, bool is_tls, const std::vector<std::uint32_t>& members, const std::vector<const pdb::SymbolView*>& cands,
                                    std::vector<std::uint32_t>& unmatched, std::vector<const pdb::SymbolView*>& free_cands, std::map<std::uint32_t, Match>& matched,
@@ -939,6 +991,35 @@ bool Planner::is_inlined_record(const pdb::SymbolView* v, const std::string& enc
     return comp_norm(&comp_syms_[v->parent_proc]).canonical == enclosing;
 }
 
+const std::string& Planner::plain_name(const Sym& sy) {
+    if (plain_names_.size() != syms_.size()) {
+        plain_names_.assign(syms_.size(), std::string());
+        for (std::size_t i = 0; i < syms_.size(); ++i) {
+            plain_names_[i] = pdb::without_tu_discriminator(syms_[i].name);
+        }
+    }
+    return plain_names_[static_cast<std::size_t>(&sy - syms_.data())];
+}
+
+bool Planner::in_closure(const Sym& sy, const std::string& closure) {
+    return plain_name(sy).find("??R" + closure) != std::string::npos;
+}
+
+const Sym* Planner::closure_twin(const Sym& sy, const std::string& from, const std::string& to) {
+    const std::string& name = plain_name(sy);
+    const std::size_t at = name.find("??R" + from);
+    if (at == std::string::npos) {
+        return nullptr;
+    }
+    const std::string twin = name.substr(0, at + 3) + to + name.substr(at + 3 + from.size());
+    for (const Sym& t : syms_) {
+        if (t.defined && t.dec.section == sy.dec.section && plain_name(t) == twin) {
+            return &t;
+        }
+    }
+    return nullptr;
+}
+
 void Planner::note_lambda(const Sym& sy, const std::string& base, const std::string& own_scope, const std::string& old_closure) {
     const std::size_t first = old_closure.find('@');
     const std::size_t own_first = own_scope.find('@');
@@ -956,7 +1037,7 @@ void Planner::note_lambda(const Sym& sy, const std::string& base, const std::str
         note.display = lambda_enclosing(sy.dec.display, base);
         note.old_closure = old_closure;
         for (const Sym& f : syms_) {
-            if (f.defined && f.dec.type == SymbolType::Function && starts_with(f.name, "??R" + closure)) {
+            if (f.defined && f.dec.type == SymbolType::Function && starts_with(plain_name(f), "??R" + closure)) {
                 note.call_operator = f.name;
                 break;
             }
@@ -1032,24 +1113,12 @@ bool Planner::named_by_debug_record(const Sym& sy) {
 
 std::vector<std::uint32_t> Planner::guard_scope_statics(const Sym& guard) const {
     std::vector<std::uint32_t> out;
-    const std::string& g = guard.name;
-    const std::size_t at = g.find('@');
-    if (at == std::string::npos || g.size() < at + 5) {
-        return out;
-    }
-    const std::string_view tail = std::string_view(g).substr(g.size() - 4);
-    if (tail != "@4HA" && tail != "@4IA") {
-        return out;
-    }
-    // "<scope>@4": the guard's name without its identifier and without the two characters of its type.
-    const std::string_view scope = std::string_view(g).substr(at + 1, g.size() - at - 3);
     for (std::uint32_t pos = 0; pos < syms_.size(); ++pos) {
         const Sym& s = syms_[pos];
         if (!s.defined || !s.is_static || s.dec.type != SymbolType::Data || s.name.empty() || s.name[0] != '?' || is_guard_variable(s.name)) {
             continue;
         }
-        const std::size_t s_at = s.name.find('@');
-        if (s_at != std::string::npos && std::string_view(s.name).substr(s_at + 1).substr(0, scope.size()) == scope) {
+        if (guard_covers(guard.name, s.name)) {
             out.push_back(pos);
         }
     }
@@ -1167,8 +1236,9 @@ bool Planner::pair_overloads_by_signature(const std::string& group_name, std::ve
         // WP-40 (R-48 item 5, rule (d)): this call operator's lambda is the old lambda of another number (the pipeline
         // compared their code): it is matched under that closure's name.
         for (const auto& [from, to] : in_.closure_pairing) {
-            if (from != to && sigp->known && starts_with(sy.name, "??R" + from)) {
+            if (from != to && sigp->known && starts_with(plain_name(sy), "??R" + from)) {
                 auto copy = std::make_unique<pdb::FunctionSignature>(*sigp);
+                copy->class_unique_name = pdb::without_tu_discriminator(copy->class_unique_name);
                 for (std::string* text : {&copy->text, &copy->class_unique_name}) {
                     for (std::size_t at = text->find(from); at != std::string::npos; at = text->find(from, at + to.size())) {
                         text->replace(at, from.size(), to);
@@ -1467,22 +1537,29 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
     }
     // Records directly in the function are first of all the function's OWN statics of the name (the patch declares them
     // there too); only what is left over can be an inlined lambda's.
+    // But only when every lambda static of the patch has a record in a call operator: then what is in the function itself
+    // is the function's own (as many as the patch declares there, at most). Otherwise a record in the function may be the
+    // own static's or an inlined lambda's, which nothing tells apart: the function's own statics of the name (pass A does
+    // not pair them by name, see bridge_statics) and the lambdas' are all left to the layout, and only if the counts
+    // agree (WP-40 review: an own static that is new must not take an inlined lambda's live record).
+    std::size_t own_in_patch = 0;
     if (old_inlined != 0 && !enclosing.empty()) {
         const std::string own = enclosing + "::" + base;
-        std::size_t own_in_patch = 0;
         for (const Sym& s : syms_) {
             own_in_patch += s.defined && s.is_static && s.dec.type == SymbolType::Data && canonical_lambda_names(s.dec.display) == own ? 1u : 0u;
         }
-        const std::size_t explained = std::min(own_in_patch, old_inlined);
-        old_inlined -= explained;
-        old_of_function -= explained;
+        const std::size_t in_operators = old_of_function - old_inlined;
+        if (in_operators == scoped.size() && old_inlined <= own_in_patch) {
+            old_of_function -= old_inlined;
+            old_inlined = 0;
+        }
     }
     if (old_inlined != 0) {
-        const bool same_count = old_of_function == scoped.size();
+        const bool same_count = old_of_function == scoped.size() + own_in_patch;
         CML_LOG(Trace, "bind: closure statics '%s': %zu old record(s) are in the procedure of '%s' itself (inlined lambdas), %zu in all, %zu in the patch: %s", base.c_str(),
                 old_inlined, enclosing.c_str(), old_of_function, scoped.size(), same_count ? "left to the layout and the place in the function" : "not paired");
         // (The evidence tag of the harness: cmltest prints broker-log lines that carry "WP<nn>-<NAME>".)
-        CML_LOG(Info, "WP40-INLINED function='%s' statics=%s inlined=%zu old=%zu patch=%zu %s", enclosing.c_str(), base.c_str(), old_inlined, old_of_function, scoped.size(),
+        CML_LOG(Info, "WP40-INLINED function='%s' statics=%s inlined=%zu old=%zu patch=%zu own=%zu %s", enclosing.c_str(), base.c_str(), old_inlined, old_of_function, scoped.size(), own_in_patch,
                 same_count ? "placed-by=layout-or-place" : "refused=lambdas-changed");
         for (const std::size_t m : scoped) {
             if (same_count) {
@@ -1490,7 +1567,7 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
                                     "' itself (the compiler inlined the lambdas), which does not say which lambda each belongs to";
             } else {
                 why[unmatched[m]] = "the lambdas of '" + enclosing + "' that hold a static named '" + base + "' are not the same as in the old image (" + std::to_string(old_of_function) +
-                                    " there, some of them inlined, " + std::to_string(scoped.size()) + " in the patch)";
+                                    " there, some of them inlined, " + std::to_string(scoped.size() + own_in_patch) + " in the patch" + (own_in_patch != 0 ? std::string(", " + std::to_string(own_in_patch) + " of them declared in the function itself") : std::string()) + ")";
                 no_layout.insert(unmatched[m]);
             }
         }
@@ -1612,18 +1689,12 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
                         // A static paired across the numbers does not sit where the section's positions put its old record;
                         // the patch's static of the lambda with the old record's number does (its twin): that one teaches the
                         // layout, which the guards of these lambdas are placed from (settle_guards).
-                        overridden_closure_static_.insert(unmatched[m]);
-                        const std::size_t at = sy.name.find("??R");
                         for (const auto& [from, to] : in_.closure_pairing) {
-                            if (at == std::string::npos || sy.name.compare(at + 3, from.size(), from) != 0) {
+                            if (from == to || !in_closure(sy, from)) {
                                 continue;
                             }
-                            const std::string twin = sy.name.substr(0, at + 3) + to + sy.name.substr(at + 3 + from.size());
-                            for (const Sym& t : syms_) {
-                                if (t.defined && t.name == twin && t.dec.section == sy.dec.section) {
-                                    learn_delta(t, c->rva);
-                                    break;
-                                }
+                            if (const Sym* twin = closure_twin(sy, from, to)) {
+                                learn_delta(*twin, c->rva);
                             }
                             break;
                         }
@@ -1917,20 +1988,13 @@ void Planner::pair_statics_by_procedure(const std::string& base, bool is_tls, co
             if (is_guard_variable(member)) {
                 continue;  // WP-40 (R-48 item 7): the members are guard variables themselves (cl's `$S1` of /Zc:threadSafeInit-), which have no guard
             }
-            const std::size_t member_at = member.find('@');
-            for (std::uint32_t pos = 0; member_at != std::string::npos && pos < syms_.size(); ++pos) {
+            for (std::uint32_t pos = 0; pos < syms_.size(); ++pos) {
                 const Sym& guard = syms_[pos];
                 if (pos == new_pos[k] || !guard.defined || !guard.is_static || guard.dec.type != SymbolType::Data || !is_guard_variable(guard.name) || guard.name.size() < 6) {
                     continue;
                 }
-                const std::size_t guard_at = guard.name.find('@');
-                const std::string_view tail = std::string_view(guard.name).substr(guard.name.size() - 4);
-                if (guard_at == std::string::npos || (tail != "@4HA" && tail != "@4IA")) {
-                    continue;
-                }
-                // "<scope>@4": the guard's name without its identifier and without the two characters of its type.
-                const std::string_view scope = std::string_view(guard.name).substr(guard_at + 1, guard.name.size() - guard_at - 3);
-                if (std::string_view(member).substr(member_at + 1).substr(0, scope.size()) != scope) {
+                // (WP-40: a `$TSSn` guards its block, a bitmask `$S<n>` every block of the function: guard_covers.)
+                if (!guard_covers(guard.name, member)) {
                     continue;
                 }
                 const auto bound = matched.find(pos);
@@ -2179,6 +2243,30 @@ void Planner::bridge_statics() {
     std::map<std::uint32_t, Match> matched;  // pos -> match
     std::set<std::string> deferred;          // group keys that need pass B
 
+    // WP-40 (review): functions whose lambdas in the patch hold statics of a name. A record of that name directly in such a
+    // function may be the function's own static or an inlined lambda's (clang-cl /O2 records it in the caller), and its name
+    // does not say which; the function's own statics of the name are therefore not paired by name in pass A either.
+    std::set<std::string> lambda_static_functions;  // "<function display>|<name>"
+    for (const auto& [key, g] : groups) {
+        if (!g.is_func && g.encl == "operator()") {
+            const std::string enclosing = lambda_enclosing(g.display, g.base);
+            if (!enclosing.empty()) {
+                lambda_static_functions.insert(enclosing + "|" + g.base);
+            }
+        }
+    }
+    const auto own_static_of_lambda_function = [&](const Group& g) {
+        if (g.is_func || g.encl.empty() || g.encl == "operator()" || g.display.empty()) {
+            return false;
+        }
+        const std::string canonical = canonical_lambda_names(g.display);
+        const std::string suffix = "::" + g.base;
+        if (canonical.size() <= suffix.size() || canonical.compare(canonical.size() - suffix.size(), suffix.size(), suffix) != 0) {
+            return false;
+        }
+        return lambda_static_functions.count(canonical.substr(0, canonical.size() - suffix.size()) + "|" + g.base) != 0;
+    };
+
     // Pass A: unambiguous name matches (also learns the section deltas).
     for (auto& [key, g] : groups) {
         const std::vector<const pdb::SymbolView*> cands =
@@ -2197,7 +2285,7 @@ void Planner::bridge_statics() {
         // (WP-40: a record of a lambda's static found in the procedure that inlined the lambda is not identified by its
         // name; see static_candidates.)
         const std::string enclosing = g.is_func || g.encl != "operator()" ? std::string() : lambda_enclosing(g.display, g.base);
-        if (g.members.size() == 1 && cands.size() == 1 && !is_inlined_record(cands.front(), enclosing)) {
+        if (g.members.size() == 1 && cands.size() == 1 && !is_inlined_record(cands.front(), enclosing) && !own_static_of_lambda_function(g)) {
             matched[g.members.front()] = {cands.front(), BindSource::CompilandStatic};
             if (!g.is_func) {
                 learn_delta(syms_[g.members.front()], cands.front()->rva);
@@ -2358,9 +2446,11 @@ void Planner::bridge_statics() {
     // same record: a lambda's static recorded in the procedure that inlined it is also a candidate of that procedure's
     // own statics of the name).
     {
-        std::map<const pdb::SymbolView*, std::uint32_t> owner;
+        // (Keyed by the RVA, not by the record: cl at /O2 records an inlined lambda's static twice, in its operator() and in
+        // the caller, so two records can be one live object. WP-40 review.)
+        std::map<std::uint32_t, std::uint32_t> owner;
         for (const auto& [pos, m] : matched) {
-            const auto ins = owner.emplace(m.view, pos);
+            const auto ins = owner.emplace(m.view->rva, pos);
             if (!ins.second) {
                 for (const std::uint32_t p : {ins.first->second, pos}) {
                     Sym& sy = syms_[p];
@@ -2502,18 +2592,10 @@ void Planner::settle_guards() {
         // number sits, in the old image, where the layout puts the guard of the patch's lambda of THAT number.
         const Sym* position = &sy;
         for (const auto& [from, to] : in_.closure_pairing) {
-            const std::size_t at = sy.name.find("??R" + from);
-            if (from == to || at == std::string::npos) {
+            if (from == to || !in_closure(sy, from)) {
                 continue;
             }
-            const std::string twin = sy.name.substr(0, at + 3) + to + sy.name.substr(at + 3 + from.size());
-            position = nullptr;
-            for (const Sym& t : syms_) {
-                if (t.defined && t.name == twin && t.dec.section == sy.dec.section) {
-                    position = &t;
-                    break;
-                }
-            }
+            position = closure_twin(sy, from, to);
             break;
         }
         const auto d = delta_.find(sy.dec.section);

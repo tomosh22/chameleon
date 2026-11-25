@@ -10,6 +10,7 @@
 
 #include "cml/core/bind_diag_ids.h"
 #include "cml/core/bind_names.h"
+#include "cml/pdb/type_records.h"
 #include "cml/util/format.h"
 #include "cml/util/log.h"
 
@@ -753,6 +754,14 @@ LambdaPairing pair_lambdas_by_code(const NarrowInput& input) {
         std::vector<std::vector<Equivalence>> eq(n, std::vector<Equivalence>(n, Equivalence::Unknown));
         std::string unknown_why;
         bind::BindPlan hypo = plan;  // a copy whose decisions are changed per hypothesis
+        // The closures are named without the translation unit's discriminator ("?A0x<hash>@" of an anonymous namespace):
+        // the decorated names are compared in that spelling (WP-40 review).
+        std::map<std::string, const bind::SymbolDecision*> by_plain_name;
+        for (const bind::SymbolDecision& d : plan.decisions) {
+            if (d.defined && d.type == bind::SymbolType::Data) {
+                by_plain_name.emplace(pdb::without_tu_discriminator(d.name), &d);
+            }
+        }
         for (std::size_t i = 0; i < n; ++i) {
             for (std::size_t j = 0; j < n; ++j) {
                 const bind::LambdaEntry& a = set.lambdas[i];
@@ -767,15 +776,16 @@ LambdaPairing pair_lambdas_by_code(const NarrowInput& input) {
                 bool same_statics = true;
                 // Every datum declared in lambda i (its statics and their guards, also the guards the planner placed by the
                 // section layout, which the closure step did not pair).
-                std::vector<std::string> statics_of_a;
-                for (const bind::SymbolDecision& d : plan.decisions) {
-                    if (d.defined && d.type == bind::SymbolType::Data && d.name.find("??R" + a.closure) != std::string::npos) {
-                        statics_of_a.push_back(d.name);
+                std::vector<std::pair<std::string, std::string>> statics_of_a;  // (decorated, plain)
+                for (const auto& [plain, d] : by_plain_name) {
+                    if (plain.find("??R" + a.closure) != std::string::npos) {
+                        statics_of_a.emplace_back(d->name, plain);
                     }
                 }
-                for (const std::string& st : statics_of_a) {
-                    const std::string twin = i == j ? st : with_closure(st, a.closure, b.closure);
-                    const bind::SymbolDecision* dj = plan.find_decision(twin);
+                for (const auto& [st, plain] : statics_of_a) {
+                    const std::string twin = i == j ? plain : with_closure(plain, a.closure, b.closure);
+                    const auto found = by_plain_name.find(twin);
+                    const bind::SymbolDecision* dj = found == by_plain_name.end() ? nullptr : found->second;
                     if (dj == nullptr) {
                         same_statics = false;
                         break;
@@ -857,18 +867,44 @@ LambdaPairing pair_lambdas_by_code(const NarrowInput& input) {
             }
         }
         bool by_number = false;
+        std::vector<std::size_t> by_number_lambdas;  // the new lambdas paired by their number (rule 3)
+        std::vector<std::size_t> taken_number;       // the new lambdas whose number's old lambda another one took (refused)
         if (unknown) {
             by_number = true;
             for (std::size_t i = 0; i < n; ++i) {
                 pair[i] = i;
+                by_number_lambdas.push_back(i);
             }
         } else if (new_left.size() == 1 && old_left.size() == 1) {
             pair[new_left[0]] = old_left[0];  // rule 2: the one lambda whose body changed
         } else if (!new_left.empty()) {
-            by_number = true;  // rule 3, for what is left: in the order of the numbers
-            for (std::size_t k = 0; k < new_left.size() && k < old_left.size(); ++k) {
-                pair[new_left[k]] = old_left[k];
+            // Rule 3 (the orchestrator's ruling): what is left pairs by its NUMBER. Where the old lambda of that number was
+            // already taken by a code-equivalent new one, nothing can be said about this one: refused.
+            by_number = true;
+            for (const std::size_t i : new_left) {
+                if (!old_taken[i]) {
+                    pair[i] = i;
+                    old_taken[i] = true;
+                    by_number_lambdas.push_back(i);
+                } else {
+                    taken_number.push_back(i);
+                }
             }
+        }
+        const auto names_of = [&](const std::vector<std::size_t>& which) {
+            std::string text;
+            for (const std::size_t i : which) {
+                text += (text.empty() ? "" : ", ") + set.lambdas[i].closure.substr(0, set.lambdas[i].closure.find('@'));
+            }
+            return text;
+        };
+        if (!taken_number.empty()) {
+            out.errors.push_back(Diag::make(bind::diag::kLambdasUnpairable,
+                                            "Lambdas " + names_of(taken_number) + " of '" + set.function +
+                                                "' cannot be matched to the running program's lambdas: their code changed, and the old lambda of their number is another new lambda's (by the code of its call operator), so the values of their statics would go to the wrong lambda",
+                                            "Keep the order of these lambdas while you edit them, rename their statics, or hot-restart."));
+            CML_LOG(Info, "WP40-LAMBDAS function='%s' lambdas=%zu refused=%zu", set.function.c_str(), n, taken_number.size());
+            continue;
         }
         std::size_t moved = 0;
         for (std::size_t i = 0; i < n; ++i) {
@@ -879,18 +915,9 @@ LambdaPairing pair_lambdas_by_code(const NarrowInput& input) {
                         set.lambdas[pair[i]].old_closure.c_str());
             }
         }
-        if (by_number) {
-            std::string left;
-            for (const std::size_t i : unknown ? std::vector<std::size_t>() : new_left) {
-                left += (left.empty() ? "" : ", ") + set.lambdas[i].closure.substr(0, set.lambdas[i].closure.find('@'));
-            }
-            if (unknown) {
-                for (const bind::LambdaEntry& e : set.lambdas) {
-                    left += (left.empty() ? "" : ", ") + e.closure.substr(0, e.closure.find('@'));
-                }
-            }
+        if (by_number && !by_number_lambdas.empty()) {
             out.warnings.push_back(Diag::make(bind::diag::kLambdasMatchedByNumber,
-                                              "Lambdas " + left + " of '" + set.function + "' are matched by their numbers" +
+                                              "Lambdas " + names_of(by_number_lambdas) + " of '" + set.function + "' are matched by their numbers" +
                                                   (unknown ? " (" + unknown_why + ")" : std::string(" (their code changed, so it cannot tell them apart)")) +
                                                   "; if you reordered them, the values of their statics may be exchanged.",
                                               "Rename the statics, keep the order of these lambdas, or hot-restart after reordering."));

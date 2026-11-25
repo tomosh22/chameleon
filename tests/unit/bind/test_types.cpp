@@ -2225,3 +2225,101 @@ TEST_CASE("inlined lambdas under cl /O2 /Ob2: a caller's record at ANOTHER addre
         CHECK(contains(e.message, "are not the same as in the old image (4 there, some of them inlined, 2 in the patch)"));
     }
 }
+
+TEST_CASE("lambda statics (rule (d), review): lambdas in an anonymous namespace are reported, and a pairing across numbers is followed") {
+    // The decorated names carry "?A0x<hash>@" (another hash than the old build's), the closures are named without it.
+    const std::string old_fn = "?0??f@?A0x520C9D4F@@YAHXZ@";
+    const std::string new_fn = "?0??f@?A0x11111111@@YAHXZ@";
+    const std::string plain_fn = "?0??f@?A0x@@YAHXZ@";
+    const auto sym = [&new_fn](const std::string& name, int n) { return "?" + name + "@?1???R<lambda_" + std::to_string(n) + ">@" + new_fn + "QEBA@XZ@4HA"; };
+    const auto op = [&new_fn](int n) { return "??R<lambda_" + std::to_string(n) + ">@" + new_fn + "QEBA@XZ"; };
+    const auto old_world = [&](SynthWorld& w) {
+        w.data(w.tu(), "`anonymous namespace'::s_plain", 0x08);
+        Types types;
+        for (int n = 0; n < 2; ++n) {
+            const std::uint32_t type = types.call_operator("<lambda_" + std::to_string(n) + ">", ".?AV<lambda_" + std::to_string(n) + ">@" + old_fn);
+            old_proc(w, "`anonymous namespace'::f::<lambda_" + std::to_string(n) + ">::operator()", 0x60 + 0x10 * static_cast<std::uint32_t>(n), type,
+                     {{"sname", 0x20 + 0x10 * static_cast<std::uint32_t>(n)}});
+        }
+        types.set.add_to(w.spec.tpi);
+        w.open();
+    };
+    const auto object = [&](StaticsObj& o, Types& t) {
+        for (int n = 0; n < 2; ++n) {
+            o.proc(op(n), "`anonymous namespace'::f::<lambda_" + std::to_string(n) + ">::operator()", false,
+                   t.call_operator("<lambda_" + std::to_string(n) + ">", ".?AV<lambda_" + std::to_string(n) + ">@" + new_fn));
+            o.end();
+        }
+        const std::uint32_t d = o.obj.section(".bss", kData, 0x40);
+        o.obj.symbol("?s_plain@?A0x11111111@@3HA", 0x08, static_cast<std::int32_t>(d), false, false);
+        for (int n = 0; n < 2; ++n) {
+            o.obj.symbol(sym("sname", n), 0x20 + 0x10 * static_cast<std::uint32_t>(n), static_cast<std::int32_t>(d), false, false);
+            o.obj.symbol(sym("$TSS0", n), 0x28 + 0x10 * static_cast<std::uint32_t>(n), static_cast<std::int32_t>(d), false, false);
+        }
+    };
+    SUBCASE("reported for the comparison of their code, with their call operators") {
+        SynthWorld w;
+        old_world(w);
+        Types t;
+        StaticsObj o;
+        object(o, t);
+        Built b = o.build(t.set.debug_t());
+        auto r = plan_bind(w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        REQUIRE(r->lambda_sets.size() == 1);
+        REQUIRE(r->lambda_sets[0].lambdas.size() == 2);
+        CHECK(r->lambda_sets[0].lambdas[0].closure == "<lambda_0>@" + plain_fn);
+        CHECK(r->lambda_sets[0].lambdas[0].call_operator == op(0));  // (until the review: empty, so the set was never compared)
+        CHECK(r->lambda_sets[0].lambdas[1].call_operator == op(1));
+    }
+    SUBCASE("given the swap, the statics, the call operators and the guards (by their twins' places) follow it") {
+        SynthWorld w;
+        old_world(w);
+        Types t;
+        StaticsObj o;
+        object(o, t);
+        Built b = o.build(t.set.debug_t());
+        PlanInput in = w.input(b);
+        in.closure_pairing = {{"<lambda_0>@" + plain_fn, "<lambda_1>@" + plain_fn}, {"<lambda_1>@" + plain_fn, "<lambda_0>@" + plain_fn}};
+        auto r = plan_bind(in);
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        CHECK(decision(*r, sym("sname", 0)).old_address.rva == 0x3030);
+        CHECK(decision(*r, sym("$TSS0", 0)).old_address.rva == 0x3038);
+        CHECK(decision(*r, sym("sname", 1)).old_address.rva == 0x3020);
+        CHECK(decision(*r, sym("$TSS0", 1)).old_address.rva == 0x3028);
+        CHECK(decision(*r, op(0)).old_address.rva == 0x1070);
+        CHECK(decision(*r, op(1)).old_address.rva == 0x1060);
+    }
+}
+
+// ---- WP-40 review: two statics of the patch on one live object ---------------------------------------------------------
+
+TEST_CASE("cl /O2: a new `f::n` and the lambda's `n` recorded twice at one address are never both bound to it") {
+    // cl records the lambda's static `n` in its operator() and in f() at one RVA. The patch adds f's own `n`. Until the
+    // review the duplicate check keyed the old records by their record, not by the address, and both statics were bound to
+    // the one live object.
+    SynthWorld w;
+    Types types;
+    const std::uint32_t op = types.call_operator("f::<lambda_1>", ".?AV<lambda_1>@?1??f@@YAXXZ@");
+    old_proc(w, "`f'::`2'::<lambda_1>::operator()", 0x60, op, {{"n", 0x20}, {"$TSS0", 0x28}});
+    old_proc(w, "f", 0x40, types.fn(tp::kTVoid, {}), {{"n", 0x20}, {"$TSS0", 0x28}});
+    w.pub_func("?f@@YAXXZ", 0x40);
+    types.set.add_to(w.spec.tpi);
+    w.open();
+    SynthObj o;
+    for (const char* const name : {"?n@?1???R<lambda_1>@?1??f@@YAXXZ@QEBAAEBUName@@XZ@4U2@A", "?$TSS0@?1???R<lambda_1>@?1??f@@YAXXZ@QEBAAEBUName@@XZ@4HA",
+                                    "?n@?1??f@@YAXXZ@4HA"}) {
+        const std::uint32_t sec = o.section(".bss", kDataComdat, 8, coff::ComdatSelection::Any);
+        o.symbol(name, 0, static_cast<std::int32_t>(sec), false, false);
+    }
+    Built b = o.build();
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+    std::size_t at_0x3020 = 0;
+    for (const SymbolDecision& d : partial.decisions) {
+        at_0x3020 += d.decision == DecisionKind::BindOldData && d.old_address.rva == 0x3020 ? 1u : 0u;
+    }
+    CHECK(at_0x3020 <= 1);
+    CHECK_FALSE(errors.empty());
+}

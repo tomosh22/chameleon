@@ -10,6 +10,7 @@
 #include "../pe/pe_builder.h"
 #include "cml/core/bind_diag_ids.h"
 #include "cml/core/hook_narrowing.h"
+#include "cml/pdb/type_records.h"
 #include "cml/util/log.h"
 #include "doctest.h"
 #include "synth.h"
@@ -22,13 +23,21 @@ using namespace cml_bind_test;
 namespace {
 
 constexpr std::uint64_t kImageBase = 0x140000000ull;
-constexpr std::uint32_t kOldOp[2] = {0x1100, 0x1140};   // the old call operators of <lambda_0> / <lambda_1> (16 bytes each)
-constexpr std::uint32_t kOldSlot[2] = {0x3100, 0x3110}; // their statics (only compared as addresses)
-constexpr std::uint32_t kOldLiteral[2] = {0x2980, 0x29C0};  // the string literals each passes, in .rdata
+constexpr std::uint32_t kOldOp[3] = {0x1100, 0x1140, 0x1180};   // the old call operators of <lambda_0> .. <lambda_2> (16 bytes each)
+constexpr std::uint32_t kOldSlot[3] = {0x3100, 0x3110, 0x3120};  // their statics (only compared as addresses)
+constexpr std::uint32_t kOldLiteral[3] = {0x2980, 0x29C0, 0x29E0};  // the string literals each passes, in .rdata
 
-std::string closure(int n) { return "<lambda_" + std::to_string(n) + ">@?0??f@@YAXXZ@"; }
-std::string op_name(int n) { return "??R" + closure(n) + "QEBA@XZ"; }
-std::string slot_name(int n) { return "?slot@?1???R" + closure(n) + "QEBA@XZ@4HA"; }
+// The scope of the lambdas' enclosing function as the decorated names spell it. An anonymous namespace puts the unit's
+// discriminator in it ("?A0x9a8b7c6d@"), which the closures are named without (pdb::without_tu_discriminator).
+std::string g_function_scope = "?0??f@@YAXXZ@";
+struct AnonymousNamespace {
+    AnonymousNamespace() { g_function_scope = "?0??f@?A0x9a8b7c6d@@YAXXZ@"; }
+    ~AnonymousNamespace() { g_function_scope = "?0??f@@YAXXZ@"; }
+};
+std::string raw_closure(int n) { return "<lambda_" + std::to_string(n) + ">@" + g_function_scope; }
+std::string closure(int n) { return cml::pdb::without_tu_discriminator(raw_closure(n)); }
+std::string op_name(int n) { return "??R" + raw_closure(n) + "QEBA@XZ"; }
+std::string slot_name(int n) { return "?slot@?1???R" + raw_closure(n) + "QEBA@XZ@4HA"; }
 std::string literal_name(int n) { return "??_C@_05LIT" + std::to_string(n) + "@lit@"; }
 
 struct QuietLogs {
@@ -313,4 +322,57 @@ TEST_CASE("lambdas by code (rule (d)): a body that cannot be compared leaves the
     REQUIRE(p.warnings.size() == 1);
     CHECK(p.warnings[0].code == diag::kLambdasMatchedByNumber);
     CHECK(p.warnings[0].message.find("cannot be compared") != std::string::npos);
+}
+
+TEST_CASE("lambdas by code (rule (d), review): lambdas of a function in an anonymous namespace that changed places are paired by code") {
+    // The decorated names carry the unit's discriminator "?A0x<hash>@", the closures are named without it. Until the review
+    // the statics of such lambdas were never found under their closure (no comparison could succeed) and they stayed paired
+    // by number.
+    QuietLogs quiet;
+    AnonymousNamespace anon;
+    World w;
+    w.old_lambda(0, id(400000));
+    w.old_lambda(1, id(450000));
+    w.new_lambda(0, id(450000));
+    w.new_lambda(1, id(400000));
+    const LambdaPairing p = w.run();
+    REQUIRE(p.closure_pairing.size() == 2);
+    CHECK(p.closure_pairing.at(closure(0)) == closure(1));
+    CHECK(p.closure_pairing.at(closure(1)) == closure(0));
+    CHECK(closure(0).find("?A0x@") != std::string::npos);
+    CHECK(p.warnings.empty());
+}
+
+TEST_CASE("lambdas by code (rule (d), review): a changed lambda whose number's old lambda another one took is refused (CML3603)") {
+    // Three lambdas; new 0 is the old 1 by its code; new 1 and new 2 changed. New 2 pairs with old 2 by its number (CML3602);
+    // the old lambda of new 1's number is taken by new 0, so nothing can be said about new 1: refused.
+    QuietLogs quiet;
+    World w;
+    w.old_lambda(0, id(100000));
+    w.old_lambda(1, id(200000));
+    w.old_lambda(2, id(300000));
+    w.new_lambda(0, id(200000));
+    w.new_lambda(1, id(100001));
+    w.new_lambda(2, id(300001));
+    const LambdaPairing p = w.run();
+    REQUIRE(p.errors.size() == 1);
+    CHECK(p.errors[0].code == diag::kLambdasUnpairable);
+    CHECK(p.errors[0].id() == "CML3603");
+    CHECK(p.errors[0].message.find("Lambdas <lambda_1> of 'f'") != std::string::npos);
+}
+
+TEST_CASE("lambdas by code (rule (d), review): changed lambdas whose numbers are free pair by number, and the warning names only them") {
+    QuietLogs quiet;
+    World w;
+    w.old_lambda(0, id(100000));
+    w.old_lambda(1, id(200000));
+    w.old_lambda(2, id(300000));
+    w.new_lambda(0, id(100000));  // unchanged, by code
+    w.new_lambda(1, id(200001));
+    w.new_lambda(2, id(300001));
+    const LambdaPairing p = w.run();
+    CHECK(p.errors.empty());
+    CHECK(p.closure_pairing.empty());
+    REQUIRE(p.warnings.size() == 1);
+    CHECK(p.warnings[0].message.find("Lambdas <lambda_1>, <lambda_2> of 'f' are matched by their numbers") != std::string::npos);
 }
