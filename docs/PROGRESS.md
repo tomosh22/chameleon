@@ -43,10 +43,15 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-27 | Performance budgets | 7 | done | wp/27-perf-budgets | #42 (f39dc19) | CI 14/14 push 42460887634 + PR 42460890741 at 00e0ac6; pdb index 328 ms/544 MiB (budget 4352), reload excl. compile median 40.9 ms, idle CPU 0.000 %, large-PDB broker 219 MiB = 0.40x PDB, session broker peak 11.0 MiB (limit 1.5x PDB + 32 MiB baseline). Test-coverage gap: no reload measured inside the large PDB (benchmark has no agent). |
 | WP-28 | Fuzzing and failure injection | 7 | done | wp/28-fuzz-injection | #44 (5b6dffb) | CI 14/14 x2 + fuzz 6/6 (incl. OFF build) at e41c1f5 verified; inject_stages 89/89, crash_reexecute 25/25, agent_hook 25/25 (windows-2025 clang-cl RelWithDebInfo); 8 high findings fixed, post-patch-hooks fires before commit; delta checked |
 | WP-36 | Image-relative references to old data (R-01, F-2; ADR-0042) | 10 | done | wp/36-imgrel | #67 (4878597) | ci 14/14 x2 (push 45478082260, PR 45478094808), corpus 5/5 (45478094802, Godot) at 0698a3e verified: `CMLTEST_RESULT scenario=imgrel ... passed=14 failed=0` (8 cells), `WP36-IMGREL sites=10 verified=10` (cl RelWithDebInfo), raylib/msvc `edit:header-inline-raymath: PASS ... patched=3` with 97/97 sites proved, F-2 xfail removed. High review: 2 important + 1 nit fixed (32-bit lea, immediate placement, base-less SIB); high re-review clean, 4 nits deferred (R-50) |
-| WP-37 | PDB type stream; static overloads and lambda-local statics (R-02, R-03; ADR-0042) | 10 | in progress | wp/37-pdb-types | — | — |
+| WP-37 | PDB type stream; static overloads and lambda-local statics (R-02, R-03; ADR-0042) | 10 | done | wp/37-pdb-types | #64 (2456392) | ci 14/14 x2 (push 45508103161, PR 45508112785 attempt 2), corpus 7/7 (45508112935, Godot), fuzz 10/10 at c627515 verified: Godot `edit:static-lib-scene-tree: PASS ... hooks=126` (R-03), ImGui cl three `static-overloads-*` PASS (R-02), `OPTIONS-NAMES ... guards=2 guards_bound=2` both compilers. One failed acceptance (Godot, block-number parser) and four high reviews; last review's over-refusals deferred to WP-40 (ADR-0018). Attempt 1 of the PR ci run failed only in the pre-existing unit.watch timing test (fixed in the close-out PR) |
 | WP-38 | VEX/EVEX in the hook length decoder; decoder fuzzing (R-04, R-41; ADR-0042) | 10 | done | wp/38-vex-decoder | #65 (8de8b47) | ci 14/14 x2 (push 45456991699, PR 45457008741), corpus 7/7 (45457009071), fuzz 10/10 (45457008506), package at code head 3cd27ad verified (final head 24e4212 docs only): `WP10-STRESS ... crashes=0` + `WP38-STRESS-VEX cpu_avx2=1 targets=8` in all 8 cells, Godot `refused_vex=0` (main 220), `fuzz / lde` 10.5 M runs `disagreements=0` against Zydis, `WP38-DIFF instructions=3424419 mismatches=0`. High review: 1 important (CMake 3.24) + 4 nits fixed. Legacy maps tightened beyond the ADR, accepted with the exhaustive comparison against main's decoder (`delta_real=0`) |
 | WP-39 | Reload timing inside a large PDB, with budgets (R-13; ADR-0042) | 10 | done | wp/39-large-pdb-reload | #63 (2453615) | ci 14/14 x2 (push 45422099800, PR 45422114245) and corpus 5/5 (45422114246) at b22d155 verified: `WP39-RELOAD pdb_mib=546.1 reloads=5 total_minus_compile_median_ms=109.3 max_ms=1340.4 budget_ms=3000`, `PERF broker_peak_private_mib=836.9 limit_mib=851.2`, Godot `reload-budget: PASS 6 reloads`, slowest per TU 972.8 ms. Medium review: nits only. Memory headroom of 14 MiB and the review nits go to WP-39b |
 | WP-39b | The broker reads the module file once (follow-up to WP-39) | 10 | done | wp/39b-module-read | #66 (46bf967) | ci 14/14 (PR 45440733449), corpus, fuzz, package green at 7b94c1f (42/42 checks) verified; pdb-benchmark job 138610804960: `PERF broker_peak_private_mib=587.2 limit_mib=851.2` (main 836.9), `WP39-RELOAD ... median 109.3 max_ms=813.2` (main max 1340.4). Medium review: nits only (pe::read_file_headers on corrupt files, a pre-existing harness leftover) |
+| WP-40 | Bind-planner pairing defects (R-48, R-50; ADR-0043) | 11 | in progress | wp/40-planner-pairing | — | — |
+| WP-41 | Corpus: an /arch:AVX2, unity-built, static-library project (R-06; ADR-0043) | 11 | in progress | wp/41-corpus-avx2-unity | — | — |
+| WP-42 | Corpus: a DLL-plugin architecture (R-06; ADR-0043) | 11 | in progress | wp/42-corpus-plugins | — | — |
+| WP-43 | Restart-hold follow-ups; failure injection in restart and revert (R-40, R-42; ADR-0043) | 11 | in progress | wp/43-restart-injection | — | — |
+| WP-44 | Failure injection in the crash handler and the watcher; persistent arming (R-42, R-49; ADR-0043) | 11 | todo | wp/44-injection-rest | — | starts when a wave-11 slot frees |
 
 ## Orchestrator integration work
 
@@ -130,3 +135,10 @@ Before the launch the orchestrator ran a compiler-output spike for R-01 (run 454
 reproduce the finding, and the roadmap's proposed direction would not have fixed raylib; ADR-0042 records the evidence and
 the design chosen instead. The same PR adds `DecodeResult::disp_offset`/`disp_size` to the length decoder (used by WP-36,
 kept by WP-38).
+
+**Wave 10 complete (2026-11-25):** WP-36 (#67), WP-37 (#64), WP-38 (#65), WP-39 (#63) and the follow-up WP-39b (#66), under
+ADR-0042. R-01, R-02, R-03, R-04, R-13 and the decoder part of R-41 are done. Corpus: F-2 and F-4 fixed, Godot `refused_vex`
+220 → 0, Godot `scene_tree.cpp` reloads. New findings went to R-46..R-50; R-48 (pre-existing planner pairing defects) leads
+wave 11.
+
+**Wave 11 launched (2026-11-25):** WP-40..WP-43 under ADR-0043; WP-44 starts when the first of them merges.
