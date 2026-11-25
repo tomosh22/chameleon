@@ -9,6 +9,7 @@ name: corpus
 # total - compile per recompiled translation unit (step `reload-budget`).
 # WP-42 (ADR-0043): `godot-gdextension` runs the same Godot editor binary (same cache, restored only) as the host of a
 # GDExtension plugin (godot-cpp) that it loads at run time; like Godot it runs on pull requests, schedule and dispatch.
+# WP-41 (ADR-0043): `jolt`, Jolt Physics built with /arch:AVX2, as static libraries, with CMake's unity build (cl, clang-cl).
 
 on:
   schedule:
@@ -16,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'run one project only (raylib, imgui, godot, godot-gdextension); empty or all runs every cell'
+        description: 'run one project only (raylib, imgui, godot, godot-gdextension, jolt); empty or all runs every cell'
         required: false
         default: 'all'
   pull_request:
@@ -53,7 +54,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           ONLY: ${{ inputs.only }}
         run: |
-          cells='[{"project":"raylib","compiler":"msvc"},{"project":"raylib","compiler":"clang-cl"},{"project":"imgui","compiler":"msvc"},{"project":"imgui","compiler":"clang-cl"},{"project":"godot","compiler":"msvc"},{"project":"godot-gdextension","compiler":"msvc"}]'
+          cells='[{"project":"raylib","compiler":"msvc"},{"project":"raylib","compiler":"clang-cl"},{"project":"imgui","compiler":"msvc"},{"project":"imgui","compiler":"clang-cl"},{"project":"godot","compiler":"msvc"},{"project":"godot-gdextension","compiler":"msvc"},{"project":"jolt","compiler":"msvc"},{"project":"jolt","compiler":"clang-cl"}]'
           if [ "$EVENT" = "push" ]; then
             cells=$(echo "$cells" | jq -c 'map(select(.project | startswith("godot") | not))')
           elif [ -n "$ONLY" ] && [ "$ONLY" != "all" ]; then
