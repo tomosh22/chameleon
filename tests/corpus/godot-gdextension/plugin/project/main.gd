@@ -49,7 +49,9 @@ func _poll_ctl() -> void:
 		return
 	var parts := text.split(" ", false)
 	if parts[0] == "loaded":
-		var gen: String = parts[1] if parts.size() > 1 else ""
+		if parts.size() < 2:
+			return  # no generation: not a complete command (the driver renames a finished file over this one)
+		var gen: String = parts[1]
 		if gen == want_gen:
 			return
 		want_gen = gen

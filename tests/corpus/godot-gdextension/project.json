@@ -1,12 +1,7 @@
 {
   "name": "godot-gdextension",
-  "repo": "https://github.com/godotengine/godot.git",
-  "tag": "4.5.1-stable",
-  "commit": "f62fdbde15035c5576dad93e586201f4d41ef0cb",
+  "base_project": "godot",
   "license": "MIT",
-  "src_dir": "src-godot",
-  "support_dir": "platform/windows",
-  "patch": "../godot/chameleon.patch",
   "godot_cpp": {
     "repo": "https://github.com/godotengine/godot-cpp.git",
     "tag": "godot-4.5-stable",
@@ -143,7 +138,9 @@
   "start_timeout_s": 600,
   "index_timeout_s": 1800,
   "min_functions": 50000,
-  "plugin_min_functions": 1000,
+  "extra_modules": [
+    { "file": "corpus_plugin.dll", "min_functions": 1000 }
+  ],
   "expected_failures": [
     {
       "step": "check:plugin-edit-survives-reload",

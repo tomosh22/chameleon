@@ -60,6 +60,6 @@ $dll = Join-Path $pluginDir 'project/bin/corpus_plugin.dll'
 if (-not (Test-Path $dll)) { throw "the plugin build did not produce $dll" }
 if (-not (Test-Path ([System.IO.Path]::ChangeExtension($dll, '.pdb')))) { throw "no PDB next to $dll" }
 Write-Host ("plugin build (godot-cpp $($gc.tag) + corpus_plugin): {0:N0} s, {1:N1} MB" -f $watch.Elapsed.TotalSeconds, ((Get-Item $dll).Length / 1MB))
-$script:ExtraModules = @([pscustomobject]@{ path = $dll; min_functions = [int64]$cfg.plugin_min_functions })
+$script:ExtraModules = @([pscustomobject]@{ path = $dll })   # checked as extra_modules of project.json
 Remove-Item (Join-Path $WorkDir 'gdext_ctl.txt') -ErrorAction SilentlyContinue   # the plugin is loaded only when the driver says so
 $script:ExePath = $hostExe

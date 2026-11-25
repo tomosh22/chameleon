@@ -8,7 +8,7 @@
 #   build      the project's build.ps1 with the flags of docs/BUILD_REQUIREMENTS.md
 #   check      cml_broker check (WP-18) must pass on the build
 #   decode     cml_lde_probe: the hook installer's instruction-length decoder over every function entry of the PDB
-#              (both also for every module build.ps1 lists in $script:ExtraModules, as check:<file> / decode:<file>)
+#              (both also for every module of project.json extra_modules, as check:<file> / decode:<file>)
 #   enable     broker + the application with the agent: module enabled, PDB index ready, frames printed
 #   edit:<id>  one edit of project.json, `reload`, the change is observable, the application keeps running
 #   refused:<id>  the deliberately unsupported edit is refused with its diagnostic and the application keeps running
@@ -40,18 +40,26 @@ $ChameleonBin = (Resolve-Path $ChameleonBin).Path
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 $WorkDir = (Resolve-Path $WorkDir).Path
 $cfg = Get-Content (Join-Path $here "$Project/project.json") -Raw | ConvertFrom-Json
+if ($cfg.base_project) {
+    # WP-42: a project built on another one's checkout takes its pin and patch from that project's project.json (one place,
+    # so they cannot drift from the files the other project's build cache is keyed on) and its checkout src-<base>.
+    $baseCfg = Get-Content (Join-Path $here "$($cfg.base_project)/project.json") -Raw | ConvertFrom-Json
+    foreach ($key in 'repo', 'tag', 'commit', 'support_dir') { $cfg | Add-Member -Force -NotePropertyName $key -NotePropertyValue $baseCfg.$key }
+    $cfg | Add-Member -Force -NotePropertyName 'patch' -NotePropertyValue "../$($cfg.base_project)/$($baseCfg.patch)"
+    $cfg | Add-Member -Force -NotePropertyName 'src_dir' -NotePropertyValue "src-$($cfg.base_project)"
+}
 $out = Join-Path $WorkDir "out-$Project-$Compiler"
 New-Item -ItemType Directory -Force -Path $out | Out-Null
 $src = Join-Path $WorkDir "src-$Project"
 $buildDir = Join-Path $WorkDir "build-$Project-$Compiler"
 if ($Project -eq 'godot') { $src = Join-Path $WorkDir "src-godot" }   # one checkout (and one scons build tree) per cell
-if ($cfg.src_dir) { $src = Join-Path $WorkDir $cfg.src_dir }         # WP-42: a project that builds on another one's checkout
+if ($cfg.src_dir) { $src = Join-Path $WorkDir $cfg.src_dir }         # WP-42: base_project, a checkout shared with another project
 $latin1 = [System.Text.Encoding]::GetEncoding(28591)
 $script:Matrix = New-Object System.Collections.Generic.List[object]
 $script:Originals = @{}
 $script:Prev = @{}
 $script:ExePath = $null
-$script:ExtraModules = @()   # WP-42: further modules build.ps1 produced (objects with path, min_functions): check + decode
+$script:ExtraModules = @()   # WP-42: further modules build.ps1 produced (objects with path), named in project.json extra_modules
 $script:Broker = $null
 $script:App = $null
 $script:Ctl = $null
@@ -84,9 +92,10 @@ function Invoke-Step([string]$Name, [scriptblock]$Body) {
         $msg = ($_ | Out-String).Trim()
         if ($msg.Length -gt 1500) { $msg = $msg.Substring(0, 1500) }
         $expected = $cfg.expected_failures | Where-Object { $_.step -eq $Name -and ($_.compiler -eq $Compiler -or $_.compiler -eq '*') } | Select-Object -First 1
-        if ($expected -and $expected.match -and $msg -notmatch $expected.match) {
-            # WP-42: an expected failure may name how it fails (`match`, a regex of the error); any other failure is a failure.
-            Add-Result $Name 'fail' ("failed, but not as expected (/{0}/, {1}): {2}" -f $expected.match, $expected.reason, $msg) $watch.Elapsed.TotalSeconds
+        if ($expected -and $expected.match -and ([string]$_.Exception.Message) -notmatch [string]$expected.match) {
+            # WP-41: an expected failure may name the failure (`match`, a regex over the error message): failing in another
+            # way is a failure, not the documented one.
+            Add-Result $Name 'fail' ("expected to fail with /{0}/ ({1}), failed otherwise: {2}" -f $expected.match, $expected.reason, $msg) $watch.Elapsed.TotalSeconds
         } elseif ($expected) {
             Add-Result $Name 'expected-fail' ("{0} -- {1}" -f $expected.reason, $msg) $watch.Elapsed.TotalSeconds
         } else {
@@ -251,7 +260,9 @@ function Get-EditStepName($e) {
 function Write-Signal($edit) {
     if (-not $edit.write) { return }
     $path = ([string]$edit.write.file).Replace('{work}', $WorkDir)
-    [System.IO.File]::WriteAllText($path, [string]$edit.write.text)
+    # Written to a temporary file and renamed over the control file, so the application never reads half of it.
+    [System.IO.File]::WriteAllText("$path.tmp", [string]$edit.write.text)
+    [System.IO.File]::Move("$path.tmp", $path, $true)
     Write-Host "signal: wrote '$($edit.write.text)' to $path"
 }
 
@@ -349,10 +360,20 @@ function Test-Module([string]$ModulePath, [string]$Suffix, [string]$MinFunctions
 
 if ($built) {
     Test-Module $script:ExePath '' ([string]$cfg.min_functions)
-    foreach ($extra in @($script:ExtraModules)) { Test-Module $extra.path (Split-Path $extra.path -Leaf) ([string]$extra.min_functions) }
+    # WP-42: the modules project.json names in extra_modules (file, min_functions), wherever build.ps1 put them.
+    foreach ($em in @($cfg.extra_modules | Where-Object { $_ })) {
+        $extra = @($script:ExtraModules | Where-Object { (Split-Path $_.path -Leaf) -ieq $em.file }) | Select-Object -First 1
+        if ($null -eq $extra) {
+            Add-Result "check:$($em.file)" 'fail' 'build.ps1 did not list this module in $script:ExtraModules' 0
+            Skip-Step "decode:$($em.file)" 'module not built'
+            continue
+        }
+        Test-Module $extra.path $em.file ([string]$em.min_functions)
+    }
 } else {
     Skip-Step 'check' 'build failed'
     Skip-Step 'decode' 'build failed'
+    foreach ($em in @($cfg.extra_modules | Where-Object { $_ })) { Skip-Step "check:$($em.file)" 'build failed'; Skip-Step "decode:$($em.file)" 'build failed' }
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
