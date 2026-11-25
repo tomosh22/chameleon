@@ -695,16 +695,19 @@ TEST_CASE("application hooks: a module the application did not enable contribute
 namespace {
 
 // Sets an environment variable of the test process for the lifetime of the object.
+// WP-43: the object owns a copy of the name. It used to keep the caller's pointer, and the test with twelve large variables
+// destroyed the strings that pointer referred to before the ScopedVars: the destructors read the name from freed memory (a
+// use-after-free, crashing intermittently in the msvc Debug cell, WP-42 ci job 138898816837).
 class ScopedVar {
 public:
-    ScopedVar(const wchar_t* name, const wchar_t* value) : name_(name) { SetEnvironmentVariableW(name, value); }
-    ~ScopedVar() { SetEnvironmentVariableW(name_, nullptr); }
+    ScopedVar(const wchar_t* name, const wchar_t* value) : name_(name) { SetEnvironmentVariableW(name_.c_str(), value); }
+    ~ScopedVar() { SetEnvironmentVariableW(name_.c_str(), nullptr); }
     ScopedVar(const ScopedVar&) = delete;
     ScopedVar& operator=(const ScopedVar&) = delete;
-    void set(const wchar_t* value) { SetEnvironmentVariableW(name_, value); }
+    void set(const wchar_t* value) { SetEnvironmentVariableW(name_.c_str(), value); }
 
 private:
-    const wchar_t* name_;
+    std::wstring name_;
 };
 
 std::u16string u16_of(const std::wstring& text) {
@@ -952,8 +955,9 @@ TEST_CASE("hot-restart: launch parameters that do not fit one message are refuse
     ScopedPipeEnv env(pipe);
     hooktest_user::reset(nullptr);
     // More than 300 000 UTF-16 units of environment (every variable is limited to 32 767 characters).
-    std::vector<std::unique_ptr<ScopedVar>> big;
+    // `names` outlives `big` (declared first); each ScopedVar also owns its name (see ScopedVar).
     std::vector<std::wstring> names;
+    std::vector<std::unique_ptr<ScopedVar>> big;
     for (int i = 0; i < 12; ++i) {
         names.push_back(std::wstring(L"CML_WP21_BIG") + static_cast<wchar_t>(L'A' + i));
     }
@@ -1001,6 +1005,14 @@ TEST_CASE("hot-restart: launch parameters that do not fit one message are refuse
     REQUIRE(reply.has_value());
     CHECK(reply->status == 0);
     agent.stop_and_wait_for_calls();
+
+    // The variables are gone again (a later test must not inherit 360 000 units of environment).
+    big.clear();
+    for (const std::wstring& name : names) {
+        wchar_t probe[4];
+        CHECK(GetEnvironmentVariableW(name.c_str(), probe, 4) == 0);
+        CHECK(GetLastError() == ERROR_ENVVAR_NOT_FOUND);
+    }
 }
 
 
