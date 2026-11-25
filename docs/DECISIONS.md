@@ -1195,6 +1195,13 @@ closure-typed local, on both sides); otherwise CML3630. An edited lambda used on
 legacy processor (KNOWN_LIMITATIONS). After the third review round WP-46 merges on green; a later review holds it only for a new
 wrong pairing.
 
+**Split (WP-46 second failed acceptance):** WP-46's head 984e887 regressed jolt clang-cl (`fail=6`) and imgui clang-cl
+(`fail=3`) with R-54 refusals: the display-name match of closures ignores overloads (every `JPH::GetRTTIOfType` overload sees
+every overload's lambdas), and a function whose scope is C-linkage (`??main@@9`) has no decorated patch symbol. Telling a function
+that really inlined a lambda from one that merely has a closure needs the old image's inline sites, which nobody has examined yet.
+R-54 is therefore split out: WP-46 merges F-41.1..3, the hash-named lambda pairing and its review fixes, with R-54 left as on main
+(a known, pre-existing gap); R-54 becomes WP-51 in wave 12, starting with a spike on `S_INLINESITE` inlinees.
+
 ### Shared files and merge order
 
 - `tests/corpus/run_corpus.ps1`: WP-38 owns the decoder step, WP-39 the timing output; WP-36 and WP-37 change only
@@ -1438,6 +1445,6 @@ shows, within the broker and the agent's logging. R-55 is added to the roadmap: 
 minutes*. **Acceptance:** the breakdown lines in CI for both; the first reload in the WP-39 benchmark within 300 ms of later ones;
 the Godot hot-restart under 60 s, or a measured, documented reason why not.
 
-WP-47..WP-50 start together (four at once). Shared file: `broker/cml_core/src/pipeline.cpp` (WP-47 and WP-49); whoever merges
+WP-47..WP-50 start together (four at once). **WP-51 (R-54, split from WP-46):** an own static of a function that inlined a lambda never takes that lambda's static. Spike first: from the old image's `S_INLINESITE`/`S_INLINESITE2` inlinees (IPI `LF_FUNC_ID`/`LF_MFUNC_ID`), decide per function whether it inlined a call operator of one of its closures; refuse only then (CML3207), and treat unreadable inline-site data as a risk. Acceptance: the R-54 unit test, Jolt and ImGui clang-cl corpus cells unchanged (`fail=0`). It starts in the first free wave-12 slot. Shared file: `broker/cml_core/src/pipeline.cpp` (WP-47 and WP-49); whoever merges
 second merges main and re-runs. Rules as in ADR-0043: one PR per WP, CI on the Windows matrix is the only acceptance, the
 orchestrator reads the logs; "refuse what cannot be proven" stands.
