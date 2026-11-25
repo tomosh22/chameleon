@@ -74,7 +74,14 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
   borrows the old process's console during the relaunch. Reloads are refused (CML5304) while a restart runs. `timeout_ms` bounds
   the preparation (the pre-restart hooks); after the old process is terminated, `registration_timeout_ms` (default 30 s) bounds
   registration, re-enabling and re-applying the edits. Modules the application loads lazily after start-up are reported (CML5809)
-  and not enabled again. `CML_RESTART_TOKEN` stays in the new process's environment (ADR-0034). `Agent::ScheduleRestart` still
+  and not enabled again; **their edits are not re-applied when they load later, and nothing says so (F-42.3, fixed by WP-45)**.
+  A restart that leaves its new process running without finishing (CML5808, CML5809) remembers what it could not do for that
+  process; the next `restart` of it does it. A late registration alone does not (WP-43).
+- **Plugin DLLs freed and loaded again (WP-42, F-42.1/F-42.2; fixed by WP-45).** A module that is freed and loaded again
+  (FreeLibrary + LoadLibrary) runs its original code: the edits patched into the earlier instance are not re-applied and no
+  diagnostic says so. Its first reload afterwards can fail with CML3350 (LNK1104), because the new instance's first patch is
+  written to the path of the earlier instance's patch, which is still loaded. Edit the file again, or restart the application with
+  the module loaded, to bring the edits back. `CML_RESTART_TOKEN` stays in the new process's environment (ADR-0034). `Agent::ScheduleRestart` still
   returns `CML_STATUS_NOT_IMPLEMENTED`. A broker started with a short `--exit-when-idle` can exit during the restart gap.
 - Broker UI (WP-19): enable/disable of modules is shown but not switchable (the control protocol has no such command); a relative
   path in compiler output is resolved best-effort against the modules' directories.
@@ -147,8 +154,11 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
     offered for that function until a later patch.
 - **Failure injection (WP-28)** is compiled in by default (`CML_FAULT_INJECTION=ON`). Release packaging must configure with
   `-DCML_FAULT_INJECTION=OFF`; a fuzz.yml job proves that configuration builds.
-  - Covered: the reload pipeline's 11 stages.
-  - Not covered: `revert`, `restart`, the crash handler and the compile-on-save watcher.
+  - Covered: the reload pipeline's 11 stages, the hot-restart's 7 and the revert's 3 (WP-43). An armed restart or revert stage
+    applies to the next restart or revert only, whether it fired or not; unused stages are listed as `injection_disarmed`.
+  - Not covered: the crash handler and the compile-on-save watcher (WP-44).
+  - With two control clients at once, an arming made while a restart or revert is ending can be disarmed by it, or carried over to
+    a later one; a reused pid can report a phantom `injection_disarmed` (R-51, fixed by WP-44).
   - Arming is not persistent: a broker restart forgets it.
   - The reservation stage fires only on a module's first patch; arming it later is refused (CML5970).
   - If an injected post-patch-hooks rollback is incomplete (CML4656), the patch image stays mapped with some hooks possibly live;
@@ -190,13 +200,4 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
       with a fake debugger. **A real Visual Studio attach to a `CREATE_SUSPENDED` process is not verified in CI**;
       the extension resumes once the debugger lists the pid or after `HoldResumeGraceMs` (3 s), whichever comes first,
       and falls back to the late attach if the early one fails. The manual checklist in `docs/wp/WP-34.md` is the check.
-    - *WP-34 review follow-ups (not blocking, not fixed):*
-      - a failed early attach can report CML5997 two or three times;
-      - a `restart-resume` that times out (as opposed to a dropped pipe) is logged instead of reported, so the process
-        stays frozen until `hold_ms`;
-      - `restart-resume` racing with hold expiry can still answer `resumed:true` alongside CML5813;
-      - a confirmation timeout is reported as CML5817, which reads as a failed resume;
-      - the extension asks for `hold_new` even when no debugger is attached to the old process;
-      - replacing the process host during a held restart strands the hold in the old coordinator;
-      - the watchdog start logs nothing when `GetModuleFileNameW` fails;
-      - shutdown can wait for a held restart's registration step, which predates WP-34.
+    - *WP-34 review follow-ups* are fixed (WP-43, #71, R-40).
