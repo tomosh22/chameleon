@@ -151,7 +151,7 @@ jobs:
         run: |
           pwsh -NoProfile -File tests/corpus/run_corpus.ps1 -Project ${{ matrix.project }} -Compiler ${{ matrix.compiler }} `
             -ChameleonBin chameleon-bin -WorkDir $env:WORK -CxxPath $env:CXX `
-            -ReloadBudgetMsPerTu ${{ matrix.project == 'godot' && 3000 || 0 }}
+            -ReloadBudgetMsPerTu ${{ startsWith(matrix.project, 'godot') && 3000 || 0 }}
           exit $LASTEXITCODE
 
       - name: Save the Godot build tree
