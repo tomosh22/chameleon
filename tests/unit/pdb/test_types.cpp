@@ -1032,3 +1032,204 @@ TEST_CASE("statics: nesting the reader does not follow, and too many statics, ar
         CHECK((*procs)[0].statics[0].name == "mine");
     }
 }
+
+// ---- WP-46: the closure classes of the TPI (kept for WP-51, R-54) ------------------------------------------------------
+
+TEST_CASE("types: closure_classes lists every lambda class of the TPI once, with its unique name without the unit's hash") {
+    TempDir dir;
+    SUBCASE("forward references and definitions are one class; other classes are left out; the list is kept") {
+        TypeSet types;
+        types.add(kLfClass, lf_udt("o2_step::<lambda_0>", ".?AV<lambda_0>@?0??o2_step@@YAXXZ@", true));
+        types.add(kLfStructure, lf_udt("Vec2", ".?AUVec2@@"));
+        types.add(kLfClass, lf_udt("o2_step::<lambda_0>", ".?AV<lambda_0>@?0??o2_step@@YAXXZ@", false, 1));
+        types.add(kLfClass, lf_udt("`f'::`2'::<lambda_1>", ".?AV<lambda_1>@?1??f@@YAXXZ@`a8f45668", false, 1));  // cl's hash suffix
+        types.add(kLfStructure, lf_udt("<lambda_0b7c44cbca6a0337bec371af34c9af94>", ".?AU<lambda_0b7c44cbca6a0337bec371af34c9af94>@@"));
+        types.add(kLfClass, lf_udt("NoUnique", ""));
+        Spec spec = spec_with({{0x110F, "f", 0x1000}});
+        types.add_to(spec.tpi);
+        const auto idx = open_spec(dir, spec);
+        const auto list = idx->closure_classes();
+        REQUIRE_MESSAGE(list.has_value(), (list.has_value() ? std::string() : list.error().format()));
+        REQUIRE((*list)->size() == 3);
+        CHECK((**list)[0].name == "o2_step::<lambda_0>");
+        CHECK((**list)[0].unique == ".?AV<lambda_0>@?0??o2_step@@YAXXZ@");
+        CHECK((**list)[0].definition == 0x1002);  // the definition, not the forward reference 0x1000
+        CHECK((**list)[1].unique == ".?AV<lambda_1>@?1??f@@YAXXZ@");
+        CHECK((**list)[2].unique == ".?AU<lambda_0b7c44cbca6a0337bec371af34c9af94>@@");
+        const auto again = idx->closure_classes();
+        REQUIRE(again.has_value());
+        CHECK(*again == *list);  // built once
+    }
+    SUBCASE("a stream of many chunks: walked once, its chunks not kept; a lying offset table is an error, not a shorter list") {
+        TypeSet types;
+        for (int i = 0; i < 40; ++i) {
+            types.add(kLfPointer, lf_pointer(kTChar));
+            if (i % 10 == 9) {
+                const std::string n = std::to_string(i);
+                types.add(kLfClass, lf_udt("g" + n + "::<lambda_0>", ".?AV<lambda_0>@?0??g" + n + "@@YAXXZ@", false, 1));
+            }
+        }
+        Spec spec = spec_with({{0x110F, "f", 0x1000}});
+        spec.type_offsets_every = 4;
+        types.add_to(spec.tpi);
+        {
+            const auto idx = open_spec(dir, spec, "chunks.pdb");
+            const auto list = idx->closure_classes();
+            REQUIRE(list.has_value());
+            CHECK((*list)->size() == 4);
+            CHECK((**list)[3].unique == ".?AV<lambda_0>@?0??g39@@YAXXZ@");
+            const TypeStreamStats st = idx->type_stream_stats(true);
+            CHECK(st.chunks > 4);
+            CHECK(st.chunks_loaded == 0);
+            CHECK(st.bytes_loaded == 0);  // (review: the walk read them for itself only)
+            CHECK(st.bytes_copied == 0);
+        }
+        // The table claims a record boundary inside a record: that chunk is bad, so the walk is incomplete.
+        Bytes lying = spec.tpi.index_offsets(4);
+        REQUIRE(lying.size() >= 24);
+        lying[12] = static_cast<std::uint8_t>(lying[12] + 2);  // the second entry's offset, moved into the middle of a record
+        spec.tpi_offsets_override = lying;
+        spec.tpi_offsets_use_override = true;
+        const auto idx = open_spec(dir, spec, "lying.pdb");
+        const auto list = idx->closure_classes();
+        REQUIRE_FALSE(list.has_value());
+        CHECK(list.error().code == dg::kBadTypeRecord);
+    }
+    SUBCASE("no TPI stream: an error (CML1430), never an empty list") {
+        Spec spec = spec_with({{0x110F, "f", 0x1000}});
+        const auto idx = open_spec(dir, spec);
+        const auto list = idx->closure_classes();
+        REQUIRE_FALSE(list.has_value());
+        CHECK(list.error().code == dg::kBadTypeStream);
+    }
+}
+
+// ---- WP-46 review: sizes, class layouts and the types of locals -------------------------------------------------------
+
+TEST_CASE("types: type_size knows simple types, pointers, arrays and classes, a forward reference through its definition") {
+    TempDir dir;
+    TypeSet types;
+    const std::uint32_t fwd = types.add(kLfClass, lf_udt("Rtti", ".?AVRtti@@", true));
+    const std::uint32_t ptr = types.add(kLfPointer, lf_pointer(kTInt));
+    const std::uint32_t arr = types.add(kLfArray, lf_array(kTInt, 16));
+    const std::uint32_t cnst = types.add(kLfModifier, lf_modifier(fwd, 1));
+    types.add(kLfClass, lf_udt("Rtti", ".?AVRtti@@", false, 24));
+    const std::uint32_t lonely = types.add(kLfClass, lf_udt("Lonely", ".?AVLonely@@", true));
+    Spec spec = spec_with({{0x110F, "f", 0x1000}});
+    types.add_to(spec.tpi);
+    const auto idx = open_spec(dir, spec);
+    CHECK(idx->type_size(kTInt) == std::optional<std::uint64_t>(4));
+    CHECK(idx->type_size(kTDouble) == std::optional<std::uint64_t>(8));
+    CHECK(idx->type_size(ptr) == std::optional<std::uint64_t>(8));
+    CHECK(idx->type_size(arr) == std::optional<std::uint64_t>(16));
+    CHECK(idx->type_size(fwd) == std::optional<std::uint64_t>(24));
+    CHECK(idx->type_size(cnst) == std::optional<std::uint64_t>(24));
+    CHECK_FALSE(idx->type_size(lonely).has_value());  // no definition: unknown, never 0
+}
+
+TEST_CASE("types: udt_layout renders a definition's size and data members; a forward reference is unreadable") {
+    TempDir dir;
+    TypeSet types;
+    Bytes fields;
+    put16(fields, 0x150D);  // LF_MEMBER int at 0
+    put16(fields, 3);
+    put32(fields, kTInt);
+    put16(fields, 0);
+    putstr(fields, "a");
+    while (fields.size() % 4 != 0) {
+        fields.push_back(static_cast<std::uint8_t>(0xF0 + (4 - fields.size() % 4)));
+    }
+    put16(fields, 0x150D);  // LF_MEMBER double at 8
+    put16(fields, 3);
+    put32(fields, kTDouble);
+    put16(fields, 8);
+    putstr(fields, "b");
+    while (fields.size() % 4 != 0) {
+        fields.push_back(static_cast<std::uint8_t>(0xF0 + (4 - fields.size() % 4)));
+    }
+    const std::uint32_t list = types.add(0x1203, fields);
+    Bytes def;
+    put16(def, 2);
+    put16(def, 0x200);
+    put32(def, list);
+    put32(def, 0);
+    put32(def, 0);
+    put16(def, 16);
+    putstr(def, "<lambda_0>");
+    putstr(def, ".?AV<lambda_0>@?0??f@@YAXXZ@");
+    const std::uint32_t defined = types.add(kLfClass, def);
+    const std::uint32_t fwd = types.add(kLfClass, lf_udt("<lambda_0>", ".?AV<lambda_0>@?0??f@@YAXXZ@", true));
+    Spec spec = spec_with({{0x110F, "f", 0x1000}});
+    types.add_to(spec.tpi);
+    const auto idx = open_spec(dir, spec);
+    const std::optional<std::string> layout = cml::pdb::udt_layout(idx->types(), defined);
+    REQUIRE(layout.has_value());
+    CHECK(*layout == "size=16;0:t74;8:t41");
+    std::string why;
+    CHECK_FALSE(cml::pdb::udt_layout(idx->types(), fwd, &why).has_value());
+    CHECK(why.find("forward reference") != std::string::npos);
+    CHECK(cml::pdb::class_unique_name_of(idx->types(), fwd) == ".?AV<lambda_0>@?0??f@@YAXXZ@");
+}
+
+TEST_CASE("types: compiland_local_types lists each procedure's own locals, not an inlined call's") {
+    TempDir dir;
+    Spec s;
+    s.sections = {{".text", 0x1000, 0x1000, 0x1000, 0x60000020}};
+    Module m;
+    m.name = "C:\\proj\\obj\\logic.cpp.obj";
+    m.symbols.objname(m.name);
+    const auto local = [&](std::uint32_t type, const std::string& name) {
+        Bytes b;
+        put32(b, type);
+        put16(b, 0);
+        putstr(b, name);
+        m.symbols.add(0x113E, b);
+    };
+    m.symbols.proc(0x1110, "f", 1, 0x100, 0x20, 0, 0);
+    local(0x1234, "lambda");
+    m.symbols.block();
+    local(0x1235, "inner");
+    m.symbols.end();
+    m.symbols.add(0x114D, Bytes(12, 0));  // S_INLINESITE
+    local(0x9999, "inlinee_local");
+    m.symbols.add(0x114E, Bytes());       // S_INLINESITE_END
+    m.symbols.end();
+    m.symbols.proc(0x1110, "g", 1, 0x200, 0x20, 0, 0);
+    Bytes regrel;
+    put32(regrel, 0x20);
+    put32(regrel, 0x1236);
+    put16(regrel, 335);
+    putstr(regrel, "x");
+    m.symbols.add(0x1111, regrel);  // S_REGREL32 (cl at /Od)
+    m.symbols.end();
+    s.modules.push_back(std::move(m));
+    const auto idx = open_spec(dir, s);
+    const auto uses = idx->compiland_local_types(0);
+    REQUIRE_MESSAGE(uses.has_value(), (uses.has_value() ? std::string() : uses.error().format()));
+    REQUIRE(uses->size() == 3);
+    CHECK((*uses)[0].proc_rva == 0x1100);
+    CHECK((*uses)[0].type_index == 0x1234);
+    CHECK((*uses)[1].type_index == 0x1235);
+    CHECK((*uses)[2].proc_rva == 0x1200);
+    CHECK((*uses)[2].type_index == 0x1236);
+}
+
+TEST_CASE("types: type_size keys definitions by the exact unique name; definitions of one name that disagree are unknown") {
+    TempDir dir;
+    TypeSet types;
+    // Two units' `namespace { struct State; }`: the same name, different discriminators, different sizes.
+    types.add(kLfStructure, lf_udt("`anonymous namespace'::State", ".?AUState@?A0x11111111@@", false, 8));
+    types.add(kLfStructure, lf_udt("`anonymous namespace'::State", ".?AUState@?A0x22222222@@", false, 32));
+    const std::uint32_t small = types.add(kLfStructure, lf_udt("`anonymous namespace'::State", ".?AUState@?A0x11111111@@", true));
+    const std::uint32_t large = types.add(kLfStructure, lf_udt("`anonymous namespace'::State", ".?AUState@?A0x22222222@@", true));
+    // One exact name defined twice with different sizes (a PDB that merged two definitions).
+    types.add(kLfStructure, lf_udt("Odd", ".?AUOdd@@", false, 4));
+    types.add(kLfStructure, lf_udt("Odd", ".?AUOdd@@", false, 12));
+    const std::uint32_t odd = types.add(kLfStructure, lf_udt("Odd", ".?AUOdd@@", true));
+    Spec spec = spec_with({{0x110F, "f", 0x1000}});
+    types.add_to(spec.tpi);
+    const auto idx = open_spec(dir, spec);
+    CHECK(idx->type_size(small) == std::optional<std::uint64_t>(8));
+    CHECK(idx->type_size(large) == std::optional<std::uint64_t>(32));  // 4092e8b: 8, the first definition without the discriminator
+    CHECK_FALSE(idx->type_size(odd).has_value());
+}

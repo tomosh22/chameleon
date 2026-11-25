@@ -452,6 +452,80 @@ Result<ProcInfo> PdbIndex::proc_info(const SymbolView& proc) const {
     return info;
 }
 
+// ---- WP-46 (F-41.2 review): the types of every procedure's own locals ------------------------------------------------
+
+Result<std::vector<PdbIndex::LocalTypeUse>> PdbIndex::compiland_local_types(std::uint32_t ci) const {
+    const Impl& impl = *impl_;
+    if (ci >= impl.compilands.size()) {
+        return Diag::make(diag::kCompilandOutOfRange, "compiland_local_types needs a compiland of this index.", "Pass a compiland index below compiland_count().");
+    }
+    const Compiland& c = impl.compilands[ci];
+    if (c.symbol_stream == 0xFFFF || c.symbol_bytes <= 4 || c.symbol_bytes > impl.msf->stream_size(c.symbol_stream)) {
+        return Diag::make(diag::kBadModuleSymbols, "The symbols of module '" + std::string(c.object_name) + "' in '" + impl.path + "' are unreadable.",
+                          "Rebuild the module so the linker regenerates the PDB.");
+    }
+    CountedBuffer scratch;
+    std::size_t got = 0;
+    const std::uint8_t* data = impl.msf->read_range(c.symbol_stream, 0, c.symbol_bytes, scratch, got);
+    if (data == nullptr || got < c.symbol_bytes) {
+        return Diag::make(diag::kBadModuleSymbols, "The symbols of module '" + std::string(c.object_name) + "' in '" + impl.path + "' cannot be read.",
+                          "Rebuild the module so the linker regenerates the PDB.");
+    }
+    constexpr std::uint16_t S_BPREL32 = 0x110B;
+    std::vector<LocalTypeUse> out;
+    std::vector<std::uint16_t> scopes;  // kinds of the open scopes, outermost first
+    std::uint32_t proc_rva = kNoRva;
+    std::size_t inline_depth = 0;  // open inline sites
+    for (std::uint64_t off = 4; off < c.symbol_bytes;) {
+        if (c.symbol_bytes - off < 4) {
+            break;
+        }
+        const std::uint32_t reclen = rd16(data + off);
+        if (reclen < 2 || reclen > c.symbol_bytes - off - 2) {
+            return Diag::make(diag::kBadModuleSymbols, "The symbols of module '" + std::string(c.object_name) + "' in '" + impl.path + "' are corrupt (a record leaves the symbol area).",
+                              "Rebuild the module so the linker regenerates the PDB.");
+        }
+        const std::uint16_t k = rd16(data + off + 2);
+        const std::uint8_t* b = data + off + 4;
+        const std::uint32_t n = reclen - 2;
+        off += 2 + reclen;
+        if (cv::is_scope_opener(k)) {
+            if (scopes.empty() && cv::is_proc(k)) {
+                proc_rva = n >= 34 ? impl.rva_or_none(rd16(b + 32), rd32(b + 28)) : kNoRva;
+            }
+            if (k == cv::S_INLINESITE || k == cv::S_INLINESITE2) {
+                ++inline_depth;
+            }
+            scopes.push_back(k);
+            continue;
+        }
+        if (cv::is_scope_closer(k)) {
+            if (!scopes.empty()) {
+                if (scopes.back() == cv::S_INLINESITE || scopes.back() == cv::S_INLINESITE2) {
+                    --inline_depth;
+                }
+                scopes.pop_back();
+            }
+            if (scopes.empty()) {
+                proc_rva = kNoRva;
+            }
+            continue;
+        }
+        if (scopes.empty() || inline_depth != 0 || proc_rva == kNoRva || !cv::is_proc(scopes.front())) {
+            continue;
+        }
+        if (k == S_LOCAL && n >= 6) {
+            if ((rd16(b + 4) & 1u) != 0) {
+                continue;  // (second review) a parameter (fIsParam): a template that takes the closure, not the function that creates it
+            }
+            out.push_back({proc_rva, rd32(b)});
+        } else if ((k == S_REGREL32 || k == S_BPREL32) && n >= 8) {
+            out.push_back({proc_rva, rd32(b + 4)});
+        }
+    }
+    return out;
+}
+
 // ---- WP-37 (ADR-0042, amended): the function-local statics of a procedure, with their place in it ---------------------
 
 Result<std::vector<ProcStatic>> PdbIndex::proc_statics(const SymbolView& proc, bool* complete) const {

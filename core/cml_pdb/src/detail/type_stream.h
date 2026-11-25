@@ -15,6 +15,7 @@
 // per entry, as in the file) plus the chunks actually read.
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -33,8 +34,13 @@ public:
     static Result<std::unique_ptr<TypeStream>> open(const Msf& msf, std::uint32_t stream, const std::string& pdb_path, const char* what);
 
     bool find(std::uint32_t index, TypeRecord& out) const;
+    // WP-46 (R-54): calls `visit` for every record in index order. Chunks that were not loaded yet are read for the walk only
+    // and not kept. False when a chunk is malformed or the records do not add up to the header's index range (the walk then
+    // saw less than the stream holds). `visit` must not call back into this stream.
+    bool walk(const std::function<void(std::uint32_t index, const TypeRecord& record)>& visit) const;
     TypeStreamStats stats() const;
     std::uint32_t type_begin() const noexcept { return type_begin_; }
+    std::uint32_t type_end() const noexcept { return type_end_; }  // one past the last index the header promises (WP-46)
 
 private:
     TypeStream() = default;
@@ -58,6 +64,7 @@ private:
     std::uint32_t stream_ = 0;
     std::uint32_t header_size_ = 0;
     std::uint32_t type_begin_ = 0;
+    std::uint32_t type_end_ = 0;
     std::uint32_t record_bytes_ = 0;
     Vec<Entry> entries_;  // by first_index; at least one
 

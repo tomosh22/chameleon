@@ -12,6 +12,7 @@
 // CML14xx id and a reason), never a crash or a read outside the record.
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -78,6 +79,33 @@ FunctionSignature function_signature(const TypeSource& types, std::uint32_t inde
 // The canonical text of one type (tools and tests). nullopt with `why` when it cannot be rendered.
 std::optional<std::string> canonical_type(const TypeSource& types, std::uint32_t type_index, std::string* why = nullptr);
 
+// WP-46 (R-54): the name and the unique name of an LF_CLASS / LF_STRUCTURE / LF_INTERFACE / LF_UNION / LF_ENUM record
+// (`unique` empty when the record has none). False for any other record and for a malformed one.
+bool udt_record_names(const TypeRecord& record, std::string_view& name, std::string_view& unique);
+
+// WP-46 (R-54): a closure class (lambda) of a PDB's TPI stream: its name ("o2_step::<lambda_0>") and its unique name
+// without the translation-unit discriminator (".?AV<lambda_0>@?0??o2_step@@YAXXZ@"); `definition` is the index of its
+// definition record (not a forward reference), 0 when the stream has none.
+struct ClosureClass {
+    std::string name;
+    std::string unique;
+    std::uint32_t definition = 0;
+};
+
+// WP-46 (F-41.2 review): the layout of a class or struct definition (not a forward reference) as a canonical text: its size,
+// then for every data member its offset and canonical type ("size=8;0:t74;4:t74"). Methods and nested types are read past,
+// any other field leaf makes it unreadable. nullopt with `why` when it cannot be read.
+std::optional<std::string> udt_layout(const TypeSource& types, std::uint32_t index, std::string* why = nullptr);
+// WP-46: the unique name, without the unit's discriminator, of the class or struct a type index names, through LF_MODIFIER
+// records (const, volatile) but never through a pointer or reference. Empty for anything else.
+std::string class_unique_name_of(const TypeSource& types, std::uint32_t index);
+// WP-46 (review): the size of a class / struct / union DEFINITION record (nullopt for a forward reference or another kind).
+std::optional<std::uint64_t> udt_definition_size(const TypeRecord& record);
+// WP-46 (review): the size in bytes of a type: simple types, pointers, modifiers, enums, arrays, class definitions; a forward
+// reference asks `forward` (by its exact unique name, the unit's discriminator included). nullopt when it cannot be known.
+std::optional<std::uint64_t> type_size_of(const TypeSource& types, std::uint32_t index,
+                                          const std::function<std::optional<std::uint64_t>(const std::string& unique)>& forward);
+
 // ---- objects ---------------------------------------------------------------------------------------------------------
 
 // What LF_TYPESERVER2 says: the compiler PDB that holds the object's types.
@@ -138,6 +166,9 @@ public:
 
     bool find_type(std::uint32_t index, TypeRecord& out) const override;
     bool find_id(std::uint32_t index, TypeRecord& out) const override;
+    // WP-46: calls `visit` for every TPI record in index order (chunks not kept); false when the stream is malformed or its
+    // records do not add up to its index range.
+    bool walk_types(const std::function<void(std::uint32_t index, const TypeRecord& record)>& visit) const;
 
     // GUID and age of the PDB info stream (what LF_TYPESERVER2 records).
     const PdbId& id() const noexcept;
@@ -178,6 +209,8 @@ struct ObjectProc {
     bool global = false;             // S_GPROC32*
     std::string_view name;           // display name, points into the section
     std::vector<ProcStatic> statics; // the data records declared inside it, in the order the compiler emitted them
+    // WP-46: the types of its own local variables (S_LOCAL without fIsParam, S_REGREL32, S_BPREL32; none of an inlined call's)
+    std::vector<std::uint32_t> local_types;
     bool statics_complete = true;    // false: more than kMaxProcStatics, the rest was dropped
 };
 // A procedure with more function-local statics than this is not followed further (untrusted input).

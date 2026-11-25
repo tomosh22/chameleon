@@ -22,6 +22,7 @@ cml_add_unit_test(bind
         test_lambda_code.cpp  # WP-40: lambdas told apart by the code of their call operators (rule (d))
         test_pairing.cpp  # WP-40: pairing defects (R-48): inlined lambdas, guards and their statics, scopes, split aggregates
         test_bitmask_code.cpp  # WP-40: a `$S<n>` bitmask kept only for an unchanged function (ADR-0043 ruling)
+        test_hashed_code.cpp  # WP-46: lambdas cl names by a hash, proven by the code of their functions (CML3630)
     LIBS cml_core)
 target_compile_definitions(cml_test_bind PRIVATE "CML_BIND_GOLDEN_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/golden\"")
 if(NOT MSVC)

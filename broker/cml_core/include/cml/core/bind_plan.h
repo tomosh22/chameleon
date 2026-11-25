@@ -245,6 +245,21 @@ struct BitmaskGuard {
     std::string function;  // decorated name of the function whose statics it guards ("" when it cannot be read)
 };
 
+// WP-46 (F-41.2, ADR-0043 ruling D1): a lambda that cl's legacy lambda processor (C++17 without /permissive-, /Zc:lambda-)
+// names by a hash, `<lambda_<32 hex digits>>`, in no scope. The hash depends on the lambda's own code (CI, fixture
+// legacy_lambdas: editing a lambda renames it; moving it does not). Its functions (call operator, invoker) and statics were
+// paired by that name, or, for the one lambda left unmatched on each side (an edited lambda), by elimination; the pipeline
+// proves the pairing by code (hook_narrowing.h: prove_hashed_lambdas): every name-matched function's new code must be the old
+// code it is hooked to (under the plan, so its statics are the old lambda's); one changed lambda is allowed (ADR-0043 rule
+// (d)), and that is the eliminated one when there is one. Otherwise CML3630. Functions with external linkage (paired by their
+// public decorated name, like any external function) are not listed.
+struct HashedLambda {
+    std::string closure;                  // "<lambda_9c7f...>"
+    std::string old_closure;              // WP-46 round 2: the old closure it was paired with by elimination ("" when by its name)
+    std::vector<std::string> functions;   // the patch's static functions of the closure that are hooked to old ones
+    std::vector<std::string> statics;     // the patch's statics of the closure bound to old ones (guards included)
+};
+
 struct BindPlan {
     std::string object_name;
     std::string module_name;
@@ -274,6 +289,7 @@ struct BindPlan {
     std::size_t imgrel_verified = 0;
     std::vector<LambdaSet> lambda_sets;  // WP-40, see LambdaSet
     std::vector<BitmaskGuard> bitmask_guards;  // WP-40, see BitmaskGuard
+    std::vector<HashedLambda> hashed_lambdas;  // WP-46, see HashedLambda
 
     PlanSummary summary() const;
     // `BINDPLAN <label> hooks=N bind_old_data=N thunks=N new=N fixups=N` (the CI evidence line).
