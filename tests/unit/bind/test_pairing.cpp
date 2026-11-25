@@ -10,6 +10,7 @@
 #include "doctest.h"
 #include "synth.h"
 #include "worlds.h"
+#include "../pdb/type_builder.h"
 
 using namespace cml_bind_test;
 using namespace cml::core;
@@ -608,3 +609,92 @@ TEST_CASE("guards: a `$S1` bitmask (no thread-safe statics) guards the statics o
     }
 }
 
+
+// ---- WP-46 (R-54, ADR-0043): a lambda clang-cl inlined everywhere ----------------------------------------------------
+//
+// clang-cl at -O2 inlines a lambda into every caller and emits no procedure for its call operator; its static `sname` is a
+// record of the caller (`o2_step`, fixture planner_pairing_o2: llvm-pdbutil shows three S_LDATA32 `sname` in o2_step), and
+// nothing in the records names the lambda. When the edit deletes the lambda and declares a static `sname` of the caller
+// itself, pass A paired the new static with that record by its name: the lambda's live object. The TPI keeps the closure
+// class of the lambda (`.?AV<lambda_0>@?0??o2_step@@YAXXZ@`, a forward reference and the definition, even when inlined);
+// cml_pdb's closure_classes() lists them, and an own static of a function whose old image has a closure without a call
+// operator procedure is refused (CML3207).
+namespace {
+const char* const kO2Own = "?sname@?1??o2_step@@YAXXZ@4UO2Name@@A";
+const char* const kO2OwnGuard = "?$TSS0@?1??o2_step@@YAXXZ@4HA";
+
+// The old o2_step with one record `sname` (data 0x20) and the closure class of its lambda in the TPI. `compiler` is the
+// compiland's S_COMPILE3 version; `with_operator`: the lambda's call operator is a procedure of the compiland (not inlined);
+// `closure_function`: the function the closure belongs to.
+SynthWorld o2_world(const std::string& compiler, bool with_operator, const std::string& closure_function = "?o2_step@@YAXXZ") {
+    SynthWorld w = basic_world(false);
+    tp::Module& tu = w.tu();
+    tu.symbols = tp::Records();
+    tu.symbols.objname(tu.name);
+    tu.symbols.compile3(1, 0, 0xD0, compiler);
+    w.proc(w.tu(), "compute_value", 0x10);
+    w.proc(w.tu(), "helper", 0x40, 0x10, true);
+    tp::TypeSet types;
+    const std::string unique = ".?AV<lambda_0>@?0?" + closure_function + "@";
+    const std::uint32_t forward = types.add(tp::kLfClass, tp::lf_udt("o2_step::<lambda_0>", unique, true));
+    types.add(tp::kLfClass, tp::lf_udt("o2_step::<lambda_0>", unique, false, 1));
+    const std::uint32_t this_ptr = types.add(tp::kLfPointer, tp::lf_pointer(forward, tp::kPtr64 | 0x400));
+    const std::uint32_t args = types.add(tp::kLfArgList, tp::lf_arglist({}));
+    const std::uint32_t op_type = types.add(tp::kLfMFunction, tp::lf_mfunction(tp::kTInt, forward, this_ptr, args, 0));
+    types.add_to(w.spec.tpi);
+    w.proc_with_statics(w.tu(), "o2_step", 0x60, {{"sname", 0x20}});
+    if (with_operator) {
+        w.tu().symbols.proc(0x110F, "o2_step::<lambda_0>::operator()", SynthWorld::kTextSec, 0x90, 0x10, 0, op_type);
+        w.tu().symbols.end();
+    }
+    w.pub_func("?o2_step@@YAXXZ", 0x60);
+    w.open();
+    return w;
+}
+Built o2_own_static_object() {
+    SynthObj o;
+    const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+    o.symbol(kO2Own, 0x20, bss, false, false);
+    o.symbol(kO2OwnGuard, 0x28, bss, false, false);
+    return o.build();
+}
+}  // namespace
+
+TEST_CASE("R-54 (WP-46): an own static named like the static of a lambda clang-cl inlined everywhere is refused, never bound to its record") {
+    SUBCASE("clang-cl, the lambda has no call operator procedure: the record in o2_step may be the lambda's (CML3207)") {
+        // main: `o2_step::sname` paired by name with the record at 0x3020, the deleted lambda's live object (compiland-static).
+        SynthWorld w = o2_world("clang version 18.1.3 (https://github.com/llvm/llvm-project)", false);
+        Built b = o2_own_static_object();
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+        REQUIRE(errors.size() == 1);
+        CHECK(errors[0].code == diag::kAmbiguousStatic);
+        CHECK_MESSAGE(contains(errors[0].message, "whose call operator the compiler inlined everywhere"), errors[0].message);
+        CHECK(contains(errors[0].message, "o2_step::<lambda_0>"));
+        CHECK(decision(partial, kO2Own).decision != DecisionKind::BindOldData);
+        CHECK(decision(partial, kO2OwnGuard).decision != DecisionKind::BindOldData);
+    }
+    SUBCASE("clang-cl, the lambda's call operator is a procedure of the compiland: its statics would be recorded there; pairs by name") {
+        SynthWorld w = o2_world("clang version 18.1.3 (https://github.com/llvm/llvm-project)", true);
+        Built b = o2_own_static_object();
+        auto r = plan_bind(w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        CHECK(decision(*r, kO2Own).source == BindSource::CompilandStatic);
+        CHECK(decision(*r, kO2Own).old_address.rva == 0x3020);
+    }
+    SUBCASE("clang-cl, the closure belongs to another function: pairs by name") {
+        SynthWorld w = o2_world("clang version 18.1.3 (https://github.com/llvm/llvm-project)", false, "?o2_other@@YAXXZ");
+        Built b = o2_own_static_object();
+        auto r = plan_bind(w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        CHECK(decision(*r, kO2Own).old_address.rva == 0x3020);
+    }
+    SUBCASE("cl (which emits the call operators it inlines, WP-40): not looked at; pairs by name") {
+        SynthWorld w = o2_world("Microsoft (R) Optimizing Compiler", false);
+        Built b = o2_own_static_object();
+        auto r = plan_bind(w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        CHECK(decision(*r, kO2Own).old_address.rva == 0x3020);
+    }
+}

@@ -151,6 +151,11 @@ public:
     FunctionSignature proc_signature(const SymbolView& proc) const;
     // What has been read of the TPI (`tpi` true) or IPI stream so far. `opened` is false before the first lookup.
     TypeStreamStats type_stream_stats(bool tpi) const;
+    // WP-46 (R-54): every closure class (a class or struct whose unique name starts with ".?AV<lambda_" / ".?AU<lambda_")
+    // of the TPI stream, once each (forward references and definitions are one class), in index order. A lambda that the
+    // compiler inlined into every caller has no procedure, but its class stays in the TPI. The first call walks the whole
+    // TPI stream (nothing else does); the result is kept for the life of the index. CML1430 when the stream cannot be read.
+    Result<const std::vector<ClosureClass>*> closure_classes() const;
 
     // ---- Loading control -----------------------------------------------------------------
     Result<void> load_publics() const;

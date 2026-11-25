@@ -51,4 +51,7 @@ inline constexpr std::uint32_t kSplitAggregate = 3601; // a piece `name.N` of a 
 inline constexpr std::uint32_t kLambdasMatchedByNumber = 3602;  // lambdas no type or code tells apart were paired by their numbers (warning)
 inline constexpr std::uint32_t kLambdasUnpairable = 3603;  // a changed lambda whose number's old lambda another new lambda is (error)
 
+// WP-46 (ADR-0043: CML3630..CML3649, planner).
+inline constexpr std::uint32_t kHashedLambdasUnproven = 3630;  // lambdas named by a hash (cl's legacy lambda processor) paired by that name without proof by code (error)
+
 }  // namespace cml::core::bind::diag

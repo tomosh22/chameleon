@@ -186,4 +186,12 @@ LambdaPairing pair_lambdas_by_code(const NarrowInput& input);
 // `WP40-BITMASK guard=... function=... proven=unchanged|refused`.
 std::vector<Diag> prove_bitmask_guards(const NarrowInput& input);
 
+// WP-46 (F-41.2, ADR-0043 ruling D1). For every BindPlan::hashed_lambdas entry (a lambda cl names by a hash, whose functions
+// and statics the planner paired by that name): each of its hooked functions is compared with the old function it is hooked
+// to, by the rules above and with the plan's decisions (its statics at the old lambda's addresses). The pairing is proven when
+// every lambda's code is unchanged except at most one lambda's (rule (d): the one changed lambda is the edited one). Otherwise,
+// or when a function cannot be compared, the result holds one CML3630 naming the lambdas. Logs
+// `WP46-HASHED-LAMBDAS object=... closures=N unchanged=N changed=N unknown=N proven=unchanged|one-changed|refused`.
+std::vector<Diag> prove_hashed_lambdas(const NarrowInput& input);
+
 }  // namespace cml::core

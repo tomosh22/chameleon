@@ -1032,3 +1032,71 @@ TEST_CASE("statics: nesting the reader does not follow, and too many statics, ar
         CHECK((*procs)[0].statics[0].name == "mine");
     }
 }
+
+// ---- WP-46 (R-54): the closure classes of the TPI ---------------------------------------------------------------------
+
+TEST_CASE("types: closure_classes lists every lambda class of the TPI once, with its unique name without the unit's hash") {
+    TempDir dir;
+    SUBCASE("forward references and definitions are one class; other classes are left out; the list is kept") {
+        TypeSet types;
+        types.add(kLfClass, lf_udt("o2_step::<lambda_0>", ".?AV<lambda_0>@?0??o2_step@@YAXXZ@", true));
+        types.add(kLfStructure, lf_udt("Vec2", ".?AUVec2@@"));
+        types.add(kLfClass, lf_udt("o2_step::<lambda_0>", ".?AV<lambda_0>@?0??o2_step@@YAXXZ@", false, 1));
+        types.add(kLfClass, lf_udt("`f'::`2'::<lambda_1>", ".?AV<lambda_1>@?1??f@@YAXXZ@`a8f45668", false, 1));  // cl's hash suffix
+        types.add(kLfStructure, lf_udt("<lambda_0b7c44cbca6a0337bec371af34c9af94>", ".?AU<lambda_0b7c44cbca6a0337bec371af34c9af94>@@"));
+        types.add(kLfClass, lf_udt("NoUnique", ""));
+        Spec spec = spec_with({{0x110F, "f", 0x1000}});
+        types.add_to(spec.tpi);
+        const auto idx = open_spec(dir, spec);
+        const auto list = idx->closure_classes();
+        REQUIRE_MESSAGE(list.has_value(), (list.has_value() ? std::string() : list.error().format()));
+        REQUIRE((*list)->size() == 3);
+        CHECK((**list)[0].name == "o2_step::<lambda_0>");
+        CHECK((**list)[0].unique == ".?AV<lambda_0>@?0??o2_step@@YAXXZ@");
+        CHECK((**list)[1].unique == ".?AV<lambda_1>@?1??f@@YAXXZ@");
+        CHECK((**list)[2].unique == ".?AU<lambda_0b7c44cbca6a0337bec371af34c9af94>@@");
+        const auto again = idx->closure_classes();
+        REQUIRE(again.has_value());
+        CHECK(*again == *list);  // built once
+    }
+    SUBCASE("a stream of many chunks: walked once, its chunks not kept; a lying offset table is an error, not a shorter list") {
+        TypeSet types;
+        for (int i = 0; i < 40; ++i) {
+            types.add(kLfPointer, lf_pointer(kTChar));
+            if (i % 10 == 9) {
+                const std::string n = std::to_string(i);
+                types.add(kLfClass, lf_udt("g" + n + "::<lambda_0>", ".?AV<lambda_0>@?0??g" + n + "@@YAXXZ@", false, 1));
+            }
+        }
+        Spec spec = spec_with({{0x110F, "f", 0x1000}});
+        spec.type_offsets_every = 4;
+        types.add_to(spec.tpi);
+        {
+            const auto idx = open_spec(dir, spec, "chunks.pdb");
+            const auto list = idx->closure_classes();
+            REQUIRE(list.has_value());
+            CHECK((*list)->size() == 4);
+            CHECK((**list)[3].unique == ".?AV<lambda_0>@?0??g39@@YAXXZ@");
+            const TypeStreamStats st = idx->type_stream_stats(true);
+            CHECK(st.chunks > 4);
+            CHECK(st.chunks_loaded == 0);
+        }
+        // The table claims a record boundary inside a record: that chunk is bad, so the walk is incomplete.
+        Bytes lying = spec.tpi.index_offsets(4);
+        REQUIRE(lying.size() >= 24);
+        lying[12] = static_cast<std::uint8_t>(lying[12] + 2);  // the second entry's offset, moved into the middle of a record
+        spec.tpi_offsets_override = lying;
+        spec.tpi_offsets_use_override = true;
+        const auto idx = open_spec(dir, spec, "lying.pdb");
+        const auto list = idx->closure_classes();
+        REQUIRE_FALSE(list.has_value());
+        CHECK(list.error().code == dg::kBadTypeRecord);
+    }
+    SUBCASE("no TPI stream: an error (CML1430), never an empty list") {
+        Spec spec = spec_with({{0x110F, "f", 0x1000}});
+        const auto idx = open_spec(dir, spec);
+        const auto list = idx->closure_classes();
+        REQUIRE_FALSE(list.has_value());
+        CHECK(list.error().code == dg::kBadTypeStream);
+    }
+}

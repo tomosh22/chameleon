@@ -1,0 +1,9 @@
+--- a/lambdas.cpp
++++ b/lambdas.cpp
+@@ -54,5 +54,5 @@
+ 
+ int ll_mark()
+ {
+-    return 1;
++    return 2;
+ }

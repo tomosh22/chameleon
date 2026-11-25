@@ -2156,8 +2156,17 @@ TEST_CASE("by place (R-48 item 7, F-41.1 under cl): each overload's guarded stat
     }
 }
 
-TEST_CASE("by place, F-41.1 under clang-cl: the guards have no record, the overloads' statics stay refused (CML3207)") {
-    SynthWorld w;
+// ---- WP-46 (F-41.1 under clang-cl, ADR-0043): the guards without a record ---------------------------------------------
+//
+// clang-cl records no thread-safe guard (`$TSS0`) at all. The by-place step refused every overload's `rtti` because its guard
+// had no record (F-41.1's message under clang-cl). Now, in a compiland that records no `$TSS` guard, a static that is the only
+// one of its name in its function pairs by that function, and its guard is left to settle_guards, which places it from the
+// layout those statics teach (only settle_guards reads it) or refuses with CML3600. The shape is clang 18's (llvm-objdump of
+// tests/corpus/repro/f41_1_f41_2_rtti_overloads.cpp, -O2): `rtti` and its guard next to each other in one `.bss`, not a COMDAT.
+namespace {
+// The clang-cl old image: three overloads, `rtti` at data 0x10 / 0x20 / 0x30, no guard record. `cl_guard_record`: another
+// function of the compiland has a `$TSS0` record (the compiler records guards: cl).
+void clang_rtti_world(SynthWorld& w, bool cl_guard_record = false) {
     tp::Records& s = w.tu().symbols;
     for (int n = 0; n < 3; ++n) {
         s.proc(0x1110, "GetRTTIOfType", SynthWorld::kTextSec, 0x40 + 0x20 * static_cast<std::uint32_t>(n), 0x20);
@@ -2165,25 +2174,115 @@ TEST_CASE("by place, F-41.1 under clang-cl: the guards have no record, the overl
         s.end();
         w.pub_func(kRttiFn[n], 0x40 + 0x20 * static_cast<std::uint32_t>(n));
     }
+    if (cl_guard_record) {
+        s.proc(0x1110, "other", SynthWorld::kTextSec, 0xA0, 0x10);
+        s.data(0x110C, "cache", SynthWorld::kDataSec, 0x50, tp::kTInt);
+        s.data(0x110C, "$TSS0", SynthWorld::kDataSec, 0x58, tp::kTInt);
+        s.end();
+        w.pub_func("?other@@YAHXZ", 0xA0);
+    }
     w.open();
+}
+// The patch: the overloads in another order (2, 0, 1) in .debug$S; `rtti` n at .bss 0x10 + 0x10 n + shift[n], its guard 8
+// bytes after it. `comdat`: every static and guard in a COMDAT section of its own instead (nothing teaches a layout).
+Built clang_rtti_object(const std::array<std::uint32_t, 3>& shift, bool comdat = false) {
     StaticsObj o;
+    const std::uint32_t bss = comdat ? 0 : o.obj.section(".bss", kData, 0x80);
+    std::array<std::uint32_t, 3> rtti{};
     for (int n = 0; n < 3; ++n) {
+        const std::uint32_t at = 0x10 + 0x10 * static_cast<std::uint32_t>(n) + shift[static_cast<std::size_t>(n)];
+        if (comdat) {
+            rtti[static_cast<std::size_t>(n)] = o.symbol(rtti_of(n));
+            o.symbol(rtti_guard_of(n));
+        } else {
+            rtti[static_cast<std::size_t>(n)] = o.obj.symbol(rtti_of(n), at, static_cast<std::int32_t>(bss), false, false);
+            o.obj.symbol(rtti_guard_of(n), at + 8, static_cast<std::int32_t>(bss), false, false);
+        }
+    }
+    for (const int n : {2, 0, 1}) {
         o.proc(kRttiFn[n], "GetRTTIOfType");
-        o.local(rtti_of(n), "rtti");
+        o.record(rtti[static_cast<std::size_t>(n)], "rtti");
         o.end();
-        o.symbol(rtti_guard_of(n));  // clang-cl: the guard has a symbol, no record
     }
-    Built b = o.build(some_debug_t());
-    std::vector<cml::Diag> errors;
-    BindPlan partial;
-    REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
-    REQUIRE_FALSE(errors.empty());
-    for (const cml::Diag& e : errors) {
-        CHECK(e.code == diag::kAmbiguousStatic);
+    return o.build(some_debug_t());
+}
+}  // namespace
+
+TEST_CASE("by place, F-41.1 under clang-cl (WP-46): each overload's `rtti` binds to its own overload's record, its guard to the old guard next to it") {
+    SUBCASE("one .bss: paired by their functions, the guards placed from the layout the statics teach") {
+        // main: CML3207 for every `rtti` ("the guard variable ... of static 1 of 1 has no record in the old image").
+        SynthWorld w;
+        clang_rtti_world(w);
+        Built b = clang_rtti_object({0, 0, 0});
+        auto r = plan_bind(w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        for (int n = 0; n < 3; ++n) {
+            CAPTURE(n);
+            const std::uint32_t at = 0x3010 + 0x10 * static_cast<std::uint32_t>(n);
+            const SymbolDecision st = decision(*r, rtti_of(n));
+            CHECK(st.decision == DecisionKind::BindOldData);
+            CHECK(st.source == BindSource::CompilandProcedure);
+            CHECK(st.old_address.rva == at);
+            const SymbolDecision g = decision(*r, rtti_guard_of(n));
+            CHECK(g.decision == DecisionKind::BindOldData);
+            CHECK(g.source == BindSource::CompilandLayout);
+            CHECK(g.old_address.rva == at + 8);
+        }
+        for (const cml::Diag& warning : r->warnings) {
+            CHECK(warning.code != diag::kStaticsMatchedByOrder);
+            CHECK(warning.code != diag::kGuardUnmatched);
+        }
     }
-    CHECK(contains(errors[0].message, "has no record in the old image"));
-    for (int n = 0; n < 3; ++n) {
-        CHECK(decision(partial, rtti_guard_of(n)).decision != DecisionKind::BindOldData);
+    SUBCASE("every static a COMDAT of its own: no layout, the guards are refused (CML3600), never fresh, never bound") {
+        SynthWorld w;
+        clang_rtti_world(w);
+        Built b = clang_rtti_object({0, 0, 0}, true);
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+        REQUIRE(errors.size() == 3);
+        for (const cml::Diag& e : errors) {
+            CHECK(e.code == diag::kGuardMismatch);
+            CHECK_MESSAGE(contains(e.message, "no layout of its object section is known"), e.message);
+        }
+        for (int n = 0; n < 3; ++n) {
+            CHECK(decision(partial, rtti_guard_of(n)).decision != DecisionKind::BindOldData);
+        }
+        for (const cml::Diag& warning : partial.warnings) {
+            CHECK(warning.code != diag::kGuardUnmatched);
+        }
+    }
+    SUBCASE("the statics disagree on the layout (one moved in the section): no layout, CML3600, no guard bound") {
+        SynthWorld w;
+        clang_rtti_world(w);
+        Built b = clang_rtti_object({0, 0, 0x40});
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+        REQUIRE(errors.size() == 3);
+        for (const cml::Diag& e : errors) {
+            CHECK(e.code == diag::kGuardMismatch);
+        }
+        for (int n = 0; n < 3; ++n) {
+            CHECK(decision(partial, rtti_guard_of(n)).decision != DecisionKind::BindOldData);
+        }
+    }
+    SUBCASE("a compiland that records `$TSS` guards (cl): a guard without a record still refuses its static (CML3207), as before") {
+        SynthWorld w;
+        clang_rtti_world(w, true);
+        Built b = clang_rtti_object({0, 0, 0});
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+        REQUIRE_FALSE(errors.empty());
+        for (const cml::Diag& e : errors) {
+            CHECK(e.code == diag::kAmbiguousStatic);
+        }
+        CHECK(contains(errors[0].message, "has no record in the old image"));
+        for (int n = 0; n < 3; ++n) {
+            CHECK(decision(partial, rtti_of(n)).decision != DecisionKind::BindOldData);
+            CHECK(decision(partial, rtti_guard_of(n)).decision != DecisionKind::BindOldData);
+        }
     }
 }
 
@@ -2438,4 +2537,210 @@ TEST_CASE("cl /O2: a new `f::n` and the lambda's `n` recorded twice at one addre
     }
     CHECK(at_0x3020 <= 1);
     CHECK_FALSE(errors.empty());
+}
+
+// ---- WP-46 (F-41.3, ADR-0043): the destructor of a function-local class under clang-cl -------------------------------
+//
+// tests/corpus/repro/f41_3_local_class_destructor.cpp, built with clang 18 (-O2, llvm-pdbutil): the old compiland has two
+// S_LPROC32 `System::Process::LocalCollector::~LocalCollector` with the same type, the destructor `??1` and its scalar
+// deleting destructor `??_G` (the lld map gives their addresses); only the second has the implicit parameter
+// `should_call_delete`. The patch's `??1` matched both (CML3214, "1 new and 2 old functions have the same signature").
+namespace {
+const char* const kLocalDtor = "??1LocalCollector@?1??Process@System@@QEAAXH@Z@UEAA@XZ";
+const char* const kLocalDtorDisplay = "System::Process::LocalCollector::~LocalCollector";
+
+void s_local(tp::Records& s, const std::string& name, std::uint32_t type) {
+    tp::Bytes b;
+    tp::put32(b, type);
+    tp::put16(b, 1);  // CV_LVARFLAGS: fIsParam
+    tp::putstr(b, name);
+    s.add(0x113E, b);  // S_LOCAL
+}
+// The old destructor at text 0x60 and its deleting destructor at `deleting_at`, both under the destructor's name and type.
+// `record_flag`: the deleting destructor's `should_call_delete` is recorded.
+void old_destructors(SynthWorld& w, std::uint32_t deleting_at, bool record_flag = true) {
+    Types old_types;
+    const std::uint32_t type = old_types.fn(tp::kTVoid, {});
+    tp::Records& s = w.tu().symbols;
+    const auto destructor = [&](std::uint32_t at, bool deleting) {
+        s.proc(0x110F, kLocalDtorDisplay, SynthWorld::kTextSec, at, 0x10, 0, type);
+        s_local(s, "this", 0x0603);
+        if (deleting && record_flag) {
+            s_local(s, "should_call_delete", tp::kTInt);
+        }
+        s.end();
+    };
+    if (deleting_at < 0x60) {
+        destructor(deleting_at, true);
+        destructor(0x60, false);
+    } else {
+        destructor(0x60, false);
+        destructor(deleting_at, true);
+    }
+    old_types.set.add_to(w.spec.tpi);
+    w.open();
+}
+Built local_destructor_object() {
+    Types t;
+    const std::uint32_t id = t.func_id(t.fn(tp::kTVoid, {}), "~LocalCollector");
+    TypedObj o;
+    o.function(kLocalDtor, id);
+    o.obj.function("??_GLocalCollector@?1??Process@System@@QEAAXH@Z@UEAAPEAXI@Z", false);  // the patch's deleting destructor
+    return o.build(t.set.debug_t());
+}
+}  // namespace
+
+TEST_CASE("destructor of a local class (F-41.3, WP-46): the deleting destructor's record is not a candidate, the destructor is hooked to its own") {
+    for (const std::uint32_t deleting_at : {0x40u, 0x80u}) {
+        CAPTURE(deleting_at);
+        // main: CML3214 "1 new and 2 old functions have the same signature", in either order.
+        SynthWorld w;
+        old_destructors(w, deleting_at);
+        Built b = local_destructor_object();
+        auto r = plan_bind(w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        const SymbolDecision d = decision(*r, kLocalDtor);
+        CHECK(d.decision == DecisionKind::PatchHooked);
+        CHECK(d.source == BindSource::CompilandSignature);
+        CHECK(d.old_address.rva == 0x1060);
+        for (const HookEntry& h : r->hooks) {
+            CHECK(h.old_va != SynthWorld::kBase + 0x1000 + deleting_at);  // nothing is hooked onto the old deleting destructor
+        }
+    }
+}
+
+TEST_CASE("destructor of a local class (F-41.3, WP-46): without the recorded parameter the two records stay ambiguous (CML3214)") {
+    SynthWorld w;
+    old_destructors(w, 0x80, false);
+    Built b = local_destructor_object();
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+    REQUIRE(errors.size() == 1);
+    CHECK(errors[0].code == diag::kAmbiguousOverloads);
+    CHECK(contains(errors[0].message, "1 new and 2 old functions have the same signature"));
+    CHECK(partial.hooks.empty());
+}
+
+// ---- WP-46 (F-41.2, ADR-0043 ruling D1): lambdas cl names by a hash ------------------------------------------------
+//
+// cl's legacy lambda processor (Jolt: C++17 without /permissive-) names every closure `<lambda_<32 hex>>`, in no scope
+// (`??R<lambda_0b7c...>@@QEBA@XZ`): the closures of the whole translation unit are one set. The corpus (cl, unity batch 12)
+// had 39 static call operators in the patch and 90 records named `operator()` in the old compiland: the other 51 had external
+// linkage (lambdas of inline functions whose COMDAT the linker took from this unit) and were paired by their public name, but
+// were counted in the set, so the sets never agreed (CML3214).
+namespace {
+const std::string kHash1 = "<lambda_0b7c44cbca6a0337bec371af34c9af94>";
+const std::string kHash2 = "<lambda_056dc9763d275277fba2e4fa806073e2>";
+const std::string kHash3 = "<lambda_24d82191404f736f33e380197c42a713>";
+std::string hashed_op(const std::string& closure) { return "??R" + closure + "@@QEBAHXZ"; }
+std::string hashed_unique(const std::string& closure) { return ".?AV" + closure + "@@"; }
+
+// The old compiland: static call operators of kHash1 (text 0x60) and kHash3 (0x80), and the call operator of kHash2 (0x70),
+// which has external linkage (a public at its address).
+void hashed_world(SynthWorld& w) {
+    Types old_types;
+    old_proc(w, kHash1 + "::operator()", 0x60, old_types.call_operator(kHash1, hashed_unique(kHash1)));
+    old_proc(w, kHash2 + "::operator()", 0x70, old_types.call_operator(kHash2, hashed_unique(kHash2)));
+    old_proc(w, kHash3 + "::operator()", 0x80, old_types.call_operator(kHash3, hashed_unique(kHash3)));
+    w.pub_func(hashed_op(kHash2), 0x70);
+    old_types.set.add_to(w.spec.tpi);
+    w.open();
+}
+}  // namespace
+
+TEST_CASE("hash-named lambdas (F-41.2, WP-46): an old call operator an external definition of the patch replaces is not in the set") {
+    SUBCASE("the patch defines kHash2 with external linkage: the static ones pair by their names, and are listed for the proof by code") {
+        // main: CML3214 for both static call operators ("the lambdas of the enclosing function are not the same as in the old
+        // image (3 call operator(s) there, 2 in the patch)").
+        SynthWorld w;
+        hashed_world(w);
+        Types t;
+        TypedObj o;
+        o.function(hashed_op(kHash3), t.call_operator(kHash3, hashed_unique(kHash3)), false);
+        o.function(hashed_op(kHash1), t.call_operator(kHash1, hashed_unique(kHash1)), false);
+        o.obj.function(hashed_op(kHash2), true);
+        Built b = o.build(t.set.debug_t());
+        auto r = plan_bind(w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        const SymbolDecision d1 = decision(*r, hashed_op(kHash1));
+        CHECK(d1.decision == DecisionKind::PatchHooked);
+        CHECK(d1.source == BindSource::CompilandSignature);
+        CHECK(d1.old_address.rva == 0x1060);
+        const SymbolDecision d3 = decision(*r, hashed_op(kHash3));
+        CHECK(d3.decision == DecisionKind::PatchHooked);
+        CHECK(d3.old_address.rva == 0x1080);
+        const SymbolDecision d2 = decision(*r, hashed_op(kHash2));
+        CHECK(d2.decision == DecisionKind::PatchHooked);
+        CHECK(d2.source == BindSource::PdbPublic);
+        CHECK(d2.old_address.rva == 0x1070);
+        // Only the pairings made by the hash name are left to the proof (the external one pairs by its public name).
+        REQUIRE(r->hashed_lambdas.size() == 2);
+        for (const HashedLambda& h : r->hashed_lambdas) {
+            CHECK((h.closure == kHash1 || h.closure == kHash3));
+            REQUIRE(h.functions.size() == 1);
+            CHECK(h.functions[0] == hashed_op(h.closure));
+        }
+    }
+    SUBCASE("the patch has no kHash2 any more: the set changed, nothing is paired by the hash names (CML3214)") {
+        SynthWorld w;
+        hashed_world(w);
+        Types t;
+        TypedObj o;
+        o.function(hashed_op(kHash1), t.call_operator(kHash1, hashed_unique(kHash1)), false);
+        o.function(hashed_op(kHash3), t.call_operator(kHash3, hashed_unique(kHash3)), false);
+        Built b = o.build(t.set.debug_t());
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+        REQUIRE(errors.size() == 2);
+        for (const cml::Diag& e : errors) {
+            CHECK(e.code == diag::kAmbiguousOverloads);
+            CHECK(contains(e.message, "the lambdas of the enclosing function are not the same as in the old image (3 call operator(s) there, 2 in the patch)"));
+        }
+        CHECK(partial.hooks.empty());
+    }
+    SUBCASE("a lambda added: the set changed (CML3214), also where every old name is still there") {
+        SynthWorld w;
+        hashed_world(w);
+        const std::string added = "<lambda_ffffffffffffffffffffffffffffffff>";
+        Types t;
+        TypedObj o;
+        o.function(hashed_op(kHash1), t.call_operator(kHash1, hashed_unique(kHash1)), false);
+        o.function(hashed_op(kHash3), t.call_operator(kHash3, hashed_unique(kHash3)), false);
+        o.function(hashed_op(added), t.call_operator(added, hashed_unique(added)), false);
+        o.obj.function(hashed_op(kHash2), true);
+        Built b = o.build(t.set.debug_t());
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+        CHECK(errors.size() == 3);
+        for (const cml::Diag& e : errors) {
+            CHECK(e.code == diag::kAmbiguousOverloads);
+        }
+        CHECK(decision(partial, hashed_op(kHash1)).decision != DecisionKind::PatchHooked);
+    }
+}
+
+TEST_CASE("hash-named lambdas (F-41.2, WP-46): a static paired by the hash name with no hooked function of its lambda is refused (CML3630)") {
+    // The patch's lambda has no call operator of its own (the compiler inlined it), so the static pairs with the old static of
+    // the same closure by the hash name alone, and no function of the lambda is hooked to an old one whose code could prove
+    // that it is the same lambda. main: bound to the old static without any proof.
+    SynthWorld w;
+    Types old_types;
+    old_proc(w, kHash1 + "::operator()", 0x60, old_types.call_operator(kHash1, hashed_unique(kHash1)), {{"sname", 0x20}});
+    old_types.set.add_to(w.spec.tpi);
+    w.open();
+    StaticsObj o;
+    const std::string sname = "?sname@?1???R" + kHash1 + "@@QEBAHXZ@4HA";
+    o.symbol(sname);
+    Built b = o.build(some_debug_t());
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    REQUIRE_FALSE(plan_bind(w.input(b), &errors, &partial).has_value());
+    REQUIRE(errors.size() == 1);
+    CHECK(errors[0].code == diag::kHashedLambdasUnproven);
+    CHECK(contains(errors[0].message, "belongs to lambda '" + kHash1 + "', which the compiler names by a hash"));
+    CHECK(decision(partial, sname).decision != DecisionKind::BindOldData);
+    CHECK(partial.hashed_lambdas.empty());
 }

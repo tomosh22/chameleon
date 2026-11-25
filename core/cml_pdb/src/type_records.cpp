@@ -437,6 +437,16 @@ std::optional<std::string> canonical_type(const TypeSource& types, std::uint32_t
     return out;
 }
 
+bool udt_record_names(const TypeRecord& record, std::string_view& name, std::string_view& unique) {
+    UdtNames names;
+    if (record.body == nullptr || !udt_names(record, names)) {
+        return false;
+    }
+    name = names.name;
+    unique = names.unique;
+    return true;
+}
+
 // ---- objects ---------------------------------------------------------------------------------------------------------
 
 Result<DebugTInfo> inspect_debug_t(std::span<const std::uint8_t> section) {

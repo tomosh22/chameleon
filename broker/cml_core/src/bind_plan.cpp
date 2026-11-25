@@ -321,6 +321,60 @@ std::string bitmask_function(std::string_view guard) {
     return std::string(scope.substr(block + 1));
 }
 
+// WP-46 (F-41.2): the closure a decorated name belongs to when cl's legacy lambda processor named it by a hash
+// ("??R<lambda_9c7f...>@@QEBA@XZ" -> "<lambda_9c7f...>": `<lambda_` and 32 lower-case hex digits). Empty otherwise (no
+// closure, or a closure numbered by the compiler, "<lambda_1>").
+std::string hashed_closure(std::string_view decorated) {
+    for (std::size_t at = decorated.find("<lambda_"); at != std::string_view::npos; at = decorated.find("<lambda_", at + 1)) {
+        const std::size_t digits = at + 8;
+        if (decorated.size() < digits + 33 || decorated[digits + 32] != '>') {
+            continue;
+        }
+        bool hex32 = true;
+        for (std::size_t k = digits; hex32 && k < digits + 32; ++k) {
+            const char c = decorated[k];
+            hex32 = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        }
+        if (hex32) {
+            return std::string(decorated.substr(at, 41));
+        }
+    }
+    return {};
+}
+
+// WP-46 (R-54): the decorated name of the function a function-local static is declared in ("?x@?1??o2_step@@YAXXZ@4HA" ->
+// "?o2_step@@YAXXZ", also from a nested block "?x@?2??o2_step@@YAXXZ@4HA"). Empty when the name has no such scope.
+std::string function_of_static(std::string_view decorated) {
+    const std::size_t at = decorated.find('@');
+    if (decorated.empty() || decorated[0] != '?' || at == std::string_view::npos) {
+        return {};
+    }
+    const std::string_view scope = decorated.substr(at + 1);
+    const std::size_t block = block_prefix_length(scope);
+    if (block == 0 || block >= scope.size() || scope[block] != '?') {
+        return {};
+    }
+    const std::string_view rest = scope.substr(block + 1);  // "?o2_step@@YAXXZ@4HA"
+    const std::size_t storage = rest.rfind("@4");     // a function-local static's storage class follows its scope
+    return storage == std::string_view::npos || storage < 2 ? std::string() : std::string(rest.substr(0, storage));
+}
+
+// WP-46 (R-54): does the closure class with this unique name (".?AV<lambda_0>@?0??o2_step@@YAXXZ@", without the unit's
+// discriminator) belong to `function` ("?o2_step@@YAXXZ"), directly or through another lambda of it? Wherever the function
+// is a scope of the closure, its name follows a block prefix ("?0?") and is followed by '@'.
+bool closure_in_function(std::string_view unique, const std::string& function) {
+    if (function.empty()) {
+        return false;
+    }
+    const std::string needle = function + "@";
+    for (std::size_t at = unique.find(needle); at != std::string_view::npos; at = unique.find(needle, at + 1)) {
+        if (at > 0 && unique[at - 1] == '?') {
+            return true;
+        }
+    }
+    return false;
+}
+
 class Planner {
 public:
     Planner(const PlanInput& in, BindPlan* partial) : in_(in), obj_(*in.object), pdb_(*in.module_pdb), partial_(partial) {}
@@ -439,6 +493,30 @@ private:
     void pair_statics_by_procedure(const std::string& base, bool is_tls, const std::vector<std::uint32_t>& members, const std::vector<const pdb::SymbolView*>& cands,
                                    std::vector<std::uint32_t>& unmatched, std::vector<const pdb::SymbolView*>& free_cands, std::map<std::uint32_t, Match>& matched,
                                    std::map<std::uint32_t, std::string>& why, const std::set<std::uint32_t>& no_layout);
+
+    // WP-46 (F-41.2): is the old function at `v` the one an external definition of the patch replaces (a public symbol at its
+    // address whose decorated name the patch defines with external linkage)? Such a function pairs by that name.
+    std::set<std::string, std::less<>> external_defined_;
+    bool external_defined_built_ = false;
+    bool taken_by_public(const pdb::SymbolView& v);
+    // WP-46 (F-41.3): is the old procedure a deleting destructor (`??_G` / `??_E`)? clang-cl records it under the
+    // destructor's name and type; only its implicit parameter `should_call_delete` tells it apart.
+    bool is_deleting_destructor(const pdb::SymbolView& v);
+    // WP-46 (F-41.1): does the old compiland record any thread-safe guard (`$TSS<n>`)? clang-cl records none.
+    int records_tss_guards_ = -1;
+    bool compiland_records_tss_guards();
+    // WP-46 (F-41.1): statics paired by their function alone (one of the name in it) whose guard has no record; with their
+    // old RVAs they teach the layout from which settle_guards places those guards (and nothing else).
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> place_taught_;  // (position in syms_, old rva)
+    std::map<std::uint32_t, std::int64_t> guard_delta_;            // delta_ plus what place_taught_ adds; used by settle_guards
+    std::map<std::uint32_t, std::uint16_t> guard_delta_image_section_;
+    void learn_guard_layout();
+    // WP-46 (R-54): why an own static of a function may be an inlined lambda's record ("" when it cannot be).
+    std::set<std::string> closures_with_proc_;  // unique names (without the unit's discriminator) of closures with an operator() procedure
+    bool closures_with_proc_built_ = false;
+    std::string inlined_lambda_risk(const std::string& member);
+    // WP-46 (F-41.2): BindPlan::hashed_lambdas, and CML3630 for a hashed lambda's static that no hooked function vouches for.
+    void note_hashed_lambdas();
 
     // ---- helpers ----
     void fatal(Diag d) {
@@ -1236,6 +1314,186 @@ void Planner::learn_delta(const Sym& sy, std::uint32_t old_rva) {
     }
 }
 
+bool Planner::taken_by_public(const pdb::SymbolView& v) {
+    if (!external_defined_built_) {
+        external_defined_built_ = true;
+        for (const Sym& sy : syms_) {
+            if (sy.defined && !sy.is_static) {
+                external_defined_.insert(sy.name);
+            }
+        }
+    }
+    if (v.rva == pdb::kNoRva) {
+        return false;
+    }
+    const Result<std::vector<pdb::SymbolView>> pubs = pdb_.publics_at_rva(v.rva);
+    for (std::size_t k = 0; pubs && k < pubs->size(); ++k) {
+        if (external_defined_.count((*pubs)[k].name) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Planner::is_deleting_destructor(const pdb::SymbolView& v) {
+    if (!pdb::is_proc_kind(v.kind)) {
+        return false;
+    }
+    const Result<pdb::ProcInfo> info = pdb_.proc_info(v);
+    if (!info) {
+        return false;
+    }
+    for (const pdb::ProcVariable& var : info->variables) {
+        if (var.is_param && var.name == "should_call_delete") {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Planner::compiland_records_tss_guards() {
+    if (records_tss_guards_ < 0) {
+        records_tss_guards_ = 0;
+        if (!ensure_compiland_symbols()) {
+            records_tss_guards_ = 1;  // unknown: as if it recorded them (the relaxation does not apply)
+        } else {
+            for (const pdb::SymbolView& v : comp_syms_) {
+                if (pdb::is_data_kind(v.kind) && comp_last(&v).compare(0, 4, "$TSS") == 0) {
+                    records_tss_guards_ = 1;
+                    break;
+                }
+            }
+        }
+    }
+    return records_tss_guards_ == 1;
+}
+
+// WP-46 (F-41.1): the layout settle_guards places guards without a record from. It is delta_ (what pass A and the closure step
+// learned) plus what the statics paired by their function alone teach (place_taught_), with the same rules as learn_delta (no
+// COMDAT section, one delta and one image section per object section): a disagreement drops the section's layout, also the one
+// delta_ had. No other step reads it, so no pairing of a static depends on it.
+void Planner::learn_guard_layout() {
+    guard_delta_ = delta_;
+    guard_delta_image_section_ = delta_image_section_;
+    std::set<std::uint32_t> conflict;
+    for (const auto& [pos, old_rva] : place_taught_) {
+        const Sym& sy = syms_[pos];
+        if (sy.diagnosed || !sy.decided || sy.dec.decision != DecisionKind::BindOldData || sy.dec.old_address.rva != old_rva) {
+            continue;  // refused after all (two statics on one record, ...)
+        }
+        if (sy.dec.section == 0 || secs_[sy.dec.section - 1].sec->is_comdat() || delta_conflict_.count(sy.dec.section) != 0) {
+            continue;
+        }
+        const std::int64_t d = static_cast<std::int64_t>(old_rva) - static_cast<std::int64_t>(sy.s->value);
+        const std::optional<pdb::SectionOffset> so = pdb_.section_offset_from_rva(old_rva);
+        const std::uint16_t image_section = so ? so->section : 0;
+        const auto it = guard_delta_.find(sy.dec.section);
+        if (it == guard_delta_.end()) {
+            guard_delta_[sy.dec.section] = d;
+            guard_delta_image_section_[sy.dec.section] = image_section;
+        } else if (it->second != d || guard_delta_image_section_[sy.dec.section] != image_section) {
+            conflict.insert(sy.dec.section);
+        }
+        CML_LOG(Trace, "bind: guard layout: %s (paired by its function) puts object section %u at delta %lld", sy.name.c_str(), sy.dec.section, static_cast<long long>(d));
+    }
+    for (const std::uint32_t sec : conflict) {
+        guard_delta_.erase(sec);
+        CML_LOG(Trace, "bind: guard layout: object section %u: the statics paired by their function disagree with each other or with the known layout: no layout", sec);
+    }
+    if (!place_taught_.empty()) {
+        CML_LOG(Info, "WP46-GUARD-LAYOUT object=%s taught=%zu sections_known=%zu conflicts=%zu", in_.object_name.c_str(), place_taught_.size(), guard_delta_.size(), conflict.size());
+    }
+}
+
+std::string Planner::inlined_lambda_risk(const std::string& member) {
+    // Only clang inlines a lambda into every caller without emitting its call operator (cl at /O2 /Ob2 emits it as well,
+    // WP-40), and only clang names a closure by its function's scope in the TPI.
+    const pdb::Compiland& comp = pdb_.compiland(ci_);
+    if (!comp.has_compile3 || comp.compile.version.find("clang") == std::string_view::npos) {
+        return {};
+    }
+    const std::string function = function_of_static(pdb::without_tu_discriminator(member));
+    if (function.empty()) {
+        return {};
+    }
+    const Result<const std::vector<pdb::ClosureClass>*> closures = pdb_.closure_classes();
+    if (!closures) {
+        return "the closure classes of the old image cannot be read (" + closures.error().message + "), so a lambda of the function that the compiler inlined cannot be ruled out";
+    }
+    for (const pdb::ClosureClass& c : **closures) {
+        if (!closure_in_function(c.unique, function)) {
+            continue;
+        }
+        if (!closures_with_proc_built_) {
+            closures_with_proc_built_ = true;
+            if (ensure_compiland_symbols()) {
+                for (const pdb::SymbolView& v : comp_syms_) {
+                    if (pdb::is_proc_kind(v.kind) && comp_last(&v) == "operator()" && std::string_view(v.name).find("<lambda") != std::string_view::npos) {
+                        const pdb::FunctionSignature& sig = old_signature(v);
+                        if (sig.known && sig.member && !sig.class_unique_name.empty()) {
+                            closures_with_proc_.insert(pdb::without_tu_discriminator(sig.class_unique_name));
+                        }
+                    }
+                }
+            }
+        }
+        if (closures_with_proc_.count(c.unique) != 0) {
+            continue;  // its call operator is a procedure of the compiland: its statics are recorded there
+        }
+        CML_LOG(Info, "WP46-R54 static=%s function=%s closure='%s' unique=%s inlined-everywhere refused", member.c_str(), function.c_str(), c.name.c_str(), c.unique.c_str());
+        return "the old image has a lambda of that function ('" + c.name + "') whose call operator the compiler inlined everywhere (no procedure of it in compiland " + std::to_string(ci_) +
+               "), and the statics of such a lambda are recorded in the function itself";
+    }
+    return {};
+}
+
+void Planner::note_hashed_lambdas() {
+    std::map<std::string, HashedLambda> by_closure;
+    for (const Sym& sy : syms_) {
+        if (!sy.defined || !sy.is_static || !sy.decided || sy.diagnosed) {
+            continue;
+        }
+        const bool hooked = sy.dec.type == SymbolType::Function && sy.dec.decision == DecisionKind::PatchHooked;
+        const bool bound = sy.dec.type == SymbolType::Data && sy.dec.decision == DecisionKind::BindOldData;
+        if (!hooked && !bound) {
+            continue;
+        }
+        const std::string closure = hashed_closure(sy.name);
+        if (closure.empty()) {
+            continue;
+        }
+        HashedLambda& h = by_closure[closure];
+        h.closure = closure;
+        (hooked ? h.functions : h.statics).push_back(sy.name);
+    }
+    for (auto& [closure, h] : by_closure) {
+        if (h.functions.empty()) {
+            // Its statics were paired by the hash name, and no function of the closure is hooked to an old one whose code
+            // could prove that this is the same lambda.
+            for (const std::string& name : h.statics) {
+                for (Sym& sy : syms_) {
+                    if (sy.name != name) {
+                        continue;
+                    }
+                    error(diag::kHashedLambdasUnproven,
+                          "static data " + describe(sy) + " in " + in_.object_name + " belongs to lambda '" + closure +
+                              "', which the compiler names by a hash; it was paired with the old static of that name, but no function of the lambda is hooked to an old one whose code could prove that it is the same lambda",
+                          "Compile with /Zc:lambda (or /std:c++20), keep the lambda's code unchanged, or hot-restart.");
+                    sy.diagnosed = true;
+                    decide(sy, DecisionKind::PatchNewData, BindSource::None, sy.dec.type, {}, "static of a hash-named lambda without a hooked function (CML3630)");
+                }
+            }
+            CML_LOG(Info, "WP46-HASHED-LAMBDA closure=%s statics=%zu functions=0 refused", closure.c_str(), h.statics.size());
+            continue;
+        }
+        CML_LOG(Trace, "bind: hashed lambda %s: %zu function(s), %zu static(s) paired by its name: to be proven by code", closure.c_str(), h.functions.size(), h.statics.size());
+        plan_.hashed_lambdas.push_back(std::move(h));
+    }
+    if (!plan_.hashed_lambdas.empty()) {
+        CML_LOG(Info, "WP46-HASHED-LAMBDAS object=%s closures=%zu (proven by code in the pipeline)", in_.object_name.c_str(), plan_.hashed_lambdas.size());
+    }
+}
+
 // Static functions that share scope and name (overloads; the call operators of same-numbered lambdas of overloaded
 // functions): one-to-one by canonical signature. Never by position, never by a decorated name. Members that get a
 // partner move to `matched`; a member whose signature no old function has is a new function (decided here); what is
@@ -1274,6 +1532,27 @@ bool Planner::pair_overloads_by_signature(const std::string& group_name, std::ve
         CML_LOG(Trace, "bind: overloads '%s': new %s signature=%s", group_name.c_str(), sy.name.c_str(), sig.known ? sig.text.c_str() : ("unknown (" + sig.why + ")").c_str());
         if (!sig.known && unreadable.empty()) {
             unreadable = "the signature of '" + sy.name + "' in " + in_.object_name + " cannot be read: " + sig.why;
+        }
+    }
+    // WP-46 (F-41.3): clang-cl records a deleting destructor (`??_G`, `??_E`) under the destructor's display name and with the
+    // destructor's type, so the old records of a destructor are the destructor AND its deleting destructor, which no signature
+    // tells apart. Only the deleting destructor has the implicit parameter `should_call_delete` (a destructor has none): such
+    // a record is not a candidate of the destructor. The patch's deleting destructor is a symbol of its own (`??_G...`). Where
+    // the parameter is not recorded the records stay ambiguous (CML3214), as before.
+    if (!group_name.empty() && group_name[0] == '~') {
+        std::size_t dropped = 0;
+        for (auto it = free_cands.begin(); it != free_cands.end();) {
+            if (is_deleting_destructor(**it)) {
+                CML_LOG(Trace, "bind: overloads '%s': old record '%s' at rva %s has the parameter 'should_call_delete': a deleting destructor, not a candidate", group_name.c_str(),
+                        std::string((*it)->name).c_str(), hex((*it)->rva).c_str());
+                it = free_cands.erase(it);
+                ++dropped;
+            } else {
+                ++it;
+            }
+        }
+        if (dropped != 0) {
+            CML_LOG(Info, "WP46-DELETING-DTOR group='%s' dropped=%zu left=%zu", group_name.c_str(), dropped, free_cands.size());
         }
     }
     for (const pdb::SymbolView* c : free_cands) {
@@ -1337,11 +1616,41 @@ bool Planner::pair_overloads_by_signature(const std::string& group_name, std::ve
             new_closures[member_function[m]].insert(closure);
         }
     }
-    for (const pdb::FunctionSignature* o : old_sig) {
-        const std::string closure = closure_of_signature(*o);
-        if (!closure.empty()) {
-            old_closures[function_of_closure(closure)].insert(closure);
+    // WP-46 (F-41.2): an old call operator with external linkage (a lambda of an inline function, a COMDAT the linker took
+    // from this translation unit) that the patch defines under the same decorated name is paired by that public name
+    // (decide_defined), like every external function; it is not one of the lambdas this group of static call operators pairs.
+    // Counted here it made the sets differ whenever the linker had kept such COMDATs from this unit (Jolt, cl: 39 call
+    // operators in the patch against 90 records, the other 51 external).
+    std::size_t taken_by_public_count = 0;
+    for (std::size_t c = 0; c < old_sig.size(); ++c) {
+        const std::string closure = closure_of_signature(*old_sig[c]);
+        if (closure.empty()) {
+            continue;
         }
+        if (taken_by_public(*free_cands[c])) {
+            CML_LOG(Trace, "bind: overloads '%s': old record '%s' at rva %s is replaced by an external definition of the patch (its public): not in the set of lambdas", group_name.c_str(),
+                    std::string(free_cands[c]->name).c_str(), hex(free_cands[c]->rva).c_str());
+            ++taken_by_public_count;
+            continue;
+        }
+        old_closures[function_of_closure(closure)].insert(closure);
+    }
+    if (taken_by_public_count != 0) {
+        CML_LOG(Info, "WP46-PUBLIC-LAMBDAS group='%s' old=%zu taken-by-public=%zu", group_name.c_str(), old_sig.size(), taken_by_public_count);
+    }
+    // WP-46 (D1 evidence): for closures cl names by a hash, how the two sets compare (do the hashes of unchanged lambdas
+    // stay when lambdas are added or removed?).
+    for (const auto& [function, new_set] : new_closures) {
+        const auto old_set = old_closures.find(function);
+        if (old_set == old_closures.end() || new_set.empty() || hashed_closure(*new_set.begin()).empty()) {
+            continue;
+        }
+        std::size_t common = 0;
+        for (const std::string& c : new_set) {
+            common += old_set->second.count(c);
+        }
+        CML_LOG(Info, "WP46-HASH-SET group='%s' scope='%s' old=%zu new=%zu common=%zu %s", group_name.c_str(), function.c_str(), old_set->second.size(), new_set.size(), common,
+                old_set->second == new_set ? "same" : "changed");
     }
     std::vector<bool> lambdas_changed(unmatched.size(), false);
     for (std::size_t m = 0; m < unmatched.size(); ++m) {
@@ -1992,6 +2301,7 @@ void Planner::pair_statics_by_procedure(const std::string& base, bool is_tls, co
         // The guard variables of the blocks these statics are declared in must be bound to their old records already
         // (see above). A guard `?$TSS0@<scope>@4HA` belongs to the block whose statics are `?<name>@<scope>@4...`.
         std::vector<std::uint32_t> unbound_guards;
+        std::vector<std::uint32_t> relaxed_guards;  // WP-46: guards without a record left to settle_guards (see below)
         for (std::size_t k = 0; (problem.empty() || !unbound_guards.empty()) && k < count; ++k) {
             if (matched.count(new_pos[k]) != 0) {
                 continue;  // paired by an earlier step, which answers for its guard
@@ -2012,6 +2322,16 @@ void Planner::pair_statics_by_procedure(const std::string& base, bool is_tls, co
                 const auto bound = matched.find(pos);
                 const bool by_record = (bound != matched.end() && pdb::is_data_kind(bound->second.view->kind)) ||
                                        (guard.decided && guard.dec.decision == DecisionKind::BindOldData && guard.dec.source != BindSource::CompilandLayout);
+                // WP-46 (F-41.1, ADR-0043): a compiler that records no thread-safe guard at all (clang-cl) leaves every `$TSS<n>`
+                // without a record, so this requirement refused every such static (Jolt's GetRTTIOfType overloads). When the static
+                // is the only one of its name in its function (the function is its identity, no order is involved), it is paired
+                // here and its guard is left to settle_guards, which places it from the layout these statics teach (and only
+                // settle_guards reads that layout) or refuses with CML3600. cl records its `$TSS<n>` guards; its `$S<n>` bitmask
+                // (no record, WP-40 item 7) is not relaxed.
+                if (!by_record && count == 1 && !is_tls && guard.name.compare(0, 5, "?$TSS") == 0 && !compiland_records_tss_guards()) {
+                    relaxed_guards.push_back(pos);
+                    continue;
+                }
                 if (!by_record) {
                     unbound_guards.push_back(pos);
                     if (problem.empty()) {
@@ -2047,6 +2367,11 @@ void Planner::pair_statics_by_procedure(const std::string& base, bool is_tls, co
             free_cands.erase(std::remove(free_cands.begin(), free_cands.end(), old_views[k]), free_cands.end());
             why.erase(pos);
             ++paired;
+            if (!relaxed_guards.empty()) {
+                place_taught_.emplace_back(pos, old_views[k]->rva);
+                CML_LOG(Info, "WP46-GUARD-BY-PLACE static=%s function=%s guards=%zu (no guard record in the compiland: placed by settle_guards from the layout, or CML3600)",
+                        syms_[pos].name.c_str(), function.c_str(), relaxed_guards.size());
+            }
         }
         if (paired != 0 && count > 1) {
             warn(diag::kStaticsMatchedByOrder,
@@ -2332,7 +2657,19 @@ void Planner::bridge_statics() {
         const std::vector<const pdb::SymbolView*> cands =
             static_candidates(g.base, g.encl, g.is_func, g.display, g.is_tls ? 1 : 0, g.is_func && g.members.size() == 1 ? syms_[g.members.front()].name : std::string());
         if (!cands.empty()) {
-            const std::string risk = own_static_lambda_risk(g);
+            std::string risk = own_static_lambda_risk(g);
+            // WP-46 (R-54, ADR-0043): a lambda that clang-cl inlined into every caller leaves no call operator and no record that
+            // names it; the static it had is a record of the caller, under the same name as an own static of the caller would
+            // be. The TPI still has the lambda's closure class: when the function had such a lambda, a record of the name in the
+            // function is not provably the own static's (the patch may have deleted the lambda and declared the own static).
+            if (risk.empty() && !g.is_func && !g.encl.empty() && g.encl != "operator()" && !g.display.empty() && !is_guard_variable("?" + g.base + "@")) {
+                for (const std::uint32_t pos : g.members) {
+                    risk = inlined_lambda_risk(syms_[pos].name);
+                    if (!risk.empty()) {
+                        break;
+                    }
+                }
+            }
             if (!risk.empty()) {
                 for (const std::uint32_t pos : g.members) {
                     Sym& sy = syms_[pos];
@@ -2562,6 +2899,10 @@ void Planner::bridge_statics() {
         }
     }
 
+    // WP-46: the lambdas named by a hash (F-41.2), before the guards are settled (a static refused here takes its guard
+    // along); then the layout for guards without a record (F-41.1).
+    note_hashed_lambdas();
+    learn_guard_layout();
     settle_guards();
     build_lambda_sets();
     // Anything still undecided (defensive).
@@ -2675,14 +3016,14 @@ void Planner::settle_guards() {
             position = closure_twin(sy, from, to);
             break;
         }
-        const auto d = delta_.find(sy.dec.section);
+        const auto d = guard_delta_.find(sy.dec.section);
         if (position == nullptr) {
             why_not = "its lambda was paired with the old lambda of another number, and the patch has no guard of that number in the same section";
-        } else if (sy.dec.section == 0 || d == delta_.end()) {
+        } else if (sy.dec.section == 0 || d == guard_delta_.end()) {
             why_not = "no layout of its object section is known (no static matched there, or the matched ones disagree)";
         } else {
             const std::int64_t rva = d->second + static_cast<std::int64_t>(position->s->value);
-            const auto image_section = delta_image_section_.find(sy.dec.section);
+            const auto image_section = guard_delta_image_section_.find(sy.dec.section);
             const std::optional<pdb::SectionOffset> so =
                 rva >= 0 && rva < 0x7FFFFFFF ? pdb_.section_offset_from_rva(static_cast<std::uint32_t>(rva)) : std::nullopt;
             const std::optional<std::uint32_t> owner = so ? pdb_.compiland_for_rva(static_cast<std::uint32_t>(rva)) : std::nullopt;
@@ -2699,7 +3040,7 @@ void Planner::settle_guards() {
             if (!so || !owner || *owner != ci_ || !owner_end || *owner_end != ci_) {
                 why_not = "the layout of object section " + std::to_string(sy.dec.section) + " puts it at rva " + hex(static_cast<std::uint64_t>(std::max<std::int64_t>(rva, 0))) +
                           ", outside this translation unit's contribution to the old image";
-            } else if (image_section == delta_image_section_.end() || image_section->second != so->section) {
+            } else if (image_section == guard_delta_image_section_.end() || image_section->second != so->section) {
                 why_not = "the layout of object section " + std::to_string(sy.dec.section) + " puts it at rva " + hex(static_cast<std::uint64_t>(rva)) +
                           ", in another image section than the statics that taught the layout";
             } else if (other != nullptr) {

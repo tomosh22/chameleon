@@ -1190,6 +1190,15 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 - **What to do:** Keep the order of these lambdas while you edit them, rename their statics, or hot-restart.  
 - **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
 
+### CML3630
+
+- **Cause:** The translation unit was compiled by cl with its legacy lambda processor (C++17 or earlier without `/Zc:lambda`, the default before `/std:c++20`), which names every lambda `<lambda_` plus a 32-digit hash, in no scope. That name is the only thing that pairs a lambda of the new compile with the lambda of the running program, and how cl derives it is not documented, so Chameleon proves each such pairing by the code: every function of the lambda (its call operator, its invoker) must be the code of the old function of that name, with its statics at the old lambda's statics. One lambda whose code changed is accepted (the edit changed it); two or more changed lambdas, or a lambda whose code cannot be compared (for example a function that is not hooked to an old one, or a lambda inlined into its caller so that only its static is left), are not proven, and pairing them by name could run one lambda's code, or give its statics, for another. Lambdas with external linkage (in inline functions) pair by their public name like any other function and are not part of this check. The reload is refused; the program keeps running unchanged.  
+- **Message:** `Lambdas <...> in <...> are named by a hash (cl's legacy lambda processor) and were paired with the old lambdas of the same name, which only their code can confirm, and <...>; a wrong pairing would run one lambda's code, or give its statics, for another`  
+- **Message:** `static data <...> in <...> belongs to lambda '<...>', which the compiler names by a hash; it was paired with the old static of that name, but no function of the lambda is hooked to an old one whose code could prove that it is the same lambda`  
+- **What to do:** Change at most one lambda of this file per reload, compile with `/Zc:lambda` (the default under `/std:c++20`), or hot-restart.  
+  Other variants of the advice: Compile with /Zc:lambda (or /std:c++20), keep the lambda's code unchanged, or hot-restart.  
+- **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
+
 
 ## CML4200 to CML4299
 

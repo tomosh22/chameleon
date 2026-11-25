@@ -78,6 +78,17 @@ FunctionSignature function_signature(const TypeSource& types, std::uint32_t inde
 // The canonical text of one type (tools and tests). nullopt with `why` when it cannot be rendered.
 std::optional<std::string> canonical_type(const TypeSource& types, std::uint32_t type_index, std::string* why = nullptr);
 
+// WP-46 (R-54): the name and the unique name of an LF_CLASS / LF_STRUCTURE / LF_INTERFACE / LF_UNION / LF_ENUM record
+// (`unique` empty when the record has none). False for any other record and for a malformed one.
+bool udt_record_names(const TypeRecord& record, std::string_view& name, std::string_view& unique);
+
+// WP-46 (R-54): a closure class (lambda) of a PDB's TPI stream: its name ("o2_step::<lambda_0>") and its unique name
+// without the translation-unit discriminator (".?AV<lambda_0>@?0??o2_step@@YAXXZ@").
+struct ClosureClass {
+    std::string name;
+    std::string unique;
+};
+
 // ---- objects ---------------------------------------------------------------------------------------------------------
 
 // What LF_TYPESERVER2 says: the compiler PDB that holds the object's types.

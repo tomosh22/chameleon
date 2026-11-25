@@ -41,3 +41,9 @@ TEST_CASE("scenario: the WP-40 scenarios parse") {
         CHECK(r->steps.size() > 5);
     }
 }
+
+TEST_CASE("scenario: the WP-46 scenario parses") {
+    cml::Result<Scenario> r = load_scenario(std::string(CML_HARNESS_SCENARIOS_DIR) + "/legacy_lambdas.toml");
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    CHECK(r->steps.size() > 10);
+}

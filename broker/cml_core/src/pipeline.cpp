@@ -752,6 +752,26 @@ private:
                 plan = std::move(*again);
             }
         }
+        // WP-46 (F-41.2, ADR-0043 ruling D1): lambdas cl names by a hash (its legacy lambda processor) were paired by that name,
+        // whose derivation is not documented; their code proves the pairing (one changed lambda allowed), otherwise CML3630.
+        if (!plan.hashed_lambdas.empty()) {
+            NarrowInput hi;
+            hi.object = &object->object;
+            hi.plan = &plan;
+            hi.old_image = image ? &image->image : nullptr;
+            hi.load_base = module_.base;
+            hi.is_hooked = [this](std::uint64_t va) { return module_.is_hooked(va); };
+            hi.prior_code = [this](std::uint64_t va) { return module_.code_running_at(va); };
+            const std::vector<Diag> unproven = prove_hashed_lambdas(hi);
+            if (!unproven.empty()) {
+                std::optional<Diag> first;
+                for (const Diag& e : unproven) {
+                    const Diag shown = fail("plan", e);
+                    first = first ? first : std::optional<Diag>(shown);
+                }
+                return *first;
+            }
+        }
         // WP-40 (second high review, ADR-0043 ruling): a `$S<n>` bitmask bound to the old one only while its function's
         // code is unchanged (the bits follow the order of its dynamically initialised statics); otherwise CML3600.
         if (!plan.bitmask_guards.empty()) {
