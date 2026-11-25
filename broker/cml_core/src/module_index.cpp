@@ -390,6 +390,13 @@ void ModuleIndex::run() {
     if (cancel_.load(std::memory_order_acquire)) {
         return;
     }
+    if (spec_.carried) {
+        // WP-45: before Ready, so that no reload sweeps this instance without the earlier instance's baseline.
+        const std::size_t applied = spec_.carried_live ? baseline_.adopt(*spec_.carried) : baseline_.restore(*spec_.carried);
+        carried_files_.store(applied, std::memory_order_release);
+        CML_LOG(Trace, "index: carried baseline applied: module=%s mode=%s files=%zu originals=%zu", spec_.module_path.c_str(),
+                spec_.carried_live ? "adopt" : "restore", applied, spec_.carried->originals.size());
+    }
     {
         std::lock_guard<std::mutex> lock(mutex_);
         status_.files = baseline_.size();

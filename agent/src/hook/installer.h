@@ -138,6 +138,12 @@ public:
     BatchResult revert(const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes,
                        ipc::fault::Stage inject = ipc::fault::Stage::Count);
 
+    // WP-45: the module mapped at [base, base + size) was unloaded. Its hooks went with its image, so their records are dropped: a module
+    // loaded again at the same base has its original bytes there, and a hook of the new image is a first install, not a re-point of a
+    // jump that no longer exists. Takes the batch mutex (so it runs after any batch in flight, never while threads are suspended) and only
+    // erases (no allocation). Returns the number of records dropped.
+    std::size_t forget_range(std::uint64_t base, std::uint64_t size);
+
     bool ready() const noexcept { return ready_; }
     std::size_t hook_count() const;
     bool find(const void* target, HookInfo* info) const;

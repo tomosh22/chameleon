@@ -1,0 +1,166 @@
+# Scenario `plugin_late_load` (WP-45, F-42.3): after a hot-restart the new process loads its plugin DLL only later (lazily). The
+# restart cannot enable it (CML5809) and hands its edits over; they are re-applied when the new process enables it.
+#
+#  1. The host loads the plugin late and enables it; edit 1 -> 2, reload: value=2.
+#  2. `restart`: the new process enables its exe by itself, the plugin is not loaded yet: CML5809 (which now says the edits are
+#     re-applied when it is enabled), `not_enabled` names it.
+#  3. The new process loads and enables the plugin: the original code runs at first (value=1), and its enable re-applies the session's
+#     edit (value=2; F-42.3: it used to stay at value=1, silently). A further edit (2 -> 3) reloads as usual.
+#  4. The file is broken on disk (not reloaded) and the process restarted again; when the plugin is loaded, re-applying fails to
+#     compile: CML5600 names the module and the file, the plugin runs its original code. The fixed file (value=4) reloads.
+name = "plugin_late_load"
+description = "fixture plugin_reload: edit -> restart (plugin loaded lazily, CML5809) -> load: edit re-applied -> failed re-apply after a restart is CML5600"
+fixture = "plugin_reload"
+timeout_s = 600
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=0 loaded=0 gen=0 pid=\\d+ restarted=0"
+within_s = 20
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_plugin_reload.exe"
+within_s = 30
+
+[[step]]
+kind = "signal_fixture"
+
+[[step]]
+kind = "expect_stdout"
+regex = "LOADED gen=1 ok=1"
+within_s = 10
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_plugin_reload_plugin.dll"
+within_s = 30
+
+[[step]]
+kind = "wait"
+for = "index"
+within_s = 60
+
+[[step]]
+kind = "edit"
+patch = "edits/value_2.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2 loaded=1 gen=1 pid=\\d+ restarted=0"
+within_s = 15
+
+# --- 2. hot-restart; the new process does not load the plugin by itself ---
+[[step]]
+kind = "restart"
+within_s = 180
+expect_not_enabled = "fixture_plugin_reload_plugin.dll"
+expect_warning = "CML5809"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=0 loaded=0 gen=0 pid=\\d+ restarted=1"
+within_s = 20
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_plugin_reload.exe"
+within_s = 30
+
+# --- 3. it loads the plugin later: the edit is re-applied as part of its enable ---
+[[step]]
+kind = "signal_fixture"
+
+[[step]]
+kind = "expect_stdout"
+regex = "LOADED gen=1 ok=1"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2 loaded=1 gen=1 pid=\\d+ restarted=1"
+within_s = 90
+
+[[step]]
+kind = "wait"
+for = "idle"
+within_s = 90
+
+[[step]]
+kind = "edit"
+patch = "edits/value_3.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=3 loaded=1 gen=1 pid=\\d+ restarted=1"
+within_s = 15
+
+# --- 4. a re-apply that fails after a restart is a diagnostic, not silence ---
+[[step]]
+kind = "edit"
+patch = "edits/broken.edit"
+
+[[step]]
+kind = "restart"
+within_s = 180
+expect_not_enabled = "fixture_plugin_reload_plugin.dll"
+expect_warning = "CML5809"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=0 loaded=0 gen=0 pid=\\d+ restarted=1"
+within_s = 20
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_plugin_reload.exe"
+within_s = 30
+
+[[step]]
+kind = "signal_fixture"
+
+[[step]]
+kind = "expect_stdout"
+regex = "LOADED gen=1 ok=1"
+within_s = 10
+
+[[step]]
+kind = "expect_diag"
+id = "CML5600"
+expect_text = "fixture_plugin_reload_plugin.dll"
+within_s = 120
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1 loaded=1 gen=1 pid=\\d+ restarted=1"
+within_s = 15
+
+[[step]]
+kind = "edit"
+patch = "edits/fixed_4.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=4 loaded=1 gen=1 pid=\\d+ restarted=1"
+within_s = 15

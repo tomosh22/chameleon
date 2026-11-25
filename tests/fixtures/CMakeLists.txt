@@ -62,3 +62,4 @@ endforeach()
 # Wave 11 fixture directories (ADR-0043), one line per fixture.
 add_subdirectory(planner_pairing)     # WP-40
 add_subdirectory(planner_pairing_o2)  # WP-40 (/O2 /Ob2)
+add_subdirectory(plugin_reload)       # WP-45
