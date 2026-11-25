@@ -41,6 +41,15 @@ enum class Stage : std::uint8_t {
     RevertRepoint,        // agent: a revert's re-pointing of hooks to an older patch, inside the window with the threads suspended
     RevertRestore,        // agent: a revert's restoring of original bytes, inside the window with the threads suspended
     RevertUncommit,       // agent: the un-commit of a reverted patch image (ReleaseRange, mode Uncommit)
+    // WP-44 (ADR-0043): the crash handler (WP-20, WP-23) and the compile-on-save watcher (WP-14). Append only.
+    ExceptionHold,        // agent: the vectored handler passes a fault it would hold on (one lock-free decrement in the handler)
+    ExceptionReport,      // broker: the report of a held thread: no `exception` event (a diag instead); the thread stays held
+    ExceptionContinue,    // agent: the action continue is refused before the thread is touched (it stays held)
+    ExceptionLeave,       // agent: the action leave is refused before the thread is touched
+    ExceptionReexecute,   // agent: the action reexecute is refused before the thread is touched
+    WatchDebounce,        // broker: the debounced batch of a save is lost: the watcher re-checks every tracked file (overflow path)
+    WatchChangeDetection, // broker: the check which saved files are tracked fails: the batch is dropped, nothing reloads
+    WatchReload,          // broker: the reload a save starts fails before it runs
     Count
 };
 inline constexpr std::size_t kStageCount = static_cast<std::size_t>(Stage::Count);
@@ -84,6 +93,21 @@ inline constexpr std::uint32_t kRestartRegistration = 5975;
 inline constexpr std::uint32_t kRestartReenable = 5976;
 inline constexpr std::uint32_t kRestartReapply = 5977;
 inline constexpr std::uint32_t kInjectBusy = 5978;           // inject-failure: a restart / revert stage while a restart / revert runs
+// WP-44 (ADR-0043): CML5979-5984 (broker) and CML4661-4664 (agent; CML4665-4699 stay free).
+// The group "exception" (exception-hold, exception-report) is armed for the next fault the agent would hold, which always reaches its
+// stage; one arming of the group at a time (arming one of its stages disarms the other). The group "exception-action" applies to the next
+// `exception-action` command for a held thread of the process, the group "watch" to the next batch of saves that touches a tracked file
+// (or an overflow); at the end of either every stage of its group still armed is disarmed, whether it fired or not.
+inline constexpr std::uint32_t kAgentExceptionHold = 4661;
+inline constexpr std::uint32_t kAgentExceptionContinue = 4662;
+inline constexpr std::uint32_t kAgentExceptionLeave = 4663;
+inline constexpr std::uint32_t kAgentExceptionReexecute = 4664;
+inline constexpr std::uint32_t kExceptionReport = 5979;
+inline constexpr std::uint32_t kWatchDebounce = 5980;
+inline constexpr std::uint32_t kWatchChangeDetection = 5981;
+inline constexpr std::uint32_t kWatchReload = 5982;
+inline constexpr std::uint32_t kWatchDisarmed = 5983;        // (warning) a batch of saves did not reach the armed watch stage(s): disarmed
+inline constexpr std::uint32_t kPersist = 5984;              // persistent arming: no place to keep it (no --log), or its file cannot be written / read
 }  // namespace ids
 
 struct StageInfo {
@@ -92,8 +116,8 @@ struct StageInfo {
     bool agent_side;          // armed in the agent through ArmFault
     std::uint32_t diag_id;    // the diagnostic the failure carries
     const char* where;        // one line: what is made to fail
-    // WP-43: which path the stage belongs to: "reload" (WP-28's pipeline stages), "restart", "revert" (WP-44 adds its own). A
-    // default, so the rows of the earlier stages stay as they were (the table is append-only).
+    // WP-43: which path the stage belongs to: "reload" (WP-28's pipeline stages), "restart", "revert"; WP-44: "exception",
+    // "exception-action", "watch". A default, so the rows of the earlier stages stay as they were (the table is append-only).
     const char* group = "reload";
 };
 
@@ -130,6 +154,24 @@ inline constexpr StageInfo kStages[] = {
      "a revert's restoring of original bytes, inside the window with the application's threads suspended; nothing is written", "revert"},
     {Stage::RevertUncommit, "revert-uncommit", true, ids::kAgentRevertUncommit,
      "the un-commit of a reverted patch image (its application hooks may keep running; the revert itself succeeds)", "revert"},
+    // WP-44: the crash handler, then the compile-on-save watcher.
+    {Stage::ExceptionHold, "exception-hold", true, ids::kAgentExceptionHold,
+     "the crash handler's hold of a faulting thread: the fault is passed on as without Chameleon (the application's own handler or the system sees it)",
+     "exception"},
+    {Stage::ExceptionReport, "exception-report", false, ids::kExceptionReport,
+     "the report of a held thread: no `exception` event is published; the thread stays held and `exceptions` lists it", "exception"},
+    {Stage::ExceptionContinue, "exception-continue", true, ids::kAgentExceptionContinue,
+     "the action continue for a held thread: refused before the thread is touched (it stays held)", "exception-action"},
+    {Stage::ExceptionLeave, "exception-leave", true, ids::kAgentExceptionLeave,
+     "the action leave for a held thread: refused before the thread is touched (it stays held)", "exception-action"},
+    {Stage::ExceptionReexecute, "exception-reexecute", true, ids::kAgentExceptionReexecute,
+     "the action reexecute for a held thread: refused before the thread is touched (it stays held)", "exception-action"},
+    {Stage::WatchDebounce, "watch-debounce", false, ids::kWatchDebounce,
+     "the debounced batch of a save is lost: the watcher re-checks every tracked file, as after lost events", "watch"},
+    {Stage::WatchChangeDetection, "watch-change-detection", false, ids::kWatchChangeDetection,
+     "the check which saved files are tracked: the batch is dropped (the next save or `reload` picks the change up)", "watch"},
+    {Stage::WatchReload, "watch-reload", false, ids::kWatchReload,
+     "the reload a save starts, before it runs (the next save or `reload` picks the change up)", "watch"},
 };
 static_assert(sizeof(kStages) / sizeof(kStages[0]) == kStageCount, "every stage has a table row");
 

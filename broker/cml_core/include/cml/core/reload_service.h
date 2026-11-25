@@ -126,6 +126,10 @@ public:
     void cancel();
     // WP-28: the broker-side failure injection state (control command `inject-failure`).
     FaultInjector& faults() noexcept { return faults_; }
+#if defined(CML_FAULT_INJECTION)
+    // WP-44: whether the process host confirms that process `pid` has exited (RestartCoordinator::process_exited; false without a host).
+    bool process_exited(std::uint32_t pid);
+#endif
 
     // The state of a module (tests, diagnostics); null when it is not enabled.
     std::shared_ptr<ModuleState> module_state(std::uint64_t agent_id, const std::string& module_path) const;
@@ -228,7 +232,10 @@ private:
     std::vector<std::future<void>> retiring_;  // stopped save watchers finishing a reload
     WatcherFactory watcher_factory_;
 
-    Result<ipc::json::Value> revert_impl(const ipc::json::Value& args, std::vector<std::uint32_t>* pids, std::string* outcome);
+    // `acquired`: revert() holds the run lock. `outcomes`: the diagnostics of each process (R-51: an agent stage's id in one process's
+    // outcome says it fired there, not in the others).
+    Result<ipc::json::Value> revert_impl(const ipc::json::Value& args, bool acquired, std::vector<std::uint32_t>* pids,
+                                         std::map<std::uint32_t, std::string>* outcomes);
     std::shared_ptr<RestartCoordinator> restart_;  // guarded by mutex_; restart() works on a copy
     std::mutex observer_mutex_;
     OptionObserver option_observer_;

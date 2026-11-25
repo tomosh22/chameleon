@@ -244,25 +244,9 @@ private:
         constexpr std::uint32_t kExitWaitMs = 15000;
         const bool gone = supervisor_.wait_all_exited(kExitWaitMs);
         std::size_t restored = 0;
-        std::string problems;
-        for (const auto& entry : external_originals_) {
-            std::error_code ec;
-            if (!entry.second) {
-                fs::remove(entry.first, ec);  // the patch created the file
-            } else {
-                std::ofstream out(entry.first, std::ios::binary | std::ios::trunc);
-                out.write(entry.second->data(), static_cast<std::streamsize>(entry.second->size()));
-                out.close();
-                if (!out) {
-                    ec = std::make_error_code(std::errc::io_error);
-                }
-            }
-            if (ec) {
-                problems += (problems.empty() ? "" : "; ") + entry.first.string() + " (" + ec.message() + ")";
-            } else {
-                ++restored;
-            }
-        }
+        // WP-44 (R-49): the directories the patches created go as well.
+        const std::string problems = restore_tree(external_originals_, external_created_dirs_, &restored);
+        external_created_dirs_.clear();
         const std::string summary = "restored " + std::to_string(restored) + " of " + std::to_string(external_originals_.size()) +
                                     " edited files of the external source tree " + built_.source_dir.string();
         external_originals_.clear();
@@ -283,6 +267,7 @@ private:
         for (std::size_t i = 0; i < patch.files.size() && i < patch.originals.size(); ++i) {
             external_originals_.try_emplace(built_.source_dir / fs::path(patch.files[i]), std::move(patch.originals[i]));
         }
+        external_created_dirs_.insert(external_created_dirs_.end(), patch.created_dirs.begin(), patch.created_dirs.end());  // WP-44 (R-49)
     }
 
     std::uint32_t remaining_ms() const {
@@ -1062,6 +1047,7 @@ private:
     ExceptionSteps exception_steps_;  // WP-20
     PerfRecorder perf_;               // WP-27
     std::map<fs::path, std::optional<std::string>> external_originals_;  // WP-39: file -> content before the first edit
+    std::vector<fs::path> external_created_dirs_;                        // WP-44 (R-49): directories the edits created
     bool failed_ = false;
     std::optional<std::string> skip_reason_;
     Clock::time_point run_deadline_ = Clock::now();

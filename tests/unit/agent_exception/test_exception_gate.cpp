@@ -18,8 +18,10 @@
 #include <utility>
 #include <vector>
 
+#include "cml/ipc/fault_stages.h"
 #include "crash/exception_gate.h"
 #include "doctest.h"
+#include "fault/fault_injection.h"
 #include "heap.h"
 
 using cml::agent::crash::Action;
@@ -607,6 +609,95 @@ void scenario_resolve_races_with_release() {
     CHECK(ExceptionGate::shared().held_count() == 0);
 }
 
+#if defined(CML_FAULT_INJECTION)
+// WP-44: the stage exception-hold. The handler passes the armed fault on, as when every slot is taken (the handler behind it repairs the
+// page), counts it for the agent thread, and the next fault is held as usual.
+void scenario_exception_hold_injected() {
+    ChildProcess process;
+    namespace ipf = cml::ipc::fault;
+    cml::agent::fault::arm(ipf::Stage::ExceptionHold, 1);
+    char* page = make_noaccess_page();
+    g_repair_page.store(page);
+    std::atomic<int> held_count{0};
+    Decider decider([&](const Held& held) {
+        held_count.fetch_add(1);
+        DWORD old = 0;
+        VirtualProtect(page, 4096, PAGE_READWRITE, &old);
+        expect(ExceptionGate::shared().resolve(held.id, Action::Continue).has_value(), "continue accepted");
+    });
+    write_page(page, 5);  // passed on: the handler behind the gate repairs the page
+    CHECK(page[0] == 5);
+    CHECK(g_next_handler_saw.load() == 1);
+    CHECK(held_count.load() == 0);
+    CHECK(ExceptionGate::shared().take_injected_count() == 1);
+    CHECK(ExceptionGate::shared().take_overflow_count() == 0);  // not a full table
+    CHECK(cml::agent::fault::armed(ipf::Stage::ExceptionHold) == 0);
+    // The next fault is held.
+    g_repair_page.store(nullptr);
+    DWORD old = 0;
+    VirtualProtect(page, 4096, PAGE_NOACCESS, &old);
+    write_page(page, 6);
+    CHECK(page[0] == 6);
+    CHECK(decider.wait_for_handled(1));
+    CHECK(held_count.load() == 1);
+    CHECK(g_next_handler_saw.load() == 1);
+    CHECK(ExceptionGate::shared().take_injected_count() == 0);
+}
+
+// WP-44: the stages exception-continue / exception-leave / exception-reexecute. The action is refused with the stage's id once the thread
+// is claimed; the thread stays held, and the same action afterwards is carried out. An unknown id does not use the arming up.
+void scenario_action_injected() {
+    ChildProcess process;
+    namespace ipf = cml::ipc::fault;
+    char* page = make_noaccess_page();
+    std::atomic<int> refusals{0};
+    Decider decider([&](const Held& held) {
+        ExceptionGate& gate = ExceptionGate::shared();
+        cml::agent::fault::arm(ipf::Stage::ExceptionContinue, 1);
+        cml::agent::fault::arm(ipf::Stage::ExceptionLeave, 1);
+        // Not held: CML4400, the arming stays.
+        const cml::Result<void> unknown = gate.resolve(held.id + 1000, Action::Continue);
+        expect(!unknown.has_value() && unknown.error().code == 4400u, "an unknown id is CML4400");
+        expect(cml::agent::fault::armed(ipf::Stage::ExceptionContinue) == 1, "an unknown id does not use the arming up");
+        const cml::Result<void> leave = gate.resolve(held.id, Action::Leave);
+        expect(!leave.has_value() && leave.error().code == ipf::ids::kAgentExceptionLeave, "leave refused with CML4663");
+        const cml::Result<void> cont = gate.resolve(held.id, Action::Continue);
+        expect(!cont.has_value() && cont.error().code == ipf::ids::kAgentExceptionContinue, "continue refused with CML4662");
+        expect(!cont.has_value() && cont.error().message.find("exception-continue") != std::string::npos, "the message names the stage");
+        refusals.store(2);
+        expect(gate.held_count() == 1, "the thread stays held");
+        DWORD old = 0;
+        VirtualProtect(page, 4096, PAGE_READWRITE, &old);
+        expect(gate.resolve(held.id, Action::Continue).has_value(), "the next continue is carried out");
+    });
+    write_page(page, 9);
+    CHECK(page[0] == 9);
+    CHECK(decider.wait_for_handled(1));
+    CHECK(refusals.load() == 2);
+    CHECK(g_next_handler_saw.load() == 0);
+}
+
+// WP-44: exception-reexecute refuses before the plan is looked at.
+void scenario_reexecute_injected() {
+    ChildProcess process;
+    namespace ipf = cml::ipc::fault;
+    char* page = make_noaccess_page();
+    Decider decider([&](const Held& held) {
+        cml::agent::fault::arm(ipf::Stage::ExceptionReexecute, 1);
+        ReexecutePlan nonsense;  // would be refused for itself (no frame matches); the injected refusal comes first
+        const cml::Result<void> r = ExceptionGate::shared().resolve_reexecute(held.id, nonsense);
+        expect(!r.has_value() && r.error().code == ipf::ids::kAgentExceptionReexecute, "re-execute refused with CML4664");
+        expect(ExceptionGate::shared().held_count() == 1, "the thread stays held");
+        DWORD old = 0;
+        VirtualProtect(page, 4096, PAGE_READWRITE, &old);
+        expect(ExceptionGate::shared().resolve(held.id, Action::Continue).has_value(), "continue accepted");
+    });
+    write_page(page, 3);
+    CHECK(page[0] == 3);
+    CHECK(decider.wait_for_handled(1));
+}
+#endif
+
 struct Scenario {
     const char* name;
     void (*run)();
@@ -632,6 +723,11 @@ const Scenario kScenarios[] = {
     {"unwind_frames", &scenario_unwind_frames},
     {"unwind_damaged_stack", &scenario_unwind_survives_a_damaged_stack},
     {"resolve_races_release", &scenario_resolve_races_with_release},
+#if defined(CML_FAULT_INJECTION)
+    {"exception_hold_injected", &scenario_exception_hold_injected},  // WP-44
+    {"action_injected", &scenario_action_injected},
+    {"reexecute_injected", &scenario_reexecute_injected},
+#endif
 };
 
 // ---- the parent side -------------------------------------------------------------------------------------------------------

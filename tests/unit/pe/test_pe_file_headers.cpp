@@ -149,3 +149,61 @@ TEST_CASE("pe file headers: a missing file is CML1300, an empty one is read as e
     REQUIRE(empty.has_value());
     CHECK(empty->empty());
 }
+
+// ---- WP-44 (R-49) ----------------------------------------------------------------------------------------------------------------
+
+TEST_CASE("pe file headers (R-49): a corrupt e_lfanew in a large file is refused from the first block, naming the file's size") {
+    const PeBytes disk = build_pe_on_disk();
+    TempFile file("lfanew.exe");
+    constexpr std::size_t kTail = 32u * 1024u * 1024u;
+    const std::string size_text = std::to_string(disk.size() + kTail);
+
+    // Beyond the end of the file: before R-49 the whole 32 MiB were read, and the message named that buffer's size.
+    PeBytes beyond = disk;
+    w32(beyond, 0x3C, 0x7FFFFFF0u);
+    file.write(beyond, kTail);
+    auto head = read_file_headers(file.name());
+    REQUIRE_FALSE(head.has_value());
+    CHECK(head.error().code == 1302u);
+    CHECK(head.error().message.find(file.name()) == 0);
+    CHECK(head.error().message.find("outside the " + size_text + "-byte image") != std::string::npos);
+    // The same words as the whole-file reader (after the path).
+    const auto whole = load_image_file(file.name());
+    REQUIRE_FALSE(whole.has_value());
+    CHECK(whole.error().code == 1302u);
+    CHECK(head.error().message == whole.error().message);
+
+    // Inside the file but 20 MiB into it: before R-49 the read went to there (20 MiB). Now it is refused.
+    PeBytes far = disk;
+    w32(far, 0x3C, 20u * 1024u * 1024u);
+    file.write(far, kTail);
+    head = read_file_headers(file.name());
+    REQUIRE_FALSE(head.has_value());
+    CHECK(head.error().code == 1302u);
+    CHECK(head.error().message.find(file.name()) == 0);
+    CHECK(head.error().message.find("more than 1024 KiB into the " + size_text + "-byte file") != std::string::npos);
+    CHECK_FALSE(head.error().what_to_do.empty());
+
+    // At the limit it is still followed (a long DOS stub is legal).
+    PeBytes at_limit(1024u * 1024u + (kHeaderEnd - kLfanew), 0);
+    w16(at_limit, 0, 0x5A4D);
+    w32(at_limit, 0x3C, 1024u * 1024u);
+    std::memcpy(at_limit.data() + 1024u * 1024u, disk.data() + kLfanew, kHeaderEnd - kLfanew);
+    file.write(at_limit, 4096);
+    head = read_file_headers(file.name());
+    REQUIRE_MESSAGE(head.has_value(), head.error().format());
+    CHECK(head->size() == at_limit.size());
+}
+
+TEST_CASE("pe file headers (R-49): a large file that is not an image is CML1301 naming the file's size, not the block's") {
+    TempFile file("notpe.bin");
+    file.write(PeBytes(16, 0x11), 1024u * 1024u);  // 16 bytes then 1 MiB of 0xEE: no MZ
+    const auto head = read_file_headers(file.name());
+    REQUIRE_FALSE(head.has_value());
+    CHECK(head.error().code == 1301u);
+    CHECK(head.error().message.find(file.name()) == 0);
+    CHECK(head.error().message.find("in " + std::to_string(16u + 1024u * 1024u) + " bytes") != std::string::npos);  // before R-49: "in 4096 bytes"
+    const auto whole = load_image_file(file.name());
+    REQUIRE_FALSE(whole.has_value());
+    CHECK(head.error().message == whole.error().message);
+}

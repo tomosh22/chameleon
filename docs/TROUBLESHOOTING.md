@@ -1587,6 +1587,34 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 
 ## CML4700 to CML4799
 
+### CML4661
+
+- **Cause:** Failure injection, stage `exception-hold` (group `exception`, armed for the next fault the crash handler would hold): the agent's crash handler passed the fault on instead of holding the thread, as when every slot is taken (CML4403). The application's own exception handler, or the system, saw the fault as it would without Chameleon. The agent logs this warning; the broker publishes no `exception` event for that fault.
+- **Message:** `injected failure at the stage 'exception-hold': <n> fault(s) were passed on instead of held (the application's own handler or the system saw them)`
+- **What to do:** This failure was requested with the control command `inject-failure` (failure injection, a test facility; capability `fault-injection`). Repeat the operation without arming the stage (`{"stage":"none"}` disarms every stage). An application without its own handler for the fault ends as it would without Chameleon. The next fault is held as usual.
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML4662
+
+- **Cause:** Failure injection, stage `exception-continue` (group `exception-action`, armed for the next `exception-action` of the process; at the end of that action it is disarmed whether it fired or not, and the answer lists an unused one in `injection_disarmed`): the agent refused the action `continue` before it touched the held thread. The thread stays held and `exceptions` still lists it.
+- **Message:** `injected failure at the stage 'exception-continue' (the action continue for a held thread: refused before the thread is touched (it stays held))`
+- **What to do:** This failure was requested with the control command `inject-failure` (failure injection, a test facility; capability `fault-injection`). Repeat the operation without arming the stage (`{"stage":"none"}` disarms every stage). Send the action again.
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML4663
+
+- **Cause:** Failure injection, stage `exception-leave` (group `exception-action`, like CML4662): the agent refused the action `leave` before it touched the held thread. The thread stays held.
+- **Message:** `injected failure at the stage 'exception-leave' (the action leave for a held thread: refused before the thread is touched (it stays held))`
+- **What to do:** This failure was requested with the control command `inject-failure` (failure injection, a test facility; capability `fault-injection`). Repeat the operation without arming the stage (`{"stage":"none"}` disarms every stage). Send the action again.
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML4664
+
+- **Cause:** Failure injection, stage `exception-reexecute` (group `exception-action`, like CML4662): the agent refused the action `reexecute` before it touched the held thread. The thread stays held; `reexecute` stays offered.
+- **Message:** `injected failure at the stage 'exception-reexecute' (the action reexecute for a held thread: refused before the thread is touched (it stays held))`
+- **What to do:** This failure was requested with the control command `inject-failure` (failure injection, a test facility; capability `fault-injection`). Repeat the operation without arming the stage (`{"stage":"none"}` disarms every stage). Send the action again.
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
 ### CML4700
 
 - **Cause:** The agent refused an image-relative fix-up (kind Addr32NbDisp): `target - patch image base` does not fit a signed 32-bit displacement. Nothing was written; a patch that was being loaded is unloaded and the program keeps running the old code. The broker checks the same range before it sends the fix-up (CML3550), so this is only seen when the patch landed somewhere else than planned.  
@@ -2930,9 +2958,51 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 
 ### CML5978
 
-- **Cause:** `inject-failure` was asked to arm a stage of the restart (or the revert) while a restart (or a reload or revert) runs. A restart or revert stage is armed for the next operation of its process only; arming it in the middle of one could fail a step that must not fail (the undo of a revert's re-pointing, say).  
-- **Message:** `the stage '<name>' cannot be armed while a restart runs` (or `... while a reload or revert runs`)  
+- **Cause:** `inject-failure` was asked to arm a stage of the restart (or the revert) while a restart (or a reload or revert) runs. A restart or revert stage is armed for the next operation of its process only; arming it in the middle of one could fail a step that must not fail (the undo of a revert's re-pointing, say).   WP-44: the same holds for the stages of `exception-action` while an `exception-action` runs, and for the watch stages while a batch of saves is handled (the operation counts as running until it has disarmed what is left for it).  
+- **Message:** `the stage '<name>' cannot be armed while a restart runs` (or `... while a reload or revert runs`, `... while an exception-action runs`, `... while a batch of saves of the compile-on-save watcher runs`)  
 - **What to do:** Wait for the operation to finish (control command `wait`), then arm the stage.  
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5979
+
+- **Cause:** Failure injection, stage `exception-report` (group `exception`, armed for the next held thread the broker hears of; one arming of the group at a time, so arming it disarms `exception-hold`): the broker did not publish the `exception` event of a held thread and published this diag instead. The thread stays held and pending.
+- **Message:** `injected failure at the stage 'exception-report' (...): exception <id> of process <pid> (thread <tid>) was not reported; it stays held`
+- **What to do:** Query `exceptions` for the held thread and answer it with `exception-action`. This failure was requested with the control command `inject-failure` (failure injection, a test facility; capability `fault-injection`). Repeat the operation without arming the stage (`{"stage":"none"}` disarms every stage).
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5980
+
+- **Cause:** Failure injection, stage `watch-debounce` (group `watch`, armed for the next batch of saves that touches a tracked file; at the end of that batch every watch stage still armed is disarmed and reported, CML5983): the compile-on-save watcher lost the debounced batch and did what it does after lost events: every tracked source is re-checked by content hash, so the save is still picked up.
+- **Message:** `injected failure at the stage 'watch-debounce' (...): <n> tracked file(s) of the batch are re-checked with every other tracked file`
+- **What to do:** Nothing: the reload runs. This failure was requested with the control command `inject-failure` (failure injection, a test facility; capability `fault-injection`). Repeat the operation without arming the stage (`{"stage":"none"}` disarms every stage).
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5981
+
+- **Cause:** Failure injection, stage `watch-change-detection` (group `watch`, like CML5980): the watcher's check which saved files are tracked failed and the batch was dropped; no reload started. The change stays pending.
+- **Message:** `injected failure at the stage 'watch-change-detection' (...): the save of <n> tracked file(s) starts no reload`
+- **What to do:** Save again, or run `reload`. This failure was requested with the control command `inject-failure` (failure injection, a test facility; capability `fault-injection`). Repeat the operation without arming the stage (`{"stage":"none"}` disarms every stage).
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5982
+
+- **Cause:** Failure injection, stage `watch-reload` (group `watch`, like CML5980): the reload that a save started failed before it ran; the watcher's own CML5505 follows. The change stays pending.
+- **Message:** `injected failure at the stage 'watch-reload' (...): the reload that the save started did not run`
+- **What to do:** Save again, or run `reload`. This failure was requested with the control command `inject-failure` (failure injection, a test facility; capability `fault-injection`). Repeat the operation without arming the stage (`{"stage":"none"}` disarms every stage).
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5983
+
+- **Cause:** (warning) Failure injection: a batch of saves ended without reaching a watch stage that was armed for it (for example `watch-reload` after `watch-change-detection` dropped the batch). The stage was disarmed: an arming of the group `watch` applies to one batch only and never carries over.
+- **Message:** `failure injection: the batch of saves did not reach the armed stage(s) <names>; disarmed (injection_disarmed)`
+- **What to do:** Arm the stage again before the save that should fail it.
+- **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
+
+### CML5984
+
+- **Cause:** Persistent arming (`inject-failure {"persist":true}`): the broker writes no log file, so there is no place next to it to keep the arming; or the state file `<log>.fault-injection.json` could not be written; or, at start, the file could not be used (not JSON, another version, an entry naming no stage of its side or with a bad count or pid). Nothing is armed in that case; a broken file is renamed to `<file>.bad`.
+- **Message:** `the arming of '<stage>' cannot be kept across a broker restart: this broker writes no log file to keep it next to`, `cannot write the failure-injection state file '<path>'`, or `the failure-injection state file '<path>' cannot be used (<why>); nothing was armed from it`
+- **What to do:** Start the broker with `--log FILE`, check that the log's directory is writable, or arm the stage without `persist`. After a broken file, arm the stages again.
 - **Raised by:** `core/cml_ipc/include/cml/ipc/fault_stages.h`
 
 ### CML5985

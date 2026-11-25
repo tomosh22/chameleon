@@ -5,6 +5,10 @@
 #              is the bug. From then on cell_store() faults on every frame. A helper thread calls maintain() every 10 ms.
 #              `--leave`: after a frame whose cell_store() returned 0 the application recovers by making the page accessible
 #              again (so the scenario that answers "leave function" faults exactly once).
+#              `--seh` (WP-44): the store runs under the application's own __try/__except. A fault the crash handler passes on (the
+#              failure-injection stage exception-hold) reaches it: the fixture prints `PASSED_ON n=<k> code=0xC0000005`, makes the page
+#              accessible again and carries on (`cell=-1` for that frame). Each new signal file makes the page inaccessible again
+#              (`ARMED again`), so one run can fault several times.
 #   logic.cpp  cell_store() (where the fault happens) and maintain() (what the edit fixes). The only TU the scenarios patch.
 #
 # Output: `TICK n=<k> cell=<v> armed=<0|1>` (v: the value read back from the page; 0 when the fault was left), `ARMED`
@@ -18,6 +22,10 @@
 cml_add_fixture(crash SOURCES main.cpp logic.cpp)
 
 add_test(NAME fixture.crash.runs COMMAND fixture_crash --ticks 3)
+add_test(NAME fixture.crash.runs_seh COMMAND fixture_crash --seh --ticks 3)
+set_tests_properties(fixture.crash.runs_seh PROPERTIES
+    PASS_REGULAR_EXPRESSION "TICK n=2 cell=102 armed=0"
+    TIMEOUT 30)
 set_tests_properties(fixture.crash.runs PROPERTIES
     PASS_REGULAR_EXPRESSION "TICK n=2 cell=102 armed=0"
     TIMEOUT 30)
