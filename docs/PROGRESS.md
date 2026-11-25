@@ -49,9 +49,11 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-39b | The broker reads the module file once (follow-up to WP-39) | 10 | done | wp/39b-module-read | #66 (46bf967) | ci 14/14 (PR 45440733449), corpus, fuzz, package green at 7b94c1f (42/42 checks) verified; pdb-benchmark job 138610804960: `PERF broker_peak_private_mib=587.2 limit_mib=851.2` (main 836.9), `WP39-RELOAD ... median 109.3 max_ms=813.2` (main max 1340.4). Medium review: nits only (pe::read_file_headers on corrupt files, a pre-existing harness leftover) |
 | WP-40 | Bind-planner pairing defects (R-48, R-50; ADR-0043) | 11 | in progress | wp/40-planner-pairing | — | — |
 | WP-41 | Corpus: an /arch:AVX2, unity-built, static-library project (R-06; ADR-0043) | 11 | in progress | wp/41-corpus-avx2-unity | — | — |
-| WP-42 | Corpus: a DLL-plugin architecture (R-06; ADR-0043) | 11 | in progress | wp/42-corpus-plugins | — | — |
-| WP-43 | Restart-hold follow-ups; failure injection in restart and revert (R-40, R-42; ADR-0043) | 11 | in progress | wp/43-restart-injection | — | — |
-| WP-44 | Failure injection in the crash handler and the watcher; persistent arming (R-42, R-49; ADR-0043) | 11 | todo | wp/44-injection-rest | — | starts when a wave-11 slot frees |
+| WP-42 | Corpus: a DLL-plugin architecture (R-06; ADR-0043) | 11 | done | wp/42-corpus-plugins | #70 (2e33ca6) | corpus 6/6 at ced5a04 (PR 45547023275) verified: `CORPUS-RESULT project=godot-gdextension compiler=msvc pass=18 expected_fail=3 fail=0 skipped=0`, `reload-budget: PASS 3 reloads, each within 3000 ms`. Found F-42.1..3 (edits lost on plugin reload / late load, patch path collision), asserted as expected failures with `match`; fixed by WP-45. Medium review, fixes re-checked |
+| WP-43 | Restart-hold follow-ups; failure injection in restart and revert (R-40, R-42; ADR-0043) | 11 | done | wp/43-restart-injection | #71 (4bf051f) | ci 14/14 at 6dec4de (push 45547613555, PR 45547619893), vs, fuzz, package green; verified in every ninja cell: `CMLTEST_RESULT scenario=restart_inject ... passed=54 failed=0`, `scenario=revert_inject ... passed=44 failed=0`, `WP10-REPEAT ... unit.agent_hook runs=25 passed=25 failed=0`. Two high reviews; the second (fix delta) found five fault-injection-build-only races, deferred to WP-44 as R-51 (ADR-0018). Found and fixed a use-after-free in test_dispatch's `ScopedVar` (the intermittent SIGSEGV) |
+| WP-44 | Failure injection in the crash handler and the watcher; persistent arming (R-42, R-49, R-51; ADR-0043) | 11 | in progress | wp/44-injection-rest | — | — |
+| WP-45 | Re-apply session edits to re-loaded and late-enabled modules (F-42.1..3; ADR-0043) | 11 | in progress | wp/45-module-reenable | — | — |
+| WP-46 | Planner coverage on unity builds (F-41.1..3; ADR-0043) | 11 | todo | wp/46-unity-planner | — | starts after WP-40 merges |
 
 ## Orchestrator integration work
 
@@ -142,3 +144,4 @@ ADR-0042. R-01, R-02, R-03, R-04, R-13 and the decoder part of R-41 are done. Co
 wave 11.
 
 **Wave 11 launched (2026-11-25):** WP-40..WP-43 under ADR-0043; WP-44 starts when the first of them merges.
+**Wave 11 progress (2026-11-25):** WP-43 (#71) and WP-42 (#70) merged; WP-45 and WP-44 launched into the freed slots; WP-46 waits for WP-40.
