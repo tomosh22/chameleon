@@ -2258,6 +2258,20 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 
 ## CML5600 to CML5699
 
+### CML5600
+
+- **Cause:** (warning) a module instance enabled after the session accepted edits for its sources (a DLL freed and loaded again, or a module a hot-restarted process enabled late) could not get those edits re-applied: the reload that re-applies them failed. The instance runs its original code.  
+- **Message:** `module '<...>' (process <...>) runs its original code: re-applying the session's edits of <files> failed: <the reload's diagnostic>`  
+- **What to do:** Fix the error and run `reload`; the edits stay pending until a reload applies them.  
+- **Raised by:** `broker/cml_core/include/cml/core/reenable_diag_ids.h`
+
+### CML5601
+
+- **Cause:** (warning) a module instance enabled after the session accepted edits for its sources could not get those edits re-applied because its PDB index failed. The instance runs its original code.  
+- **Message:** `module '<...>' (process <...>) runs its original code: the session's edits of <files> were not re-applied because its PDB index failed: <the index's diagnostic>`  
+- **What to do:** Fix what the index diagnostic says, then run `reload` (or load the module again).  
+- **Raised by:** `broker/cml_core/include/cml/core/reenable_diag_ids.h`
+
 ### CML5650
 
 - **Cause:** a hook record points outside its image: skipped.  
