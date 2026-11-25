@@ -1343,7 +1343,12 @@ not the same as in the old image"; F-41.3, under clang-cl the implicit destructo
 ambiguous overload. **Decision:** after WP-40 merges (it brings the code-equivalence pairing of lambdas that F-41.2 needs),
 a planner package makes these pair correctly or narrows the refusal to the members that are really ambiguous, under ADR-0042's
 rule that a wrong pairing is never acceptable. Review: high. Range CML3630–3649. Acceptance: the Jolt cells' F-41.n
-expected failures flip to pass. Queue order: WP-45, WP-46, then WP-44.
+expected failures flip to pass.
+**Amended (WP-40 last round):** WP-46 also closes R-54: under clang-cl -O2 a lambda inlined everywhere leaves no
+`operator()` procedure, so when an edit deletes it and declares a static of its static's name in the caller, the old record
+still pairs by name. WP-46 may extend `core/cml_pdb` for this (a lazy by-name lookup of closure classes in the TPI, or the
+caller's inline sites) and refuses (CML3207) where the old function had a lambda whose statics it cannot rule out. This gap
+predates WP-40 and does not hold its merge. Queue order: WP-45, WP-46, then WP-44.
 
 ### Shared files and merge order
 
