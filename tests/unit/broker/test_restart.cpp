@@ -20,11 +20,18 @@
 #include "cml/core/agent_link.h"
 #include "cml/core/control_server.h"
 #include "cml/core/event_bus.h"
+#include "cml/core/fault_injection.h"
 #include "cml/core/reload_service.h"
 #include "cml/core/restart_diag_ids.h"
 #include "cml/core/session.h"
 #include "cml/util/log.h"
 #include "doctest.h"
+
+#if defined(_WIN32)
+#include <windows.h>
+
+#include <cwchar>
+#endif
 
 using namespace cml;
 using namespace cml::core;
@@ -175,11 +182,14 @@ public:
     Result<std::uint32_t> relaunch(const RelaunchSpec& spec) override;
     std::optional<std::uint32_t> relaunched_exit_code() override;
     Result<void> resume() override;  // WP-34
+    bool relaunch_created_process() const override { return created_on_failure_; }  // WP-43
 
 private:
     Rig& rig_;
     bool suspended_ = false;  // created suspended and not resumed yet: the new process has not "run" (it does not register)
     RelaunchSpec spec_;
+    std::uint32_t pid_ = 0;   // WP-43: the pid relaunch() handed out (200, then 201, ... for chained restarts)
+    bool created_on_failure_ = false;  // WP-43: the last failed relaunch() had created a process (and terminated it)
 };
 
 class FakeHost final : public ProcessHost {
@@ -188,6 +198,7 @@ public:
     Result<std::unique_ptr<RestartableProcess>> open(std::uint32_t pid, const std::uint64_t std_handles[3], std::uint32_t info_flags,
                                                      std::vector<Diag>* warnings) override;
     bool supports_hold() const override;
+    bool has_exited(std::uint32_t pid) const override;  // WP-43
 
 private:
     Rig& rig_;
@@ -221,6 +232,16 @@ struct Rig {
     std::atomic<int> destroyed_suspended{0};  // a process object destroyed while still suspended: the coordinator did not resume it itself
     std::atomic<bool> agent_started{false};   // the new process "ran" (registered an agent)
     std::vector<ipc::RestartModule> reported_modules{{1, kExe}, {1, kDll}};
+    // WP-43
+    bool refused_after_hooks = false;       // with prepare_status: the refusal says the hooks ran (stage pre-restart-hooks)
+    int fail_launch_times = 0;              // the first N relaunch() calls fail before a process exists (the broker tries twice)
+    bool fail_launch_after_create = false;  // the first relaunch() creates the process, a later step fails, the host terminates it
+    int launch_calls = 0;
+    int resume_delay_ms = 0;                // resume() takes this long (the restart thread confirms late)
+    std::atomic<std::uint32_t> next_pid{200};  // the pid of the next relaunched process
+    std::uint64_t next_agent_id = 2;
+    std::vector<std::shared_ptr<SimAgent>> new_agents;  // every relaunched process's agent (new_agent is the newest)
+    std::set<std::uint32_t> exited;         // processes the fake host reports as exited (ProcessHost::has_exited)
 
     // what happened
     std::mutex mutex;
@@ -270,6 +291,13 @@ struct Rig {
         if (restart == nullptr || !answer_prepare) {
             return;
         }
+        answer_restart(*old_agent, *restart, reported_modules);
+    }
+
+    // The answer of an agent to Restart. WP-43: a relaunched process can be restarted again (chained restarts); its agent reports no
+    // modules of its own (the broker then uses its list of what is enabled in that process).
+    void answer_restart(SimAgent& agent, const ipc::Restart& request, const std::vector<ipc::RestartModule>& modules) {
+        const ipc::Restart* restart = &request;
         if (during_prepare) {
             during_prepare();
         }
@@ -279,6 +307,7 @@ struct Rig {
         info.status = prepare_status;
         if (prepare_status != 0) {
             info.message = "no launch information";
+            info.hooks_run = refused_after_hooks ? hooks_run : 0;  // WP-43: the stage pre-restart-hooks refuses after the hooks ran
         } else {
             info.hooks_run = hooks_run;
             info.image_path = u"C:\\app\\game.exe";
@@ -289,20 +318,24 @@ struct Rig {
             info.std_input = 4;
             info.std_output = 8;
             info.std_error = 8;
-            info.modules = reported_modules;
+            info.modules = modules;
         }
         if (prepare_delay_ms > 0) {
             // A slow application: the answer comes later, from another thread, like a SyncPoint() that is reached late.
-            threads.emplace_back([this, info, delay = prepare_delay_ms] {
+            threads.emplace_back([&agent, info, delay = prepare_delay_ms] {
                 std::this_thread::sleep_for(std::chrono::milliseconds(delay));
-                old_agent->to_broker(info);
+                agent.to_broker(info);
             });
             return;
         }
-        old_agent->to_broker(info);
+        agent.to_broker(info);
     }
 
-    void new_handles(const ipc::Message& m) {
+    void new_handles(SimAgent& agent, const ipc::Message& m) {
+        if (const auto* restart = std::get_if<ipc::Restart>(&m)) {
+            answer_restart(agent, *restart, {});
+            return;
+        }
         const auto* ask = std::get_if<ipc::ReenableModules>(&m);
         if (ask == nullptr) {
             return;
@@ -317,15 +350,15 @@ struct Rig {
         // Like the real agent: each module becomes an EnableModule request of the application, then Reply.
         for (const ipc::RestartModule& module : ask->modules) {
             ipc::EnableModule enable;
-            enable.request_id = new_agent->next_request();
+            enable.request_id = agent.next_request();
             enable.options = module.options;
             enable.path = module.path;
-            new_agent->to_broker(enable);
+            agent.to_broker(enable);
         }
         ipc::Reply reply;
         reply.request_id = ask->request_id;
         reply.message = "queued";
-        new_agent->to_broker(reply);
+        agent.to_broker(reply);
     }
 
     // The relaunched process: registers after a moment, with the token from its environment.
@@ -348,10 +381,17 @@ struct Rig {
             spoof_agent = std::make_shared<SimAgent>(service, 9);
             spoof_agent->register_process(spoof_pid, token, {kExe}, {kExe});
         }
-        threads.emplace_back([this, pid, token] {
+        std::shared_ptr<SimAgent> agent;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            agent = std::make_shared<SimAgent>(service, next_agent_id++);
+            new_agents.push_back(agent);
+        }
+        SimAgent* raw = agent.get();
+        agent->on_request = [this, raw](const ipc::Message& m) { new_handles(*raw, m); };
+        threads.emplace_back([this, pid, token, agent] {
             std::this_thread::sleep_for(std::chrono::milliseconds(register_delay_ms));
-            new_agent = std::make_shared<SimAgent>(service, 2);
-            new_agent->on_request = [this](const ipc::Message& m) { new_handles(m); };
+            new_agent = agent;
             std::vector<std::string> enable;
             if (app_enables_exe) {
                 enable.push_back(kExe);
@@ -359,7 +399,7 @@ struct Rig {
             if (app_enables_dll) {
                 enable.push_back(kDll);
             }
-            new_agent->register_process(pid, token, {kExe, kDll, kOther}, enable);
+            agent->register_process(pid, token, {kExe, kDll, kOther}, enable);
         });
     }
 };
@@ -374,20 +414,28 @@ Result<void> FakeProcess::terminate(std::uint32_t) {
 
 Result<std::uint32_t> FakeProcess::relaunch(const RelaunchSpec& spec) {
     rig_.note(spec.suspended ? "relaunch suspended" : "relaunch");
-    if (rig_.fail_launch) {
+    ++rig_.launch_calls;
+    created_on_failure_ = false;
+    if (rig_.fail_launch || rig_.launch_calls <= rig_.fail_launch_times) {
         return Diag::make(restart::diag::kLaunchFailed, "CreateProcessW failed", "x");
+    }
+    if (rig_.fail_launch_after_create && rig_.launch_calls == 1) {
+        rig_.note("terminate created");  // what a host does when a step after CreateProcess fails: no process is left behind
+        created_on_failure_ = true;
+        return Diag::make(restart::diag::kLaunchFailed, "a step after CreateProcessW failed", "x");
     }
     {
         std::lock_guard<std::mutex> lock(rig_.mutex);
         rig_.relaunched = spec;
     }
+    pid_ = rig_.next_pid++;
     if (spec.suspended) {
         suspended_ = true;  // nothing runs: the process starts (and registers) when it is resumed
         spec_ = spec;
-        return 200u;
+        return pid_;
     }
-    rig_.start_new_process(spec, 200);
-    return 200u;
+    rig_.start_new_process(spec, pid_);
+    return pid_;
 }
 
 std::optional<std::uint32_t> FakeProcess::relaunched_exit_code() {
@@ -403,12 +451,15 @@ Result<void> FakeProcess::resume() {
     }
     suspended_ = false;
     rig_.note("resume");
+    if (rig_.resume_delay_ms > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(rig_.resume_delay_ms));
+    }
     if (rig_.fail_resume) {
         return Diag::make(restart::diag::kResumeFailed, "ResumeThread failed (Win32 error 5); the process was terminated instead of being left suspended", "x");
     }
     ++rig_.resumes;
     rig_.agent_started = true;
-    rig_.start_new_process(spec_, 200);
+    rig_.start_new_process(spec_, pid_);
     return Result<void>();
 }
 
@@ -421,6 +472,11 @@ FakeProcess::~FakeProcess() {
 
 bool FakeHost::supports_hold() const {
     return rig_.hold_supported;
+}
+
+bool FakeHost::has_exited(std::uint32_t pid) const {
+    std::lock_guard<std::mutex> lock(rig_.mutex);
+    return rig_.exited.count(pid) != 0;
 }
 
 Result<std::unique_ptr<RestartableProcess>> FakeHost::open(std::uint32_t pid, const std::uint64_t std_handles[3], std::uint32_t info_flags,
@@ -1175,3 +1231,617 @@ TEST_CASE("restart hold: the control commands, the capability and the opt-in eve
     CHECK_FALSE(reply->get_bool("ok"));
     CHECK(reply->find("diag")->get_string("id") == "CML5814");
 }
+
+// ---- WP-43 (R-40): the WP-34 review follow-ups -----------------------------------------------------------------------------------
+
+namespace {
+
+bool has_diag(Rig& rig, const std::string& severity, const std::string& id, const std::string& text = std::string()) {
+    std::lock_guard<std::mutex> lock(rig.events->mutex);
+    for (const Event& e : rig.events->events) {
+        if (e.name == "diag" && e.body.get_string("severity") == severity && e.body.get_string("id") == id &&
+            (text.empty() || e.body.get_string("message").find(text) != std::string::npos)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[maybe_unused]] std::int64_t diag_pid(Rig& rig, const std::string& id) {  // only the injection tests use it
+    std::lock_guard<std::mutex> lock(rig.events->mutex);
+    for (const Event& e : rig.events->events) {
+        if (e.name == "diag" && e.body.get_string("id") == id) {
+            return e.body.get_integer("pid");
+        }
+    }
+    return -1;
+}
+
+bool logged_contains(Rig& rig, const std::string& line) {
+    const std::vector<std::string> log = rig.logged();
+    return std::find(log.begin(), log.end(), line) != log.end();
+}
+
+long long ms_since(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t).count();
+}
+
+}  // namespace
+
+TEST_CASE("restart hold (R-40): a restart-resume that arrives as the hold ends is never answered resumed:true next to CML5813") {
+    // The restart thread has decided that hold_ms expired (trace "hold-ending") when restart-resume arrives. Whichever takes the hold's
+    // mutex first decides; here the request gets it first, so the hold ends as requested: resumed:true, and no CML5813.
+    QuietLogs quiet;
+    Rig rig;
+    rig.hold_supported = true;
+    std::optional<Result<Value>> answer;
+    std::thread resumer;
+    rig.service.set_restart_trace_for_testing([&](const std::string& step) {
+        if (step == "hold-ending") {
+            resumer = std::thread([&] { answer.emplace(rig.service.restart_resume(pid_args(200))); });
+            // The request has taken the hold's mutex and is waiting for the confirmation.
+            CHECK(wait_until([&] { return rig.service.restart_coordinator_for_testing()->resume_requested_for_testing(200); }));
+        }
+    });
+    Result<Value> result = rig.service.restart(hold_args(100));
+    REQUIRE(resumer.joinable());
+    resumer.join();
+    REQUIRE_MESSAGE(result.has_value(), result.error().format());
+    REQUIRE(answer.has_value());
+    REQUIRE_MESSAGE(answer->has_value(), answer->error().format());
+    CHECK((*answer)->get_bool("resumed"));
+    CHECK_FALSE(has_warning(rig, "CML5813"));
+    CHECK(rig.resumes.load() == 1);
+    CHECK(rig.destroyed_suspended.load() == 0);
+}
+
+TEST_CASE("restart hold (R-40): a restart-resume that comes after the hold ended is CML5814 with the reason, and the expiry is CML5813") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.hold_supported = true;
+    Result<Value> result = rig.service.restart(hold_args(100));
+    REQUIRE_MESSAGE(result.has_value(), result.error().format());
+    CHECK(has_warning(rig, "CML5813"));
+    Result<Value> late = rig.service.restart_resume(pid_args(200));
+    REQUIRE_FALSE(late.has_value());
+    CHECK(late.error().code == restart::diag::kNotHeld);
+    CHECK(late.error().message.find("hold_ms expired") != std::string::npos);
+}
+
+TEST_CASE("restart hold (R-40): a resume the restart does not confirm in time is CML5820, not CML5817 (nothing failed)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.hold_supported = true;
+    rig.resume_delay_ms = 600;  // ResumeThread is slow: the restart thread confirms after the wait of restart-resume
+    rig.service.restart_coordinator_for_testing()->set_resume_confirm_wait_for_testing(std::chrono::milliseconds(100));
+    HeldRestart restart(rig, hold_args(30000));
+    REQUIRE(wait_until([&] { return is_held(rig); }));
+    Result<Value> resumed = rig.service.restart_resume(pid_args(200));
+    REQUIRE_FALSE(resumed.has_value());
+    CHECK(resumed.error().code == restart::diag::kResumeUnconfirmed);
+    CHECK(resumed.error().id() == "CML5820");
+    CHECK(resumed.error().message.find("still requested") != std::string::npos);
+    Result<Value>& result = restart.join();
+    REQUIRE_MESSAGE(result.has_value(), result.error().format());  // the process was resumed after all, and registered
+    CHECK(rig.resumes.load() == 1);
+    CHECK(rig.destroyed_suspended.load() == 0);
+    CHECK_FALSE(has_warning(rig, "CML5813"));  // the request counted
+}
+
+TEST_CASE("restart hold (R-40): replacing the process host while a process is held does not strand it") {
+    QuietLogs quiet;
+    SUBCASE("restart-resume reaches the restart that holds the process") {
+        Rig rig;
+        rig.hold_supported = true;
+        HeldRestart restart(rig, hold_args(30000));
+        REQUIRE(wait_until([&] { return is_held(rig); }));
+        rig.service.set_process_host(std::make_shared<FakeHost>(rig));
+        Result<Value> resumed = rig.service.restart_resume(pid_args(200));
+        REQUIRE_MESSAGE(resumed.has_value(), resumed.error().format());
+        CHECK(resumed->get_bool("resumed"));
+        Result<Value>& result = restart.join();
+        REQUIRE_MESSAGE(result.has_value(), result.error().format());
+        CHECK_FALSE(has_warning(rig, "CML5813"));
+        CHECK(rig.destroyed_suspended.load() == 0);
+    }
+    SUBCASE("with the host removed, restart-resume over the control pipe still reaches it, and the restart capability goes") {
+        Rig rig;
+        rig.hold_supported = true;
+        ControlContext context;
+        context.service = &rig.service;
+        HeldRestart restart(rig, hold_args(30000));
+        REQUIRE(wait_until([&] { return is_held(rig); }));
+        rig.service.set_process_host(nullptr);
+        const std::vector<std::string> caps = broker_capabilities(context);
+        CHECK(std::find(caps.begin(), caps.end(), "restart") == caps.end());
+        Result<ipc::json::Value> reply = ipc::json::parse(handle_control_line(R"({"id":1,"cmd":"restart-resume","args":{"pid":200}})", context));
+        REQUIRE(reply.has_value());
+        CHECK_MESSAGE(reply->get_bool("ok"), ipc::json::serialize(*reply));
+        Result<Value>& result = restart.join();
+        REQUIRE_MESSAGE(result.has_value(), result.error().format());
+        Result<Value> refused = rig.service.restart(args_for(200, 1000));
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().code == restart::diag::kUnavailable);
+    }
+    SUBCASE("a shutdown after the host was replaced resumes the held process") {
+        Rig rig;
+        rig.hold_supported = true;
+        HeldRestart restart(rig, hold_args(30000));
+        REQUIRE(wait_until([&] { return is_held(rig); }));
+        rig.service.set_process_host(std::make_shared<FakeHost>(rig));
+        const auto cancelled = std::chrono::steady_clock::now();
+        rig.service.cancel();
+        Result<Value>& result = restart.join();
+        CHECK(ms_since(cancelled) < 5000);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().code == restart::diag::kHoldAborted);
+        CHECK(rig.resumes.load() == 1);
+        CHECK(rig.destroyed_suspended.load() == 0);
+    }
+}
+
+TEST_CASE("restart (R-40): a broker that shuts down does not wait for the new process to register, held or not") {
+    QuietLogs quiet;
+    SUBCASE("held: resumed, then the shutdown comes during the registration") {
+        Rig rig;
+        rig.hold_supported = true;
+        rig.new_registers = false;
+        HeldRestart restart(rig, hold_args(30000, 20000));  // a registration budget of 20 s
+        REQUIRE(wait_until([&] { return is_held(rig); }));
+        REQUIRE(rig.service.restart_resume(pid_args(200)).has_value());
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const auto cancelled = std::chrono::steady_clock::now();
+        rig.service.cancel();
+        Result<Value>& result = restart.join();
+        CHECK(ms_since(cancelled) < 3000);  // not the 20 s of the registration budget
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().code == restart::diag::kShutdown);
+        CHECK(result.error().message.find("left running") != std::string::npos);
+        CHECK(rig.destroyed_suspended.load() == 0);
+    }
+    SUBCASE("not held") {
+        Rig rig;
+        rig.new_registers = false;
+        HeldRestart restart(rig, args_for(100, 10000, 20000));
+        REQUIRE(wait_until([&] { return logged_contains(rig, "relaunch"); }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const auto cancelled = std::chrono::steady_clock::now();
+        rig.service.cancel();
+        Result<Value>& result = restart.join();
+        CHECK(ms_since(cancelled) < 3000);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().code == restart::diag::kShutdown);
+    }
+    SUBCASE("before the termination: nothing is terminated") {
+        Rig rig;
+        rig.during_prepare = [&] { rig.service.cancel(); };
+        Result<Value> result = rig.service.restart(args_for(100, 10000));
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().code == restart::diag::kShutdown);
+        CHECK(result.error().message.find("not touched") != std::string::npos);
+        CHECK_FALSE(logged_contains(rig, "terminate"));
+    }
+}
+
+#if defined(_WIN32)
+namespace {
+
+struct LogCapture {
+    static void sink(void* user, LogLevel level, const char*, int, const char* message) {
+        auto* self = static_cast<LogCapture*>(user);
+        std::lock_guard<std::mutex> lock(self->mutex);
+        self->lines.emplace_back(level, message);
+    }
+    LogCapture() : previous(log_level()) {
+        set_log_level(LogLevel::Debug);
+        set_log_sink(&LogCapture::sink, this);
+    }
+    ~LogCapture() {
+        set_log_sink(nullptr, nullptr);
+        set_log_level(previous);
+    }
+    bool has(LogLevel level, const std::string& text) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return std::any_of(lines.begin(), lines.end(),
+                           [&](const std::pair<LogLevel, std::string>& l) { return l.first == level && l.second.find(text) != std::string::npos; });
+    }
+    LogLevel previous;
+    std::mutex mutex;
+    std::vector<std::pair<LogLevel, std::string>> lines;
+};
+
+}  // namespace
+
+TEST_CASE("restart hold (R-40): the watchdog's executable, and a warning in the log when GetModuleFileNameW fails") {
+    const auto fixed = [](const wchar_t* path) {
+        return [path](wchar_t* buffer, unsigned long capacity) -> unsigned long {
+            const std::size_t n = std::wcslen(path);
+            if (n >= capacity) {
+                return capacity;  // truncated, as GetModuleFileNameW reports it
+            }
+            std::wmemcpy(buffer, path, n + 1);
+            return static_cast<unsigned long>(n);
+        };
+    };
+    {
+        LogCapture log;
+        const std::optional<std::wstring> exe = hold_watchdog_executable(fixed(L"C:\\tools\\CML_Broker.exe"));
+        REQUIRE(exe.has_value());
+        CHECK(*exe == L"C:\\tools\\CML_Broker.exe");
+    }
+    {
+        LogCapture log;
+        const std::optional<std::wstring> exe = hold_watchdog_executable([](wchar_t*, unsigned long) -> unsigned long {
+            SetLastError(ERROR_ACCESS_DENIED);
+            return 0;
+        });
+        CHECK_FALSE(exe.has_value());
+        CHECK(log.has(LogLevel::Warn, "GetModuleFileNameW failed (Win32 error 5)"));  // before WP-43 nothing was logged
+    }
+    {
+        LogCapture log;
+        const std::optional<std::wstring> exe = hold_watchdog_executable([](wchar_t*, unsigned long capacity) -> unsigned long {
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            return capacity;
+        });
+        CHECK_FALSE(exe.has_value());
+        CHECK(log.has(LogLevel::Warn, "does not fit"));
+    }
+    {
+        LogCapture log;
+        const std::optional<std::wstring> exe = hold_watchdog_executable(fixed(L"C:\\work\\cml_test_broker_core.exe"));
+        CHECK_FALSE(exe.has_value());
+        CHECK(log.has(LogLevel::Debug, "not cml_broker.exe"));
+        CHECK_FALSE(log.has(LogLevel::Warn, "watchdog"));
+    }
+}
+#endif
+
+// ---- WP-43 (R-42): failure injection in the restart -----------------------------------------------------------------------------
+// Each stage fails once through the restart's own error path. Before the old process is terminated the process is left untouched with
+// a clear diagnostic; after it, a new process runs. A normal restart after it succeeds, and does what the failed one could not.
+
+TEST_CASE("restart injection: pre-restart-hooks (agent): the refusal after the hooks says how many ran, the process is not touched") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.prepare_status = ipc::fault::ids::kAgentPreRestartHooks;
+    rig.refused_after_hooks = true;
+    Result<Value> result = rig.service.restart(args_for(100, 10000));
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().code == restart::diag::kPrepareFailed);
+    CHECK(result.error().message.find("CML4657") != std::string::npos);
+    CHECK(result.error().message.find("3 pre-restart hook(s) ran") != std::string::npos);
+    CHECK(result.error().message.find("not touched") != std::string::npos);
+    CHECK(rig.logged().empty());  // not opened, not terminated
+    rig.prepare_status = 0;
+    Result<Value> again = rig.service.restart(args_for(100, 10000));
+    REQUIRE_MESSAGE(again.has_value(), again.error().format());
+}
+
+#if defined(CML_FAULT_INJECTION)  // the broker's stages arm only in a build with failure injection (ADR-0035)
+TEST_CASE("restart injection: restart-terminate fails before the termination; the next restart works") {
+    QuietLogs quiet;
+    Rig rig;
+    REQUIRE(rig.service.faults().arm(ipc::fault::Stage::RestartTerminate, 1, std::nullopt).has_value());
+    Result<Value> result = rig.service.restart(args_for(100, 10000));
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().id() == "CML5972");
+    CHECK(result.error().message.find("was not terminated") != std::string::npos);
+    CHECK(result.error().message.find("3 pre-restart hook(s) ran") != std::string::npos);
+    CHECK(rig.logged() == std::vector<std::string>{"open pid=100 handles=4,8,8"});
+    CHECK(has_error(rig, "CML5972"));
+    CHECK(diag_pid(rig, "CML5972") == 100);
+    Result<Value> again = rig.service.restart(args_for(100, 10000));
+    REQUIRE_MESSAGE(again.has_value(), again.error().format());
+    CHECK(again->get_integer("new_pid") == 200);
+}
+#endif
+
+#if defined(CML_FAULT_INJECTION)  // the broker's stages arm only in a build with failure injection (ADR-0035)
+TEST_CASE("restart injection: restart-relaunch fails the first start; the second starts the new process") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.service.restart_coordinator_for_testing()->set_relaunch_retry_delay_for_testing(std::chrono::milliseconds(1));
+    REQUIRE(rig.service.faults().arm(ipc::fault::Stage::RestartRelaunch, 1, std::nullopt).has_value());
+    Result<Value> result = rig.service.restart(args_for(100, 10000));
+    REQUIRE_MESSAGE(result.has_value(), result.error().format());
+    CHECK(result->get_integer("new_pid") == 200);
+    CHECK(has_diag(rig, "warning", "CML5973", "trying once more"));
+    CHECK(rig.launch_calls == 1);  // the injected failure took the place of the first attempt
+    CHECK(rig.service.faults().armed(ipc::fault::Stage::RestartRelaunch) == 0);
+}
+#endif
+
+TEST_CASE("restart: a real failure of the first start is tried once more (CML5822); two failures are CML5807") {
+    QuietLogs quiet;
+    {
+        Rig rig;
+        rig.service.restart_coordinator_for_testing()->set_relaunch_retry_delay_for_testing(std::chrono::milliseconds(1));
+        rig.fail_launch_times = 1;
+        Result<Value> result = rig.service.restart(args_for(100, 10000));
+        REQUIRE_MESSAGE(result.has_value(), result.error().format());
+        CHECK(rig.launch_calls == 2);
+        CHECK(has_diag(rig, "warning", "CML5822", "CML5807"));
+    }
+    {
+        Rig rig;
+        rig.service.restart_coordinator_for_testing()->set_relaunch_retry_delay_for_testing(std::chrono::milliseconds(1));
+        rig.fail_launch_times = 2;
+        Result<Value> result = rig.service.restart(args_for(100, 10000));
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().code == restart::diag::kLaunchFailed);
+        CHECK(result.error().message.find("2 attempts") != std::string::npos);
+        CHECK(rig.launch_calls == 2);
+    }
+}
+
+#if defined(CML_FAULT_INJECTION)  // the broker's stages arm only in a build with failure injection (ADR-0035)
+TEST_CASE("restart injection: restart-hold resumes the new process at once, without `restarting`") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.hold_supported = true;
+    REQUIRE(rig.service.faults().arm(ipc::fault::Stage::RestartHold, 1, std::nullopt).has_value());
+    // The process is restarted with hold_new: the hold cannot be kept.
+    Value held = hold_args(30000);
+    const auto start = std::chrono::steady_clock::now();
+    Result<Value> result = rig.service.restart(held);
+    REQUIRE_MESSAGE(result.has_value(), result.error().format());
+    CHECK(ms_since(start) < 10000);  // not held for 30 s
+    CHECK(result->get_integer("new_pid") == 200);
+    CHECK(result->find("injection_disarmed") == nullptr);  // it fired
+    CHECK(rig.events->named("restarting").empty());
+    CHECK(has_diag(rig, "warning", "CML5974", "resumed at once"));
+    CHECK(rig.resumes.load() == 1);
+    CHECK(rig.destroyed_suspended.load() == 0);
+    Result<Value> late = rig.service.restart_resume(pid_args(200));
+    REQUIRE_FALSE(late.has_value());
+    CHECK(late.error().code == restart::diag::kNotHeld);
+    CHECK(late.error().message.find("could not be kept") != std::string::npos);
+}
+#endif
+
+#if defined(CML_FAULT_INJECTION)  // the broker's stages arm only in a build with failure injection (ADR-0035)
+TEST_CASE("restart injection: restart-registration leaves the new process running; its next restart enables its modules again") {
+    QuietLogs quiet;
+    Rig rig;
+    REQUIRE(rig.service.faults().arm(ipc::fault::Stage::RestartRegistration, 1, std::nullopt).has_value());
+    Result<Value> result = rig.service.restart(args_for(100, 10000));
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().id() == "CML5975");
+    CHECK(result.error().message.find("left running") != std::string::npos);
+    CHECK(diag_pid(rig, "CML5975") == 200);  // the diag event names the new process
+    CHECK(rig.service.restart_coordinator_for_testing()->has_unfinished_for_testing(200));
+    // The new process registers by itself (it enables game.exe, not plugin.dll: nobody asked it to).
+    REQUIRE(wait_until([&] { return rig.service.link_for_pid(200) != nullptr; }));
+    {
+        std::lock_guard<std::mutex> lock(rig.mutex);
+        CHECK(rig.reenable_requests == 0);
+    }
+    // The next restart of it asks for the module the failed one could not enable.
+    Result<Value> again = rig.service.restart(args_for(200, 10000));
+    REQUIRE_MESSAGE(again.has_value(), again.error().format());
+    CHECK(again->get_integer("new_pid") == 201);
+    CHECK(again->find("not_enabled")->items().empty());
+    {
+        std::lock_guard<std::mutex> lock(rig.mutex);
+        CHECK(rig.reenable_requests == 1);
+        REQUIRE(rig.reenabled.size() == 1);
+        CHECK(rig.reenabled[0].path == kDll);
+        CHECK(rig.reenabled[0].options == 1);  // with the options the application gave the first time
+    }
+    CHECK_FALSE(rig.service.restart_coordinator_for_testing()->has_unfinished_for_testing(200));
+}
+#endif
+
+#if defined(CML_FAULT_INJECTION)  // the broker's stages arm only in a build with failure injection (ADR-0035)
+TEST_CASE("restart injection: what an unfinished restart left is kept when the next restart is refused before the termination") {
+    QuietLogs quiet;
+    Rig rig;
+    REQUIRE(rig.service.faults().arm(ipc::fault::Stage::RestartRegistration, 1, std::nullopt).has_value());
+    REQUIRE_FALSE(rig.service.restart(args_for(100, 10000)).has_value());
+    REQUIRE(wait_until([&] { return rig.service.link_for_pid(200) != nullptr; }));
+    REQUIRE(rig.service.faults().arm(ipc::fault::Stage::RestartTerminate, 1, std::nullopt).has_value());
+    Result<Value> refused = rig.service.restart(args_for(200, 10000));
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().id() == "CML5972");
+    CHECK(rig.service.restart_coordinator_for_testing()->has_unfinished_for_testing(200));  // process 200 still runs: still its record
+    Result<Value> again = rig.service.restart(args_for(200, 10000));
+    REQUIRE_MESSAGE(again.has_value(), again.error().format());
+    CHECK_FALSE(rig.service.restart_coordinator_for_testing()->has_unfinished_for_testing(200));
+    std::lock_guard<std::mutex> lock(rig.mutex);
+    REQUIRE(rig.reenabled.size() == 1);
+    CHECK(rig.reenabled[0].path == kDll);
+}
+#endif
+
+TEST_CASE("restart: a new process that registers too late is remembered like an injected registration failure") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.register_delay_ms = 700;
+    Result<Value> result = rig.service.restart(args_for(100, 10000, 200));
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().code == restart::diag::kNoRegistration);
+    CHECK(rig.service.restart_coordinator_for_testing()->has_unfinished_for_testing(200));
+    REQUIRE(wait_until([&] { return rig.service.link_for_pid(200) != nullptr; }));
+    rig.register_delay_ms = 40;
+    Result<Value> again = rig.service.restart(args_for(200, 10000));
+    REQUIRE_MESSAGE(again.has_value(), again.error().format());
+    std::lock_guard<std::mutex> lock(rig.mutex);
+    REQUIRE(rig.reenabled.size() == 1);
+    CHECK(rig.reenabled[0].path == kDll);
+}
+
+#if defined(CML_FAULT_INJECTION)  // the broker's stages arm only in a build with failure injection (ADR-0035)
+TEST_CASE("restart injection: restart-reenable does not ask the new process; the module is reported and its next restart asks") {
+    QuietLogs quiet;
+    Rig rig;
+    REQUIRE(rig.service.faults().arm(ipc::fault::Stage::RestartReenable, 1, std::nullopt).has_value());
+    Result<Value> result = rig.service.restart(args_for(100, 10000));
+    REQUIRE_MESSAGE(result.has_value(), result.error().format());  // the new process runs; the restart reports what it could not do
+    const Value* not_enabled = result->find("not_enabled");
+    REQUIRE(not_enabled != nullptr);
+    REQUIRE(not_enabled->items().size() == 1);
+    CHECK(not_enabled->items()[0].as_string() == kDll);
+    CHECK(has_diag(rig, "warning", "CML5976", "was not sent"));
+    CHECK(has_diag(rig, "warning", "CML5809", "next `restart`"));
+    {
+        std::lock_guard<std::mutex> lock(rig.mutex);
+        CHECK(rig.reenable_requests == 0);
+    }
+    CHECK(rig.service.restart_coordinator_for_testing()->has_unfinished_for_testing(200));
+    Result<Value> again = rig.service.restart(args_for(200, 10000));
+    REQUIRE_MESSAGE(again.has_value(), again.error().format());
+    CHECK(again->find("not_enabled")->items().empty());
+    std::lock_guard<std::mutex> lock(rig.mutex);
+    CHECK(rig.reenable_requests == 1);
+    REQUIRE(rig.reenabled.size() == 1);
+    CHECK(rig.reenabled[0].path == kDll);
+}
+#endif
+
+#if defined(CML_FAULT_INJECTION)  // the broker's stages arm only in a build with failure injection (ADR-0035)
+TEST_CASE("restart injection: an armed stage fires only for the pid it was armed for, and the restart stages are listed in order") {
+    QuietLogs quiet;
+    Rig rig;
+    REQUIRE(rig.service.faults().arm(ipc::fault::Stage::RestartTerminate, 1, 4242u).has_value());
+    Result<Value> result = rig.service.restart(args_for(100, 10000));
+    REQUIRE_MESSAGE(result.has_value(), result.error().format());
+    CHECK(rig.service.faults().armed(ipc::fault::Stage::RestartTerminate) == 1);
+    const Value stages = fault_stages();
+    std::vector<std::string> restart_group;
+    for (const Value& d : stages.find("details")->items()) {
+        if (d.get_string("group") == "restart") {
+            restart_group.push_back(d.get_string("name"));
+        }
+    }
+    CHECK(restart_group == std::vector<std::string>{"pre-restart-hooks", "restart-terminate", "restart-relaunch", "restart-hold", "restart-registration",
+                                                     "restart-reenable", "restart-reapply"});
+}
+#endif
+
+// ---- WP-43: what is retried, and what an unfinished restart's record applies to --------------------------------------------------
+
+TEST_CASE("restart: an attempt that created the new process and then failed is never repeated (no second copy)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.service.restart_coordinator_for_testing()->set_relaunch_retry_delay_for_testing(std::chrono::milliseconds(1));
+    rig.fail_launch_after_create = true;
+    Result<Value> result = rig.service.restart(args_for(100, 10000));
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().code == restart::diag::kLaunchFailed);
+    CHECK(result.error().message.find("no second attempt") != std::string::npos);
+    CHECK(rig.launch_calls == 1);                      // retried only when no process was created (see the CML5822 test)
+    CHECK(logged_contains(rig, "terminate created"));  // the host did not leave the created process behind
+    CHECK_FALSE(has_warning(rig, "CML5822"));
+}
+
+TEST_CASE("restart: an unfinished restart's record is dropped when that process has exited, not when only its pipe dropped") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.register_delay_ms = 700;  // registers after the budget: the restart ends with CML5808 and leaves the record (no injection needed)
+    REQUIRE_FALSE(rig.service.restart(args_for(100, 10000, 200)).has_value());
+    REQUIRE(wait_until([&] { return rig.service.link_for_pid(200) != nullptr; }));
+    CHECK(rig.service.restart_coordinator_for_testing()->has_unfinished_for_testing(200));
+    // The pipe drops while process 200 runs (the agent reconnects later): the record stays.
+    rig.service.detach(rig.service.link_for_pid(200)->agent_id());  // what the connection server does when the pipe ends
+    CHECK(rig.service.restart_coordinator_for_testing()->has_unfinished_for_testing(200));
+    // It reconnects, and then exits: the record goes.
+    SimAgent again(rig.service, 41);
+    again.register_process(200, rig.new_token, {kExe}, {kExe});
+    {
+        std::lock_guard<std::mutex> lock(rig.mutex);
+        rig.exited.insert(200);
+    }
+    rig.service.detach(41);
+    CHECK_FALSE(rig.service.restart_coordinator_for_testing()->has_unfinished_for_testing(200));
+}
+
+TEST_CASE("restart: an unfinished restart's record never applies to another process with the same pid (another restart token)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.new_registers = false;  // the process the restart started never registers (it exits, say) ...
+    Result<Value> result = rig.service.restart(args_for(100, 10000, 200));
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().code == restart::diag::kNoRegistration);
+    CHECK(rig.service.restart_coordinator_for_testing()->has_unfinished_for_testing(200));
+    // ... and an unrelated process gets pid 200 and registers without that restart's token.
+    SimAgent stranger(rig.service, 40);
+    stranger.on_request = [&](const ipc::Message& m) { rig.new_handles(stranger, m); };
+    stranger.register_process(200, "", {kExe, kDll, kOther}, {kExe});
+    rig.new_registers = true;
+    Result<Value> again = rig.service.restart(args_for(200, 10000));
+    REQUIRE_MESSAGE(again.has_value(), again.error().format());
+    CHECK_FALSE(rig.service.restart_coordinator_for_testing()->has_unfinished_for_testing(200));
+    std::lock_guard<std::mutex> lock(rig.mutex);
+    CHECK(rig.reenabled.empty());  // plugin.dll of the earlier restart was not asked for in the stranger's restart
+}
+
+#if defined(CML_FAULT_INJECTION)
+TEST_CASE("restart injection: an armed restart stage that the restart does not reach is disarmed at its end, never carried over") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.hold_supported = true;
+    rig.app_enables_dll = true;  // nothing is missing after the grace period: restart-reenable is not reached either
+    REQUIRE(rig.service.faults().arm(ipc::fault::Stage::RestartHold, 1, std::nullopt).has_value());
+    REQUIRE(rig.service.faults().arm(ipc::fault::Stage::RestartReenable, 1, std::nullopt).has_value());
+    REQUIRE(rig.service.faults().arm(ipc::fault::Stage::RestartReapply, 1, std::nullopt).has_value());  // nothing to re-apply (no index)
+    Result<Value> plain = rig.service.restart(args_for(100, 10000));  // no hold_new
+    REQUIRE_MESSAGE(plain.has_value(), plain.error().format());
+    const Value* disarmed = plain->find("injection_disarmed");
+    REQUIRE(disarmed != nullptr);
+    std::vector<std::string> names;
+    for (const Value& v : disarmed->items()) {
+        names.push_back(v.as_string());
+    }
+    CHECK(names == std::vector<std::string>{"restart-hold", "restart-reenable", "restart-reapply"});
+    for (const ipc::fault::Stage st : {ipc::fault::Stage::RestartHold, ipc::fault::Stage::RestartReenable, ipc::fault::Stage::RestartReapply}) {
+        CHECK(rig.service.faults().armed(st) == 0);
+    }
+    // The next, held, restart of the new process is held normally: nothing carried over.
+    HeldRestart restart(rig, [] {
+        Value a = hold_args(30000);
+        a.set("pid", Value::integer(200));
+        return a;
+    }());
+    REQUIRE(wait_until([&] { return is_held(rig); }));
+    REQUIRE(rig.service.restart_resume(pid_args(201)).has_value());
+    Result<Value>& second = restart.join();
+    REQUIRE_MESSAGE(second.has_value(), second.error().format());
+    CHECK(second->find("injection_disarmed") == nullptr);
+    CHECK_FALSE(has_warning(rig, "CML5974"));
+}
+
+TEST_CASE("restart injection: an arming for another process is left alone; restart and revert stages take count 1 only") {
+    QuietLogs quiet;
+    Rig rig;
+    REQUIRE(rig.service.faults().arm(ipc::fault::Stage::RestartHold, 1, 4242u).has_value());
+    REQUIRE(rig.service.restart(args_for(100, 10000)).has_value());
+    CHECK(rig.service.faults().armed(ipc::fault::Stage::RestartHold) == 1);  // armed for 4242, not for 100
+    Result<void> two = rig.service.faults().arm(ipc::fault::Stage::RestartTerminate, 2, std::nullopt);
+    REQUIRE_FALSE(two.has_value());
+    CHECK(two.error().id() == "CML5960");
+    // Over the control command too.
+    Value args = Value::object();
+    args.set("stage", Value::string("restart-terminate"));
+    args.set("count", Value::integer(2));
+    Result<Value> refused = inject_failure(rig.service, args);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().id() == "CML5960");
+}
+
+TEST_CASE("restart injection: a restart stage cannot be armed while a restart runs (CML5978)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.hold_supported = true;
+    HeldRestart restart(rig, hold_args(30000));
+    REQUIRE(wait_until([&] { return is_held(rig); }));
+    Value args = Value::object();
+    args.set("stage", Value::string("restart-reapply"));
+    Result<Value> busy = inject_failure(rig.service, args);
+    REQUIRE_FALSE(busy.has_value());
+    CHECK(busy.error().id() == "CML5978");
+    REQUIRE(rig.service.restart_resume(pid_args(200)).has_value());
+    REQUIRE(restart.join().has_value());
+    CHECK(inject_failure(rig.service, args).has_value());  // and afterwards it can
+}
+#endif

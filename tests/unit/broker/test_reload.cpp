@@ -1055,6 +1055,49 @@ TEST_CASE("revert: the reverted patches are un-committed in the agent, newest fi
     CHECK(warned);
 }
 
+TEST_CASE("revert injection (WP-43): the answers of the agent's stages revert-repoint, revert-restore and revert-uncommit take the revert's error paths") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    apply_two_patches(rig);
+    const std::uint64_t live = rig.module->hooked.at(kModuleBase + 0x1010);
+
+    // revert-repoint: `last` re-points compute_value to patch 1; the agent refuses inside its window, nothing changes.
+    rig.hooks_status = ipc::fault::ids::kAgentRevertRepoint;
+    Result<Value> refused = revert_with(rig, "last");
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().id() == "CML5851");
+    CHECK(refused.error().message.find("CML4658") != std::string::npos);
+    CHECK(rig.module->batches.size() == 2);
+    CHECK(rig.module->hooked.at(kModuleBase + 0x1010) == live);
+    CHECK(rig.module->generation == 2);
+    rig.hooks_status = 0;
+    REQUIRE(revert_with(rig, "last").has_value());  // the next revert works
+    CHECK(rig.module->batches.size() == 1);
+
+    // revert-restore: `all` restores the original bytes; refused, nothing changes.
+    rig.hooks_status = ipc::fault::ids::kAgentRevertRestore;
+    refused = revert_with(rig, "all");
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().id() == "CML5851");
+    CHECK(refused.error().message.find("CML4659") != std::string::npos);
+    CHECK(rig.module->batches.size() == 1);
+    CHECK(rig.events->count("patch_reverted") == 1);
+
+    // revert-uncommit: the revert goes through, the un-commit failure is the warning CML5855.
+    rig.hooks_status = 0;
+    rig.uncommit_status = ipc::fault::ids::kAgentRevertUncommit;
+    Result<Value> ok = revert_with(rig, "all");
+    REQUIRE_MESSAGE(ok.has_value(), ok.error().format());
+    CHECK(rig.module->batches.empty());
+    CHECK(rig.module->hooked.empty());
+    bool warned = false;
+    for (const Event& e : rig.events->events) {
+        warned = warned || (e.name == "diag" && e.body.get_string("id") == "CML5855" && e.body.get_string("message").find("CML4660") != std::string::npos);
+    }
+    CHECK(warned);
+}
+
 TEST_CASE("revert: a module that is no longer loaded is refused (CML5856) and its stale patch list is dropped") {
     QuietLogs quiet;
     Rig rig;
@@ -1853,7 +1896,10 @@ TEST_CASE("fault injection: the control capability, fault-stages and inject-fail
         names.push_back(v.as_string());
     }
     CHECK(names == std::vector<std::string>{"pdb-load", "change-detection", "compile", "bind-plan", "reservation", "link", "pre-apply", "send-patch",
-                                            "patch-load", "hook-install", "post-patch-hooks"});
+                                            "patch-load", "hook-install", "post-patch-hooks",
+                                            // WP-43: the restart's and the revert's stages, after the reload's
+                                            "pre-restart-hooks", "restart-terminate", "restart-relaunch", "restart-hold", "restart-registration",
+                                            "restart-reenable", "restart-reapply", "revert-repoint", "revert-restore", "revert-uncommit"});
     CHECK(stages.find("result")->find("details")->items().size() == names.size());
 
     const Value armed = call(R"({"id":2,"cmd":"inject-failure","args":{"stage":"bind-plan"}})");
@@ -2020,6 +2066,43 @@ TEST_CASE("fault injection: when the agent could not take its hooks out again (C
         CHECK(rig.module->is_hooked(kModuleBase + 0x1010));          // remembered as hooked, like after a timeout
         CHECK(rig.module->batches.size() == 1);                      // recorded as live, like after a timeout, so that a revert knows it
     }
+}
+
+TEST_CASE("revert injection (WP-43): an armed revert stage the revert does not reach is disarmed in the agent at its end, never carried over") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    apply_two_patches(rig);
+    // revert-restore is armed, but `last` only re-points (both patches hook compute_value): the stage is not reached.
+    REQUIRE(inject_failure(*rig.service, inject_args("revert-restore")).has_value());
+    Result<Value> last = revert_with(rig, "last");
+    REQUIRE_MESSAGE(last.has_value(), last.error().format());
+    const Value* disarmed = last->find("injection_disarmed");
+    REQUIRE(disarmed != nullptr);
+    REQUIRE(disarmed->items().size() == 1);
+    CHECK(disarmed->items()[0].as_string() == "revert-restore");
+    const auto arms = rig.seen<ipc::ArmFault>();
+    REQUIRE(arms.size() == 2);
+    CHECK(arms[0].stage == "revert-restore");
+    CHECK(arms[0].count == 1);
+    CHECK(arms[1].stage == "revert-restore");
+    CHECK(arms[1].count == 0);  // disarmed in the agent at the end of the revert
+    // A stage that fired is disarmed too, and is not listed as unused.
+    REQUIRE(inject_failure(*rig.service, inject_args("revert-restore")).has_value());
+    rig.hooks_status = ipc::fault::ids::kAgentRevertRestore;  // the scripted agent's answer when the stage fires
+    Result<Value> all = revert_with(rig, "all");
+    REQUIRE_FALSE(all.has_value());
+    CHECK(all.error().message.find("CML4659") != std::string::npos);
+    CHECK(rig.seen<ipc::ArmFault>().size() == 4);
+    rig.hooks_status = 0;
+    Result<Value> again = revert_with(rig, "all");  // nothing armed any more: no ArmFault, nothing listed
+    REQUIRE_MESSAGE(again.has_value(), again.error().format());
+    CHECK(again->find("injection_disarmed") == nullptr);
+    CHECK(rig.seen<ipc::ArmFault>().size() == 4);
+    // A revert stage takes count 1 only.
+    Result<Value> two = inject_failure(*rig.service, inject_args("revert-uncommit", 2));
+    REQUIRE_FALSE(two.has_value());
+    CHECK(two.error().id() == "CML5960");
 }
 
 #endif  // CML_FAULT_INJECTION

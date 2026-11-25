@@ -288,6 +288,12 @@ Diag batch_diag(std::uint32_t code, ThreadSet::Result result, std::uint32_t thre
         case ipc::fault::ids::kAgentHookInstall:  // WP-28: built after the threads run again
             return Diag::make(code, "injected failure at the stage 'hook-install' (inside the window with the application's threads suspended); nothing was written",
                               "This failure was requested with the control command inject-failure. Reload again: without it the hooks install.");
+        case ipc::fault::ids::kAgentRevertRepoint:  // WP-43
+            return Diag::make(code, "injected failure at the stage 'revert-repoint' (re-pointing hooks to an older patch, inside the window with the application's threads suspended); nothing was written",
+                              "This failure was requested with the control command inject-failure. Revert again: without it the hooks are re-pointed.");
+        case ipc::fault::ids::kAgentRevertRestore:  // WP-43
+            return Diag::make(code, "injected failure at the stage 'revert-restore' (restoring original bytes, inside the window with the application's threads suspended); nothing was written",
+                              "This failure was requested with the control command inject-failure. Revert again: without it the original code comes back.");
         default:
             return Diag::make(code, format("hook installation failed (internal code %u).", code), "Report this as a bug.");
     }
@@ -373,11 +379,15 @@ bool Installer::find(const void* target, HookInfo* info) const {
 }
 
 BatchResult Installer::install(const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes, bool injectable) {
-    return apply(false, requests, count, outcomes, injectable);
+    return apply(false, requests, count, outcomes, injectable ? ipc::fault::Stage::HookInstall : ipc::fault::Stage::Count);
 }
 
-BatchResult Installer::revert(const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes) {
-    return apply(true, requests, count, outcomes, false);
+BatchResult Installer::install(const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes, ipc::fault::Stage inject) {
+    return apply(false, requests, count, outcomes, inject);
+}
+
+BatchResult Installer::revert(const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes, ipc::fault::Stage inject) {
+    return apply(true, requests, count, outcomes, inject);
 }
 
 // ---- the stopped-world part ---------------------------------------------------------------------
@@ -403,7 +413,7 @@ bool Installer::find_conflict(const Job* jobs, std::size_t count, std::size_t* t
 // Runs with the application's threads stopped. No allocation, no logging, no locks, no CRT: see
 // thread_set.h for the system calls used and why each is safe. The code that touches memory is
 // bracketed by heap::set_alloc_forbidden so that a stray allocation aborts in tests.
-void Installer::attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, Report* report, bool injectable) noexcept {
+void Installer::attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, Report* report, ipc::fault::Stage inject) noexcept {
     if (options_.test_before_stop != nullptr) {
         options_.test_before_stop(options_.test_context);
     }
@@ -421,10 +431,11 @@ void Installer::attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, 
         std::size_t thread_index = 0;
         std::size_t job_index = 0;
         if (!find_conflict(jobs, count, &thread_index, &job_index)) {
-            // WP-28: failure injection (stage hook-install). One lock-free atomic decrement: nothing here allocates or takes a
-            // lock. Nothing was written; the threads are resumed below and the batch fails with the stage's diagnostic.
-            if (injectable && fault::consume(ipc::fault::Stage::HookInstall)) {
-                report->diag = ipc::fault::ids::kAgentHookInstall;
+            // WP-28: failure injection (stage hook-install; WP-43: revert-repoint and revert-restore for the requests of a revert). One
+            // lock-free atomic decrement and a constant table read: nothing here allocates or takes a lock. Nothing was written; the threads
+            // are resumed below and the batch fails with the stage's diagnostic.
+            if (inject != ipc::fault::Stage::Count && fault::consume(inject)) {
+                report->diag = ipc::fault::info(inject).diag_id;
                 break;
             }
             // Nobody is inside any window. Verify, then write.
@@ -559,7 +570,7 @@ struct Interval {
 }  // namespace
 
 BatchResult Installer::apply(bool reverting, const HookRequest* requests, std::size_t count,
-                             std::vector<HookOutcome>& outcomes, bool injectable) {
+                             std::vector<HookOutcome>& outcomes, ipc::fault::Stage inject) {
     std::lock_guard<std::mutex> lock(mutex_);
     BatchResult result;
     outcomes.assign(count, HookOutcome{});
@@ -936,7 +947,7 @@ BatchResult Installer::apply(bool reverting, const HookRequest* requests, std::s
     if (any_write) {
         for (;;) {
             report = Report{};
-            attempt(jobs.data(), count, &conflicts, &report, injectable);
+            attempt(jobs.data(), count, &conflicts, &report, inject);
             ++result.stats.attempts;
             result.stats.threads = std::max(result.stats.threads, report.threads);
             result.stats.passes = std::max(result.stats.passes, report.passes);

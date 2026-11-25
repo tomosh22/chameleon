@@ -13,6 +13,9 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <set>
+#include <string>
+#include <vector>
 
 #include "cml/ipc/fault_stages.h"
 #include "cml/ipc/json.h"
@@ -43,6 +46,13 @@ public:
     // Remaining armed passes of a stage (tests, `inject-failure` result).
     std::uint32_t armed(ipc::fault::Stage stage) const;
 
+    // WP-43: disarms the broker stages of `group` ("restart", "revert") armed for process `pid` or for every process, whether they fired
+    // or not; returns the names of those that had not fired.
+    std::vector<std::string> disarm_group(const char* group, std::uint32_t pid);
+    // WP-43: which agent stages inject-failure armed in which process, so that the end of an operation can disarm them there.
+    void note_agent_armed(ipc::fault::Stage stage, std::uint32_t pid);
+    bool take_agent_armed(ipc::fault::Stage stage, std::uint32_t pid);
+
     // The diagnostic an injected failure of `stage` carries.
     static Diag make_diag(ipc::fault::Stage stage);
 
@@ -53,6 +63,7 @@ private:
     };
     mutable std::mutex mutex_;
     std::array<Arming, ipc::fault::kStageCount> armed_{};
+    std::array<std::set<std::uint32_t>, ipc::fault::kStageCount> agent_armed_{};  // WP-43
 };
 
 // Control command `inject-failure` {stage, pid?, count?} -> {stage, armed, count, side, processes}; {"stage":"none"} disarms
@@ -60,7 +71,15 @@ private:
 // pid, CML5962 when the agent refuses.
 Result<ipc::json::Value> inject_failure(ReloadService& service, const ipc::json::Value& args);
 
-// Control command `fault-stages` -> {stages:[name...], details:[{name, side, id, where}]} in pipeline order.
+// WP-43: the end of a restart (group "restart") or a revert (group "revert") of process `pid`. Every stage of the group still armed for it is
+// disarmed, in the broker and in the agent, whether it fired or not, so an arming never carries over to a later operation. `outcome` is the
+// text of the operation's diagnostics (an agent stage whose id appears in it fired). Returns the names of the stages disarmed unused; the
+// operation's answer lists them as `injection_disarmed`.
+// `agent_alive` false: the process is gone (a restart terminated it): its agent armings are only forgotten.
+std::vector<std::string> finish_injection(ReloadService& service, const char* group, std::uint32_t pid, const std::string& outcome, bool agent_alive = true);
+
+// Control command `fault-stages` -> {stages:[name...], details:[{name, side, id, where, group}]} in pipeline order (the reload's stages,
+// then WP-43's restart and revert stages).
 ipc::json::Value fault_stages();
 
 }  // namespace cml::core

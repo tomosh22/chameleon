@@ -756,13 +756,15 @@ private:
         }
         proc->cursor = read_whole_file(proc->stdout_file).size();  // what the hooks and the new process print belongs to the restart
         const std::uint32_t old_pid = supervisor_.pid(proc->id);
-        const RestartStepOutcome restarted = run_restart_step(*control_, capabilities_, old_pid, step, limit_ms);
+        const RestartStepOutcome restarted = run_restart_step(*control_, capabilities_, old_pid, step, limit_ms, control_pipe_);
         if (!restarted.ok) {
             return StepOutcome::fail(restarted.diag_code, restarted.detail);
         }
-        cml::Result<void> followed = supervisor_.adopt(proc->id, restarted.new_pid);
-        if (!followed) {
-            return StepOutcome::fail(followed.error());
+        if (restarted.new_pid != old_pid) {  // WP-43: a refused restart (expect_error) before the termination leaves the old process
+            cml::Result<void> followed = supervisor_.adopt(proc->id, restarted.new_pid);
+            if (!followed) {
+                return StepOutcome::fail(followed.error());
+            }
         }
         return StepOutcome::pass(restarted.detail);
     }
@@ -998,6 +1000,10 @@ private:
                 if (e.name == "diag") {
                     const std::string id = e.body.get_string("id");
                     seen += (seen.empty() ? "" : ", ") + id;
+                    if (id == step.id && !step.expect_error_text.empty() && e.body.get_string("message").find(step.expect_error_text) == std::string::npos) {
+                        seen += " (not mentioning " + step.expect_error_text + ")";  // WP-43: `expect_text`; keep looking
+                        continue;
+                    }
                     if (id == step.id) {
                         if (step.expect_line != 0) {
                             const std::string wrong = check_location(step, "the diag event", e.body.get_string("file"),

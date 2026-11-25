@@ -1,0 +1,307 @@
+# Scenario `restart_inject` (WP-43, ADR-0043, R-42): failure injection in every stage of the hot-restart.
+#
+# For each stage of the restart that `fault-stages` lists in the group "restart" the scenario arms the stage, restarts, and checks
+# that the application runs afterwards:
+#   * before the old process is terminated (pre-restart-hooks, restart-terminate) the restart is refused with a clear diagnostic and
+#     the OLD process keeps running, with its patched code (restarted=0, value=2);
+#   * after it (restart-relaunch, restart-hold, restart-registration, restart-reenable, restart-reapply) a NEW process runs
+#     (restarted=1): the broker starts it on a second attempt, resumes it without the hold, leaves it running unregistered, or runs it
+#     without its module / without the session's edits, and says so;
+# then a normal restart (or reload) succeeds and brings the edited value back (value=2). A process is never left suspended: every
+# expect_stdout that follows a restart reads lines the new process printed.
+#
+# The fixture does not enable its module when it was relaunched (CML_RESTART_TOKEN is set), so whatever is enabled in a relaunched
+# process was enabled by the broker: after restart-reenable and restart-registration the module stays off until the next restart,
+# which enables it from what the failed restart remembered ("unfinished restart", docs/wp/WP-43.md).
+name = "restart_inject"
+description = "fixture hot_restart: each restart stage fails once (old process intact before terminate, a new one running after), then a normal restart works"
+fixture = "hot_restart"
+fixture_args = "--label=kept"
+timeout_s = 1500
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1 pid=\\d+ restarted=0 label=kept"
+within_s = 20
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_hot_restart.exe"
+within_s = 20
+
+[[step]]
+kind = "edit"
+patch = "edits/value_2.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2 pid=\\d+ restarted=0"
+within_s = 15
+
+# ---- pre-restart-hooks (agent, the old process) -> CML5804 naming CML4657; the hooks ran; the process is not touched ----
+[[step]]
+kind = "inject_failure"
+stage = "pre-restart-hooks"
+
+[[step]]
+kind = "restart"
+within_s = 120
+expect_error = "CML5804"
+expect_error_text = "CML4657"
+
+[[step]]
+kind = "expect_stdout"
+regex = "PRERESTART pid=\\d+ value=2"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2 pid=\\d+ restarted=0"
+within_s = 10
+
+# ---- restart-terminate -> CML5972; not terminated ----
+[[step]]
+kind = "inject_failure"
+stage = "restart-terminate"
+
+[[step]]
+kind = "restart"
+within_s = 120
+expect_error = "CML5972"
+expect_error_text = "was not terminated"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2 pid=\\d+ restarted=0"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2 pid=\\d+ restarted=0"
+within_s = 10
+
+# The next restart works: the new process starts from the original binary and gets the edit back.
+[[step]]
+kind = "restart"
+within_s = 120
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=0 value=1 pid=\\d+ restarted=1 label=kept"
+within_s = 15
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2 pid=\\d+ restarted=1 label=kept"
+within_s = 15
+
+# ---- restart-relaunch -> warning CML5973; the second attempt starts the new process ----
+[[step]]
+kind = "inject_failure"
+stage = "restart-relaunch"
+
+[[step]]
+kind = "restart"
+within_s = 120
+expect_warning = "CML5973"
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=0 value=1 pid=\\d+ restarted=1 label=kept"
+within_s = 15
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2 pid=\\d+ restarted=1 label=kept"
+within_s = 15
+
+# ---- restart-hold -> warning CML5974; a held restart's process is resumed at once, no `restarting` ----
+[[step]]
+kind = "inject_failure"
+stage = "restart-hold"
+
+[[step]]
+kind = "restart"
+within_s = 120
+hold_new = true
+hold_ms = 30000
+expect_restarting = false
+expect_warning = "CML5974"
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=0 value=1 pid=\\d+ restarted=1 label=kept"
+within_s = 15
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2 pid=\\d+ restarted=1 label=kept"
+within_s = 15
+
+# A normal held restart: `restarting`, restart-resume (from the step's second connection), `restarted`.
+[[step]]
+kind = "restart"
+within_s = 120
+hold_new = true
+hold_ms = 30000
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=0 value=1 pid=\\d+ restarted=1 label=kept"
+within_s = 15
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2 pid=\\d+ restarted=1 label=kept"
+within_s = 15
+
+# ---- restart-reapply -> warning CML5810, reapply_error CML5977; the new process runs the original code until a reload ----
+[[step]]
+kind = "inject_failure"
+stage = "restart-reapply"
+
+[[step]]
+kind = "restart"
+within_s = 120
+expect_warning = "CML5810"
+expect_reapply_error = "CML5977"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=0 value=1 pid=\\d+ restarted=1 label=kept"
+within_s = 15
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_hot_restart.exe"
+within_s = 30
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1 pid=\\d+ restarted=1 label=kept"
+within_s = 10
+
+# The baseline was restored: a plain reload applies the session's edit.
+[[step]]
+kind = "reload"
+within_s = 120
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2 pid=\\d+ restarted=1 label=kept"
+within_s = 15
+
+# ---- restart-reenable -> warning CML5976; the module is not enabled in the new process (not_enabled) ----
+[[step]]
+kind = "inject_failure"
+stage = "restart-reenable"
+
+[[step]]
+kind = "restart"
+within_s = 120
+expect_warning = "CML5976"
+expect_not_enabled = "fixture_hot_restart.exe"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=0 value=1 pid=\\d+ restarted=1 label=kept"
+within_s = 15
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1 pid=\\d+ restarted=1 label=kept"
+within_s = 10
+
+# The next restart enables the module the failed one could not, and re-applies the edit.
+[[step]]
+kind = "restart"
+within_s = 120
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_hot_restart.exe"
+within_s = 30
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2 pid=\\d+ restarted=1 label=kept"
+within_s = 15
+
+# ---- restart-registration -> CML5975; the new process is left running (it registers by itself, without its module) ----
+[[step]]
+kind = "inject_failure"
+stage = "restart-registration"
+
+[[step]]
+kind = "restart"
+within_s = 120
+expect_error = "CML5975"
+expect_error_text = "left running"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=0 value=1 pid=\\d+ restarted=1 label=kept"
+within_s = 15
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=1 pid=\\d+ restarted=1 label=kept"
+within_s = 10
+
+# Its next restart (the step waits for its agent) enables the module and re-applies the edit.
+[[step]]
+kind = "restart"
+within_s = 120
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_hot_restart.exe"
+within_s = 30
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2 pid=\\d+ restarted=1 label=kept"
+within_s = 15
+
+# ---- disarm: an armed stage is gone after "none"; a normal restart ----
+[[step]]
+kind = "inject_failure"
+stage = "restart-terminate"
+
+[[step]]
+kind = "inject_failure"
+stage = "none"
+
+[[step]]
+kind = "restart"
+within_s = 120
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ value=2 pid=\\d+ restarted=1 label=kept"
+within_s = 15
