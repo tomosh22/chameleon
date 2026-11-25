@@ -144,11 +144,15 @@ void ReloadService::detach(std::uint64_t agent_id) {
         agents_.erase(it);
         coordinator = restart_;
     }
-    // WP-43: an unfinished restart's record for this process must not outlive it (its pid may be reused).
-    if (coordinator != nullptr && entry.link != nullptr) {
+    // WP-43: an unfinished restart's record for this process must not outlive it (its pid may be reused). R-51: neither must what
+    // inject-failure armed in its agent: a new process with the same pid would report it as `injection_disarmed`.
+    if (entry.link != nullptr) {
         const LinkSnapshot snap = entry.link->snapshot();
         if (snap.handshaken && snap.pid != 0) {
-            coordinator->process_gone(snap.pid);
+            faults_.forget_process(snap.pid);
+            if (coordinator != nullptr) {
+                coordinator->process_gone(snap.pid);
+            }
         }
     }
     entry.modules.clear();  // index threads are joined here, outside the lock
@@ -650,23 +654,30 @@ Result<Value> ReloadService::run_reload(const Value& args, bool automatic, bool 
 // ---- revert (WP-22) -------------------------------------------------------------------------------------------
 
 Result<Value> ReloadService::revert(const Value& args) {
+    // A revert and a reload never overlap: both change the hooks and the broker's per-module patch list. R-51: the run lock is taken
+    // here, under the failure-injection gate, and held until finish_injection below has run (an inject-failure sees the revert running
+    // until then); revert_impl refuses busy after checking its arguments when it could not be taken.
+    std::unique_lock<std::mutex> gate(faults_.gate());
+    std::optional<ExclusiveRun> exclusive;
+    exclusive.emplace(reload_mutex_, running_);
+    gate.unlock();
     std::vector<std::uint32_t> pids;
-    std::string outcome;
-    Result<Value> result = revert_impl(args, &pids, &outcome);
-    // WP-43: an armed revert stage applies to this revert only, whether it fired or not.
-    Value names = Value::array();
+    std::map<std::uint32_t, std::string> outcomes;
+    Result<Value> result = revert_impl(args, exclusive->acquired(), &pids, &outcomes);
+    // WP-43: an armed revert stage applies to this revert only, whether it fired or not. R-51: each process by what happened in it.
+    std::vector<std::string> unused;
     for (const std::uint32_t p : pids) {
-        for (const std::string& n : finish_injection(*this, "revert", p, outcome + (result ? std::string() : result.error().format()))) {
-            names.push(Value::string(n));
+        for (std::string& n : finish_injection(*this, "revert", p, outcomes[p])) {
+            unused.push_back(std::move(n));
         }
     }
-    if (result && !names.items().empty()) {
-        result->set("injection_disarmed", std::move(names));
+    if (result) {
+        set_injection_disarmed(*result, unused);
     }
     return result;
 }
 
-Result<Value> ReloadService::revert_impl(const Value& args, std::vector<std::uint32_t>* pids, std::string* outcome) {
+Result<Value> ReloadService::revert_impl(const Value& args, bool acquired, std::vector<std::uint32_t>* pids, std::map<std::uint32_t, std::string>* outcomes) {
     std::uint32_t pid = 0;
     std::uint32_t timeout_ms = 60000;
     std::optional<Diag> error;
@@ -688,9 +699,7 @@ Result<Value> ReloadService::revert_impl(const Value& args, std::vector<std::uin
         }
         scope = sc->as_string() == "all" ? RevertScope::All : RevertScope::Last;
     }
-    // A revert and a reload never overlap: both change the hooks and the broker's per-module patch list.
-    ExclusiveRun exclusive(reload_mutex_, running_);
-    if (!exclusive.acquired()) {
+    if (!acquired) {  // revert() could not take the run lock: a reload (or a restart) runs
         const Diag d = Diag::make(pd::kBusy, "a reload is still running", "Wait for it to finish (control command `wait`) and try again.");
         if (events_ != nullptr) {
             events_->publish(make_diag_event(d, "error", "revert"));
@@ -730,7 +739,7 @@ Result<Value> ReloadService::revert_impl(const Value& args, std::vector<std::uin
         const std::uint32_t target_pid = t.link->snapshot().pid;
         Result<RevertReport> r = revert_module(*t.link, *t.module, scope, revert_options);
         if (!r) {
-            *outcome += r.error().format() + "\n";
+            (*outcomes)[target_pid] += r.error().format() + "\n";
             CML_LOG(Warn, "revert: %s", r.error().format().c_str());
             if (events_ != nullptr) {
                 events_->publish(make_diag_event(r.error(), "error", "revert", target_pid));
@@ -748,7 +757,7 @@ Result<Value> ReloadService::revert_impl(const Value& args, std::vector<std::uin
             continue;
         }
         for (const Diag& w : r->warnings) {
-            *outcome += w.format() + "\n";
+            (*outcomes)[target_pid] += w.format() + "\n";
             CML_LOG(Warn, "revert: %s", w.format().c_str());
             if (events_ != nullptr) {
                 events_->publish(make_diag_event(w, "warning", "revert", r->pid));
@@ -863,6 +872,7 @@ std::optional<Diag> ReloadService::apply_compile_on_save(bool on) {
             SaveWatcherHooks hooks;
             hooks.tracked_files = [this] { return tracked_files(); };
             hooks.reload = [this] { return reload_for_save(); };
+            hooks.faults = &faults_;  // WP-44: the group "watch"
             hooks.report = [this](const Diag& d, const char* severity) {
                 if (events_ != nullptr) {
                     events_->publish(make_diag_event(d, severity, "watch"));

@@ -10,6 +10,7 @@
 #include <thread>
 
 #include "../pdb/test_util.h"
+#include "cml/core/fault_injection.h"
 #include "cml/core/save_watcher.h"
 #include "cml/core/source_baseline.h"
 #include "cml/util/log.h"
@@ -504,3 +505,118 @@ TEST_CASE("save watcher: stop() starts no further reload") {
     std::this_thread::sleep_for(250ms);
     CHECK(reloads.load() == before);
 }
+
+// ---- WP-44: failure injection in the watcher (group "watch") ----------------------------------------------------------------------
+
+#if defined(CML_FAULT_INJECTION)
+namespace {
+
+// A watcher on one tracked file, with failure injection, that records its reloads and reports.
+struct InjectRig {
+    FakeFactory fake;
+    FaultInjector faults;
+    std::atomic<int> reloads{0};
+    std::mutex m;
+    std::vector<std::pair<std::uint32_t, std::string>> reported;  // id, severity
+    std::vector<std::string> messages;
+    std::unique_ptr<SaveWatcher> watcher;
+
+    InjectRig() {
+        SaveWatcherHooks hooks;
+        hooks.tracked_files = [] { return std::vector<std::string>{"c:\\p\\a.cpp"}; };
+        hooks.reload = [this] {
+            ++reloads;
+            return SaveWatcherHooks::ReloadResult::Done;
+        };
+        hooks.report = [this](const Diag& d, const char* severity) {
+            std::lock_guard<std::mutex> lock(m);
+            reported.emplace_back(d.code, severity);
+            messages.push_back(d.message);
+        };
+        hooks.faults = &faults;
+        watcher = std::make_unique<SaveWatcher>(hooks, fast(fake.factory()));
+        watcher->rearm();
+        REQUIRE(wait_until([&] { return reloads.load() >= 1; }));  // the catch-up sweep after arming (it is a batch too)
+        std::this_thread::sleep_for(100ms);
+    }
+    void arm(ipc::fault::Stage stage) { REQUIRE(faults.arm(stage, 1, std::nullopt).has_value()); }
+    void save() { watcher->inject(modified("c:\\p\\a.cpp")); }
+    bool has(std::uint32_t id, const std::string& severity) {
+        std::lock_guard<std::mutex> lock(m);
+        for (const auto& r : reported) {
+            if (r.first == id && r.second == severity) {
+                return true;
+            }
+        }
+        return false;
+    }
+    std::size_t report_count() {
+        std::lock_guard<std::mutex> lock(m);
+        return reported.size();
+    }
+};
+
+}  // namespace
+
+TEST_CASE("save watcher injection (WP-44): watch-debounce loses the batch; the watcher re-checks everything, as after lost events") {
+    QuietLogs quiet;
+    InjectRig rig;
+    const int before = rig.reloads.load();
+    rig.arm(ipc::fault::Stage::WatchDebounce);
+    rig.save();
+    REQUIRE(wait_until([&] { return rig.reloads.load() > before; }));  // the reload still runs
+    CHECK(rig.has(5980, "warning"));
+    CHECK(rig.faults.armed(ipc::fault::Stage::WatchDebounce) == 0);
+}
+
+TEST_CASE("save watcher injection (WP-44): watch-change-detection drops the batch (no reload); the next save reloads") {
+    QuietLogs quiet;
+    InjectRig rig;
+    const int before = rig.reloads.load();
+    rig.arm(ipc::fault::Stage::WatchChangeDetection);
+    rig.save();
+    REQUIRE(wait_until([&] { return rig.has(5981, "error"); }));
+    std::this_thread::sleep_for(100ms);
+    CHECK(rig.reloads.load() == before);
+    rig.save();
+    REQUIRE(wait_until([&] { return rig.reloads.load() > before; }));
+}
+
+TEST_CASE("save watcher injection (WP-44): watch-reload fails the reload before it runs; the watcher's own CML5505 follows") {
+    QuietLogs quiet;
+    InjectRig rig;
+    const int before = rig.reloads.load();
+    rig.arm(ipc::fault::Stage::WatchReload);
+    rig.save();
+    REQUIRE(wait_until([&] { return rig.has(5505, "warning"); }));
+    CHECK(rig.has(5982, "error"));
+    CHECK(rig.reloads.load() == before);  // the reload hook was not called
+    rig.save();
+    REQUIRE(wait_until([&] { return rig.reloads.load() > before; }));
+    CHECK(rig.faults.armed(ipc::fault::Stage::WatchReload) == 0);
+}
+
+TEST_CASE("save watcher injection (WP-44): a stage the batch does not reach is disarmed at its end and reported (CML5983); "
+          "a batch that touches no tracked file uses nothing up") {
+    QuietLogs quiet;
+    InjectRig rig;
+    const int before = rig.reloads.load();
+    rig.arm(ipc::fault::Stage::WatchChangeDetection);
+    rig.arm(ipc::fault::Stage::WatchReload);
+    rig.watcher->inject(modified("c:\\p\\notes.txt"));  // not tracked: not an operation of the group
+    std::this_thread::sleep_for(200ms);
+    CHECK(rig.report_count() == 0);
+    CHECK(rig.faults.armed(ipc::fault::Stage::WatchReload) == 1);
+    rig.save();
+    REQUIRE(wait_until([&] { return rig.has(5983, "warning"); }));
+    CHECK(rig.has(5981, "error"));
+    CHECK(rig.faults.armed(ipc::fault::Stage::WatchReload) == 0);  // not reached (the batch was dropped): disarmed, never carried over
+    {
+        std::lock_guard<std::mutex> lock(rig.m);
+        CHECK(rig.messages.back().find("watch-reload") != std::string::npos);
+    }
+    rig.save();
+    REQUIRE(wait_until([&] { return rig.reloads.load() > before; }));
+    CHECK_FALSE(rig.has(5982, "error"));
+}
+#endif

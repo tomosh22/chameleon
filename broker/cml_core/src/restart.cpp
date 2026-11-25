@@ -186,7 +186,19 @@ void RestartCoordinator::process_gone(std::uint32_t pid) {
         return;
     }
     const std::shared_ptr<ProcessHost> h = host();
-    if (h == nullptr || !h->has_exited(pid)) {
+    bool exited = h != nullptr && h->has_exited(pid);
+    if (h != nullptr && !exited) {
+        // R-51: the pipe of a process that is exiting can break before its handle is signalled. Look again for a short while, so a dead
+        // process does not keep one of the 16 records; a process that really keeps running costs this wait once per disconnect.
+        const Clock::time_point until = Clock::now() + exit_recheck_;
+        while (!exited && Clock::now() < until) {
+            std::this_thread::sleep_for(exit_recheck_step_);
+            exited = h->has_exited(pid);
+        }
+        CML_LOG(Trace, "restart: process %u %s after its agent disconnected (looked again for up to %lld ms)", pid, exited ? "has exited" : "still runs",
+                static_cast<long long>(exit_recheck_.count()));
+    }
+    if (!exited) {
         CML_LOG(Info, "restart: the agent of process %u disconnected, the process has not exited; what its unfinished restart left is kept", pid);
         return;
     }
@@ -198,25 +210,49 @@ bool RestartCoordinator::has_unfinished_for_testing(std::uint32_t pid) {
     return has_unfinished(pid);
 }
 
+namespace {
+
+struct ActiveScope {  // the broker does not exit as idle while a restart runs (the old process is gone, the new one not registered yet)
+    explicit ActiveScope(std::atomic<int>& n) : n_(n) { ++n_; }
+    ~ActiveScope() { --n_; }
+    ActiveScope(const ActiveScope&) = delete;
+    ActiveScope& operator=(const ActiveScope&) = delete;
+    std::atomic<int>& n_;
+};
+
+}  // namespace
+
 Result<Value> RestartCoordinator::restart(const Value& args, const std::function<bool()>& client_gone) {
+    // Reloads are held off for the whole restart: a patch applied to the old process after its baseline was taken would be lost in
+    // the new one. A reload that is running now makes this restart busy (restart_impl says so after checking its arguments); one that
+    // arrives meanwhile is refused busy (CML5304).
+    // R-51: the locks are taken here, under the failure-injection gate (an inject-failure that is arming waits for it, or sees this
+    // restart as running), and held until finish_injection below has run, so no arming can slip in while this restart cleans up.
+    std::unique_lock<std::mutex> gate(service_.faults().gate());
+    std::unique_lock<std::mutex> only_one(mutex_, std::try_to_lock);
+    std::unique_ptr<ExclusiveRun> no_reloads = service_.lock_reloads();  // the run lock of reloads and reverts (shows as running)
+    const bool locked = only_one.owns_lock() && no_reloads != nullptr;
+    std::optional<ActiveScope> active_scope;
+    if (locked) {
+        active_scope.emplace(active_);
+    }
+    gate.unlock();
+
     std::uint32_t ran_for = 0;
     bool terminated = false;
-    Result<Value> result = restart_impl(args, client_gone, &ran_for, &terminated);
+    Result<Value> result = restart_impl(args, client_gone, locked, &ran_for, &terminated);
     if (ran_for != 0) {
         // WP-43: an armed restart stage applies to this restart only, whether it fired or not.
         const std::vector<std::string> unused = finish_injection(service_, "restart", ran_for, result ? std::string() : result.error().format(), !terminated);
-        if (result && !unused.empty()) {
-            Value names = Value::array();
-            for (const std::string& n : unused) {
-                names.push(Value::string(n));
-            }
-            result->set("injection_disarmed", std::move(names));
+        if (result) {
+            set_injection_disarmed(*result, unused);
         }
     }
     return result;
 }
 
-Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::function<bool()>& client_gone, std::uint32_t* ran_for, bool* old_terminated) {
+Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::function<bool()>& client_gone, bool locked, std::uint32_t* ran_for,
+                                               bool* old_terminated) {
     std::uint32_t pid = 0;
     std::uint32_t timeout_ms = kDefaultTimeoutMs;
     std::optional<Diag> arg_error;
@@ -297,19 +333,10 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
                     pid);
     }
 
-    // Reloads are held off for the whole restart: a patch applied to the old process after its baseline was taken would be lost in
-    // the new one. A reload that is running now makes this restart busy; one that arrives meanwhile is refused busy (CML5304).
-    std::unique_lock<std::mutex> only_one(mutex_, std::try_to_lock);
-    std::unique_ptr<ExclusiveRun> no_reloads = service_.lock_reloads();  // the run lock of reloads and reverts (shows as running)
-    if (!only_one.owns_lock() || !no_reloads) {
+    // restart() holds the run locks (this restart's and the reloads') for the whole restart, or could not take them.
+    if (!locked) {
         return fail(Diag::make(rd::kBusy, "another restart or a reload is still running", "Wait for it to finish (control command `wait`) and try again."), pid);
     }
-
-    struct ActiveScope {  // the broker does not exit as idle while a restart runs (the old process is gone, the new one not registered yet)
-        explicit ActiveScope(std::atomic<int>& n) : n_(n) { ++n_; }
-        ~ActiveScope() { --n_; }
-        std::atomic<int>& n_;
-    } active_scope(active_);
 
     // ---- which process ----
     std::shared_ptr<AgentLink> old_link;

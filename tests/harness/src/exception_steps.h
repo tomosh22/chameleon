@@ -11,7 +11,9 @@
 //                              exception" of the following steps.
 //   exception_action           control command `exception-action` for the current exception: continue | leave | ignore. With
 //                              `expect_error = "CMLnnnn"` the action must be refused with that diagnostic.
-//   expect_pending_exceptions  control command `exceptions`: exactly `count` threads wait for a decision.
+//   expect_pending_exceptions  control command `exceptions`: exactly `count` threads wait for a decision. WP-44: when exactly one waits
+//                              and no expect_exception named a current exception, that thread becomes the current one (a thread
+//                              whose `exception` event was not published, failure-injection stage exception-report).
 //
 // WP-23 (needs capability "reexecute"; bodies in exception_steps.cpp):
 //   expect_exception           also accepts `offers` / `lacks` (an action that must / must not be in the event's `actions`) and `reason`

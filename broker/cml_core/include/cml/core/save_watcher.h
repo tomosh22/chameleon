@@ -27,6 +27,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "cml/core/fault_injection.h"
 #include "cml/util/diag.h"
 #include "cml/watch/watch.h"
 
@@ -38,8 +39,14 @@ struct SaveWatcherHooks {
     enum class ReloadResult { Done, Busy, Failed };
     // Runs one reload (blocking). Busy: another reload is running, try again shortly.
     std::function<ReloadResult()> reload;
-    // Watcher problems (CML5500..CML5504); `severity` is "warning" or "info". May be empty.
+    // Watcher problems (CML5500..CML5504); `severity` is "warning" or "info". May be empty. WP-44: also the injected failures
+    // (CML5980..5983, "warning" or "error").
     std::function<void(const Diag&, const char* severity)> report;
+    // WP-44: failure injection, group "watch" (null: none). The operation is one batch that touches a tracked file (or reports lost
+    // events): watch-debounce at its start (the batch is treated as lost events: every tracked file is re-checked), then
+    // watch-change-detection (the batch is dropped), then watch-reload (the reload fails before it runs); at its end every watch stage
+    // still armed is disarmed and reported (CML5983, warning).
+    FaultInjector* faults = nullptr;
 };
 
 using WatcherFactory = std::function<Result<std::unique_ptr<watch::DirectoryWatcher>>(

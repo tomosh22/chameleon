@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -11,6 +12,8 @@
 #include <vector>
 
 #include "cml/core/control_server.h"
+#include "cml/core/fault_injection.h"
+#include "cml/core/session.h"
 #include "cml/util/log.h"
 #include "doctest.h"
 
@@ -49,13 +52,18 @@ struct Rig {
                 sent.push_back(message);
             }
             const std::optional<std::uint64_t> id = request_id_of(message);
-            if (id && (std::holds_alternative<ipc::ExceptionConfig>(message) || std::holds_alternative<ipc::ExceptionAction>(message))) {
+            if (id && (std::holds_alternative<ipc::ExceptionConfig>(message) || std::holds_alternative<ipc::ExceptionAction>(message) ||
+                       std::holds_alternative<ipc::ArmFault>(message))) {  // WP-44: ArmFault too
                 std::uint32_t status = 0;
-                if (std::holds_alternative<ipc::ExceptionAction>(message)) {
+                const bool is_action = std::holds_alternative<ipc::ExceptionAction>(message);
+                if (is_action) {
                     status = action_status;
                 }
                 std::lock_guard<std::mutex> lock(mutex);
-                answerers.emplace_back([this, id = *id, status] {
+                answerers.emplace_back([this, id = *id, status, is_action] {
+                    if (is_action && before_action_answer) {
+                        before_action_answer();
+                    }
                     ipc::Reply reply;
                     reply.request_id = id;
                     reply.status = status;
@@ -135,6 +143,18 @@ struct Rig {
     std::vector<ipc::Message> sent;
     std::vector<std::thread> answerers;
     std::atomic<std::uint32_t> action_status{0};
+    std::function<void()> before_action_answer;  // WP-44: runs on the answering thread before the agent answers ExceptionAction
+
+    std::vector<ipc::ArmFault> arms() {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::vector<ipc::ArmFault> out;
+        for (const ipc::Message& m : sent) {
+            if (const auto* a = std::get_if<ipc::ArmFault>(&m)) {
+                out.push_back(*a);
+            }
+        }
+        return out;
+    }
 };
 
 }  // namespace
@@ -481,3 +501,129 @@ TEST_CASE("control: an empty events array is the default set, not every event (e
     CHECK(subscribed.count("progress") == 0);
     CHECK(subscribed.count("diag") == 1);
 }
+
+// ---- WP-44: failure injection in the crash handler (groups "exception" and "exception-action") ---------------------------------
+
+#if defined(CML_FAULT_INJECTION)
+namespace {
+
+constexpr std::int64_t kRigPid = 4242;
+
+Value stage(const char* name) {
+    Value a = Value::object();
+    a.set("stage", Value::string(name));
+    return a;
+}
+
+// The rig's agent, handshaken as process kRigPid so that inject-failure reaches it.
+void handshake(Rig& rig) {
+    Session session(5, "0.1.0");
+    ipc::Hello hello;
+    hello.request_id = 1;
+    hello.pid = static_cast<std::uint32_t>(kRigPid);
+    (void)session.on_message(hello);
+    rig.link->publish(session);
+    rig.service.attach(rig.link);
+}
+
+bool has_diag(Collect& c, const std::string& id, const std::string& severity) {
+    std::lock_guard<std::mutex> lock(c.mutex);
+    for (const Event& e : c.events) {
+        if (e.name == "diag" && e.body.get_string("id") == id && e.body.get_string("severity") == severity) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+TEST_CASE("exceptions injection (WP-44): exception-report publishes CML5979 instead of the event; the thread stays held and can be answered") {
+    QuietLogs quiet;
+    Rig rig;
+    auto heard = std::make_shared<Collect>();
+    rig.listen(heard, {"exception", "diag"});
+    REQUIRE(inject_failure(rig.service, stage("exception-report")).has_value());
+    rig.exceptions.on_exception(rig.link, static_cast<std::uint32_t>(kRigPid), Rig::fault(7));
+    CHECK(heard->count("exception") == 0);
+    CHECK(has_diag(*heard, "CML5979", "error"));
+    CHECK(rig.exceptions.pending_count() == 1);  // still held: `exceptions` lists it
+    Result<Value> listed = rig.exceptions.pending(Value::object());
+    REQUIRE(listed.has_value());
+    CHECK(listed->find("pending")->items()[0].get_integer("exception_id") == 7);
+    REQUIRE(rig.exceptions.action(Rig::args(kRigPid, 7, "continue")).has_value());
+    CHECK(rig.exceptions.pending_count() == 0);
+    // It fired once: the next fault is reported as usual.
+    rig.exceptions.on_exception(rig.link, static_cast<std::uint32_t>(kRigPid), Rig::fault(8));
+    CHECK(heard->count("exception") == 1);
+}
+
+TEST_CASE("exceptions injection (WP-44): the group exception keeps one arming; arming exception-hold drops exception-report and back") {
+    QuietLogs quiet;
+    Rig rig;
+    handshake(rig);
+    REQUIRE(inject_failure(rig.service, stage("exception-report")).has_value());
+    CHECK(rig.service.faults().armed(ipc::fault::Stage::ExceptionReport) == 1);
+    Result<Value> hold = inject_failure(rig.service, stage("exception-hold"));
+    REQUIRE_MESSAGE(hold.has_value(), hold.error().format());
+    CHECK(rig.service.faults().armed(ipc::fault::Stage::ExceptionReport) == 0);
+    REQUIRE(inject_failure(rig.service, stage("exception-report")).has_value());
+    const std::vector<ipc::ArmFault> arms = rig.arms();
+    REQUIRE(arms.size() == 3);  // each arming of exception-report disarms exception-hold in the agent
+    for (const ipc::ArmFault& a : arms) {
+        CHECK(a.stage == "exception-hold");
+    }
+    CHECK(arms[0].count == 0);
+    CHECK(arms[1].count == 1);
+    CHECK(arms[2].count == 0);
+}
+
+TEST_CASE("exceptions injection (WP-44): an action stage applies to the next action only; one that is not reached is disarmed and listed") {
+    QuietLogs quiet;
+    Rig rig;
+    handshake(rig);
+    auto heard = std::make_shared<Collect>();
+    rig.listen(heard);
+    rig.exceptions.on_exception(rig.link, static_cast<std::uint32_t>(kRigPid), Rig::fault(3));
+    REQUIRE(inject_failure(rig.service, stage("exception-leave")).has_value());
+    Result<Value> continued = rig.exceptions.action(Rig::args(kRigPid, 3, "continue"));  // not leave: the stage is not reached
+    REQUIRE_MESSAGE(continued.has_value(), continued.error().format());
+    const Value* disarmed = continued->find("injection_disarmed");
+    REQUIRE(disarmed != nullptr);
+    REQUIRE(disarmed->items().size() == 1);
+    CHECK(disarmed->items()[0].as_string() == "exception-leave");
+    std::vector<ipc::ArmFault> arms = rig.arms();
+    REQUIRE(arms.size() == 2);
+    CHECK(arms[1].count == 0);  // disarmed in the agent at the end of the action
+    // A stage that fires: the agent refuses with its id, the thread stays held, nothing is listed as unused.
+    rig.exceptions.on_exception(rig.link, static_cast<std::uint32_t>(kRigPid), Rig::fault(4));
+    REQUIRE(inject_failure(rig.service, stage("exception-continue")).has_value());
+    rig.action_status = ipc::fault::ids::kAgentExceptionContinue;  // what the agent answers when the stage fires
+    Result<Value> refused = rig.exceptions.action(Rig::args(kRigPid, 4, "continue"));
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().id() == "CML4662");
+    CHECK(rig.exceptions.pending_count() == 1);
+    rig.action_status = 0;
+    Result<Value> again = rig.exceptions.action(Rig::args(kRigPid, 4, "continue"));
+    REQUIRE_MESSAGE(again.has_value(), again.error().format());
+    CHECK(again->find("injection_disarmed") == nullptr);
+    CHECK(rig.arms().size() == 4);  // armed, disarmed at the end of the refused action; nothing for the last one
+}
+
+TEST_CASE("exceptions injection (WP-44): an action stage cannot be armed while an action runs (CML5978); afterwards it can") {
+    QuietLogs quiet;
+    Rig rig;
+    handshake(rig);
+    auto heard = std::make_shared<Collect>();
+    rig.listen(heard);
+    rig.exceptions.on_exception(rig.link, static_cast<std::uint32_t>(kRigPid), Rig::fault(9));
+    std::optional<Result<Value>> during;
+    rig.before_action_answer = [&] { during.emplace(inject_failure(rig.service, stage("exception-leave"))); };
+    REQUIRE(rig.exceptions.action(Rig::args(kRigPid, 9, "ignore")).has_value());
+    REQUIRE(during.has_value());
+    REQUIRE_FALSE(during->has_value());
+    CHECK(during->error().id() == "CML5978");
+    rig.before_action_answer = nullptr;
+    CHECK(inject_failure(rig.service, stage("exception-leave")).has_value());
+}
+#endif

@@ -216,6 +216,15 @@ ExceptionStepResult ExceptionSteps::pending(ipc::ControlClient& control, const S
         return fail(cml::ids::kResultMismatch, std::to_string(count) + " threads are held, expected " + std::to_string(step.result_value) + ": " +
                                                    ipc::json::serialize(response->result));
     }
+    // WP-44: a thread whose `exception` event was not published (the failure-injection stage exception-report) is only seen here: when
+    // exactly one is held and no expect_exception named one, it becomes the current exception of the following steps.
+    if (count == 1 && !have_current_) {
+        const ipc::json::Value& only = list->items()[0];
+        current_pid_ = only.get_integer("pid");
+        current_id_ = only.get_integer("exception_id");
+        have_current_ = true;
+        return pass("1 thread held; exception " + std::to_string(current_id_) + " of pid " + std::to_string(current_pid_) + " is now the current exception");
+    }
     return pass(std::to_string(count) + " threads held");
 }
 

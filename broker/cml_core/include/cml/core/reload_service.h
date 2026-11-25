@@ -184,7 +184,10 @@ private:
     std::vector<std::future<void>> retiring_;  // stopped save watchers finishing a reload
     WatcherFactory watcher_factory_;
 
-    Result<ipc::json::Value> revert_impl(const ipc::json::Value& args, std::vector<std::uint32_t>* pids, std::string* outcome);
+    // `acquired`: revert() holds the run lock. `outcomes`: the diagnostics of each process (R-51: an agent stage's id in one process's
+    // outcome says it fired there, not in the others).
+    Result<ipc::json::Value> revert_impl(const ipc::json::Value& args, bool acquired, std::vector<std::uint32_t>* pids,
+                                         std::map<std::uint32_t, std::string>* outcomes);
     std::shared_ptr<RestartCoordinator> restart_;  // guarded by mutex_; restart() works on a copy
     std::mutex observer_mutex_;
     OptionObserver option_observer_;

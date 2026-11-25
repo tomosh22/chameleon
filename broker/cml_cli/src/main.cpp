@@ -262,6 +262,8 @@ int run_headless(const Options& options) {
     }
     server_options.session_dir = options.session_dir;
     server_options.compile_on_save = options.compile_on_save;
+    // WP-44: inject-failure {persist:true} keeps its armings next to the log (without a log file there is no such place).
+    server_options.fault_state_file = options.log_file.empty() ? std::string() : options.log_file + ".fault-injection.json";
     server_options.exit_when_idle_ms = options.exit_when_idle_ms;
     server_options.startup_timeout_ms = options.startup_timeout_ms;
     g_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);

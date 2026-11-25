@@ -170,6 +170,52 @@ void SaveWatcher::on_batch(const watch::ChangeBatch& batch) {
         }
     }
     relevant = relevant || hits != 0;
+    // WP-44: a batch that would start a reload is the operation of the failure-injection group "watch" (an irrelevant batch is not).
+    FaultInjector* const faults = relevant ? hooks_.faults : nullptr;
+    const auto injected = [&](ipc::fault::Stage stage) { return faults != nullptr ? faults->hit(stage, 0) : std::optional<Diag>(); };
+    const auto finish = [&] {
+        if (faults == nullptr) {
+            return;
+        }
+        const std::vector<std::string> unused = faults->disarm_group("watch", 0);
+        if (unused.empty()) {
+            CML_LOG(Trace, "compile-on-save: the batch leaves no watch stage armed");
+            return;
+        }
+        std::string names;
+        for (const std::string& n : unused) {
+            names += (names.empty() ? "" : ", ") + n;
+        }
+        const Diag d = Diag::make(ipc::fault::ids::kWatchDisarmed,
+                                  "failure injection: the batch of saves did not reach the armed stage(s) " + names + "; disarmed (injection_disarmed)",
+                                  "An arming of a watch stage applies to the next batch of saves only; arm it again before the save that should fail.");
+        CML_LOG(Warn, "compile-on-save: %s", d.format().c_str());
+        if (hooks_.report) {
+            hooks_.report(d, "warning");
+        }
+    };
+    bool overflow = batch.overflow;
+    if (std::optional<Diag> lost = injected(ipc::fault::Stage::WatchDebounce)) {
+        // The debounced batch is lost: what the watcher does after lost events, it does now (every tracked file is re-checked).
+        Diag d = *lost;
+        d.message += ": " + std::to_string(hits) + " tracked file(s) of the batch are re-checked with every other tracked file";
+        if (hooks_.report) {
+            hooks_.report(d, "warning");
+        }
+        overflow = true;
+    }
+    if (std::optional<Diag> dropped = injected(ipc::fault::Stage::WatchChangeDetection)) {
+        Diag d = *dropped;
+        d.message += ": the save of " + std::to_string(hits) + " tracked file(s) starts no reload";
+        if (hooks_.report) {
+            hooks_.report(d, "error");
+        }
+        finish();
+        return;
+    }
+    if (overflow && !batch.overflow) {
+        CML_LOG(Trace, "compile-on-save: the injected loss of the batch re-checks every tracked file");
+    }
     if (batch.overflow && batch.lost_roots.empty()) {
         CML_LOG(Warn, "compile-on-save: file events were lost; every tracked file is re-checked");
         if (hooks_.report) {
@@ -183,13 +229,27 @@ void SaveWatcher::on_batch(const watch::ChangeBatch& batch) {
         return;
     }
     CML_LOG(Debug, "compile-on-save: %zu tracked file(s) saved; reloading", hits);
+    bool first_attempt = true;
     for (;;) {
         if (stopping_.load()) {
+            finish();
             return;
         }
         reloads_.fetch_add(1);
-        const SaveWatcherHooks::ReloadResult r = hooks_.reload ? hooks_.reload() : SaveWatcherHooks::ReloadResult::Done;
+        SaveWatcherHooks::ReloadResult r = SaveWatcherHooks::ReloadResult::Done;
+        std::optional<Diag> failed_reload = first_attempt ? injected(ipc::fault::Stage::WatchReload) : std::nullopt;
+        first_attempt = false;
+        if (failed_reload) {
+            failed_reload->message += ": the reload that the save started did not run";
+            if (hooks_.report) {
+                hooks_.report(*failed_reload, "error");
+            }
+            r = SaveWatcherHooks::ReloadResult::Failed;  // the watcher's own error path: CML5505 follows
+        } else {
+            r = hooks_.reload ? hooks_.reload() : SaveWatcherHooks::ReloadResult::Done;
+        }
         if (r == SaveWatcherHooks::ReloadResult::Done) {
+            finish();
             return;
         }
         if (r == SaveWatcherHooks::ReloadResult::Failed) {
@@ -199,10 +259,12 @@ void SaveWatcher::on_batch(const watch::ChangeBatch& batch) {
                                          "Fix the error reported just before this and save again, or run `reload`."),
                               "warning");
             }
+            finish();
             return;
         }
         reloads_.fetch_sub(1);  // busy: not started
         if (stopping_.load()) {
+            finish();
             return;
         }
         std::this_thread::sleep_for(options_.busy_retry);

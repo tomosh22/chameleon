@@ -132,6 +132,7 @@ struct Rig {
     bool close_on_load = false;
     std::uint32_t arm_status = 0;               // WP-28: status of the Reply to ArmFault (failure injection)
     std::uint32_t arm_status2 = 0;              // WP-28: the same for the second process
+    std::function<void(const ipc::ArmFault&)> on_arm;  // WP-44: runs when an agent receives ArmFault, before it answers
 
     std::mutex mutex;
     std::vector<ipc::Message> requests;         // what the agent received, in order (requests only)
@@ -333,7 +334,10 @@ struct Rig {
                 r.threads = 3;
                 l.deliver(r);
             }
-        } else if (std::holds_alternative<ipc::ArmFault>(m)) {
+        } else if (const auto* arm = std::get_if<ipc::ArmFault>(&m)) {
+            if (on_arm) {
+                on_arm(*arm);
+            }
             const std::uint32_t arm_result = (link2 && &l == link2.get()) ? arm_status2 : arm_status;
             reply(arm_result, arm_result != 0 ? "not an injection stage of the agent" : "armed");
         } else if (const auto* release = std::get_if<ipc::ReleaseRange>(&m)) {
@@ -1899,7 +1903,10 @@ TEST_CASE("fault injection: the control capability, fault-stages and inject-fail
                                             "patch-load", "hook-install", "post-patch-hooks",
                                             // WP-43: the restart's and the revert's stages, after the reload's
                                             "pre-restart-hooks", "restart-terminate", "restart-relaunch", "restart-hold", "restart-registration",
-                                            "restart-reenable", "restart-reapply", "revert-repoint", "revert-restore", "revert-uncommit"});
+                                            "restart-reenable", "restart-reapply", "revert-repoint", "revert-restore", "revert-uncommit",
+                                            // WP-44: the crash handler's and the watcher's
+                                            "exception-hold", "exception-report", "exception-continue", "exception-leave", "exception-reexecute",
+                                            "watch-debounce", "watch-change-detection", "watch-reload"});
     CHECK(stages.find("result")->find("details")->items().size() == names.size());
 
     const Value armed = call(R"({"id":2,"cmd":"inject-failure","args":{"stage":"bind-plan"}})");
@@ -2103,6 +2110,182 @@ TEST_CASE("revert injection (WP-43): an armed revert stage the revert does not r
     Result<Value> two = inject_failure(*rig.service, inject_args("revert-uncommit", 2));
     REQUIRE_FALSE(two.has_value());
     CHECK(two.error().id() == "CML5960");
+}
+
+// ---- WP-44 (R-51): races and stale records of WP-43's failure injection, revert side ----------------------------------------------
+
+TEST_CASE("revert injection (R-51 1): while a revert disarms what is left for it, inject-failure is refused busy") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    apply_two_patches(rig);
+    REQUIRE(inject_failure(*rig.service, inject_args("revert-restore")).has_value());  // `last` only re-points: not reached
+    std::optional<Result<Value>> during_cleanup;
+    rig.on_arm = [&](const ipc::ArmFault& arm) {
+        if (arm.count == 0 && !during_cleanup) {
+            during_cleanup.emplace(inject_failure(*rig.service, inject_args("revert-restore")));
+        }
+    };
+    Result<Value> last = revert_with(rig, "last");
+    REQUIRE_MESSAGE(last.has_value(), last.error().format());
+    REQUIRE(during_cleanup.has_value());
+    REQUIRE_FALSE(during_cleanup->has_value());  // before R-51: armed:true, and then disarmed by the ending revert
+    CHECK(during_cleanup->error().id() == "CML5978");
+    CHECK_FALSE(rig.service->faults().take_agent_armed(ipc::fault::Stage::RevertRestore, kPid));
+}
+
+TEST_CASE("revert injection (R-51 3): an agent that disconnects takes its armings along; a later process with its pid reports none") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    REQUIRE(inject_failure(*rig.service, inject_args("revert-repoint")).has_value());
+    rig.service->detach(1);
+    CHECK(finish_injection(*rig.service, "revert", kPid, std::string()).empty());  // before R-51: {"revert-repoint"}, a phantom
+}
+
+TEST_CASE("revert injection (R-51 4): a revert across processes decides per process which agent stage fired") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.enable2();
+    rig.changed_on(*rig.module);
+    rig.changed_on(*rig.module2);
+    REQUIRE(rig.reload().has_value());
+    REQUIRE(inject_failure(*rig.service, inject_args("revert-restore")).has_value());  // armed in both agents
+    rig.hooks_status = ipc::fault::ids::kAgentRevertRestore;  // it fires in the first process ...
+    rig.hooks_status2 = 0;                                     // ... and is not reached in the second (its revert succeeds)
+    Result<Value> r = revert_with(rig, "all");
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    CHECK(r->get_bool("partial"));
+    const Value* disarmed = r->find("injection_disarmed");
+    REQUIRE(disarmed != nullptr);  // before R-51 the first process's CML4659 counted as fired for both: nothing was listed
+    REQUIRE(disarmed->items().size() == 1);
+    CHECK(disarmed->items()[0].as_string() == "revert-restore");
+    CHECK_FALSE(rig.service->faults().take_agent_armed(ipc::fault::Stage::RevertRestore, kPid));
+    CHECK_FALSE(rig.service->faults().take_agent_armed(ipc::fault::Stage::RevertRestore, kPid + 1));
+}
+
+// ---- WP-44: persistent arming ----------------------------------------------------------------------------------------------------
+
+TEST_CASE("fault injection (WP-44): an arming with persist survives a broker restart; one without does not; it fires once") {
+    QuietLogs quiet;
+    testpdb::TempDir logs;
+    const std::string state = logs.file("broker.log.fault-injection.json");
+    {
+        Rig first;
+        first.service->faults().set_state_file(state);
+        first.enable();
+        Value keep = inject_args("link");
+        keep.set("persist", Value::boolean(true));
+        Result<Value> armed = inject_failure(*first.service, keep);
+        REQUIRE_MESSAGE(armed.has_value(), armed.error().format());
+        CHECK(armed->get_bool("persist"));
+        REQUIRE(inject_failure(*first.service, inject_args("compile")).has_value());  // not kept
+        CHECK(std::filesystem::exists(state));
+    }  // the broker exits
+    {
+        Rig second;  // a new broker with the same log
+        second.service->faults().set_state_file(state);
+        CHECK(second.service->faults().load_state().empty());
+        CHECK(second.faults_left("link") == 1);
+        CHECK(second.faults_left("compile") == 0);
+        second.enable();
+        second.changed();
+        Result<Value> failed = second.reload();
+        REQUIRE_FALSE(failed.has_value());
+        CHECK(failed.error().id() == "CML5967");  // link, not compile
+        CHECK_FALSE(std::filesystem::exists(state));  // it fired: nothing is kept any more
+        second.changed();
+        Result<Value> again = second.reload();
+        REQUIRE_MESSAGE(again.has_value(), again.error().format());
+    }
+    {
+        Rig third;  // and a third broker finds nothing
+        third.service->faults().set_state_file(state);
+        CHECK(third.service->faults().load_state().empty());
+        CHECK(third.faults_left("link") == 0);
+    }
+}
+
+TEST_CASE("fault injection (WP-44): none clears the kept armings; an agent stage's record is kept; without a log file persist is CML5984") {
+    QuietLogs quiet;
+    testpdb::TempDir logs;
+    const std::string state = logs.file("b.log.fault-injection.json");
+    {
+        Rig rig;
+        rig.enable();
+        Value keep = inject_args("link");
+        keep.set("persist", Value::boolean(true));
+        Result<Value> refused = inject_failure(*rig.service, keep);  // no state file: the broker writes no log
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().id() == "CML5984");
+        CHECK(rig.faults_left("link") == 0);
+        Value bad = inject_args("link");
+        bad.set("persist", Value::string("yes"));
+        CHECK(inject_failure(*rig.service, bad).error().id() == "CML5960");
+
+        rig.service->faults().set_state_file(state);
+        REQUIRE(inject_failure(*rig.service, keep).has_value());
+        Value agent_stage = inject_args("revert-repoint");
+        agent_stage.set("persist", Value::boolean(true));
+        REQUIRE(inject_failure(*rig.service, agent_stage).has_value());
+        CHECK(std::filesystem::exists(state));
+    }
+    {
+        Rig rig;
+        rig.service->faults().set_state_file(state);
+        CHECK(rig.service->faults().load_state().empty());
+        CHECK(rig.faults_left("link") == 1);
+        // The agent arming lives in the agent process; the broker remembers that the end of the next revert must disarm it there.
+        CHECK(rig.service->faults().take_agent_armed(ipc::fault::Stage::RevertRepoint, kPid));
+        rig.service->faults().note_agent_armed(ipc::fault::Stage::RevertRepoint, kPid, true);
+        REQUIRE(inject_failure(*rig.service, inject_args("none")).has_value());
+        CHECK(rig.faults_left("link") == 0);
+        CHECK_FALSE(std::filesystem::exists(state));
+    }
+    {
+        Rig rig;
+        rig.service->faults().set_state_file(state);
+        CHECK(rig.service->faults().load_state().empty());
+        CHECK(rig.faults_left("link") == 0);
+        CHECK_FALSE(rig.service->faults().take_agent_armed(ipc::fault::Stage::RevertRepoint, kPid));
+    }
+}
+
+TEST_CASE("fault injection (WP-44): a state file that cannot be used arms nothing, is put aside and is reported (CML5984)") {
+    QuietLogs quiet;
+    testpdb::TempDir logs;
+    const std::string state = logs.file("b.log.fault-injection.json");
+    for (const char* text : {"not json", R"({"version":2,"broker":[]})", R"({"version":1,"broker":[{"stage":"patch-load","count":1}]})",
+                             R"({"version":1,"broker":[{"stage":"restart-hold","count":2}]})", R"({"version":1,"agent":[{"stage":"link","pid":5}]})"}) {
+        CAPTURE(text);
+        {
+            std::ofstream out(state, std::ios::binary | std::ios::trunc);
+            out << text;
+        }
+        FaultInjector faults;
+        faults.set_state_file(state);
+        const std::vector<Diag> problems = faults.load_state();
+        REQUIRE(problems.size() == 1);
+        CHECK(problems[0].id() == "CML5984");
+        CHECK(problems[0].message.find(state) != std::string::npos);
+        CHECK_FALSE(std::filesystem::exists(state));
+        CHECK(std::filesystem::exists(state + ".bad"));
+        for (const ipc::fault::StageInfo& s : ipc::fault::kStages) {
+            CHECK(faults.armed(s.stage) == 0);
+        }
+    }
+    // A count of a reload stage is kept as what is left of it.
+    FaultInjector faults;
+    faults.set_state_file(state);
+    REQUIRE(faults.arm(ipc::fault::Stage::Compile, 3, 77u, true).has_value());
+    CHECK(faults.hit(ipc::fault::Stage::Compile, 77).has_value());
+    FaultInjector later;
+    later.set_state_file(state);
+    CHECK(later.load_state().empty());
+    CHECK(later.armed(ipc::fault::Stage::Compile) == 2);
+    CHECK_FALSE(later.hit(ipc::fault::Stage::Compile, 78).has_value());  // still for process 77 only
+    CHECK(later.hit(ipc::fault::Stage::Compile, 77).has_value());
 }
 
 #endif  // CML_FAULT_INJECTION
