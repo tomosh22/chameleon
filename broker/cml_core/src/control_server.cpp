@@ -193,7 +193,8 @@ ipc::ControlResponse handle_control_request(const ipc::ControlRequest& request, 
         if (request.cmd == "restart" && context.service->restart_available()) {
             return answer(request, context.service->restart(request.args, context.client_gone));  // WP-21, WP-34
         }
-        if (request.cmd == ipc::restart_hold::kResumeCommand && context.service->restart_hold_available()) {
+        // WP-34. WP-43 (R-40): also while a restart runs whose host was replaced (or removed) meanwhile: it may hold a process.
+        if (request.cmd == ipc::restart_hold::kResumeCommand && (context.service->restart_hold_available() || context.service->restart_active())) {
             return answer(request, context.service->restart_resume(request.args));  // WP-34
         }
     }

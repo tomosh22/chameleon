@@ -7,6 +7,8 @@ name: corpus
 # WP-39 (ADR-0042): every cell prints the stage timings of each accepted reload (`WP39-<PROJECT> edit=... total_ms=...
 # compile_ms=... rest_ms=... budget_ms=...`); the Godot cell (529 MB PDB) fails when a reload takes more than 3000 ms of
 # total - compile per recompiled translation unit (step `reload-budget`).
+# WP-42 (ADR-0043): `godot-gdextension` runs the same Godot editor binary (same cache, restored only) as the host of a
+# GDExtension plugin (godot-cpp) that it loads at run time; like Godot it runs on pull requests, schedule and dispatch.
 
 on:
   schedule:
@@ -14,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: 'run one project only (raylib, imgui, godot); empty or all runs every cell'
+        description: 'run one project only (raylib, imgui, godot, godot-gdextension); empty or all runs every cell'
         required: false
         default: 'all'
   pull_request:
@@ -51,9 +53,9 @@ jobs:
           EVENT: ${{ github.event_name }}
           ONLY: ${{ inputs.only }}
         run: |
-          cells='[{"project":"raylib","compiler":"msvc"},{"project":"raylib","compiler":"clang-cl"},{"project":"imgui","compiler":"msvc"},{"project":"imgui","compiler":"clang-cl"},{"project":"godot","compiler":"msvc"}]'
+          cells='[{"project":"raylib","compiler":"msvc"},{"project":"raylib","compiler":"clang-cl"},{"project":"imgui","compiler":"msvc"},{"project":"imgui","compiler":"clang-cl"},{"project":"godot","compiler":"msvc"},{"project":"godot-gdextension","compiler":"msvc"}]'
           if [ "$EVENT" = "push" ]; then
-            cells=$(echo "$cells" | jq -c 'map(select(.project != "godot"))')
+            cells=$(echo "$cells" | jq -c 'map(select(.project | startswith("godot") | not))')
           elif [ -n "$ONLY" ] && [ "$ONLY" != "all" ]; then
             cells=$(echo "$cells" | jq -c --arg o "$ONLY" 'map(select(.project == $o))')
           fi
@@ -93,7 +95,7 @@ jobs:
     runs-on: windows-2022
     # Godot is the large one: a cold scons build of the editor with debug information. The driver step is limited to
     # 130 minutes; the cache is saved afterwards (also on failure) so that a partial build is continued by the next run.
-    timeout-minutes: ${{ matrix.project == 'godot' && 175 || 90 }}
+    timeout-minutes: ${{ startsWith(matrix.project, 'godot') && 175 || 90 }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
@@ -115,7 +117,7 @@ jobs:
           path: chameleon-bin
 
       - name: Restore the Godot build tree
-        if: matrix.project == 'godot'
+        if: startsWith(matrix.project, 'godot')
         id: godot-cache
         uses: actions/cache/restore@v4
         with:
@@ -145,11 +147,11 @@ jobs:
           Write-Host "cache hit: ${{ steps.godot-cache.outputs.cache-hit }}"
 
       - name: Run the corpus (${{ matrix.project }}, ${{ matrix.compiler }})
-        timeout-minutes: ${{ matrix.project == 'godot' && 130 || 75 }}
+        timeout-minutes: ${{ startsWith(matrix.project, 'godot') && 130 || 75 }}
         run: |
           pwsh -NoProfile -File tests/corpus/run_corpus.ps1 -Project ${{ matrix.project }} -Compiler ${{ matrix.compiler }} `
             -ChameleonBin chameleon-bin -WorkDir $env:WORK -CxxPath $env:CXX `
-            -ReloadBudgetMsPerTu ${{ matrix.project == 'godot' && 3000 || 0 }}
+            -ReloadBudgetMsPerTu ${{ startsWith(matrix.project, 'godot') && 3000 || 0 }}
           exit $LASTEXITCODE
 
       - name: Save the Godot build tree

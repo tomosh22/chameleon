@@ -72,7 +72,13 @@ ipc::Message handle_arm_request(const ipc::Message& message) {
     const f::StageInfo* info = f::find_stage(request->stage);
     if (info == nullptr || !info->agent_side) {
         reply.status = f::ids::kAgentBadArm;
-        reply.message = std::string("'") + request->stage + "' is not a failure-injection stage of the agent (reservation, patch-load, hook-install, post-patch-hooks)";
+        std::string agent_stages;
+        for (const f::StageInfo& s : f::kStages) {
+            if (s.agent_side) {
+                agent_stages += (agent_stages.empty() ? "" : ", ") + std::string(s.name);
+            }
+        }
+        reply.message = std::string("'") + request->stage + "' is not a failure-injection stage of the agent (" + agent_stages + ")";
         return reply;
     }
     if (request->count > f::kMaxCount) {

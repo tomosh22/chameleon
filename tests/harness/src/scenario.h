@@ -101,6 +101,17 @@ struct Step {
     // total_minus_compile_median_ms=... max_ms=... budget_ms=...` followed by the stage medians (perf_steps.h).
     std::string perf_tag;
 
+    // WP-43. Restart (restart_step.h): `hold_new`, `hold_ms`, `expect_restarting`; `expect_error` (above) with `expect_error_text`, a
+    // substring of the refusal's message (also for Revert, and `expect_text` of ExpectDiag: a substring of the diag event's message); `expect_warning` (a warning diag with that id), `expect_reapply_error` (the id
+    // of the result's reapply_error) and `expect_not_enabled` (a module the result's not_enabled lists).
+    bool hold_new = false;
+    int hold_ms = 10000;
+    bool expect_restarting = true;
+    std::string expect_error_text;
+    std::string expect_warning;
+    std::string expect_reapply_error;
+    std::string expect_not_enabled;
+
     // "expect_stdout /value=2/ within 10 s"
     std::string describe() const;
     // The broker capability the step needs, or nullptr when it needs none beyond `status`.

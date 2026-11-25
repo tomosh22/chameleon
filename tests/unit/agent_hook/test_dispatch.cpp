@@ -20,6 +20,7 @@
 #include "cml/ipc/messages.h"
 #include "cml/ipc/pipe.h"
 #include "doctest.h"
+#include "fault/fault_injection.h"
 #include "hook/diag_ids.h"
 #include "hook/installer.h"
 #include "hook/user_hook_ids.h"
@@ -694,16 +695,19 @@ TEST_CASE("application hooks: a module the application did not enable contribute
 namespace {
 
 // Sets an environment variable of the test process for the lifetime of the object.
+// WP-43: the object owns a copy of the name. It used to keep the caller's pointer, and the test with twelve large variables
+// destroyed the strings that pointer referred to before the ScopedVars: the destructors read the name from freed memory (a
+// use-after-free, crashing intermittently in the msvc Debug cell, WP-42 ci job 138898816837).
 class ScopedVar {
 public:
-    ScopedVar(const wchar_t* name, const wchar_t* value) : name_(name) { SetEnvironmentVariableW(name, value); }
-    ~ScopedVar() { SetEnvironmentVariableW(name_, nullptr); }
+    ScopedVar(const wchar_t* name, const wchar_t* value) : name_(name) { SetEnvironmentVariableW(name_.c_str(), value); }
+    ~ScopedVar() { SetEnvironmentVariableW(name_.c_str(), nullptr); }
     ScopedVar(const ScopedVar&) = delete;
     ScopedVar& operator=(const ScopedVar&) = delete;
-    void set(const wchar_t* value) { SetEnvironmentVariableW(name_, value); }
+    void set(const wchar_t* value) { SetEnvironmentVariableW(name_.c_str(), value); }
 
 private:
-    const wchar_t* name_;
+    std::wstring name_;
 };
 
 std::u16string u16_of(const std::wstring& text) {
@@ -951,8 +955,9 @@ TEST_CASE("hot-restart: launch parameters that do not fit one message are refuse
     ScopedPipeEnv env(pipe);
     hooktest_user::reset(nullptr);
     // More than 300 000 UTF-16 units of environment (every variable is limited to 32 767 characters).
-    std::vector<std::unique_ptr<ScopedVar>> big;
+    // `names` outlives `big` (declared first); each ScopedVar also owns its name (see ScopedVar).
     std::vector<std::wstring> names;
+    std::vector<std::unique_ptr<ScopedVar>> big;
     for (int i = 0; i < 12; ++i) {
         names.push_back(std::wstring(L"CML_WP21_BIG") + static_cast<wchar_t>(L'A' + i));
     }
@@ -1000,6 +1005,59 @@ TEST_CASE("hot-restart: launch parameters that do not fit one message are refuse
     REQUIRE(reply.has_value());
     CHECK(reply->status == 0);
     agent.stop_and_wait_for_calls();
+
+    // The variables are gone again (a later test must not inherit 360 000 units of environment).
+    big.clear();
+    for (const std::wstring& name : names) {
+        wchar_t probe[4];
+        CHECK(GetEnvironmentVariableW(name.c_str(), probe, 4) == 0);
+        CHECK(GetLastError() == ERROR_ENVVAR_NOT_FOUND);
+    }
 }
+
+
+#if defined(CML_FAULT_INJECTION)
+TEST_CASE("hot-restart, failure injection (WP-43): pre-restart-hooks refuses after the hooks ran, says how many, and the next Restart works") {
+    namespace fi = cml::agent::fault;
+    struct Disarm {
+        ~Disarm() { fi::disarm_all(); }
+    } disarm;
+    const std::string pipe = unique_pipe_name();
+    FakeBroker broker(pipe);
+    REQUIRE(broker.listening());
+    ScopedPipeEnv env(pipe);
+    hooktest_user::reset(nullptr);
+
+    Agent agent(CML_MODE_IMMEDIATE);
+    REQUIRE(agent.start().has_value());
+    REQUIRE(broker.handshake());
+    REQUIRE(enable_this_module(agent, broker));
+    fi::arm(ipc::fault::Stage::PreRestartHooks, 1);
+
+    ipc::Restart restart;
+    restart.request_id = 131;
+    REQUIRE(broker.send(restart));
+    std::optional<ipc::RestartInfo> info = broker.wait_for<ipc::RestartInfo>(15000);
+    REQUIRE(info.has_value());
+    CHECK(info->request_id == 131);
+    CHECK(info->status == ipc::fault::ids::kAgentPreRestartHooks);
+    CHECK(info->hooks_run == 1);  // the hook ran before the injected failure
+    CHECK(info->message.find("pre-restart-hooks") != std::string::npos);
+    CHECK(info->command_line.empty());  // no launch parameters: the broker does not touch the process
+    CHECK(hooktest_user::log() == std::vector<std::string>{"pre-restart"});
+    CHECK(fi::armed(ipc::fault::Stage::PreRestartHooks) == 0);
+
+    restart.request_id = 132;
+    REQUIRE(broker.send(restart));
+    info = broker.wait_for<ipc::RestartInfo>(15000);
+    REQUIRE(info.has_value());
+    CHECK(info->request_id == 132);
+    CHECK_MESSAGE(info->status == 0, info->message);
+    CHECK(info->hooks_run == 1);
+    CHECK_FALSE(info->command_line.empty());
+    agent.stop_and_wait_for_calls();
+    hooktest_user::reset(nullptr);
+}
+#endif
 
 #endif  // _WIN32

@@ -115,6 +115,11 @@ public:
         return Result<void>();
     }
 
+    // WP-43: every failure this returns happens BEFORE CreateProcessW created a process (attribute list, CreateProcessW itself), so
+    // relaunch_created_process() stays false and the broker may try again. Once CreateProcessW succeeded nothing here can fail (the
+    // watchdog is optional and only logged).
+    bool relaunch_created_process() const override { return false; }
+
     Result<std::uint32_t> relaunch(const RelaunchSpec& spec) override {
         const auto fail = [](const std::string& why) {
             return Diag::make(rd::kLaunchFailed, why, "Check that the image still exists and can be started.");
@@ -176,11 +181,13 @@ public:
                                             cwd.empty() ? nullptr : cwd.c_str(), &startup.StartupInfo, &info);
         const DWORD create_error = GetLastError();
         DeleteProcThreadAttributeList(attributes);
-        close_duplicates();  // the new process has its own copies now
-        detach_console();    // the broker lets go of the console it borrowed
         if (!created) {
+            // WP-43: the broker tries once more; the copied handles and the borrowed console stay for that attempt (the destructor
+            // lets go of them otherwise).
             return fail("CreateProcessW failed for '" + utf8_of(image) + "' (" + win32_error(create_error) + ")");
         }
+        close_duplicates();  // the new process has its own copies now
+        detach_console();    // the broker lets go of the console it borrowed
         if (spec.suspended) {
             main_thread_ = info.hThread;  // kept to resume; closed by resume()
             start_watchdog(info.hProcess);
@@ -239,18 +246,13 @@ private:
     // It inherits exactly four handles (PROC_THREAD_ATTRIBUTE_HANDLE_LIST): the broker process, the held thread, the two events; none of the
     // broker's pipes. It ends with the hold, when the thread ends, or after hold_max (a hold lasts at most 60 s) at the latest.
     void start_watchdog(HANDLE new_process) {
-        wchar_t exe[MAX_PATH * 2];
-        const DWORD length = GetModuleFileNameW(nullptr, exe, MAX_PATH * 2);
-        if (length == 0 || length >= MAX_PATH * 2) {
+        // WP-43 (R-40): every reason not to start one is logged (a failed GetModuleFileNameW used to be silent).
+        const std::optional<std::wstring> executable =
+            hold_watchdog_executable([](wchar_t* buffer, unsigned long capacity) -> unsigned long { return GetModuleFileNameW(nullptr, buffer, capacity); });
+        if (!executable) {
             return;
         }
-        const std::wstring path(exe, length);
-        const std::size_t slash = path.find_last_of(L"\\/");
-        const std::wstring name = slash == std::wstring::npos ? path : path.substr(slash + 1);
-        if (_wcsicmp(name.c_str(), L"cml_broker.exe") != 0) {
-            CML_LOG(Debug, "restart: no hold watchdog (this executable is not cml_broker.exe)");
-            return;  // a test host or a tool embedding the library: there is no hidden mode to start
-        }
+        const std::wstring& path = *executable;
         SECURITY_ATTRIBUTES inheritable;
         ZeroMemory(&inheritable, sizeof(inheritable));
         inheritable.nLength = sizeof(inheritable);
@@ -382,6 +384,16 @@ class WindowsProcessHost final : public ProcessHost {
 public:
     bool supports_hold() const override { return true; }
 
+    bool has_exited(std::uint32_t pid) const override {
+        HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (process == nullptr) {
+            return GetLastError() == ERROR_INVALID_PARAMETER;  // no such process; access denied and the like: cannot tell
+        }
+        const bool exited = WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
+        CloseHandle(process);
+        return exited;
+    }
+
     Result<std::unique_ptr<RestartableProcess>> open(std::uint32_t pid, const std::uint64_t std_handles[3], std::uint32_t info_flags,
                                                      std::vector<Diag>* warnings) override {
         HANDLE process = OpenProcess(PROCESS_TERMINATE | PROCESS_DUP_HANDLE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
@@ -425,6 +437,32 @@ public:
 };
 
 }  // namespace
+
+std::optional<std::wstring> hold_watchdog_executable(const std::function<unsigned long(wchar_t* buffer, unsigned long capacity)>& module_file_name) {
+    constexpr unsigned long kCapacity = 32768;  // the longest path Windows has
+    std::vector<wchar_t> buffer(kCapacity, L'\0');
+    SetLastError(ERROR_SUCCESS);
+    const unsigned long length = module_file_name(buffer.data(), kCapacity);
+    const DWORD error = GetLastError();
+    const char* const consequence = "; a broker that is killed while it holds a process would leave that process suspended";
+    if (length == 0) {
+        CML_LOG(Warn, "restart: could not start the hold watchdog: GetModuleFileNameW failed (%s)%s", win32_error(error).c_str(), consequence);
+        return std::nullopt;
+    }
+    if (length >= kCapacity) {
+        CML_LOG(Warn, "restart: could not start the hold watchdog: the path of this executable does not fit %lu characters (%s)%s", kCapacity,
+                win32_error(error).c_str(), consequence);
+        return std::nullopt;
+    }
+    const std::wstring path(buffer.data(), length);
+    const std::size_t slash = path.find_last_of(L"\\/");
+    const std::wstring name = slash == std::wstring::npos ? path : path.substr(slash + 1);
+    if (_wcsicmp(name.c_str(), L"cml_broker.exe") != 0) {
+        CML_LOG(Debug, "restart: no hold watchdog (this executable is not cml_broker.exe)");
+        return std::nullopt;  // a test host or a tool embedding the library: there is no hidden mode to start
+    }
+    return path;
+}
 
 std::shared_ptr<ProcessHost> native_process_host() {
     return std::make_shared<WindowsProcessHost>();

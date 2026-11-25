@@ -304,7 +304,91 @@ namespace Chameleon.Control.Tests
         {
             var rig = new Rig();
             rig.Settings.ReattachOnRestart = reattachOn;
-            Assert.Equal(expected, rig.Coordinator.ShouldHoldNewProcess(brokerHasRestartHold));
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));   // the debugger is on the process to be restarted
+            Assert.Equal(expected, rig.Coordinator.ShouldHoldNewProcess(brokerHasRestartHold, 100));
+        }
+
+        // ---- WP-43 (R-40): the WP-34 review follow-ups -----------------------------------------------------------------------------
+
+        [Fact]
+        public void TheRestartIsNotHeldWhenTheDebuggerIsNotOnTheProcessToBeRestarted()
+        {
+            var rig = new Rig();
+            Assert.False(rig.Coordinator.ShouldHoldNewProcess(true, 100));       // no debugger at all (before WP-43: true)
+            rig.Debugger.Attached.Add(new DebuggedProcess(300, new[] { "Native" }));
+            Assert.False(rig.Coordinator.ShouldHoldNewProcess(true, 100));       // the debugger is on another process
+            Assert.False(rig.Coordinator.ShouldHoldNewProcess(true, null));      // the broker picks the process: unknown, not held
+            Assert.True(rig.Coordinator.ShouldHoldNewProcess(true, 300));
+        }
+
+        [Fact]
+        public async Task AFailedEarlyAttachAndAFailedLateAttachAreReportedOnce()
+        {
+            var rig = new Rig();
+            rig.Debugger.FailTimes = 99;
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
+            rig.Coordinator.Observe();
+            rig.Debugger.ProcessExits(100);
+            rig.Coordinator.Observe();
+
+            Assert.Equal(ReattachOutcome.Failed, await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume()));
+            Assert.Equal(ReattachOutcome.Failed, await rig.Coordinator.OnRestartedAsync(100, 200));   // the late attach is tried, and fails too
+
+            ChameleonDiagnostic d = Assert.Single(rig.Reported);   // before WP-43: two CML5997 for one restart
+            Assert.Equal("CML5997", d.Id);
+            Assert.Contains(rig.Log, m => m.Contains("reported for this restart already"));
+        }
+
+        [Fact]
+        public async Task AFailedAttachIsReportedOncePerRestartAndAFailedResumeAlways()
+        {
+            var rig = new Rig();
+            rig.Debugger.FailTimes = 99;
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
+
+            await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume(throws: new InvalidOperationException("the request could not be sent")));
+            await rig.Coordinator.OnRestartedAsync(100, 200);   // the late attach fails too: not reported again
+
+            // before WP-43: three (early attach, resume, late attach); now the attach once and the resume once
+            Assert.Equal(2, rig.Reported.Count);
+            Assert.All(rig.Reported, d => Assert.Equal("CML5997", d.Id));
+            Assert.Single(rig.Reported, d => d.Message.Contains("resume the restarted process"));
+            Assert.Single(rig.Reported, d => d.Message.Contains("Could not attach"));
+            // A different restart is reported again.
+            rig.Debugger.Attached.Add(new DebuggedProcess(300, new[] { "Native" }));
+            await rig.Coordinator.OnRestartingAsync(300, 400, rig.Resume());
+            Assert.Equal(3, rig.Reported.Count);
+        }
+
+        [Fact]
+        public async Task AResumeThatTimesOutAfterTheEarlyAttachFailedIsStillReportedNamingTheFrozenProcess()
+        {
+            var rig = new Rig();
+            rig.Debugger.FailTimes = 99;
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
+            var timedOut = new ControlException(ClientDiagnostics.PipeLost("pipe", "no answer to 'restart-resume' within 20 s"), timedOut: true);
+
+            await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume(throws: timedOut));
+
+            Assert.Equal(2, rig.Reported.Count);   // the attach failure, then the resume: not swallowed by the one-per-restart rule
+            Assert.Contains("Could not attach", rig.Reported[0].Message);
+            Assert.Contains("pid 200", rig.Reported[1].Message);
+            Assert.Contains("may stay suspended", rig.Reported[1].Message);
+        }
+
+        [Fact]
+        public async Task ARestartResumeThatGetsNoAnswerInTimeIsReportedNotOnlyLogged()
+        {
+            var rig = new Rig();
+            rig.Debugger.Attached.Add(new DebuggedProcess(100, new[] { "Native" }));
+            var timedOut = new ControlException(ClientDiagnostics.PipeLost("pipe", "no answer to 'restart-resume' within 20 s"), timedOut: true);
+
+            await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume(throws: timedOut));
+
+            ChameleonDiagnostic d = Assert.Single(rig.Reported);   // before WP-43: only logged, the process frozen until hold_ms
+            Assert.Equal("CML5997", d.Id);
+            Assert.Contains("did not answer restart-resume in time", d.Message);
+            Assert.Contains("resumes the process by itself", d.Action);
         }
 
         [Fact]
@@ -534,6 +618,25 @@ namespace Chameleon.Control.Tests
             ChameleonDiagnostic d = Assert.Single(rig.Reported);
             Assert.Equal("CML5997", d.Id);
             Assert.Contains("CML5817", d.Message);
+        }
+
+        [Fact]
+        public async Task AnUnconfirmedResumeOfANewerBrokerIsReportedAsSuchAndAnOlderBrokersCml5817AsAFailedResume()
+        {
+            var rig = new Rig();
+            var unconfirmed = new ControlResponse { Ok = false, Error = new BrokerError { Id = "CML5820", Message = "the restart did not confirm within 10000 ms that process 200 runs", Action = "x" } };
+            await rig.Coordinator.OnRestartingAsync(100, 200, rig.Resume(unconfirmed));
+            ChameleonDiagnostic d = Assert.Single(rig.Reported);
+            Assert.Equal("CML5997", d.Id);
+            Assert.Contains("did not confirm in time", d.Message);
+            Assert.Contains("still requested", d.Action);
+
+            var older = new Rig();   // a broker from before WP-43 answers the same situation with CML5817
+            var failed = new ControlResponse { Ok = false, Error = new BrokerError { Id = "CML5817", Message = "the restart did not confirm within 10 s that process 200 runs", Action = "x" } };
+            await older.Coordinator.OnRestartingAsync(100, 200, older.Resume(failed));
+            ChameleonDiagnostic e = Assert.Single(older.Reported);
+            Assert.Equal("CML5997", e.Id);
+            Assert.Contains("CML5817", e.Message);
         }
 
         [Fact]

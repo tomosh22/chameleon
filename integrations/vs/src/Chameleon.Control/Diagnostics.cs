@@ -92,6 +92,16 @@ namespace Chameleon.Control
                 "If the application stays frozen, run Tools > Chameleon > Hot-restart again.");
         }
 
+        /// <summary>WP-43: the broker took `restart-resume` but did not confirm in time that the process runs (broker id CML5820).</summary>
+        public static ChameleonDiagnostic ResumeUnconfirmed(int newPid, string reason, int holdMs)
+        {
+            return new ChameleonDiagnostic(
+                ClientDiagIds.ReattachFailed,
+                "The broker did not confirm in time that the restarted process (pid " + newPid + ") runs again: " + reason + ".",
+                "Wait a moment: the resume is still requested, and the broker resumes the process by itself when the hold time (" + (Math.Min(60000, holdMs) / 1000) +
+                " s) has passed. If the application stays frozen, run Tools > Chameleon > Hot-restart again.");
+        }
+
         /// <summary>WP-34: the debugger attached too slowly (or not at all) to the held process.</summary>
         public static ChameleonDiagnostic AttachTooSlow(int oldPid, int newPid, int waitedMs)
         {
@@ -102,12 +112,16 @@ namespace Chameleon.Control
     /// <summary>Thrown by the control client and the broker session for a failure that has a client-side diagnostic.</summary>
     public sealed class ControlException : Exception
     {
-        public ControlException(ChameleonDiagnostic diagnostic)
+        public ControlException(ChameleonDiagnostic diagnostic, bool timedOut = false)
             : base(diagnostic.ToString())
         {
             Diagnostic = diagnostic;
+            TimedOut = timedOut;
         }
 
         public ChameleonDiagnostic Diagnostic { get; }
+
+        /// <summary>WP-43 (R-40): the request got no answer in time; the connection is still open (a dropped connection is false).</summary>
+        public bool TimedOut { get; }
     }
 }
