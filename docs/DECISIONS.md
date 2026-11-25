@@ -1295,6 +1295,15 @@ Each gets a unit test. They exist only in fault-injection builds, so they did no
 **Directories:** `agent/src/crash`, `broker/cml_core` (exception service, save watcher, fault injection, and for R-51 restart and
 reload service), `core/cml_pe` (R-49), `tests/harness`, `tests/unit/broker`.
 
+**Ruling (WP-40, second high review; ADR-0018 convergence):** in the planner's static pairing, a case that cannot be proven
+safe is refused, not paired cleverly. Concretely: a `$S<n>` bitmask guard is placed on the old bitmask only when the function's
+dynamically initialised statics are the same set in the same order as in the old image (else CML3600); a new own static of a
+function whose name equals a static of one of its lambdas (old or new, inlined or not) pairs only when every candidate record is
+provably the function's own (else CML3207). Over-refusals this causes are recorded in KNOWN_LIMITATIONS and are acceptable; a
+later review of WP-40 that finds only over-refusals does not hold the merge. raylib clang-cl `edit:header-inline-raymath` is
+now refused with CML3601 (a split static, `rprand_state.0`, whose piece the PDB does not record): before WP-40 that reload reset
+the variable silently, so the refusal is the intended outcome and the corpus asserts it as an expected failure.
+
 **Rulings (WP-44 round 1):** the persistent-arming state file is derived from `--log` in `broker/cml_cli/src/main.cpp` and loaded in
 `connection_server.{h,cpp}` (outside the listed directories, accepted: only the CLI knows the log path); TROUBLESHOOTING.md entries for
 the new ids are part of the WP. `exception-hold` (agent, CML4661) passes the fault on and is only logged by the agent, since no new
