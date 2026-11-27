@@ -109,7 +109,8 @@ struct ModuleState {
     Reservation reservation;
     std::optional<toolchain::ToolInfo> linker;      // resolved once per option set, mirrors the module's linker
     std::string linker_key;                         // the `linker` / `linker_path` options `linker` was resolved with
-    std::shared_ptr<const pe::OwnedImage> image;    // the module file on disk (old code bytes, narrowing)
+    std::shared_ptr<const pe::OwnedImage> image;    // the module file on disk (old code bytes, narrowing); see ensure_image()
+    bool image_released = false;                    // WP-50: release_image() ran (the state was dropped); no background read stores
     std::uint64_t generation = 0;                   // patches applied to this module
     std::uint64_t patch_counter = 0;                // names patch files (also counts failed attempts; never goes back)
     std::vector<PatchBatch> batches;                // live patches, oldest first (WP-22)
@@ -118,6 +119,23 @@ struct ModuleState {
     std::optional<BaselineSnapshot> carried_in;
 
     bool is_hooked(std::uint64_t old_va);
+
+    // WP-50 (R-47): the module file, read once per state and kept (`image`). The read happens in the background once the index is
+    // Ready (ReloadService, `background` true), or in the plan stage of the first reload if that came first; `image_mutex`
+    // makes the second wait for the first instead of reading the file again (two copies of a large executable would cross the
+    // broker's memory budget). A background read neither reads nor stores after release_image(); a reload's read always reads (and
+    // stores unless released). Takes `image_mutex`, then `mutex` only around the member accesses (never while reading).
+    struct ImageRead {
+        std::shared_ptr<const pe::OwnedImage> image;  // null when the file could not be read, or (background) after release_image()
+        std::optional<Diag> error;                    // why it could not be read
+        bool read_now = false;                        // this call read the file
+        double ms = 0;                                // how long the read took
+        double mib = 0;
+    };
+    ImageRead ensure_image(bool background);
+    // Drops the copy and stops later background reads from storing one (a WP-45 re-enable is a new state and reads afresh).
+    void release_image();
+    std::mutex image_mutex;  // one reader of the module file at a time
 
     // WP-25: what the patches' functions look like, keyed by the address of the patch code (the new entry of a hook, or the
     // address of a function a patch introduced). `code_running_at(entry)` is the record of the code that runs when `entry`

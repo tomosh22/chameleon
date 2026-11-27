@@ -31,6 +31,12 @@ revert, restart).
      threads (`stop_us` = `enumerate_us` + `suspend_us` + `context_us`), the writes (`write_us`, slowest hook
      `write_max_us`) and resuming; the broker's line gives the round trip it saw. `batch=1` is the first of the process.
    * `WP50-ONEOFF what=module-image|linker-detection|reserve-range ms=...`: work done once per module at its first reload.
+     The module file is normally read in the background once the index is ready (`image=background`); `image=reload` means
+     the first reload had to read it itself (set-option `prefetch_module_image` false, or the reload came first).
+   * `WP50-SCAN-CACHE hit|miss module=... reason=...`: whether an index took the file lists and include graph of an earlier
+     index of the same module file (a hot-restart's new process, a module loaded again). `miss reason=size|mtime|pdb` means the
+     module file was rebuilt since; `absent` that this broker had not indexed it before. Set-option `cache_include_scan` false
+     scans every time.
 
 ## Ids raised by the integrations
 

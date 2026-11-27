@@ -1272,24 +1272,24 @@ private:
     static constexpr std::uint64_t kMinPatchRoom = 4ull << 20;  // a patch needs room for at least this much image
 
     std::shared_ptr<const pe::OwnedImage> module_image(PatchReport& report) {
-        std::lock_guard<std::mutex> lock(module_.mutex);
-        if (!module_.image) {
-            const Clock::time_point read_started = Clock::now();
-            Result<pe::OwnedImage> loaded = pe::load_image_file(module_.path);
-            // WP-50 (R-47): a one-off cost of the session's first reload of the module (the copy is kept for the session).
-            CML_LOG(Info, "WP50-ONEOFF what=module-image module=%s ms=%.1f mib=%.1f ok=%d", module_.name.c_str(), ms_between(read_started, Clock::now()),
-                    loaded ? static_cast<double>(loaded->bytes.size()) / (1024.0 * 1024.0) : 0.0, loaded ? 1 : 0);
-            if (!loaded) {
-                // Not fatal: without the old bytes every planned hook is kept.
-                const Diag d = Diag::make(pd::kModuleImage, "cannot read the module file '" + module_.path + "' to compare function bodies: " + loaded.error().message,
-                                          "All functions of the patched object are hooked this time.");
-                emit(d, "warning", "plan");
-                report.warnings.push_back(d);
-                return nullptr;
-            }
-            module_.image = std::make_shared<const pe::OwnedImage>(std::move(*loaded));
+        // WP-50 (R-47): normally read in the background once the index was ready (ReloadService); this waits for a read in flight
+        // instead of reading the file a second time, and reads it here only when no background read did.
+        ModuleState::ImageRead read = module_.ensure_image(false);
+        if (read.read_now) {
+            CML_LOG(Info, "WP50-ONEOFF what=module-image image=reload module=%s ms=%.1f mib=%.1f ok=%d", module_.name.c_str(), read.ms, read.mib,
+                    read.image ? 1 : 0);
         }
-        return module_.image;
+        if (!read.image) {
+            // Not fatal: without the old bytes every planned hook is kept.
+            const Diag d = Diag::make(pd::kModuleImage,
+                                      "cannot read the module file '" + module_.path + "' to compare function bodies: " +
+                                          (read.error ? read.error->message : std::string("it was not read")),
+                                      "All functions of the patched object are hooked this time.");
+            emit(d, "warning", "plan");
+            report.warnings.push_back(d);
+            return nullptr;
+        }
+        return read.image;
     }
 
     Result<void> ensure_reserved() {

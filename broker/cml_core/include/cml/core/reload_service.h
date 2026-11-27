@@ -298,6 +298,19 @@ private:
     bool reapply_stop_ = false;
     std::atomic<std::size_t> reapply_pending_{0};  // queued + running
 
+    // WP-50 (R-55): the scan results of the module files this session indexed (ModuleIndexSpec::scan_cache).
+    std::shared_ptr<ScanCache> scan_cache_ = std::make_shared<ScanCache>();
+    // WP-50 (R-47): background reads of the module files the reloads compare with (ModuleState::ensure_image), queued when a
+    // module's index becomes Ready (ReloadOptions::prefetch_module_image). One worker thread, started on first use, joined by the
+    // destructor. It holds a state only while it reads that state's file.
+    void queue_image_prefetch(std::weak_ptr<ModuleState> state);
+    void prefetch_loop();
+    std::mutex prefetch_mutex_;  // guards the members below
+    std::condition_variable prefetch_changed_;
+    std::deque<std::weak_ptr<ModuleState>> prefetch_queue_;
+    std::thread prefetch_thread_;
+    bool prefetch_stop_ = false;
+
     std::mutex reload_mutex_;  // one reload at a time
     std::atomic<bool> running_{false};
     std::atomic<std::uint64_t> generation_{0};

@@ -5,6 +5,7 @@
 #include <string>
 
 #include "cml/core/include_scan.h"
+#include "cml/core/module_index.h"
 
 using namespace cml;
 using namespace cml::core;
@@ -222,6 +223,49 @@ TEST_CASE("the precompiled header is the named header and the forced includes wi
     CHECK(roots.pch_header == "cmake_pch.hxx");
 }
 
+// WP-50: the scanner expands a header reached again with new stack directories by looking at those alone. These are the three
+// ways a new directory can relate to the earlier answer; the expected sets are what the scanner before WP-50 (full search on
+// every expansion) returns for the same trees.
+TEST_CASE("WP-50: a header reached again with a new stack directory resolves its includes as a full search would") {
+    const auto deps = [](const std::map<std::string, std::string>& files, const std::string& tu) {
+        FakeFs fs;
+        fs.files = files;
+        IncludeScanner scanner(fs.reader());
+        ScanRoots roots;
+        roots.source = tu;
+        roots.cwd = "c:\\p";
+        roots.include_dirs = {"c:\\p\\inc"};
+        return scanner.dependencies(roots);
+    };
+    SUBCASE("answered by -I first; the new directory has it: found there too") {
+        CHECK(deps({{"c:\\p\\t\\tu.cpp", "#include \"../l/one.h\"\n#include \"../m/two.h\"\n"},
+                    {"c:\\p\\l\\one.h", "#include \"c.h\"\n"},
+                    {"c:\\p\\m\\two.h", "#include \"../l/one.h\"\n"},
+                    {"c:\\p\\inc\\c.h", ""},
+                    {"c:\\p\\m\\c.h", ""}},
+                   "c:\\p\\t\\tu.cpp") ==
+              std::set<std::string>{"c:\\p\\inc\\c.h", "c:\\p\\l\\one.h", "c:\\p\\m\\c.h", "c:\\p\\m\\two.h"});
+    }
+    SUBCASE("answered by a stack directory that sorts before the new one: kept") {
+        CHECK(deps({{"c:\\p\\a\\tu.cpp", "#include \"../l/one.h\"\n#include \"../m/two.h\"\n"},
+                    {"c:\\p\\l\\one.h", "#include \"c.h\"\n"},
+                    {"c:\\p\\m\\two.h", "#include \"../l/one.h\"\n"},
+                    {"c:\\p\\a\\c.h", ""},
+                    {"c:\\p\\m\\c.h", ""},
+                    {"c:\\p\\inc\\c.h", ""}},
+                   "c:\\p\\a\\tu.cpp") == std::set<std::string>{"c:\\p\\a\\c.h", "c:\\p\\l\\one.h", "c:\\p\\m\\two.h"});
+    }
+    SUBCASE("answered by a stack directory that sorts after the new one: the new one answers too") {
+        CHECK(deps({{"c:\\p\\z\\tu.cpp", "#include \"../l/one.h\"\n#include \"../m/two.h\"\n"},
+                    {"c:\\p\\l\\one.h", "#include \"c.h\"\n"},
+                    {"c:\\p\\m\\two.h", "#include \"../l/one.h\"\n"},
+                    {"c:\\p\\z\\c.h", ""},
+                    {"c:\\p\\m\\c.h", ""}},
+                   "c:\\p\\z\\tu.cpp") ==
+              std::set<std::string>{"c:\\p\\l\\one.h", "c:\\p\\m\\c.h", "c:\\p\\m\\two.h", "c:\\p\\z\\c.h"});
+    }
+}
+
 TEST_CASE("WP-50: the scan's statistics count each path read once, found or missing, and the questions answered from the cache") {
     FakeFs fs;
     fs.files["c:\\proj\\src\\main.cpp"] = "#include \"a.h\"\n#include <b.h>\n";
@@ -261,4 +305,70 @@ TEST_CASE("WP-50: the scan's statistics count each path read once, found or miss
     CHECK(second.missing == first.missing);
     CHECK(calls == first.found + first.missing);
     CHECK(second.lookups > first.lookups);
+}
+
+TEST_CASE("WP-50: the scan cache hits only for the same module stamp; a changed size, time, PDB or option misses and the new scan replaces it") {
+    ScanCache cache;
+    ModuleFileStamp stamp;
+    stamp.size = 119u * 1024u * 1024u;
+    stamp.mtime = 1700000000;
+    stamp.pdb.guid[0] = 0x3C;
+    stamp.pdb.age = 1;
+    std::string reason;
+    CHECK(cache.find("C:\\Game\\bin\\game.exe", stamp, &reason) == nullptr);
+    CHECK(reason == "absent");
+
+    auto first = std::make_shared<ScanResult>();
+    first->files = {"c:\\game\\src\\a.cpp", "c:\\game\\src\\a.h"};
+    first->header_deps["c:\\game\\src\\a.h"] = {0};
+    cache.store("C:\\Game\\bin\\game.exe", stamp, first);
+    CHECK(cache.size() == 1);
+
+    // The same file, spelled differently: a hit, the very result stored.
+    std::shared_ptr<const ScanResult> hit = cache.find("c:/game/BIN/game.exe", stamp, &reason);
+    CHECK(hit == first);
+    CHECK(reason.empty());
+
+    const auto misses_with = [&](ModuleFileStamp changed, const char* expected) {
+        std::string why;
+        CHECK(cache.find("C:\\Game\\bin\\game.exe", changed, &why) == nullptr);
+        CHECK(why == expected);
+    };
+    ModuleFileStamp s = stamp;
+    s.size += 1;
+    misses_with(s, "size");
+    s = stamp;
+    s.mtime += 2;
+    misses_with(s, "mtime");
+    s = stamp;
+    s.pdb.age = 2;
+    misses_with(s, "pdb");
+    s = stamp;
+    s.pdb.guid[15] = 0x01;
+    misses_with(s, "pdb");
+    s = stamp;
+    s.scan_includes = false;
+    misses_with(s, "options");
+    CHECK(stamp_difference(stamp, stamp).empty());
+
+    // A relinked module: its new scan replaces the entry, and the old stamp misses from then on.
+    ModuleFileStamp relinked = stamp;
+    relinked.mtime += 60;
+    auto second = std::make_shared<ScanResult>();
+    cache.store("C:\\Game\\bin\\game.exe", relinked, second);
+    CHECK(cache.size() == 1);
+    CHECK(cache.find("C:\\Game\\bin\\game.exe", relinked, &reason) == second);
+    misses_with(stamp, "mtime");
+
+    // Bounded: the least recently used module file goes.
+    for (std::size_t i = 0; i < ScanCache::kMaxEntries + 4; ++i) {
+        cache.store("C:\\other\\m" + std::to_string(i) + ".dll", stamp, std::make_shared<ScanResult>());
+        if (i % 4 == 0) {
+            CHECK(cache.find("C:\\Game\\bin\\game.exe", relinked, &reason) == second);  // kept in use
+        }
+    }
+    CHECK(cache.size() == ScanCache::kMaxEntries);
+    CHECK(cache.find("C:\\Game\\bin\\game.exe", relinked, &reason) == second);
+    CHECK(cache.find("C:\\other\\m1.dll", stamp, &reason) == nullptr);
+    CHECK(reason == "absent");
 }

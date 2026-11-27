@@ -256,4 +256,51 @@ TEST_CASE("static libraries (WP-26b): a skipped plain object keeps its headers t
     CHECK(pch->pch_headers[0] == pdb::normalize_path(dir.file("pch.h")));
 }
 
+TEST_CASE("WP-50: an index of the same module file takes the file lists from the scan cache; a changed module stamp scans again") {
+    QuietLogs quiet;
+    World w;
+    const auto cache = std::make_shared<ScanCache>();
+    const auto build = [&]() {
+        ModuleIndexSpec spec;
+        spec.module_path = w.exe;
+        spec.scan_includes = false;
+        spec.scan_cache = cache;
+        std::shared_ptr<ModuleIndex> index = ModuleIndex::start(spec);
+        REQUIRE(index->wait(30000));
+        REQUIRE(index->status().state == IndexState::Ready);
+        return index;
+    };
+    const std::shared_ptr<ModuleIndex> first = build();
+    CHECK(first->status().scan_cache == "cold");
+    CHECK(cache->size() == 1);
+
+    const std::shared_ptr<ModuleIndex> second = build();
+    CHECK(second->status().scan_cache == "warm");
+    CHECK(second->tracked_files() == first->tracked_files());
+    const std::vector<SkippedCompiland> a = first->skipped_compilands();
+    const std::vector<SkippedCompiland> b = second->skipped_compilands();
+    REQUIRE(a.size() == b.size());
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        CHECK(a[i].compiland == b[i].compiland);
+        CHECK(a[i].reason == b[i].reason);
+    }
+    CHECK(second->status().baseline_files == first->status().baseline_files);  // the sources are hashed afresh either way
+
+    // The module file was relinked (here: only its time changed): scanned again.
+    bump_mtime(w.exe);
+    const std::shared_ptr<ModuleIndex> third = build();
+    CHECK(third->status().scan_cache == "cold");
+    CHECK(third->tracked_files() == first->tracked_files());
+    const std::shared_ptr<ModuleIndex> fourth = build();
+    CHECK(fourth->status().scan_cache == "warm");  // the new stamp replaced the entry
+
+    // Without a cache nothing is reused.
+    ModuleIndexSpec plain;
+    plain.module_path = w.exe;
+    plain.scan_includes = false;
+    std::shared_ptr<ModuleIndex> uncached = ModuleIndex::start(plain);
+    REQUIRE(uncached->wait(30000));
+    CHECK(uncached->status().scan_cache == "off");
+}
+
 #endif

@@ -282,6 +282,14 @@ struct Rig {
         };
         pipeline_env = env;
         service = std::make_unique<ReloadService>(std::move(env), &bus, default_session_dir ? std::string() : dir.subdir("session"));
+        {
+            // WP-50: the tests decide when the module file is read (several rewrite it after the enable); the background read has
+            // tests of its own.
+            Value off = Value::object();
+            off.set("name", Value::string("prefetch_module_image"));
+            off.set("value", Value::boolean(false));
+            REQUIRE(service->set_option(off).has_value());
+        }
         link = std::make_shared<AgentLink>(1, [this](const ipc::Message& m) { return agent(m); });
         session.set_answer_sink([this](const ipc::Message& m) { return link->deliver(m); });
         service->attach(link);
@@ -1688,6 +1696,74 @@ TEST_CASE("the index of a module whose PDB is missing fails with the PDB's own d
     Result<Value> r = rig.reload();
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().code == status.error->code);
+}
+
+TEST_CASE("WP-50: the module file is read in the background once the index is ready, the first reload uses that copy, and a drop releases it") {
+    QuietLogs quiet;
+    Rig rig;
+    Value on = Value::object();
+    on.set("name", Value::string("prefetch_module_image"));
+    on.set("value", Value::boolean(true));
+    REQUIRE(rig.service->set_option(on).has_value());
+    rig.enable();
+    std::shared_ptr<const pe::OwnedImage> prefetched;
+    for (int i = 0; i < 500 && prefetched == nullptr; ++i) {
+        {
+            std::lock_guard<std::mutex> lock(rig.module->mutex);
+            prefetched = rig.module->image;
+        }
+        if (prefetched == nullptr) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    REQUIRE_MESSAGE(prefetched != nullptr, "no background read within 10 s of the index being ready");
+
+    // The reload compares with the copy read in the background: no second read.
+    rig.changed();
+    REQUIRE(rig.reload().has_value());
+    {
+        std::lock_guard<std::mutex> lock(rig.module->mutex);
+        CHECK(rig.module->image == prefetched);
+    }
+    const ModuleState::ImageRead again = rig.module->ensure_image(false);
+    CHECK_FALSE(again.read_now);
+    CHECK(again.image == prefetched);
+
+    // Disabled: the state drops its copy, and a background read that comes late stores nothing.
+    const std::shared_ptr<ModuleState> old = rig.module;
+    ipc::DisableModule disable;
+    disable.request_id = 9;
+    disable.path = rig.exe;
+    rig.session.on_message(disable);
+    rig.link->publish(rig.session);
+    rig.service->on_session_changed(1);
+    CHECK(rig.service->module_state(1, rig.exe) == nullptr);
+    {
+        std::lock_guard<std::mutex> lock(old->mutex);
+        CHECK(old->image == nullptr);
+        CHECK(old->image_released);
+    }
+    const ModuleState::ImageRead late = old->ensure_image(true);
+    CHECK_FALSE(late.read_now);
+    CHECK(late.image == nullptr);
+    // A reload's own read still works (it compares, but keeps nothing on a released state).
+    const ModuleState::ImageRead own = old->ensure_image(false);
+    CHECK(own.read_now);
+    CHECK(own.image != nullptr);
+    {
+        std::lock_guard<std::mutex> lock(old->mutex);
+        CHECK(old->image == nullptr);
+    }
+}
+
+TEST_CASE("WP-50: a module file that cannot be read is reported by the read, not stored") {
+    ModuleState state;
+    state.path = "C:\\no\\such\\dir\\missing_module.exe";
+    const ModuleState::ImageRead background = state.ensure_image(true);
+    CHECK(background.read_now);
+    CHECK(background.image == nullptr);
+    CHECK(background.error.has_value());
+    CHECK(state.image == nullptr);
 }
 
 TEST_CASE("disabling a module or losing the agent drops its state") {

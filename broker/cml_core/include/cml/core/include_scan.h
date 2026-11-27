@@ -16,13 +16,19 @@
 // of the files further up the include stack, then in the -I list.
 //
 // Portable (the file reader is injectable); not thread-safe, one scanner per index run.
+//
+// WP-50 (R-55): what one scanner has learnt serves every translation unit it walks: each distinct path is read (or found
+// missing) once, and each (directory, include name) question of the search is answered once. Paths and directories are
+// interned, so a walk compares ids instead of building and normalising candidate paths again; the result is the same.
 
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <optional>
 #include <set>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "cml/toolchain/record.h"
@@ -70,15 +76,17 @@ public:
     // none of them can be found on disk.
     std::set<std::string> pch_files(const ScanRoots& roots);
 
-    std::size_t files_read() const noexcept { return parsed_.size(); }
+    std::size_t files_read() const noexcept { return files_.size(); }
 
     // WP-50 (R-55): what the scan cost. Every distinct path the scan asked about is read once (`files_read()` = found + missing);
     // `read_ms` is the time spent in the file reader (opening, reading, and failing to open the paths that do not exist), `parse_ms`
-    // in parse_includes, `lookups` counts the questions answered (most from the cache of paths already read).
+    // in parse_includes, `lookups` counts the (directory, include name) questions of the search, `resolved` those of them that had to
+    // build and look up a candidate path (the rest came from the scanner's memory).
     struct Stats {
         std::size_t found = 0;    // paths that could be read
         std::size_t missing = 0;  // paths that could not (no such file, or unreadable): candidates of the include search
         std::size_t lookups = 0;
+        std::size_t resolved = 0;
         std::size_t walks = 0;    // dependencies() / pch_files() calls
         double read_ms = 0;
         double parse_ms = 0;
@@ -98,8 +106,25 @@ private:
 
     const std::vector<IncludeDirective>* includes_of(const std::string& normalised_path);
 
+    // One path the scan asked about, read once.
+    struct File {
+        std::string path;           // normalised
+        bool readable = false;
+        bool system = false;        // is_system_path(path): neither returned nor followed
+        std::uint32_t dir = 0;      // id of its directory (path::parent_directory)
+        std::vector<IncludeDirective> includes;
+    };
+    std::uint32_t file_id(const std::string& normalised_path);  // reads the file the first time
+    std::uint32_t dir_id(const std::string& normalised_dir);
+    // The id of `name` searched in directory `dir` when that file can be read, else -1. Answered once per (dir, name).
+    std::int64_t resolve(std::uint32_t dir, const std::string& name);
+
     ScanFileReader reader_;
-    std::map<std::string, std::optional<std::vector<IncludeDirective>>> parsed_;  // nullopt: unreadable
+    std::vector<File> files_;
+    std::unordered_map<std::string, std::uint32_t> file_ids_;
+    std::vector<std::string> dirs_;
+    std::unordered_map<std::string, std::uint32_t> dir_ids_;
+    std::vector<std::unordered_map<std::string, std::int64_t>> resolved_;  // by directory id: include name -> file id or -1
     Stats stats_;
 };
 

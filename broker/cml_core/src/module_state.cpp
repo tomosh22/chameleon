@@ -1,6 +1,7 @@
 #include "cml/core/module_state.h"
 
 #include <algorithm>
+#include <chrono>
 #include <iterator>
 #include <set>
 
@@ -121,6 +122,49 @@ void ModuleState::prune_code_locked() {
         }
         it = keep ? std::next(it) : code.erase(it);
     }
+}
+
+ModuleState::ImageRead ModuleState::ensure_image(bool background) {
+    std::lock_guard<std::mutex> reading(image_mutex);
+    ImageRead out;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (image) {
+            out.image = image;
+            return out;
+        }
+        if (background && image_released) {
+            return out;
+        }
+    }
+    const auto started = std::chrono::steady_clock::now();
+    Result<pe::OwnedImage> loaded = pe::load_image_file(path);
+    out.read_now = true;
+    out.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    if (!loaded) {
+        out.error = loaded.error();
+        return out;
+    }
+    out.mib = static_cast<double>(loaded->bytes.size()) / (1024.0 * 1024.0);
+    std::shared_ptr<const pe::OwnedImage> read = std::make_shared<const pe::OwnedImage>(std::move(*loaded));
+    std::lock_guard<std::mutex> lock(mutex);
+    if (image_released) {
+        if (!background) {
+            out.image = std::move(read);  // a reload of a state that is going away still compares, it only does not keep the copy
+        }
+        return out;
+    }
+    if (!image) {
+        image = std::move(read);
+    }
+    out.image = image;
+    return out;
+}
+
+void ModuleState::release_image() {
+    std::lock_guard<std::mutex> lock(mutex);
+    image.reset();
+    image_released = true;
 }
 
 }  // namespace cml::core

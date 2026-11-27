@@ -110,9 +110,18 @@ ReloadService::~ReloadService() {
         reapply_stop_ = true;
     }
     reapply_changed_.notify_all();
+    {
+        std::lock_guard<std::mutex> lock(prefetch_mutex_);  // WP-50: no new background read; one in flight finishes
+        prefetch_stop_ = true;
+        prefetch_queue_.clear();
+    }
+    prefetch_changed_.notify_all();
     cancel();
     if (reapply_thread_.joinable()) {
         reapply_thread_.join();
+    }
+    if (prefetch_thread_.joinable()) {
+        prefetch_thread_.join();
     }
     {
         std::shared_ptr<SaveWatcher> watcher;
@@ -235,6 +244,9 @@ void ReloadService::detach(std::uint64_t agent_id) {
                 coordinator->process_gone(snap.pid, exited);
             }
         }
+    }
+    for (auto& module : entry.modules) {
+        module.second->release_image();  // WP-50
     }
     entry.modules.clear();  // index threads are joined here, outside the lock
     rearm_save_watcher();
@@ -359,6 +371,7 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
         }
     }
     for (const std::shared_ptr<ModuleState>& state : dropped) {
+        state->release_image();  // WP-50: the copy goes with the state; a later instance reads the file afresh
         std::optional<BaselineSnapshot> left = leaving_baseline(*state);
         bool live = image_loaded(state->path, state->base);
         if (!left || left->originals.empty()) {
@@ -437,6 +450,9 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
         ModuleIndexSpec spec;
         spec.module_path = state->path;
         spec.baseline.track_system = options.track_system_headers;
+        if (options.cache_include_scan) {
+            spec.scan_cache = scan_cache_;  // WP-50 (R-55)
+        }
         std::optional<ReapplyItem> reapply;
         if (carry) {
             // The same image enabled again (it never went away) still runs the patches: nothing to recompile. Any other instance runs
@@ -463,9 +479,14 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
             }
         }
         const std::string name = state->name;
-        spec.on_change = [this, name](const IndexStatus& s) {
+        const std::weak_ptr<ModuleState> weak_state = state;
+        const bool prefetch = options.prefetch_module_image;
+        spec.on_change = [this, name, weak_state, prefetch](const IndexStatus& s) {
             if (s.state == IndexState::Ready) {
                 rearm_save_watcher();  // its tracked files are known now (compile-on-save)
+                if (prefetch) {
+                    queue_image_prefetch(weak_state);  // WP-50 (R-47): only once the index is Ready
+                }
             }
             if (s.state == IndexState::Failed) {
                 CML_LOG(Warn, "index of %s failed: %s", name.c_str(), s.error ? s.error->format().c_str() : "unknown error");
@@ -724,6 +745,48 @@ bool ReloadService::has_carry_for_testing(std::uint32_t pid, const std::string& 
         *live = it->second.live_base != 0;
     }
     return true;
+}
+
+// ---- WP-50 (R-47): the module file read in the background ----------------------------------------------------------------------
+
+void ReloadService::queue_image_prefetch(std::weak_ptr<ModuleState> state) {
+    std::lock_guard<std::mutex> lock(prefetch_mutex_);
+    if (prefetch_stop_) {
+        return;
+    }
+    prefetch_queue_.push_back(std::move(state));
+    if (!prefetch_thread_.joinable()) {
+        prefetch_thread_ = std::thread([this] { prefetch_loop(); });
+    }
+    prefetch_changed_.notify_all();
+}
+
+void ReloadService::prefetch_loop() {
+    for (;;) {
+        std::weak_ptr<ModuleState> next;
+        {
+            std::unique_lock<std::mutex> lock(prefetch_mutex_);
+            prefetch_changed_.wait(lock, [this] { return prefetch_stop_ || !prefetch_queue_.empty(); });
+            if (prefetch_stop_) {
+                return;
+            }
+            next = std::move(prefetch_queue_.front());
+            prefetch_queue_.pop_front();
+        }
+        const std::shared_ptr<ModuleState> state = next.lock();
+        if (!state) {
+            continue;  // dropped before its turn
+        }
+        const ModuleState::ImageRead read = state->ensure_image(true);
+        if (read.read_now) {
+            CML_LOG(Info, "WP50-ONEOFF what=module-image image=background module=%s ms=%.1f mib=%.1f ok=%d", state->name.c_str(), read.ms, read.mib,
+                    read.image ? 1 : 0);
+            if (read.error) {
+                // Not a failure: the first reload reads the file itself and warns (CML5313) if it still cannot.
+                CML_LOG(Debug, "reload: background read of %s: %s", state->path.c_str(), read.error->format().c_str());
+            }
+        }
+    }
 }
 
 void ReloadService::queue_reapply(ReapplyItem item) {
@@ -1639,6 +1702,12 @@ Result<Value> ReloadService::set_option(const Value& args) {
     } else if (name == "track_system_headers") {
         previous = Value::boolean(o.track_system_headers);
         error = want_bool(&o.track_system_headers);
+    } else if (name == "prefetch_module_image") {  // WP-50: applies to modules enabled from now on
+        previous = Value::boolean(o.prefetch_module_image);
+        error = want_bool(&o.prefetch_module_image);
+    } else if (name == "cache_include_scan") {  // WP-50: applies to indexes started from now on
+        previous = Value::boolean(o.cache_include_scan);
+        error = want_bool(&o.cache_include_scan);
     } else if (name == "max_parallel_compiles") {
         previous = Value::integer(o.max_parallel_compiles);
         std::uint32_t v = o.max_parallel_compiles;
@@ -1710,7 +1779,8 @@ Result<Value> ReloadService::set_option(const Value& args) {
         }
     } else {
         return bad_request("unknown option '" + name +
-                           "'; options: narrow_hooks, release_pdb_after_reload, track_system_headers, max_parallel_compiles, max_affected_compilands, agent_timeout_ms, "
+                           "'; options: narrow_hooks, release_pdb_after_reload, track_system_headers, prefetch_module_image, cache_include_scan, max_parallel_compiles, "
+                           "max_affected_compilands, agent_timeout_ms, "
                            "hooks_timeout_ms, reserve_block_mb, reserve_blocks, max_load_attempts, linker, linker_path, compile_on_save, crash_handler, break_with_debugger, log_level");
     }
     if (error) {

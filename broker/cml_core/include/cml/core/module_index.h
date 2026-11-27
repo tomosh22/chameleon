@@ -27,6 +27,7 @@
 #include <thread>
 #include <vector>
 
+#include "cml/core/include_scan.h"
 #include "cml/core/module_audit.h"
 #include "cml/core/source_baseline.h"
 #include "cml/pdb/index.h"
@@ -55,7 +56,12 @@ struct IndexStatus {
     std::size_t scan_missing = 0;
     std::size_t scan_lookups = 0;
     std::size_t baseline_files = 0;  // files the baseline hashed (= files listed)
+    // WP-50: where the file lists and the include scan came from: "cold" (scanned now), "warm" (ScanCache, the same module file
+    // scanned before in this session), "off" (no cache given).
+    std::string scan_cache = "off";
 };
+
+class ScanCache;
 
 struct ModuleIndexSpec {
     std::string module_path;  // the module's file; its PDB is located from the debug directory
@@ -78,6 +84,9 @@ struct ModuleIndexSpec {
     // again; it still runs the patches). carried_files() says how many files it covered.
     std::optional<BaselineSnapshot> carried;
     bool carried_live = false;
+    // WP-50 (R-55): the file lists and the include graph of a module file this session indexed before are taken from here when
+    // the file is the same (ScanCache); null: always scanned.
+    std::shared_ptr<ScanCache> scan_cache;
 };
 
 // WP-26b: a compiland that cannot be reloaded although its object is real (no build environment, missing source file).
@@ -86,6 +95,57 @@ struct SkippedCompiland {
     std::string name;     // the object's file name
     std::string library;  // the archive it came from; empty for a plain object
     std::string reason;
+};
+
+// WP-50 (R-55): the identity of a module file for the scan cache: its size and last-write time, the GUID and age of the PDB it
+// was indexed with, and whether includes were scanned (ModuleIndexSpec::scan_includes).
+struct ModuleFileStamp {
+    std::uint64_t size = 0;
+    long long mtime = 0;
+    pdb::PdbId pdb;
+    bool scan_includes = true;
+};
+// "" when equal, else the first difference: "size", "mtime", "pdb" or "options".
+std::string stamp_difference(const ModuleFileStamp& cached, const ModuleFileStamp& now);
+// The stamp of `module_path` indexed as `index`; nullopt when the file cannot be stat'ed.
+std::optional<ModuleFileStamp> module_file_stamp(const std::string& module_path, const pdb::PdbIndex& index, bool scan_includes);
+
+// What the file-list and include-scan phase of an index build produces (all of it depends only on the PDB, the compile
+// commands it records and the files on disk).
+struct ScanResult {
+    std::set<std::string> files;                                     // tracked files (the baseline hashes them)
+    std::map<std::string, std::vector<std::uint32_t>> header_deps;   // scanned header -> compilands
+    std::set<std::string> pch_files;
+    std::set<std::uint32_t> pch_unverified;
+    std::vector<SkippedCompiland> skipped;
+    std::set<std::uint32_t> skipped_set;
+    IncludeScanner::Stats stats;  // of the scan that produced it
+    std::size_t files_read = 0;
+    double scan_ms = 0;
+};
+
+// WP-50 (R-55): the scan results of the module files this session indexed, so that a module indexed again (the new process of a
+// hot-restart, a module freed and loaded again, a second process of the same executable) is not scanned again while its file is
+// unchanged. The graph is the one the first index of that file built: exactly what the session's reloads of the first instance
+// used (no index is ever re-scanned after a reload either). A stamp that differs replaces the entry. Thread-safe; at most
+// kMaxEntries module files (the least recently used goes).
+class ScanCache {
+public:
+    static constexpr std::size_t kMaxEntries = 32;
+    // The entry of `module_path` when its stamp equals `stamp`; otherwise null and `*reason` is "absent" or stamp_difference().
+    std::shared_ptr<const ScanResult> find(const std::string& module_path, const ModuleFileStamp& stamp, std::string* reason);
+    void store(const std::string& module_path, const ModuleFileStamp& stamp, std::shared_ptr<const ScanResult> result);
+    std::size_t size() const;
+
+private:
+    struct Entry {
+        ModuleFileStamp stamp;
+        std::shared_ptr<const ScanResult> result;
+        std::uint64_t used = 0;
+    };
+    mutable std::mutex mutex_;
+    std::map<std::string, Entry> entries_;  // by normalised path
+    std::uint64_t clock_ = 0;
 };
 
 class ModuleIndex {
@@ -177,6 +237,8 @@ private:
     void run();
     void set_status(IndexState state, std::uint32_t percent, std::string phase, std::optional<Diag> error = std::nullopt, bool drop_pdb = false);
     Result<std::shared_ptr<const pdb::PdbIndex>> open_pdb();
+    // The file lists and the include scan of every compiland (WP-50: cached as a ScanResult). nullopt when cancelled.
+    std::optional<ScanResult> scan_files(const pdb::PdbIndex& index);
 
     ModuleIndexSpec spec_;
     mutable std::mutex mutex_;
