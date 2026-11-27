@@ -89,6 +89,7 @@ TEST_CASE("the checked-in large-PDB scenario: external, five edit + reload round
     int reloads = 0;
     bool report_seen = false;
     bool edit_pending = false;
+    int hook_checks = 0;
     for (const Step& s : r->steps) {
         if (s.kind == StepKind::Edit) {
             ++edits;
@@ -104,6 +105,12 @@ TEST_CASE("the checked-in large-PDB scenario: external, five edit + reload round
             CHECK(s.result_key == "patched");
             CHECK(s.result_value == 1);
         }
+        if (s.kind == StepKind::ExpectReloadResult) {
+            ++hook_checks;  // WP-49: one hook per one-function edit, in every cell (the program is built by cl only)
+            CHECK(s.key == "hooks_installed");
+            CHECK(s.result_value == 1);
+            CHECK(s.compiler.empty());
+        }
         if (s.kind == StepKind::PerfIdle) {
             FAIL("the idle measurement belongs to the perf scenario");
         }
@@ -116,6 +123,7 @@ TEST_CASE("the checked-in large-PDB scenario: external, five edit + reload round
         }
     }
     CHECK(edits == 5);
+    CHECK(hook_checks == 5);
     CHECK(report_seen);
 }
 #endif

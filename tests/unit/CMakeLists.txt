@@ -114,6 +114,14 @@ cml_add_unit_test(broker_core
         # WP-20: crash -> patch -> continue (broker side)
         broker/test_exceptions.cpp
     LIBS cml_core)
+# WP-49: hook narrowing on switch objects of this cell's compiler at /Od and /O2 (broker/jump_tables/objects.cmake). Local
+# override for portable syntax-check builds: CML_TEST_JUMP_TABLE_OBJECTS = a directory holding switches_<Od|O2>_<plain|swapped>.obj.
+if(MSVC)
+    include(broker/jump_tables/objects.cmake)
+elseif(CML_TEST_JUMP_TABLE_OBJECTS)
+    target_sources(cml_test_broker_core PRIVATE broker/test_jump_tables.cpp)
+    target_compile_definitions(cml_test_broker_core PRIVATE "CML_JT_OBJ_DIR=\"${CML_TEST_JUMP_TABLE_OBJECTS}\"")
+endif()
 add_subdirectory(bind)  # WP-07: unit.bind
 add_subdirectory(reexecute)  # WP-23: unit.reexecute (recipe builder, wire format, broker decision, fixture PDB records)
 add_subdirectory(ui)    # WP-19: unit.ui (broker UI view model, parsing, settings)

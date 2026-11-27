@@ -45,6 +45,11 @@ struct Scenario {
     SynthObj::Func foo;
 
     explicit Scenario(std::uint32_t size = 16) { foo = obj.function("?foo@@YAHXZ", true, size); }
+    // WP-49: `foo` at the start of a plain (non-COMDAT) code section of `section_size` bytes; its extent ends at the next symbol.
+    Scenario(std::uint32_t section_size, bool /*plain section*/) {
+        foo.section = obj.section(".text$mn", kText, section_size);
+        foo.symbol = obj.symbol("?foo@@YAHXZ", 0, static_cast<std::int32_t>(foo.section), true);
+    }
 
     void old_code(const std::vector<std::uint8_t>& bytes) {
         for (std::size_t i = 0; i < bytes.size(); ++i) {
@@ -939,5 +944,538 @@ TEST_CASE("elision (WP-36): the record of an earlier patch holds the address an 
         std::string why;
         CHECK_FALSE(capture_code(in, "?foo@@YAHXZ", &why).has_value());
         CHECK(why.find("ADDR32NB") != std::string::npos);
+    }
+}
+
+// ---- WP-49 (R-46, ADR-0044): jump tables in the function's own code ---------------------------------------------------
+//
+// The byte layouts are the ones cl writes for a dense `switch` (x64, /Gy, one COMDAT section per function): `lea reg,
+// [__ImageBase]` (REL32), the table load `mov r32, [reg + rax*4 + $LNt]` (ADDR32NB to the table's label), `add`, `jmp`, the
+// cases, and behind the code, still inside the function (the PDB's size includes it), one ADDR32NB entry per case label.
+// tests/unit/broker/test_jump_tables.cpp runs the same rules on objects the cell's compiler really wrote.
+
+namespace {
+
+struct SwitchCode {
+    const char* what = "";
+    std::vector<std::uint8_t> bytes;
+    std::uint32_t image_base_site = 0;  // lea reg, [__ImageBase]: REL32
+    std::uint32_t load_site = 0;        // the table load: ADDR32NB to the table
+    std::uint32_t table = 0;            // the first entry
+    std::vector<std::uint32_t> cases;   // the case label of each entry
+    std::uint32_t size() const { return static_cast<std::uint32_t>(bytes.size()); }
+};
+
+// cl /Od: int f(int k) { switch (k) { case 0: return 10; case 1: return 20; case 2: return 30; default: return 0; } }
+SwitchCode cl_od_switch() {
+    SwitchCode c;
+    c.what = "cl /Od";
+    c.bytes = {0x89, 0x54, 0x24, 0x10,               // 00 mov [rsp+10h], edx
+               0x89, 0x4C, 0x24, 0x08,               // 04 mov [rsp+8], ecx
+               0x48, 0x83, 0xEC, 0x18,               // 08 sub rsp, 18h
+               0x8B, 0x44, 0x24, 0x20,               // 0C mov eax, [rsp+20h]
+               0x89, 0x04, 0x24,                     // 10 mov [rsp], eax
+               0x83, 0x3C, 0x24, 0x02,               // 13 cmp dword ptr [rsp], 2
+               0x77, 0x2C,                           // 17 ja $LN7 (default)
+               0x48, 0x63, 0x04, 0x24,               // 19 movsxd rax, dword ptr [rsp]
+               0x48, 0x8D, 0x0D, 0, 0, 0, 0,         // 1D lea rcx, [__ImageBase]
+               0x8B, 0x84, 0x81, 0, 0, 0, 0,         // 24 mov eax, [rcx+rax*4+$LN9]
+               0x48, 0x03, 0xC1,                     // 2B add rax, rcx
+               0xFF, 0xE0,                           // 2E jmp rax
+               0xB8, 0x0A, 0, 0, 0, 0xEB, 0x10,      // 30 $LN4: mov eax, 10 ; jmp $LN2
+               0xB8, 0x14, 0, 0, 0, 0xEB, 0x09,      // 37 $LN5: mov eax, 20 ; jmp $LN2
+               0xB8, 0x1E, 0, 0, 0, 0xEB, 0x02,      // 3E $LN6: mov eax, 30 ; jmp $LN2
+               0x33, 0xC0,                           // 45 $LN7: xor eax, eax
+               0x48, 0x83, 0xC4, 0x18,               // 47 $LN2: add rsp, 18h
+               0xC3,                                 // 4B ret
+               0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};  // 4C $LN9: DD $LN4, $LN5, $LN6
+    c.image_base_site = 0x20;
+    c.load_site = 0x27;
+    c.table = 0x4C;
+    c.cases = {0x30, 0x37, 0x3E};
+    return c;
+}
+
+// cl /O2: the same switch.
+SwitchCode cl_o2_switch() {
+    SwitchCode c;
+    c.what = "cl /O2";
+    c.bytes = {0x83, 0xF9, 0x02,                     // 00 cmp ecx, 2
+               0x77, 0x28,                           // 03 ja $LN7
+               0x48, 0x63, 0xC1,                     // 05 movsxd rax, ecx
+               0x48, 0x8D, 0x15, 0, 0, 0, 0,         // 08 lea rdx, [__ImageBase]
+               0x8B, 0x8C, 0x82, 0, 0, 0, 0,         // 0F mov ecx, [rdx+rax*4+$LN9]
+               0x48, 0x03, 0xCA,                     // 16 add rcx, rdx
+               0xFF, 0xE1,                           // 19 jmp rcx
+               0xB8, 0x0A, 0, 0, 0, 0xC3,            // 1B $LN4: mov eax, 10 ; ret
+               0xB8, 0x14, 0, 0, 0, 0xC3,            // 21 $LN5: mov eax, 20 ; ret
+               0xB8, 0x1E, 0, 0, 0, 0xC3,            // 27 $LN6: mov eax, 30 ; ret
+               0x33, 0xC0, 0xC3,                     // 2D $LN7: xor eax, eax ; ret
+               0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};  // 30 $LN9: DD $LN4, $LN5, $LN6
+    c.image_base_site = 0x0B;
+    c.load_site = 0x12;
+    c.table = 0x30;
+    c.cases = {0x1B, 0x21, 0x27};
+    return c;
+}
+
+struct TableEdit {
+    std::vector<std::uint32_t> new_cases;  // the entries of the NEW table (default: the code's)
+    std::vector<std::uint32_t> old_cases;  // the entries the OLD linker wrote, as offsets in the function (default: the same)
+    std::uint32_t old_table = 0;           // where the old table load pointed (0: the table)
+    bool labels = true;                    // case labels as `$LNn` symbols; false: `foo` + in-place addend (one symbol)
+};
+
+TableEdit new_entries(std::vector<std::uint32_t> cases) {
+    TableEdit e;
+    e.new_cases = std::move(cases);
+    return e;
+}
+TableEdit old_entries(std::vector<std::uint32_t> cases) {
+    TableEdit e;
+    e.old_cases = std::move(cases);
+    return e;
+}
+TableEdit old_load(std::uint32_t table) {
+    TableEdit e;
+    e.old_table = table;
+    return e;
+}
+TableEdit one_symbol() {
+    TableEdit e;
+    e.labels = false;
+    return e;
+}
+
+// The new object (foo = the switch, its labels, __ImageBase) and the old image at kFnRva, linked from the same code.
+void jump_table(Scenario& s, const SwitchCode& c, const TableEdit& e = {}) {
+    const std::vector<std::uint32_t> new_cases = e.new_cases.empty() ? c.cases : e.new_cases;
+    const std::vector<std::uint32_t> old_cases = e.old_cases.empty() ? c.cases : e.old_cases;
+    s.new_code(c.bytes);
+    s.old_code(c.bytes);
+    put32(s.disk, text_off(kFnRva) + c.image_base_site, static_cast<std::uint32_t>(-static_cast<std::int32_t>(kFnRva + c.image_base_site + 4)));
+    put32(s.disk, text_off(kFnRva) + c.load_site, kFnRva + (e.old_table != 0 ? e.old_table : c.table));
+    for (std::size_t i = 0; i < old_cases.size(); ++i) {
+        put32(s.disk, text_off(kFnRva) + c.table + 4 * i, kFnRva + old_cases[i]);
+    }
+    const std::uint32_t sec = s.foo.section;
+    const std::uint32_t base = s.obj.undefined("__ImageBase", false);
+    s.obj.reloc(sec, c.image_base_site, base, kRel32);
+    std::vector<std::pair<std::uint32_t, std::string>> labels;
+    const auto label = [&](std::uint32_t at, const std::string& name) {
+        const std::uint32_t sym = s.obj.symbol(name, at, static_cast<std::int32_t>(sec), false, false);
+        labels.emplace_back(sym, name);
+        return sym;
+    };
+    if (e.labels) {
+        s.obj.reloc(sec, c.load_site, label(c.table, "$LN9"), kAddr32Nb);
+        for (std::size_t i = 0; i < new_cases.size(); ++i) {
+            s.obj.reloc(sec, static_cast<std::uint32_t>(c.table + 4 * i), label(new_cases[i], "$LN" + std::to_string(4 + i)), kAddr32Nb);
+        }
+    } else {
+        s.obj.reloc(sec, c.load_site, s.foo.symbol, kAddr32Nb, c.table);
+        for (std::size_t i = 0; i < new_cases.size(); ++i) {
+            s.obj.reloc(sec, static_cast<std::uint32_t>(c.table + 4 * i), s.foo.symbol, kAddr32Nb, new_cases[i]);
+        }
+    }
+    s.hook(c.size());
+    s.decision(base, "__ImageBase", DecisionKind::LinkerProvided);
+    for (const auto& [sym, name] : labels) {  // as the planner decides cl's labels: patch-local, never bound
+        SymbolDecision& d = s.decision(sym, name, DecisionKind::PatchFresh);
+        d.defined = true;
+        d.is_static = true;
+        d.section = sec;
+    }
+}
+
+const NarrowDecision& only(const NarrowResult& r) {
+    REQUIRE(r.decisions.size() == 1);
+    return r.decisions[0];
+}
+
+void set_le32(coff::ModelSection& sec, std::size_t at, std::uint32_t v) {
+    for (std::size_t i = 0; i < 4; ++i) {
+        sec.data[at + i] = static_cast<std::byte>((v >> (8 * i)) & 0xFF);
+    }
+}
+
+}  // namespace
+
+TEST_CASE("narrowing (WP-49): an identical jump table in the function's own code is dropped (cl /Od and /O2 layouts)") {
+    QuietLogs quiet;
+    for (const SwitchCode& c : {cl_od_switch(), cl_o2_switch()}) {
+        CAPTURE(c.what);
+        {
+            Scenario s(c.size());
+            jump_table(s, c);
+            const NarrowResult r = s.run();
+            CHECK_MESSAGE(only(r).reason == NarrowReason::Unchanged, to_string(only(r).reason) << " " << only(r).detail);
+            CHECK(r.hooks.empty());
+            CHECK(r.dropped == 1);
+        }
+        {
+            // The module loaded away from its preferred base: the entries are RVAs, the comparison is relative to the function.
+            Scenario s(c.size());
+            s.load_base = 0x7FF600000000ull;
+            jump_table(s, c);
+            const NarrowResult r = s.run();
+            CHECK_MESSAGE(only(r).reason == NarrowReason::Unchanged, to_string(only(r).reason) << " " << only(r).detail);
+        }
+        {
+            // The entries name the function's own symbol with the offset in place (one symbol for every label).
+            Scenario s(c.size());
+            jump_table(s, c, one_symbol());
+            const NarrowResult r = s.run();
+            CHECK_MESSAGE(only(r).reason == NarrowReason::Unchanged, to_string(only(r).reason) << " " << only(r).detail);
+        }
+    }
+}
+
+TEST_CASE("narrowing (WP-49): a changed case target, or a table load that reached elsewhere, keeps the hook") {
+    QuietLogs quiet;
+    for (const SwitchCode& c : {cl_od_switch(), cl_o2_switch()}) {
+        CAPTURE(c.what);
+        {
+            // `case 1:` and `case 2:` exchanged in the source: the same bytes, only two entries of the table differ.
+            Scenario s(c.size());
+            jump_table(s, c, new_entries({c.cases[0], c.cases[2], c.cases[1]}));
+            const NarrowResult r = s.run();
+            REQUIRE(r.hooks.size() == 1);
+            CHECK(only(r).reason == NarrowReason::TargetChanged);
+            CHECK_MESSAGE(only(r).detail.find("jump-table reference at byte " + std::to_string(c.table + 4) + " ") != std::string::npos, only(r).detail);
+        }
+        {
+            Scenario s(c.size());
+            jump_table(s, c, old_load(c.table + 4));
+            const NarrowResult r = s.run();
+            REQUIRE(r.hooks.size() == 1);
+            CHECK(only(r).reason == NarrowReason::TargetChanged);
+            CHECK_MESSAGE(only(r).detail.find("jump-table reference at byte " + std::to_string(c.load_site) + " ") != std::string::npos, only(r).detail);
+        }
+        {
+            // The last entry of the old table pointed one byte further: kept (every entry is compared, not only the first).
+            Scenario s(c.size());
+            jump_table(s, c, old_entries({c.cases[0], c.cases[1], c.cases[2] + 1}));
+            const NarrowResult r = s.run();
+            REQUIRE(r.hooks.size() == 1);
+            CHECK(only(r).reason == NarrowReason::TargetChanged);
+            CHECK_MESSAGE(only(r).detail.find("jump-table reference at byte " + std::to_string(c.table + 8) + " ") != std::string::npos, only(r).detail);
+        }
+    }
+}
+
+TEST_CASE("narrowing (WP-49): a table whose entries leave the function is not judged") {
+    QuietLogs quiet;
+    const SwitchCode c = cl_od_switch();
+    {
+        // The last entry reaches past the end of the function (here: past the end of its COMDAT section).
+        Scenario s(c.size());
+        jump_table(s, c);
+        coff::ModelSection& sec = s.obj.model().sections[s.foo.section - 1];
+        sec.relocations.back().symbol_index = s.foo.symbol;
+        set_le32(sec, c.table + 8, c.size() + 0x10);
+        put32(s.disk, text_off(kFnRva) + c.table + 8, kFnRva + c.size() + 0x10);
+        const NarrowResult r = s.run();
+        REQUIRE(r.hooks.size() == 1);
+        CHECK(only(r).reason == NarrowReason::Unverifiable);
+        CHECK_MESSAGE(only(r).detail.find("outside the function") != std::string::npos, only(r).detail);
+    }
+    {
+        // An entry names another function's section: not this function's code, judged as before (no retargeted displacement).
+        Scenario s(c.size());
+        jump_table(s, c);
+        const SynthObj::Func bar = s.obj.function("?bar@@YAHXZ", true, 16);
+        s.obj.model().sections[s.foo.section - 1].relocations.back().symbol_index = bar.symbol;
+        SymbolDecision& d = s.decision(bar.symbol, "?bar@@YAHXZ", DecisionKind::BindOldFunction);
+        d.old_address.valid = true;
+        d.old_address.va = kPreferred + kBarRva;
+        const NarrowResult r = s.run();
+        REQUIRE(r.hooks.size() == 1);
+        CHECK(only(r).reason == NarrowReason::Unverifiable);
+    }
+}
+
+TEST_CASE("narrowing (WP-49): a table that runs to the function end with an ADDR32NB behind it is not judged (its end cannot be told)") {
+    QuietLogs quiet;
+    const SwitchCode c = cl_o2_switch();
+    for (const bool entry_behind : {true, false}) {
+        CAPTURE(entry_behind);
+        // A plain code section: foo, then bar; foo's extent ends at bar, so the table ends exactly at foo's end.
+        Scenario s(c.size() + 8, true);
+        jump_table(s, c, one_symbol());
+        s.obj.symbol("?bar@@YAHXZ", c.size(), static_cast<std::int32_t>(s.foo.section), true);
+        if (entry_behind) {
+            s.obj.reloc(s.foo.section, c.size(), s.foo.symbol, kAddr32Nb, c.cases[0]);  // one more entry, outside the bytes compared
+        }
+        const NarrowResult r = s.run();
+        if (entry_behind) {
+            REQUIRE(r.hooks.size() == 1);
+            CHECK(only(r).reason == NarrowReason::Unverifiable);
+            CHECK_MESSAGE(only(r).detail.find("its end cannot be told") != std::string::npos, only(r).detail);
+        } else {
+            CHECK_MESSAGE(only(r).reason == NarrowReason::Unchanged, to_string(only(r).reason) << " " << only(r).detail);
+        }
+    }
+}
+
+TEST_CASE("narrowing (WP-49): a reference to a place in the function that is not a jump table is not judged (index tables)") {
+    QuietLogs quiet;
+    const SwitchCode c = cl_o2_switch();
+    Scenario s(c.size());
+    jump_table(s, c);
+    // `mov eax, imm32` of case 0 now holds the RVA of the default label (as `movzx eax, byte ptr [rdx+rax+$LNi]` of a two-level
+    // switch names a byte table, which has no relocations to compare).
+    s.obj.reloc(s.foo.section, c.cases[0] + 1, s.foo.symbol, kAddr32Nb, 0x2D);
+    put32(s.disk, text_off(kFnRva) + c.cases[0] + 1, kFnRva + 0x2D);
+    const NarrowResult r = s.run();
+    REQUIRE(r.hooks.size() == 1);
+    CHECK(only(r).reason == NarrowReason::Unverifiable);
+    CHECK_MESSAGE(only(r).detail.find("not the start of a jump table") != std::string::npos, only(r).detail);
+}
+
+TEST_CASE("narrowing (WP-49): a clang-cl jump table lives in .rdata and stays unverifiable") {
+    QuietLogs quiet;
+    // clang-cl -O2 (x64) for a six-case switch: `lea rdx, [rip + table]` (REL32 to the associative .rdata section) and
+    // `movslq rcx, [rdx + rcx*4]`; the table holds REL32 entries to .text, relative to the table.
+    const std::vector<std::uint8_t> code = {0x89, 0xD0, 0x83, 0xF9, 0x05, 0x77, 0x2A, 0x89, 0xC9, 0x48, 0x8D, 0x15, 0,    0,    0,    0,    0x48, 0x63,
+                                            0x0C, 0x8A, 0x48, 0x01, 0xD1, 0xFF, 0xE1, 0x83, 0xC0, 0x03, 0xC3, 0xC1, 0xE0, 0x02, 0xC3, 0x83, 0xC0, 0xF9,
+                                            0xC3, 0x83, 0xF0, 0x0B, 0xC3, 0x8D, 0x04, 0x80, 0xC3, 0x0F, 0xAF, 0xC0, 0xC3, 0xF7, 0xD8, 0xC3};
+    for (const bool named : {false, true}) {
+        CAPTURE(named);
+        Scenario s(static_cast<std::uint32_t>(code.size()));
+        s.new_code(code);
+        s.old_code(code);
+        const std::uint32_t rdata = s.obj.section(".rdata", kRdata, 0x18, coff::ComdatSelection::Associative, s.foo.section);
+        const std::uint32_t table = s.obj.symbol("$jt0", 0, static_cast<std::int32_t>(rdata), false, false);
+        s.obj.reloc(s.foo.section, 0x0C, table, kRel32);
+        const std::uint32_t targets[6] = {0x19, 0x31, 0x2D, 0x35, 0x31, 0x45};
+        for (std::uint32_t i = 0; i < 6; ++i) {
+            s.obj.reloc(rdata, 4 * i, s.foo.symbol, kRel32, targets[i]);
+        }
+        s.hook(static_cast<std::uint32_t>(code.size()));
+        if (named) {
+            SymbolDecision& d = s.decision(table, "$jt0", DecisionKind::PatchFresh);  // a fresh constant: it holds pointers
+            d.defined = true;
+            d.type = SymbolType::Data;
+            d.section = rdata;
+        }
+        const NarrowResult r = s.run();
+        REQUIRE(r.hooks.size() == 1);
+        CHECK_MESSAGE(only(r).reason == NarrowReason::Unverifiable, to_string(only(r).reason) << " " << only(r).detail);
+    }
+}
+
+TEST_CASE("elision (WP-49): the record of an earlier patch holds each jump-table target relative to the function") {
+    QuietLogs quiet;
+    const SwitchCode c = cl_od_switch();
+    Scenario first(c.size());
+    jump_table(first, c);
+    const std::shared_ptr<const CodeImage> prior = first.capture();
+    REQUIRE(prior->relocs.size() == 5);
+    CHECK(prior->relocs[0].target.kind == CodeTarget::Kind::Address);  // __ImageBase
+    CHECK(prior->relocs[1].offset == c.load_site);
+    CHECK(prior->relocs[1].target.kind == CodeTarget::Kind::Local);
+    CHECK(prior->relocs[1].target.value == c.table);
+    for (std::size_t i = 0; i < c.cases.size(); ++i) {
+        CHECK(prior->relocs[2 + i].offset == c.table + 4 * i);
+        CHECK(prior->relocs[2 + i].target.kind == CodeTarget::Kind::Local);
+        CHECK(prior->relocs[2 + i].target.value == c.cases[i]);
+    }
+    {
+        Scenario s(c.size());
+        jump_table(s, c);
+        s.prior = [&](std::uint64_t va) { return entry_is_hooked(va) ? prior : nullptr; };
+        const NarrowResult r = s.run(true, entry_is_hooked);
+        CHECK_MESSAGE(only(r).reason == NarrowReason::Unchanged, to_string(only(r).reason) << " " << only(r).detail);
+        CHECK(only(r).from_prior);
+        CHECK(r.hooks.empty());
+    }
+    {
+        Scenario s(c.size());
+        jump_table(s, c, new_entries({c.cases[0], c.cases[2], c.cases[1]}));
+        s.prior = [&](std::uint64_t) { return prior; };
+        const NarrowResult r = s.run(true, entry_is_hooked);
+        REQUIRE(r.hooks.size() == 1);
+        CHECK(only(r).reason == NarrowReason::TargetChanged);
+        CHECK_MESSAGE(only(r).detail.find("earlier patch") != std::string::npos, only(r).detail);
+    }
+    {
+        // A table that cannot be judged yields no record: the function is hooked every time, as before.
+        Scenario s(c.size());
+        jump_table(s, c);
+        s.obj.reloc(s.foo.section, c.cases[0] + 1, s.foo.symbol, kAddr32Nb, 0x45);
+        Built built = s.obj.build();
+        NarrowInput in;
+        in.object = &built.obj();
+        in.plan = &s.plan;
+        in.load_base = s.load_base;
+        std::string why;
+        CHECK_FALSE(capture_code(in, "?foo@@YAHXZ", &why).has_value());
+        CHECK_MESSAGE(why.find("not the start of a jump table") != std::string::npos, why);
+    }
+}
+
+TEST_CASE("narrowing (WP-49, R-50): a relocation that starts before the function and reaches into it is not judged") {
+    QuietLogs quiet;
+    for (const std::uint32_t site : {6u, 2u}) {
+        CAPTURE(site);
+        // A plain section: `pre` at 0, foo at 8 (mov eax, 1 ; ret ; int3...). A REL32 at 6 covers foo's first two bytes; one at
+        // 2 ends at 6.
+        Scenario s(24, true);
+        for (coff::ModelSymbol& m : s.obj.model().symbols) {
+            if (m.name == "?foo@@YAHXZ") {
+                m.value = 8;
+            }
+        }
+        s.obj.symbol("?pre@@YAHXZ", 0, static_cast<std::int32_t>(s.foo.section), true);
+        std::vector<std::uint8_t> code = {0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3};
+        code.resize(16, 0xCC);
+        std::vector<std::uint8_t> bytes(8, 0x90);
+        bytes.insert(bytes.end(), code.begin(), code.end());
+        s.new_code(bytes);
+        s.old_code(code);
+        const std::uint32_t g = s.obj.undefined("g", false);
+        s.obj.reloc(s.foo.section, site, g, kRel32);
+        coff::ModelSection& sec = s.obj.model().sections[s.foo.section - 1];
+        for (std::uint32_t i = 0; i < 4; ++i) {  // the in-place addend bytes are the code's
+            sec.data[site + i] = static_cast<std::byte>(bytes[site + i]);
+        }
+        s.hook(16);
+        for (SymbolDecision& d : s.plan.decisions) {
+            if (d.name == "?foo@@YAHXZ") {
+                d.value = 8;
+            }
+        }
+        const NarrowResult r = s.run();
+        if (site == 6) {
+            REQUIRE(r.hooks.size() == 1);
+            CHECK(only(r).reason == NarrowReason::Unverifiable);
+            CHECK_MESSAGE(only(r).detail.find("before the function reaches into it") != std::string::npos, only(r).detail);
+        } else {
+            CHECK_MESSAGE(only(r).reason == NarrowReason::Unchanged, to_string(only(r).reason) << " " << only(r).detail);
+        }
+    }
+}
+
+TEST_CASE("narrowing (WP-49, R-50): the relocation reaching into the start is refused before the bytes are compared") {
+    QuietLogs quiet;
+    // As above with the REL32 at 6, but the old function's first byte differs from the new one's (unmasked, under the relocation):
+    // the verdict must be "unverifiable", never a "bytes differ" that WP-40/WP-46 would count as a changed function.
+    Scenario s(24, true);
+    for (coff::ModelSymbol& m : s.obj.model().symbols) {
+        if (m.name == "?foo@@YAHXZ") {
+            m.value = 8;
+        }
+    }
+    s.obj.symbol("?pre@@YAHXZ", 0, static_cast<std::int32_t>(s.foo.section), true);
+    std::vector<std::uint8_t> code = {0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3};
+    code.resize(16, 0xCC);
+    std::vector<std::uint8_t> bytes(8, 0x90);
+    bytes.insert(bytes.end(), code.begin(), code.end());
+    s.new_code(bytes);
+    std::vector<std::uint8_t> old = code;
+    old[0] = 0xB9;
+    s.old_code(old);
+    const std::uint32_t g = s.obj.undefined("g", false);
+    s.obj.reloc(s.foo.section, 6, g, kRel32);
+    coff::ModelSection& sec = s.obj.model().sections[s.foo.section - 1];
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        sec.data[6 + i] = static_cast<std::byte>(bytes[6 + i]);
+    }
+    s.hook(16);
+    for (SymbolDecision& d : s.plan.decisions) {
+        if (d.name == "?foo@@YAHXZ") {
+            d.value = 8;
+        }
+    }
+    const NarrowResult r = s.run();
+    REQUIRE(r.hooks.size() == 1);
+    CHECK_MESSAGE(only(r).reason == NarrowReason::Unverifiable, to_string(only(r).reason) << " " << only(r).detail);
+}
+
+TEST_CASE("narrowing (WP-49): a table load names the table's label only with a small entry-aligned index bias") {
+    QuietLogs quiet;
+    const SwitchCode c = cl_od_switch();
+    struct Case {
+        std::int32_t addend;
+        bool comparable;
+    };
+    // -4: `$LN9[rcx+rax*4-4]` (first case 1); -64: the largest bias taken; -2: not entry-aligned; -68: beyond the bias.
+    for (const Case k : {Case{-4, true}, Case{-64, true}, Case{-2, false}, Case{-68, false}}) {
+        CAPTURE(k.addend);
+        Scenario s(c.size());
+        jump_table(s, c);
+        set_le32(s.obj.model().sections[s.foo.section - 1], c.load_site, static_cast<std::uint32_t>(k.addend));
+        put32(s.disk, text_off(kFnRva) + c.load_site, kFnRva + c.table + static_cast<std::uint32_t>(k.addend));
+        const NarrowResult r = s.run();
+        if (k.comparable) {
+            CHECK_MESSAGE(only(r).reason == NarrowReason::Unchanged, to_string(only(r).reason) << " " << only(r).detail);
+        } else {
+            REQUIRE(r.hooks.size() == 1);
+            CHECK(only(r).reason == NarrowReason::Unverifiable);
+            CHECK_MESSAGE(only(r).detail.find("not the start of a jump table") != std::string::npos, only(r).detail);
+        }
+    }
+}
+
+namespace {
+
+// foo in a plain code section (no /Gy): `mov eax, 1`, then a label `$LN3` at 8 (as a case label is), then `mov eax, <tail>; ret`.
+// The extent of foo in the section ends at the label.
+void labelled_function(Scenario& s, std::uint8_t tail, std::uint32_t old_size, std::uint32_t old_rva = kFnRva) {
+    s.new_code({0xB8, 0x01, 0, 0, 0, 0x90, 0x90, 0x90, 0xB8, tail, 0, 0, 0, 0xC3});
+    s.obj.symbol("$LN3", 8, static_cast<std::int32_t>(s.foo.section), false, false);
+    s.hook(old_size, old_rva);
+}
+
+}  // namespace
+
+TEST_CASE("elision (WP-49 review): in a section with other symbols, an edit behind an inner label is not hidden by the earlier patch's record") {
+    QuietLogs quiet;
+    Scenario first(24, true);
+    labelled_function(first, 10, 14);
+    const std::shared_ptr<const CodeImage> prior = first.capture();
+    REQUIRE(prior->bytes.size() == 8);  // cut at the label, in the record as well
+    {
+        // The edit changes the code behind the label (10 -> 20): the 8 bytes before it equal the record's.
+        Scenario s(24, true);
+        labelled_function(s, 20, 14);
+        s.prior = [&](std::uint64_t) { return prior; };
+        const NarrowResult r = s.run(true, entry_is_hooked);
+        REQUIRE(r.hooks.size() == 1);
+        CHECK(only(r).reason == NarrowReason::SizeDiffers);
+        CHECK_MESSAGE(only(r).detail.find("PDB's size 14") != std::string::npos, only(r).detail);
+    }
+    {
+        // A function an earlier patch introduced (no size from the PDB): its extent cannot be checked, kept.
+        Scenario s(24, true);
+        labelled_function(s, 20, 0, kNoRva);
+        s.prior = [&](std::uint64_t) { return prior; };
+        const NarrowResult r = s.run(true, entry_is_hooked);
+        REQUIRE(r.hooks.size() == 1);
+        CHECK(only(r).reason == NarrowReason::UnknownOldSize);
+    }
+    {
+        // Against the module file the size check was already there: the cut extent (8) is not the PDB's 14.
+        Scenario s(24, true);
+        labelled_function(s, 20, 14);
+        s.old_code({0xB8, 0x01, 0, 0, 0, 0x90, 0x90, 0x90, 0xB8, 10, 0, 0, 0, 0xC3});
+        const NarrowResult r = s.run();
+        REQUIRE(r.hooks.size() == 1);
+        CHECK(only(r).reason == NarrowReason::SizeDiffers);
+    }
+    {
+        // A COMDAT function is its whole section: an earlier patch that made it longer than the module's copy (16 bytes against
+        // the PDB's 24) is still compared with that patch's record, and an unchanged one is dropped.
+        Scenario a;
+        a.new_code({0xB8, 0x01, 0, 0, 0, 0xC3});
+        a.hook(24);
+        const std::shared_ptr<const CodeImage> comdat_prior = a.capture();
+        Scenario b;
+        b.new_code({0xB8, 0x01, 0, 0, 0, 0xC3});
+        b.hook(24);
+        b.prior = [&](std::uint64_t) { return comdat_prior; };
+        const NarrowResult r = b.run(true, entry_is_hooked);
+        CHECK_MESSAGE(only(r).reason == NarrowReason::Unchanged, to_string(only(r).reason) << " " << only(r).detail);
     }
 }

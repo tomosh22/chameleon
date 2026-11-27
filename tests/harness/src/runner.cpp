@@ -724,6 +724,15 @@ private:
                         options_.config.c_str());
             std::fflush(stdout);
         }
+        // WP-49 evidence: how many distinct entries the planner wanted to hook, how many of them narrowing found identical to the
+        // running code, and how many hooks were installed (planned - dropped = installed for a reload that applied a patch).
+        if (const ipc::json::Value* planned = response->result.find("hooks_planned"); planned != nullptr && planned->is_integer()) {
+            std::printf("WP49-HOOKS hooks_planned=%lld hooks_dropped=%lld hooks_installed=%lld fixture=%s compiler=%s config=%s\n",
+                        static_cast<long long>(planned->as_integer()), static_cast<long long>(response->result.get_integer("hooks_dropped")),
+                        static_cast<long long>(response->result.get_integer("hooks_installed")), scenario_.fixture.c_str(), report_.compiler.c_str(),
+                        options_.config.c_str());
+            std::fflush(stdout);
+        }
         {
             std::ofstream out(options_.artifacts_dir / "reload-result.json", std::ios::binary | std::ios::app);
             out << ipc::json::serialize(response->result) << "\n";
@@ -959,6 +968,17 @@ private:
     StepOutcome expect_reload_result(const Step& step) {
         if (!has_reload_result_) {
             return StepOutcome::fail(cml::ids::kResultMismatch, "no reload ran before this step");
+        }
+        if (!step.compiler.empty()) {  // WP-49
+            const std::string family = compiler_family(report_.compiler);
+            if (family.empty()) {
+                return StepOutcome::fail(cml::ids::kResultMismatch, "the expectation " + step.key + " = " + std::to_string(step.result_value) + " is for " + step.compiler +
+                                                                        ", and this cell's compiler '" + report_.compiler + "' is neither cl nor clang-cl");
+            }
+            if (family != step.compiler) {
+                return StepOutcome::pass("not checked: the expectation " + step.key + " = " + std::to_string(step.result_value) + " is for " + step.compiler +
+                                         ", this cell is " + family);
+            }
         }
         const ipc::json::Value* member = last_reload_result_.find(step.key);
         if (member == nullptr || !member->is_integer() || member->as_integer() != step.result_value) {

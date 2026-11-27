@@ -1,0 +1,9 @@
+--- a/jump_tables.cpp
++++ b/jump_tables.cpp
+@@ -38,5 +38,5 @@
+ // No switch: the function the edits change.
+ __declspec(noinline) int jt_value()
+ {
+-    return 2;
++    return 3;
+ }
