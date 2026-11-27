@@ -786,46 +786,7 @@ void ReloadService::prefetch_loop() {
                 CML_LOG(Debug, "reload: background read of %s: %s", state->path.c_str(), read.error->format().c_str());
             }
         }
-        warm_pdb_types(*state, read.image);
     }
-}
-
-void ReloadService::warm_pdb_types(ModuleState& state, const std::shared_ptr<const pe::OwnedImage>& image) {
-    // WP-50 (R-47, orchestrator's ruling): the bind planner's first use of the module's type records builds cml_pdb's
-    // whole-module type tables (the TPI / IPI streams for signatures and parameter types). Built here instead, through the
-    // public accessors, on the procedure at the module's entry point (any procedure builds the same tables). A TPI stream
-    // over kMaxWarmTpiBytes is left for the reload to read (it would be held for the session either way, but not by a
-    // session that never reloads).
-    constexpr std::uint64_t kMaxWarmTpiBytes = 64ull << 20;
-    std::shared_ptr<ModuleIndex> index;
-    {
-        std::lock_guard<std::mutex> lock(state.mutex);
-        index = state.index;
-    }
-    const std::shared_ptr<const pdb::PdbIndex> pdb = index ? index->pdb() : nullptr;
-    if (!pdb || !image) {
-        return;
-    }
-    using Clock = std::chrono::steady_clock;
-    const auto ms = [](Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-    const Clock::time_point t0 = Clock::now();
-    const Result<std::optional<pdb::SymbolView>> proc = pdb->find_proc_by_rva(image->image.optional_header().address_of_entry_point);
-    if (!proc || !*proc) {
-        CML_LOG(Info, "WP50-ONEOFF what=pdb-types module=%s warmed=0 reason=no-procedure-at-entry", state.name.c_str());
-        return;
-    }
-    const Clock::time_point t1 = Clock::now();
-    (void)pdb->proc_signature(**proc);  // the type streams' headers and index-offset tables, and the records it needs
-    const Clock::time_point t2 = Clock::now();
-    const pdb::TypeStreamStats tpi = pdb->type_stream_stats(true);
-    double info_ms = 0;
-    const bool full = tpi.record_bytes <= kMaxWarmTpiBytes;
-    if (full) {
-        (void)pdb->proc_info(**proc);  // the TPI table the parameter types are resolved through
-        info_ms = ms(t2, Clock::now());
-    }
-    CML_LOG(Info, "WP50-ONEOFF what=pdb-types module=%s warmed=1 find_ms=%.1f signature_ms=%.1f info_ms=%.1f tpi_mib=%.1f tpi_table=%d", state.name.c_str(),
-            ms(t0, t1), ms(t1, t2), info_ms, static_cast<double>(tpi.record_bytes) / (1024.0 * 1024.0), full ? 1 : 0);
 }
 
 void ReloadService::queue_reapply(ReapplyItem item) {

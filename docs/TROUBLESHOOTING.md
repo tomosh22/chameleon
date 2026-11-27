@@ -35,8 +35,7 @@ revert, restart).
      first query of the code region.
    * `WP50-PLAN module=... object_ms=... image_ms=... bind_ms=... export_parses=... prove_ms=... narrow_ms=...
      pdb_*_ms=...`: the plan stage of one recompiled object, split up (`image_ms` is near 0 once the module file was read in
-     the background). `WP50-ONEOFF what=pdb-types ... signature_ms=... info_ms=... tpi_mib=...`: the PDB's type tables
-     built in the background after the image read, so that the first reload's bind plan does not build them.
+     the background).
    * `WP50-ONEOFF what=module-image|linker-detection|reserve-range ms=...`: work done once per module at its first reload.
      The module file is normally read in the background once the index is ready (`image=background`); `image=reload` means
      the first reload had to read it itself (set-option `prefetch_module_image` false, or the reload came first).
@@ -45,8 +44,8 @@ revert, restart).
      module file was rebuilt since; `absent` that this broker had not indexed it before. Set-option `cache_include_scan` false
      scans every time.
    * The two set-options of WP-50 (control command `set-option {"name":..., "value": true|false}`, both default `true`):
-     `prefetch_module_image` (read the module file for the function comparison, and build the PDB's type tables, in the
-     background once its index is ready; applies to modules enabled afterwards) and `cache_include_scan` (reuse the file lists and include graph of an unchanged
+     `prefetch_module_image` (read the module file for the function comparison in the background once its index is
+     ready; applies to modules enabled afterwards) and `cache_include_scan` (reuse the file lists and include graph of an unchanged
      module file this broker indexed before; applies to indexes started afterwards). Turn one off only to rule it out when
      looking for a problem.
 

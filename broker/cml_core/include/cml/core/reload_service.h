@@ -305,7 +305,6 @@ private:
     // destructor. It holds a state only while it reads that state's file.
     void queue_image_prefetch(std::weak_ptr<ModuleState> state);
     void prefetch_loop();
-    void warm_pdb_types(ModuleState& state, const std::shared_ptr<const pe::OwnedImage>& image);
     std::mutex prefetch_mutex_;  // guards the members below
     std::condition_variable prefetch_changed_;
     std::deque<std::weak_ptr<ModuleState>> prefetch_queue_;

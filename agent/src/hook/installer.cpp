@@ -183,14 +183,6 @@ bool is_code_region(const MEMORY_BASIC_INFORMATION& info) noexcept {
     return (info.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
 }
 
-bool is_code(const void* address) noexcept {
-    MEMORY_BASIC_INFORMATION info;
-    if (VirtualQuery(address, &info, sizeof(info)) == 0) {
-        return false;
-    }
-    return is_code_region(info);
-}
-
 // WP-50 (R-47): the answers of VirtualQuery during the planning of one batch. Every page of the range VirtualQuery reports
 // ([BaseAddress, BaseAddress + RegionSize)) has the same attributes, so an address inside a range already reported gets the
 // same answer without another call. The first query into the large code region of a module that was never changed is
