@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "hook/diag_ids.h"
+#include "hook/hook_timing.h"
 #include "doctest.h"
 
 using namespace cml::agent::hook;
@@ -378,4 +379,76 @@ TEST_CASE("to_string names the strategies") {
     CHECK(std::string(to_string(Strategy::PaddingTwoByte)) == "padding+2-byte");
     CHECK(std::string(to_string(Strategy::FiveByte)) == "5-byte");
     CHECK(std::string(to_string(Strategy::None)) == "none");
+}
+
+TEST_CASE("WP-50: the WP50-HOOKS line carries every phase under a stable key, in order") {
+    HooksTimingLine l;
+    l.request_id = 17;
+    l.batch = 1;
+    l.op = "install";
+    l.hooks = 275;
+    l.threads = 3;
+    l.attempts = 1;
+    l.batch_timing.installs = 275;
+    l.batch_timing.pages = 61;
+    l.batch_timing.plan_us = 1200;
+    l.batch_timing.write_us = 380000;
+    l.batch_timing.write_max_us = 9000;
+    l.dispatch.total_us = 395000;
+    l.dispatch.install_us = 392000;
+    const std::string line = format_hooks_timing(l);
+    CHECK(line.rfind("WP50-HOOKS side=agent request=17 batch=1 op=install hooks=275 installed=275 repointed=0 unchanged=0 reverted=0 pages=61 "
+                     "threads=3 attempts=1 status=0 total_us=395000 ",
+                     0) == 0);
+    const char* const keys[] = {"wait_us",      "collect_us", "prepatch_us",   "build_us",     "install_us", "lock_us",     "plan_us",
+                                "probe_us",     "query_us", "queries", "protect_us", "stop_us",       "enumerate_us", "suspend_us", "context_us",  "check_us",
+                                "write_us",     "write_max_us", "step_us",     "resume_us",    "retry_wait_us", "unprotect_us", "commit_us",
+                                "rollback_us",  "postpatch_us", "reply_us"};
+    std::size_t at = 0;
+    for (const char* key : keys) {
+        const std::size_t found = line.find(std::string(" ") + key + "=", at);
+        CHECK_MESSAGE(found != std::string::npos, key);
+        if (found != std::string::npos) {
+            at = found + 1;
+        }
+    }
+    CHECK(line.find(" write_us=380000 write_max_us=9000 ") != std::string::npos);
+    CHECK(line.find(" plan_us=1200 ") != std::string::npos);
+    CHECK(line.find('\n') == std::string::npos);
+
+
+    l.status = 4301;
+    l.op = "revert";
+    const std::string refused = format_hooks_timing(l);
+    CHECK(refused.find(" op=revert ") != std::string::npos);
+    CHECK(refused.find(" status=CML4301 total_us=") != std::string::npos);
+}
+
+TEST_CASE("WP-50 (review): the WP50-HOOKS line is never cut, however wide its numbers") {
+    HooksTimingLine l;
+    const std::uint64_t big = ~std::uint64_t{0};
+    l.request_id = big;
+    l.batch = big;
+    l.hooks = static_cast<std::size_t>(big);
+    l.status = 4294967295u;
+    BatchTiming& b = l.batch_timing;
+    for (std::uint64_t* f : {&b.lock_us, &b.plan_us, &b.probe_us, &b.query_us, &b.protect_us, &b.enumerate_us, &b.suspend_us, &b.context_us,
+                             &b.stop_us, &b.check_us, &b.write_us, &b.write_max_us, &b.step_us, &b.resume_us, &b.retry_wait_us, &b.unprotect_us,
+                             &b.commit_us, &b.total_us}) {
+        *f = big;
+    }
+    b.queries = 4294967295u;
+    DispatchTiming& d = l.dispatch;
+    for (std::uint64_t* f : {&d.wait_us, &d.collect_us, &d.prepatch_us, &d.build_us, &d.install_us, &d.rollback_us, &d.postpatch_us, &d.reply_us,
+                             &d.total_us}) {
+        *f = big;
+    }
+    const std::string line = format_hooks_timing(l);
+    // Each chunk used to go through a 160-byte buffer: the install_us .. protect_us chunk alone is wider than that here.
+    CHECK(line.find(" install_us=18446744073709551615 lock_us=18446744073709551615 plan_us=18446744073709551615 probe_us=18446744073709551615 "
+                    "query_us=18446744073709551615 queries=4294967295 protect_us=18446744073709551615 stop_us=") != std::string::npos);
+    const std::string tail = " reply_us=18446744073709551615";
+    REQUIRE(line.size() > tail.size());
+    CHECK(line.compare(line.size() - tail.size(), tail.size(), tail) == 0);
+    CHECK(line.find('\0') == std::string::npos);
 }

@@ -310,6 +310,144 @@ TEST_CASE("immediate mode: the agent thread applies InstallHooks and answers Hoo
     set_window_probe(false);
 }
 
+TEST_CASE("WP-50: the timing of an InstallHooks reaches the broker as a Log line, before the answer") {
+    Rig rig;
+    const std::string pipe = unique_pipe_name();
+    FakeBroker broker(pipe);
+    REQUIRE(broker.listening());
+    ScopedPipeEnv env(pipe);
+    set_window_probe(false);
+
+    Agent agent(CML_MODE_IMMEDIATE);
+    REQUIRE(agent.start().has_value());
+    REQUIRE(broker.handshake());
+
+    // Everything the agent sends until the answer, in order.
+    const auto collect = [&](std::uint64_t id, std::vector<std::string>* lines) -> std::optional<ipc::HooksInstalled> {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        while (std::chrono::steady_clock::now() < deadline) {
+            std::optional<ipc::Message> message = broker.receive(100);
+            if (!message) {
+                continue;
+            }
+            if (const auto* log = std::get_if<ipc::Log>(&*message)) {
+                lines->push_back(log->text);
+            } else if (const auto* answer = std::get_if<ipc::HooksInstalled>(&*message); answer != nullptr && answer->request_id == id) {
+                return *answer;
+            } else if (const auto* list = std::get_if<ipc::ModuleList>(&*message)) {
+                ipc::Reply reply;
+                reply.request_id = list->request_id;
+                broker.send(reply);
+            }
+        }
+        return std::nullopt;
+    };
+    const auto timing_line = [](const std::vector<std::string>& lines, std::uint64_t id) {
+        const std::string wanted = "WP50-HOOKS side=agent request=" + std::to_string(id) + " ";
+        for (const std::string& l : lines) {
+            if (l.rfind(wanted, 0) == 0) {
+                return l;
+            }
+        }
+        return std::string();
+    };
+
+    std::vector<std::string> lines;
+    REQUIRE(broker.send(request(31, 0, {{rig.old_fn.entry, rig.new_1.entry}, {rig.other_fn.entry, rig.new_1.entry}})));
+    std::optional<ipc::HooksInstalled> answer = collect(31, &lines);
+    REQUIRE(answer.has_value());
+    CHECK(answer->status == 0);
+    std::string line = timing_line(lines, 31);  // received before the answer: collect() stops at the answer
+    REQUIRE_MESSAGE(!line.empty(), "no WP50-HOOKS line before the answer");
+    CHECK(line.find(" op=install hooks=2 installed=2 repointed=0 unchanged=0 reverted=0 ") != std::string::npos);
+    // WP-50: the planning's VirtualQuery calls are counted (the region cache answers most of them).
+    CHECK(line.find(" query_us=") != std::string::npos);
+    CHECK(line.find(" queries=0 ") == std::string::npos);
+    CHECK(line.find(" pages=") != std::string::npos);
+    CHECK(line.find(" status=0 total_us=") != std::string::npos);
+    CHECK(line.find(" stop_us=") != std::string::npos);
+    CHECK(line.find(" write_max_us=") != std::string::npos);
+
+    lines.clear();
+    REQUIRE(broker.send(request(32, 0, {{rig.old_fn.entry, rig.new_2.entry}, {rig.other_fn.entry, rig.new_1.entry}})));
+    answer = collect(32, &lines);
+    REQUIRE(answer.has_value());
+    line = timing_line(lines, 32);
+    REQUIRE(!line.empty());
+    CHECK(line.find(" installed=0 repointed=1 unchanged=1 reverted=0 ") != std::string::npos);
+
+    lines.clear();
+    REQUIRE(broker.send(request(33, 0, {{rig.old_fn.entry, rig.new_1.entry}, {rig.tiny.entry, rig.new_1.entry}})));
+    answer = collect(33, &lines);
+    REQUIRE(answer.has_value());
+    CHECK(answer->status == hook::ids::kFunctionTooShort);
+    line = timing_line(lines, 33);
+    REQUIRE(!line.empty());
+    CHECK(line.find(" status=CML4301 ") != std::string::npos);
+
+    lines.clear();
+    REQUIRE(broker.send(request(34, ipc::kInstallHooksRevert, {{rig.old_fn.entry, nullptr}, {rig.other_fn.entry, nullptr}})));
+    answer = collect(34, &lines);
+    REQUIRE(answer.has_value());
+    CHECK(answer->status == 0);
+    line = timing_line(lines, 34);
+    REQUIRE(!line.empty());
+    CHECK(line.find(" op=revert hooks=2 installed=0 repointed=0 unchanged=0 reverted=2 ") != std::string::npos);
+    CHECK(snapshot(rig.old_fn.entry - 16, 64) == rig.original);
+
+    agent.stop_and_wait_for_calls();
+}
+
+TEST_CASE("WP-50 (review): in synchronised mode the timing line queued by the SyncPoint thread still reaches the broker before its answer") {
+    Rig rig;
+    const std::string pipe = unique_pipe_name();
+    FakeBroker broker(pipe);
+    REQUIRE(broker.listening());
+    ScopedPipeEnv env(pipe);
+    set_window_probe(false);
+
+    Agent agent(CML_MODE_SYNCHRONIZED);
+    REQUIRE(agent.start().has_value());
+    REQUIRE(broker.handshake());
+
+    // The application thread (here: this one) calls SyncPoint while the agent thread serves the pipe; the line and the answer
+    // are queued by this thread, at any point of the agent thread's pass. Every round: the line arrives, and before the answer.
+    for (std::uint64_t round = 0; round < 12; ++round) {
+        const std::uint64_t id = 60 + round;
+        const bool revert = (round % 2) == 1;
+        REQUIRE(broker.send(revert ? request(id, ipc::kInstallHooksRevert, {{rig.old_fn.entry, nullptr}})
+                                   : request(id, 0, {{rig.old_fn.entry, rig.new_1.entry}})));
+        const std::string wanted = "WP50-HOOKS side=agent request=" + std::to_string(id) + " ";
+        bool line_seen = false;
+        std::optional<ipc::HooksInstalled> answer;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        while (!answer && std::chrono::steady_clock::now() < deadline) {
+            agent.sync_point();
+            for (;;) {
+                std::optional<ipc::Message> message = broker.receive(20);
+                if (!message) {
+                    break;
+                }
+                if (const auto* log = std::get_if<ipc::Log>(&*message)) {
+                    line_seen = line_seen || log->text.rfind(wanted, 0) == 0;
+                } else if (const auto* got = std::get_if<ipc::HooksInstalled>(&*message); got != nullptr && got->request_id == id) {
+                    answer = *got;
+                    break;
+                } else if (const auto* list = std::get_if<ipc::ModuleList>(&*message)) {
+                    ipc::Reply reply;
+                    reply.request_id = list->request_id;
+                    broker.send(reply);
+                }
+            }
+        }
+        REQUIRE(answer.has_value());
+        CHECK(answer->status == 0);
+        CHECK_MESSAGE(line_seen, "round " << round << ": the WP50-HOOKS line did not arrive before its answer");
+    }
+    CHECK(snapshot(rig.old_fn.entry - 16, 64) == rig.original);
+    agent.stop_and_wait_for_calls();
+}
+
 TEST_CASE("synchronised mode: the hooks are applied inside SyncPoint on the calling thread") {
     Rig rig;
     const std::string pipe = unique_pipe_name();

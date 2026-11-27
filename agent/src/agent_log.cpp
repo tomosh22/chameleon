@@ -46,6 +46,19 @@ std::optional<LogLevel> parse_level(const std::string& text) {
     return std::nullopt;
 }
 
+// With the state's mutex held.
+void enqueue_locked(State& s, LogLevel level, std::string text) {
+    ipc::Log entry;
+    entry.level = static_cast<std::uint32_t>(level);
+    // The C runtime cuts log lines at a fixed byte count, possibly inside a multi-byte
+    // character, and callers may log arbitrary bytes: always repair before it goes on the wire.
+    entry.text = ipc::sanitize_utf8(text, kMaxForwardedTextBytes);
+    if (s.queue.size() >= kMaxForwarded) {
+        s.queue.pop_front();
+    }
+    s.queue.push_back(std::move(entry));
+}
+
 void sink(void*, LogLevel level, const char* file, int line, const char* message) {
     char buffer[1280];
     const int n = std::snprintf(buffer, sizeof(buffer), "[cml_agent pid=%lu tid=%lu] [%s] %s:%d: %s\n",
@@ -65,17 +78,7 @@ void sink(void*, LogLevel level, const char* file, int line, const char* message
         std::fflush(s.file);
     }
     if (level >= LogLevel::Warn && s.forwarders > 0) {
-        ipc::Log entry;
-        entry.level = static_cast<std::uint32_t>(level);
-        // The C runtime cuts log lines at a fixed byte count, possibly inside a multi-byte
-        // character, and callers may log arbitrary bytes: always repair before it goes on the wire.
-        entry.text = ipc::sanitize_utf8(std::string(path::base_name(std::string_view(file))) + ":" +
-                                            std::to_string(line) + ": " + message,
-                                        kMaxForwardedTextBytes);
-        if (s.queue.size() >= kMaxForwarded) {
-            s.queue.pop_front();
-        }
-        s.queue.push_back(std::move(entry));
+        enqueue_locked(s, level, std::string(path::base_name(std::string_view(file))) + ":" + std::to_string(line) + ": " + message);
     }
 }
 
@@ -111,6 +114,14 @@ void set_log_forwarding(bool enabled) {
     if (s.forwarders <= 0) {
         s.forwarders = 0;
         std::deque<ipc::Log>().swap(s.queue);  // drop the storage too, not just the entries
+    }
+}
+
+void forward_to_broker(LogLevel level, const std::string& text) {
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (s.forwarders > 0) {
+        enqueue_locked(s, level, text);
     }
 }
 

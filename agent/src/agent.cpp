@@ -1374,7 +1374,9 @@ void Agent::handle_message(const ipc::Message& message) {
 void Agent::serve(ipc::PipeConnection& connection) {
     while (!stopping_.load(std::memory_order_acquire)) {
         refresh_exception_ranges_if_due();
-        if (!flush_outgoing(connection) || !flush_replies(connection) || !flush_logs(connection) || !flush_exceptions(connection)) {
+        // WP-50: logs before answers, so a line logged before an answer was queued (the hooks' timing) reaches the broker first;
+        // flush_replies drains the logs again before each answer, for an answer queued after this pass's flush_logs.
+        if (!flush_outgoing(connection) || !flush_logs(connection) || !flush_replies(connection) || !flush_exceptions(connection)) {
             return;
         }
         // WP-48: a ring that is half full is drained at once (the agent thread wakes at least every kReceiveSliceMs), so a burst of

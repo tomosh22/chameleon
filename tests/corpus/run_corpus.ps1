@@ -17,7 +17,9 @@
 #              for the `expect` line(s), a marker count that grows (`expect_grows`) and, with `wait_module`, a module of
 #              the process (path regex) that is enabled with its PDB index ready; kind "check" only observes.
 #   restart:<id>  (WP-42) hot-restart (`restart` on the control pipe): asserts `expect_diag`, `expect_not_enabled` (a
-#              path regex in the result's not_enabled), `expect_reapplied`, then follows the new pid.
+#              path regex in the result's not_enabled), `expect_reapplied`, then follows the new pid. Prints the stage
+#              breakdown as `WP50-RESTART project=... edit=<id> total_ms=... <stage>_ms=... index_...` and the broker's
+#              `WP50-INDEX` lines (WP-50, R-55; also in the step summary).
 #   reload-budget (WP-39, only with -ReloadBudgetMsPerTu): every accepted reload took at most that many ms of
 #              `total - compile` per recompiled translation unit. Every cell prints the stage timings of each accepted
 #              reload as `WP39-<PROJECT> edit=<id> total_ms=... compile_ms=... rest_ms=... budget_ms=...` (also in the
@@ -66,6 +68,7 @@ $script:App = $null
 $script:Ctl = $null
 $script:Failed = $false
 $script:Timings = New-Object System.Collections.Generic.List[object]   # WP-39: one row per accepted reload
+$script:RestartTimings = New-Object System.Collections.Generic.List[string]   # WP-50: WP50-RESTART and WP50-INDEX lines
 
 function Add-Result([string]$Step, [string]$Result, [string]$Detail = '', [double]$Seconds = 0) {
     $row = [ordered]@{ project = $Project; compiler = $Compiler; step = $Step; result = $Result; detail = $Detail; seconds = [math]::Round($Seconds, 1) }
@@ -152,6 +155,33 @@ function Add-ReloadTiming([string]$EditId, $Result) {
             budget_ms = $(if ($ReloadBudgetMsPerTu -gt 0) { $budget } else { $null })
             over_budget = ($ReloadBudgetMsPerTu -gt 0 -and $rest -gt $budget); stages_ms = $v; line = $line
         })
+}
+
+# WP-50 (R-55): the stage breakdown of a hot-restart, from the restart result's `timing` (the broker's RESTART-TIMING line:
+# prepare, takeover, terminate, relaunch, register, module_list, reenable, carry, index, restore, reapply, and the index build
+# of the module the restart waited for longest). Prints
+#   WP50-RESTART project=<project> compiler=<compiler> edit=<id> old_pid=... new_pid=... total_ms=... <stage>_ms=... index_...
+# and the broker's WP50-INDEX lines (where each index build went: PDB, build checks, include scan, source hashes). A result
+# without the line is a broker that predates WP-50: said, not failed.
+function Write-RestartTiming([string]$EditId, $Result) {
+    $t = [string]$Result.timing
+    if ($t -match '^RESTART-TIMING (.*)$') {
+        $line = "WP50-RESTART project={0} compiler={1} edit={2} {3}" -f $Project, $Compiler, $EditId, $Matches[1]
+    } else {
+        $line = "WP50-RESTART project={0} compiler={1} edit={2} missing (the restart result has no RESTART-TIMING line)" -f $Project, $Compiler, $EditId
+    }
+    Write-Host $line
+    $script:RestartTimings.Add($line)
+    $bl = Join-Path $out 'broker.log'
+    if (Test-Path $bl) {
+        foreach ($m in @(Select-String -Path $bl -Pattern 'WP50-INDEX .*$')) {
+            $index = 'WP50-INDEX ' + ($m.Line -replace '^.*?WP50-INDEX ', '')
+            if (-not $script:RestartTimings.Contains($index)) {
+                Write-Host $index
+                $script:RestartTimings.Add($index)
+            }
+        }
+    }
 }
 
 function Invoke-Native([string]$Label, [string]$Exe, [string[]]$ArgList, [string]$LogFile = '') {
@@ -588,6 +618,8 @@ if ($built) {
                     Write-Host "events: $(@($script:Ctl.Events | ForEach-Object { if ($_.Length -gt 400) { $_.Substring(0, 400) } else { $_ } }) -join ' || ')"
                     $r = $resp | ConvertFrom-Json
                     if (-not $r.ok) { throw "restart failed: $resp" }
+                    # WP-50 (R-55): the broker's stage breakdown of the restart, and of the index builds in the new process.
+                    Write-RestartTiming $edit.id $r.result
                     $newPid = [int]$r.result.new_pid
                     $proc = Get-Process -Id $newPid -ErrorAction SilentlyContinue
                     if ($null -eq $proc) { throw "the restarted process (pid $newPid) is not running" }
@@ -724,6 +756,15 @@ if ($env:GITHUB_STEP_SUMMARY) {
         $d = ([string]$row.detail) -replace '\|', '/' -replace "[\r\n]+", ' '
         if ($d.Length -gt 300) { $d = $d.Substring(0, 300) + '...' }
         $md.Add("| $($row.step) | $($row.result) | $d |")
+    }
+    if ($script:RestartTimings.Count -gt 0) {
+        # WP-50: the stage breakdown of every hot-restart (ms), and the index builds.
+        $md.Add('')
+        $md.Add('Hot-restart and index timing (WP-50):')
+        $md.Add('')
+        $md.Add('```')
+        foreach ($l in $script:RestartTimings) { $md.Add([string]$l) }
+        $md.Add('```')
     }
     if ($script:Timings.Count -gt 0) {
         # WP-39: the stage timings of every accepted reload (ms). rest = total - compile.

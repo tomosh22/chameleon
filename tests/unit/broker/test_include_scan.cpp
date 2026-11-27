@@ -1,10 +1,15 @@
 // WP-15: the include scan that maps headers to compilands independently of the PDB's file list (ADR-0013).
 #include "doctest.h"
 
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <map>
+#include <memory>
 #include <string>
 
 #include "cml/core/include_scan.h"
+#include "cml/core/module_index.h"
 
 using namespace cml;
 using namespace cml::core;
@@ -220,4 +225,332 @@ TEST_CASE("the precompiled header is the named header and the forced includes wi
     roots = scan_roots_from_record(yc);
     CHECK(roots.creates_pch);
     CHECK(roots.pch_header == "cmake_pch.hxx");
+}
+
+// WP-50: the scanner expands a header reached again with new stack directories by looking at those alone. These are the three
+// ways a new directory can relate to the earlier answer; the expected sets are what the scanner before WP-50 (full search on
+// every expansion) returns for the same trees.
+TEST_CASE("WP-50: a header reached again with a new stack directory resolves its includes as a full search would") {
+    const auto deps = [](const std::map<std::string, std::string>& files, const std::string& tu) {
+        FakeFs fs;
+        fs.files = files;
+        IncludeScanner scanner(fs.reader());
+        ScanRoots roots;
+        roots.source = tu;
+        roots.cwd = "c:\\p";
+        roots.include_dirs = {"c:\\p\\inc"};
+        return scanner.dependencies(roots);
+    };
+    SUBCASE("answered by -I first; the new directory has it: found there too") {
+        CHECK(deps({{"c:\\p\\t\\tu.cpp", "#include \"../l/one.h\"\n#include \"../m/two.h\"\n"},
+                    {"c:\\p\\l\\one.h", "#include \"c.h\"\n"},
+                    {"c:\\p\\m\\two.h", "#include \"../l/one.h\"\n"},
+                    {"c:\\p\\inc\\c.h", ""},
+                    {"c:\\p\\m\\c.h", ""}},
+                   "c:\\p\\t\\tu.cpp") ==
+              std::set<std::string>{"c:\\p\\inc\\c.h", "c:\\p\\l\\one.h", "c:\\p\\m\\c.h", "c:\\p\\m\\two.h"});
+    }
+    SUBCASE("answered by a stack directory that sorts before the new one: kept") {
+        CHECK(deps({{"c:\\p\\a\\tu.cpp", "#include \"../l/one.h\"\n#include \"../m/two.h\"\n"},
+                    {"c:\\p\\l\\one.h", "#include \"c.h\"\n"},
+                    {"c:\\p\\m\\two.h", "#include \"../l/one.h\"\n"},
+                    {"c:\\p\\a\\c.h", ""},
+                    {"c:\\p\\m\\c.h", ""},
+                    {"c:\\p\\inc\\c.h", ""}},
+                   "c:\\p\\a\\tu.cpp") == std::set<std::string>{"c:\\p\\a\\c.h", "c:\\p\\l\\one.h", "c:\\p\\m\\two.h"});
+    }
+    SUBCASE("answered by a stack directory that sorts after the new one: the new one answers too") {
+        CHECK(deps({{"c:\\p\\z\\tu.cpp", "#include \"../l/one.h\"\n#include \"../m/two.h\"\n"},
+                    {"c:\\p\\l\\one.h", "#include \"c.h\"\n"},
+                    {"c:\\p\\m\\two.h", "#include \"../l/one.h\"\n"},
+                    {"c:\\p\\z\\c.h", ""},
+                    {"c:\\p\\m\\c.h", ""}},
+                   "c:\\p\\z\\tu.cpp") ==
+              std::set<std::string>{"c:\\p\\l\\one.h", "c:\\p\\m\\c.h", "c:\\p\\m\\two.h", "c:\\p\\z\\c.h"});
+    }
+}
+
+TEST_CASE("WP-50: the scan's statistics count each path read once, found or missing, and the questions answered from the cache") {
+    FakeFs fs;
+    fs.files["c:\\proj\\src\\main.cpp"] = "#include \"a.h\"\n#include <b.h>\n";
+    fs.files["c:\\proj\\src\\a.h"] = "#include <b.h>\n";
+    fs.files["c:\\proj\\inc2\\b.h"] = "";
+    std::size_t calls = 0;
+    std::size_t hits = 0;
+    const ScanFileReader inner = fs.reader();
+    IncludeScanner scanner([&](const std::string& path) {
+        ++calls;
+        std::optional<std::string> text = inner(path);
+        hits += text ? 1 : 0;
+        return text;
+    });
+    ScanRoots roots;
+    roots.source = "c:\\proj\\src\\main.cpp";
+    roots.cwd = "c:\\proj";
+    roots.include_dirs = {"c:\\proj\\inc1", "c:\\proj\\inc2"};  // <b.h> is looked for in inc1 first: a missing path
+
+    CHECK(scanner.dependencies(roots) == std::set<std::string>{"c:\\proj\\src\\a.h", "c:\\proj\\inc2\\b.h"});
+    const IncludeScanner::Stats first = scanner.stats();
+    CHECK(first.walks == 1);
+    CHECK(first.found == hits);
+    CHECK(first.missing == calls - hits);
+    CHECK(first.found == 3);    // main.cpp, a.h, inc2\b.h
+    CHECK(first.missing >= 1);  // at least inc1\b.h
+    CHECK(first.found + first.missing == scanner.files_read());
+    CHECK(first.lookups > scanner.files_read());  // <b.h> twice: the second time from the cache
+    CHECK(first.read_ms >= 0.0);
+    CHECK(first.parse_ms >= 0.0);
+
+    // The same translation unit again: nothing is read again, every question comes from the cache.
+    scanner.dependencies(roots);
+    const IncludeScanner::Stats second = scanner.stats();
+    CHECK(second.walks == 2);
+    CHECK(second.found == first.found);
+    CHECK(second.missing == first.missing);
+    CHECK(calls == first.found + first.missing);
+    CHECK(second.lookups > first.lookups);
+}
+
+TEST_CASE("WP-50: the scan cache hits only for the same module stamp; a changed size, time, PDB or option misses and the new scan replaces it") {
+    ScanCache cache;
+    ModuleFileStamp stamp;
+    stamp.size = 119u * 1024u * 1024u;
+    stamp.mtime = 1700000000;
+    stamp.pdb.guid[0] = 0x3C;
+    stamp.pdb.age = 1;
+    std::string reason;
+    CHECK((cache.find("C:\\Game\\bin\\game.exe", stamp, &reason) == nullptr));
+    CHECK(reason == "absent");
+
+    auto first = std::make_shared<ScanResult>();
+    first->files = {"c:\\game\\src\\a.cpp", "c:\\game\\src\\a.h"};
+    first->header_deps["c:\\game\\src\\a.h"] = {0};
+    cache.store("C:\\Game\\bin\\game.exe", stamp, first);
+    CHECK(cache.size() == 1);
+
+    // The same file, spelled differently: a hit, the very result stored.
+    std::shared_ptr<const ScanResult> hit = cache.find("c:/game/BIN/game.exe", stamp, &reason);
+    CHECK((hit == first));
+    CHECK(reason.empty());
+
+    const auto misses_with = [&](ModuleFileStamp changed, const char* expected) {
+        std::string why;
+        CHECK((cache.find("C:\\Game\\bin\\game.exe", changed, &why) == nullptr));
+        CHECK(why == expected);
+    };
+    ModuleFileStamp s = stamp;
+    s.size += 1;
+    misses_with(s, "size");
+    s = stamp;
+    s.mtime += 2;
+    misses_with(s, "mtime");
+    s = stamp;
+    s.pdb.age = 2;
+    misses_with(s, "pdb");
+    s = stamp;
+    s.pdb.guid[15] = 0x01;
+    misses_with(s, "pdb");
+    s = stamp;
+    s.scan_includes = false;
+    misses_with(s, "options");
+    CHECK(stamp_difference(stamp, stamp).empty());
+
+    // A relinked module: its new scan replaces the entry, and the old stamp misses from then on.
+    ModuleFileStamp relinked = stamp;
+    relinked.mtime += 60;
+    auto second = std::make_shared<ScanResult>();
+    cache.store("C:\\Game\\bin\\game.exe", relinked, second);
+    CHECK(cache.size() == 1);
+    CHECK((cache.find("C:\\Game\\bin\\game.exe", relinked, &reason) == second));
+    misses_with(stamp, "mtime");
+
+    // Bounded: the least recently used module file goes.
+    for (std::size_t i = 0; i < ScanCache::kMaxEntries + 4; ++i) {
+        cache.store("C:\\other\\m" + std::to_string(i) + ".dll", stamp, std::make_shared<ScanResult>());
+        if (i % 4 == 0) {
+            CHECK((cache.find("C:\\Game\\bin\\game.exe", relinked, &reason) == second));  // kept in use
+        }
+    }
+    CHECK(cache.size() == ScanCache::kMaxEntries);
+    CHECK((cache.find("C:\\Game\\bin\\game.exe", relinked, &reason) == second));
+    CHECK((cache.find("C:\\other\\m1.dll", stamp, &reason) == nullptr));
+    CHECK(reason == "absent");
+}
+
+TEST_CASE("WP-50 (review): a scan cache hit re-checks every input: an edited source, a created or removed file, a changed directory miss") {
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() /
+                          ("cml_scan_inputs_" + std::to_string(static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count() & 0xFFFFFFF)));
+    fs::create_directories(root / "src");
+    struct Cleanup {
+        fs::path p;
+        ~Cleanup() {
+            std::error_code ec;
+            fs::remove_all(p, ec);
+        }
+    } cleanup{root};
+    const auto write = [](const fs::path& p, const std::string& text) {
+        std::ofstream out(p, std::ios::binary | std::ios::trunc);
+        out << text;
+    };
+    const std::string source = (root / "src" / "a.cpp").string();
+    const std::string header = (root / "src" / "a.h").string();
+    const std::string later = (root / "src" / "later.cpp").string();  // absent when scanned
+    const std::string dir = (root / "src").string();
+    write(source, "#include \"a.h\"\nint a() { return 1; }\n");
+    write(header, "#pragma once\n");
+
+    ScanCache cache;
+    ModuleFileStamp stamp;
+    stamp.size = 4096;
+    stamp.mtime = 1700000000;
+    const std::string exe = "C:\\Game\\bin\\game.exe";
+    const auto stored = [&]() {
+        auto result = std::make_shared<ScanResult>();
+        result->inputs = {probe_scan_input(source), probe_scan_input(header), probe_scan_input(later), probe_scan_input(dir)};
+        cache.store(exe, stamp, result);
+        return result;
+    };
+    auto entry = stored();
+    CHECK(entry->inputs[0].exists);
+    CHECK_FALSE(entry->inputs[0].directory);
+    CHECK(entry->inputs[0].size > 0);
+    CHECK_FALSE(entry->inputs[2].exists);
+    CHECK(entry->inputs[3].directory);
+    CHECK(changed_scan_input(entry->inputs).empty());
+    std::string reason;
+    CHECK((cache.find(exe, stamp, &reason) == entry));
+    CHECK(reason.empty());
+
+    // The source gains `#include "new.h"` (and new.h is created): the same module stamp, a miss naming the source.
+    write(source, "#include \"a.h\"\n#include \"new.h\"\nint a() { return 1; }\n");
+    write(root / "src" / "new.h", "#pragma once\n");
+    CHECK((cache.find(exe, stamp, &reason) == nullptr));
+    CHECK(reason == "file-changed:" + source);
+    CHECK(cache.size() == 1);  // kept until the new scan replaces it
+
+    // Only the time changed (same size): a miss.
+    entry = stored();
+    std::error_code ec;
+    fs::last_write_time(fs::path(header), fs::last_write_time(fs::path(header), ec) + std::chrono::seconds(2), ec);
+    CHECK((cache.find(exe, stamp, &reason) == nullptr));
+    CHECK(reason == "file-changed:" + header);
+
+    // A path the result found absent appears.
+    entry = stored();
+    write(later, "int later() { return 2; }\n");
+    CHECK((cache.find(exe, stamp, &reason) == nullptr));
+    CHECK(reason == "file-changed:" + later);
+
+    // A file the result read disappears.
+    entry = stored();
+    fs::remove(fs::path(header), ec);
+    CHECK((cache.find(exe, stamp, &reason) == nullptr));
+    CHECK(reason == "file-changed:" + header);
+
+    // Only the directory changed (a file created or removed in it, where an include could now resolve): a miss. The time is set
+    // explicitly so that the test does not depend on the file system's timestamp resolution.
+    entry = stored();
+    CHECK((cache.find(exe, stamp, &reason) == entry));
+    fs::last_write_time(fs::path(dir), fs::last_write_time(fs::path(dir), ec) + std::chrono::seconds(2), ec);
+    CHECK((cache.find(exe, stamp, &reason) == nullptr));
+    CHECK(reason == "file-changed:" + dir);
+    entry = stored();
+    CHECK((cache.find(exe, stamp, &reason) == entry));
+}
+
+namespace {
+struct ScratchDir {
+    std::filesystem::path root;
+    ScratchDir() {
+        root = std::filesystem::temp_directory_path() /
+               ("cml_scan_rec_" + std::to_string(static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count() & 0xFFFFFFF)));
+        std::filesystem::create_directories(root / "src");
+    }
+    ~ScratchDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(root, ec);
+    }
+    ScratchDir(const ScratchDir&) = delete;
+    ScratchDir& operator=(const ScratchDir&) = delete;
+    std::string path(const std::string& name) const { return (root / "src" / name).string(); }
+    std::string dir() const { return (root / "src").string(); }
+};
+void write_file(const std::string& p, const std::string& text) {
+    std::ofstream out(p, std::ios::binary | std::ios::trunc);
+    out << text;
+}
+}  // namespace
+
+TEST_CASE("WP-50 (second review): an input edited after the scan read it makes the scan uncacheable, and its stored stamp is the one from before") {
+    ScratchDir d;
+    const std::string source = d.path("a.cpp");
+    write_file(source, "#include \"a.h\"\nint a() { return 1; }\n");
+    write_file(d.path("a.h"), "#pragma once\n");
+    const auto run_scan = [&](ScanInputRecorder& rec) {
+        const ScanFileReader reader = rec.wrap(disk_file_reader());
+        CHECK(reader(source).has_value());
+        CHECK(reader(d.path("a.h")).has_value());
+        CHECK_FALSE(reader(d.path("missing.h")).has_value());                   // a candidate that does not exist
+        CHECK_FALSE(reader((d.root / "nodir" / "x.h").string()).has_value());  // in a directory that does not exist
+    };
+
+    // Nothing changed: cacheable.
+    {
+        ScanInputRecorder rec;
+        run_scan(rec);
+        std::string why = "unset";
+        const std::vector<ScanInput> inputs = rec.finish({source, d.path("a.h"), d.dir()}, &why);
+        CHECK(why.empty());
+        REQUIRE(inputs.size() == 3);
+        CHECK(inputs[0].exists);
+        CHECK(inputs[2].directory);
+    }
+
+    // The source gains #include "new.h" after the scan read it, before the result is stored.
+    ScanInputRecorder rec;
+    run_scan(rec);
+    const std::uintmax_t old_size = std::filesystem::file_size(source);
+    write_file(source, "#include \"a.h\"\n#include \"new.h\"\nint a() { return 1; }\n");
+    std::error_code ec;
+    std::filesystem::last_write_time(source, std::filesystem::last_write_time(source, ec) + std::chrono::seconds(2), ec);
+    std::string why;
+    const std::vector<ScanInput> inputs = rec.finish({source, d.path("a.h"), d.dir()}, &why);
+    CHECK(why == "changed-during-scan:" + source);
+    REQUIRE(inputs.size() == 3);
+    CHECK(inputs[0].size == old_size);  // the stamp from before the read, not the edited file's
+
+    // Even if it were stored, such a result could never hit: the next find sees the source changed.
+    ScanCache cache;
+    ModuleFileStamp stamp;
+    stamp.size = 1;
+    auto result = std::make_shared<ScanResult>();
+    result->inputs = inputs;
+    cache.store("C:\\bin\\m.exe", stamp, result);
+    std::string reason;
+    CHECK((cache.find("C:\\bin\\m.exe", stamp, &reason) == nullptr));
+    CHECK(reason == "file-changed:" + source);
+}
+
+TEST_CASE("WP-50 (second review): a file that exists but cannot be read makes the scan uncacheable; a missing file or a directory does not") {
+    ScratchDir d;
+    write_file(d.path("ok.h"), "#pragma once\n");
+    write_file(d.path("big.h"), std::string(9u * 1024u * 1024u, ' '));  // over the scanner's 8 MiB limit
+    {
+        ScanInputRecorder rec;
+        const ScanFileReader reader = rec.wrap(disk_file_reader());
+        CHECK(reader(d.path("ok.h")).has_value());
+        CHECK_FALSE(reader(d.path("missing.h")).has_value());
+        CHECK_FALSE(reader(d.dir()).has_value());  // an include naming a directory
+        std::string why = "unset";
+        rec.finish({d.path("ok.h"), d.dir()}, &why);
+        CHECK(why.empty());
+    }
+    ScanInputRecorder rec;
+    const ScanFileReader reader = rec.wrap(disk_file_reader());
+    CHECK(reader(d.path("ok.h")).has_value());
+    CHECK_FALSE(reader(d.path("big.h")).has_value());
+    std::string why;
+    rec.finish({d.path("ok.h"), d.dir()}, &why);
+    CHECK(why == "unreadable:" + d.path("big.h"));
 }

@@ -17,6 +17,13 @@ using NtQueryInformationThreadFn = LONG(NTAPI*)(HANDLE thread, int information_c
 // Resolved once in init(); read-only afterwards.
 NtQueryInformationThreadFn g_query_information_thread = nullptr;
 
+// WP-50: the performance counter, window-safe (no lock, no allocation).
+inline long long ticks() noexcept {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return now.QuadPart;
+}
+
 template <class Fn>
 Fn resolve(HMODULE module, const char* name) {
     return reinterpret_cast<Fn>(reinterpret_cast<void (*)()>(GetProcAddress(module, name)));
@@ -119,10 +126,14 @@ bool ThreadSet::suspend_only(std::size_t index) noexcept {
         if (expired()) {
             return false;
         }
-        if (SuspendThread(e.handle) != static_cast<DWORD>(-1)) {
+        const long long t0 = ticks();
+        const DWORD suspended = SuspendThread(e.handle);
+        const DWORD error = suspended == static_cast<DWORD>(-1) ? GetLastError() : 0;  // before anything else can touch it
+        timing_.suspend += ticks() - t0;
+        if (suspended != static_cast<DWORD>(-1)) {
             break;
         }
-        failed_error_ = GetLastError();
+        failed_error_ = error;
         if (exited(e.handle)) {
             return true;
         }
@@ -147,10 +158,14 @@ bool ThreadSet::capture_context(std::size_t index) noexcept {
         if (expired()) {
             return false;
         }
-        if (GetThreadContext(e.handle, &context) != 0) {
+        const long long t0 = ticks();
+        const BOOL captured = GetThreadContext(e.handle, &context);
+        const DWORD error = captured == 0 ? GetLastError() : 0;
+        timing_.context += ticks() - t0;
+        if (captured != 0) {
             break;
         }
-        failed_error_ = GetLastError();
+        failed_error_ = error;
         if (exited(e.handle)) {
             e.rip = 0;
             e.rip_valid = true;
@@ -200,10 +215,14 @@ ThreadSet::Result ThreadSet::enumerate_pass(std::size_t* fresh) noexcept {
             return Result::Timeout;
         }
         HANDLE next = nullptr;
+        const long long t0 = ticks();
         const LONG status = get_next_thread_(process, previous, kThreadAccess, 0, 0, &next);
         if (previous_is_temporary && previous != nullptr) {
             CloseHandle(previous);
         }
+        const DWORD id = (status >= 0 && next != nullptr) ? GetThreadId(next) : 0;
+        const DWORD id_error = (status >= 0 && next != nullptr && id == 0) ? GetLastError() : 0;
+        timing_.enumerate += ticks() - t0;
         const DWORD came_from = previous_id;
         previous = nullptr;
         previous_is_temporary = false;
@@ -215,9 +234,8 @@ ThreadSet::Result ThreadSet::enumerate_pass(std::size_t* fresh) noexcept {
             failed_error_ = static_cast<DWORD>(status);
             return Result::EnumFailed;
         }
-        const DWORD id = GetThreadId(next);
         if (id == 0) {
-            failed_error_ = GetLastError();
+            failed_error_ = id_error;
             CloseHandle(next);
             return Result::EnumFailed;
         }
@@ -295,7 +313,9 @@ ThreadSet::Result ThreadSet::suspend_all(ULONGLONG deadline_tick, unsigned max_p
 void ThreadSet::resume_one(std::size_t index) noexcept {
     Entry& e = entries_[index];
     if (e.suspended) {
+        const long long t0 = ticks();
         ResumeThread(e.handle);
+        timing_.resume += ticks() - t0;
         e.suspended = false;
     }
 }
@@ -305,6 +325,7 @@ bool ThreadSet::suspend_one(std::size_t index) noexcept {
 }
 
 void ThreadSet::resume_all() noexcept {
+    const long long t0 = ticks();
     for (std::size_t i = 0; i < count_; ++i) {
         if (entries_[i].suspended) {
             ResumeThread(entries_[i].handle);
@@ -323,6 +344,7 @@ void ThreadSet::resume_all() noexcept {
     }
     timed_out_ = false;
     checks_ = 0;
+    timing_.resume += ticks() - t0;
 }
 
 }  // namespace cml::agent::hook

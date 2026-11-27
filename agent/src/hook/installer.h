@@ -45,6 +45,7 @@
 #include "cml/ipc/fault_stages.h"
 #include "cml/util/diag.h"
 #include "hook_plan.h"
+#include "hook_timing.h"
 #include "thread_set.h"
 
 namespace cml::agent::hook {
@@ -78,9 +79,12 @@ struct BatchStats {
     unsigned window_ms = 0;        // longest time the world was stopped
 };
 
+// WP-50 (R-47): BatchTiming (where the time of one batch went) is in hook_timing.h, portable so that its log line is tested on every host.
+
 struct BatchResult {
     Diag diag;  // code 0 = every hook of the batch was applied
     BatchStats stats;
+    BatchTiming timing;  // WP-50
     bool ok() const noexcept { return diag.code == 0; }
 };
 
@@ -112,6 +116,8 @@ struct InstallerOptions {
     // is forgotten (a test shows that an install started meanwhile waits for the whole call).
     void (*test_in_reconcile)(void* context) = nullptr;
     void* test_context = nullptr;
+    // Tests only (WP-50): plan with a VirtualQuery per question instead of the per-batch region cache, to compare the two.
+    bool test_no_region_cache = false;
 };
 
 struct HookInfo {
@@ -203,6 +209,9 @@ private:
     struct Report;
 
     BatchResult apply(bool revert, const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes, ipc::fault::Stage inject);
+    // `called`: the counter when apply() was entered (WP-50: the wait for the mutex is the batch's lock_us).
+    BatchResult apply_locked(bool revert, const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes, ipc::fault::Stage inject,
+                             long long called);
     void attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, Report* report, ipc::fault::Stage inject) noexcept;
     bool find_conflict(const Job* jobs, std::size_t count, std::size_t* thread_index, std::size_t* job_index) const noexcept;
     Record* find_record(std::uintptr_t target);
@@ -218,6 +227,8 @@ private:
 // The process-wide installer used by the agent: hooks are process state, so every agent in the
 // process shares one registry. Created on first use, never destroyed.
 Installer& process_installer();
+
+
 
 }  // namespace cml::agent::hook
 

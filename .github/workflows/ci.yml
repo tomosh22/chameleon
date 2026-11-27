@@ -375,7 +375,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) { $failed += $s }
             Write-Host "::endgroup::"
           }
-          Get-Content "$env:LOG_DIR/cmltest-ninja-*.log" | Where-Object { $_ -match '^(CMLTEST_RESULT|PARTIAL|FAILED|RELOAD-TIMING)' } |
+          Get-Content "$env:LOG_DIR/cmltest-ninja-*.log" | Where-Object { $_ -match '^(CMLTEST_RESULT|PARTIAL|FAILED|RELOAD-TIMING|WP50-RESTART)' } |
             Tee-Object -FilePath "$env:LOG_DIR/cmltest-ninja-summary.txt" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
           Get-Content "$env:LOG_DIR/cmltest-ninja-summary.txt"
           if ($failed.Count -gt 0) { Write-Host "FAILED scenarios: $($failed -join ', ')"; exit 1 }
@@ -727,15 +727,23 @@ jobs:
             Select-String -Path $brokerLog.FullName -Pattern 'index: .* ready: |reload: sweep of ' | ForEach-Object { "BROKER " + ($_.Line -replace '^.*?(index: |reload: )', '$1') } | Tee-Object -FilePath "$env:LOG_DIR/large-pdb-broker-lines.txt"
           }
           '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
-          Get-Content "$env:LOG_DIR/cmltest-large-pdb.log" | Where-Object { $_ -match '^(CMLTEST_RESULT|WP39-RELOAD|PERF|RELOAD-TIMING|PARTIAL|FAILED)' } | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          Get-Content "$env:LOG_DIR/cmltest-large-pdb.log" | Where-Object { $_ -match '^(CMLTEST_RESULT|WP39-RELOAD|WP50-|PERF|RELOAD-TIMING|PARTIAL|FAILED)' } | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
           if (Test-Path "$env:LOG_DIR/large-pdb-broker-lines.txt") { Get-Content "$env:LOG_DIR/large-pdb-broker-lines.txt" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY }
           '```' | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
-          Get-Content "$env:LOG_DIR/cmltest-large-pdb.log" | Where-Object { $_ -match '^(CMLTEST_RESULT|WP39-RELOAD|PERF|RELOAD-TIMING)' }
+          Get-Content "$env:LOG_DIR/cmltest-large-pdb.log" | Where-Object { $_ -match '^(CMLTEST_RESULT|WP39-RELOAD|WP50-|PERF|RELOAD-TIMING)' }
           if ($rc -ne 0) { exit $rc }
           # A run that passed without the evidence line measured nothing: that is a failure, not a pass.
           if (-not (Select-String -Path "$env:LOG_DIR/cmltest-large-pdb.log" -Pattern '^WP39-RELOAD pdb_mib=[0-9.]+ reloads=5 total_minus_compile_median_ms=[0-9.]+ max_ms=[0-9.]+ budget_ms=3000 ' -Quiet)) {
             Write-Host '::error::the scenario passed but printed no WP39-RELOAD line with five reloads and the 3000 ms budget'
             exit 1
+          }
+          # WP-50 (R-47): the agent's and the broker's breakdown of every reload's InstallHooks (five reloads, so five of each).
+          foreach ($side in 'agent', 'broker') {
+            $n = @(Select-String -Path "$env:LOG_DIR/cmltest-large-pdb.log" -Pattern "^WP50-HOOKS side=$side request=").Count
+            if ($n -lt 5) {
+              Write-Host "::error::the scenario printed $n WP50-HOOKS side=$side line(s); five reloads should give five"
+              exit 1
+            }
           }
 
       # WP-27: trend output. perf-results.json (sha, runner, every number) is uploaded as the artifact `perf-results`, the

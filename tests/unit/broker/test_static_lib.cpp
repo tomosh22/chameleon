@@ -7,6 +7,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <mutex>
 
@@ -254,6 +255,174 @@ TEST_CASE("static libraries (WP-26b): a skipped plain object keeps its headers t
     REQUIRE(pch.has_value());
     REQUIRE(pch->pch_headers.size() == 1);  // the pipeline refuses it with CML5550
     CHECK(pch->pch_headers[0] == pdb::normalize_path(dir.file("pch.h")));
+}
+
+TEST_CASE("WP-50: an index of the same module file takes the file lists from the scan cache; a changed module stamp scans again") {
+    QuietLogs quiet;
+    World w;
+    const auto cache = std::make_shared<ScanCache>();
+    const auto build = [&]() {
+        ModuleIndexSpec spec;
+        spec.module_path = w.exe;
+        spec.scan_includes = false;
+        spec.scan_cache = cache;
+        std::shared_ptr<ModuleIndex> index = ModuleIndex::start(spec);
+        REQUIRE(index->wait(30000));
+        REQUIRE(index->status().state == IndexState::Ready);
+        return index;
+    };
+    const std::shared_ptr<ModuleIndex> first = build();
+    CHECK(first->status().scan_cache == "cold");
+    CHECK(cache->size() == 1);
+
+    const std::shared_ptr<ModuleIndex> second = build();
+    CHECK(second->status().scan_cache == "warm");
+    CHECK(second->tracked_files() == first->tracked_files());
+    const std::vector<SkippedCompiland> a = first->skipped_compilands();
+    const std::vector<SkippedCompiland> b = second->skipped_compilands();
+    REQUIRE(a.size() == b.size());
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        CHECK(a[i].compiland == b[i].compiland);
+        CHECK(a[i].reason == b[i].reason);
+    }
+    CHECK(second->status().baseline_files == first->status().baseline_files);  // the sources are hashed afresh either way
+
+    // The module file was relinked (here: only its time changed): scanned again.
+    bump_mtime(w.exe);
+    const std::shared_ptr<ModuleIndex> third = build();
+    CHECK(third->status().scan_cache == "cold");
+    CHECK(third->tracked_files() == first->tracked_files());
+    const std::shared_ptr<ModuleIndex> fourth = build();
+    CHECK(fourth->status().scan_cache == "warm");  // the new stamp replaced the entry
+
+    // Without a cache nothing is reused.
+    ModuleIndexSpec plain;
+    plain.module_path = w.exe;
+    plain.scan_includes = false;
+    std::shared_ptr<ModuleIndex> uncached = ModuleIndex::start(plain);
+    REQUIRE(uncached->wait(30000));
+    CHECK(uncached->status().scan_cache == "off");
+}
+
+TEST_CASE("WP-50 (review): a source edited to include a new header, or a skipped member's source that appears, misses the scan cache") {
+    QuietLogs quiet;
+    World w;
+    const auto cache = std::make_shared<ScanCache>();
+    const auto build = [&]() {
+        ModuleIndexSpec spec;
+        spec.module_path = w.exe;
+        spec.scan_includes = true;
+        spec.scan_cache = cache;
+        std::shared_ptr<ModuleIndex> index = ModuleIndex::start(spec);
+        REQUIRE(index->wait(30000));
+        REQUIRE(index->status().state == IndexState::Ready);
+        return index;
+    };
+    const std::string header = pdb::normalize_path(w.dir.file("new.h"));
+    const auto tracks = [](const std::shared_ptr<ModuleIndex>& index, const std::string& f) {
+        const std::vector<std::string> tracked = index->tracked_files();
+        return std::find(tracked.begin(), tracked.end(), f) != tracked.end();
+    };
+    const std::shared_ptr<ModuleIndex> first = build();
+    CHECK(first->status().scan_cache == "cold");
+    CHECK_FALSE(tracks(first, header));
+    CHECK(build()->status().scan_cache == "warm");
+
+    // The source gains an include of a header created for it (as a reload before a hot-restart would have compiled): the module
+    // file is the same, but the stored graph is not, so the index scans again and tracks the new header.
+    write_text(w.dir.file("new.h"), "#pragma once\nint fresh();\n");
+    write_text(w.dir.file("app.cpp"), "#include \"new.h\"\nint app() { return 1; }\n");
+    bump_mtime(w.dir.file("app.cpp"));
+    const std::shared_ptr<ModuleIndex> edited = build();
+    CHECK(edited->status().scan_cache == "cold");
+    CHECK(tracks(edited, header));
+    const std::shared_ptr<ModuleIndex> again = build();
+    CHECK(again->status().scan_cache == "warm");
+    CHECK(tracks(again, header));
+    // An edit of the new header reaches the compiland that includes it (the bug: the stale graph answered nothing).
+    write_text(w.dir.file("new.h"), "#pragma once\nint fresh(int);\n");
+    bump_mtime(w.dir.file("new.h"));
+    Result<ModuleIndex::Sweep> swept = again->sweep();
+    REQUIRE(swept.has_value());
+    CHECK(std::find(swept->compilands.begin(), swept->compilands.end(), kPlain) != swept->compilands.end());
+    again->accept(swept->stamps);
+
+    CHECK(build()->status().scan_cache == "cold");  // new.h changed since the entry was stored
+    const std::shared_ptr<ModuleIndex> settled = build();
+    CHECK(settled->status().scan_cache == "warm");
+
+    // The archive member skipped because its source was missing: the source appears, the member is no longer skipped.
+    REQUIRE(settled->skipped_compilands().size() == 2);
+    write_text(w.dir.file("missing.cpp"), "int missing() { return 1; }\n");
+    const std::shared_ptr<ModuleIndex> appeared = build();
+    CHECK(appeared->status().scan_cache == "cold");
+    REQUIRE(appeared->skipped_compilands().size() == 1);
+    CHECK(appeared->skipped_compilands()[0].compiland == kLibNoEnv);
+}
+
+namespace {
+std::shared_ptr<ModuleIndex> build_index(const World& w, const std::shared_ptr<ScanCache>& cache, std::function<void()> after_scan = nullptr) {
+    ModuleIndexSpec spec;
+    spec.module_path = w.exe;
+    spec.scan_includes = true;
+    spec.scan_cache = cache;
+    spec.after_scan_for_testing = std::move(after_scan);
+    std::shared_ptr<ModuleIndex> index = ModuleIndex::start(spec);
+    REQUIRE(index->wait(30000));
+    REQUIRE(index->status().state == IndexState::Ready);
+    return index;
+}
+bool tracks_file(const std::shared_ptr<ModuleIndex>& index, const std::string& f) {
+    const std::vector<std::string> tracked = index->tracked_files();
+    return std::find(tracked.begin(), tracked.end(), pdb::normalize_path(f)) != tracked.end();
+}
+}  // namespace
+
+TEST_CASE("WP-50 (second review): a source edited while the index scans is not cached; the next index scans again and sees the new include") {
+    QuietLogs quiet;
+    World w;
+    const auto cache = std::make_shared<ScanCache>();
+    // Between the scan (which read the old app.cpp) and the store: app.cpp gains #include "new.h".
+    const std::shared_ptr<ModuleIndex> first = build_index(w, cache, [&w] {
+        write_text(w.dir.file("new.h"), "#pragma once\nint fresh();\n");
+        write_text(w.dir.file("app.cpp"), "#include \"new.h\"\nint app() { return 1; }\n");
+        bump_mtime(w.dir.file("app.cpp"));
+    });
+    CHECK(first->status().scan_cache == "cold");
+    CHECK_FALSE(tracks_file(first, w.dir.file("new.h")));  // the scan saw the old contents
+    CHECK(cache->size() == 0);                             // ... so its result was not stored
+
+    const std::shared_ptr<ModuleIndex> second = build_index(w, cache);
+    CHECK(second->status().scan_cache == "cold");  // nothing stale to hit
+    CHECK(tracks_file(second, w.dir.file("new.h")));
+    CHECK(cache->size() == 1);
+    const std::shared_ptr<ModuleIndex> third = build_index(w, cache);
+    CHECK(third->status().scan_cache == "warm");
+    CHECK(tracks_file(third, w.dir.file("new.h")));
+}
+
+TEST_CASE("WP-50 (second review): a scan that could not read a file that exists is not cached") {
+    QuietLogs quiet;
+    World w;
+    const auto cache = std::make_shared<ScanCache>();
+    // Over the scanner's size limit (8 MiB): it exists, but the scan cannot read it (as during a sharing violation).
+    write_text(w.dir.file("big.h"), "#pragma once\n" + std::string(9u * 1024u * 1024u, ' ') + "\n");
+    write_text(w.dir.file("app.cpp"), "#include \"big.h\"\nint app() { return 1; }\n");
+    bump_mtime(w.dir.file("app.cpp"));
+    CHECK(build_index(w, cache)->status().scan_cache == "cold");
+    CHECK(cache->size() == 0);
+    CHECK(build_index(w, cache)->status().scan_cache == "cold");  // scanned again every time while it cannot be read
+    CHECK(cache->size() == 0);
+
+    // Readable again (and including a header now): scanned, stored, then reused.
+    write_text(w.dir.file("inner.h"), "#pragma once\n");
+    write_text(w.dir.file("big.h"), "#pragma once\n#include \"inner.h\"\n");
+    bump_mtime(w.dir.file("big.h"));
+    const std::shared_ptr<ModuleIndex> readable = build_index(w, cache);
+    CHECK(readable->status().scan_cache == "cold");
+    CHECK(tracks_file(readable, w.dir.file("inner.h")));
+    CHECK(cache->size() == 1);
+    CHECK(build_index(w, cache)->status().scan_cache == "warm");
 }
 
 #endif

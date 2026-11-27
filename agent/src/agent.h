@@ -225,7 +225,8 @@ private:
     // in replies_ and sent by the agent thread. See docs/wp/WP-10.md.
     void handle_install_hooks(const ipc::InstallHooks& request);
     static void run_hook_job(void* context);
-    void apply_install_hooks(const ipc::InstallHooks& request);
+    // `received` (WP-50): QueryPerformanceCounter when the request arrived (0: unknown), for the wait in the queue.
+    void apply_install_hooks(const ipc::InstallHooks& request, long long received = 0);
     void queue_reply(ipc::Message message);
 
     // WP-17: broker -> agent CompileEvent. Same dispatch rule as InstallHooks: the application's compile hooks

@@ -107,6 +107,19 @@ public:
         step_limit_override_ = step_limit;
     }
 
+    // WP-50: QueryPerformanceCounter ticks spent in the system calls of the window, summed since the last reset_timing():
+    // enumeration (NtGetNextThread, GetThreadId and closing the handles used only to walk the list), SuspendThread,
+    // GetThreadContext (which waits until a thread has really stopped) and resuming (ResumeThread and closing the handles).
+    // One counter read around each call; window-safe (the counter is a register / shared-page read, nothing is allocated).
+    struct Timing {
+        long long enumerate = 0;
+        long long suspend = 0;
+        long long context = 0;
+        long long resume = 0;
+    };
+    const Timing& timing() const noexcept { return timing_; }
+    void reset_timing() noexcept { timing_ = Timing{}; }
+
     // Details of the last failure, for the diagnostic.
     DWORD failed_thread_id() const noexcept { return failed_thread_id_; }
     DWORD failed_error() const noexcept { return failed_error_; }
@@ -139,6 +152,7 @@ private:
     unsigned expire_after_checks_ = 0;
     unsigned checks_ = 0;
     std::size_t step_limit_override_ = 0;
+    Timing timing_;
 };
 
 }  // namespace cml::agent::hook

@@ -772,6 +772,9 @@ private:
         proc->cursor = read_whole_file(proc->stdout_file).size();  // what the hooks and the new process print belongs to the restart
         const std::uint32_t old_pid = supervisor_.pid(proc->id);
         const RestartStepOutcome restarted = run_restart_step(*control_, capabilities_, old_pid, step, limit_ms, control_pipe_);
+        // WP-50 (R-55): the broker's evidence of the restart (WP50-RESTART: the stages; WP50-INDEX: the new process's index builds;
+        // WP50-HOOKS: the re-applying reload) goes to the job log like a reload's.
+        print_broker_evidence();
         if (!restarted.ok) {
             return StepOutcome::fail(restarted.diag_code, restarted.detail);
         }

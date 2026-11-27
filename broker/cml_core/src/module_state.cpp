@@ -1,6 +1,7 @@
 #include "cml/core/module_state.h"
 
 #include <algorithm>
+#include <chrono>
 #include <iterator>
 #include <set>
 
@@ -121,6 +122,77 @@ void ModuleState::prune_code_locked() {
         }
         it = keep ? std::next(it) : code.erase(it);
     }
+}
+
+ModuleImageRead ModuleImageSlot::ensure(const std::string& path, bool background) {
+    std::lock_guard<std::mutex> reading(reading_);
+    ModuleImageRead out;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (image_) {
+            out.image = image_;
+            return out;
+        }
+        if (background && released_) {
+            return out;
+        }
+    }
+    const auto started = std::chrono::steady_clock::now();
+    Result<pe::OwnedImage> loaded = pe::load_image_file(path);
+    out.read_now = true;
+    out.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    if (!loaded) {
+        out.error = loaded.error();
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++reads_;
+        return out;
+    }
+    out.mib = static_cast<double>(loaded->bytes.size()) / (1024.0 * 1024.0);
+    std::shared_ptr<const pe::OwnedImage> read = std::make_shared<const pe::OwnedImage>(std::move(*loaded));
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++reads_;
+    if (released_) {
+        if (!background) {
+            out.image = std::move(read);  // a reload of a state that is going away still compares, it only does not keep the copy
+        }
+        return out;
+    }
+    if (!image_) {
+        image_ = std::move(read);
+    }
+    out.image = image_;
+    return out;
+}
+
+void ModuleImageSlot::release() {
+    std::shared_ptr<const pe::OwnedImage> dropped;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        dropped = std::move(image_);
+        image_.reset();
+        released_ = true;
+    }
+    // `dropped` is freed here, outside the lock (unless a reload still holds it).
+}
+
+std::shared_ptr<const pe::OwnedImage> ModuleImageSlot::stored() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return image_;
+}
+
+bool ModuleImageSlot::released() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return released_;
+}
+
+std::uint64_t ModuleImageSlot::reads() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return reads_;
+}
+
+void ModuleImageSlot::forget_for_testing() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    image_.reset();
 }
 
 }  // namespace cml::core

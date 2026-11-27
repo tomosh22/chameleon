@@ -887,14 +887,20 @@ private:
         s.after_pending = any_pending();
 
         // ---- plan --------------------------------------------------------------------------------------------
+        // WP-50 (R-47): where the plan stage goes, one `WP50-PLAN` line per unit (the first reload of a session spends more here).
+        const Clock::time_point plan_started = Clock::now();
         Result<coff::OwnedObject> object = coff::load_object_file(u.outcome.object_path);
         if (!object) {
             return fail("plan", object.error());
         }
+        const Clock::time_point plan_object = Clock::now();
         s.object = std::make_unique<coff::OwnedObject>(std::move(*object));
         report.objects_held_peak = std::max<std::size_t>(report.objects_held_peak, static_cast<std::size_t>(std::count_if(
             staged_.begin(), staged_.end(), [](const std::unique_ptr<Staged>& t) { return t->object != nullptr; })));
         std::shared_ptr<const pe::OwnedImage> image = module_image(report);
+        const Clock::time_point plan_image = Clock::now();
+        const std::size_t export_parses_before = ctx_.exports ? ctx_.exports->parses() : 0;
+        const pdb::Timings pdb_before = pdb.timings();  // WP-50: the PDB's lazily loaded tables, before and after the bind plan
         FileProcessModules process_modules(snapshot_.modules, LoadedModule{module_.path, module_.base, module_.size}, ctx_.exports, image);
         const OverlayRegistry registry(*this);
         bind::PlanInput in;
@@ -919,6 +925,7 @@ private:
         }
         s.plan = std::move(*planned);
         bind::BindPlan& plan = s.plan;
+        const Clock::time_point plan_bound = Clock::now();
         // WP-40 (R-48 item 5, ADR-0043 rule (d)): lambdas the type records cannot tell apart were paired by their numbers;
         // their call operators' code decides. Where it shows that lambdas changed places, the unit is planned again with
         // that pairing (once: the second plan is not compared again).
@@ -960,6 +967,7 @@ private:
         for (const Diag& w : plan.warnings) {
             warn(report, "plan", w);
         }
+        const Clock::time_point plan_proved = Clock::now();
         // WP-36 evidence: image-relative references to old data in this object, and how many were proved displacements.
         s.counts.imgrel_sites = plan.imgrel_sites;
         s.counts.imgrel_verified = plan.imgrel_verified;
@@ -971,6 +979,7 @@ private:
         NarrowInput ni = narrow_input(s, image.get());
         ni.enabled = options_.narrow_hooks;
         const NarrowResult narrowed = narrow_hooks(ni);
+        const Clock::time_point plan_narrowed = Clock::now();
         // After merging plan hooks that share an old entry: planned - dropped == hooks.size() == hooks installed by this patch.
         s.planned = narrowed.planned;
         s.dropped = narrowed.dropped;
@@ -1000,6 +1009,18 @@ private:
         }
         s.has_effect = !s.hooks.empty() || !plan.new_functions.empty() || !plan.new_globals.empty() || !plan.initialisers.empty();
         report.times.plan += lap.lap();
+        {
+            const Clock::time_point plan_done = Clock::now();
+            const std::size_t export_parses = (ctx_.exports ? ctx_.exports->parses() : 0) - export_parses_before;
+            const pdb::Timings pdb_after = pdb.timings();
+            CML_LOG(Info, "WP50-PLAN module=%s object=%s total_ms=%.1f object_ms=%.1f image_ms=%.1f bind_ms=%.1f export_parses=%zu prove_ms=%.1f "
+                          "narrow_ms=%.1f rest_ms=%.1f hooks_planned=%zu pdb_module_symbols_ms=%.1f pdb_publics_ms=%.1f pdb_buildinfo_ms=%.1f",
+                    module_.name.c_str(), std::string(path::base_name(std::string_view(u.outcome.object_path))).c_str(), ms_between(plan_started, plan_done),
+                    ms_between(plan_started, plan_object), ms_between(plan_object, plan_image), ms_between(plan_image, plan_bound), export_parses,
+                    ms_between(plan_bound, plan_proved), ms_between(plan_proved, plan_narrowed), ms_between(plan_narrowed, plan_done), narrowed.planned,
+                    pdb_after.module_symbols_ms - pdb_before.module_symbols_ms, pdb_after.publics_ms - pdb_before.publics_ms,
+                    pdb_after.buildinfo_ms - pdb_before.buildinfo_ms);
+        }
         if (!s.has_effect) {
             CML_LOG(Info, "reload: %s changes no code (all %zu planned hooks are identical to the running code); nothing to load", u.source.c_str(),
                     narrowed.planned);
@@ -1570,12 +1591,20 @@ private:
 
         // ---- hooks -------------------------------------------------------------------------------------------------
         if (!s.hook_table.empty()) {
+            const Clock::time_point hooks_started = Clock::now();  // WP-50: request built / round trip
             ipc::InstallHooks req;
             req.request_id = link_.next_request_id();
+            const std::uint64_t hooks_request_id = req.request_id;
             for (const AppliedHook& h : s.hook_table) {
                 req.hooks.push_back(ipc::HookSpec{h.old_entry, h.new_entry, h.name});
             }
+            const Clock::time_point hooks_sent = Clock::now();
             Result<ipc::Message> answer = link_.request(ipc::Message(std::move(req)), clamp_timeout(options_.hooks_timeout_ms));
+            // WP-50 (R-47): the broker's side of the hooks stage. The agent's breakdown of the same request (the line
+            // `WP50-HOOKS side=agent request=<same id>`) is forwarded by the agent and logged by the session before this one.
+            CML_LOG(Info, "WP50-HOOKS side=broker request=%llu module=%s hooks=%zu prepare_ms=%.1f roundtrip_ms=%.1f answered=%d",
+                    static_cast<unsigned long long>(hooks_request_id), module_.name.c_str(), s.hook_table.size(), ms_between(hooks_started, hooks_sent),
+                    ms_between(hooks_sent, Clock::now()), answer ? 1 : 0);
             if (!answer) {
                 // No answer: the agent may still apply the hooks (synchronised mode waits for SyncPoint). The
                 // patch must then stay loaded; remember the hooks as installed so the next reload re-points them.
@@ -1717,21 +1746,32 @@ private:
     static constexpr std::int64_t kRollbackBudgetMs = 10000;      // WP-47: the least time a roll-back gets, whatever the reload has left
 
     std::shared_ptr<const pe::OwnedImage> module_image(PatchReport& report) {
-        std::lock_guard<std::mutex> lock(module_.mutex);
-        if (!module_.image) {
-            Result<pe::OwnedImage> loaded = pe::load_image_file(module_.path);
-            if (!loaded) {
-                // Not fatal: without the old bytes every planned hook is kept.
-                const Diag d = Diag::make(pd::kModuleImage, "cannot read the module file '" + module_.path + "' to compare function bodies: " + loaded.error().message,
-                                          "All functions of the patched object are hooked this time.");
-                emit(d, "warning", "plan");
-                report.warnings.push_back(d);
-                return nullptr;
-            }
-            module_.image = std::make_shared<const pe::OwnedImage>(std::move(*loaded));
+        // WP-50 (R-47): normally read in the background once the index was ready (ReloadService); this waits for a read in flight
+        // instead of reading the file a second time, and reads it here only when no background read did. The run keeps what it got
+        // for its later units: a state released meanwhile (disabled while this reload runs) stores nothing, and each unit would
+        // otherwise read the whole file again and hold a copy of its own.
+        if (image_) {
+            return image_;
         }
-        return module_.image;
+        ModuleState::ImageRead read = module_.ensure_image(false);
+        if (read.read_now) {
+            CML_LOG(Info, "WP50-ONEOFF what=module-image image=reload module=%s ms=%.1f mib=%.1f ok=%d", module_.name.c_str(), read.ms, read.mib,
+                    read.image ? 1 : 0);
+        }
+        if (!read.image) {
+            // Not fatal: without the old bytes every planned hook is kept.
+            const Diag d = Diag::make(pd::kModuleImage,
+                                      "cannot read the module file '" + module_.path + "' to compare function bodies: " +
+                                          (read.error ? read.error->message : std::string("it was not read")),
+                                      "All functions of the patched object are hooked this time.");
+            emit(d, "warning", "plan");
+            report.warnings.push_back(d);
+            return nullptr;
+        }
+        image_ = read.image;
+        return image_;
     }
+    std::shared_ptr<const pe::OwnedImage> image_;  // the module file as this run compares with it (module_image)
 
     Result<void> ensure_reserved() {
         {
@@ -1740,6 +1780,7 @@ private:
                 return Result<void>();
             }
         }
+        const Clock::time_point reserve_started = Clock::now();
         ipc::ReserveRange req;
         req.request_id = link_.next_request_id();
         req.module_base = module_.base;
@@ -1763,6 +1804,7 @@ private:
         for (const ipc::AddressBlock& b : rr->blocks) {
             CML_LOG(Info, "reload: reserved %llu MiB at %s near %s", static_cast<unsigned long long>(b.size >> 20), hex(b.base).c_str(), module_.name.c_str());
         }
+        CML_LOG(Info, "WP50-ONEOFF what=reserve-range module=%s ms=%.1f blocks=%zu", module_.name.c_str(), ms_between(reserve_started, Clock::now()), rr->blocks.size());
         std::lock_guard<std::mutex> lock(module_.mutex);
         module_.reservation.set_blocks(rr->blocks);
         return Result<void>();
@@ -1780,6 +1822,7 @@ private:
         if (!env_.resolve_linker) {
             return fail("link", Diag::make(pd::kStageFailed, "this broker has no linker driver", "Run the broker on Windows."));
         }
+        const Clock::time_point detect_started = Clock::now();
         std::vector<std::string> dirs;
         if (!u.outcome.compiler_used.empty()) {
             dirs.push_back(std::string(path::parent_directory(std::string_view(u.outcome.compiler_used))));
@@ -1793,6 +1836,7 @@ private:
             return fail("link", tool.error());
         }
         CML_LOG(Info, "reload: linker for %s: %s %s", module_.name.c_str(), tool->path.c_str(), tool->version_text.c_str());
+        CML_LOG(Info, "WP50-ONEOFF what=linker-detection module=%s ms=%.1f", module_.name.c_str(), ms_between(detect_started, Clock::now()));
         std::lock_guard<std::mutex> lock(module_.mutex);
         module_.linker = *tool;
         module_.linker_key = key;
