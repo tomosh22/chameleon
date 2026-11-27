@@ -1158,6 +1158,93 @@ BatchResult Installer::apply_locked(bool reverting, const HookRequest* requests,
     return result;
 }
 
+// ---- WP-50: prefetching the targets' pages -------------------------------------------------------------------------------
+
+namespace {
+
+// The layout of WIN32_MEMORY_RANGE_ENTRY (declared by the SDK only for _WIN32_WINNT >= 0x0602).
+struct MemoryRange {
+    void* address;
+    SIZE_T bytes;
+};
+using PrefetchVirtualMemoryFn = BOOL(WINAPI*)(HANDLE process, ULONG_PTR count, MemoryRange* ranges, ULONG flags);
+
+PrefetchVirtualMemoryFn prefetch_api() {
+    static const PrefetchVirtualMemoryFn fn = [] {
+        PrefetchVirtualMemoryFn found = nullptr;
+        for (const wchar_t* dll : {L"kernel32.dll", L"kernelbase.dll"}) {
+            if (HMODULE module = GetModuleHandleW(dll); module != nullptr && found == nullptr) {
+                found = reinterpret_cast<PrefetchVirtualMemoryFn>(reinterpret_cast<void (*)()>(GetProcAddress(module, "PrefetchVirtualMemory")));
+            }
+        }
+        return found;
+    }();
+    return fn;
+}
+
+}  // namespace
+
+const char* to_string(PrefetchResult::Method method) noexcept {
+    switch (method) {
+        case PrefetchResult::Method::Api: return "api";
+        case PrefetchResult::Method::Touch: return "touch";
+        case PrefetchResult::Method::None: break;
+    }
+    return "none";
+}
+
+PrefetchResult prefetch_code_pages(const std::vector<const void*>& targets, bool use_api) {
+    PrefetchResult result;
+    std::vector<std::uintptr_t> pages;
+    pages.reserve(targets.size() * 2);
+    for (const void* target : targets) {
+        const auto t = reinterpret_cast<std::uintptr_t>(target);
+        if (t < kLookBehind) {
+            continue;
+        }
+        const std::uintptr_t first = (t - kLookBehind) & ~(kPageSize - 1);
+        const std::uintptr_t last = (t + kLookAhead - 1) & ~(kPageSize - 1);
+        for (std::uintptr_t p = first; p <= last; p += kPageSize) {
+            pages.push_back(p);
+        }
+    }
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    if (pages.empty()) {
+        return result;
+    }
+    result.pages = static_cast<std::uint32_t>(pages.size());
+    std::vector<MemoryRange> ranges;
+    for (const std::uintptr_t p : pages) {
+        if (!ranges.empty() && reinterpret_cast<std::uintptr_t>(ranges.back().address) + ranges.back().bytes == p) {
+            ranges.back().bytes += kPageSize;
+        } else {
+            ranges.push_back(MemoryRange{reinterpret_cast<void*>(p), kPageSize});
+        }
+    }
+    result.ranges = static_cast<std::uint32_t>(ranges.size());
+    if (use_api) {
+        if (const PrefetchVirtualMemoryFn fn = prefetch_api(); fn != nullptr) {
+            if (fn(GetCurrentProcess(), ranges.size(), ranges.data(), 0) != 0) {
+                result.method = PrefetchResult::Method::Api;
+                return result;
+            }
+            result.error = GetLastError();
+        }
+    }
+    // The fallback: read one byte of every page (ReadProcessMemory fails instead of faulting on a page that cannot be read).
+    result.method = PrefetchResult::Method::Touch;
+    const HANDLE process = GetCurrentProcess();
+    for (const std::uintptr_t p : pages) {
+        std::uint8_t byte = 0;
+        SIZE_T got = 0;
+        if (ReadProcessMemory(process, reinterpret_cast<const void*>(p), &byte, 1, &got) != 0 && got == 1) {
+            ++result.touched;
+        }
+    }
+    return result;
+}
+
 Installer& process_installer() {
     static Installer* instance = new Installer();  // never destroyed: hooks outlive every static destructor
     return *instance;

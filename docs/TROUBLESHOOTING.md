@@ -30,6 +30,12 @@ revert, restart).
      into the wait, the application hooks, planning (`plan_us`, `probe_us`), `VirtualProtect` (`protect_us`), stopping the
      threads (`stop_us` = `enumerate_us` + `suspend_us` + `context_us`), the writes (`write_us`, slowest hook
      `write_max_us`) and resuming; the broker's line gives the round trip it saw. `batch=1` is the first of the process.
+     `prefetch_us` / `prefetch=api|touch` / `prefetch_pages`: before planning, with every thread running, the agent asks for
+     the targets' code pages at once (`PrefetchVirtualMemory`; `touch` when that is unavailable or failed and each page was
+     read once instead). It is never an error; a large `probe_us` with `prefetch=touch` means the pages came from disk one by
+     one.
+   * `WP50-PLAN module=... object_ms=... image_ms=... bind_ms=... export_parses=... prove_ms=... narrow_ms=...`: the plan
+     stage of one recompiled object, split up (`image_ms` is near 0 once the module file was read in the background).
    * `WP50-ONEOFF what=module-image|linker-detection|reserve-range ms=...`: work done once per module at its first reload.
      The module file is normally read in the background once the index is ready (`image=background`); `image=reload` means
      the first reload had to read it itself (set-option `prefetch_module_image` false, or the reload came first).
@@ -37,6 +43,11 @@ revert, restart).
      index of the same module file (a hot-restart's new process, a module loaded again). `miss reason=size|mtime|pdb` means the
      module file was rebuilt since; `absent` that this broker had not indexed it before. Set-option `cache_include_scan` false
      scans every time.
+   * The two set-options of WP-50 (control command `set-option {"name":..., "value": true|false}`, both default `true`):
+     `prefetch_module_image` (read the module file for the function comparison in the background once its index is ready;
+     applies to modules enabled afterwards) and `cache_include_scan` (reuse the file lists and include graph of an unchanged
+     module file this broker indexed before; applies to indexes started afterwards). Turn one off only to rule it out when
+     looking for a problem.
 
 ## Ids raised by the integrations
 

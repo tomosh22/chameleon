@@ -680,11 +680,16 @@ private:
         const std::string tag = "g" + std::to_string(patch_no);
 
         // ---- plan --------------------------------------------------------------------------------------------
+        // WP-50 (R-47): where the plan stage goes, one `WP50-PLAN` line per unit (the first reload of a session spends more here).
+        const Clock::time_point plan_started = Clock::now();
         Result<coff::OwnedObject> object = coff::load_object_file(u.outcome.object_path);
         if (!object) {
             return fail("plan", object.error());
         }
+        const Clock::time_point plan_object = Clock::now();
         std::shared_ptr<const pe::OwnedImage> image = module_image(report);
+        const Clock::time_point plan_image = Clock::now();
+        const std::size_t export_parses_before = ctx_.exports ? ctx_.exports->parses() : 0;
         FileProcessModules process_modules(snapshot_.modules, LoadedModule{module_.path, module_.base, module_.size}, ctx_.exports, image);
         bind::PlanInput in;
         in.object = &object->object;
@@ -715,6 +720,7 @@ private:
             return *first;
         }
         bind::BindPlan plan = std::move(*planned);
+        const Clock::time_point plan_bound = Clock::now();
         // WP-40 (R-48 item 5, ADR-0043 rule (d)): lambdas the type records cannot tell apart were paired by their numbers;
         // their call operators' code decides. Where it shows that lambdas changed places, the unit is planned again with
         // that pairing (once: the second plan is not compared again).
@@ -799,6 +805,7 @@ private:
         for (const Diag& w : plan.warnings) {
             warn(report, "plan", w);
         }
+        const Clock::time_point plan_proved = Clock::now();
         // WP-36 evidence: image-relative references to old data in this object, and how many were proved displacements.
         report.imgrel_sites += plan.imgrel_sites;
         report.imgrel_verified += plan.imgrel_verified;
@@ -816,6 +823,7 @@ private:
         ni.enabled = options_.narrow_hooks;
         ni.prior_code = [this](std::uint64_t va) { return module_.code_running_at(va); };  // WP-25
         const NarrowResult narrowed = narrow_hooks(ni);
+        const Clock::time_point plan_narrowed = Clock::now();
         // After merging plan hooks that share an old entry: planned - dropped == hooks.size() == hooks installed by this patch.
         report.hooks_planned += narrowed.planned;
         report.hooks_dropped += narrowed.dropped;
@@ -847,6 +855,15 @@ private:
         }
         const bool has_effect = !hooks.empty() || !plan.new_functions.empty() || !plan.new_globals.empty() || !plan.initialisers.empty();
         report.times.plan += lap.lap();
+        {
+            const Clock::time_point plan_done = Clock::now();
+            const std::size_t export_parses = (ctx_.exports ? ctx_.exports->parses() : 0) - export_parses_before;
+            CML_LOG(Info, "WP50-PLAN module=%s object=%s total_ms=%.1f object_ms=%.1f image_ms=%.1f bind_ms=%.1f export_parses=%zu prove_ms=%.1f "
+                          "narrow_ms=%.1f rest_ms=%.1f hooks_planned=%zu",
+                    module_.name.c_str(), std::string(path::base_name(std::string_view(u.outcome.object_path))).c_str(), ms_between(plan_started, plan_done),
+                    ms_between(plan_started, plan_object), ms_between(plan_object, plan_image), ms_between(plan_image, plan_bound), export_parses,
+                    ms_between(plan_bound, plan_proved), ms_between(plan_proved, plan_narrowed), ms_between(plan_narrowed, plan_done), narrowed.planned);
+        }
         if (!has_effect) {
             CML_LOG(Info, "reload: %s changes no code (all %zu planned hooks are identical to the running code); nothing to load", u.source.c_str(),
                     narrowed.planned);

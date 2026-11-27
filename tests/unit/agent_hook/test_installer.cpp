@@ -849,6 +849,49 @@ TEST_CASE("WP-50: the batch timing counts the jobs and pages and its phases fit 
     CHECK(r.timing.total_us >= r.timing.plan_us);
 }
 
+TEST_CASE("WP-50: prefetch_code_pages asks for every target page once, by the API or by reading a byte of each") {
+    Arena arena(16);
+    std::vector<Placed> placed;
+    for (int i = 0; i < 20; ++i) {
+        placed.push_back(arena.place_padded(cl_release(i), 8, 8));
+    }
+    arena.seal();
+    std::vector<const void*> targets;
+    for (const Placed& p : placed) {
+        targets.push_back(p.entry);
+        targets.push_back(p.entry);  // listed twice: still one page
+    }
+    std::vector<std::uintptr_t> expected;
+    for (const Placed& p : placed) {
+        const auto t = reinterpret_cast<std::uintptr_t>(p.entry);
+        for (std::uintptr_t page = (t - kLookBehind) & ~std::uintptr_t{0xFFF}; page <= ((t + kLookAhead - 1) & ~std::uintptr_t{0xFFF}); page += 0x1000) {
+            expected.push_back(page);
+        }
+    }
+    std::sort(expected.begin(), expected.end());
+    expected.erase(std::unique(expected.begin(), expected.end()), expected.end());
+
+    const PrefetchResult api = prefetch_code_pages(targets, true);
+    CHECK(api.pages == expected.size());
+    CHECK(api.ranges >= 1);
+    CHECK(api.ranges <= api.pages);
+    // Windows 8 and later have PrefetchVirtualMemory; were it to fail, the pages are read instead (never an error).
+    CHECK((api.method == PrefetchResult::Method::Api || (api.method == PrefetchResult::Method::Touch && api.error != 0)));
+
+    const PrefetchResult touch = prefetch_code_pages(targets, false);
+    CHECK(touch.method == PrefetchResult::Method::Touch);
+    CHECK(touch.pages == expected.size());
+    CHECK(touch.touched == touch.pages);
+
+    // An address that is not mapped is skipped by the fallback, not faulted on.
+    const PrefetchResult unmapped = prefetch_code_pages({reinterpret_cast<const void*>(std::uintptr_t{0x10000})}, false);
+    CHECK(unmapped.method == PrefetchResult::Method::Touch);
+    CHECK(unmapped.touched < unmapped.pages);
+
+    CHECK(prefetch_code_pages({}, true).method == PrefetchResult::Method::None);
+    CHECK(std::string(to_string(PrefetchResult::Method::Api)) == "api");
+}
+
 TEST_CASE("two threads installing at once are serialised") {
     Arena arena;
     const Placed a = arena.place_padded(cl_release(0), 8, 8);

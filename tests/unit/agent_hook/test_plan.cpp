@@ -400,7 +400,7 @@ TEST_CASE("WP-50: the WP50-HOOKS line carries every phase under a stable key, in
     CHECK(line.rfind("WP50-HOOKS side=agent request=17 batch=1 op=install hooks=275 installed=275 repointed=0 unchanged=0 reverted=0 pages=61 "
                      "threads=3 attempts=1 status=0 total_us=395000 ",
                      0) == 0);
-    const char* const keys[] = {"wait_us",      "collect_us", "prepatch_us",   "build_us",     "install_us", "lock_us",     "plan_us",
+    const char* const keys[] = {"wait_us",      "prefetch_us", "prefetch", "prefetch_pages", "collect_us", "prepatch_us",   "build_us",     "install_us", "lock_us",     "plan_us",
                                 "probe_us",     "protect_us", "stop_us",       "enumerate_us", "suspend_us", "context_us",  "check_us",
                                 "write_us",     "write_max_us", "step_us",     "resume_us",    "retry_wait_us", "unprotect_us", "commit_us",
                                 "rollback_us",  "postpatch_us", "reply_us"};
@@ -414,7 +414,13 @@ TEST_CASE("WP-50: the WP50-HOOKS line carries every phase under a stable key, in
     }
     CHECK(line.find(" write_us=380000 write_max_us=9000 ") != std::string::npos);
     CHECK(line.find(" plan_us=1200 ") != std::string::npos);
+    CHECK(line.find(" prefetch_us=0 prefetch=none prefetch_pages=0 ") != std::string::npos);
     CHECK(line.find('\n') == std::string::npos);
+
+    l.prefetch = "api";
+    l.prefetch_pages = 275;
+    l.dispatch.prefetch_us = 1800;
+    CHECK(format_hooks_timing(l).find(" prefetch_us=1800 prefetch=api prefetch_pages=275 collect_us=") != std::string::npos);
 
     l.status = 4301;
     l.op = "revert";
