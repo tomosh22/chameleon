@@ -154,14 +154,6 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
   its old namesake (the PDB carries no signatures for the planner yet; ADR-0029). Callers inside
   the patched TU are recompiled and are fine; an old function pointer to it held elsewhere would
   be called with the old signature. Rename the function when changing its signature, or hot-restart.
-- **Statics of inlined helper functions are not detected (R-57, WP-51).** clang-cl at `-O2` records the function-local
-  statics of an internal-linkage (`static`, anonymous-namespace or local-class) helper it inlined as plain records of the
-  caller. An edit that deletes the helper and declares a static of that name in the caller pairs the new static with the
-  helper's live object, as R-54 did for lambdas; the planner refuses that only for a lambda's code (CML3207, WP-51). The
-  inline sites name the helper, but not whether it has internal linkage (a header `inline` helper looks the same and records
-  its statics as globals instead), so a rule for helpers would refuse the own statics of most optimised functions.
-  `WP51-WOULD-REFUSE` lines in the broker log count how often such a rule would fire. Also not detected: a lambda whose
-  inline site the compiler dropped although its static stayed (no case is known).
 - **Re-execute after a crash (WP-23)** is offered only for an unoptimised frame of an enabled module with a loaded PDB. The recorded
   build command must end in `/Od`/`-O0`. Frames in patch code are never offered (patch PDBs are not indexed).
   - It reloads the parameters' values *at the fault*. They equal the call arguments only if the function did not assign to a
