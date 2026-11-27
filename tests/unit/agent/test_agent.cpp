@@ -1238,6 +1238,79 @@ TEST_CASE("WP-48 review round 2 (3): after the broker refuses the module list, t
     CHECK(reported_after_refusal);  // the broker learns the module from the events, before the request that names it
 }
 
+TEST_CASE("WP-48 review round 3 (2): after a refused list sent again, a same-base reload still reaches the broker as an unload and a load") {
+    using FailFn = void (*)(int);
+    const std::string pipe = unique_pipe_name("events_refused_again");
+    ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));
+    ScopedEnv broker_env(L"CML_BROKER_PATH", exe_directory() + L"\\no_such_broker.exe");
+    cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str());
+    REQUIRE(agent.IsValid());
+    const FailFn fail_enumeration = agent_export<FailFn>("cml_agent_testing_fail_enumeration");
+    fail_enumeration(3);  // the first list goes out empty (accepted); the agent sends the full list again, which is refused
+    std::atomic<int> lists{0};
+    ScriptedBroker broker(pipe, [&lists](const cml::ipc::Message& m) {
+        if (std::holds_alternative<cml::ipc::ModuleList>(m)) {
+            const int n = lists.fetch_add(1);
+            if (n == 1 || n == 2) {
+                return ScriptedBroker::Action::Reject;
+            }
+        }
+        return ScriptedBroker::Action::Answer;
+    });
+    broker.welcome_abi.store(cml::ipc::kAgentAbiModuleEvents);
+    REQUIRE(broker.ready());
+    REQUIRE(wait_until([&] { return agent.IsConnected(); }, 20000));
+
+    const std::wstring dummy = exe_directory() + L"\\cml_test_dummy_module.dll";
+    cml::Reply reply;
+    HMODULE module = LoadLibraryW(dummy.c_str());
+    REQUIRE(module != nullptr);
+    cml::Request r = agent.EnableModule(dummy);
+    REQUIRE(agent.WaitForRequest(r, 20000, &reply) == CML_STATUS_OK);
+    const auto refused_again = [&broker] {
+        std::size_t lists_seen = 0;
+        bool refusal_logged = false;
+        for (const cml::ipc::Message& m : broker.messages(0)) {
+            lists_seen += std::holds_alternative<cml::ipc::ModuleList>(m) ? 1 : 0;
+            if (const auto* log = std::get_if<cml::ipc::Log>(&m); log != nullptr && log->text.find("refused the module list") != std::string::npos) {
+                refusal_logged = true;
+            }
+        }
+        return lists_seen >= 2 && refusal_logged;
+    };
+    REQUIRE(wait_until(refused_again, 20000));
+    // FreeLibrary + LoadLibrary with nothing in between, then a request: the agent polls before sending it.
+    REQUIRE(FreeLibrary(module));
+    REQUIRE(GetModuleHandleW(dummy.c_str()) == nullptr);
+    module = LoadLibraryW(dummy.c_str());
+    REQUIRE(module != nullptr);
+    r = agent.EnableModule(dummy);
+    REQUIRE(agent.WaitForRequest(r, 20000, &reply) == CML_STATUS_OK);
+    FreeLibrary(module);
+    cml::DestroyAgent(agent);
+
+    // The changes of the dummy between the refused list (the second ModuleList) and the last request.
+    std::string changes;
+    std::size_t lists_seen = 0;
+    for (const cml::ipc::Message& m : broker.messages(0)) {
+        if (std::holds_alternative<cml::ipc::ModuleList>(m)) {
+            ++lists_seen;
+        } else if (const auto* enable = std::get_if<cml::ipc::EnableModule>(&m); enable != nullptr && enable->request_id == r.id) {
+            break;
+        } else if (const auto* events = std::get_if<cml::ipc::ModuleEvents>(&m); events != nullptr && lists_seen >= 2) {
+            for (const cml::ipc::ModuleEvent& e : events->events) {
+                if (names_dummy(e.module.path)) {
+                    changes.push_back(e.kind == cml::ipc::ModuleEventKind::Loaded ? 'L' : 'U');
+                }
+            }
+        }
+    }
+    // The reload is the last pair before the request: judged against what the broker believed (not an emptied list), an unload, then a
+    // load. (The dummy's first load can also be in the window, before it, when the list was sent again early.)
+    REQUIRE(changes.size() >= 2);
+    CHECK(changes.substr(changes.size() - 2) == "UL");
+}
+
 TEST_CASE("WP-48: without loader notifications the agent falls back to the module-list diff and says so (CML4720)") {
     const std::string pipe = unique_pipe_name("events_off");
     ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));

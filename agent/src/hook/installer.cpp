@@ -369,6 +369,37 @@ std::size_t Installer::forget_range(std::uint64_t base, std::uint64_t size) {
     return dropped;
 }
 
+Installer::RangeHooks Installer::hooks_in_range(std::uint64_t base, std::uint64_t size) const {
+    if (size == 0) {
+        return RangeHooks::None;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const std::uint64_t end = base + size;
+    bool any = false;
+    for (const Record& r : records_) {
+        const std::uint64_t target = static_cast<std::uint64_t>(r.target);
+        if (target < base || target >= end) {
+            continue;
+        }
+        any = true;
+        std::uint8_t bytes[5] = {};
+        std::size_t got = 0;
+        if (r.entry_length == 0 || r.entry_length > sizeof(bytes) ||
+            !read_code(reinterpret_cast<const void*>(r.target), bytes, r.entry_length, &got) || got != r.entry_length ||
+            std::memcmp(bytes, r.current_entry, r.entry_length) != 0) {
+            return RangeHooks::Absent;
+        }
+        if (r.padding_length != 0) {
+            if (r.padding_length > sizeof(bytes) ||
+                !read_code(reinterpret_cast<const void*>(r.target - r.padding_length), bytes, r.padding_length, &got) ||
+                got != r.padding_length || std::memcmp(bytes, r.current_padding, r.padding_length) != 0) {
+                return RangeHooks::Absent;
+            }
+        }
+    }
+    return any ? RangeHooks::Present : RangeHooks::None;
+}
+
 Installer::Record* Installer::find_record(std::uintptr_t target) {
     auto it = std::lower_bound(records_.begin(), records_.end(), target,
                                [](const Record& r, std::uintptr_t t) { return r.target < t; });

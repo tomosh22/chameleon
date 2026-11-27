@@ -694,11 +694,10 @@ bool Agent::send_module_list(ipc::PipeConnection& connection, bool session_start
     ipc::ModuleList list;
     list.request_id = next_id_.fetch_add(1, std::memory_order_relaxed);
     const std::uint64_t seq_mark = queue_seq_.load(std::memory_order_acquire);
+    // WP-48: what the ring holds so far is drained BEFORE the list is taken (a change during it stays in the ring and is reported by
+    // the next poll; a load the list has as well is redundant there, see track_modules). The list covers what the ring lost.
     std::vector<DrainedEvent> before_list;
-    if (session_start && module_ring_ != nullptr) {
-        // WP-48: the new broker knows nothing yet. What the ring holds so far is drained BEFORE the list is taken (a change during it
-        // stays in the ring and is reported by the next poll; a load the list has as well is redundant there, see track_modules) and
-        // applied to the list, which can still show an image whose unload notification was delivered (apply_before_list).
+    if (module_ring_ != nullptr) {
         before_list = drain_module_ring();
         ring_lost_seen_ = module_ring_->lost();
     }
@@ -711,16 +710,31 @@ bool Agent::send_module_list(ipc::PipeConnection& connection, bool session_start
         modules = enumerate_loaded_modules();
     }
     if (modules) {
-        list.modules = session_start ? apply_before_list(before_list, to_entries(*modules)) : to_entries(*modules);
-        CML_LOG(Debug, "module events: %llu from before the session applied to its module list", static_cast<unsigned long long>(before_list.size()));
+        const std::vector<ipc::ModuleEntry> snapshot = to_entries(*modules);
+        if (session_start) {
+            // The new broker knows nothing yet: the notifications are applied to the list, which can still show an image whose unload
+            // notification was delivered (apply_before_list; an image whose hooks are in place is live and stays).
+            list.modules = apply_before_list(before_list, snapshot, hook_probe());
+            CML_LOG(Debug, "module events: %llu from before the session applied to its module list", static_cast<unsigned long long>(before_list.size()));
+        } else {
+            // A list sent again (the last one was refused, or could not be built): the broker believes module_track_.known. What was
+            // held back and drained now is reported against that first, like any poll (an unload and a load at one base stay two
+            // changes; the hook bytes decide what is live), so no older event is applied after the list. Then the list replaces it.
+            const ModulePollReport pre =
+                track_modules(module_track_, before_list, 0, &snapshot, /*quiet=*/false, /*known_trusted=*/true, hook_probe());
+            if (!send_module_report(connection, pre)) {
+                return false;
+            }
+            list.modules = list_with_hooked(module_track_.known, snapshot, hook_probe());
+        }
     } else {
         // Send what we have (nothing, at the start of a session) and keep the session: polled_seq_
         // stays as it is, so the next flush polls again, and the next poll sends the difference.
         CML_LOG(Warn, "cannot enumerate the loaded modules (%s); sending the list we have",
                 modules.error().format().c_str());
         list.modules = module_track_.known;
-        // WP-48: the notifications drained for this list are not lost: the next poll applies them (to a list nobody trusts yet).
-        module_track_.deferred.insert(module_track_.deferred.begin(), before_list.begin(), before_list.end());
+        // WP-48: the notifications drained for this list are not lost: the next poll applies them, after what was held back already.
+        module_track_.deferred.insert(module_track_.deferred.end(), before_list.begin(), before_list.end());
     }
     {
         // Register before sending so the Reply cannot race the registration.
@@ -742,8 +756,9 @@ bool Agent::send_module_list(ipc::PipeConnection& connection, bool session_start
     if (!send_message(connection, list)) {
         return false;
     }
+    known_before_list_ = module_track_.known;  // WP-48: what the broker believes if it refuses this list
     if (modules) {
-        adopt_full_list(module_track_, list.modules);  // WP-48: a list taken now is up to date for every unload drained before it
+        adopt_full_list(module_track_, list.modules);
     } else {
         module_track_.suspect.reset();  // the list we had went out again: nothing new is known
     }
@@ -858,8 +873,8 @@ bool Agent::poll_modules(ipc::PipeConnection& connection) {
     const bool quiet = !module_ring_->has_pending();
     // While the broker has no full list (the session's could not be built, or was refused: full_list_pending_), the snapshot is
     // reported at once: a request naming a module must find it known (polled_seq_), and a difference is no disagreement then.
-    const ModulePollReport report =
-        track_modules(module_track_, drained, lost, modules ? &snapshot : nullptr, quiet, /*known_trusted=*/!full_list_pending_);
+    const ModulePollReport report = track_modules(module_track_, drained, lost, modules ? &snapshot : nullptr, quiet,
+                                                  /*known_trusted=*/!full_list_pending_, hook_probe());
     if (!drained.empty()) {
         CML_LOG(Debug, "module events: drained=%llu (seq %llu..%llu) reported=%llu patch_images=%llu redundant=%llu lost=%llu",
                 static_cast<unsigned long long>(drained.size()), static_cast<unsigned long long>(drained.front().seq),
@@ -1014,6 +1029,22 @@ void Agent::unregister_module_notifications() {
     // Once LdrUnregisterDllNotification has returned no callback runs with this ring any more (it takes the lock the loader holds
     // while it calls the callbacks), so it can go.
     module_ring_.reset();
+}
+
+HookProbe Agent::hook_probe() {
+    // ADR-0044 ruling (review round 3): the hook bytes are the arbiter. The installer's mutex is taken inside (never with a thread
+    // suspended: a batch holds it for its whole window); the agent thread runs this, outside any batch.
+    return [](const ipc::ModuleEntry& module) {
+        switch (hook::process_installer().hooks_in_range(module.base, module.size)) {
+            case hook::Installer::RangeHooks::Present:
+                return ImageHooks::Present;
+            case hook::Installer::RangeHooks::Absent:
+                return ImageHooks::Absent;
+            case hook::Installer::RangeHooks::None:
+                break;
+        }
+        return ImageHooks::None;
+    };
 }
 
 std::vector<DrainedEvent> Agent::drain_module_ring() {
@@ -1255,9 +1286,9 @@ void Agent::handle_message(const ipc::Message& message) {
             full_list_not_before_ = GetTickCount64() + list_backoff_ms_;
             list_backoff_ms_ = std::min(list_backoff_ms_ * 2, kMaxListBackoffMs);
             polled_seq_ = 0;
-            // WP-48: the broker did not take the list, so it does not know what the list said: the next poll reports every loaded
-            // module from the snapshot (the untrusted diff against nothing; ModuleLoaded is idempotent in the broker).
-            module_track_.known.clear();
+            // WP-48: the broker did not take the list, so it still believes what it had before it: the next polls report against
+            // that (the untrusted diff), so an unload is still an unload, with forget_range (review round 3).
+            module_track_.known = known_before_list_;
             module_track_.suspect.reset();
         }
         complete(reply->request_id, reply->status, reply->message);

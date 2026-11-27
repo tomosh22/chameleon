@@ -144,6 +144,15 @@ public:
     // erases (no allocation). Returns the number of records dropped.
     std::size_t forget_range(std::uint64_t base, std::uint64_t size);
 
+    // WP-48 (ADR-0044 ruling: hook bytes are the arbiter): is the image mapped at [base, base + size) the one this installer hooked?
+    //   None:    no record has its target in the range (no applied edit can be lost there);
+    //   Present: for every such record the bytes it wrote (entry and padding) are in memory: the live, hooked image;
+    //   Absent:  for some record they are not, or cannot be read: the image was replaced (or unmapped).
+    // Takes the batch mutex (so it never races an install or a revert, and never runs while threads are suspended); reads with
+    // ReadProcessMemory on the own process, which fails instead of faulting. No allocation.
+    enum class RangeHooks : std::uint8_t { None, Present, Absent };
+    RangeHooks hooks_in_range(std::uint64_t base, std::uint64_t size) const;
+
     bool ready() const noexcept { return ready_; }
     std::size_t hook_count() const;
     bool find(const void* target, HookInfo* info) const;

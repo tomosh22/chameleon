@@ -460,6 +460,69 @@ TEST_CASE("WP-45: forget_range drops the records of an unloaded module; a hook o
     }
 }
 
+TEST_CASE("WP-48: hooks_in_range tells the live, hooked image from a replaced one with the same base, size and path") {
+    for (const bool padded : {true, false}) {
+        INFO((padded ? "strategy 1" : "strategy 2"));
+        Arena arena;
+        const Placed old_fn = arena.place_padded(cl_release(0), padded ? 8 : 0, 16);
+        const Placed other_fn = arena.place_padded(cl_release(0), 8, 16);
+        const Placed new_1 = arena.place_padded(lea_ret(100), 8, 8);
+        const Placed new_2 = arena.place_padded(lea_ret(200), 8, 8);
+        arena.seal();
+        const std::uint64_t image_base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(old_fn.entry - kBefore));
+        const std::uint64_t image_size = static_cast<std::uint64_t>(kBefore + kAfter);
+        const std::uint64_t other_base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(other_fn.entry - kBefore));
+        const Bytes original = around(old_fn);
+        Installer installer;
+        CHECK(installer.hooks_in_range(image_base, image_size) == Installer::RangeHooks::None);  // nothing hooked there
+        HookOutcome outcome;
+        REQUIRE(install_one(installer, old_fn.entry, new_1.entry, "fn", &outcome).ok());
+        REQUIRE(install_one(installer, other_fn.entry, new_1.entry, "other", &outcome).ok());
+        CHECK(installer.hooks_in_range(image_base, image_size) == Installer::RangeHooks::Present);
+        CHECK(installer.hooks_in_range(image_base, 0) == Installer::RangeHooks::None);
+
+        // Re-pointed: the record follows the bytes written, so the image is still the hooked one.
+        REQUIRE(install_one(installer, old_fn.entry, new_2.entry, "fn", &outcome).ok());
+        CHECK(outcome.status == HookStatus::Repointed);
+        CHECK(installer.hooks_in_range(image_base, image_size) == Installer::RangeHooks::Present);
+
+        // FreeLibrary + LoadLibrary at the same base (same path and size): the fresh image has its original bytes where the jump was.
+        arena.unseal();
+        std::memcpy(old_fn.entry - kBefore, original.data(), original.size());
+        arena.seal();
+        CHECK(installer.hooks_in_range(image_base, image_size) == Installer::RangeHooks::Absent);
+        CHECK(installer.hooks_in_range(other_base, image_size) == Installer::RangeHooks::Present);  // the other module is untouched
+
+        // Once forgotten (the agent reports the unload), nothing is recorded there any more.
+        CHECK(installer.forget_range(image_base, image_size) == 1);
+        CHECK(installer.hooks_in_range(image_base, image_size) == Installer::RangeHooks::None);
+
+        // After a revert the record is gone too.
+        REQUIRE(revert_one(installer, other_fn.entry, "other", nullptr).ok());
+        CHECK(installer.hooks_in_range(other_base, image_size) == Installer::RangeHooks::None);
+    }
+}
+
+TEST_CASE("WP-48: hooks_in_range reports an unreadable range as replaced") {
+    // A no-access page stands for the unmapped image: ReadProcessMemory fails, nothing faults.
+    Arena arena;
+    const Placed fn = arena.place_padded(cl_release(0), 8, 16);
+    const Placed repl = arena.place_padded(lea_ret(5), 8, 8);
+    arena.seal();
+    const std::uint64_t base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(fn.entry - kBefore));
+    const Bytes original = around(fn);
+    Installer installer;
+    HookOutcome outcome;
+    REQUIRE(install_one(installer, fn.entry, repl.entry, "fn", &outcome).ok());
+    CHECK(installer.hooks_in_range(base, kBefore + kAfter) == Installer::RangeHooks::Present);
+    arena.seal(PAGE_NOACCESS);
+    CHECK(installer.hooks_in_range(base, kBefore + kAfter) == Installer::RangeHooks::Absent);
+    arena.unseal();
+    std::memcpy(fn.entry - kBefore, original.data(), original.size());
+    arena.seal();
+    CHECK(installer.forget_range(base, kBefore + kAfter) == 1);
+}
+
 TEST_CASE("a batch is all or nothing") {
     Arena arena;
     const Placed good_1 = arena.place_padded(cl_release(0), 8, 8);

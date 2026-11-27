@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "doctest.h"
@@ -418,59 +419,171 @@ TEST_CASE("WP-48 review 3: a load at a base whose unload was seen is never redun
     }
 }
 
-TEST_CASE("WP-48 review round 2 (1): a list taken in a later poll than the unload is up to date: the next load there is redundant") {
-    // The unload of the plugin is drained in poll 1. The new image is in place before its load notification is drained, and a list
-    // taken in a later poll shows it: the broker learns it from that list. Its load notification must then be redundant, never an
-    // unload of the live (by then hooked) image.
-    const std::vector<ModuleEntry> with_new_image = {kGame, kPlugin};
-    SUBCASE("the untrusted snapshot diff") {
-        ModuleTrackState state;
-        state.known = {kGame, kPlugin};
-        ModulePollReport report = track_modules(state, {unloaded(1, kPlugin)}, 0, nullptr, true);
-        REQUIRE(report.events.size() == 1);
-        report = track_modules(state, {}, 0, &with_new_image, true, /*known_trusted=*/false);
-        REQUIRE(report.events.size() == 1);
-        CHECK(is(report.events[0], ModuleEventKind::Loaded, 0, kPlugin.base, "C:\\game\\plugin.dll"));
-        CHECK(state.unloads_seen.empty());
-        report = track_modules(state, {loaded(2, kPlugin)}, 0, &with_new_image, true);
-        CHECK(report.events.empty());
-        CHECK(report.redundant == 1);
+// --- review round 3: the hook bytes are the arbiter (ADR-0044 ruling) -------------------------------------------------------------
+
+namespace {
+
+// A stand-in for Installer::hooks_in_range: what the probe finds at each base (None where nothing is set).
+struct FakeHooks {
+    std::vector<std::pair<std::uint64_t, ImageHooks>> at;
+    void set(std::uint64_t base, ImageHooks hooks) {
+        for (auto& entry : at) {
+            if (entry.first == base) {
+                entry.second = hooks;
+                return;
+            }
+        }
+        at.emplace_back(base, hooks);
     }
-    SUBCASE("a resync after lost notifications") {
-        ModuleTrackState state;
-        state.known = {kGame, kPlugin};
-        ModulePollReport report = track_modules(state, {unloaded(1, kPlugin)}, 0, nullptr, true);
-        REQUIRE(report.events.size() == 1);
-        report = track_modules(state, {}, 4, &with_new_image, true);
-        CHECK(report.resync_reason == module_events::ids::kRingOverflow);
-        REQUIRE(report.events.size() == 1);
-        CHECK(report.events[0].kind == ModuleEventKind::Loaded);
-        CHECK(state.unloads_seen.empty());
-        report = track_modules(state, {loaded(2, kPlugin)}, 0, &with_new_image, true);
-        CHECK(report.events.empty());
-        CHECK(report.redundant == 1);
+    HookProbe probe() const {
+        return [this](const ModuleEntry& m) {
+            for (const auto& entry : at) {
+                if (entry.first == m.base) {
+                    return entry.second;
+                }
+            }
+            return ImageHooks::None;
+        };
     }
-    SUBCASE("a full list sent again") {
-        ModuleTrackState state;
-        state.known = {kGame, kPlugin};
-        ModulePollReport report = track_modules(state, {unloaded(1, kPlugin)}, 0, nullptr, true);
-        REQUIRE(report.events.size() == 1);
-        REQUIRE(state.unloads_seen.size() == 1);
-        adopt_full_list(state, with_new_image);
-        CHECK(state.unloads_seen.empty());
-        report = track_modules(state, {loaded(2, kPlugin)}, 0, &with_new_image, true);
-        CHECK(report.events.empty());
-        CHECK(report.redundant == 1);
+};
+
+std::size_t unloads_of(const ModulePollReport& report, std::uint64_t base) {
+    std::size_t n = 0;
+    for (const ModuleEvent& e : report.events) {
+        n += e.kind == ModuleEventKind::Unloaded && e.module.base == base ? 1 : 0;
     }
-    SUBCASE("but a list of the SAME poll may lag: the unload stays remembered") {
-        ModuleTrackState state;
-        state.known = {kGame, kPlugin};
-        track_modules(state, {unloaded(1, kPlugin)}, 0, &with_new_image, true, /*known_trusted=*/false);
-        REQUIRE(state.unloads_seen.size() == 1);
-        const ModulePollReport report = track_modules(state, {loaded(2, kPlugin)}, 0, &with_new_image, true);
+    return n;
+}
+
+}  // namespace
+
+TEST_CASE("WP-48 review round 3 (1): a list that lags over two polls cannot hide a reload") {
+    // The plugin's unload is drained in poll 1 and reported (its hook records are forgotten with it). The loader list still shows the
+    // old image in polls 2 and 3 (preemption before ntdll unlinks it), so a resync puts it back; the new image's load comes in poll 4.
+    const std::vector<ModuleEntry> lagging = {kGame, kPlugin};
+    FakeHooks hooks;
+    ModuleTrackState state;
+    state.known = {kGame, kPlugin};
+    hooks.set(kPlugin.base, ImageHooks::Absent);  // poll 1: unmapped
+    ModulePollReport report = track_modules(state, {unloaded(1, kPlugin)}, 0, &lagging, true, true, hooks.probe());
+    REQUIRE(unloads_of(report, kPlugin.base) == 1);
+    hooks.set(kPlugin.base, ImageHooks::None);  // forget_range ran with that report
+    report = track_modules(state, {}, 3, &lagging, true, true, hooks.probe());  // poll 2: a resync from the lagging list
+    CHECK(report.resync_reason == module_events::ids::kRingOverflow);
+    CHECK(state.known.size() == 2);
+    report = track_modules(state, {}, 0, &lagging, true, /*known_trusted=*/false, hooks.probe());  // poll 3: still lagging
+    CHECK(report.events.empty());
+
+    SUBCASE("no hooks were re-applied in between: the reload is reported (unloads_seen is kept as the hint)") {
+        report = track_modules(state, {loaded(2, kPlugin)}, 0, &lagging, true, true, hooks.probe());
         REQUIRE(report.events.size() == 2);
-        CHECK(report.events[0].kind == ModuleEventKind::Unloaded);
-        CHECK(report.events[1].seq == 2);
+        CHECK(is(report.events[0], ModuleEventKind::Unloaded, 0, kPlugin.base, "C:\\game\\plugin.dll"));
+        CHECK(is(report.events[1], ModuleEventKind::Loaded, 2, kPlugin.base, "C:\\game\\plugin.dll"));
+    }
+    SUBCASE("the broker re-applied into the new image already (its hooks are in place): the load is of that image, redundant") {
+        hooks.set(kPlugin.base, ImageHooks::Present);
+        report = track_modules(state, {loaded(2, kPlugin)}, 0, &lagging, true, true, hooks.probe());
+        CHECK(report.events.empty());
+        CHECK(report.hooked_live == 1);
+    }
+}
+
+TEST_CASE("WP-48 review round 3 (2): unloads are judged against what the broker believes, so a same-base reload is two changes") {
+    // The agent keeps `known` as the last list the broker accepted when it refuses one (agent.cpp); against that list an unload and a
+    // load of the same base are an Unloaded and a Loaded. (Against an emptied list the unload would be redundant: a bare Loaded.)
+    FakeHooks hooks;
+    hooks.set(kPlugin.base, ImageHooks::Absent);  // the old image's hooks went with it
+    ModuleTrackState believed;
+    believed.known = {kGame, kPlugin};
+    const std::vector<ModuleEntry> snapshot = {kGame, kPlugin};
+    ModulePollReport report =
+        track_modules(believed, {unloaded(5, kPlugin), loaded(6, kPlugin)}, 0, &snapshot, true, /*known_trusted=*/false, hooks.probe());
+    REQUIRE(report.events.size() == 2);
+    CHECK(is(report.events[0], ModuleEventKind::Unloaded, 5, kPlugin.base, "C:\\game\\plugin.dll"));
+    CHECK(is(report.events[1], ModuleEventKind::Loaded, 6, kPlugin.base, "C:\\game\\plugin.dll"));
+
+    ModuleTrackState emptied;  // what the round-2 change did
+    report = track_modules(emptied, {unloaded(5, kPlugin), loaded(6, kPlugin)}, 0, &snapshot, true, false, hooks.probe());
+    CHECK(unloads_of(report, kPlugin.base) == 0);  // the defect: no unload, so no re-enable in the broker
+}
+
+TEST_CASE("WP-48 review round 3 (3): a live, hooked image survives stale older events and stale lists; it is never unloaded") {
+    // A list sent again showed the new image, the broker re-applied the edits into it (its hooks are in place), and only then are
+    // older notifications applied: an unload of the old image and the load of the new one.
+    FakeHooks hooks;
+    hooks.set(kPlugin.base, ImageHooks::Present);
+    ModuleTrackState state;
+    state.known = {kGame, kPlugin};
+    const std::vector<ModuleEntry> snapshot = {kGame, kPlugin};
+    ModulePollReport report = track_modules(state, {unloaded(7, kPlugin), loaded(8, kPlugin), loaded(9, kOther)}, 0, &snapshot,
+                                            true, true, hooks.probe());
+    CHECK(unloads_of(report, kPlugin.base) == 0);  // never reported: no forget_range for the live hooks
+    REQUIRE(report.events.size() == 1);            // the unrelated load goes on
+    CHECK(report.events[0].module.base == kOther.base);
+    REQUIRE(state.rechecks.size() == 1);            // checked again (the loader may not have unmapped it yet) ...
+    REQUIRE(state.deferred.size() == 1);            // ... and the load at that base waits behind it, in order
+    const std::vector<ModuleEntry> all = {kGame, kPlugin, kOther};
+    for (unsigned poll = 0; poll < kHookedUnloadRechecks + 2; ++poll) {
+        report = track_modules(state, {}, 0, &all, true, true, hooks.probe());
+        CHECK(report.events.empty());
+    }
+    CHECK(state.rechecks.empty());  // dropped as stale: the hooks never went
+    CHECK(state.deferred.empty());  // the load was redundant once it could be judged (the hooked image is live)
+    CHECK(state.known.size() == 3);
+
+    SUBCASE("a stale list that does not show it (a resync) does not unload it either") {
+        const std::vector<ModuleEntry> without = {kGame, kOther};
+        report = track_modules(state, {}, 2, &without, true, true, hooks.probe());
+        CHECK(report.resync_reason == module_events::ids::kRingOverflow);
+        CHECK(unloads_of(report, kPlugin.base) == 0);
+        CHECK(report.hooked_live == 1);
+        CHECK(state.known.size() == 3);
+        CHECK(list_with_hooked(state.known, without, hooks.probe()).size() == 3);  // and a list sent again keeps it
+    }
+    SUBCASE("nor a session's first list that drained its old unload") {
+        CHECK(apply_before_list({unloaded(7, kPlugin)}, snapshot, hooks.probe()).size() == 2);
+        CHECK(apply_before_list({unloaded(7, kPlugin)}, snapshot).size() == 1);  // without hooks the unload applies
+    }
+}
+
+TEST_CASE("WP-48 review round 3: an unload is reported as soon as its image's hooks are gone (the loader unmapped it after notifying)") {
+    FakeHooks hooks;
+    hooks.set(kPlugin.base, ImageHooks::Present);  // the notification came a moment before the unmap
+    ModuleTrackState state;
+    state.known = {kGame, kPlugin};
+    const std::vector<ModuleEntry> snapshot = {kGame, kPlugin};
+    ModulePollReport report = track_modules(state, {unloaded(11, kPlugin)}, 0, &snapshot, true, true, hooks.probe());
+    CHECK(report.events.empty());
+    hooks.set(kPlugin.base, ImageHooks::Absent);  // unmapped now; the new image is loaded and its notification drained
+    report = track_modules(state, {loaded(12, kPlugin)}, 0, &snapshot, true, true, hooks.probe());
+    REQUIRE(report.events.size() == 2);
+    CHECK(is(report.events[0], ModuleEventKind::Unloaded, 11, kPlugin.base, "C:\\game\\plugin.dll"));  // its own sequence number
+    CHECK(is(report.events[1], ModuleEventKind::Loaded, 12, kPlugin.base, "C:\\game\\plugin.dll"));
+    CHECK(state.rechecks.empty());
+}
+
+TEST_CASE("WP-48 review round 3: a replaced image with the same path, size and base is told by its missing jump bytes") {
+    FakeHooks hooks;
+    ModuleTrackState state;
+    state.known = {kGame, kPlugin};
+    const std::vector<ModuleEntry> snapshot = {kGame, kPlugin};
+    SUBCASE("hooks gone: a load of the very same entry is a reload") {
+        hooks.set(kPlugin.base, ImageHooks::Absent);
+        const ModulePollReport report = track_modules(state, {loaded(3, kPlugin)}, 0, &snapshot, true, true, hooks.probe());
+        REQUIRE(report.events.size() == 2);
+        CHECK(is(report.events[0], ModuleEventKind::Unloaded, 0, kPlugin.base, "C:\\game\\plugin.dll"));
+        CHECK(is(report.events[1], ModuleEventKind::Loaded, 3, kPlugin.base, "C:\\game\\plugin.dll"));
+    }
+    SUBCASE("hooks in place: the same load is redundant") {
+        hooks.set(kPlugin.base, ImageHooks::Present);
+        const ModulePollReport report = track_modules(state, {loaded(3, kPlugin)}, 0, &snapshot, true, true, hooks.probe());
+        CHECK(report.events.empty());
+        CHECK(report.hooked_live == 1);
+    }
+    SUBCASE("no hooks: as before (redundant unless an unload was seen at that base)") {
+        const ModulePollReport report = track_modules(state, {loaded(3, kPlugin)}, 0, &snapshot, true, true, hooks.probe());
+        CHECK(report.events.empty());
+        CHECK(report.redundant == 1);
     }
 }
 
