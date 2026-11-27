@@ -1294,7 +1294,12 @@ private:
 
     std::shared_ptr<const pe::OwnedImage> module_image(PatchReport& report) {
         // WP-50 (R-47): normally read in the background once the index was ready (ReloadService); this waits for a read in flight
-        // instead of reading the file a second time, and reads it here only when no background read did.
+        // instead of reading the file a second time, and reads it here only when no background read did. The run keeps what it got
+        // for its later units: a state released meanwhile (disabled while this reload runs) stores nothing, and each unit would
+        // otherwise read the whole file again and hold a copy of its own.
+        if (image_) {
+            return image_;
+        }
         ModuleState::ImageRead read = module_.ensure_image(false);
         if (read.read_now) {
             CML_LOG(Info, "WP50-ONEOFF what=module-image image=reload module=%s ms=%.1f mib=%.1f ok=%d", module_.name.c_str(), read.ms, read.mib,
@@ -1310,8 +1315,10 @@ private:
             report.warnings.push_back(d);
             return nullptr;
         }
-        return read.image;
+        image_ = read.image;
+        return image_;
     }
+    std::shared_ptr<const pe::OwnedImage> image_;  // the module file as this run compares with it (module_image)
 
     Result<void> ensure_reserved() {
         {

@@ -79,15 +79,21 @@ struct HooksTimingLine {
 
 namespace timing_detail {
 
+// Appends the formatted text, growing `out` to fit (nothing is cut). Not used while threads are suspended.
 inline void append(std::string& out, const char* format, ...) {
-    char buffer[160];
     va_list args;
     va_start(args, format);
-    const int n = std::vsnprintf(buffer, sizeof(buffer), format, args);
-    va_end(args);
+    va_list measure;
+    va_copy(measure, args);
+    const int n = std::vsnprintf(nullptr, 0, format, measure);
+    va_end(measure);
     if (n > 0) {
-        out.append(buffer, static_cast<std::size_t>(n) < sizeof(buffer) ? static_cast<std::size_t>(n) : sizeof(buffer) - 1);
+        const std::size_t at = out.size();
+        out.resize(at + static_cast<std::size_t>(n) + 1);  // vsnprintf writes the terminator too
+        std::vsnprintf(&out[at], static_cast<std::size_t>(n) + 1, format, args);
+        out.resize(at + static_cast<std::size_t>(n));
     }
+    va_end(args);
 }
 
 inline unsigned long long ull(std::uint64_t v) { return static_cast<unsigned long long>(v); }

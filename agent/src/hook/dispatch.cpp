@@ -444,6 +444,14 @@ bool Agent::flush_replies(ipc::PipeConnection& connection) {
             message = std::move(replies_.front());
             replies_.pop_front();
         }
+        // WP-50: a line logged before this answer was queued (the hooks' timing, which in synchronised mode the SyncPoint thread
+        // queues while this thread may already be past serve()'s flush_logs) goes first. Taking the answer under mutex_ makes the
+        // log queued before it visible here.
+        if (!flush_logs(connection)) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            replies_.clear();
+            return false;
+        }
         if (!send_message(connection, message)) {
             // The session is over; answers to its requests mean nothing to the next one.
             std::lock_guard<std::mutex> lock(mutex_);

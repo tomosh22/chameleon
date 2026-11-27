@@ -126,21 +126,68 @@ std::optional<ModuleFileStamp> module_file_stamp(const std::string& module_path,
     return stamp;
 }
 
+ScanInput probe_scan_input(const std::string& path) {
+    ScanInput in;
+    in.path = path;
+    std::error_code ec;
+    // One query for the type, the size and the time where the library caches them in the entry (MSVC does).
+    const std::filesystem::directory_entry entry(std::filesystem::path(path), ec);
+    if (ec || !entry.exists(ec) || ec) {  // missing (some libraries report that in ec too) or unreachable: absent
+        return in;
+    }
+    in.exists = true;
+    in.directory = entry.is_directory(ec);
+    if (!in.directory) {
+        const std::uintmax_t size = entry.file_size(ec);
+        in.size = ec ? 0 : static_cast<std::uint64_t>(size);
+    }
+    const std::filesystem::file_time_type t = entry.last_write_time(ec);
+    in.mtime = ec ? 0 : static_cast<long long>(t.time_since_epoch().count());
+    return in;
+}
+
+std::string changed_scan_input(const std::vector<ScanInput>& inputs) {
+    for (const ScanInput& recorded : inputs) {
+        const ScanInput now = probe_scan_input(recorded.path);
+        if (now.exists != recorded.exists || now.directory != recorded.directory || now.size != recorded.size || now.mtime != recorded.mtime) {
+            return recorded.path;
+        }
+    }
+    return std::string();
+}
+
 std::shared_ptr<const ScanResult> ScanCache::find(const std::string& module_path, const ModuleFileStamp& stamp, std::string* reason) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto it = entries_.find(pdb::normalize_path(module_path));
-    if (it == entries_.end()) {
-        *reason = "absent";
+    const std::string key = pdb::normalize_path(module_path);
+    std::shared_ptr<const ScanResult> result;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = entries_.find(key);
+        if (it == entries_.end()) {
+            *reason = "absent";
+            return nullptr;
+        }
+        const std::string difference = stamp_difference(it->second.stamp, stamp);
+        if (!difference.empty()) {
+            *reason = difference;
+            return nullptr;
+        }
+        result = it->second.result;
+    }
+    // Thousands of stats for a large module: not under the lock. The entry stays; the scan that follows a miss replaces it.
+    const std::string changed = result ? changed_scan_input(result->inputs) : std::string();
+    if (!changed.empty()) {
+        *reason = "file-changed:" + changed;
         return nullptr;
     }
-    const std::string difference = stamp_difference(it->second.stamp, stamp);
-    if (!difference.empty()) {
-        *reason = difference;
-        return nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = entries_.find(key);
+        if (it != entries_.end() && it->second.result == result) {
+            it->second.used = ++clock_;
+        }
     }
-    it->second.used = ++clock_;
     reason->clear();
-    return it->second.result;
+    return result;
 }
 
 void ScanCache::store(const std::string& module_path, const ModuleFileStamp& stamp, std::shared_ptr<const ScanResult> result) {
@@ -286,6 +333,7 @@ std::optional<ScanResult> ModuleIndex::scan_files(const pdb::PdbIndex& index) {
     const std::uint32_t compiland_total = index.compiland_count();
     std::vector<SkippedCompiland> skipped;
     std::set<std::uint32_t> skipped_set;
+    std::set<std::string> absent;  // paths found missing whose appearance would change the result
     for (std::uint32_t ci = 0; ci < compiland_total; ++ci) {
         if (!is_object_compiland(index, ci)) {
             continue;  // an import stub or a linker record: nothing to recompile, not counted
@@ -308,8 +356,12 @@ std::optional<ScanResult> ModuleIndex::scan_files(const pdb::PdbIndex& index) {
             reason = "no build environment recorded";
         } else if (!env->source_file() || env->source_file()->empty()) {
             reason = "its build environment records no source file";
-        } else if (!library.empty() && !file_exists(pdb::normalize_path(*env->source_file(), env->cwd().value_or(std::string_view{})))) {
-            reason = "its source file does not exist";
+        } else if (!library.empty()) {
+            const std::string source = pdb::normalize_path(*env->source_file(), env->cwd().value_or(std::string_view{}));
+            if (!file_exists(source)) {
+                reason = "its source file does not exist";
+                absent.insert(source);  // the member becomes reloadable when it appears
+            }
         }
         std::set<std::string> listed;
         for (const std::string_view f : index.compiland_files_normalized(ci)) {
@@ -326,6 +378,8 @@ std::optional<ScanResult> ModuleIndex::scan_files(const pdb::PdbIndex& index) {
             for (const std::string& f : listed) {
                 if (file_exists(f)) {
                     files.insert(f);
+                } else {
+                    absent.insert(f);
                 }
             }
         }
@@ -379,6 +433,30 @@ std::optional<ScanResult> ModuleIndex::scan_files(const pdb::PdbIndex& index) {
         }
     }
     ScanResult out;
+    // WP-50 (review): what the result was built from, as it is now, so that a cache hit can tell it is still true. The tracked
+    // files (sources, PDB-listed and scanned headers, PCH files), the paths found absent, and the directories the include search
+    // looked in (an include that resolves elsewhere once a file is created or removed there). Stamped after the scan: an edit made
+    // while the index is built is seen by neither the scan nor the baseline, as before.
+    if (spec_.scan_cache) {
+        std::set<std::string> directories;
+        for (const std::string& d : scanner.directories()) {
+            if (!d.empty() && files.count(d) == 0) {
+                directories.insert(d);
+            }
+        }
+        out.inputs.reserve(files.size() + absent.size() + directories.size());
+        for (const std::string& f : files) {
+            out.inputs.push_back(probe_scan_input(f));
+        }
+        for (const std::string& f : absent) {
+            if (files.count(f) == 0) {
+                out.inputs.push_back(probe_scan_input(f));
+            }
+        }
+        for (const std::string& d : directories) {
+            out.inputs.push_back(probe_scan_input(d));
+        }
+    }
     out.files = std::move(files);
     out.header_deps = std::move(header_deps);
     out.pch_files = std::move(pch_files);
@@ -462,8 +540,8 @@ void ModuleIndex::run() {
             scan = spec_.scan_cache->find(spec_.module_path, *stamp, &reason);
         }
         cache_state = scan ? "warm" : "cold";
-        CML_LOG(Info, "WP50-SCAN-CACHE %s module=%s reason=%s", scan ? "hit" : "miss", base_name_of(spec_.module_path).c_str(),
-                scan ? "same-stamp" : reason.c_str());
+        CML_LOG(Info, "WP50-SCAN-CACHE %s module=%s reason=%s inputs=%zu check_ms=%.1f", scan ? "hit" : "miss", base_name_of(spec_.module_path).c_str(),
+                scan ? "same-stamp" : reason.c_str(), scan ? scan->inputs.size() : std::size_t{0}, ms_since(scan_started));
     }
     if (!scan) {
         std::optional<ScanResult> fresh = scan_files(*index);

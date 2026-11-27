@@ -180,6 +180,8 @@ public:
     // Tests: called in on_session_changed after a dropped state left the service's map and before its baseline is kept (the moment
     // another thread can hand over a carry for the same module).
     void set_drop_hook_for_testing(std::function<void()> hook);
+    // Tests: called on the background-read thread (WP-50) after it let go of the state and before it reads the module file.
+    void set_prefetch_hook_for_testing(std::function<void()> hook);
     // Tests: every baseline kept for `pid`, whoever stored it (nothing is dropped).
     std::vector<std::pair<std::string, BaselineSnapshot>> kept_baselines_for_testing(std::uint32_t pid) const;
     // What a module's state hands on (to its next instance, or through a restart): the index's baseline (Ready) with the baseline it was
@@ -302,7 +304,8 @@ private:
     std::shared_ptr<ScanCache> scan_cache_ = std::make_shared<ScanCache>();
     // WP-50 (R-47): background reads of the module files the reloads compare with (ModuleState::ensure_image), queued when a
     // module's index becomes Ready (ReloadOptions::prefetch_module_image). One worker thread, started on first use, joined by the
-    // destructor. It holds a state only while it reads that state's file.
+    // destructor. It never holds a state while it reads: only the state's ModuleImageSlot, its path and a weak reference, checked
+    // again after the read (a state dropped meanwhile is destroyed by whoever dropped it, and keeps no copy).
     void queue_image_prefetch(std::weak_ptr<ModuleState> state);
     void prefetch_loop();
     std::mutex prefetch_mutex_;  // guards the members below
@@ -310,6 +313,7 @@ private:
     std::deque<std::weak_ptr<ModuleState>> prefetch_queue_;
     std::thread prefetch_thread_;
     bool prefetch_stop_ = false;
+    std::function<void()> prefetch_hook_;  // guarded by prefetch_mutex_ (set_prefetch_hook_for_testing)
 
     std::mutex reload_mutex_;  // one reload at a time
     std::atomic<bool> running_{false};

@@ -423,3 +423,32 @@ TEST_CASE("WP-50: the WP50-HOOKS line carries every phase under a stable key, in
     CHECK(refused.find(" op=revert ") != std::string::npos);
     CHECK(refused.find(" status=CML4301 total_us=") != std::string::npos);
 }
+
+TEST_CASE("WP-50 (review): the WP50-HOOKS line is never cut, however wide its numbers") {
+    HooksTimingLine l;
+    const std::uint64_t big = ~std::uint64_t{0};
+    l.request_id = big;
+    l.batch = big;
+    l.hooks = static_cast<std::size_t>(big);
+    l.status = 4294967295u;
+    BatchTiming& b = l.batch_timing;
+    for (std::uint64_t* f : {&b.lock_us, &b.plan_us, &b.probe_us, &b.query_us, &b.protect_us, &b.enumerate_us, &b.suspend_us, &b.context_us,
+                             &b.stop_us, &b.check_us, &b.write_us, &b.write_max_us, &b.step_us, &b.resume_us, &b.retry_wait_us, &b.unprotect_us,
+                             &b.commit_us, &b.total_us}) {
+        *f = big;
+    }
+    b.queries = 4294967295u;
+    DispatchTiming& d = l.dispatch;
+    for (std::uint64_t* f : {&d.wait_us, &d.collect_us, &d.prepatch_us, &d.build_us, &d.install_us, &d.rollback_us, &d.postpatch_us, &d.reply_us,
+                             &d.total_us}) {
+        *f = big;
+    }
+    const std::string line = format_hooks_timing(l);
+    // Each chunk used to go through a 160-byte buffer: the install_us .. protect_us chunk alone is wider than that here.
+    CHECK(line.find(" install_us=18446744073709551615 lock_us=18446744073709551615 plan_us=18446744073709551615 probe_us=18446744073709551615 "
+                    "query_us=18446744073709551615 queries=4294967295 protect_us=18446744073709551615 stop_us=") != std::string::npos);
+    const std::string tail = " reply_us=18446744073709551615";
+    REQUIRE(line.size() > tail.size());
+    CHECK(line.compare(line.size() - tail.size(), tail.size(), tail) == 0);
+    CHECK(line.find('\0') == std::string::npos);
+}

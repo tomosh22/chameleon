@@ -77,6 +77,9 @@ public:
     std::set<std::string> pch_files(const ScanRoots& roots);
 
     std::size_t files_read() const noexcept { return files_.size(); }
+    // WP-50: the directories of every path the scan asked about (found or not), normalised. A file appearing in or vanishing
+    // from one of them can change what an include resolves to.
+    const std::vector<std::string>& directories() const noexcept { return dirs_; }
 
     // WP-50 (R-55): what the scan cost. Every distinct path the scan asked about is read once (`files_read()` = found + missing);
     // `read_ms` is the time spent in the file reader (opening, reading, and failing to open the paths that do not exist), `parse_ms`

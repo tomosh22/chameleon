@@ -303,4 +303,60 @@ TEST_CASE("WP-50: an index of the same module file takes the file lists from the
     CHECK(uncached->status().scan_cache == "off");
 }
 
+TEST_CASE("WP-50 (review): a source edited to include a new header, or a skipped member's source that appears, misses the scan cache") {
+    QuietLogs quiet;
+    World w;
+    const auto cache = std::make_shared<ScanCache>();
+    const auto build = [&]() {
+        ModuleIndexSpec spec;
+        spec.module_path = w.exe;
+        spec.scan_includes = true;
+        spec.scan_cache = cache;
+        std::shared_ptr<ModuleIndex> index = ModuleIndex::start(spec);
+        REQUIRE(index->wait(30000));
+        REQUIRE(index->status().state == IndexState::Ready);
+        return index;
+    };
+    const std::string header = pdb::normalize_path(w.dir.file("new.h"));
+    const auto tracks = [](const std::shared_ptr<ModuleIndex>& index, const std::string& f) {
+        const std::vector<std::string> tracked = index->tracked_files();
+        return std::find(tracked.begin(), tracked.end(), f) != tracked.end();
+    };
+    const std::shared_ptr<ModuleIndex> first = build();
+    CHECK(first->status().scan_cache == "cold");
+    CHECK_FALSE(tracks(first, header));
+    CHECK(build()->status().scan_cache == "warm");
+
+    // The source gains an include of a header created for it (as a reload before a hot-restart would have compiled): the module
+    // file is the same, but the stored graph is not, so the index scans again and tracks the new header.
+    write_text(w.dir.file("new.h"), "#pragma once\nint fresh();\n");
+    write_text(w.dir.file("app.cpp"), "#include \"new.h\"\nint app() { return 1; }\n");
+    bump_mtime(w.dir.file("app.cpp"));
+    const std::shared_ptr<ModuleIndex> edited = build();
+    CHECK(edited->status().scan_cache == "cold");
+    CHECK(tracks(edited, header));
+    const std::shared_ptr<ModuleIndex> again = build();
+    CHECK(again->status().scan_cache == "warm");
+    CHECK(tracks(again, header));
+    // An edit of the new header reaches the compiland that includes it (the bug: the stale graph answered nothing).
+    write_text(w.dir.file("new.h"), "#pragma once\nint fresh(int);\n");
+    bump_mtime(w.dir.file("new.h"));
+    Result<ModuleIndex::Sweep> swept = again->sweep();
+    REQUIRE(swept.has_value());
+    CHECK(std::find(swept->compilands.begin(), swept->compilands.end(), kPlain) != swept->compilands.end());
+    again->accept(swept->stamps);
+
+    CHECK(build()->status().scan_cache == "cold");  // new.h changed since the entry was stored
+    const std::shared_ptr<ModuleIndex> settled = build();
+    CHECK(settled->status().scan_cache == "warm");
+
+    // The archive member skipped because its source was missing: the source appears, the member is no longer skipped.
+    REQUIRE(settled->skipped_compilands().size() == 2);
+    write_text(w.dir.file("missing.cpp"), "int missing() { return 1; }\n");
+    const std::shared_ptr<ModuleIndex> appeared = build();
+    CHECK(appeared->status().scan_cache == "cold");
+    REQUIRE(appeared->skipped_compilands().size() == 1);
+    CHECK(appeared->skipped_compilands()[0].compiland == kLibNoEnv);
+}
+
 #endif

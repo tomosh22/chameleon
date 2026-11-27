@@ -1708,10 +1708,7 @@ TEST_CASE("WP-50: the module file is read in the background once the index is re
     rig.enable();
     std::shared_ptr<const pe::OwnedImage> prefetched;
     for (int i = 0; i < 500 && prefetched == nullptr; ++i) {
-        {
-            std::lock_guard<std::mutex> lock(rig.module->mutex);
-            prefetched = rig.module->image;
-        }
+        prefetched = rig.module->image_slot->stored();
         if (prefetched == nullptr) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
@@ -1721,10 +1718,8 @@ TEST_CASE("WP-50: the module file is read in the background once the index is re
     // The reload compares with the copy read in the background: no second read.
     rig.changed();
     REQUIRE(rig.reload().has_value());
-    {
-        std::lock_guard<std::mutex> lock(rig.module->mutex);
-        CHECK((rig.module->image == prefetched));
-    }
+    CHECK((rig.module->image_slot->stored() == prefetched));
+    CHECK(rig.module->image_slot->reads() == 1);
     const ModuleState::ImageRead again = rig.module->ensure_image(false);
     CHECK_FALSE(again.read_now);
     CHECK((again.image == prefetched));
@@ -1738,11 +1733,8 @@ TEST_CASE("WP-50: the module file is read in the background once the index is re
     rig.link->publish(rig.session);
     rig.service->on_session_changed(1);
     CHECK((rig.service->module_state(1, rig.exe) == nullptr));
-    {
-        std::lock_guard<std::mutex> lock(old->mutex);
-        CHECK((old->image == nullptr));
-        CHECK(old->image_released);
-    }
+    CHECK((old->image_slot->stored() == nullptr));
+    CHECK(old->image_slot->released());
     const ModuleState::ImageRead late = old->ensure_image(true);
     CHECK_FALSE(late.read_now);
     CHECK((late.image == nullptr));
@@ -1750,10 +1742,108 @@ TEST_CASE("WP-50: the module file is read in the background once the index is re
     const ModuleState::ImageRead own = old->ensure_image(false);
     CHECK(own.read_now);
     CHECK((own.image != nullptr));
+    CHECK((old->image_slot->stored() == nullptr));
+}
+
+TEST_CASE("WP-50 (review): a disable during the background read destroys the state on the disabling thread at once; the read keeps nothing") {
+    QuietLogs quiet;
+    // Declared before the rig: the service's reader thread may call the hook until the rig is gone.
+    std::mutex m;
+    std::condition_variable cv;
+    bool entered = false;
+    bool go = false;
+    Rig rig;
+    rig.option("prefetch_module_image", Value::boolean(true));
+    rig.service->set_prefetch_hook_for_testing([&] {
+        std::unique_lock<std::mutex> lock(m);
+        entered = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return go; });
+    });
+    rig.enable();
     {
-        std::lock_guard<std::mutex> lock(old->mutex);
-        CHECK((old->image == nullptr));
+        std::unique_lock<std::mutex> lock(m);
+        REQUIRE_MESSAGE(cv.wait_for(lock, std::chrono::seconds(10), [&] { return entered; }), "the background read did not start");
     }
+    // The reader is about to read (it waits in the hook). It holds the slot, not the state.
+    const std::weak_ptr<ModuleState> weak = rig.module;
+    const std::weak_ptr<ModuleIndex> index = rig.module->index;
+    const std::shared_ptr<ModuleImageSlot> slot = rig.module->image_slot;
+    rig.module.reset();
+    ipc::DisableModule disable;
+    disable.request_id = 9;
+    disable.path = rig.exe;
+    rig.session.on_message(disable);
+    rig.link->publish(rig.session);
+    rig.service->on_session_changed(1);
+    CHECK(weak.expired());   // destroyed here, by the disabling thread, while the read is still pending
+    CHECK(index.expired());  // its index joined and its PDB released with it
+    CHECK(slot->released());
+    {
+        std::lock_guard<std::mutex> lock(m);
+        go = true;
+    }
+    cv.notify_all();
+    // The read finds the slot released: it reads nothing and stores nothing.
+    for (int i = 0; i < 50; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(slot->reads() == 0);
+    CHECK((slot->stored() == nullptr));
+    rig.service->set_prefetch_hook_for_testing(nullptr);
+}
+
+TEST_CASE("WP-50 (review): the background read is queued once per state, on the change into Ready") {
+    QuietLogs quiet;
+    std::atomic<int> reads{0};
+    Rig rig;
+    rig.option("prefetch_module_image", Value::boolean(true));
+    rig.service->set_prefetch_hook_for_testing([&] { ++reads; });
+    rig.enable();
+    for (int i = 0; i < 500 && rig.module->image_slot->stored() == nullptr; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    REQUIRE((rig.module->image_slot->stored() != nullptr));
+    // Later reloads queue no further read, and the reload uses the copy (the guard also holds should Ready be reported again).
+    rig.changed();
+    REQUIRE(rig.reload().has_value());
+    rig.unchanged();
+    REQUIRE(rig.reload().has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(reads.load() == 1);
+    CHECK(rig.module->image_slot->reads() == 1);
+    rig.service->set_prefetch_hook_for_testing(nullptr);
+}
+
+TEST_CASE("WP-50 (review): a reload of a released state reads the module file once for all of its units") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.option("narrow_hooks", Value::boolean(false));  // both units patch
+    // The state is released while a reload runs on it (disabled meanwhile): nothing is stored, so each unit used to read again.
+    rig.module->release_image();
+    rig.changed_both();
+    rig.second_object = make_object();
+    Result<Value> r = rig.reload();
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    REQUIRE(rig.module->batches.size() == 1);
+    CHECK(rig.module->batches[0].patches.size() == 2);
+    CHECK(rig.module->image_slot->reads() == 1);
+    CHECK((rig.module->image_slot->stored() == nullptr));
+}
+
+TEST_CASE("WP-50 (review): the units of a reload share the stored copy: one read for two units, none for the next reload") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.option("narrow_hooks", Value::boolean(false));
+    rig.changed_both();
+    rig.second_object = make_object();
+    REQUIRE(rig.reload().has_value());
+    CHECK(rig.module->image_slot->reads() == 1);
+    rig.changed();
+    REQUIRE(rig.reload().has_value());
+    CHECK(rig.module->image_slot->reads() == 1);
 }
 
 TEST_CASE("WP-50: a module file that cannot be read is reported by the read, not stored") {
@@ -1763,7 +1853,7 @@ TEST_CASE("WP-50: a module file that cannot be read is reported by the read, not
     CHECK(background.read_now);
     CHECK((background.image == nullptr));
     CHECK(background.error.has_value());
-    CHECK((state.image == nullptr));
+    CHECK((state.image_slot->stored() == nullptr));
 }
 
 TEST_CASE("disabling a module or losing the agent drops its state") {
@@ -3383,8 +3473,7 @@ void use_rich_module_file(Rig& rig) {
     std::ofstream out(rig.exe, std::ios::binary | std::ios::trunc);
     out.write(reinterpret_cast<const char*>(pe.data()), static_cast<std::streamsize>(pe.size()));
     out.close();
-    std::lock_guard<std::mutex> lock(rig.module->mutex);
-    rig.module->image.reset();  // the pipeline reads the file again
+    rig.module->image_slot->forget_for_testing();  // the pipeline reads the file again
 }
 
 Value module_report(const Value& result) { return result.find("patches")->items().at(0); }

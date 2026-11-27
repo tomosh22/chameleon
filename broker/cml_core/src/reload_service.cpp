@@ -481,10 +481,12 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
         const std::string name = state->name;
         const std::weak_ptr<ModuleState> weak_state = state;
         const bool prefetch = options.prefetch_module_image;
-        spec.on_change = [this, name, weak_state, prefetch](const IndexStatus& s) {
+        // WP-50: the read is queued once, on the change into Ready (a Ready index reports again on later status changes).
+        const auto prefetch_queued = std::make_shared<std::atomic<bool>>(false);
+        spec.on_change = [this, name, weak_state, prefetch, prefetch_queued](const IndexStatus& s) {
             if (s.state == IndexState::Ready) {
                 rearm_save_watcher();  // its tracked files are known now (compile-on-save)
-                if (prefetch) {
+                if (prefetch && !prefetch_queued->exchange(true)) {
                     queue_image_prefetch(weak_state);  // WP-50 (R-47): only once the index is Ready
                 }
             }
@@ -773,20 +775,47 @@ void ReloadService::prefetch_loop() {
             next = std::move(prefetch_queue_.front());
             prefetch_queue_.pop_front();
         }
-        const std::shared_ptr<ModuleState> state = next.lock();
-        if (!state) {
-            continue;  // dropped before its turn
+        std::shared_ptr<ModuleImageSlot> slot;
+        std::string path;
+        std::string name;
+        {
+            const std::shared_ptr<ModuleState> state = next.lock();
+            if (!state) {
+                continue;  // dropped before its turn
+            }
+            slot = state->image_slot;
+            path = state->path;
+            name = state->name;
         }
-        const ModuleState::ImageRead read = state->ensure_image(true);
+        // The state is not held from here on: a disable that drops it meanwhile destroys it on the disabling thread at once
+        // (its index joined, its PDB released), and it released the slot first, so this read stores nothing.
+        std::function<void()> hook;
+        {
+            std::lock_guard<std::mutex> lock(prefetch_mutex_);
+            hook = prefetch_hook_;
+        }
+        if (hook) {
+            hook();
+        }
+        const ModuleState::ImageRead read = slot->ensure(path, true);
+        const bool gone = next.expired();
+        if (gone) {
+            slot->release();  // a state dropped without a release (none does today): the copy goes with this slot
+        }
         if (read.read_now) {
-            CML_LOG(Info, "WP50-ONEOFF what=module-image image=background module=%s ms=%.1f mib=%.1f ok=%d", state->name.c_str(), read.ms, read.mib,
-                    read.image ? 1 : 0);
+            CML_LOG(Info, "WP50-ONEOFF what=module-image image=background module=%s ms=%.1f mib=%.1f ok=%d kept=%d", name.c_str(), read.ms, read.mib,
+                    read.image ? 1 : 0, !gone && read.image && !slot->released() ? 1 : 0);
             if (read.error) {
                 // Not a failure: the first reload reads the file itself and warns (CML5313) if it still cannot.
-                CML_LOG(Debug, "reload: background read of %s: %s", state->path.c_str(), read.error->format().c_str());
+                CML_LOG(Debug, "reload: background read of %s: %s", path.c_str(), read.error->format().c_str());
             }
         }
     }
+}
+
+void ReloadService::set_prefetch_hook_for_testing(std::function<void()> hook) {
+    std::lock_guard<std::mutex> lock(prefetch_mutex_);
+    prefetch_hook_ = std::move(hook);
 }
 
 void ReloadService::queue_reapply(ReapplyItem item) {

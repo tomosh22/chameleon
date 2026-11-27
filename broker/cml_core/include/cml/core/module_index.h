@@ -110,6 +110,20 @@ std::string stamp_difference(const ModuleFileStamp& cached, const ModuleFileStam
 // The stamp of `module_path` indexed as `index`; nullopt when the file cannot be stat'ed.
 std::optional<ModuleFileStamp> module_file_stamp(const std::string& module_path, const pdb::PdbIndex& index, bool scan_includes);
 
+// WP-50 (review): one file or directory a scan result depends on, as it was when the scan ended. `exists` false records a path
+// whose absence the result depends on; a directory records only its last-write time (a file created in or removed from it).
+struct ScanInput {
+    std::string path;
+    bool exists = false;
+    bool directory = false;
+    std::uint64_t size = 0;
+    long long mtime = 0;
+};
+// What `path` is now.
+ScanInput probe_scan_input(const std::string& path);
+// "" when every input is still as recorded, else the first path that differs (changed, created or removed).
+std::string changed_scan_input(const std::vector<ScanInput>& inputs);
+
 // What the file-list and include-scan phase of an index build produces (all of it depends only on the PDB, the compile
 // commands it records and the files on disk).
 struct ScanResult {
@@ -119,6 +133,9 @@ struct ScanResult {
     std::set<std::uint32_t> pch_unverified;
     std::vector<SkippedCompiland> skipped;
     std::set<std::uint32_t> skipped_set;
+    // Every file the result was built from (the tracked files, the skipped compilands' sources found absent) and every
+    // directory the include search looked in: a cache hit re-checks them all (ScanCache::find).
+    std::vector<ScanInput> inputs;
     IncludeScanner::Stats stats;  // of the scan that produced it
     std::size_t files_read = 0;
     double scan_ms = 0;
@@ -126,13 +143,14 @@ struct ScanResult {
 
 // WP-50 (R-55): the scan results of the module files this session indexed, so that a module indexed again (the new process of a
 // hot-restart, a module freed and loaded again, a second process of the same executable) is not scanned again while its file is
-// unchanged. The graph is the one the first index of that file built: exactly what the session's reloads of the first instance
-// used (no index is ever re-scanned after a reload either). A stamp that differs replaces the entry. Thread-safe; at most
-// kMaxEntries module files (the least recently used goes).
+// unchanged. A hit also requires every input of the stored scan (ScanResult::inputs) to be as it was: a source edited since (a
+// new #include), a header created or removed, a skipped compiland's source that appeared all make it a miss, and the new scan
+// replaces the entry. Thread-safe; at most kMaxEntries module files (the least recently used goes).
 class ScanCache {
 public:
     static constexpr std::size_t kMaxEntries = 32;
-    // The entry of `module_path` when its stamp equals `stamp`; otherwise null and `*reason` is "absent" or stamp_difference().
+    // The entry of `module_path` when its stamp equals `stamp` and its inputs are unchanged; otherwise null and `*reason` is
+    // "absent", stamp_difference() or "file-changed:<path>". The inputs are checked outside the lock.
     std::shared_ptr<const ScanResult> find(const std::string& module_path, const ModuleFileStamp& stamp, std::string* reason);
     void store(const std::string& module_path, const ModuleFileStamp& stamp, std::shared_ptr<const ScanResult> result);
     std::size_t size() const;

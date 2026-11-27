@@ -37,12 +37,15 @@ revert, restart).
      pdb_*_ms=...`: the plan stage of one recompiled object, split up (`image_ms` is near 0 once the module file was read in
      the background).
    * `WP50-ONEOFF what=module-image|linker-detection|reserve-range ms=...`: work done once per module at its first reload.
-     The module file is normally read in the background once the index is ready (`image=background`); `image=reload` means
-     the first reload had to read it itself (set-option `prefetch_module_image` false, or the reload came first).
-   * `WP50-SCAN-CACHE hit|miss module=... reason=...`: whether an index took the file lists and include graph of an earlier
-     index of the same module file (a hot-restart's new process, a module loaded again). `miss reason=size|mtime|pdb` means the
-     module file was rebuilt since; `absent` that this broker had not indexed it before. Set-option `cache_include_scan` false
-     scans every time.
+     The module file is normally read in the background once the index is ready (`image=background`; `kept=0` when the
+     module was disabled during the read, whose copy is then dropped); `image=reload` means the first reload had to read it
+     itself (set-option `prefetch_module_image` false, the reload came first, or the module was disabled while it ran).
+   * `WP50-SCAN-CACHE hit|miss module=... reason=... inputs=... check_ms=...`: whether an index took the file lists and include
+     graph of an earlier index of the same module file (a hot-restart's new process, a module loaded again). `miss
+     reason=size|mtime|pdb` means the module file was rebuilt since; `absent` that this broker had not indexed it before;
+     `file-changed:<path>` that a file the earlier scan read, or a directory it searched, changed since (an edited source, a
+     header created or removed), so the graph may be stale and is built again. On a hit, `inputs` files and directories were
+     checked in `check_ms`. Set-option `cache_include_scan` false scans every time.
    * The two set-options of WP-50 (control command `set-option {"name":..., "value": true|false}`, both default `true`):
      `prefetch_module_image` (read the module file for the function comparison in the background once its index is
      ready; applies to modules enabled afterwards) and `cache_include_scan` (reuse the file lists and include graph of an unchanged

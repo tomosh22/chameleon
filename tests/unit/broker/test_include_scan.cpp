@@ -1,7 +1,11 @@
 // WP-15: the include scan that maps headers to compilands independently of the PDB's file list (ADR-0013).
 #include "doctest.h"
 
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <map>
+#include <memory>
 #include <string>
 
 #include "cml/core/include_scan.h"
@@ -371,4 +375,86 @@ TEST_CASE("WP-50: the scan cache hits only for the same module stamp; a changed 
     CHECK((cache.find("C:\\Game\\bin\\game.exe", relinked, &reason) == second));
     CHECK((cache.find("C:\\other\\m1.dll", stamp, &reason) == nullptr));
     CHECK(reason == "absent");
+}
+
+TEST_CASE("WP-50 (review): a scan cache hit re-checks every input: an edited source, a created or removed file, a changed directory miss") {
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() /
+                          ("cml_scan_inputs_" + std::to_string(static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count() & 0xFFFFFFF)));
+    fs::create_directories(root / "src");
+    struct Cleanup {
+        fs::path p;
+        ~Cleanup() {
+            std::error_code ec;
+            fs::remove_all(p, ec);
+        }
+    } cleanup{root};
+    const auto write = [](const fs::path& p, const std::string& text) {
+        std::ofstream out(p, std::ios::binary | std::ios::trunc);
+        out << text;
+    };
+    const std::string source = (root / "src" / "a.cpp").string();
+    const std::string header = (root / "src" / "a.h").string();
+    const std::string later = (root / "src" / "later.cpp").string();  // absent when scanned
+    const std::string dir = (root / "src").string();
+    write(source, "#include \"a.h\"\nint a() { return 1; }\n");
+    write(header, "#pragma once\n");
+
+    ScanCache cache;
+    ModuleFileStamp stamp;
+    stamp.size = 4096;
+    stamp.mtime = 1700000000;
+    const std::string exe = "C:\\Game\\bin\\game.exe";
+    const auto stored = [&]() {
+        auto result = std::make_shared<ScanResult>();
+        result->inputs = {probe_scan_input(source), probe_scan_input(header), probe_scan_input(later), probe_scan_input(dir)};
+        cache.store(exe, stamp, result);
+        return result;
+    };
+    auto entry = stored();
+    CHECK(entry->inputs[0].exists);
+    CHECK_FALSE(entry->inputs[0].directory);
+    CHECK(entry->inputs[0].size > 0);
+    CHECK_FALSE(entry->inputs[2].exists);
+    CHECK(entry->inputs[3].directory);
+    CHECK(changed_scan_input(entry->inputs).empty());
+    std::string reason;
+    CHECK((cache.find(exe, stamp, &reason) == entry));
+    CHECK(reason.empty());
+
+    // The source gains `#include "new.h"` (and new.h is created): the same module stamp, a miss naming the source.
+    write(source, "#include \"a.h\"\n#include \"new.h\"\nint a() { return 1; }\n");
+    write(root / "src" / "new.h", "#pragma once\n");
+    CHECK((cache.find(exe, stamp, &reason) == nullptr));
+    CHECK(reason == "file-changed:" + source);
+    CHECK(cache.size() == 1);  // kept until the new scan replaces it
+
+    // Only the time changed (same size): a miss.
+    entry = stored();
+    std::error_code ec;
+    fs::last_write_time(fs::path(header), fs::last_write_time(fs::path(header), ec) + std::chrono::seconds(2), ec);
+    CHECK((cache.find(exe, stamp, &reason) == nullptr));
+    CHECK(reason == "file-changed:" + header);
+
+    // A path the result found absent appears.
+    entry = stored();
+    write(later, "int later() { return 2; }\n");
+    CHECK((cache.find(exe, stamp, &reason) == nullptr));
+    CHECK(reason == "file-changed:" + later);
+
+    // A file the result read disappears.
+    entry = stored();
+    fs::remove(fs::path(header), ec);
+    CHECK((cache.find(exe, stamp, &reason) == nullptr));
+    CHECK(reason == "file-changed:" + header);
+
+    // Only the directory changed (a file created or removed in it, where an include could now resolve): a miss. The time is set
+    // explicitly so that the test does not depend on the file system's timestamp resolution.
+    entry = stored();
+    CHECK((cache.find(exe, stamp, &reason) == entry));
+    fs::last_write_time(fs::path(dir), fs::last_write_time(fs::path(dir), ec) + std::chrono::seconds(2), ec);
+    CHECK((cache.find(exe, stamp, &reason) == nullptr));
+    CHECK(reason == "file-changed:" + dir);
+    entry = stored();
+    CHECK((cache.find(exe, stamp, &reason) == entry));
 }

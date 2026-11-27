@@ -398,6 +398,56 @@ TEST_CASE("WP-50: the timing of an InstallHooks reaches the broker as a Log line
     agent.stop_and_wait_for_calls();
 }
 
+TEST_CASE("WP-50 (review): in synchronised mode the timing line queued by the SyncPoint thread still reaches the broker before its answer") {
+    Rig rig;
+    const std::string pipe = unique_pipe_name();
+    FakeBroker broker(pipe);
+    REQUIRE(broker.listening());
+    ScopedPipeEnv env(pipe);
+    set_window_probe(false);
+
+    Agent agent(CML_MODE_SYNCHRONIZED);
+    REQUIRE(agent.start().has_value());
+    REQUIRE(broker.handshake());
+
+    // The application thread (here: this one) calls SyncPoint while the agent thread serves the pipe; the line and the answer
+    // are queued by this thread, at any point of the agent thread's pass. Every round: the line arrives, and before the answer.
+    for (std::uint64_t round = 0; round < 12; ++round) {
+        const std::uint64_t id = 60 + round;
+        const bool revert = (round % 2) == 1;
+        REQUIRE(broker.send(revert ? request(id, ipc::kInstallHooksRevert, {{rig.old_fn.entry, nullptr}})
+                                   : request(id, 0, {{rig.old_fn.entry, rig.new_1.entry}})));
+        const std::string wanted = "WP50-HOOKS side=agent request=" + std::to_string(id) + " ";
+        bool line_seen = false;
+        std::optional<ipc::HooksInstalled> answer;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        while (!answer && std::chrono::steady_clock::now() < deadline) {
+            agent.sync_point();
+            for (;;) {
+                std::optional<ipc::Message> message = broker.receive(20);
+                if (!message) {
+                    break;
+                }
+                if (const auto* log = std::get_if<ipc::Log>(&*message)) {
+                    line_seen = line_seen || log->text.rfind(wanted, 0) == 0;
+                } else if (const auto* got = std::get_if<ipc::HooksInstalled>(&*message); got != nullptr && got->request_id == id) {
+                    answer = *got;
+                    break;
+                } else if (const auto* list = std::get_if<ipc::ModuleList>(&*message)) {
+                    ipc::Reply reply;
+                    reply.request_id = list->request_id;
+                    broker.send(reply);
+                }
+            }
+        }
+        REQUIRE(answer.has_value());
+        CHECK(answer->status == 0);
+        CHECK_MESSAGE(line_seen, "round " << round << ": the WP50-HOOKS line did not arrive before its answer");
+    }
+    CHECK(snapshot(rig.old_fn.entry - 16, 64) == rig.original);
+    agent.stop_and_wait_for_calls();
+}
+
 TEST_CASE("synchronised mode: the hooks are applied inside SyncPoint on the calling thread") {
     Rig rig;
     const std::string pipe = unique_pipe_name();
