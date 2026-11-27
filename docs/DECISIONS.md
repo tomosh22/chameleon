@@ -1438,6 +1438,11 @@ judged redundant or as a reload, the agent checks, under the installer's mutex a
 it wrote at that module's recorded targets are still in memory: present means the image is the live, hooked one (redundant; never
 `forget_range`), absent means it was replaced (report Unloaded then Loaded). A module with no hook records carries no edit a reload
 could lose, so either answer is safe for it. Snapshot timing heuristics may stay as hints but never override the check.
+**Refined (WP-48 final check):** the check is per record and three-way, in one call under the installer's mutex that also does the
+forgetting: bytes equal to what the agent wrote → live; bytes equal to the record's saved original bytes (a fresh image at the same
+base) → replaced, and only those records are forgotten; anything else (a debugger's int3, a third-party detour) → not proof of a
+replacement, the record is kept and a warning logged. An image counts as replaced when at least one record reads as original. A stale
+unload is re-checked for a bounded time (about 2 s), not a number of polls.
 
 ### WP-49: hook narrowing verifies jump tables (R-46)
 
