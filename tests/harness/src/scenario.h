@@ -48,6 +48,9 @@ struct Step {
     std::string patch;     // Edit: path relative to the fixture directory
     std::string id;        // ExpectDiag: "CML3101"
     std::string event;     // ExpectEvent: "patch_applied"
+    // ExpectEvent (WP-47): no event of that name may arrive within `within_s` (the events not consumed since the last
+    // expect_event are read too, so a refused reload's events are checked after it answered).
+    bool event_absent = false;
     std::string option;    // SetOption: option name
     enum class OptionKind { Bool, Integer, String } option_kind = OptionKind::Bool;
     bool option_bool = false;
