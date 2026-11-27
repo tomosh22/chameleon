@@ -720,8 +720,11 @@ bool Agent::send_module_list(ipc::PipeConnection& connection, bool session_start
             // A list sent again (the last one was refused, or could not be built): the broker believes module_track_.known. What was
             // held back and drained now is reported against that first, like any poll (an unload and a load at one base stay two
             // changes; the hook bytes decide what is live), so no older event is applied after the list. Then the list replaces it.
+            // A list is only sent again while full_list_pending_ is set, so the broker's view is not a full list: the pre-report is an
+            // untrusted poll, which also reports the snapshot diff against that view at once (an empty one after a first list that
+            // could not be built), exactly as poll_modules does in that state.
             const ModulePollReport pre =
-                track_modules(module_track_, before_list, 0, &snapshot, /*quiet=*/false, /*known_trusted=*/true, hook_probe());
+                track_modules(module_track_, before_list, 0, &snapshot, /*quiet=*/false, /*known_trusted=*/false, hook_probe());
             if (!send_module_report(connection, pre)) {
                 return false;
             }
