@@ -20,8 +20,9 @@
 // WP-47 (ADR-0044): all or nothing over the module's compilands. plan .. fix-ups run for EVERY recompiled compiland
 // first (each planned against the ones staged before it, as if they were applied); only then load .. hooks run, per
 // compiland. A refusal while preparing applies nothing (CML3650 for a reload of several compilands); a failure while
-// applying rolls back what the reload applied (the WP-22 revert of its batch; CML3651, CML3652 when that fails too),
-// except after hooks that may still become live (CML5309 / CML4656: the reload stops there, CML3653). `patch_applied`
+// applying rolls back what the reload applied (the WP-22 revert of its batch; CML3651; CML3652 when that fails, CML3654 when it is not confirmed),
+// except after hooks that may still become live (CML5309 / CML4656: the reload stops there, CML3653) or when the agent
+// is gone (CML3655: nothing re-baselined or announced). `patch_applied`
 // is published when the reload's compilands are live, never for one that was rolled back. docs/wp/WP-47.md.
 //
 // The external effects (compiler, linker) are in PipelineEnv so the orchestration is unit-tested on every host
@@ -129,6 +130,9 @@ struct PatchReport {
     std::size_t initializers = 0;   // requested
     std::size_t initializers_run = 0;
     std::size_t load_attempts = 0;
+    // WP-47: the most COFF objects of recompiled compilands the reload held at once (each is dropped once it is linked, so this
+    // stays 1 however many compilands a header fan-out recompiles; a relink of a compiland holds its object again).
+    std::size_t objects_held_peak = 0;
     std::uint64_t base = 0;
     std::uint32_t image_size = 0;
     std::string dll_path;

@@ -22,5 +22,12 @@ inline constexpr std::uint32_t kRollbackFailed = 3652;
 // compiland may still become live and cannot be rolled back, so the reload stopped there and the compilands after it were not
 // applied; the process may run a part of the edit.
 inline constexpr std::uint32_t kStoppedPartly = 3653;
+// (error) Applying a compiland failed and the roll-back of the compilands applied before it was sent but not confirmed: the agent did
+// not confirm the hook changes in time (CML5852, synchronised mode) or did not un-commit the rolled-back images (CML5855). The broker's
+// state follows the roll-back (as `revert` does in that case); the process may run a part of the edit until the agent applies it.
+inline constexpr std::uint32_t kRollbackUnconfirmed = 3654;
+// (warning) The agent disconnected while a reload of several compilands was being applied: the compilands applied before stay
+// recorded (nothing could be rolled back), the others were not applied, and none of their files is re-baselined.
+inline constexpr std::uint32_t kAgentLostPartly = 3655;
 
 }  // namespace cml::core::atomic_reload::diag

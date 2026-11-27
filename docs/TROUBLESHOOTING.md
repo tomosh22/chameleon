@@ -1210,16 +1210,17 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 
 ### CML3651
 
-- **Cause:** (warning) A reload of several translation units failed while it was being applied (the agent refused to load a patch, a fix-up, an initialiser or the hooks of one of them, or the reload ran out of time between two of them) after one or more of its translation units had already been applied. Those were rolled back with the patch revert of WP-22: functions that an older patch had hooked jump to that patch again, the others get their original bytes back, the patch images are un-committed (they stay loaded, as after `revert`), and the broker's registry, hook table and generation go back. No `patch_applied` event was published for them. The failure itself is the reload's error.  
+- **Cause:** (warning) A reload of several translation units failed while it was being applied (the agent refused to load a patch, a fix-up, an initialiser or the hooks of one of them, or the reload ran out of time between two of them) after one or more of its translation units had already been applied. Those were rolled back with the patch revert of WP-22: functions that an older patch had hooked jump to that patch again, the others get their original bytes back, the patch images are un-committed (they stay loaded, as after `revert`), and the broker's registry, hook table and generation go back. No `patch_applied` event was published for them. The failure itself is the reload's error. Raised only when the agent confirmed every step of the roll-back; otherwise the reload's error is `CML3654`.  
 - **Message:** `applying compiland <...> of <...> of <...> (<...>, <...>) failed, so the <...> compiland(s) this reload had applied were rolled back (<...> function(s) back to the original code, <...> re-pointed at an older patch): the process runs what it ran before the reload`  
 - **What to do:** Fix what the failure names, then reload: the whole edit is applied then.  
 - **Raised by:** `broker/cml_core/include/cml/core/atomic_reload_diag_ids.h`
 
 ### CML3652
 
-- **Cause:** A reload of several translation units failed while it was being applied, and rolling back the translation units it had already applied failed as well (the agent refused the revert of the hooks, for example because a thread would not leave a function, `CML5851`; the message carries both diagnostics). The program runs a part of the edit. The applied patches stay recorded as the reload's batch, so a `revert` can undo them later; their files are not taken into the baseline, so the next reload compiles them again.  
-- **Message:** `applying compiland <...> of <...> of <...> (<...>) failed (<...>) and rolling back the <...> compiland(s) this reload had applied failed too (<...>): the process runs a part of the edit`  
+- **Cause:** A reload of several translation units failed while it was being applied, and rolling back the translation units it had already applied failed as well (the agent refused the revert of the hooks, for example because a thread would not leave a function, `CML5851`; the message carries both diagnostics). The program runs a part of the edit. The applied patches stay recorded as the reload's batch, so a `revert` can undo them later (unless the module is no longer loaded where they were made, `CML5856`: then its patch list was dropped and the message says so); their files are not taken into the baseline, so the next reload compiles them again.  
+- **Message:** `applying compiland <...> of <...> of <...> (<...>) failed (<...>) and rolling back the <...> compiland(s) this reload had applied failed too (<...>): the process runs a part of the edit; they stay recorded as this reload's batch` (or `...; the module's patch list was dropped`)  
 - **What to do:** Send `revert` (scope last) to try the roll-back again, or restart the application.  
+  Other variants of the advice: Restart the application, or enable the module again and reload.  
 - **Raised by:** `broker/cml_core/include/cml/core/atomic_reload_diag_ids.h`
 
 ### CML3653
@@ -1229,6 +1230,19 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 - **What to do:** In synchronised mode let the application reach SyncPoint(), then reload (the files of the compilands that were not applied are compiled again), or `revert` this reload.  
 - **Raised by:** `broker/cml_core/include/cml/core/atomic_reload_diag_ids.h`
 
+### CML3654
+
+- **Cause:** A reload of several translation units failed while it was being applied, and the roll-back of the translation units it had already applied (the WP-22 revert, see `CML3651`) was sent but not confirmed: the agent did not confirm the hook changes in time (`CML5852`: synchronised mode, the application did not reach `SyncPoint()`), or did not un-commit the rolled-back patch images (`CML5855`: an older agent). The broker's state follows the roll-back, as it does for `revert` in that case: the agent may still apply the hook changes at the next `SyncPoint()`, and the application hooks (`CML_PREPATCH_HOOK`, ...) of patches that were not un-committed may keep running. Until then the program may run a part of the edit. Nothing of the reload is taken into the baseline or announced with `patch_applied`; the message carries both the failure and the warnings of the roll-back.
+- **Message:** `applying compiland <...> of <...> of <...> (<...>) failed (<...>) and the roll-back of the <...> compiland(s) this reload had applied was sent but not confirmed (<...>): the broker's state follows the roll-back, and the process may run a part of the edit until the agent applies it`
+- **What to do:** In synchronised mode let the application reach SyncPoint(); if the application's hooks of the rolled-back patches keep running, restart the application.
+- **Raised by:** `broker/cml_core/include/cml/core/atomic_reload_diag_ids.h`
+
+### CML3655
+
+- **Cause:** (warning) The agent disconnected (the application exited or crashed, or its pipe broke) while a reload of several translation units was being applied. The translation units applied before that stay recorded as the reload's batch, the others were not applied, and nothing could be rolled back. None of the reload's files is taken into the baseline and no `patch_applied` is published, so if the application still runs and the module is enabled again, the next reload compiles them again. The disconnection itself is the reload's error (`CML5317`, or the failure of the request that was in flight).
+- **Message:** `the agent of process <...> disconnected while compiland <...> of <...> of <...> (<...>, <...>) was applied: <...> compiland(s) of the reload were applied before it, <...> were not, and nothing could be rolled back; if the process still runs, it runs a part of the edit`
+- **What to do:** Restart the application (or hot-restart it); if it still runs, enable the module again and reload: the reload's files are compiled again.
+- **Raised by:** `broker/cml_core/include/cml/core/atomic_reload_diag_ids.h`
 
 ## CML4200 to CML4299
 

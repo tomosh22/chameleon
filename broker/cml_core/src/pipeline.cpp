@@ -21,6 +21,7 @@
 #include "cml/core/patch_image.h"
 #include "cml/core/pipeline_diag_ids.h"
 #include "cml/core/revert.h"
+#include "cml/core/revert_diag_ids.h"
 #include "cml/core/static_lib_diag_ids.h"
 #include "cml/toolchain/rewrite.h"
 #include "cml/util/hash.h"
@@ -113,6 +114,7 @@ ipc::json::Value to_json(const PatchReport& r) {
     v.set("initializers", n(r.initializers));
     v.set("initializers_run", n(r.initializers_run));
     v.set("load_attempts", n(r.load_attempts));
+    v.set("objects_held_peak", n(r.objects_held_peak));  // WP-47
     char buf[32];
     std::snprintf(buf, sizeof buf, "0x%llx", static_cast<unsigned long long>(r.base));
     v.set("base", Value::string(buf));
@@ -315,6 +317,8 @@ private:
     struct Staged;
     std::vector<std::unique_ptr<Staged>> staged_;
     std::vector<Event> applied_events_;
+    bool hold_back_ = false;  // WP-47: the agent went away while applying: no file of the reload is re-baselined, nothing is announced
+    std::optional<std::size_t> reprepare_failed_;  // WP-47: the compiland whose preparation after a relink failed
     const pdb::PdbIndex* pdb_ = nullptr;
     std::string workdir_;
     std::vector<Unit>* units_ = nullptr;
@@ -627,9 +631,9 @@ private:
         std::map<std::uint32_t, bool> unit_ok;
         bool before_applied = true;  // every compiland with effect so far was applied
         for (const std::unique_ptr<Staged>& s : staged_) {
-            const bool ok = s->prepared && (s->has_effect ? s->applied : (!s->after_pending || before_applied));
+            const bool ok = s->prepared && (s->has_effect ? (s->applied && !hold_back_) : (!s->after_pending || before_applied));
             unit_ok[units[s->unit].compiland] = ok;
-            before_applied = before_applied && (!s->has_effect || s->applied);
+            before_applied = before_applied && (!s->has_effect || (s->applied && !hold_back_));
         }
         std::map<std::string, FileStamp> accepted;
         for (const auto& entry : swept->file_compilands) {
@@ -886,6 +890,8 @@ private:
             return fail("plan", object.error());
         }
         s.object = std::make_unique<coff::OwnedObject>(std::move(*object));
+        report.objects_held_peak = std::max<std::size_t>(report.objects_held_peak, static_cast<std::size_t>(std::count_if(
+            staged_.begin(), staged_.end(), [](const std::unique_ptr<Staged>& t) { return t->object != nullptr; })));
         std::shared_ptr<const pe::OwnedImage> image = module_image(report);
         FileProcessModules process_modules(snapshot_.modules, LoadedModule{module_.path, module_.base, module_.size}, ctx_.exports, image);
         const OverlayRegistry registry(*this);
@@ -1001,6 +1007,7 @@ private:
             CML_LOG(Trace, "reload: compiland %s%s prepared: nothing to load%s", unit_name(s).c_str(), unit_suffix(s).c_str(),
                     s.after_pending ? " (compared with a compiland staged before it)" : "");
             s.prepared = true;
+            release_prepared(s);
             return Result<void>();
         }
 
@@ -1097,7 +1104,20 @@ private:
                 s.hooks.size(), plan.new_functions.size(), plan.new_globals.size(), hex(s.linked.base).c_str(),
                 s.after_pending ? " (planned against the compilands staged before it)" : "");
         s.prepared = true;
+        release_prepared(s);
         return Result<void>();
+    }
+
+    // Drops what only prepare() and link() need: the COFF object (with its /Z7 debug sections), the plan, the narrowed hooks and the
+    // link inputs. A header fan-out over hundreds of compilands must not hold every object until the reload ends (the sequential
+    // pipeline freed each one in turn). What the apply and the overlay need stays: the fix-ups, the hook table, the code records and
+    // the registry entries. A relink prepares the compiland again from its object file.
+    void release_prepared(Staged& s) {
+        s.object.reset();
+        s.plan = bind::BindPlan{};
+        std::vector<bind::HookEntry>().swap(s.hooks);
+        std::vector<coff::SectionLocator>().swap(s.locators);
+        std::vector<coff::BindSymbol>().swap(s.binds);
     }
 
     // The first of `errors` (each one published as a diag event), else `fallback`.
@@ -1274,7 +1294,7 @@ private:
     // Applying compiland `k` failed (its own patch is already unloaded, or kept when it may still become live). Rolls back what the
     // reload applied before it, unless that patch may still become live (it cannot be rolled back) or the agent is gone.
     Diag after_apply_failure(Diag d, std::size_t k, std::uint64_t generation_before) {
-        const Staged& s = *staged_[k];
+        const Staged& s = *staged_[reprepare_failed_.value_or(k)];  // the compiland that failed: k, or one prepared again after its relink
         std::size_t with_effect = 0;
         for (const std::unique_ptr<Staged>& t : staged_) {
             with_effect += t->has_effect ? 1 : 0;
@@ -1307,8 +1327,22 @@ private:
             return d;
         }
         if (link_.closed()) {
-            CML_LOG(Trace, "reload: applying compiland %s%s failed (%s) and the agent is gone: the %zu applied compiland(s) stay recorded", unit_name(s).c_str(),
-                    unit_suffix(s).c_str(), d.id().c_str(), applied_.size());
+            // Nothing can be rolled back or confirmed any more: the applied compilands stay recorded (the batch), but none of the
+            // reload's files is re-baselined and no `patch_applied` is published (hold_back_).
+            const std::size_t left = with_effect - applied;
+            CML_LOG(Trace, "reload: applying compiland %s%s failed (%s) and the agent is gone: %zu applied compiland(s) stay recorded, %zu not applied",
+                    unit_name(s).c_str(), unit_suffix(s).c_str(), d.id().c_str(), applied, left);
+            hold_back_ = true;
+            applied_events_.clear();
+            emit(Diag::make(ar::kAgentLostPartly,
+                            "the agent of process " + std::to_string(pid_) + " disconnected while compiland " + std::to_string(s.unit + 1) + " of " +
+                                std::to_string(units_->size()) + " of " + module_.name + " (" + unit_name(s) + ", " + d.id() + ") was applied: " +
+                                std::to_string(applied) + " compiland(s) of the reload were applied before it, " + std::to_string(left) +
+                                " were not, and nothing could be rolled back; if the process still runs, it runs a part of the edit",
+                            "Restart the application (or hot-restart it); if it still runs, enable the module again and reload: the reload's files are compiled again."),
+                 "warning", "load");
+            d.message += unit_suffix(s) + "; the agent is gone: " + std::to_string(applied) + " compiland(s) of this reload were applied before it, " +
+                         std::to_string(left) + " were not";
             return d;
         }
         // The WP-22 revert of this reload's batch: re-points what an older patch also hooked, restores the original bytes of the rest,
@@ -1332,26 +1366,48 @@ private:
         ro.only_reload = ctx_.reload_id;
         ro.events = nullptr;  // nothing of it was announced: `patch_applied` waits for the end of the reload
         Result<RevertReport> back = revert_module(link_, module_, RevertScope::Last, ro);
-        if (!back) {
-            // revert_module changed nothing (or reports the mixed state itself): the batch stays recorded, so `revert` can try again.
-            // Its files are not re-baselined (the batch replaced no baseline), so the next reload compiles them again.
-            for (const std::unique_ptr<Staged>& t : staged_) {
-                t->applied = false;
-            }
-            applied_events_.clear();
-            return fail("rollback", Diag::make(ar::kRollbackFailed,
-                                               "applying compiland " + std::to_string(s.unit + 1) + " of " + std::to_string(units_->size()) + " of " + module_.name + " (" +
-                                                   unit_name(s) + ") failed (" + d.format() + ") and rolling back the " + std::to_string(count) +
-                                                   " compiland(s) this reload had applied failed too (" + back.error().format() + "): the process runs a part of the edit",
-                                               "Send `revert` (scope last) to try the roll-back again, or restart the application."));
-        }
-        for (const Diag& w : back->warnings) {
-            emit(w, "warning", "rollback");
-        }
+        // Whatever the outcome, nothing of this reload is re-baselined (the batch replaced no baseline, so the next reload compiles its
+        // files again) and nothing of it is announced.
         for (const std::unique_ptr<Staged>& t : staged_) {
             t->applied = false;
         }
         applied_events_.clear();
+        const std::string what = "applying compiland " + std::to_string(s.unit + 1) + " of " + std::to_string(units_->size()) + " of " + module_.name + " (" +
+                                 unit_name(s) + ") failed (" + d.format() + ") and ";
+        if (!back) {
+            // revert_module changed nothing (or reports the mixed state itself, CML5857). The batch stays recorded unless the revert
+            // dropped the module's patch list (CML5856: the module is no longer loaded where the patches were made).
+            bool batch_kept = false;
+            {
+                std::lock_guard<std::mutex> lock(module_.mutex);
+                batch_kept = !module_.batches.empty() && module_.batches.back().reload_id == ctx_.reload_id;
+            }
+            return fail("rollback", Diag::make(ar::kRollbackFailed,
+                                               what + "rolling back the " + std::to_string(count) + " compiland(s) this reload had applied failed too (" +
+                                                   back.error().format() + "): the process runs a part of the edit" +
+                                                   (batch_kept ? std::string("; they stay recorded as this reload's batch")
+                                                               : std::string("; the module's patch list was dropped")),
+                                               batch_kept ? "Send `revert` (scope last) to try the roll-back again, or restart the application."
+                                                          : "Restart the application, or enable the module again and reload."));
+        }
+        for (const Diag& w : back->warnings) {
+            emit(w, "warning", "rollback");
+        }
+        // revert_module succeeds also when the agent did not confirm the hook changes in time (CML5852) or did not un-commit the
+        // images (CML5855): its state then follows the roll-back as if the agent applies it later (WP-22). That is not "the process
+        // runs what it ran before": say so, as an error.
+        std::string unconfirmed;
+        for (const Diag& w : back->warnings) {
+            if (w.code == revert::diag::kRevertUnconfirmed || w.code == revert::diag::kUncommitFailed) {
+                unconfirmed += (unconfirmed.empty() ? "" : "; ") + w.format();
+            }
+        }
+        if (!unconfirmed.empty()) {
+            return fail("rollback", Diag::make(ar::kRollbackUnconfirmed,
+                                               what + "the roll-back of the " + std::to_string(count) + " compiland(s) this reload had applied was sent but not confirmed (" +
+                                                   unconfirmed + "): the broker's state follows the roll-back, and the process may run a part of the edit until the agent applies it",
+                                               "In synchronised mode let the application reach SyncPoint(); if the application's hooks of the rolled-back patches keep running, restart the application."));
+        }
         emit(Diag::make(ar::kRolledBack,
                         "applying compiland " + std::to_string(s.unit + 1) + " of " + std::to_string(units_->size()) + " of " + module_.name + " (" + unit_name(s) + ", " +
                             d.id() + ") failed, so the " + std::to_string(count) + " compiland(s) this reload had applied were rolled back (" +
@@ -1554,20 +1610,32 @@ private:
         return Result<void>();
     }
 
-    // The range of compiland `k` was taken: link it again at the next free base, and prepare the staged compilands after it again,
-    // since they were planned against its addresses (its new functions and globals, its hook targets).
+    // The range of compiland `k` was taken: prepare it again (its object and plan were dropped after its link, release_prepared), which
+    // links it at the next free base, and prepare the staged compilands after it again, since they were planned against its addresses
+    // (its new functions and globals, its hook targets). A failure names the compiland that failed (reprepare_failed_).
     Result<void> relink(std::size_t k, PatchReport& report) {
         release_ranges(k + 1);
         for (std::size_t j = k + 1; j < staged_.size(); ++j) {
             staged_[j]->reset();  // out of the overlay until prepared again
         }
-        if (Result<void> r = link(*staged_[k], report); !r) {
-            return r;
-        }
-        for (std::size_t j = k + 1; j < staged_.size(); ++j) {
-            CML_LOG(Trace, "reload: compiland %s is prepared again: compiland %zu was relinked at %s", unit_name(*staged_[j]).c_str(), staged_[k]->unit + 1,
-                    hex(staged_[k]->linked.base).c_str());
-            if (Result<void> r = prepare(*staged_[j], report); !r) {
+        for (std::size_t j = k; j < staged_.size(); ++j) {
+            if (j > k) {
+                CML_LOG(Trace, "reload: compiland %s is prepared again: compiland %zu was relinked at %s", unit_name(*staged_[j]).c_str(), staged_[k]->unit + 1,
+                        hex(staged_[k]->linked.base).c_str());
+            }
+            Result<void> r = prepare(*staged_[j], report);
+            if (r && j == k && !staged_[k]->has_effect) {
+                r = fail("link", Diag::make(pd::kStageFailed, "compiland " + unit_name(*staged_[k]) + " planned to nothing when it was prepared again for a relink",
+                                            "This is a bug in the broker; see the broker log."));
+            }
+            if (!r) {
+                if (j != k) {
+                    reprepare_failed_ = j;
+                    Diag d = r.error();
+                    d.message += " (when compiland " + std::to_string(staged_[j]->unit + 1) + " was prepared again after compiland " + std::to_string(staged_[k]->unit + 1) +
+                                 " was relinked at another base)";
+                    return d;
+                }
                 return r;
             }
         }
@@ -1625,11 +1693,11 @@ private:
         s.applied = true;
         report.dll_path = s.linked.dll_path;
         report.patched = true;
-        applied_events_.push_back(make_patch_applied_event(pid_, module_.name, report.generation, s.hook_table.size(), s.plan.new_functions.size(),
-                                                           s.plan.new_globals.size(), s.planned, s.dropped));
+        applied_events_.push_back(make_patch_applied_event(pid_, module_.name, report.generation, s.hook_table.size(), s.counts.new_functions,
+                                                           s.counts.new_globals, s.planned, s.dropped));
         CML_LOG(Info, "reload: patch %llu of %s applied at %s (%zu hooks, %zu dropped, %zu new functions, %zu new globals, %zu fix-ups, %zu initialisers)",
                 static_cast<unsigned long long>(report.generation), module_.name.c_str(), hex(s.linked.base).c_str(), s.hook_table.size(), s.dropped,
-                s.plan.new_functions.size(), s.plan.new_globals.size(), s.fixups.wire.size(), s.init_rvas.size());
+                s.counts.new_functions, s.counts.new_globals, s.fixups.wire.size(), s.init_rvas.size());
     }
     // ---- pieces -----------------------------------------------------------------------------------------------
     static constexpr std::size_t kMaxKeptNotes = 50;  // entries of PatchReport::hooks_kept
