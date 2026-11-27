@@ -35,6 +35,17 @@
 // the address of a symbol the patch introduced). `NarrowInput::prior_code` hands that record back for an entry, and the
 // same three rules apply to it: same length, equal masked bytes, every relocation reaching the same target (with the same
 // in-place addend). Whatever cannot be recorded or compared keeps the hook ("when in doubt, hook").
+//
+// WP-49 (R-46, ADR-0044). A jump table in the function's OWN code (cl: a `switch` compiles to `lea rcx,[__ImageBase]` /
+// `mov eax,[rcx+rax*4+$LNt]` / `add rax,rcx` / `jmp rax` and a table of ADDR32NB entries to the case labels, placed behind
+// the code inside the function) reaches places relative to wherever the function lies: the old code reaches its own case
+// labels, the patch its own. Such references are compared entry by entry relative to the function start: every ADDR32NB
+// whose target lies inside the function must be either an entry of a table (a run of consecutive 4-byte ADDR32NB entries,
+// every one of them to a place inside the function, starting where a reference points) or a reference to the start of one;
+// the target of each, relative to the function start, must be the same in the old code (or in an earlier patch's record).
+// A table whose entries leave the function, that runs to the function end with an ADDR32NB right behind it (its end cannot
+// be told), a reference to a place inside the function that is not a table (a byte index table), or a table in another
+// section (clang-cl puts its tables in .rdata) keeps the hook as before.
 
 #include <cstdint>
 #include <functional>
@@ -57,6 +68,8 @@ struct CodeTarget {
         SecRel,     // a SECREL site: `value` is the planned section-relative value
         Constant,   // a fresh read-only constant the patch carries (string literal, table): `bytes` is its content
         NewSymbol,  // a symbol this patch introduced; `name` until the patch is laid out, then turned into an Address
+        Local,      // WP-49: a place inside the function itself (a jump-table entry or the table it loads from): `value` is
+                    // its offset from the function start
     };
     Kind kind = Kind::Address;
     std::uint64_t value = 0;
