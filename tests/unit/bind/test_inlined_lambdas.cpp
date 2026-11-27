@@ -430,3 +430,76 @@ TEST_CASE("R-54 review: a call operator whose closure cannot be read counts as t
     REQUIRE_FALSE(r.has_value());
     CHECK(decision(partial, gx).decision != DecisionKind::BindOldData);
 }
+
+// ---- second review (3b2fef3): another closure's call operator is skipped only when it inlined the static's own closure ------
+
+namespace {
+
+// A call operator procedure `name` of closure (`cls`, `unique`) with the records `statics`, which inlined the call operators of
+// the closures `inlined` (name, unique name).
+void call_operator(SynthWorld& w, OldTypes& t, const std::string& name, const std::string& cls, const std::string& unique,
+                   const std::vector<std::pair<std::string, std::uint32_t>>& statics, const std::vector<std::pair<std::string, std::string>>& inlined) {
+    const std::uint32_t c = t.tpi.add(tp::kLfClass, tp::lf_udt(cls, unique, true));
+    const std::uint32_t this_ptr = t.tpi.add(tp::kLfPointer, tp::lf_pointer(c, tp::kPtr64 | 0x400));
+    const std::uint32_t fn = t.tpi.add(tp::kLfMFunction, tp::lf_mfunction(tp::kTInt, c, this_ptr, t.args, 0));
+    std::vector<std::vector<std::uint32_t>> chains;
+    for (const auto& [inner_cls, inner_unique] : inlined) {
+        chains.push_back({t.member(w.spec.ipi, inner_cls, inner_unique, "operator()")});
+    }
+    proc_inlining(w, name, 0x60, fn, statics, chains);
+}
+
+}  // namespace
+
+TEST_CASE("R-54 second review: a lambda renumbered without rule (d) is checked against the call operator its record is in") {
+    // The static is `f::<lambda_1>`'s; its old records are in `f::<lambda_0>::operator()`, which inlined `f::<lambda_2>` (not
+    // `<lambda_1>`): nothing proves the records are another lambda's, so they count as the static's own, and the inlined
+    // closure refuses it. 3b2fef3: skipped as "another closure's call operator" and paired (the one record of the name), no
+    // CML3207.
+    SynthWorld w = basic_world(false);
+    w.data(w.tu(), "`anonymous namespace'::s_count", 0x10);
+    OldTypes t;
+    call_operator(w, t, "f::<lambda_0>::operator()", "f::<lambda_0>", ".?AV<lambda_0>@?0??f@@YAHXZ@", {{"x", 0x20}},
+                  {{"f::<lambda_2>", ".?AV<lambda_2>@?0??f@@YAHXZ@"}});
+    open_with(w, t);
+    SynthObj o;
+    const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+    o.symbol("?s_count@?A0x1@@3HA", 0x10, bss, false, false);
+    const std::string x = "?x@?1???R<lambda_1>@?0??f@@YAHXZ@QEBA@XZ@4HA";
+    o.symbol(x, 0x20, bss, false, false);
+    Built b = o.build();
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    auto r = plan_bind(w.input(b), &errors, &partial);
+    REQUIRE_FALSE(r.has_value());
+    REQUIRE(count_code(errors, diag::kAmbiguousStatic) == 1);
+    CAPTURE(errors[0].message);
+    CHECK(contains(errors[0].message, "inlined 'f::<lambda_2>::operator()', a lambda's code"));
+    CHECK(decision(partial, x).decision != DecisionKind::BindOldData);
+}
+
+TEST_CASE("R-54 second review: a call operator whose closure name is spelled with other back-references is checked") {
+    // clang spells the inner closure's unique name with a back-reference (`???R0?0??g@@...`, docs/wp/WP-51.md, g_caller) and
+    // the static's decorated scope without (`???R<lambda_0>@?0??g@@...`): the record in the inner lambda's own call operator
+    // looks like another closure's. That call operator inlined an innermost lambda, not the static's closure, so the record is
+    // checked and refused. 3b2fef3: skipped, paired by name, no CML3207.
+    SynthWorld w = basic_world(false);
+    OldTypes t;
+    call_operator(w, t, "g::<lambda_0>::operator()::<lambda_1>::operator()", "g::<lambda_0>::operator()::<lambda_1>",
+                  ".?AV<lambda_1>@?0???R0?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@", {{"gx", 0x20}},
+                  {{"g::<lambda_0>::operator()::<lambda_1>::operator()::<lambda_2>", ".?AV<lambda_2>@?0???R1?0???R0?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?<auto>@@XZ@"}});
+    open_with(w, t);
+    SynthObj o;
+    const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+    const std::string gx = "?gx@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?4@XZ@4UObj@@A";
+    o.symbol(gx, 0x20, bss, false, false);
+    Built b = o.build();
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    auto r = plan_bind(w.input(b), &errors, &partial);
+    REQUIRE_FALSE(r.has_value());
+    REQUIRE(count_code(errors, diag::kAmbiguousStatic) == 1);
+    CAPTURE(errors[0].message);
+    CHECK(contains(errors[0].message, "a lambda's code"));
+    CHECK(decision(partial, gx).decision != DecisionKind::BindOldData);
+}
