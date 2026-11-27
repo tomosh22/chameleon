@@ -82,6 +82,7 @@ fixtures" to "works on your project".
 | R-55 | **A hot-restart of the Godot editor takes over two minutes** (131–167 s in the godot-gdextension corpus cell, before and after WP-45). Not measured by stage. | WP-45 (#73) corpus logs |
 | R-56 | **A reload across several modules or processes is atomic per module only (WP-47).** A refused plugin DLL after an applied exe in the same reload still leaves the exe patched. Needs a two-phase pipeline API across the modules of one process in `reload_service`. | WP-47 (#79) |
 | R-57 | **A static of an inlined helper function can be taken by a new static of its caller (WP-51 spike).** A `static` (internal-linkage) helper inlined into its caller records its function-local statics in the caller; deleting the helper and adding a same-named static to the caller pairs it with the helper's live object, as R-54 does for lambdas. WP-51 logs how often a wider rule would refuse on the corpus. | WP-51 (#81) |
+| R-58 | **A hot-restart after source edits rescans every compiland's includes (WP-50).** WP-50's include-scan cache is valid for a whole module only while none of its scanned inputs changed; one edited source or header (the usual case in a session) makes the next restart scan cold (Godot: about 13 s of a ~18 s restart). Per-compiland cache entries would rescan only the affected compilands. | WP-50 (#77) |
 
 ---
 
