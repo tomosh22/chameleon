@@ -1408,3 +1408,74 @@ TEST_CASE("inlinees: a procedure that is not in its module, or a module without 
     REQUIRE_FALSE(not_proc.has_value());
     CHECK(not_proc.error().code == dg::kCompilandOutOfRange);
 }
+
+TEST_CASE("inlinees: a procedure nested in another owns its inline sites; several procedures are read in one walk") {
+    TempDir dir;
+    InlineWorld w = inline_world();
+    Module m = inline_module();
+    m.symbols.proc(0x1110, "outer", 1, 0x100, 0x80, 0, w.proc_void);
+    m.symbols.add(0x114D, inline_site(w.id_make));
+    m.symbols.add(0x114E, Bytes());
+    m.symbols.proc(0x110F, "nested", 1, 0x140, 0x20, 0, w.proc_void);  // review of 2a3580d: was counted as outer's
+    m.symbols.add(0x114D, inline_site(w.id_call));
+    m.symbols.add(0x114D, inline_site(w.id_ctor));
+    m.symbols.add(0x114E, Bytes());
+    m.symbols.add(0x114E, Bytes());
+    m.symbols.end();
+    m.symbols.add(0x115D, inline_site(w.id_make, true));  // outer's again, after the nested procedure
+    m.symbols.add(0x114E, Bytes());
+    m.symbols.end();
+    m.symbols.proc(0x1110, "later", 1, 0x200, 0x20, 0, w.proc_void);
+    m.symbols.add(0x114D, inline_site(w.id_call));
+    m.symbols.add(0x114E, Bytes());
+    m.symbols.end();
+    w.spec.modules.push_back(std::move(m));
+    w.types.add_to(w.spec.tpi);
+    const auto idx = open_spec(dir, w.spec);
+    const std::vector<SymbolView> procs = procs_of(*idx);
+    REQUIRE(procs.size() == 3);
+
+    const auto outer = idx->proc_inlinees(procs[0]);
+    REQUIRE(outer.has_value());
+    CHECK(outer->sites == 2);
+    REQUIRE(outer->inlinees.size() == 1);
+    CHECK(outer->inlinees[0].name == "o2_make");
+    CHECK(outer->inlinees[0].sites == 2);
+    CHECK(outer->inlinees[0].depth == 1);
+
+    const auto nested = idx->proc_inlinees(procs[1]);
+    REQUIRE(nested.has_value());
+    CHECK(nested->sites == 2);
+    REQUIRE(nested->inlinees.size() == 2);
+    CHECK(nested->inlinees[0].name == "operator()");
+    CHECK(nested->inlinees[0].depth == 1);
+    CHECK(nested->inlinees[1].name == "RTTI");
+    CHECK(nested->inlinees[1].depth == 2);
+
+    // One walk for all of them (in any order, one asked twice), with the same answers.
+    const auto all = idx->procs_inlinees({procs[2], procs[0], procs[1], procs[2]});
+    REQUIRE_MESSAGE(all.has_value(), (all.has_value() ? std::string() : all.error().format()));
+    REQUIRE(all->size() == 4);
+    CHECK((*all)[0].sites == 1);
+    REQUIRE((*all)[0].inlinees.size() == 1);
+    CHECK((*all)[0].inlinees[0].class_unique == ".?AV<lambda_0>@?0??o2_step@@YAXXZ@");
+    CHECK((*all)[1].sites == 2);
+    CHECK((*all)[1].inlinees.size() == 1);
+    CHECK((*all)[2].sites == 2);
+    CHECK((*all)[2].inlinees.size() == 2);
+    CHECK((*all)[3].sites == 1);
+    CHECK((*all)[3].inlinees.size() == 1);
+
+    // Procedures of two compilands, or one that is not in its module, fail the call.
+    SymbolView other = procs[0];
+    other.compiland = 5;
+    CHECK_FALSE(idx->procs_inlinees({procs[0], other}).has_value());
+    SymbolView elsewhere = procs[0];
+    elsewhere.offset = 0x900;
+    const auto missing = idx->procs_inlinees({procs[1], elsewhere});
+    REQUIRE_FALSE(missing.has_value());
+    CHECK(missing.error().code == dg::kBadModuleSymbols);
+    const auto none = idx->procs_inlinees({});
+    REQUIRE(none.has_value());
+    CHECK(none->empty());
+}

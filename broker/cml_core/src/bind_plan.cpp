@@ -617,6 +617,11 @@ private:
     };
     std::map<std::uint32_t, InlineVerdict> inline_verdicts_;  // by the procedure's index in comp_syms_
     const InlineVerdict& inline_verdict(std::uint32_t proc);
+    void judge_inlinees(std::uint32_t proc, const Result<pdb::PdbIndex::ProcInlinees>& sites);
+    bool inline_batch_done_ = false;
+    // WP-51 (review): the closure a lambda's static belongs to, as the decorated scope spells it after "??R" (without the
+    // unit's discriminator), with rule (d)'s closure pairing applied.
+    std::string own_closure_scope(const Sym& sy) const;
     std::size_t wp51_procs_ = 0;
     std::size_t wp51_sites_ = 0;
     std::size_t wp51_closures_ = 0;
@@ -1166,21 +1171,16 @@ bool internal_class(const std::string& unique) {
 
 }  // namespace
 
-const Planner::InlineVerdict& Planner::inline_verdict(std::uint32_t proc) {
-    const auto found = inline_verdicts_.find(proc);
-    if (found != inline_verdicts_.end()) {
-        return found->second;
-    }
+void Planner::judge_inlinees(std::uint32_t proc, const Result<pdb::PdbIndex::ProcInlinees>& sites) {
     InlineVerdict& v = inline_verdicts_[proc];
     const pdb::SymbolView& p = comp_syms_[proc];
     const std::string where = "'" + std::string(p.name) + "' (rva " + hex(p.rva) + ")";
-    const Result<pdb::PdbIndex::ProcInlinees> sites = pdb_.proc_inlinees(p);
     ++wp51_procs_;
     if (!sites) {
         v.risk = "the inline sites of " + where + " cannot be read (" + sites.error().message + ")";
         ++wp51_unreadable_;
         CML_LOG(Trace, "WP51-INLINEES proc=%s unreadable (%s)", where.c_str(), sites.error().message.c_str());
-        return v;
+        return;
     }
     std::size_t closures = 0;
     std::size_t unreadable = 0;
@@ -1217,16 +1217,71 @@ const Planner::InlineVerdict& Planner::inline_verdict(std::uint32_t proc) {
             v.risk = risk;
         }
     }
-    if (!sites->complete && v.risk.empty()) {
+    if (!sites->complete) {
+        // (Review: counted even when a risk was found already; the list is cut, so it is unreadable data either way.)
         ++unreadable;
-        v.risk = where + " has more inline sites than the reader follows (" + std::to_string(pdb::PdbIndex::kMaxProcInlinees) + " inlinees)";
+        if (v.risk.empty()) {
+            v.risk = where + " has more inline sites than the reader follows (" + std::to_string(pdb::PdbIndex::kMaxProcInlinees) + " inlinees)";
+        }
     }
     wp51_sites_ += sites->sites;
     wp51_closures_ += closures;
     wp51_unreadable_ += unreadable;
     CML_LOG(Trace, "WP51-INLINEES proc=%s sites=%u inlinees=%zu closures=%zu unreadable=%zu verdict=%s", where.c_str(), sites->sites, sites->inlinees.size(), closures, unreadable,
             v.risk.empty() ? "no-closure" : "risk");
-    return v;
+}
+
+const Planner::InlineVerdict& Planner::inline_verdict(std::uint32_t proc) {
+    const auto found = inline_verdicts_.find(proc);
+    if (found != inline_verdicts_.end()) {
+        return found->second;
+    }
+    // (Review: one walk of the module stream for every procedure of the compiland that holds a function-local record, the only
+    // ones a static can be paired into, instead of one walk per procedure asked for.)
+    std::vector<std::uint32_t> batch;
+    if (!inline_batch_done_) {
+        inline_batch_done_ = true;
+        std::set<std::uint32_t> holders;
+        for (const pdb::SymbolView& v : comp_syms_) {
+            if (pdb::is_data_kind(v.kind) && v.parent_proc != pdb::kNoSymbol && v.parent_proc < comp_syms_.size() && pdb::is_proc_kind(comp_syms_[v.parent_proc].kind) &&
+                inline_verdicts_.count(v.parent_proc) == 0) {
+                holders.insert(v.parent_proc);
+            }
+        }
+        holders.insert(proc);
+        batch.assign(holders.begin(), holders.end());
+    }
+    if (batch.size() > 1) {
+        std::vector<pdb::SymbolView> views;
+        for (const std::uint32_t p : batch) {
+            views.push_back(comp_syms_[p]);
+        }
+        const Result<std::vector<pdb::PdbIndex::ProcInlinees>> all = pdb_.procs_inlinees(views);
+        if (all) {
+            for (std::size_t i = 0; i < batch.size(); ++i) {
+                judge_inlinees(batch[i], Result<pdb::PdbIndex::ProcInlinees>((*all)[i]));
+            }
+            CML_LOG(Trace, "WP51-INLINEES compiland=%u read %zu procedure(s) in one walk", ci_, batch.size());
+            return inline_verdicts_[proc];
+        }
+        // One of them could not be read: each procedure on its own, so the error is the asked procedure's own.
+        CML_LOG(Trace, "WP51-INLINEES compiland=%u: the batch of %zu procedure(s) failed (%s); read one by one", ci_, batch.size(), all.error().message.c_str());
+    }
+    judge_inlinees(proc, pdb_.proc_inlinees(comp_syms_[proc]));
+    return inline_verdicts_[proc];
+}
+
+std::string Planner::own_closure_scope(const Sym& sy) const {
+    std::string scope = pdb::without_tu_discriminator(call_operator_scope(sy.name));
+    // A closure paired with an old closure of another number by the code of its call operator (WP-40, rule (d)): its statics
+    // are the old closure's.
+    for (const auto& [from, to] : closure_pairing_) {
+        if (from != to && scope.size() > from.size() && scope.compare(0, from.size(), from) == 0) {
+            scope = to + scope.substr(from.size());
+            break;
+        }
+    }
+    return scope;
 }
 
 bool Planner::refuse_inlined_owner(Sym& sy, const pdb::SymbolView& record, const std::string& encl, const char* step) {
@@ -1241,6 +1296,20 @@ bool Planner::refuse_inlined_owner(Sym& sy, const pdb::SymbolView& record, const
         CML_LOG(Trace, "WP51-SKIP static='%s' record rva=%s in '%s': not the procedure of its own function '%s' (%s)", sy.dec.display.c_str(), hex(record.rva).c_str(),
                 std::string(record.parent_name).c_str(), encl.c_str(), step);
         return false;
+    }
+    if (encl == "operator()") {
+        // (Review: every call operator is named so.) The record is the static's own only when its procedure is the call operator
+        // of the static's own closure. An inner lambda's static recorded in the outer lambda's call operator, which inlined
+        // it, is WP-40's case. When the closure of either cannot be told, the record counts as the static's own and is checked.
+        const std::string scope = own_closure_scope(sy);
+        const ClosureId id = closure_of(record);
+        if (id.known && !id.tail.empty() && !scope.empty() && !starts_with(scope, id.tail)) {
+            CML_LOG(Trace, "WP51-SKIP static='%s' record rva=%s in '%s': the call operator of closure %s, not of the static's own (%s) (%s)", sy.dec.display.c_str(),
+                    hex(record.rva).c_str(), std::string(record.parent_name).c_str(), id.tail.c_str(), scope.c_str(), step);
+            return false;
+        }
+        CML_LOG(Trace, "WP51-OWN static='%s' record rva=%s in '%s': closure %s (%s)", sy.dec.display.c_str(), hex(record.rva).c_str(), std::string(record.parent_name).c_str(),
+                id.known ? (id.tail.empty() ? "(none)" : id.tail.c_str()) : ("unknown: " + id.why).c_str(), step);
     }
     wp51_checked_.insert(pos);
     const InlineVerdict& v = inline_verdict(record.parent_proc);

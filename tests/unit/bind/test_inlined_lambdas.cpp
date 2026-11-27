@@ -345,3 +345,88 @@ TEST_CASE("R-54: WP-40's case is unchanged: the statics of inlined lambdas are s
         CHECK(decision(*r, name).old_address.rva == 0x3020 + 0x10 * static_cast<std::uint32_t>(n));
     }
 }
+
+// ---- review of 2a3580d, finding 1: nested lambdas ----------------------------------------------------------------------
+//
+// clang 18 -O2 for `void g() { auto o = []() __attribute__((noinline)) { auto i = [] { static Obj gx = make(1); return gx.v; };
+// return i() + 1; }; sink(o()); }` (llvm-pdbutil, docs/wp/WP-51.md): the outer call operator keeps its procedure, the inner one
+// is inlined into it, and the inner lambda's `gx` is a record of the OUTER call operator, next to the inner closure's inline site.
+
+namespace {
+
+const char* const kOuterClosure = ".?AV<lambda_0>@?0??g@@YAXXZ@";
+const char* const kInnerClosure = ".?AV<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@";
+
+// The old image: `s_count` (teaches the layout), the outer call operator with the record `gx` and the inner one inlined.
+void nested_world(SynthWorld& w) {
+    w.data(w.tu(), "`anonymous namespace'::s_count", 0x10);
+    OldTypes t;
+    const std::uint32_t outer_cls = t.tpi.add(tp::kLfClass, tp::lf_udt("g::<lambda_0>", kOuterClosure, true));
+    const std::uint32_t this_ptr = t.tpi.add(tp::kLfPointer, tp::lf_pointer(outer_cls, tp::kPtr64 | 0x400));
+    const std::uint32_t outer_fn = t.tpi.add(tp::kLfMFunction, tp::lf_mfunction(tp::kTInt, outer_cls, this_ptr, t.args, 0));
+    const std::uint32_t inner = t.member(w.spec.ipi, "g::<lambda_0>::operator()::<lambda_1>", kInnerClosure, "operator()");
+    proc_inlining(w, "g::<lambda_0>::operator()", 0x60, outer_fn, {{"gx", 0x20}}, {{inner}});
+    open_with(w, t);
+}
+
+}  // namespace
+
+TEST_CASE("R-54 review: an inner lambda's static recorded in the outer call operator is still bound (WP-40), not refused") {
+    // 2a3580d: CML3207 (every call operator was taken for the static's own function). main: bound by the layout.
+    SynthWorld w = basic_world(false);
+    nested_world(w);
+    SynthObj o;
+    const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+    o.symbol("?s_count@?A0x1@@3HA", 0x10, bss, false, false);
+    const std::string gx = "?gx@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?4@XZ@4UObj@@A";
+    // (Its guard is left out: clang spells the guard's scope with another back-reference number than the static's,
+    // `QEBA?A?3@XZ` against `QEBA?A?4@XZ`, so the planner does not tie them together. Pre-existing, reported with WP-51.)
+    o.symbol(gx, 0x20, bss, false, false);
+    Built b = o.build();
+    auto r = plan_bind(w.input(b));
+    REQUIRE_MESSAGE(r.has_value(), err(r));
+    CHECK(decision(*r, gx).decision == DecisionKind::BindOldData);
+    CHECK(decision(*r, gx).old_address.rva == 0x3020);
+}
+
+TEST_CASE("R-54 review: the R-54 edit one level down (the inner lambda deleted, its static's name declared in the outer lambda) is refused") {
+    // main: the outer lambda's new static paired with the inner lambda's record (pass A).
+    SynthWorld w = basic_world(false);
+    nested_world(w);
+    SynthObj o;
+    const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+    o.symbol("?s_count@?A0x1@@3HA", 0x10, bss, false, false);
+    const std::string own = "?gx@?1???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@4UObj@@A";
+    o.symbol(own, 0x20, bss, false, false);
+    Built b = o.build();
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    auto r = plan_bind(w.input(b), &errors, &partial);
+    REQUIRE_FALSE(r.has_value());
+    REQUIRE(count_code(errors, diag::kAmbiguousStatic) == 1);
+    CAPTURE(errors[0].message);
+    CHECK(contains(errors[0].message, "inlined 'g::<lambda_0>::operator()::<lambda_1>::operator()', a lambda's code"));
+    CHECK(decision(partial, own).decision != DecisionKind::BindOldData);
+}
+
+TEST_CASE("R-54 review: a call operator whose closure cannot be read counts as the static's own and is checked") {
+    // The outer call operator's type is not in the TPI: which closure it belongs to cannot be told, so the record is not
+    // proven to be another lambda's, and the inner closure's inline site refuses the static.
+    SynthWorld w = basic_world(false);
+    w.data(w.tu(), "`anonymous namespace'::s_count", 0x10);
+    OldTypes t;
+    const std::uint32_t inner = t.member(w.spec.ipi, "g::<lambda_0>::operator()::<lambda_1>", kInnerClosure, "operator()");
+    proc_inlining(w, "g::<lambda_0>::operator()", 0x60, 0x7FFF, {{"gx", 0x20}}, {{inner}});
+    open_with(w, t);
+    SynthObj o;
+    const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+    o.symbol("?s_count@?A0x1@@3HA", 0x10, bss, false, false);
+    const std::string gx = "?gx@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?4@XZ@4UObj@@A";
+    o.symbol(gx, 0x20, bss, false, false);
+    Built b = o.build();
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    auto r = plan_bind(w.input(b), &errors, &partial);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(decision(partial, gx).decision != DecisionKind::BindOldData);
+}

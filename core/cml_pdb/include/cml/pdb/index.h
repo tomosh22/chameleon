@@ -170,6 +170,11 @@ public:
     };
     static constexpr std::size_t kMaxProcInlinees = 4096;
     Result<ProcInlinees> proc_inlinees(const SymbolView& proc) const;
+    // WP-51 (review): the same for several procedures of ONE compiland in one walk of its module stream (each inlinee id is
+    // resolved once for all of them); element i belongs to procs[i]. A procedure nested in another (an S_LPROC32 inside a
+    // procedure's scope) is a scope of its own: its inline sites are its own, not the enclosing procedure's. CML1417 when
+    // the procedures are not of one compiland of this index, CML1413 when one is not found or has no end record.
+    Result<std::vector<ProcInlinees>> procs_inlinees(const std::vector<SymbolView>& procs) const;
 
     // ---- Types (WP-37, lazy) -------------------------------------------------------------
     // The type records of this PDB: find_type reads the TPI stream, find_id the IPI stream. Opening an index reads no

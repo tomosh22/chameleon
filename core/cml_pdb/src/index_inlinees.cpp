@@ -4,9 +4,12 @@
 // procedure, next to its S_INLINESITE records (docs/wp/WP-51.md, round 1). A record named `x` directly in a procedure is
 // therefore the procedure's own static or a static of something it inlined; the inline sites say what it inlined. Each
 // S_INLINESITE / S_INLINESITE2 names its inlinee by an IPI index: LF_FUNC_ID (scope, type, name) for a function,
-// LF_MFUNC_ID (class, type, name) for a member function. Read on demand, for one procedure at a time; nothing is kept.
+// LF_MFUNC_ID (class, type, name) for a member function. Read on demand, for the procedures asked for in one walk of their
+// module stream (procs_inlinees); nothing is kept.
 
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "cml/pdb/diag_ids.h"
 #include "detail/codeview.h"
@@ -79,11 +82,25 @@ void resolve_inlinee(const TypeSource& types, PdbIndex::Inlinee& e) {
 }  // namespace
 
 Result<PdbIndex::ProcInlinees> PdbIndex::proc_inlinees(const SymbolView& proc) const {
-    const Impl& impl = *impl_;
-    if (!is_proc_kind(proc.kind) || proc.compiland >= impl.compilands.size()) {
-        return Diag::make(diag::kCompilandOutOfRange, "proc_inlinees needs a proc symbol of a compiland of this index.", "Pass a symbol returned by compiland_symbols.");
+    Result<std::vector<ProcInlinees>> all = procs_inlinees(std::vector<SymbolView>{proc});
+    if (!all) {
+        return all.error();
     }
-    const Compiland& c = impl.compilands[proc.compiland];
+    return std::move((*all)[0]);
+}
+
+Result<std::vector<PdbIndex::ProcInlinees>> PdbIndex::procs_inlinees(const std::vector<SymbolView>& procs) const {
+    const Impl& impl = *impl_;
+    if (procs.empty()) {
+        return std::vector<ProcInlinees>{};
+    }
+    const std::uint32_t ci = procs.front().compiland;
+    for (const SymbolView& p : procs) {
+        if (!is_proc_kind(p.kind) || p.compiland >= impl.compilands.size() || p.compiland != ci) {
+            return Diag::make(diag::kCompilandOutOfRange, "procs_inlinees needs proc symbols of one compiland of this index.", "Pass symbols returned by compiland_symbols.");
+        }
+    }
+    const Compiland& c = impl.compilands[ci];
     if (c.symbol_stream == 0xFFFF || c.symbol_bytes <= 4 || c.symbol_bytes > impl.msf->stream_size(c.symbol_stream)) {
         return Diag::make(diag::kBadModuleSymbols, "The symbols of module '" + std::string(c.object_name) + "' in '" + impl.path + "' are unreadable.",
                           "Rebuild the module so the linker regenerates the PDB.");
@@ -95,12 +112,30 @@ Result<PdbIndex::ProcInlinees> PdbIndex::proc_inlinees(const SymbolView& proc) c
         return Diag::make(diag::kBadModuleSymbols, "The symbols of module '" + std::string(c.object_name) + "' in '" + impl.path + "' cannot be read.",
                           "Rebuild the module so the linker regenerates the PDB.");
     }
-    ProcInlinees out;
-    enum class State { Before, Inside, Done } state = State::Before;
-    std::size_t depth = 0;         // scopes open since the procedure's record, itself included
-    std::size_t inline_depth = 0;  // inline sites among them
-    std::vector<bool> open_inline;  // per open scope inside the procedure: is it an inline site
-    for (std::uint64_t off = 4; off < c.symbol_bytes && state != State::Done;) {
+
+    // The wanted procedures by their section:offset (the same key proc_statics finds a procedure by). A procedure asked for
+    // twice gets one walk and is copied at the end.
+    std::unordered_map<std::uint64_t, std::size_t> wanted;
+    for (std::size_t i = 0; i < procs.size(); ++i) {
+        wanted.emplace((static_cast<std::uint64_t>(procs[i].section) << 32) | procs[i].offset, i);
+    }
+    std::vector<ProcInlinees> out(procs.size());
+    std::vector<std::unordered_map<std::uint32_t, std::size_t>> seen(procs.size());  // per procedure: id -> index in inlinees
+    enum class Found : std::uint8_t { No, Open, Done };
+    std::vector<Found> found(procs.size(), Found::No);
+    std::size_t done = 0;
+    std::unordered_map<std::uint32_t, Inlinee> resolved;  // id -> the inlinee resolved once (sites and depth not set)
+
+    // Every open scope: the wanted procedure it belongs to (kNone: none; a procedure that is not wanted owns its own scopes,
+    // so its inline sites are nobody's) and the number of inline sites open inside that procedure, itself included.
+    constexpr std::size_t kNone = static_cast<std::size_t>(-1);
+    struct Scope {
+        std::size_t owner = kNone;
+        std::uint32_t inline_depth = 0;
+        bool root = false;  // the record of a wanted procedure
+    };
+    std::vector<Scope> scopes;
+    for (std::uint64_t off = 4; off < c.symbol_bytes && done < wanted.size();) {
         if (c.symbol_bytes - off < 4) {
             break;
         }
@@ -113,74 +148,92 @@ Result<PdbIndex::ProcInlinees> PdbIndex::proc_inlinees(const SymbolView& proc) c
         const std::uint8_t* b = data + off + 4;
         const std::uint32_t n = reclen - 2;
         off += 2 + reclen;
-        if (state == State::Before) {
-            if (cv::is_proc(k) && n >= 36 && rd16(b + 32) == proc.section && rd32(b + 28) == proc.offset) {
-                state = State::Inside;
-                depth = 1;
-                open_inline.assign(1, false);
+        if (cv::is_scope_closer(k)) {
+            if (!scopes.empty()) {
+                const Scope s = scopes.back();
+                scopes.pop_back();
+                if (s.root && found[s.owner] == Found::Open) {
+                    found[s.owner] = Found::Done;
+                    ++done;
+                }
             }
             continue;
         }
-        if (cv::is_scope_opener(k)) {
-            const bool site = k == cv::S_INLINESITE || k == cv::S_INLINESITE2;
-            ++depth;
-            open_inline.push_back(site);
-            if (!site) {
+        if (!cv::is_scope_opener(k)) {
+            continue;
+        }
+        const Scope parent = scopes.empty() ? Scope{} : scopes.back();
+        Scope s;
+        if (cv::is_proc(k)) {
+            // A procedure, at the top or nested in another: its scopes are its own.
+            if (n >= 36) {
+                const auto w = wanted.find((static_cast<std::uint64_t>(rd16(b + 32)) << 32) | rd32(b + 28));
+                if (w != wanted.end() && found[w->second] == Found::No) {
+                    s.owner = w->second;
+                    s.root = true;
+                    found[w->second] = Found::Open;
+                }
+            }
+            scopes.push_back(s);
+            continue;
+        }
+        const bool site = k == cv::S_INLINESITE || k == cv::S_INLINESITE2;
+        s.owner = parent.owner;
+        s.inline_depth = parent.inline_depth + (site ? 1u : 0u);
+        scopes.push_back(s);
+        if (!site || s.owner == kNone) {
+            continue;
+        }
+        ProcInlinees& pi = out[s.owner];
+        ++pi.sites;
+        // S_INLINESITE: parent u32, end u32, inlinee u32, annotations; S_INLINESITE2 has an invocation count before them.
+        const std::uint32_t id = n >= 12 ? rd32(b + 8) : 0;
+        const auto at = seen[s.owner].find(id);
+        Inlinee* entry = nullptr;
+        if (at != seen[s.owner].end()) {
+            entry = &pi.inlinees[at->second];
+        } else {
+            if (pi.inlinees.size() >= kMaxProcInlinees) {
+                pi.complete = false;
                 continue;
             }
-            ++inline_depth;
-            ++out.sites;
-            // S_INLINESITE: parent u32, end u32, inlinee u32, annotations; S_INLINESITE2 has an invocation count before them.
-            const std::uint32_t id = n >= 12 ? rd32(b + 8) : 0;
-            Inlinee* entry = nullptr;
-            for (Inlinee& e : out.inlinees) {
-                if (e.id == id) {
-                    entry = &e;
-                    break;
+            Inlinee e;
+            if (n < 12) {
+                e.why = "an inline site record is too short to name its inlinee";
+            } else {
+                auto r = resolved.find(id);
+                if (r == resolved.end()) {
+                    Inlinee fresh;
+                    fresh.id = id;
+                    resolve_inlinee(types(), fresh);
+                    r = resolved.emplace(id, std::move(fresh)).first;
                 }
+                e = r->second;
             }
-            if (entry == nullptr) {
-                if (out.inlinees.size() >= kMaxProcInlinees) {
-                    out.complete = false;
-                    continue;
-                }
-                Inlinee e;
-                e.id = id;
-                e.depth = static_cast<std::uint32_t>(inline_depth);
-                if (n < 12) {
-                    e.why = "an inline site record is too short to name its inlinee";
-                } else {
-                    resolve_inlinee(types(), e);
-                }
-                out.inlinees.push_back(std::move(e));
-                entry = &out.inlinees.back();
-            }
-            ++entry->sites;
-            if (static_cast<std::uint32_t>(inline_depth) < entry->depth) {
-                entry->depth = static_cast<std::uint32_t>(inline_depth);
-            }
-            continue;
+            e.id = id;
+            e.depth = s.inline_depth;
+            seen[s.owner].emplace(id, pi.inlinees.size());
+            pi.inlinees.push_back(std::move(e));
+            entry = &pi.inlinees.back();
         }
-        if (cv::is_scope_closer(k)) {
-            if (!open_inline.empty()) {
-                if (open_inline.back()) {
-                    --inline_depth;
-                }
-                open_inline.pop_back();
-            }
-            if (--depth == 0) {
-                state = State::Done;
-            }
-            continue;
+        ++entry->sites;
+        if (s.inline_depth < entry->depth) {
+            entry->depth = s.inline_depth;
         }
     }
-    if (state == State::Before) {
-        return Diag::make(diag::kBadModuleSymbols, "The symbol record of '" + std::string(proc.name) + "' was not found in module '" + std::string(c.object_name) + "'.",
-                          "Rebuild the module so the linker regenerates the PDB.");
-    }
-    if (state == State::Inside) {
-        return Diag::make(diag::kBadModuleSymbols, "The procedure '" + std::string(proc.name) + "' in module '" + std::string(c.object_name) + "' has no end record.",
-                          "Rebuild the module so the linker regenerates the PDB.");
+    for (std::size_t i = 0; i < procs.size(); ++i) {
+        const std::size_t first = wanted.find((static_cast<std::uint64_t>(procs[i].section) << 32) | procs[i].offset)->second;
+        if (found[first] == Found::No) {
+            return Diag::make(diag::kBadModuleSymbols, "The symbol record of '" + std::string(procs[i].name) + "' was not found in module '" + std::string(c.object_name) + "'.",
+                              "Rebuild the module so the linker regenerates the PDB.");
+        }
+        if (found[first] == Found::Open) {
+            return Diag::make(diag::kBadModuleSymbols, "The procedure '" + std::string(procs[i].name) + "' in module '" + std::string(c.object_name) + "' has no end record.",
+                              "Rebuild the module so the linker regenerates the PDB.");
+        }
+        if (first != i) {
+            out[i] = out[first];
+        }
     }
     return out;
 }
