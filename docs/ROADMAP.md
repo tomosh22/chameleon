@@ -81,6 +81,7 @@ fixtures" to "works on your project".
 | R-54 | **An own static can take a fully inlined, deleted lambda's static (clang-cl -O2).** With no `operator()` procedure left in the old image, the planner cannot see that a record named `x` directly in `f` belonged to `f`'s lambda; an edit that deletes the lambda and declares `static x` in `f` binds it to the lambda's live object. Needs closure classes from the TPI (by name) or the caller's `S_INLINESITE`s in `cml_pdb`. Split out of WP-46 (its overload-blind closure match regressed the clang-cl corpus); WP-51 in wave 12 (ADR-0044). | WP-40 (#72) |
 | R-55 | **A hot-restart of the Godot editor takes over two minutes** (131–167 s in the godot-gdextension corpus cell, before and after WP-45). Not measured by stage. | WP-45 (#73) corpus logs |
 | R-56 | **A reload across several modules or processes is atomic per module only (WP-47).** A refused plugin DLL after an applied exe in the same reload still leaves the exe patched. Needs a two-phase pipeline API across the modules of one process in `reload_service`. | WP-47 (#79) |
+| R-57 | **A static of an inlined helper function can be taken by a new static of its caller (WP-51 spike).** A `static` (internal-linkage) helper inlined into its caller records its function-local statics in the caller; deleting the helper and adding a same-named static to the caller pairs it with the helper's live object, as R-54 does for lambdas. WP-51 logs how often a wider rule would refuse on the corpus. | WP-51 (#81) |
 
 ---
 
