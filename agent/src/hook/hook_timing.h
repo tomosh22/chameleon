@@ -29,6 +29,8 @@ struct BatchTiming {
     std::uint64_t lock_us = 0;        // waiting for another batch (the installer's mutex)
     std::uint64_t plan_us = 0;        // 1 + 1b: reading the bytes, choosing strategies, the batch checks
     std::uint64_t probe_us = 0;       //   of plan_us: ReadProcessMemory / VirtualQuery on the targets and the replacements
+    std::uint64_t query_us = 0;       //     of probe_us: VirtualQuery (is_code); the rest is ReadProcessMemory
+    std::uint32_t queries = 0;        //     VirtualQuery calls
     std::uint64_t protect_us = 0;     // 2: VirtualProtect to writable
     std::uint64_t enumerate_us = 0;   // 3: NtGetNextThread (ThreadSet::Timing::enumerate)
     std::uint64_t suspend_us = 0;     // 3: SuspendThread (also when an offender is stopped again, which is inside step_us)
@@ -114,8 +116,8 @@ inline std::string format_hooks_timing(const HooksTimingLine& l) {
     append(out, " total_us=%llu wait_us=%llu prefetch_us=%llu prefetch=%s prefetch_pages=%u", ull(d.total_us), ull(d.wait_us), ull(d.prefetch_us),
            l.prefetch, l.prefetch_pages);
     append(out, " collect_us=%llu prepatch_us=%llu build_us=%llu", ull(d.collect_us), ull(d.prepatch_us), ull(d.build_us));
-    append(out, " install_us=%llu lock_us=%llu plan_us=%llu probe_us=%llu protect_us=%llu", ull(d.install_us), ull(b.lock_us), ull(b.plan_us),
-           ull(b.probe_us), ull(b.protect_us));
+    append(out, " install_us=%llu lock_us=%llu plan_us=%llu probe_us=%llu query_us=%llu queries=%u protect_us=%llu", ull(d.install_us), ull(b.lock_us),
+           ull(b.plan_us), ull(b.probe_us), ull(b.query_us), b.queries, ull(b.protect_us));
     append(out, " stop_us=%llu enumerate_us=%llu suspend_us=%llu context_us=%llu check_us=%llu", ull(b.stop_us), ull(b.enumerate_us),
            ull(b.suspend_us), ull(b.context_us), ull(b.check_us));
     append(out, " write_us=%llu write_max_us=%llu step_us=%llu resume_us=%llu retry_wait_us=%llu", ull(b.write_us), ull(b.write_max_us),

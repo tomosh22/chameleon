@@ -647,6 +647,15 @@ BatchResult Installer::apply_locked(bool reverting, const HookRequest* requests,
     long long since = ticks();
     result.timing.lock_us = to_us(since - called);
     long long probing = 0;  // ticks inside ReadProcessMemory / VirtualQuery while planning
+    long long querying = 0;  // of them: inside VirtualQuery (is_code)
+    std::uint32_t queries = 0;
+    const auto timed_is_code = [&querying, &queries](const void* address) {
+        const long long q0 = ticks();
+        const bool code = is_code(address);
+        querying += ticks() - q0;
+        ++queries;
+        return code;
+    };
     const auto lap = [&since]() {
         const long long now = ticks();
         const long long spent = now - since;
@@ -736,7 +745,7 @@ BatchResult Installer::apply_locked(bool reverting, const HookRequest* requests,
         }
 
         long long probe_started = ticks();
-        const bool replacement_is_code = is_code(request.replacement);
+        const bool replacement_is_code = timed_is_code(request.replacement);
         probing += ticks() - probe_started;
         if (!replacement_is_code) {
             failure.reason = BadArgument::NotCode;
@@ -781,7 +790,7 @@ BatchResult Installer::apply_locked(bool reverting, const HookRequest* requests,
 
         // A new hook: read the bytes around the entry and choose a strategy.
         probe_started = ticks();
-        if (!is_code(request.target)) {
+        if (!timed_is_code(request.target)) {
             probing += ticks() - probe_started;
             reject(ids::kCodeUnreadable);
             continue;
@@ -801,8 +810,8 @@ BatchResult Installer::apply_locked(bool reverting, const HookRequest* requests,
         PlanEnvironment environment;
         environment.entry_two_byte_aligned = (target & 1) == 0;
         // Only worth a VirtualQuery when the bytes say the padding is there at all.
-        environment.padding_executable = before_len < kMinPadding || (is_code(reinterpret_cast<const void*>(target - kMinPadding)) &&
-                                                                      is_code(reinterpret_cast<const void*>(target - 1)));
+        environment.padding_executable = before_len < kMinPadding || (timed_is_code(reinterpret_cast<const void*>(target - kMinPadding)) &&
+                                                                      timed_is_code(reinterpret_cast<const void*>(target - 1)));
         probing += ticks() - probe_started;
         const HookPlan plan = plan_hook(before, before_len, at, at_len, environment);
         if (plan.strategy == Strategy::None) {
@@ -923,6 +932,8 @@ BatchResult Installer::apply_locked(bool reverting, const HookRequest* requests,
 
     result.timing.plan_us = lap();
     result.timing.probe_us = to_us(probing);
+    result.timing.query_us = to_us(querying);
+    result.timing.queries = queries;
     for (const Job& job : jobs) {
         if (job.failure.code != 0) {
             continue;

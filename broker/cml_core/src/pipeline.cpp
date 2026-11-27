@@ -690,6 +690,7 @@ private:
         std::shared_ptr<const pe::OwnedImage> image = module_image(report);
         const Clock::time_point plan_image = Clock::now();
         const std::size_t export_parses_before = ctx_.exports ? ctx_.exports->parses() : 0;
+        const pdb::Timings pdb_before = pdb.timings();  // WP-50: the PDB's lazily loaded tables, before and after the bind plan
         FileProcessModules process_modules(snapshot_.modules, LoadedModule{module_.path, module_.base, module_.size}, ctx_.exports, image);
         bind::PlanInput in;
         in.object = &object->object;
@@ -858,11 +859,14 @@ private:
         {
             const Clock::time_point plan_done = Clock::now();
             const std::size_t export_parses = (ctx_.exports ? ctx_.exports->parses() : 0) - export_parses_before;
+            const pdb::Timings pdb_after = pdb.timings();
             CML_LOG(Info, "WP50-PLAN module=%s object=%s total_ms=%.1f object_ms=%.1f image_ms=%.1f bind_ms=%.1f export_parses=%zu prove_ms=%.1f "
-                          "narrow_ms=%.1f rest_ms=%.1f hooks_planned=%zu",
+                          "narrow_ms=%.1f rest_ms=%.1f hooks_planned=%zu pdb_module_symbols_ms=%.1f pdb_publics_ms=%.1f pdb_buildinfo_ms=%.1f",
                     module_.name.c_str(), std::string(path::base_name(std::string_view(u.outcome.object_path))).c_str(), ms_between(plan_started, plan_done),
                     ms_between(plan_started, plan_object), ms_between(plan_object, plan_image), ms_between(plan_image, plan_bound), export_parses,
-                    ms_between(plan_bound, plan_proved), ms_between(plan_proved, plan_narrowed), ms_between(plan_narrowed, plan_done), narrowed.planned);
+                    ms_between(plan_bound, plan_proved), ms_between(plan_proved, plan_narrowed), ms_between(plan_narrowed, plan_done), narrowed.planned,
+                    pdb_after.module_symbols_ms - pdb_before.module_symbols_ms, pdb_after.publics_ms - pdb_before.publics_ms,
+                    pdb_after.buildinfo_ms - pdb_before.buildinfo_ms);
         }
         if (!has_effect) {
             CML_LOG(Info, "reload: %s changes no code (all %zu planned hooks are identical to the running code); nothing to load", u.source.c_str(),

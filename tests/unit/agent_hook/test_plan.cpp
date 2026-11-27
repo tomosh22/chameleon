@@ -401,7 +401,7 @@ TEST_CASE("WP-50: the WP50-HOOKS line carries every phase under a stable key, in
                      "threads=3 attempts=1 status=0 total_us=395000 ",
                      0) == 0);
     const char* const keys[] = {"wait_us",      "prefetch_us", "prefetch", "prefetch_pages", "collect_us", "prepatch_us",   "build_us",     "install_us", "lock_us",     "plan_us",
-                                "probe_us",     "protect_us", "stop_us",       "enumerate_us", "suspend_us", "context_us",  "check_us",
+                                "probe_us",     "query_us", "queries", "protect_us", "stop_us",       "enumerate_us", "suspend_us", "context_us",  "check_us",
                                 "write_us",     "write_max_us", "step_us",     "resume_us",    "retry_wait_us", "unprotect_us", "commit_us",
                                 "rollback_us",  "postpatch_us", "reply_us"};
     std::size_t at = 0;
