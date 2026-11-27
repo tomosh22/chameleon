@@ -742,8 +742,11 @@ bool Agent::send_module_list(ipc::PipeConnection& connection, bool session_start
     if (!send_message(connection, list)) {
         return false;
     }
-    module_track_.known = list.modules;
-    module_track_.suspect.reset();
+    if (modules) {
+        adopt_full_list(module_track_, list.modules);  // WP-48: a list taken now is up to date for every unload drained before it
+    } else {
+        module_track_.suspect.reset();  // the list we had went out again: nothing new is known
+    }
     ranges_dirty_.store(true, std::memory_order_release);
     last_module_poll_ = GetTickCount64();
     if (modules) {
@@ -893,8 +896,10 @@ bool Agent::poll_modules(ipc::PipeConnection& connection) {
     if (!report.events.empty()) {
         ranges_dirty_.store(true, std::memory_order_release);
     }
-    if (!report.need_full_list && !report.deferred) {
-        polled_seq_ = seq_mark;  // everything loaded before seq_mark is reported (a deferred load is not yet)
+    if (!report.need_full_list) {
+        // Everything loaded before seq_mark is reported, except a deferred cut-path load (and later events at its base), which the
+        // next poll with a module list reports.
+        polled_seq_ = seq_mark;
     }
     return true;
 }
@@ -1250,6 +1255,10 @@ void Agent::handle_message(const ipc::Message& message) {
             full_list_not_before_ = GetTickCount64() + list_backoff_ms_;
             list_backoff_ms_ = std::min(list_backoff_ms_ * 2, kMaxListBackoffMs);
             polled_seq_ = 0;
+            // WP-48: the broker did not take the list, so it does not know what the list said: the next poll reports every loaded
+            // module from the snapshot (the untrusted diff against nothing; ModuleLoaded is idempotent in the broker).
+            module_track_.known.clear();
+            module_track_.suspect.reset();
         }
         complete(reply->request_id, reply->status, reply->message);
         if (is_list && reply->status == 0) {

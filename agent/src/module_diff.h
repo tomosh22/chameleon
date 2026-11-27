@@ -53,15 +53,26 @@ DrainedEvent to_drained(const RawModuleEvent& raw);
 struct ModuleTrackState {
     std::vector<ipc::ModuleEntry> known;  // what the broker was told: the last full ModuleList and every event since
     std::optional<ModuleDelta> suspect;   // a disagreement with the module list seen in one quiet poll (CML4722 when seen again)
-    // Bases whose unload notification was seen (reported or redundant) and at which no load has been reported since. A load at such
-    // a base is never redundant, even when `known` holds exactly that entry: `known` can have it back from a module list that still
-    // showed the image after its unload notification (a resync, or a list sent again), and the load is then a new image. Kept across
-    // resyncs and lists sent again; a new session starts empty.
-    std::vector<std::uint64_t> unloads_seen;
-    // Events kept for the next poll, in order: a load whose path was cut (longer than a slot) when no module list could be taken
-    // to complete it, and every event after it.
+    // Bases whose unload notification was seen (reported or redundant) and at which no load has been reported since, with the poll
+    // that drained it. A load at such a base is never redundant, even when `known` holds exactly that entry: a module list taken in
+    // the SAME poll, right after the drain, can still show the image after its unload notification (it lags), and the load is then
+    // a new image. A list taken in a LATER poll is up to date: when it becomes `known` the bases of earlier polls are dropped from
+    // here (an image it shows at such a base is the new one, already reported loaded; its load notification is then redundant,
+    // and must not unload a live, hooked image). A new session starts empty.
+    struct SeenUnload {
+        std::uint64_t base = 0;
+        std::uint64_t poll = 0;
+    };
+    std::vector<SeenUnload> unloads_seen;
+    std::uint64_t polls = 0;  // track_modules calls so far (the poll number of the current one)
+    // Events kept for the next poll, in order: a load whose path was cut (longer than a slot) when no module list could be taken to
+    // complete it, and the later events at the same base (the order per base is kept; every other event is processed).
     std::vector<DrainedEvent> deferred;
 };
+
+// A full module list the broker was sent (a list sent again, not the session's first one) becomes the known list. It is taken
+// after everything drained so far, so it is up to date for every unload seen: unloads_seen is cleared.
+void adopt_full_list(ModuleTrackState& state, std::vector<ipc::ModuleEntry> list);
 
 // The first module list of a session: `before` are the notifications drained right before `list` was taken (oldest first). The
 // list can lag behind them (still show an image whose unload notification was delivered), so they are applied to it: an unload
@@ -78,7 +89,7 @@ struct ModulePollReport {
     std::size_t patch_events = 0;     // dropped: the patch loader's own images
     std::size_t redundant = 0;        // dropped: a load of a module the broker knows as it is, an unload of one it does not know
     bool need_full_list = false;      // a resync was needed and no snapshot was available: send a full ModuleList
-    bool deferred = false;            // events were kept for the next poll (state.deferred): this poll does not cover everything
+    bool deferred = false;            // events were kept for the next poll (state.deferred): a cut-path load and later events at its base
 };
 
 // One poll. `drained` are the notifications taken from the ring, oldest first (state.deferred goes before them); `lost` how many
@@ -90,9 +101,9 @@ struct ModulePollReport {
 //     seen since (state.unloads_seen: then the known entry's unload is reported first, seq 0); a load at a base that holds another
 //     module reports that module's unload first (seq 0);
 //   * a truncated path is completed from the snapshot (same base and size); one that cannot be is a resync (kPathUnresolved);
-//     without a snapshot that load and everything after it wait for the next poll (state.deferred).
+//     without a snapshot that load and the later events at its base wait for the next poll (state.deferred); the others go on.
 // A resync (lost > 0 or an unresolved path) appends the snapshot diff of what is left (unloads, then loads, seq 0) and makes the
-// snapshot the known list. So does an untrusted known list, at once and without a diagnostic (the broker must learn the modules
+// snapshot the known list (unloads_seen keeps only this poll's bases: the snapshot may lag behind them). So does an untrusted known list, at once and without a diagnostic (the broker must learn the modules
 // before a request that names one). Otherwise, with no events and a quiet snapshot, a difference between the known list and the
 // snapshot is only remembered; the same difference in the next such poll is reported as a resync (kListDisagrees). So transient
 // differences (a notification delivered before the module list shows the change, or after it) never reach the broker.

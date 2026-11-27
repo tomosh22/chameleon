@@ -58,16 +58,25 @@ ipc::ModuleEvent make_event(ipc::ModuleEventKind kind, std::uint64_t seq, const 
     return event;
 }
 
-// Reports the difference between `known` and `snapshot` (unloads first, then loads, both seq 0) and makes the snapshot the known list.
-void append_snapshot_diff(ModulePollReport& report, std::vector<ipc::ModuleEntry>& known, const std::vector<ipc::ModuleEntry>& snapshot) {
-    const ModuleDelta delta = diff_modules(known, snapshot);
+// Drops the unloads seen before poll `poll`: a module list taken in that poll is up to date for them (review round 2).
+void forget_unloads_before(ModuleTrackState& state, std::uint64_t poll) {
+    state.unloads_seen.erase(std::remove_if(state.unloads_seen.begin(), state.unloads_seen.end(),
+                                            [poll](const ModuleTrackState::SeenUnload& u) { return u.poll < poll; }),
+                             state.unloads_seen.end());
+}
+
+// Reports the difference between the known list and `snapshot` (taken in the current poll; unloads first, then loads, both seq 0)
+// and makes the snapshot the known list. The unloads of this poll stay remembered: the snapshot may lag behind them.
+void append_snapshot_diff(ModulePollReport& report, ModuleTrackState& state, const std::vector<ipc::ModuleEntry>& snapshot) {
+    const ModuleDelta delta = diff_modules(state.known, snapshot);
     for (const ipc::ModuleEntry& module : delta.unloaded) {
         report.events.push_back(make_event(ipc::ModuleEventKind::Unloaded, 0, module));
     }
     for (const ipc::ModuleEntry& module : delta.loaded) {
         report.events.push_back(make_event(ipc::ModuleEventKind::Loaded, 0, module));
     }
-    known = snapshot;
+    state.known = snapshot;
+    forget_unloads_before(state, state.polls);
 }
 
 }  // namespace
@@ -143,25 +152,40 @@ std::vector<ipc::ModuleEntry> apply_before_list(const std::vector<DrainedEvent>&
     return out;
 }
 
+void adopt_full_list(ModuleTrackState& state, std::vector<ipc::ModuleEntry> list) {
+    state.known = std::move(list);
+    state.suspect.reset();
+    state.unloads_seen.clear();  // the list was taken after every drain so far: up to date for each of them
+}
+
 ModulePollReport track_modules(ModuleTrackState& state, const std::vector<DrainedEvent>& drained, std::uint64_t lost,
                                const std::vector<ipc::ModuleEntry>* snapshot, bool quiet, bool known_trusted) {
     ModulePollReport report;
     report.lost = lost;
     std::uint32_t resync = lost > 0 ? module_events::ids::kRingOverflow : 0u;
     std::vector<ipc::ModuleEntry>& known = state.known;
+    const std::uint64_t poll = ++state.polls;
     std::vector<DrainedEvent> events = std::move(state.deferred);  // what the previous poll could not finish goes first
     state.deferred.clear();
     events.insert(events.end(), drained.begin(), drained.end());
+    std::vector<std::uint64_t> deferred_bases;  // bases with a deferred event in this poll: their later events wait too
     const auto find_base = [&known](std::uint64_t base) {
         return std::find_if(known.begin(), known.end(), [base](const ipc::ModuleEntry& m) { return m.base == base; });
     };
-    const auto note_unload = [&state](std::uint64_t base) {
-        if (std::find(state.unloads_seen.begin(), state.unloads_seen.end(), base) == state.unloads_seen.end()) {
-            state.unloads_seen.push_back(base);
+    const auto seen_at = [&state](std::uint64_t base) {
+        return std::find_if(state.unloads_seen.begin(), state.unloads_seen.end(),
+                            [base](const ModuleTrackState::SeenUnload& u) { return u.base == base; });
+    };
+    const auto note_unload = [&state, &seen_at, poll](std::uint64_t base) {
+        const auto it = seen_at(base);
+        if (it == state.unloads_seen.end()) {
+            state.unloads_seen.push_back(ModuleTrackState::SeenUnload{base, poll});
+        } else {
+            it->poll = poll;  // the latest unload at that base is the one a list can lag behind
         }
     };
-    const auto take_unload = [&state](std::uint64_t base) {
-        const auto it = std::find(state.unloads_seen.begin(), state.unloads_seen.end(), base);
+    const auto take_unload = [&state, &seen_at](std::uint64_t base) {
+        const auto it = seen_at(base);
         if (it == state.unloads_seen.end()) {
             return false;
         }
@@ -172,6 +196,10 @@ ModulePollReport track_modules(ModuleTrackState& state, const std::vector<Draine
         const DrainedEvent& event = events[i];
         if (event.patch_image) {
             ++report.patch_events;
+            continue;
+        }
+        if (std::find(deferred_bases.begin(), deferred_bases.end(), event.module.base) != deferred_bases.end()) {
+            state.deferred.push_back(event);  // after a deferred load at this base: keeps the order per base
             continue;
         }
         const auto at = find_base(event.module.base);
@@ -188,10 +216,12 @@ ModulePollReport track_modules(ModuleTrackState& state, const std::vector<Draine
         ipc::ModuleEntry entry = event.module;
         if (event.path_truncated) {
             if (snapshot == nullptr) {
-                // No list to read the full path from: this load and everything after it wait for the next poll, in order.
-                state.deferred.assign(events.begin() + static_cast<std::ptrdiff_t>(i), events.end());
+                // No list to read the full path from: this load, and the later events at its base, wait for the next poll. Every other
+                // event goes on (an unload elsewhere must reach forget_range and the broker now, WP-45).
+                state.deferred.push_back(event);
+                deferred_bases.push_back(event.module.base);
                 report.deferred = true;
-                break;
+                continue;
             }
             // While the module is still loaded the snapshot has its full path.
             const auto full = std::find_if(snapshot->begin(), snapshot->end(),
@@ -224,7 +254,7 @@ ModulePollReport track_modules(ModuleTrackState& state, const std::vector<Draine
         if (snapshot == nullptr) {
             report.need_full_list = true;
         } else {
-            append_snapshot_diff(report, known, *snapshot);
+            append_snapshot_diff(report, state, *snapshot);
         }
         return report;
     }
@@ -235,7 +265,7 @@ ModulePollReport track_modules(ModuleTrackState& state, const std::vector<Draine
         if (snapshot == nullptr) {
             report.need_full_list = true;
         } else {
-            append_snapshot_diff(report, known, *snapshot);
+            append_snapshot_diff(report, state, *snapshot);
         }
         return report;
     }
@@ -251,7 +281,7 @@ ModulePollReport track_modules(ModuleTrackState& state, const std::vector<Draine
     if (state.suspect.has_value() && same_delta(*state.suspect, delta)) {
         state.suspect.reset();
         report.resync_reason = module_events::ids::kListDisagrees;
-        append_snapshot_diff(report, known, *snapshot);
+        append_snapshot_diff(report, state, *snapshot);
         return report;
     }
     state.suspect = std::move(delta);
