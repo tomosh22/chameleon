@@ -137,6 +137,15 @@ struct Rig {
     std::uint32_t arm_status = 0;               // WP-28: status of the Reply to ArmFault (failure injection)
     std::uint32_t arm_status2 = 0;              // WP-28: the same for the second process
     std::function<void(const ipc::ArmFault&)> on_arm;  // WP-44: runs when an agent receives ArmFault, before it answers
+    // WP-47: failures of one compiland of several. The n-th InstallHooks of the first process (from 1, revert requests included)
+    // answers with that status, or not at all; `on_hooks(n)` runs before it answers; a link of an object whose path holds
+    // `fail_link_of` fails (CML3350).
+    std::map<int, std::uint32_t> hooks_status_at;
+    int silent_hooks_at = 0;
+    std::function<void(int)> on_hooks;
+    std::string fail_link_of;
+    std::function<bool(const std::string&)> link_fails;  // WP-47: a link of an object whose path it accepts fails (CML3350)
+    int close_on_load_at = 0;                          // WP-47: the n-th LoadPatch (from 1) closes the link instead of answering
 
     std::mutex mutex;
     std::vector<ipc::Message> requests;         // what the agent received, in order (requests only)
@@ -156,7 +165,10 @@ struct Rig {
 
     // `real_sources` (WP-45): logic.cpp exists (in `dir`) and is the compiland's source, so the module index tracks it and the real
     // sweep (no override) sees its edits.
-    explicit Rig(bool default_session_dir = false, const std::string& logic_flags = std::string(), bool const_symbol = false, bool real_sources = false) {
+    // `bitmask_world` (WP-47): logic.cpp's old compiland also holds `s_a` and a function f() with the statics n and m, so that a
+    // `$S1` bitmask of f() is bound to the old one by the layout (tests/unit/bind/test_pairing.cpp) and must be proved by f()'s code.
+    explicit Rig(bool default_session_dir = false, const std::string& logic_flags = std::string(), bool const_symbol = false, bool real_sources = false,
+                 bool bitmask_world = false) {
         if (real_sources) {
             logic_src = dir.file("logic.cpp");
             write_logic(1);
@@ -169,6 +181,10 @@ struct Rig {
             w.tu().files = {logic_src};  // the compiland's file list (what the index tracks)
         }
         w.proc(w.tu(), "compute_value", 0x10);
+        if (bitmask_world) {
+            w.data(w.tu(), "`anonymous namespace'::s_a", 0x10);
+            w.proc_with_statics(w.tu(), "f", 0x50, {{"n", 0x14}, {"m", 0x18}});
+        }
         w.main_obj().symbols.envblock({{"cwd", dir.dir()}, {"cl", "C:\\VC\\bin\\cl.exe"}, {"cmd", "/c /Zi /Gy main.cpp"}, {"src", "C:\\proj\\main.cpp"}});
         w.proc(w.main_obj(), "fixture_note", 0x100);
         w.data(w.main_obj(), "g_tick", 0x80, false);
@@ -245,6 +261,9 @@ struct Rig {
                 std::lock_guard<std::mutex> lock(mutex);
                 link_bases.push_back(request.base);
                 link_dirs.push_back(request.out_dir);
+            }
+            if ((!fail_link_of.empty() && request.objects[0].path.find(fail_link_of) != std::string::npos) || (link_fails && link_fails(request.objects[0].path))) {
+                return Diag::make(3350, "the linker reported errors for " + request.objects[0].path, "Fix the link errors.");
             }
             toolchain::LinkedPatch lp;
             lp.dll_path = request.out_dir + "/" + request.name + ".dll";
@@ -327,7 +346,14 @@ struct Rig {
             r.blocks.push_back({0x13F000000ull, 64ull << 20});
             l.deliver(r);
         } else if (const auto* load = std::get_if<ipc::LoadPatch>(&m)) {
-            if (close_on_load) {
+            int nth_load = 0;  // WP-47
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                for (const ipc::Message& q : requests) {
+                    nth_load += std::holds_alternative<ipc::LoadPatch>(q) ? 1 : 0;
+                }
+            }
+            if (close_on_load || (close_on_load_at != 0 && nth_load == close_on_load_at)) {
                 std::thread([&l] { l.close(); }).detach();
                 return Result<void>();
             }
@@ -355,10 +381,23 @@ struct Rig {
         } else if (std::holds_alternative<ipc::RunInitializers>(m)) {
             reply(init_status, init_status != 0 ? "initialiser faulted" : "");
         } else if (std::holds_alternative<ipc::InstallHooks>(m)) {
-            if (answer_hooks) {
+            int nth = 0;  // WP-47: which InstallHooks of the first process this is
+            if (&l == link.get()) {
+                std::lock_guard<std::mutex> lock(mutex);
+                for (const ipc::Message& q : requests) {
+                    nth += std::holds_alternative<ipc::InstallHooks>(q) ? 1 : 0;
+                }
+            }
+            if (on_hooks && nth != 0) {
+                on_hooks(nth);
+            }
+            if (answer_hooks && (nth == 0 || nth != silent_hooks_at)) {
                 ipc::HooksInstalled r;
                 r.request_id = id;
-                const std::uint32_t hooks_result = (link2 && &l == link2.get()) ? hooks_status2 : hooks_status;
+                std::uint32_t hooks_result = (link2 && &l == link2.get()) ? hooks_status2 : hooks_status;
+                if (const auto at = hooks_status_at.find(nth); nth != 0 && at != hooks_status_at.end()) {
+                    hooks_result = at->second;
+                }
                 r.status = hooks_result;
                 r.message = hooks_result != 0 ? "too short" : "";
                 r.threads = 3;
@@ -2805,24 +2844,554 @@ TEST_CASE("set-option reserve_block_mb below the room a patch needs is refused")
     CHECK(rig.service->options().reserve_block_mb == 4);
 }
 
-TEST_CASE("patches applied before a later compiland failed still count in the generation") {
+// ---- WP-47 (ADR-0044, R-52): a refused multi-compiland reload applies nothing -----------------------------------------
+
+namespace {
+
+// The diag events of one severity and id the rig's listener has seen (WP-47).
+int diag_count(Rig& rig, const std::string& id, const std::string& severity) {
+    std::lock_guard<std::mutex> lock(rig.events->mutex);
+    int n = 0;
+    for (const Event& e : rig.events->events) {
+        n += (e.name == "diag" && e.body.get_string("id") == id && e.body.get_string("severity") == severity) ? 1 : 0;
+    }
+    return n;
+}
+
+// The next sweep reports logic.cpp (compiland 0) and main.cpp (compiland 1) as changed, the compilands in `order`.
+void changed_in_order(Rig& rig, std::vector<std::uint32_t> order) {
+    rig.module->index->set_sweep_override_for_testing([order]() -> Result<ModuleIndex::Sweep> {
+        ModuleIndex::Sweep s;
+        for (const char* f : {"C:\\proj\\logic.cpp", "C:\\proj\\main.cpp"}) {
+            s.changed.push_back(f);
+        }
+        s.compilands = order;
+        s.file_compilands["C:\\proj\\logic.cpp"] = {0};
+        s.file_compilands["C:\\proj\\main.cpp"] = {1};
+        s.stamps["C:\\proj\\logic.cpp"] = FileStamp{1, 2, 3};
+        s.stamps["C:\\proj\\main.cpp"] = FileStamp{4, 5, 6};
+        return s;
+    });
+}
+
+// What every refusal or rolled-back failure of a two-compiland reload must leave: nothing of the reload live, nothing announced,
+// nothing re-baselined (both files are processed again by the next reload).
+void check_nothing_live(Rig& rig) {
+    CHECK(rig.module->generation == 0);
+    CHECK(rig.service->generation() == 0);
+    CHECK(rig.events->count("patch_applied") == 0);
+    CHECK_FALSE(rig.module->is_hooked(kModuleBase + 0x1010));
+    CHECK_FALSE(rig.module->registry.find("?new_helper@@YAHXZ").has_value());
+    CHECK(rig.module->batches.empty());
+    {
+        std::lock_guard<std::mutex> lock(rig.module->mutex);
+        CHECK(rig.module->hooked.empty());
+        CHECK(rig.module->code.empty());
+    }
+    const auto accepted = rig.module->index->accepted_for_testing();
+    REQUIRE_FALSE(accepted.empty());
+    CHECK(accepted.back().count("C:\\proj\\logic.cpp") == 0);
+    CHECK(accepted.back().count("C:\\proj\\main.cpp") == 0);
+}
+
+// logic.cpp (applied first) defines new_helper and hooks compute_value; main.cpp's compute_value calls new_helper, which only the
+// staged first compiland defines: main.cpp is planned against it (the overlay registry), and both hook compute_value.
+void two_dependent_units(Rig& rig) {
+    rig.object = make_object({}, true);
+    rig.second_object = make_object("?new_helper@@YAHXZ");
+    rig.changed_both();
+}
+
+// After the cause is gone the very same reload applies both compilands, and main.cpp binds to logic.cpp's new_helper.
+void check_clean_reload(Rig& rig) {
+    rig.hooks_status_at.clear();
+    rig.silent_hooks_at = 0;
+    rig.on_hooks = nullptr;
+    rig.fail_link_of.clear();
+    rig.link_fails = nullptr;
+    rig.close_on_load_at = 0;
+    two_dependent_units(rig);
+    const std::size_t loads_before = rig.seen<ipc::LoadPatch>().size();
+    Result<Value> r = rig.reload();
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    CHECK(r->get_integer("patched") == 2);
+    CHECK(rig.module->generation == 2);
+    CHECK(rig.events->count("patch_applied") == 2);
+    const auto loads = rig.seen<ipc::LoadPatch>();
+    REQUIRE(loads.size() == loads_before + 2);
+    const auto helper = rig.module->registry.find("?new_helper@@YAHXZ");
+    REQUIRE(helper.has_value());
+    CHECK(helper->va == loads[loads_before].candidates[0].image_base + 0x1020);
+    const auto fixups = rig.seen<ipc::ApplyFixups>();
+    REQUIRE(fixups.size() >= 2);
+    bool bound = false;
+    for (const ipc::Fixup& f : fixups.back().fixups) {
+        bound = bound || (f.rva == 0x100F && f.kind == ipc::FixupKind::Rel32 && f.value == helper->va);
+    }
+    CHECK(bound);
+    REQUIRE(rig.module->batches.size() == 1);
+    CHECK(rig.module->batches[0].patches.size() == 2);
+}
+
+}  // namespace
+
+TEST_CASE("atomic reload (WP-47): a plan refusal of the second compiland applies nothing; the first was linked, never loaded") {
     QuietLogs quiet;
     Rig rig;
     rig.enable();
-    rig.changed_both();
+    rig.object = make_object({}, true);
     rig.second_object = make_object({}, false, "no_such_function_anywhere");  // main.cpp cannot be planned
+    rig.changed_both();
     Result<Value> r = rig.reload();
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().id() == "CML3200");
-    CHECK(rig.seen<ipc::LoadPatch>().size() == 1);  // logic.cpp was patched first
-    CHECK(rig.module->generation == 1);
-    CHECK(rig.service->generation() == 1);
-    CHECK(rig.events->count("patch_applied") == 1);
-    // Only logic.cpp's stamp is accepted: main.cpp is processed again by the next reload.
+    CHECK(r.error().message.find("(compiland 2 of 2, main.cpp)") != std::string::npos);
+    CHECK(r.error().message.find("nothing of this reload was applied") != std::string::npos);
+    CHECK(rig.link_calls == 1);  // logic.cpp was planned and linked ...
+    CHECK(rig.seen<ipc::LoadPatch>().empty());  // ... and never loaded
+    CHECK(rig.seen<ipc::InstallHooks>().empty());
+    CHECK(rig.seen<ipc::ReleaseRange>().empty());
+    CHECK(rig.events->diag_ids() == std::vector<std::string>{"CML3200"});
+    CHECK(diag_count(rig, "CML3650", "warning") == 1);
+    check_nothing_live(rig);
+
+    // The slice logic.cpp was linked into was given back: the clean reload loads it there.
+    const std::uint64_t first_base = rig.link_bases.front();
+    check_clean_reload(rig);
+    CHECK(rig.seen<ipc::LoadPatch>().front().candidates[0].image_base == first_base);
+}
+
+TEST_CASE("atomic reload (WP-47): a single-compiland refusal keeps its message and raises no CML3650") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    rig.object = make_object({}, false, "no_such_function_anywhere");
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML3200");
+    CHECK(r.error().message.find("compiland 1 of 1") == std::string::npos);
+    CHECK(diag_count(rig, "CML3650", "warning") == 0);
+}
+
+TEST_CASE("atomic reload (WP-47): a link refusal of the second compiland applies nothing") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    two_dependent_units(rig);
+    rig.fail_link_of = "main.cpp";
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML3350");
+    CHECK(r.error().message.find("(compiland 2 of 2, main.cpp)") != std::string::npos);
+    CHECK(rig.link_calls == 2);
+    CHECK(rig.seen<ipc::LoadPatch>().empty());
+    CHECK(rig.seen<ipc::InstallHooks>().empty());
+    CHECK(diag_count(rig, "CML3650", "warning") == 1);
+    check_nothing_live(rig);
+    check_clean_reload(rig);
+}
+
+TEST_CASE("atomic reload (WP-47): a refused code proof (the bitmask of an unchanged function, CML3600) of the second compiland applies nothing") {
+    QuietLogs quiet;
+    Rig rig(false, std::string(), false, false, true);
+    rig.enable();
+    // main.cpp (compiland 1) first: an ordinary patch. logic.cpp second: f()'s statics and its `$S1` bitmask, bound to the old ones by
+    // the layout, but f() itself is not in the patch, so its code cannot prove the bits (prove_bitmask_guards).
+    rig.second_object = make_object({}, true);
+    SynthObj o;
+    const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+    o.symbol("?s_a@?A0x1@@3HA", 0x10, bss, false, false);
+    o.symbol("?n@?2??f@@YAHXZ@4HA", 0x14, bss, false, false);
+    o.symbol("?m@?3??f@@YAHXZ@4HA", 0x18, bss, false, false);
+    o.symbol("?$S1@?1??f@@YAHXZ@4IA", 0x1C, bss, false, false);
+    Built b = o.build();
+    rig.object.assign(b.owned->bytes.begin(), b.owned->bytes.end());
+    changed_in_order(rig, {1, 0});
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML3600");
+    CHECK(r.error().message.find("bitmask guard") != std::string::npos);
+    CHECK(r.error().message.find("(compiland 2 of 2, logic.cpp)") != std::string::npos);
+    CHECK(rig.link_calls == 1);  // main.cpp
+    CHECK(rig.seen<ipc::LoadPatch>().empty());
+    CHECK(rig.seen<ipc::InstallHooks>().empty());
+    CHECK(diag_count(rig, "CML3650", "warning") == 1);
+    check_nothing_live(rig);
+}
+
+TEST_CASE("atomic reload (WP-47): an apply failure of the second compiland (the agent's hook-install stage) rolls the first back") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    two_dependent_units(rig);
+    rig.hooks_status_at[2] = ipc::fault::ids::kAgentHookInstall;  // what the agent answers when its stage hook-install is armed
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML4652");
+    CHECK(r.error().message.find("(compiland 2 of 2, main.cpp)") != std::string::npos);
+    CHECK(r.error().message.find("the 1 compiland(s) this reload had applied were rolled back") != std::string::npos);
+    // logic.cpp was applied, main.cpp failed and was unloaded, then logic.cpp's hook was reverted to the original bytes (quietly)
+    // and its image un-committed.
+    CHECK(rig.seen<ipc::LoadPatch>().size() == 2);
+    const auto hooks = rig.seen<ipc::InstallHooks>();
+    REQUIRE(hooks.size() == 3);
+    CHECK(hooks[0].flags == 0);
+    CHECK(hooks[1].flags == 0);
+    CHECK(hooks[2].flags == ipc::kInstallHooksRevert);
+    REQUIRE(hooks[2].hooks.size() == 1);
+    CHECK(hooks[2].hooks[0].old_entry == kModuleBase + 0x1010);
+    const auto releases = rig.seen<ipc::ReleaseRange>();
+    REQUIRE(releases.size() == 2);
+    CHECK(releases[0].mode == ipc::ReleaseMode::UnloadPatch);  // main.cpp's patch
+    CHECK(releases[1].mode == ipc::ReleaseMode::Uncommit);     // logic.cpp's, rolled back
+    CHECK(diag_count(rig, "CML3651", "warning") == 1);
+    CHECK(rig.events->count("patch_reverted") == 0);  // nothing of it had been announced
+    check_nothing_live(rig);
+    check_clean_reload(rig);
+}
+
+#if defined(CML_FAULT_INJECTION)
+TEST_CASE("atomic reload (WP-47): an injected failure of the broker's send-patch stage at the second compiland rolls the first back") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    two_dependent_units(rig);
+    // Armed once the first compiland's hooks reach the agent, so that the stage fires for the second one.
+    rig.on_hooks = [&rig](int n) {
+        if (n == 1) {
+            REQUIRE(rig.service->faults().arm(ipc::fault::Stage::SendPatch, 1, std::nullopt).has_value());
+        }
+    };
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML5969");
+    CHECK(r.error().message.find("were rolled back") != std::string::npos);
+    CHECK(rig.seen<ipc::LoadPatch>().size() == 1);  // the second LoadPatch was never sent
+    CHECK(rig.faults_left("send-patch") == 0);
+    CHECK(diag_count(rig, "CML3651", "warning") == 1);
+    check_nothing_live(rig);
+    // The second compiland's slice was given back, logic.cpp's stays used (it was loaded).
+    REQUIRE(rig.link_bases.size() == 2);
+    check_clean_reload(rig);
+    const auto loads = rig.seen<ipc::LoadPatch>();
+    CHECK(loads[1].candidates[0].image_base == rig.link_bases[1]);
+}
+#endif  // CML_FAULT_INJECTION
+
+TEST_CASE("atomic reload (WP-47): when the roll-back is refused too the reply is CML3652 and the batch stays for `revert`") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    two_dependent_units(rig);
+    rig.hooks_status_at[2] = ipc::fault::ids::kAgentHookInstall;
+    rig.hooks_status_at[3] = 4305;  // the roll-back's restoring of compute_value: a thread would not leave the function
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML3652");
+    CHECK(r.error().message.find("CML4652") != std::string::npos);
+    CHECK(r.error().message.find("CML5851") != std::string::npos);
+    CHECK(diag_count(rig, "CML3652", "error") == 1);
+    CHECK(rig.module->generation == 1);  // logic.cpp is live
+    CHECK(rig.module->is_hooked(kModuleBase + 0x1010));
+    REQUIRE(rig.module->batches.size() == 1);
+    CHECK(rig.module->batches[0].patches.size() == 1);
+    CHECK(rig.events->count("patch_applied") == 0);
+    // Its files are not re-baselined: the next reload compiles them again.
     const auto accepted = rig.module->index->accepted_for_testing();
-    REQUIRE(accepted.size() == 1);
-    CHECK(accepted[0].count("C:\\proj\\logic.cpp") == 1);
-    CHECK(accepted[0].count("C:\\proj\\main.cpp") == 0);
+    REQUIRE_FALSE(accepted.empty());
+    CHECK(accepted.back().count("C:\\proj\\logic.cpp") == 0);
+
+    rig.hooks_status_at.clear();
+    Result<Value> reverted = revert_with(rig, "last");
+    REQUIRE_MESSAGE(reverted.has_value(), reverted.error().format());
+    CHECK(rig.module->generation == 0);
+    CHECK_FALSE(rig.module->is_hooked(kModuleBase + 0x1010));
+}
+
+TEST_CASE("atomic reload (WP-47): hooks the agent does not confirm in time stop the reload there; nothing is rolled back (CML3653)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.option("hooks_timeout_ms", Value::integer(300));
+    two_dependent_units(rig);
+    rig.silent_hooks_at = 1;  // logic.cpp's hooks: no HooksInstalled (synchronised mode before SyncPoint())
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML5309");
+    CHECK(r.error().message.find("1 compiland(s) after it were not applied") != std::string::npos);
+    CHECK(diag_count(rig, "CML3653", "warning") == 1);
+    CHECK(rig.seen<ipc::LoadPatch>().size() == 1);  // main.cpp was not loaded
+    CHECK(rig.seen<ipc::InstallHooks>().size() == 1);  // no roll-back
+    CHECK(rig.module->is_hooked(kModuleBase + 0x1010));  // remembered as installed: the hooks may still apply
+    REQUIRE(rig.module->batches.size() == 1);
+    CHECK(rig.module->batches[0].patches.size() == 1);
+    const auto accepted = rig.module->index->accepted_for_testing();
+    REQUIRE_FALSE(accepted.empty());
+    CHECK(accepted.back().count("C:\\proj\\main.cpp") == 0);
+}
+
+TEST_CASE("atomic reload (WP-47): the second compiland's identical code is compared with the staged first one and loads nothing") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.object = make_object({}, true);
+    rig.second_object = make_object();  // compute_value as the first compiland's patch has it (a header inline function, say)
+    rig.changed_both();
+    Result<Value> r = rig.reload();
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    CHECK(r->get_integer("patched") == 1);
+    CHECK(r->get_integer("hooks_dropped") == 1);  // main.cpp's hook: identical to the staged logic.cpp patch, never to the old image
+    CHECK(rig.seen<ipc::LoadPatch>().size() == 1);
+    // Both files are re-baselined: main.cpp's comparison relied on logic.cpp, which was applied.
+    const auto accepted = rig.module->index->accepted_for_testing();
+    REQUIRE_FALSE(accepted.empty());
+    CHECK(accepted.back().count("C:\\proj\\logic.cpp") == 1);
+    CHECK(accepted.back().count("C:\\proj\\main.cpp") == 1);
+}
+
+TEST_CASE("atomic reload (WP-47): a range taken at the first compiland's load relinks it and prepares the second again against its new addresses") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    two_dependent_units(rig);
+    rig.load_collisions = 1;  // the first LoadPatch finds its range taken (CML4203)
+    Result<Value> r = rig.reload();
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    CHECK(r->get_integer("patched") == 2);
+    // logic.cpp at b0 (taken), main.cpp at b1 (given back), logic.cpp again at b1, main.cpp prepared again at b2.
+    REQUIRE(rig.link_bases.size() == 4);
+    CHECK(rig.link_bases[2] == rig.link_bases[1]);
+    CHECK(rig.link_bases[3] > rig.link_bases[2]);
+    const auto loads = rig.seen<ipc::LoadPatch>();
+    REQUIRE(loads.size() == 3);
+    CHECK(loads[1].candidates[0].image_base == rig.link_bases[2]);
+    CHECK(loads[2].candidates[0].image_base == rig.link_bases[3]);
+    const auto helper = rig.module->registry.find("?new_helper@@YAHXZ");
+    REQUIRE(helper.has_value());
+    CHECK(helper->va == rig.link_bases[2] + 0x1020);
+    bool bound = false;
+    const auto all_fixups = rig.seen<ipc::ApplyFixups>();
+    REQUIRE_FALSE(all_fixups.empty());
+    for (const ipc::Fixup& f : all_fixups.back().fixups) {
+        bound = bound || (f.rva == 0x100F && f.kind == ipc::FixupKind::Rel32 && f.value == helper->va);
+    }
+    CHECK(bound);  // main.cpp calls new_helper where it is now, not where the first link put it
+    CHECK(r->get_integer("load_attempts") == 3);
+}
+
+// ---- WP-47 review round: what a roll-back cannot confirm, a lost agent, the memory of a fan-out ---------------------------------
+
+TEST_CASE("atomic reload (WP-47 review): a roll-back whose hook changes the agent does not confirm in time is CML3654, never CML3651") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.option("hooks_timeout_ms", Value::integer(300));
+    two_dependent_units(rig);
+    rig.hooks_status_at[2] = ipc::fault::ids::kAgentHookInstall;  // main.cpp's hooks fail ...
+    rig.silent_hooks_at = 3;                                       // ... and the roll-back's restore gets no HooksInstalled (a revert timeout)
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML3654");
+    CHECK(r.error().message.find("CML4652") != std::string::npos);
+    CHECK(r.error().message.find("CML5852") != std::string::npos);
+    CHECK(diag_count(rig, "CML3654", "error") == 1);
+    CHECK(diag_count(rig, "CML3651", "warning") == 0);
+    CHECK(diag_count(rig, "CML5852", "warning") == 1);
+    CHECK(rig.events->count("patch_applied") == 0);
+    CHECK(rig.seen<ipc::InstallHooks>().size() == 3);
+    const auto accepted = rig.module->index->accepted_for_testing();
+    REQUIRE_FALSE(accepted.empty());
+    CHECK(accepted.back().count("C:\\proj\\logic.cpp") == 0);  // compiled again by the next reload
+    CHECK(accepted.back().count("C:\\proj\\main.cpp") == 0);
+}
+
+TEST_CASE("atomic reload (WP-47 review): a roll-back whose images the agent does not un-commit is CML3654, never CML3651") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    two_dependent_units(rig);
+    rig.hooks_status_at[2] = ipc::fault::ids::kAgentHookInstall;
+    rig.uncommit_status = 4299;  // an agent that refuses ReleaseRange mode Uncommit
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML3654");
+    CHECK(r.error().message.find("CML5855") != std::string::npos);
+    CHECK(diag_count(rig, "CML3651", "warning") == 0);
+    CHECK(rig.events->count("patch_applied") == 0);
+}
+
+TEST_CASE("atomic reload (WP-47 review): a roll-back refused because the module went away says the patch list was dropped (CML3652)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    two_dependent_units(rig);
+    rig.hooks_status_at[2] = ipc::fault::ids::kAgentHookInstall;
+    rig.on_hooks = [&rig](int n) {
+        if (n == 2) {  // the exe is no longer listed when the roll-back looks: revert_module drops the stale list (CML5856)
+            ipc::ModuleList list;
+            list.request_id = 90;
+            list.modules.push_back({0x7FF800000000ull, 0x90000, "C:\\Windows\\System32\\ntdll.dll"});
+            rig.session.on_message(list);
+            rig.link->publish(rig.session);
+        }
+    };
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML3652");
+    CHECK(r.error().message.find("CML5856") != std::string::npos);
+    CHECK(r.error().message.find("the module's patch list was dropped") != std::string::npos);
+    CHECK(r.error().what_to_do.find("revert") == std::string::npos);
+    CHECK(rig.module->batches.empty());
+}
+
+TEST_CASE("atomic reload (WP-47 review): the agent lost while applying the second compiland is CML3655; nothing is re-baselined or announced") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    two_dependent_units(rig);
+    rig.close_on_load_at = 2;  // main.cpp's LoadPatch: the agent disconnects
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message.find("(compiland 2 of 2, main.cpp)") != std::string::npos);
+    CHECK(r.error().message.find("1 compiland(s) of this reload were applied before it, 1 were not") != std::string::npos);
+    CHECK(diag_count(rig, "CML3655", "warning") == 1);
+    CHECK(diag_count(rig, "CML3651", "warning") == 0);
+    CHECK(rig.events->count("patch_applied") == 0);
+    CHECK(rig.seen<ipc::InstallHooks>().size() == 1);  // nothing was rolled back
+    const auto accepted = rig.module->index->accepted_for_testing();
+    REQUIRE_FALSE(accepted.empty());
+    CHECK(accepted.back().count("C:\\proj\\logic.cpp") == 0);
+    CHECK(accepted.back().count("C:\\proj\\main.cpp") == 0);
+}
+
+TEST_CASE("atomic reload (WP-47 review): a compiland's object is dropped once it is linked, so a reload holds one object at a time") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    two_dependent_units(rig);
+    Result<Value> r = rig.reload();
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    CHECK(r->get_integer("patched") == 2);
+    const Value* patches = r->find("patches");
+    REQUIRE(patches != nullptr);
+    REQUIRE(patches->items().size() == 1);
+    CHECK(patches->items()[0].get_integer("objects_held_peak") == 1);
+
+    // A relink prepares the compiland again from its object file, and still holds one at a time.
+    two_dependent_units(rig);
+    rig.object = make_object("", true);
+    rig.second_object = make_object("?new_helper@@YAHXZ");
+    rig.load_collisions = static_cast<int>(rig.seen<ipc::LoadPatch>().size()) + 1;  // the next LoadPatch finds its range taken
+    Result<Value> again = rig.reload();
+    REQUIRE_MESSAGE(again.has_value(), again.error().format());
+    const Value* p2 = again->find("patches");
+    REQUIRE(p2 != nullptr);
+    REQUIRE(p2->items().size() == 1);
+    CHECK(p2->items()[0].get_integer("objects_held_peak") == 1);
+    CHECK(again->get_integer("load_attempts") == 3);
+}
+
+TEST_CASE("atomic reload (WP-47 review): a compiland that fails when it is prepared again after a relink is named, not the relinked one") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    two_dependent_units(rig);
+    rig.load_collisions = 1;
+    int main_links = 0;
+    rig.link_fails = [&main_links](const std::string& path) { return path.find("main.cpp") != std::string::npos && ++main_links == 2; };
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML3350");
+    CHECK(r.error().message.find("(compiland 2 of 2, main.cpp)") != std::string::npos);
+    CHECK(r.error().message.find("when compiland 2 was prepared again after compiland 1 was relinked") != std::string::npos);
+    CHECK(r.error().message.find("compiland 1 of 2") == std::string::npos);
+    CHECK(r.error().message.find("nothing of this reload was applied") != std::string::npos);
+    check_nothing_live(rig);
+}
+
+TEST_CASE("atomic reload (WP-47 review): the agent lost with InstallHooks in flight keeps that patch as possibly live (CML3655)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    two_dependent_units(rig);
+    rig.silent_hooks_at = 2;  // main.cpp's hooks reach the agent, which then disconnects instead of answering
+    rig.on_hooks = [&rig](int n) {
+        if (n == 2) {
+            std::thread([&rig] { rig.link->close(); }).detach();
+        }
+    };
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message.find("(compiland 2 of 2, main.cpp)") != std::string::npos);
+    CHECK(r.error().message.find("1 compiland(s) of this reload were applied before it, its hooks reached the agent, so it may be live, 0 other(s) were not") !=
+          std::string::npos);
+    CHECK(r.error().message.find("nothing of this reload was applied") == std::string::npos);
+    CHECK(diag_count(rig, "CML3655", "warning") == 1);
+    CHECK(rig.events->count("patch_applied") == 0);
+    // Never unloaded (a live hook may target it), recorded as installed and in the batch.
+    for (const ipc::ReleaseRange& rr : rig.seen<ipc::ReleaseRange>()) {
+        CHECK(rr.mode != ipc::ReleaseMode::UnloadPatch);
+    }
+    REQUIRE(rig.module->batches.size() == 1);
+    CHECK(rig.module->batches[0].patches.size() == 2);
+    const auto accepted = rig.module->index->accepted_for_testing();
+    REQUIRE_FALSE(accepted.empty());
+    CHECK(accepted.back().count("C:\\proj\\logic.cpp") == 0);
+    CHECK(accepted.back().count("C:\\proj\\main.cpp") == 0);
+}
+
+TEST_CASE("atomic reload (WP-47 review): a compiland that plans to nothing when it is prepared again for a relink is not re-baselined") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    REQUIRE(rig.reload().has_value());  // logic.cpp's compute_value as make_object() has it is live (patch 1, its code recorded)
+    two_dependent_units(rig);
+    rig.load_collisions = static_cast<int>(rig.seen<ipc::LoadPatch>().size()) + 1;  // logic.cpp's next load finds its range taken
+    int links = 0;
+    rig.link_fails = [&rig, &links](const std::string& path) {
+        // main.cpp's first link: logic.cpp's object file now holds what patch 1 already runs, so its preparation for the relink plans
+        // to nothing.
+        if (path.find("main.cpp") != std::string::npos && ++links == 1) {
+            for (const std::string& out : rig.compile_outputs) {
+                if (out.find("main.cpp") == std::string::npos) {
+                    const std::vector<std::byte> same = make_object();
+                    std::ofstream o(out, std::ios::binary | std::ios::trunc);
+                    o.write(reinterpret_cast<const char*>(same.data()), static_cast<std::streamsize>(same.size()));
+                }
+            }
+        }
+        return false;
+    };
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML5318");
+    CHECK(r.error().message.find("planned to nothing") != std::string::npos);
+    CHECK(rig.module->generation == 1);  // patch 1 only
+    const auto accepted = rig.module->index->accepted_for_testing();
+    REQUIRE_FALSE(accepted.empty());
+    CHECK(accepted.back().count("C:\\proj\\logic.cpp") == 0);
+    CHECK(accepted.back().count("C:\\proj\\main.cpp") == 0);
+}
+
+TEST_CASE("atomic reload (WP-47 review): an unchanged compiland of a failed reload is not re-baselined") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    REQUIRE(rig.reload().has_value());  // patch 1: compute_value as make_object() has it
+    // logic.cpp recompiles to what patch 1 runs (nothing to load, compared with the live code), main.cpp is refused.
+    rig.object = make_object();
+    rig.second_object = make_object({}, false, "no_such_function_anywhere");
+    rig.changed_both();
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML3200");
+    const auto accepted = rig.module->index->accepted_for_testing();
+    REQUIRE_FALSE(accepted.empty());
+    CHECK(accepted.back().count("C:\\proj\\logic.cpp") == 0);
+    CHECK(accepted.back().count("C:\\proj\\main.cpp") == 0);
 }
 
 TEST_CASE("set-option compile_on_save validates, reports the previous value and starts and stops the watcher (WP-14)") {
