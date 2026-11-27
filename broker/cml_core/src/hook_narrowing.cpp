@@ -214,11 +214,17 @@ private:
         // entry lies; it is the run of consecutive 4-byte entries from there.
         std::map<std::uint64_t, std::uint64_t> tables;  // first entry -> one past the last
         std::map<std::uint64_t, std::uint64_t> table_of;  // entry -> first entry of its table
+        // The label fallback covers a table load whose displacement carries an index bias (`$LNt[rdx+rax*4-4]` for a switch
+        // whose first case is 1): the reference then names the table's label with a small negative, entry-aligned offset. Any
+        // other offset from a label that starts a table is not taken for a table load (the function stays hooked).
+        constexpr std::uint64_t kMaxIndexBias = 16 * 4;
         const auto table_at = [&](const Ref& ref) -> std::optional<std::uint64_t> {
-            for (const std::uint64_t at : {ref.target, ref.label}) {
-                if (refs.count(at) != 0) {
-                    return at;
-                }
+            if (refs.count(ref.target) != 0) {
+                return ref.target;
+            }
+            const bool biased = ref.label > ref.target && ref.label - ref.target <= kMaxIndexBias && (ref.label - ref.target) % 4 == 0;
+            if (biased && refs.count(ref.label) != 0) {
+                return ref.label;
             }
             return std::nullopt;
         };
@@ -328,6 +334,11 @@ private:
         if (relocs == nullptr) {
             return Keep{NarrowReason::Unverifiable, relocs_error};
         }
+        // R-50: before the bytes, so that an unmasked relocation never reads as a spurious "bytes differ" (WP-40/WP-46 count that
+        // as a changed function).
+        if (std::optional<Keep> keep = reaches_into_start(*relocs, start)) {
+            return keep;
+        }
         std::vector<std::uint8_t> masked(len, 0);
         std::vector<const coff::ResolvedRelocation*> inside;
         for (const coff::ResolvedRelocation& r : *relocs) {
@@ -351,9 +362,6 @@ private:
             }
         }
         // (After the bytes, so that a function whose bytes differ is reported as changed, as before WP-49.)
-        if (std::optional<Keep> keep = reaches_into_start(*relocs, start)) {
-            return keep;
-        }
         LocalTargets local;
         local_targets(h.display, *sec, dec->section, start, len, *relocs, &local);
         for (const coff::ResolvedRelocation* r : inside) {
@@ -525,6 +533,22 @@ private:
         if (std::optional<Keep> keep = capture(h.new_symbol, &now)) {
             return keep;
         }
+        // WP-49 review: in a section that holds more than one function (no /Gy), the extent runs to the next symbol, and a label
+        // inside the function (a case label, a jump table) cuts it short; the earlier patch's record was cut the same way, so
+        // the bytes behind the label would never be compared. The PDB's size of the function checks the extent: without it, or
+        // when it differs, the hook is kept. (A COMDAT function is its whole section; its size may differ from the module's
+        // because an earlier patch changed it.)
+        Loc loc;
+        const bool located = !locate(h.new_symbol, &loc);
+        if (!located || !loc.sec->is_comdat()) {
+            if (h.old_size == 0) {
+                return Keep{NarrowReason::UnknownOldSize, "the function shares its section with other symbols and the PDB gives no size to check its extent"};
+            }
+            if (now.bytes.size() != h.old_size) {
+                return Keep{NarrowReason::SizeDiffers, "the function shares its section with other symbols; its extent there is " + std::to_string(now.bytes.size()) +
+                                                           " bytes, the PDB's size " + std::to_string(h.old_size)};
+            }
+        }
         if (now.bytes.size() != prior.bytes.size()) {
             return Keep{NarrowReason::SizeDiffers, "new " + std::to_string(now.bytes.size()) + " bytes, the earlier patch has " + std::to_string(prior.bytes.size())};
         }
@@ -541,6 +565,10 @@ private:
             const CodeReloc& b = prior.relocs[i];
             if (a == b) {
                 continue;
+            }
+            if (a.target.kind == CodeTarget::Kind::Local && b.target.kind == CodeTarget::Kind::Local && a.offset == b.offset && a.type == b.type &&
+                a.target.value == b.target.value) {
+                continue;  // WP-49: the same place of the function, whether named by a label or by the section with an offset
             }
             if (a.target.kind == CodeTarget::Kind::NewSymbol) {
                 return Keep{NarrowReason::TargetNew, "reference to the new symbol '" + a.target.name + "'"};

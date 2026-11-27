@@ -1356,3 +1356,126 @@ TEST_CASE("narrowing (WP-49, R-50): a relocation that starts before the function
         }
     }
 }
+
+TEST_CASE("narrowing (WP-49, R-50): the relocation reaching into the start is refused before the bytes are compared") {
+    QuietLogs quiet;
+    // As above with the REL32 at 6, but the old function's first byte differs from the new one's (unmasked, under the relocation):
+    // the verdict must be "unverifiable", never a "bytes differ" that WP-40/WP-46 would count as a changed function.
+    Scenario s(24, true);
+    for (coff::ModelSymbol& m : s.obj.model().symbols) {
+        if (m.name == "?foo@@YAHXZ") {
+            m.value = 8;
+        }
+    }
+    s.obj.symbol("?pre@@YAHXZ", 0, static_cast<std::int32_t>(s.foo.section), true);
+    std::vector<std::uint8_t> code = {0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3};
+    code.resize(16, 0xCC);
+    std::vector<std::uint8_t> bytes(8, 0x90);
+    bytes.insert(bytes.end(), code.begin(), code.end());
+    s.new_code(bytes);
+    std::vector<std::uint8_t> old = code;
+    old[0] = 0xB9;
+    s.old_code(old);
+    const std::uint32_t g = s.obj.undefined("g", false);
+    s.obj.reloc(s.foo.section, 6, g, kRel32);
+    coff::ModelSection& sec = s.obj.model().sections[s.foo.section - 1];
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        sec.data[6 + i] = static_cast<std::byte>(bytes[6 + i]);
+    }
+    s.hook(16);
+    for (SymbolDecision& d : s.plan.decisions) {
+        if (d.name == "?foo@@YAHXZ") {
+            d.value = 8;
+        }
+    }
+    const NarrowResult r = s.run();
+    REQUIRE(r.hooks.size() == 1);
+    CHECK_MESSAGE(only(r).reason == NarrowReason::Unverifiable, to_string(only(r).reason) << " " << only(r).detail);
+}
+
+TEST_CASE("narrowing (WP-49): a table load names the table's label only with a small entry-aligned index bias") {
+    QuietLogs quiet;
+    const SwitchCode c = cl_od_switch();
+    struct Case {
+        std::int32_t addend;
+        bool comparable;
+    };
+    // -4: `$LN9[rcx+rax*4-4]` (first case 1); -64: the largest bias taken; -2: not entry-aligned; -68: beyond the bias.
+    for (const Case k : {Case{-4, true}, Case{-64, true}, Case{-2, false}, Case{-68, false}}) {
+        CAPTURE(k.addend);
+        Scenario s(c.size());
+        jump_table(s, c);
+        set_le32(s.obj.model().sections[s.foo.section - 1], c.load_site, static_cast<std::uint32_t>(k.addend));
+        put32(s.disk, text_off(kFnRva) + c.load_site, kFnRva + c.table + static_cast<std::uint32_t>(k.addend));
+        const NarrowResult r = s.run();
+        if (k.comparable) {
+            CHECK_MESSAGE(only(r).reason == NarrowReason::Unchanged, to_string(only(r).reason) << " " << only(r).detail);
+        } else {
+            REQUIRE(r.hooks.size() == 1);
+            CHECK(only(r).reason == NarrowReason::Unverifiable);
+            CHECK_MESSAGE(only(r).detail.find("not the start of a jump table") != std::string::npos, only(r).detail);
+        }
+    }
+}
+
+namespace {
+
+// foo in a plain code section (no /Gy): `mov eax, 1`, then a label `$LN3` at 8 (as a case label is), then `mov eax, <tail>; ret`.
+// The extent of foo in the section ends at the label.
+void labelled_function(Scenario& s, std::uint8_t tail, std::uint32_t old_size, std::uint32_t old_rva = kFnRva) {
+    s.new_code({0xB8, 0x01, 0, 0, 0, 0x90, 0x90, 0x90, 0xB8, tail, 0, 0, 0, 0xC3});
+    s.obj.symbol("$LN3", 8, static_cast<std::int32_t>(s.foo.section), false, false);
+    s.hook(old_size, old_rva);
+}
+
+}  // namespace
+
+TEST_CASE("elision (WP-49 review): in a section with other symbols, an edit behind an inner label is not hidden by the earlier patch's record") {
+    QuietLogs quiet;
+    Scenario first(24, true);
+    labelled_function(first, 10, 14);
+    const std::shared_ptr<const CodeImage> prior = first.capture();
+    REQUIRE(prior->bytes.size() == 8);  // cut at the label, in the record as well
+    {
+        // The edit changes the code behind the label (10 -> 20): the 8 bytes before it equal the record's.
+        Scenario s(24, true);
+        labelled_function(s, 20, 14);
+        s.prior = [&](std::uint64_t) { return prior; };
+        const NarrowResult r = s.run(true, entry_is_hooked);
+        REQUIRE(r.hooks.size() == 1);
+        CHECK(only(r).reason == NarrowReason::SizeDiffers);
+        CHECK_MESSAGE(only(r).detail.find("PDB's size 14") != std::string::npos, only(r).detail);
+    }
+    {
+        // A function an earlier patch introduced (no size from the PDB): its extent cannot be checked, kept.
+        Scenario s(24, true);
+        labelled_function(s, 20, 0, kNoRva);
+        s.prior = [&](std::uint64_t) { return prior; };
+        const NarrowResult r = s.run(true, entry_is_hooked);
+        REQUIRE(r.hooks.size() == 1);
+        CHECK(only(r).reason == NarrowReason::UnknownOldSize);
+    }
+    {
+        // Against the module file the size check was already there: the cut extent (8) is not the PDB's 14.
+        Scenario s(24, true);
+        labelled_function(s, 20, 14);
+        s.old_code({0xB8, 0x01, 0, 0, 0, 0x90, 0x90, 0x90, 0xB8, 10, 0, 0, 0, 0xC3});
+        const NarrowResult r = s.run();
+        REQUIRE(r.hooks.size() == 1);
+        CHECK(only(r).reason == NarrowReason::SizeDiffers);
+    }
+    {
+        // A COMDAT function is its whole section: an earlier patch that made it longer than the module's copy (16 bytes against
+        // the PDB's 24) is still compared with that patch's record, and an unchanged one is dropped.
+        Scenario a;
+        a.new_code({0xB8, 0x01, 0, 0, 0, 0xC3});
+        a.hook(24);
+        const std::shared_ptr<const CodeImage> comdat_prior = a.capture();
+        Scenario b;
+        b.new_code({0xB8, 0x01, 0, 0, 0, 0xC3});
+        b.hook(24);
+        b.prior = [&](std::uint64_t) { return comdat_prior; };
+        const NarrowResult r = b.run(true, entry_is_hooked);
+        CHECK_MESSAGE(only(r).reason == NarrowReason::Unchanged, to_string(only(r).reason) << " " << only(r).detail);
+    }
+}

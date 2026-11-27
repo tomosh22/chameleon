@@ -962,9 +962,16 @@ private:
         if (!has_reload_result_) {
             return StepOutcome::fail(cml::ids::kResultMismatch, "no reload ran before this step");
         }
-        if (!step.compiler.empty() && step.compiler != report_.compiler) {  // WP-49
-            return StepOutcome::pass("not checked: the expectation " + step.key + " = " + std::to_string(step.result_value) + " is for " + step.compiler + ", this cell is " +
-                                     report_.compiler);
+        if (!step.compiler.empty()) {  // WP-49
+            const std::string family = compiler_family(report_.compiler);
+            if (family.empty()) {
+                return StepOutcome::fail(cml::ids::kResultMismatch, "the expectation " + step.key + " = " + std::to_string(step.result_value) + " is for " + step.compiler +
+                                                                        ", and this cell's compiler '" + report_.compiler + "' is neither cl nor clang-cl");
+            }
+            if (family != step.compiler) {
+                return StepOutcome::pass("not checked: the expectation " + step.key + " = " + std::to_string(step.result_value) + " is for " + step.compiler +
+                                         ", this cell is " + family);
+            }
         }
         const ipc::json::Value* member = last_reload_result_.find(step.key);
         if (member == nullptr || !member->is_integer() || member->as_integer() != step.result_value) {

@@ -139,4 +139,9 @@ struct Scenario {
 cml::Result<Scenario> parse_scenario(std::string_view text);
 cml::Result<Scenario> load_scenario(const std::filesystem::path& path);
 
+// WP-49: the compiler family of a cell's compiler as `expect_reload_result compiler =` names it: "cl" or "clang-cl" for
+// "cl", "msvc", "clang-cl" or a path to cl.exe / clang-cl.exe (any case; the same stem rule as resolve_compiler); "" for
+// anything else.
+std::string compiler_family(std::string_view compiler);
+
 }  // namespace cmltest

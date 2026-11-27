@@ -750,6 +750,25 @@ cml::Result<Scenario> parse_scenario(std::string_view text) {
     return scenario;
 }
 
+std::string compiler_family(std::string_view compiler) {
+    std::string name(compiler);
+    const std::size_t slash = name.find_last_of("/\\");
+    if (slash != std::string::npos) {
+        name = name.substr(slash + 1);
+    }
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (name.size() > 4 && name.compare(name.size() - 4, 4, ".exe") == 0) {
+        name.resize(name.size() - 4);
+    }
+    if (name == "cl" || name == "msvc") {
+        return "cl";
+    }
+    if (name == "clang-cl") {
+        return "clang-cl";
+    }
+    return {};
+}
+
 cml::Result<Scenario> load_scenario(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) {

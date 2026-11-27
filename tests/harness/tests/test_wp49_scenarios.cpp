@@ -48,6 +48,20 @@ TEST_CASE("scenario key (WP-49): expect_reload_result takes compiler = \"cl\" or
     CHECK_FALSE(parse("[[step]]\nkind = \"reload\"\ncompiler = \"cl\"\n").has_value());
 }
 
+TEST_CASE("compiler_family (WP-49): the cell's compiler as cl, clang-cl or neither") {
+    CHECK(compiler_family("cl") == "cl");
+    CHECK(compiler_family("msvc") == "cl");
+    CHECK(compiler_family("CL.EXE") == "cl");
+    CHECK(compiler_family("C:\\VS\\VC\\Tools\\MSVC\\14.44\\bin\\Hostx64\\x64\\cl.exe") == "cl");
+    CHECK(compiler_family("clang-cl") == "clang-cl");
+    CHECK(compiler_family("C:/Program Files/LLVM/bin/clang-cl.exe") == "clang-cl");
+    CHECK(compiler_family("Clang-CL.exe") == "clang-cl");
+    CHECK(compiler_family("clang").empty());
+    CHECK(compiler_family("gcc").empty());
+    CHECK(compiler_family("").empty());
+    CHECK(compiler_family("C:/tools/icx.exe").empty());
+}
+
 #ifdef CML_HARNESS_SCENARIOS_DIR
 TEST_CASE("scenario jump_tables (WP-49): one hook per edit under cl, the jump-table-only change is hooked and shows") {
     cml::Result<Scenario> loaded = load_scenario(std::filesystem::path(CML_HARNESS_SCENARIOS_DIR) / "jump_tables.toml");
