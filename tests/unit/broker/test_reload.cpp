@@ -9,6 +9,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <fstream>
+#include <functional>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -1791,13 +1792,26 @@ TEST_CASE("WP-50 (review): a disable during the background read destroys the sta
     std::condition_variable cv;
     bool entered = false;
     bool go = false;
+    const auto release = [&] {
+        {
+            std::lock_guard<std::mutex> lock(m);
+            go = true;
+        }
+        cv.notify_all();
+    };
     Rig rig;
+    // Whatever fails below (a REQUIRE leaves the test early), the reader is let go before the rig's destructor joins it; and it
+    // never waits longer than 30 s on its own.
+    struct Release {
+        std::function<void()> f;
+        ~Release() { f(); }
+    } release_on_exit{release};
     rig.option("prefetch_module_image", Value::boolean(true));
     rig.service->set_prefetch_hook_for_testing([&] {
         std::unique_lock<std::mutex> lock(m);
         entered = true;
         cv.notify_all();
-        cv.wait(lock, [&] { return go; });
+        cv.wait_for(lock, std::chrono::seconds(30), [&] { return go; });
     });
     rig.enable();
     {
@@ -1818,11 +1832,7 @@ TEST_CASE("WP-50 (review): a disable during the background read destroys the sta
     CHECK(weak.expired());   // destroyed here, by the disabling thread, while the read is still pending
     CHECK(index.expired());  // its index joined and its PDB released with it
     CHECK(slot->released());
-    {
-        std::lock_guard<std::mutex> lock(m);
-        go = true;
-    }
-    cv.notify_all();
+    release();
     // The read finds the slot released: it reads nothing and stores nothing.
     for (int i = 0; i < 50; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));

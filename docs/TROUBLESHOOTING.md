@@ -45,7 +45,10 @@ revert, restart).
      reason=size|mtime|pdb` means the module file was rebuilt since; `absent` that this broker had not indexed it before;
      `file-changed:<path>` that a file the earlier scan read, or a directory it searched, changed since (an edited source, a
      header created or removed), so the graph may be stale and is built again. On a hit, `inputs` files and directories were
-     checked in `check_ms`. Set-option `cache_include_scan` false scans every time.
+     checked in `check_ms`. `store=skipped reason=unreadable:<path>` means the scan met a file that exists but could not be
+     read (locked by an editor's save, over 8 MiB, a read error), and `reason=changed-during-scan:<path>` means a file changed
+     while the index was built. Such a scan is not kept, and the next index of the module scans again. Set-option
+     `cache_include_scan` false scans every time.
    * The two set-options of WP-50 (control command `set-option {"name":..., "value": true|false}`, both default `true`):
      `prefetch_module_image` (read the module file for the function comparison in the background once its index is
      ready; applies to modules enabled afterwards) and `cache_include_scan` (reuse the file lists and include graph of an unchanged

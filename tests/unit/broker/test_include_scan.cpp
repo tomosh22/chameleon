@@ -458,3 +458,99 @@ TEST_CASE("WP-50 (review): a scan cache hit re-checks every input: an edited sou
     entry = stored();
     CHECK((cache.find(exe, stamp, &reason) == entry));
 }
+
+namespace {
+struct ScratchDir {
+    std::filesystem::path root;
+    ScratchDir() {
+        root = std::filesystem::temp_directory_path() /
+               ("cml_scan_rec_" + std::to_string(static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count() & 0xFFFFFFF)));
+        std::filesystem::create_directories(root / "src");
+    }
+    ~ScratchDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(root, ec);
+    }
+    ScratchDir(const ScratchDir&) = delete;
+    ScratchDir& operator=(const ScratchDir&) = delete;
+    std::string path(const std::string& name) const { return (root / "src" / name).string(); }
+    std::string dir() const { return (root / "src").string(); }
+};
+void write_file(const std::string& p, const std::string& text) {
+    std::ofstream out(p, std::ios::binary | std::ios::trunc);
+    out << text;
+}
+}  // namespace
+
+TEST_CASE("WP-50 (second review): an input edited after the scan read it makes the scan uncacheable, and its stored stamp is the one from before") {
+    ScratchDir d;
+    const std::string source = d.path("a.cpp");
+    write_file(source, "#include \"a.h\"\nint a() { return 1; }\n");
+    write_file(d.path("a.h"), "#pragma once\n");
+    const auto run_scan = [&](ScanInputRecorder& rec) {
+        const ScanFileReader reader = rec.wrap(disk_file_reader());
+        CHECK(reader(source).has_value());
+        CHECK(reader(d.path("a.h")).has_value());
+        CHECK_FALSE(reader(d.path("missing.h")).has_value());                   // a candidate that does not exist
+        CHECK_FALSE(reader((d.root / "nodir" / "x.h").string()).has_value());  // in a directory that does not exist
+    };
+
+    // Nothing changed: cacheable.
+    {
+        ScanInputRecorder rec;
+        run_scan(rec);
+        std::string why = "unset";
+        const std::vector<ScanInput> inputs = rec.finish({source, d.path("a.h"), d.dir()}, &why);
+        CHECK(why.empty());
+        REQUIRE(inputs.size() == 3);
+        CHECK(inputs[0].exists);
+        CHECK(inputs[2].directory);
+    }
+
+    // The source gains #include "new.h" after the scan read it, before the result is stored.
+    ScanInputRecorder rec;
+    run_scan(rec);
+    const std::uintmax_t old_size = std::filesystem::file_size(source);
+    write_file(source, "#include \"a.h\"\n#include \"new.h\"\nint a() { return 1; }\n");
+    std::error_code ec;
+    std::filesystem::last_write_time(source, std::filesystem::last_write_time(source, ec) + std::chrono::seconds(2), ec);
+    std::string why;
+    const std::vector<ScanInput> inputs = rec.finish({source, d.path("a.h"), d.dir()}, &why);
+    CHECK(why == "changed-during-scan:" + source);
+    REQUIRE(inputs.size() == 3);
+    CHECK(inputs[0].size == old_size);  // the stamp from before the read, not the edited file's
+
+    // Even if it were stored, such a result could never hit: the next find sees the source changed.
+    ScanCache cache;
+    ModuleFileStamp stamp;
+    stamp.size = 1;
+    auto result = std::make_shared<ScanResult>();
+    result->inputs = inputs;
+    cache.store("C:\\bin\\m.exe", stamp, result);
+    std::string reason;
+    CHECK((cache.find("C:\\bin\\m.exe", stamp, &reason) == nullptr));
+    CHECK(reason == "file-changed:" + source);
+}
+
+TEST_CASE("WP-50 (second review): a file that exists but cannot be read makes the scan uncacheable; a missing file or a directory does not") {
+    ScratchDir d;
+    write_file(d.path("ok.h"), "#pragma once\n");
+    write_file(d.path("big.h"), std::string(9u * 1024u * 1024u, ' '));  // over the scanner's 8 MiB limit
+    {
+        ScanInputRecorder rec;
+        const ScanFileReader reader = rec.wrap(disk_file_reader());
+        CHECK(reader(d.path("ok.h")).has_value());
+        CHECK_FALSE(reader(d.path("missing.h")).has_value());
+        CHECK_FALSE(reader(d.dir()).has_value());  // an include naming a directory
+        std::string why = "unset";
+        rec.finish({d.path("ok.h"), d.dir()}, &why);
+        CHECK(why.empty());
+    }
+    ScanInputRecorder rec;
+    const ScanFileReader reader = rec.wrap(disk_file_reader());
+    CHECK(reader(d.path("ok.h")).has_value());
+    CHECK_FALSE(reader(d.path("big.h")).has_value());
+    std::string why;
+    rec.finish({d.path("ok.h"), d.dir()}, &why);
+    CHECK(why == "unreadable:" + d.path("big.h"));
+}

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <mutex>
 
@@ -357,6 +358,71 @@ TEST_CASE("WP-50 (review): a source edited to include a new header, or a skipped
     CHECK(appeared->status().scan_cache == "cold");
     REQUIRE(appeared->skipped_compilands().size() == 1);
     CHECK(appeared->skipped_compilands()[0].compiland == kLibNoEnv);
+}
+
+namespace {
+std::shared_ptr<ModuleIndex> build_index(const World& w, const std::shared_ptr<ScanCache>& cache, std::function<void()> after_scan = nullptr) {
+    ModuleIndexSpec spec;
+    spec.module_path = w.exe;
+    spec.scan_includes = true;
+    spec.scan_cache = cache;
+    spec.after_scan_for_testing = std::move(after_scan);
+    std::shared_ptr<ModuleIndex> index = ModuleIndex::start(spec);
+    REQUIRE(index->wait(30000));
+    REQUIRE(index->status().state == IndexState::Ready);
+    return index;
+}
+bool tracks_file(const std::shared_ptr<ModuleIndex>& index, const std::string& f) {
+    const std::vector<std::string> tracked = index->tracked_files();
+    return std::find(tracked.begin(), tracked.end(), pdb::normalize_path(f)) != tracked.end();
+}
+}  // namespace
+
+TEST_CASE("WP-50 (second review): a source edited while the index scans is not cached; the next index scans again and sees the new include") {
+    QuietLogs quiet;
+    World w;
+    const auto cache = std::make_shared<ScanCache>();
+    // Between the scan (which read the old app.cpp) and the store: app.cpp gains #include "new.h".
+    const std::shared_ptr<ModuleIndex> first = build_index(w, cache, [&w] {
+        write_text(w.dir.file("new.h"), "#pragma once\nint fresh();\n");
+        write_text(w.dir.file("app.cpp"), "#include \"new.h\"\nint app() { return 1; }\n");
+        bump_mtime(w.dir.file("app.cpp"));
+    });
+    CHECK(first->status().scan_cache == "cold");
+    CHECK_FALSE(tracks_file(first, w.dir.file("new.h")));  // the scan saw the old contents
+    CHECK(cache->size() == 0);                             // ... so its result was not stored
+
+    const std::shared_ptr<ModuleIndex> second = build_index(w, cache);
+    CHECK(second->status().scan_cache == "cold");  // nothing stale to hit
+    CHECK(tracks_file(second, w.dir.file("new.h")));
+    CHECK(cache->size() == 1);
+    const std::shared_ptr<ModuleIndex> third = build_index(w, cache);
+    CHECK(third->status().scan_cache == "warm");
+    CHECK(tracks_file(third, w.dir.file("new.h")));
+}
+
+TEST_CASE("WP-50 (second review): a scan that could not read a file that exists is not cached") {
+    QuietLogs quiet;
+    World w;
+    const auto cache = std::make_shared<ScanCache>();
+    // Over the scanner's size limit (8 MiB): it exists, but the scan cannot read it (as during a sharing violation).
+    write_text(w.dir.file("big.h"), "#pragma once\n" + std::string(9u * 1024u * 1024u, ' ') + "\n");
+    write_text(w.dir.file("app.cpp"), "#include \"big.h\"\nint app() { return 1; }\n");
+    bump_mtime(w.dir.file("app.cpp"));
+    CHECK(build_index(w, cache)->status().scan_cache == "cold");
+    CHECK(cache->size() == 0);
+    CHECK(build_index(w, cache)->status().scan_cache == "cold");  // scanned again every time while it cannot be read
+    CHECK(cache->size() == 0);
+
+    // Readable again (and including a header now): scanned, stored, then reused.
+    write_text(w.dir.file("inner.h"), "#pragma once\n");
+    write_text(w.dir.file("big.h"), "#pragma once\n#include \"inner.h\"\n");
+    bump_mtime(w.dir.file("big.h"));
+    const std::shared_ptr<ModuleIndex> readable = build_index(w, cache);
+    CHECK(readable->status().scan_cache == "cold");
+    CHECK(tracks_file(readable, w.dir.file("inner.h")));
+    CHECK(cache->size() == 1);
+    CHECK(build_index(w, cache)->status().scan_cache == "warm");
 }
 
 #endif

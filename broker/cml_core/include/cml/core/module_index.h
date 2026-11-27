@@ -87,6 +87,9 @@ struct ModuleIndexSpec {
     // WP-50 (R-55): the file lists and the include graph of a module file this session indexed before are taken from here when
     // the file is the same (ScanCache); null: always scanned.
     std::shared_ptr<ScanCache> scan_cache;
+    // Tests (WP-50): called on the worker thread after the scan of the file lists and includes, before its inputs are compared
+    // with the stamps taken while scanning (an edit made "during the scan").
+    std::function<void()> after_scan_for_testing;
 };
 
 // WP-26b: a compiland that cannot be reloaded although its object is real (no build environment, missing source file).
@@ -121,8 +124,30 @@ struct ScanInput {
 };
 // What `path` is now.
 ScanInput probe_scan_input(const std::string& path);
+// Whether two stamps of the same path agree (existence, kind, size, time).
+bool same_scan_input(const ScanInput& a, const ScanInput& b);
 // "" when every input is still as recorded, else the first path that differs (changed, created or removed).
 std::string changed_scan_input(const std::vector<ScanInput>& inputs);
+
+// WP-50 (second review): the stamps of a scan's inputs, each taken before the scan used it, so that a result built from files
+// that changed while it was built, or that met a file it could not read, is never cached. One per scan; not thread-safe.
+class ScanInputRecorder {
+public:
+    // The stamp of `path` from the first time it was asked for (taken now if this is the first time).
+    const ScanInput& before(const std::string& path);
+    bool exists(const std::string& path) { return before(path).exists; }
+    // `disk` with every read stamped first: the file's directory (a file created there later changes its stamp), then the file
+    // (not when its directory does not exist). A read that fails for a file that exists is remembered as unreadable. The
+    // reader refers to this recorder, which must outlive it.
+    ScanFileReader wrap(ScanFileReader disk);
+    // The first-seen stamps of `paths`, in order. `*not_cacheable` is "unreadable:<path>" when a read failed on a file that
+    // exists, else "changed-during-scan:<path>" for the first path whose stamp now differs, else "".
+    std::vector<ScanInput> finish(const std::vector<std::string>& paths, std::string* not_cacheable);
+
+private:
+    std::map<std::string, ScanInput> before_;
+    std::string unreadable_;
+};
 
 // What the file-list and include-scan phase of an index build produces (all of it depends only on the PDB, the compile
 // commands it records and the files on disk).
@@ -135,7 +160,12 @@ struct ScanResult {
     std::set<std::uint32_t> skipped_set;
     // Every file the result was built from (the tracked files, the skipped compilands' sources found absent) and every
     // directory the include search looked in: a cache hit re-checks them all (ScanCache::find).
+    // Stamped before the scan used each of them (as each file was read); empty without a cache.
     std::vector<ScanInput> inputs;
+    // Why this result must not be cached ("" when it may): "unreadable:<path>" (a file that exists could not be read: a sharing
+    // violation, a file over the scanner's size limit, a read error) or "changed-during-scan:<path>" (an input whose stamp after
+    // the scan differs from the one taken before it was used).
+    std::string not_cacheable;
     IncludeScanner::Stats stats;  // of the scan that produced it
     std::size_t files_read = 0;
     double scan_ms = 0;
