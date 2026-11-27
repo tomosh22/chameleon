@@ -82,10 +82,11 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
   and not enabled again by the restart; their edits are re-applied when they are enabled later (WP-45).
   A restart that leaves its new process running without finishing (CML5808, CML5809) remembers what it could not do for that
   process; the next `restart` of it does it. A late registration alone does not (WP-43).
-- **A reload of several compilands that is refused partway is partly applied (F-41.4, R-52).** The compilands planned before
-  the refused one stay patched although the reply is `ok:false`; after a header edit, some compilands then run its new inline code
-  and the others the old. The applied part is one batch: `revert` undoes it. Files whose compilands were not all patched are
-  compiled again at the next reload.
+- **A reload of several compilands is atomic per module (WP-47, R-52).** Every compiland of a module is planned, proven and
+  linked before any is applied; a refusal applies nothing (CML3650). A failure while applying rolls back what that reload applied
+  (CML3651); a roll-back that fails or is not confirmed is CML3652/CML3654, and if hooks were not confirmed (CML5309/CML4656) or the
+  agent was lost mid-apply the reply says which compilands may be live (CML3653/CML3655). A reload across several modules or
+  processes is still applied module by module (R-56).
 - **Modules freed and loaded again, or enabled late after a hot-restart (WP-45).** A module instance enabled after the session has
   accepted edits for its sources (FreeLibrary + LoadLibrary, or a module the restarted process loads later, CML5809) gets those
   edits re-applied by a re-apply reload once its index is ready; each instance has its own patch work directory. A re-apply that
