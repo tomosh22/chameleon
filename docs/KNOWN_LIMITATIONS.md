@@ -26,12 +26,17 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
 | CML3401 | TLS dynamic initialiser/destructor in a patched TU (warning) | The old image's initialiser and destructor stay in effect; a changed initialiser is not run. | Hot-restart if the changed initialiser must take effect. | WP-24 (unit-tested only; no CI fixture has a dynamic `thread_local`) | **live** |
 | CML3402 | Several `S_GTHREAD32` records for one thread_local name | Ambiguous thread_local `<symbol>`. | Rename one of them, or hot-restart. | WP-24 | **live** |
 | CML3103 | Layout of a type with live instances changed | Layout of `<T>` changed; existing objects not migrated. Use a post-patch hook or hot-restart. | Migrate state in a CML_POSTPATCH_HOOK or hot-restart. | WP-07/WP-18 | **not done in WP-18**: needs the UDT layouts (TPI) of the old PDB and of the patch, which cml_pdb does not read yet (WP-04 left type records out) |
-| CML3207 | A static data symbol whose name matches several records of the old compiland (same scope) and cannot be told apart by name, closure (lambda statics, WP-37), RVA in a known section layout, or order within one procedure with equal count, types, block nesting and bound guards (WP-37) | Static `<name>` matches `<n>` records named `<id>` in compiland `<i>` ... (with the reason). | Rename one of the statics, keep their number unchanged, or hot-restart. | WP-07, WP-37 | **live**; under cl two same-named block statics of a `static` or anonymous-namespace function are still refused (qualified record names) |
+| CML3207 | A static data symbol whose name matches several records of the old compiland (same scope) and cannot be told apart by name, closure (lambda statics, WP-37), RVA in a known section layout, or order within one procedure with equal count, types, block nesting and bound guards (WP-37). **Unity builds (WP-41, F-41.1):** a translation unit or unity batch with several overloads of one function that each hold a guarded local static (Jolt's `GetRTTIOfType`, one per RTTI macro) pair by procedure (cl since WP-40; clang-cl since WP-46, whose record-less guards are then placed by the layout their statics teach, or refused with CML3600). **WP-40 over-refusals:** a function's own static `x` next to a static `x` of one of its lambdas (in the patch or the old image); two functions that `/OPT:ICF` folded to one RVA. **Not detected (R-54, WP-46):** under clang-cl -O2 a lambda inlined everywhere that an edit deletes, with a static of its static's name added to the caller, binds that static to the lambda's live object | Static `<name>` matches `<n>` records named `<id>` in compiland `<i>` ... (with the reason). | Rename one of the statics, keep their number unchanged, or hot-restart. | WP-07, WP-37 | **live**; under cl two same-named block statics of a `static` or anonymous-namespace function are still refused (qualified record names) |
 | CML3210 | Clang's TU-wide initialiser (`_GLOBAL__sub_I_<file>`) in a TU that has new globals AND globals bound to the old image (warning) | Initialiser `<fn>` initialises every global of `<obj>`, including ones bound to the old image; running it may re-initialise them. | Put new globals with dynamic initialisation into a separate source file, or hot-restart. | WP-07 | **live** |
 | CML3211 | Guard variable of a function-local static cannot be located in the old image because the TU's static layout changed (warning) | Guard variable `<name>` of a function-local static was not found in the old image; the patch gets a fresh guard. | Keep the layout of the statics in this source file unchanged, or hot-restart. | WP-07 | **live** |
 | CML3212 | Reference through a section symbol (private/section-relative) into a section that holds data bound to the old image (warning) | Object section `<n>` holds data bound to the old image and is also referenced through its section symbol. | Give the data external linkage or avoid private references to it. | WP-07 | **live** |
-| CML3214 | Overloads of a static function (same scope, same name) that cannot be paired by signature: equal signatures, or types that cannot be read (no type records, `LF_PRECOMP`, malformed), or the set of lambdas of the enclosing function changed | Ambiguous overloads of static `<name>` in `<obj>`; cannot tell which old function each new one replaces (with the reason). | Rename one overload, or hot-restart. | WP-07, WP-37 | **live** (signatures from the PDB type stream since WP-37) |
+| CML3214 | Overloads of a static function (same scope, same name) that cannot be paired by signature: equal signatures, or types that cannot be read (no type records, `LF_PRECOMP`, malformed), or the set of lambdas of the enclosing function changed. **Unity builds (WP-41):** both fixed by WP-46: the closure-set count no longer includes call operators that pair by their public name (F-41.2), and the scalar deleting destructor `??_G` is no longer a destructor candidate (F-41.3) | Ambiguous overloads of static `<name>` in `<obj>`; cannot tell which old function each new one replaces (with the reason). | Rename one overload, or hot-restart. | WP-07, WP-37 | **live** (signatures from the PDB type stream since WP-37) |
 | CML3570 | Same-named function-local statics in different blocks of one function were paired by their order in the function (warning; only where the section layout is unknown, i.e. cl) | Function-local statics `<name>` of `<function>` (`<n>`) are matched by their order in the function; if you reordered or replaced blocks that declare them, their values may be exchanged. | Rename one of them, or hot-restart after reordering. | WP-37 | **live** |
+| CML3600 | A function-local static's guard cannot be bound consistently with the statics it guards (WP-40): some statics of a block bound and some new with no old guard record; clang-cl's record-less guard that the section layout cannot place; a bitmask guard (`/Zc:threadSafeInit-`, `-fno-threadsafe-statics`) of a function whose code changed, so an edit of a function with function-local statics is refused in those modes while other functions of the file reload. Also clang-cl: a plain static added to a block next to a bound guarded one. | Hot-restart, or move the static to file scope. See TROUBLESHOOTING. |
+| CML3601 | A static the compiler split into pieces (`name.0`, `name.1`, ...) whose pieces the PDB does not record, so the live pieces cannot be found and a reload would reset them (WP-40, R-48 item 4). Seen in raylib under clang-cl (`rprand_state` in rcore.c, `edit:header-inline-raymath`); cl keeps the variable whole. | Give the variable external linkage or take its address, or hot-restart. |
+| CML3602 | Warning: lambdas of one function whose code changed and that code comparison cannot tell apart are paired by their compiler-assigned number (WP-40 rule (d)); if their order changed, their statics may be exchanged. | Check the named lambdas' state after the reload, or hot-restart. |
+| CML3603 | A lambda whose number's old lambda was taken by a code-equivalent new lambda: the remaining lambdas cannot be paired (WP-40). | Hot-restart. |
+| CML3630 | cl's legacy lambda processor (C++17 without `/permissive-` or `/Zc:lambda`) names lambdas `<lambda_HASH>` from their body, so an edited lambda is renamed (WP-46). One edited lambda per reload pairs by elimination when its signature, statics, closure layout and enclosing function (the one non-template procedure holding a closure-typed local) match and every other lambda of the unit is proven unchanged by code. Refused: two or more edited lambdas in one reload, a lambda added or removed, a lambda whose code cannot be compared, an edited lambda used only as a temporary (no closure-typed local), and an edited lambda passed to a template that has its own function-local statics. A lambda renamed by an earlier reload counts as edited until a restart. | Edit one lambda per reload, give lambdas a named local, build with `/Zc:lambda` (implied by `/permissive-` and C++20), or hot-restart. |
 | CML3215 | A dynamic initialiser (`??__E...`) of the patched TU belongs to no global the planner can see (unexpected mangling) | Dynamic initialiser `<sym>` could not be matched to a new global. | Report the symbol names; move the global to an unchanged source file, or hot-restart. | WP-07 | **live** |
 | CML1504 | C++/CLI (`/clr`) or C++/CX (`/ZW`) compilands | Compiland `<obj>` is built with /clr or /ZW; managed and WinRT code cannot be hot-reloaded. | Hot-reload only native compilands. | WP-05 (compile), WP-18 (audit) | **live** |
 | CML1601 | Functions without 6 bytes of padding before them (warning; /FUNCTIONPADMIN, /hotpatch) | Functions of `<module>` have no hot-patch padding (`<n>` of `<m>` sampled); short functions cannot be hooked atomically. | Compile with /hotpatch and link with /FUNCTIONPADMIN. | WP-18 | **live** |
@@ -74,7 +79,21 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
   borrows the old process's console during the relaunch. Reloads are refused (CML5304) while a restart runs. `timeout_ms` bounds
   the preparation (the pre-restart hooks); after the old process is terminated, `registration_timeout_ms` (default 30 s) bounds
   registration, re-enabling and re-applying the edits. Modules the application loads lazily after start-up are reported (CML5809)
-  and not enabled again. `CML_RESTART_TOKEN` stays in the new process's environment (ADR-0034). `Agent::ScheduleRestart` still
+  and not enabled again by the restart; their edits are re-applied when they are enabled later (WP-45).
+  A restart that leaves its new process running without finishing (CML5808, CML5809) remembers what it could not do for that
+  process; the next `restart` of it does it. A late registration alone does not (WP-43).
+- **A reload of several compilands that is refused partway is partly applied (F-41.4, R-52).** The compilands planned before
+  the refused one stay patched although the reply is `ok:false`; after a header edit, some compilands then run its new inline code
+  and the others the old. The applied part is one batch: `revert` undoes it. Files whose compilands were not all patched are
+  compiled again at the next reload.
+- **Modules freed and loaded again, or enabled late after a hot-restart (WP-45).** A module instance enabled after the session has
+  accepted edits for its sources (FreeLibrary + LoadLibrary, or a module the restarted process loads later, CML5809) gets those
+  edits re-applied by a re-apply reload once its index is ready; each instance has its own patch work directory. A re-apply that
+  fails is CML5600, an index that fails CML5601; both name the module and the files. Edits are carried only to the same process
+  (restart token, command line and creation time). Limits: a FreeLibrary + LoadLibrary at the same base inside one agent module
+  poll (500 ms) is invisible to the agent, and the new image runs its original code (R-53); when an agent reconnects to a live
+  process, the module instances enabled at the disconnect leave no carry; a module whose index is not ready during a restart
+  (CML5810) gets its edits re-applied when the index is ready, and CML5809/CML5810 name the files that could not be carried. `CML_RESTART_TOKEN` stays in the new process's environment (ADR-0034). `Agent::ScheduleRestart` still
   returns `CML_STATUS_NOT_IMPLEMENTED`. A broker started with a short `--exit-when-idle` can exit during the restart gap.
 - Broker UI (WP-19): enable/disable of modules is shown but not switchable (the control protocol has no such command); a relative
   path in compiler output is resolved best-effort against the modules' directories.
@@ -147,9 +166,15 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
     offered for that function until a later patch.
 - **Failure injection (WP-28)** is compiled in by default (`CML_FAULT_INJECTION=ON`). Release packaging must configure with
   `-DCML_FAULT_INJECTION=OFF`; a fuzz.yml job proves that configuration builds.
-  - Covered: the reload pipeline's 11 stages.
-  - Not covered: `revert`, `restart`, the crash handler and the compile-on-save watcher.
-  - Arming is not persistent: a broker restart forgets it.
+  - Covered: the reload pipeline's 11 stages, the hot-restart's 7 and the revert's 3 (WP-43). An armed restart or revert stage
+    applies to the next restart or revert only, whether it fired or not; unused stages are listed as `injection_disarmed`.
+  - Covered too (WP-44): the crash handler (exception report, hold, the continue/leave/re-execute actions) and the compile-on-save
+    watcher (debounce, change detection, the reload it starts). The watch group, restart, revert and exception-action stages refuse
+    to arm while their operation runs (CML5978).
+  - Arming persists across a broker restart only with `inject-failure {persist:true}` (state next to `--log`; CML5984 without one).
+  - Test-harness limitations (WP-44): records of a process whose exit the broker did not see stay until a global
+    `{"stage":"none"}` (or `none` for that pid once its exit is confirmed); broker-side armings made for a pid carry over to a new
+    process that reuses it; `none` during a running cleanup operation can clear its records before the operation reports them.
   - The reservation stage fires only on a module's first patch; arming it later is refused (CML5970).
   - If an injected post-patch-hooks rollback is incomplete (CML4656), the patch image stays mapped with some hooks possibly live;
     restart the application. A later revert of that batch may report hooks it cannot find.
@@ -190,13 +215,4 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
       with a fake debugger. **A real Visual Studio attach to a `CREATE_SUSPENDED` process is not verified in CI**;
       the extension resumes once the debugger lists the pid or after `HoldResumeGraceMs` (3 s), whichever comes first,
       and falls back to the late attach if the early one fails. The manual checklist in `docs/wp/WP-34.md` is the check.
-    - *WP-34 review follow-ups (not blocking, not fixed):*
-      - a failed early attach can report CML5997 two or three times;
-      - a `restart-resume` that times out (as opposed to a dropped pipe) is logged instead of reported, so the process
-        stays frozen until `hold_ms`;
-      - `restart-resume` racing with hold expiry can still answer `resumed:true` alongside CML5813;
-      - a confirmation timeout is reported as CML5817, which reads as a failed resume;
-      - the extension asks for `hold_new` even when no debugger is attached to the old process;
-      - replacing the process host during a held restart strands the hold in the old coordinator;
-      - the watchdog start logs nothing when `GetModuleFileNameW` fails;
-      - shutdown can wait for a held restart's registration step, which predates WP-34.
+    - *WP-34 review follow-ups* are fixed (WP-43, #71, R-40).

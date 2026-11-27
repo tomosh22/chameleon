@@ -1177,6 +1177,31 @@ functions. The decision is reversed **together with** a reference check, which i
   needs no workflow change), the timing part of `tests/corpus/run_corpus.ps1`, `.github/workflows/corpus.yml`.
   Broker code only for a fix under point 3.
 
+**Rulings (WP-46 round 1 findings):** F-41.2 is a counting defect, not changing names: cl's `<lambda_HASH>` closures (the
+legacy lambda processor, `/std:c++17` without `/permissive-`) have no enclosing scope, so the planner compared one pseudo-function
+holding every closure of the TU, old side including call operators already paired by their public names. Fix: leave publicly paired
+old call operators out of the comparison. Because how cl derives the hash is undocumented, every pairing of a hash-named closure is
+proven by code (the WP-25 comparator, rule (d)'s single changed pair allowed) or refused (CML3630); a cl `/std:c++17` fixture with an
+edit that inserts a lambda shows on CI whether the names shift. F-41.3: drop the scalar deleting destructor (`??_G`, a parameter
+`should_call_delete`) from destructor candidates. F-41.1 under clang-cl: a guard without a record does not block pairing by place
+only in a compiland that records no guards; its placement is then decided by `settle_guards` from the layout statics paired by place
+teach, or refused (CML3600). R-54: a lazy TPI closure lookup in `cml_pdb`; an own static of a function that had a closure with no
+`operator()` procedure is refused (CML3207), including when that lambda had no static (accepted over-refusal).
+
+**Ruling (WP-46 reviews; ADR-0018 convergence):** cl's legacy `<lambda_HASH>` is derived from the lambda's body (CI evidence:
+`WP46-HASH-SET ... common=2 changed` after a body edit, `same` after an edit elsewhere). An edited hash-named lambda pairs only by
+elimination with identity evidence (signature, statics, closure layout, and the one non-template function that holds a
+closure-typed local, on both sides); otherwise CML3630. An edited lambda used only as a temporary is therefore refused under cl's
+legacy processor (KNOWN_LIMITATIONS). After the third review round WP-46 merges on green; a later review holds it only for a new
+wrong pairing.
+
+**Split (WP-46 second failed acceptance):** WP-46's head 984e887 regressed jolt clang-cl (`fail=6`) and imgui clang-cl
+(`fail=3`) with R-54 refusals: the display-name match of closures ignores overloads (every `JPH::GetRTTIOfType` overload sees
+every overload's lambdas), and a function whose scope is C-linkage (`??main@@9`) has no decorated patch symbol. Telling a function
+that really inlined a lambda from one that merely has a closure needs the old image's inline sites, which nobody has examined yet.
+R-54 is therefore split out: WP-46 merges F-41.1..3, the hash-named lambda pairing and its review fixes, with R-54 left as on main
+(a known, pre-existing gap); R-54 becomes WP-51 in wave 12, starting with a spike on `S_INLINESITE` inlinees.
+
 ### Shared files and merge order
 
 - `tests/corpus/run_corpus.ps1`: WP-38 owns the decoder step, WP-39 the timing output; WP-36 and WP-37 change only
@@ -1207,7 +1232,7 @@ never constructed. A wrong pairing is the worst outcome the product has, so R-48
 | WP-43 | R-40, R-42 (restart, revert) | Restart-hold follow-ups; failure injection in restart and revert | `wp/43-restart-injection` | high (restart, process start-up) |
 | WP-44 | R-42 (rest), R-49 | Failure injection in the crash handler and the watcher; persistent arming | `wp/44-injection-rest` | high (crash handler) |
 
-WP-40..WP-43 start together; WP-44 starts when the first of them merges (at most four at once).
+WP-40..WP-43 start together; WP-45 and WP-46 (added during the wave, below) and then WP-44 start as slots free (at most four at once).
 
 **Ranges.** WP-40: CML3600–3629 (planner). WP-41: CML5000–5049. WP-42: CML5050–5099 (both for fixes their corpus finds, in
 any component, after asking the orchestrator if the fix is outside the corpus driver). WP-43: CML5820–5839 (restart),
@@ -1236,6 +1261,13 @@ fixture or fixture function per defect built in every matrix cell, plus one fixt
 inlined lambda's static keeps its value or that the reload is refused, and that the process never faults. `unit.bind`,
 the goldens and the corpus stay green. Directories: `broker/cml_core` (planner, names), `tests/unit/bind`, `tests/fixtures`,
 `tests/harness/scenarios`.
+
+**Ruling during WP-40 (item 5, lambdas that cannot be told apart).** Within one enclosing function, lambdas whose call
+operators have the same signature and no captures (Godot's `SNAME`) are paired by code equivalence: each new call operator
+with the old one that the unchanged-function comparator (WP-25) finds identical, one-to-one, even when that contradicts the
+compiler's numbering (a swap of two lines). If exactly one lambda is left on each side, those two pair. Otherwise, or where
+the comparator cannot decide, they pair by number with a warning (CML3600–3629) naming the function. The comparator must
+tell apart bodies that differ only in a string literal, or step one is not used.
 
 ### WP-41: corpus, an `/arch:AVX2`, unity-built, static-library project (R-06)
 
@@ -1279,9 +1311,79 @@ item; the vs workflow green. **Directories:** `broker/cml_core` (restart, revert
 compile-on-save watcher (debounce, change detection, the reload it starts). Arming survives a broker restart only when the
 user asks (`inject-failure {persist:true}`), stored next to the broker's log and cleared by `{"stage":"none"}`. R-49's three
 nits.
+**Amended (WP-43 merged as #71):** WP-44 also fixes R-51, the five races and stale records the high re-review of WP-43's fix
+round found in `fault_injection.cpp`, `restart.cpp` and `reload_service.cpp`: an operation's end-of-operation disarm runs while it
+still holds its run lock; an arming is recorded before its ArmFault round trips and check-and-arm is atomic against operation
+start; `detach` drops a pid's armings; a revert's per-pid outcome decides per pid; `process_gone` re-checks before keeping a record.
+Each gets a unit test. They exist only in fault-injection builds, so they did not hold WP-43's merge.
 **Acceptance.** Scenarios for the new stages in all 8 cells; a test for persistent arming across a broker restart.
-**Directories:** `agent/src/crash`, `broker/cml_core` (exception service, save watcher, fault injection), `core/cml_pe`
-(R-49), `tests/harness`.
+**Directories:** `agent/src/crash`, `broker/cml_core` (exception service, save watcher, fault injection, and for R-51 restart and
+reload service), `core/cml_pe` (R-49), `tests/harness`, `tests/unit/broker`.
+
+**Ruling (WP-40, second high review; ADR-0018 convergence):** in the planner's static pairing, a case that cannot be proven
+safe is refused, not paired cleverly. Concretely: a `$S<n>` bitmask guard is placed on the old bitmask only when the function's
+dynamically initialised statics are the same set in the same order as in the old image (else CML3600); a new own static of a
+function whose name equals a static of one of its lambdas (old or new, inlined or not) pairs only when every candidate record is
+provably the function's own (else CML3207). Over-refusals this causes are recorded in KNOWN_LIMITATIONS and are acceptable; a
+later review of WP-40 that finds only over-refusals does not hold the merge. raylib clang-cl `edit:header-inline-raymath` is
+now refused with CML3601 (a split static, `rprand_state.0`, whose piece the PDB does not record): before WP-40 that reload reset
+the variable silently, so the refusal is the intended outcome and the corpus asserts it as an expected failure.
+
+**Rulings (WP-44 round 1):** the persistent-arming state file is derived from `--log` in `broker/cml_cli/src/main.cpp` and loaded in
+`connection_server.{h,cpp}` (outside the listed directories, accepted: only the CLI knows the log path); TROUBLESHOOTING.md entries for
+the new ids are part of the WP. `exception-hold` (agent, CML4661) passes the fault on and is only logged by the agent, since no new
+message type is allowed: the scenario checks the fixture's own handler ran (`PASSED_ON`), which is the observable effect.
+
+### WP-45: re-apply session edits to re-loaded and late-enabled modules (from WP-42's corpus findings)
+
+**Added during the wave.** WP-42's DLL-plugin corpus project found three product defects, two of them silent:
+- F-42.1: a module that is unloaded and loaded again (FreeLibrary/LoadLibrary at the same base) gets a new module state
+  whose baseline is the edited file on disk; the session's edits are not re-applied and the old code runs with no diagnostic.
+- F-42.2: the new state's patch counter restarts at 0, so its first patch is written to the path of the earlier instance's
+  patch DLL, which is still loaded: the link fails (LNK1104, CML3350).
+- F-42.3: after a hot-restart, edits of a module that the new process loads only later (CML5809) are never re-applied.
+
+**Decision.** A module instance enabled after the session already has accepted edits for its sources (a reload of the
+same module, or a late load after a hot-restart) gets those edits re-applied as part of its enable, the same way
+hot-restart re-applies them; a failure to re-apply is a diagnostic naming the module and the files, never silence. Patch
+work directories are unique per module instance (not per module name), so no path can collide with a loaded patch.
+Review: high (module state, broker restart). Range CML5600–5619. Acceptance: the three asserted expected failures of the
+`godot-gdextension` corpus cell flip to pass (removed from `expected_failures`), the repro `tests/corpus/repro/f42_plugin_reload`
+becomes a cmltest scenario in all 8 matrix cells, and unit tests cover each path. It starts before WP-44 when the first
+wave-11 slot frees, because silent loss of edits outranks the remaining injection gaps.
+
+**Amended (WP-45 round 1):** the agent's hook installer never forgets the records of an unloaded module, so after FreeLibrary +
+LoadLibrary at the same base a re-apply would plan a re-point against the old jump bytes (CML4312). WP-45 may change the agent for
+this only: `hook::Installer::forget_range(base, size)` drops the records whose target lies in an unloaded module's range, under the
+installer's mutex (never with threads suspended, no allocation), called from `Agent::poll_modules` for each unloaded module; a unit
+test in `unit.agent_hook`. No new message, `agent_abi_version` unchanged; the agent part gets the high review. An unload and reload
+at the same base inside one module poll (500 ms) stays invisible to the agent (R-53).
+
+**Ruling (WP-44/WP-45 third reviews; ADR-0018 convergence):** both packages' third high reviews found further races in process
+identity across pid reuse. WP-44 removes its creation-time identity check for fault records (it was the source of most findings and
+compiled into release builds): `{"stage":"none","pid":N}` without an agent clears N's records only once the process host confirms N
+exited, otherwise it is refused as before; records of a process whose exit was not seen stay until a global `none` (a test-harness
+limitation in KNOWN_LIMITATIONS). WP-45 keeps its identity (restart token, command line, creation time) and closes the two remaining
+silent-loss windows: a carry is consumed, merged or handed to a restart only by the agent that stored it or one whose identity is
+proven equal, and never takes on another agent's identity; `carry_to_late_module` reports whether it kept the baseline and resolves
+the agent by pid, and CML5809/CML5810 say what actually happened. After these rounds both merge on green CI with no further review
+round; `ProcessHost::creation_time` then exists once (WP-45's).
+
+### WP-46: planner coverage on unity builds (from WP-41's corpus findings)
+
+**Added during the wave.** The Jolt corpus cells (WP-41) show three safe refusals that make whole unity batches of library
+code unreloadable: F-41.1, statics of a set of overloads of one free function (`GetRTTIOfType`, one per class from an RTTI
+macro) refused with CML3207; F-41.2, under cl every unity batch with lambdas refused with CML3214 because the lambdas "are
+not the same as in the old image"; F-41.3, under clang-cl the implicit destructor of a function-local class refused as an
+ambiguous overload. **Decision:** after WP-40 merges (it brings the code-equivalence pairing of lambdas that F-41.2 needs),
+a planner package makes these pair correctly or narrows the refusal to the members that are really ambiguous, under ADR-0042's
+rule that a wrong pairing is never acceptable. Review: high. Range CML3630–3649. Acceptance: the Jolt cells' F-41.n
+expected failures flip to pass.
+**Amended (WP-40 last round):** WP-46 also closes R-54: under clang-cl -O2 a lambda inlined everywhere leaves no
+`operator()` procedure, so when an edit deletes it and declares a static of its static's name in the caller, the old record
+still pairs by name. WP-46 may extend `core/cml_pdb` for this (a lazy by-name lookup of closure classes in the TPI, or the
+caller's inline sites) and refuses (CML3207) where the old function had a lambda whose statics it cannot rule out. This gap
+predates WP-40 and does not hold its merge. Queue order: WP-45, WP-46, then WP-44.
 
 ### Shared files and merge order
 
@@ -1291,3 +1393,60 @@ nits.
   merges main and re-runs the corpus.
 - CI capacity is the bottleneck (a `ci` run took over an hour in wave 10 with four branches pushing). Agents batch commits,
   push once per fix round, and hand back while their runs are queued; the orchestrator resumes them.
+
+## ADR-0044 Wave 12: reload atomicity, module-load visibility, reload cost (WP-47..WP-50)
+
+**Date:** 2026-11-25 · **Status:** Accepted (wave 11 closed with #75)
+
+Wave 11 (ADR-0043) closed R-06, R-40, R-42, R-48, R-49, R-50, R-51 and R-54 (WP-46, pending merge). The roadmap's next step is
+"fixes from R-10 as they come; R-46, R-47"; R-10 (dogfooding) has produced no findings yet. Wave 11 itself found two correctness
+gaps, R-52 and R-53; a correctness gap outranks cost, so they lead.
+
+| WP | Roadmap | Title | Branch | Review |
+|---|---|---|---|---|
+| WP-47 | R-52 | A refused multi-compiland reload applies nothing | `wp/47-atomic-reload` | high (pipeline, hooks) |
+| WP-48 | R-53 | The agent sees every module load and unload | `wp/48-module-events` | high (agent) |
+| WP-49 | R-46 | Hook narrowing verifies jump tables in a function's own code | `wp/49-jump-tables` | high (hook narrowing) |
+| WP-50 | R-47, R-55 | First-reload cost and hot-restart time in large projects | `wp/50-reload-cost` | medium |
+
+### WP-47: a refused multi-compiland reload applies nothing (R-52)
+
+**Decision.** A reload plans, links and verifies every compiland before it applies any: a refusal (any planner, link or
+narrowing diagnostic) of one compiland leaves the running process unchanged and the reply `ok:false` names the refused unit. The
+apply phase (load, fix-ups, initialisers, hooks) then runs per compiland as today; a failure *during* apply rolls back the units
+already applied in that reload (the WP-22 batch revert). Range CML3650–3669. **Acceptance:** a cmltest scenario with a header edit
+over three compilands, the third refused, shows no `patch_applied` and the old values in all three, in all 8 cells; the Jolt and
+raylib corpus cells stay green; a unit test per failure point (plan, link, narrowing, apply); and the
+F-41.4 evidence (`patch_applied` before a refusal) no longer appears in any corpus log.
+
+### WP-48: the agent sees every module load and unload (R-53)
+
+**Decision.** The agent registers for loader notifications (`LdrRegisterDllNotification`, documented in the Windows SDK) and
+records each load and unload with a per-process sequence number, so a FreeLibrary + LoadLibrary inside one poll is reported as an
+unload and a load. The notification callback only appends to a preallocated lock-free ring and never calls the loader or
+allocates; the existing poll drains it. The snapshot diff stays as the fallback. A new message type is needed (`ModuleEvents`),
+so `agent_abi_version` is bumped by one with a broker that still accepts the old agent (falls back to snapshots). Range
+CML4720–4739 (agent; amended: 4700–4719 belong to WP-36), CML5620–5629 (broker). **Amended (WP-48 round 1):** the wire ABI
+(`ipc::kAgentAbiVersion`, Hello/Welcome) goes 2 → 3; the C API's `CML_AGENT_ABI_VERSION` in `Chameleon_API.h` stays 2 (ADR-0034: a bump
+forces every application to rebuild). A pre-WP-48 agent gets the old Welcome layout and CML5621. **Acceptance:** the `plugin_reload` fixture gains a step that frees and loads the
+DLL within 50 ms; the edit is re-applied in all 8 cells; WP10-REPEAT stays 25/25.
+
+### WP-49: hook narrowing verifies jump tables (R-46)
+
+**Decision.** A jump table in a function's own code (cl `/Od` switch: ADDR32NB entries to labels in the same function) is
+compared entry by entry, relative to the function start, instead of making the function "unverifiable". A table whose entries
+leave the function, or that cannot be bounded, stays unverifiable. **Acceptance:** the WP-39 benchmark project's one-function
+edit hooks only the edited function (was 274 of 275); unit tests with cl `/Od` switch objects; `hooks_dropped` grows in the
+corpus logs and no corpus cell regresses.
+
+### WP-50: first-reload cost and hot-restart time (R-47, R-55)
+
+**Decision.** Measure before changing: agent-side timestamps for `InstallHooks`, and a breakdown of a Godot hot-restart
+(131–167 s in the godot-gdextension cell: process start, registration, PDB index, re-apply). Then fix what the measurement
+shows, within the broker and the agent's logging. R-55 is added to the roadmap: *a hot-restart of the Godot editor takes over two
+minutes*. **Acceptance:** the breakdown lines in CI for both; the first reload in the WP-39 benchmark within 300 ms of later ones;
+the Godot hot-restart under 60 s, or a measured, documented reason why not.
+
+WP-47..WP-50 start together (four at once). **WP-51 (R-54, split from WP-46):** an own static of a function that inlined a lambda never takes that lambda's static. Spike first: from the old image's `S_INLINESITE`/`S_INLINESITE2` inlinees (IPI `LF_FUNC_ID`/`LF_MFUNC_ID`), decide per function whether it inlined a call operator of one of its closures; refuse only then (CML3207), and treat unreadable inline-site data as a risk. Acceptance: the R-54 unit test, Jolt and ImGui clang-cl corpus cells unchanged (`fail=0`). It starts in the first free wave-12 slot. Shared file: `broker/cml_core/src/pipeline.cpp` (WP-47 and WP-49); whoever merges
+second merges main and re-runs. Rules as in ADR-0043: one PR per WP, CI on the Windows matrix is the only acceptance, the
+orchestrator reads the logs; "refuse what cannot be proven" stands.
