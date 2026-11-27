@@ -128,6 +128,10 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
 - Statics only match old records of exactly the same scope (same enclosing function, or file scope): a static that moved to another function is a new, fresh variable, and a lambda moved to another function is new code that is not hooked.
 - Functions currently executing on a thread's stack keep running old code until they return;
   the next call runs the new code.
+- Hook narrowing (WP-49, R-46) verifies cl's in-function jump tables, but a function with a clang-cl jump table (in `.rdata`,
+  REL32 entries in an associative COMDAT) or a two-level switch (a byte index table, then the jump table) stays hooked on every
+  reload of its TU. That is harmless but wasteful. A `/Gy-` function (already CML1105) with an inner label is kept hooked
+  (`size-differs`), never dropped.
 - Hook installation (WP-10) cannot see a thread whose real resume point is inside the bytes being
   overwritten when its RIP is in ntdll's exception / APC / callback dispatcher at the moment it is
   stopped (the interrupted RIP is in a context record on its stack, which is not examined). In
