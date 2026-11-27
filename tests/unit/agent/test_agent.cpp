@@ -1115,6 +1115,68 @@ TEST_CASE("WP-48: to a broker before WP-48 (no ABI in Welcome) the same events g
     CHECK(events_seen == 0);  // never a message type the old broker does not know
 }
 
+TEST_CASE("WP-48 review 1: when the session's first module list cannot be built, a request right after it still finds the module") {
+    using FailFn = void (*)(int);
+    const std::string pipe = unique_pipe_name("events_nolist");
+    ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));
+    ScopedEnv broker_env(L"CML_BROKER_PATH", exe_directory() + L"\\no_such_broker.exe");
+    // The agent first, with no broker to connect to (it enumerates modules only in a session), then the failures, then the broker.
+    cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str());
+    REQUIRE(agent.IsValid());
+    const FailFn fail_enumeration = agent_export<FailFn>("cml_agent_testing_fail_enumeration");
+    // Every attempt of the first list fails (it is sent empty and sent again 1 s later); the request goes out before that.
+    fail_enumeration(3);
+    ScriptedBroker broker(pipe);
+    broker.welcome_abi.store(cml::ipc::kAgentAbiModuleEvents);
+    REQUIRE(broker.ready());
+    REQUIRE(wait_until([&] { return agent.IsConnected(); }, 20000));
+    const std::wstring self = cml::GetCurrentModulePath();
+    std::string self_name;
+    for (const wchar_t c : file_name_of(self)) {
+        self_name.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));  // the test exe's name is ASCII
+    }
+    cml::Reply reply;
+    const cml::Request r = agent.EnableModule(self);
+    REQUIRE(agent.WaitForRequest(r, 20000, &reply) == CML_STATUS_OK);
+    Sleep(2500);  // a fixed observation window: two quiet polls and the list sent again (a spurious CML4722 would come here)
+    fail_enumeration(0);
+    cml::DestroyAgent(agent);
+
+    const auto names_self = [&self_name](const std::string& path) {
+        std::string lower;
+        for (const char c : path) {
+            lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        }
+        return lower.size() >= self_name.size() && lower.compare(lower.size() - self_name.size(), self_name.size(), self_name) == 0;
+    };
+    bool empty_list_first = false;
+    bool list_seen = false;
+    bool known_before_enable = false;
+    bool disagreement = false;
+    bool seen_enable = false;
+    for (const cml::ipc::Message& m : broker.messages(0)) {
+        if (const auto* list = std::get_if<cml::ipc::ModuleList>(&m); list != nullptr) {
+            if (!list_seen) {
+                empty_list_first = list->modules.empty();
+                list_seen = true;
+            }
+        } else if (const auto* events = std::get_if<cml::ipc::ModuleEvents>(&m); events != nullptr && !seen_enable) {
+            for (const cml::ipc::ModuleEvent& e : events->events) {
+                known_before_enable = known_before_enable || (e.kind == cml::ipc::ModuleEventKind::Loaded && names_self(e.module.path));
+            }
+            CHECK(events->reason == 0);  // not a resync: the broker simply had no list yet
+        } else if (const auto* enable = std::get_if<cml::ipc::EnableModule>(&m); enable != nullptr && names_self(enable->path)) {
+            seen_enable = true;
+        } else if (const auto* log = std::get_if<cml::ipc::Log>(&m); log != nullptr && log->text.find("CML4722") != std::string::npos) {
+            disagreement = true;
+        }
+    }
+    CHECK(empty_list_first);
+    CHECK(seen_enable);
+    CHECK(known_before_enable);  // the module was reported before the request that names it
+    CHECK_FALSE(disagreement);
+}
+
 TEST_CASE("WP-48: without loader notifications the agent falls back to the module-list diff and says so (CML4720)") {
     const std::string pipe = unique_pipe_name("events_off");
     ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));

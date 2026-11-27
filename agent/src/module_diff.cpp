@@ -122,22 +122,61 @@ DrainedEvent to_drained(const RawModuleEvent& raw) {
     return event;
 }
 
+std::vector<ipc::ModuleEntry> apply_before_list(const std::vector<DrainedEvent>& before, const std::vector<ipc::ModuleEntry>& list) {
+    std::vector<ipc::ModuleEntry> out = list;
+    for (const DrainedEvent& event : before) {
+        if (event.patch_image) {
+            continue;
+        }
+        const std::uint64_t base = event.module.base;
+        const auto here = [base](const ipc::ModuleEntry& m) { return m.base == base; };
+        if (event.kind == ipc::ModuleEventKind::Unloaded) {
+            out.erase(std::remove_if(out.begin(), out.end(), here), out.end());
+            continue;
+        }
+        const auto in_list = std::find_if(list.begin(), list.end(),
+                                          [&event](const ipc::ModuleEntry& m) { return m.base == event.module.base && m.size == event.module.size; });
+        if (in_list != list.end() && std::none_of(out.begin(), out.end(), here)) {
+            out.push_back(*in_list);  // unloaded and loaded again before the list was taken: the list's entry is the new image
+        }
+    }
+    return out;
+}
+
 ModulePollReport track_modules(ModuleTrackState& state, const std::vector<DrainedEvent>& drained, std::uint64_t lost,
-                               const std::vector<ipc::ModuleEntry>* snapshot, bool quiet) {
+                               const std::vector<ipc::ModuleEntry>* snapshot, bool quiet, bool known_trusted) {
     ModulePollReport report;
     report.lost = lost;
     std::uint32_t resync = lost > 0 ? module_events::ids::kRingOverflow : 0u;
     std::vector<ipc::ModuleEntry>& known = state.known;
+    std::vector<DrainedEvent> events = std::move(state.deferred);  // what the previous poll could not finish goes first
+    state.deferred.clear();
+    events.insert(events.end(), drained.begin(), drained.end());
     const auto find_base = [&known](std::uint64_t base) {
         return std::find_if(known.begin(), known.end(), [base](const ipc::ModuleEntry& m) { return m.base == base; });
     };
-    for (const DrainedEvent& event : drained) {
+    const auto note_unload = [&state](std::uint64_t base) {
+        if (std::find(state.unloads_seen.begin(), state.unloads_seen.end(), base) == state.unloads_seen.end()) {
+            state.unloads_seen.push_back(base);
+        }
+    };
+    const auto take_unload = [&state](std::uint64_t base) {
+        const auto it = std::find(state.unloads_seen.begin(), state.unloads_seen.end(), base);
+        if (it == state.unloads_seen.end()) {
+            return false;
+        }
+        state.unloads_seen.erase(it);
+        return true;
+    };
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        const DrainedEvent& event = events[i];
         if (event.patch_image) {
             ++report.patch_events;
             continue;
         }
         const auto at = find_base(event.module.base);
         if (event.kind == ipc::ModuleEventKind::Unloaded) {
+            note_unload(event.module.base);
             if (at == known.end()) {
                 ++report.redundant;  // never reported (e.g. loaded and unloaded before the session's full list was taken)
                 continue;
@@ -148,17 +187,16 @@ ModulePollReport track_modules(ModuleTrackState& state, const std::vector<Draine
         }
         ipc::ModuleEntry entry = event.module;
         if (event.path_truncated) {
-            // While the module is still loaded the snapshot has its full path.
-            const ipc::ModuleEntry* full = nullptr;
-            if (snapshot != nullptr) {
-                for (const ipc::ModuleEntry& m : *snapshot) {
-                    if (m.base == entry.base && m.size == entry.size) {
-                        full = &m;
-                        break;
-                    }
-                }
+            if (snapshot == nullptr) {
+                // No list to read the full path from: this load and everything after it wait for the next poll, in order.
+                state.deferred.assign(events.begin() + static_cast<std::ptrdiff_t>(i), events.end());
+                report.deferred = true;
+                break;
             }
-            if (full == nullptr) {
+            // While the module is still loaded the snapshot has its full path.
+            const auto full = std::find_if(snapshot->begin(), snapshot->end(),
+                                           [&entry](const ipc::ModuleEntry& m) { return m.base == entry.base && m.size == entry.size; });
+            if (full == snapshot->end()) {
                 if (resync == 0) {
                     resync = module_events::ids::kPathUnresolved;
                 }
@@ -166,12 +204,15 @@ ModulePollReport track_modules(ModuleTrackState& state, const std::vector<Draine
             }
             entry.path = full->path;
         }
+        const bool after_unload = take_unload(entry.base);
         if (at != known.end()) {
-            if (same_module(*at, entry)) {
+            if (same_module(*at, entry) && !after_unload) {
                 ++report.redundant;  // the full list (or a resync) already had it
                 continue;
             }
-            report.events.push_back(make_event(ipc::ModuleEventKind::Unloaded, 0, *at));  // what was there before is gone
+            // Another module was there, or this very entry came back from a module list that still showed the image after its
+            // unload notification: what the broker knows at this base is gone.
+            report.events.push_back(make_event(ipc::ModuleEventKind::Unloaded, 0, *at));
             known.erase(at);
         }
         report.events.push_back(make_event(ipc::ModuleEventKind::Loaded, event.seq, entry));
@@ -187,7 +228,18 @@ ModulePollReport track_modules(ModuleTrackState& state, const std::vector<Draine
         }
         return report;
     }
-    if (snapshot == nullptr || !drained.empty() || !quiet) {
+    if (!known_trusted) {
+        // The broker has no full list yet (the session's could not be built, or was refused): the snapshot tells it at once, the way
+        // the module-list diff did before WP-48. Not a disagreement, no diagnostic.
+        state.suspect.reset();
+        if (snapshot == nullptr) {
+            report.need_full_list = true;
+        } else {
+            append_snapshot_diff(report, known, *snapshot);
+        }
+        return report;
+    }
+    if (snapshot == nullptr || !events.empty() || !quiet) {
         state.suspect.reset();  // a change is under way: the list may lag behind the events, or run ahead of them
         return report;
     }
@@ -204,6 +256,30 @@ ModulePollReport track_modules(ModuleTrackState& state, const std::vector<Draine
     }
     state.suspect = std::move(delta);
     return report;
+}
+
+std::vector<ipc::ModuleEvents> to_messages(const ModulePollReport& report, std::size_t max_events, std::size_t max_bytes) {
+    constexpr std::size_t kEventOverhead = 32;  // kind, seq, base, size, path length (and some slack)
+    std::vector<ipc::ModuleEvents> messages;
+    std::size_t next = 0;
+    do {
+        ipc::ModuleEvents message;
+        if (messages.empty()) {
+            if (report.resync_reason != 0) {
+                message.flags = ipc::kModuleEventsResync;
+                message.reason = report.resync_reason;
+            }
+            message.lost = report.lost;
+        }
+        std::size_t bytes = 0;
+        while (next < report.events.size() && message.events.size() < max_events &&
+               (message.events.empty() || bytes + report.events[next].module.path.size() + kEventOverhead <= max_bytes)) {
+            bytes += report.events[next].module.path.size() + kEventOverhead;
+            message.events.push_back(report.events[next++]);
+        }
+        messages.push_back(std::move(message));
+    } while (next < report.events.size());
+    return messages;
 }
 
 }  // namespace cml::agent

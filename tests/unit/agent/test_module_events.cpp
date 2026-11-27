@@ -333,3 +333,175 @@ TEST_CASE("WP-48: a disagreement with the module list is corrected only when two
         CHECK(state.suspect.has_value());
     }
 }
+
+// --- review round 1 ------------------------------------------------------------------------------------------------------------
+
+TEST_CASE("WP-48 review 2: the patch image marker names the base AND the thread; another thread's load at that base is a module") {
+    CHECK_FALSE(is_patch_image_event(0x200000000ull, 7));
+    {
+        const ScopedPatchImage marker(0x200000000ull, 7);
+        CHECK(is_patch_image_event(0x200000000ull, 7));        // the patch loader's own load
+        CHECK_FALSE(is_patch_image_event(0x200000000ull, 8));  // an application DLL another thread loaded there (CML4202 window)
+        CHECK_FALSE(is_patch_image_event(0x210000000ull, 7));  // a dependency the patch pulled in, at its own base
+        CHECK_FALSE(is_patch_image_event(0, 7));
+    }
+    CHECK_FALSE(is_patch_image_event(0x200000000ull, 7));  // cleared with the scope
+    CHECK(g_patch_image_thread.load() == 0);
+}
+
+TEST_CASE("WP-48 review 1: while the broker has no full list, a difference from the snapshot is reported at once, without CML4722") {
+    ModuleTrackState state;  // the session's first list could not be built: the broker got an empty one
+    const std::vector<ModuleEntry> snapshot = {kGame, kPlugin};
+    const ModulePollReport report = track_modules(state, {}, 0, &snapshot, true, /*known_trusted=*/false);
+    CHECK(report.resync_reason == 0);
+    REQUIRE(report.events.size() == 2);
+    CHECK(is(report.events[0], ModuleEventKind::Loaded, 0, kGame.base, "C:\\game\\game.exe"));
+    CHECK(is(report.events[1], ModuleEventKind::Loaded, 0, kPlugin.base, "C:\\game\\plugin.dll"));
+    CHECK_FALSE(state.suspect.has_value());
+    CHECK(state.known.size() == 2);
+    // The next polls agree: nothing more, and never a disagreement.
+    CHECK(track_modules(state, {}, 0, &snapshot, true, false).events.empty());
+    const ModulePollReport trusted = track_modules(state, {}, 0, &snapshot, true, true);
+    CHECK(trusted.events.empty());
+    CHECK(trusted.resync_reason == 0);
+
+    SUBCASE("events of the moment come first, in order") {
+        ModuleTrackState fresh;
+        const ModulePollReport mixed = track_modules(fresh, {loaded(5, kOther)}, 0, &snapshot, true, false);
+        REQUIRE(mixed.events.size() == 4);
+        CHECK(is(mixed.events[0], ModuleEventKind::Loaded, 5, kOther.base, "C:\\game\\other.dll"));
+        CHECK(is(mixed.events[1], ModuleEventKind::Unloaded, 0, kOther.base, "C:\\game\\other.dll"));  // not in the snapshot: the list wins
+        CHECK(mixed.events[2].kind == ModuleEventKind::Loaded);
+        CHECK(mixed.events[3].kind == ModuleEventKind::Loaded);
+        CHECK(mixed.resync_reason == 0);
+    }
+    SUBCASE("without a snapshot the full list is asked for") {
+        ModuleTrackState fresh;
+        CHECK(track_modules(fresh, {}, 0, nullptr, true, false).need_full_list);
+    }
+}
+
+TEST_CASE("WP-48 review 3: a load at a base whose unload was seen is never redundant, even when a lagging list brought the entry back") {
+    SUBCASE("a resync whose list still showed the unloaded image") {
+        ModuleTrackState state;
+        state.known = {kGame, kPlugin};
+        const std::vector<ModuleEntry> lagging = {kGame, kPlugin, kOther};  // the plugin's unload is delivered, the list still has it
+        ModulePollReport report = track_modules(state, {unloaded(10, kPlugin)}, 2, &lagging, true);
+        CHECK(report.resync_reason == module_events::ids::kRingOverflow);
+        REQUIRE(report.events.size() == 3);
+        CHECK(is(report.events[0], ModuleEventKind::Unloaded, 10, kPlugin.base, "C:\\game\\plugin.dll"));
+        CHECK(report.events[1].kind == ModuleEventKind::Loaded);  // from the lagging list
+        CHECK(state.known.size() == 3);
+        // The real reload at that base: unload (inferred, seq 0) and load, so the broker takes the re-enable path.
+        report = track_modules(state, {loaded(11, kPlugin)}, 0, &lagging, true);
+        REQUIRE(report.events.size() == 2);
+        CHECK(is(report.events[0], ModuleEventKind::Unloaded, 0, kPlugin.base, "C:\\game\\plugin.dll"));
+        CHECK(is(report.events[1], ModuleEventKind::Loaded, 11, kPlugin.base, "C:\\game\\plugin.dll"));
+        CHECK(report.redundant == 0);
+        CHECK(state.unloads_seen.empty());
+        // Once that load is reported, the next identical load is redundant again.
+        report = track_modules(state, {loaded(12, kPlugin)}, 0, &lagging, true);
+        CHECK(report.events.empty());
+        CHECK(report.redundant == 1);
+    }
+    SUBCASE("a redundant unload is remembered too (a list sent again later can still show the image)") {
+        ModuleTrackState state;
+        state.known = {kGame};
+        ModulePollReport report = track_modules(state, {unloaded(20, kPlugin)}, 0, nullptr, true);
+        CHECK(report.redundant == 1);
+        state.known = {kGame, kPlugin};  // a full list sent again (not a new session): unloads_seen is kept
+        report = track_modules(state, {loaded(21, kPlugin)}, 0, nullptr, true);
+        REQUIRE(report.events.size() == 2);
+        CHECK(report.events[0].kind == ModuleEventKind::Unloaded);
+        CHECK(report.events[1].seq == 21);
+    }
+}
+
+TEST_CASE("WP-48 review 3: the session's first list takes the notifications drained before it into account") {
+    const std::vector<ModuleEntry> list = {kGame, kPlugin};
+    SUBCASE("an unload the list does not show yet: the image is left out") {
+        const std::vector<ModuleEntry> out = apply_before_list({unloaded(1, kPlugin)}, list);
+        REQUIRE(out.size() == 1);
+        CHECK(out[0].base == kGame.base);
+    }
+    SUBCASE("unloaded and loaded again: the list's entry stays") {
+        const std::vector<ModuleEntry> out = apply_before_list({unloaded(1, kPlugin), loaded(2, kPlugin)}, list);
+        REQUIRE(out.size() == 2);
+        CHECK(out[1].base == kPlugin.base);
+        CHECK(out[1].path == "C:\\game\\plugin.dll");
+    }
+    SUBCASE("a load the list does not have (gone again) is not added; patch images are ignored") {
+        DrainedEvent patch = unloaded(4, kGame);
+        patch.patch_image = true;
+        const std::vector<ModuleEntry> out = apply_before_list({loaded(3, kOther), patch}, list);
+        CHECK(out.size() == 2);
+    }
+    SUBCASE("nothing drained: the list as it is") {
+        CHECK(apply_before_list({}, list).size() == 2);
+    }
+}
+
+TEST_CASE("WP-48 review 5: without a module list a cut path waits for the next poll, with everything after it, instead of CML4723") {
+    const ModuleEntry long_module = module(0x1C0000000ull, 0x5000, "C:\\a\\very\\long\\path\\plugin.dll");
+    ModuleTrackState state;
+    state.known = {kGame, kPlugin};
+    ModulePollReport report = track_modules(
+        state, {unloaded(1, kPlugin), loaded(2, module(long_module.base, long_module.size, "C:\\a\\very"), true), loaded(3, kOther)}, 0,
+        nullptr, true);
+    CHECK(report.resync_reason == 0);
+    CHECK(report.deferred);
+    REQUIRE(report.events.size() == 1);  // the unload before it
+    CHECK(report.events[0].seq == 1);
+    REQUIRE(state.deferred.size() == 2);
+    const std::vector<ModuleEntry> snapshot = {kGame, long_module, kOther};
+    report = track_modules(state, {}, 0, &snapshot, true);
+    CHECK(report.resync_reason == 0);
+    CHECK_FALSE(report.deferred);
+    REQUIRE(report.events.size() == 2);
+    CHECK(is(report.events[0], ModuleEventKind::Loaded, 2, long_module.base, "C:\\a\\very\\long\\path\\plugin.dll"));
+    CHECK(is(report.events[1], ModuleEventKind::Loaded, 3, kOther.base, "C:\\game\\other.dll"));
+    CHECK(state.deferred.empty());
+}
+
+TEST_CASE("WP-48 review 4: a report split over several ModuleEvents carries the resync on the first message only, in order") {
+    ModulePollReport report;
+    report.resync_reason = module_events::ids::kRingOverflow;
+    report.lost = 9;
+    for (std::uint64_t i = 0; i < 5; ++i) {
+        ModuleEvent e;
+        e.kind = ModuleEventKind::Loaded;
+        e.seq = i + 1;
+        e.module = module(0x100000000ull + i * 0x10000ull, 0x1000, "C:\\m.dll");
+        report.events.push_back(e);
+    }
+    const std::vector<cml::ipc::ModuleEvents> messages = to_messages(report, 2, 1u << 20);
+    REQUIRE(messages.size() == 3);
+    CHECK(messages[0].flags == cml::ipc::kModuleEventsResync);
+    CHECK(messages[0].reason == module_events::ids::kRingOverflow);
+    CHECK(messages[0].lost == 9);
+    for (std::size_t m = 1; m < messages.size(); ++m) {
+        CHECK(messages[m].flags == 0);
+        CHECK(messages[m].reason == 0);
+        CHECK(messages[m].lost == 0);
+    }
+    std::uint64_t seq = 0;
+    for (const cml::ipc::ModuleEvents& m : messages) {
+        CHECK(m.events.size() <= 2);
+        for (const ModuleEvent& e : m.events) {
+            CHECK(e.seq == ++seq);
+        }
+    }
+    CHECK(seq == 5);
+
+    // By size: every message holds at least one event, however long its path.
+    const std::vector<cml::ipc::ModuleEvents> by_bytes = to_messages(report, 1024, 40);
+    CHECK(by_bytes.size() == 5);
+
+    // A resync without events is one (empty) message, so the broker still hears of it.
+    ModulePollReport empty;
+    empty.resync_reason = module_events::ids::kPathUnresolved;
+    const std::vector<cml::ipc::ModuleEvents> one = to_messages(empty, 1024, 1u << 20);
+    REQUIRE(one.size() == 1);
+    CHECK(one[0].events.empty());
+    CHECK(one[0].reason == module_events::ids::kPathUnresolved);
+}

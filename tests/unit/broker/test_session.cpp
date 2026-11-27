@@ -330,11 +330,12 @@ TEST_CASE("WP-48: ModuleEvents is applied one event at a time; the step hook see
     CHECK(outcome.replies.empty());  // an event: no answer
     CHECK(outcome.warnings.empty());
     CHECK_FALSE(outcome.close);
-    REQUIRE(present.size() == 2);
+    // Review 6: one step, between the unload and the load of the same base; the caller observes the end state after the message.
+    REQUIRE(present.size() == 1);
     CHECK_FALSE(present[0]);  // after the unload
-    CHECK(present[1]);        // after the load
     CHECK(revisions[0] > before);
-    CHECK(revisions[1] > revisions[0]);
+    CHECK(r.session.revision() > revisions[0]);
+    CHECK(has_module(r.session, kGameDll));  // after the load
     CHECK(r.session.modules().size() == 3);
     CHECK(r.session.enabled_modules().size() == 1);  // the enabled set is per path: unchanged
     CHECK(r.session.module_events_applied() == 2);
@@ -345,6 +346,33 @@ TEST_CASE("WP-48: ModuleEvents is applied one event at a time; the step hook see
         r.session.on_message(more);
         CHECK_FALSE(has_module(r.session, kGameDll));
     }
+}
+
+TEST_CASE("WP-48 review 6: the step hook runs only between events at the same base, not once per event of a large report") {
+    QuietLogs quiet;
+    Registered r;
+    ipc::ModuleEvents events;
+    for (std::uint64_t i = 0; i < 400; ++i) {
+        events.events.push_back(module_event(ipc::ModuleEventKind::Loaded, 0, {0x300000000ull + i * 0x100000ull, 0x4000, "C:\\Games\\Demo\\m.dll"}));
+    }
+    int steps = 0;
+    r.session.on_message(events, [&] { ++steps; });
+    CHECK(steps == 0);
+    CHECK(r.session.modules().size() == 403);
+
+    // Load, unload, load of one base among others: a step after each event whose base comes up again (the first two).
+    ipc::ModuleEvents churn;
+    const ipc::ModuleEntry a{0x400000000ull, 0x4000, "C:\\Games\\Demo\\a.dll"};
+    const ipc::ModuleEntry b{0x410000000ull, 0x4000, "C:\\Games\\Demo\\b.dll"};
+    churn.events = {module_event(ipc::ModuleEventKind::Loaded, 1, a), module_event(ipc::ModuleEventKind::Loaded, 2, b),
+                    module_event(ipc::ModuleEventKind::Unloaded, 3, a), module_event(ipc::ModuleEventKind::Loaded, 4, a)};
+    std::vector<bool> a_present;
+    r.session.on_message(churn, [&] { a_present.push_back(has_module(r.session, a)); });
+    REQUIRE(a_present.size() == 2);
+    CHECK(a_present[0]);
+    CHECK_FALSE(a_present[1]);
+    CHECK(has_module(r.session, a));
+    CHECK(has_module(r.session, b));
 }
 
 TEST_CASE("WP-48: a resync from the agent is the warning CML5620, naming the process and the agent's reason") {

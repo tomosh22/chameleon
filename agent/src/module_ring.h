@@ -62,15 +62,32 @@ inline void fill_raw_event(RawModuleEvent& out, std::uint64_t seq, std::uint32_t
     out.path_units = static_cast<std::uint32_t>(units);
 }
 
-// The base of the patch image the agent's patch loader is loading or freeing right now (0: none). The loader notification of that
-// image carries kRawPatchImage and the poll drops it: patch DLLs are not application modules (the module-list snapshot leaves them
-// out for the same reason). Constant-initialised, so the callback may read it at any time.
+// The patch image the agent's patch loader is loading or freeing right now: its base and the thread that does it (0, 0: none). A
+// loader notification for that base ON that thread carries kRawPatchImage and the poll drops it: patch DLLs are not application
+// modules (the module-list snapshot leaves them out for the same reason). The thread matters: while the patch loader has released
+// its reservation for the load, another thread may load an application DLL at that very base (the CML4202 collision window), and
+// that load is a real module. Constant-initialised, so the callback may read it at any time (the callback passes its own thread id,
+// GetCurrentThreadId, which only reads the TEB).
 inline std::atomic<std::uint64_t> g_patch_image_in_flight{0};
+inline std::atomic<std::uint32_t> g_patch_image_thread{0};
+
+// Whether a notification for `base` on thread `thread` is the patch loader's own image.
+inline bool is_patch_image_event(std::uint64_t base, std::uint32_t thread) noexcept {
+    // Set: thread, then base (release). Cleared: base, then thread. A reader that sees the base also sees the thread that set it.
+    return base != 0 && base == g_patch_image_in_flight.load(std::memory_order_acquire) &&
+           thread == g_patch_image_thread.load(std::memory_order_relaxed);
+}
 
 class ScopedPatchImage {
 public:
-    explicit ScopedPatchImage(std::uint64_t base) noexcept { g_patch_image_in_flight.store(base, std::memory_order_release); }
-    ~ScopedPatchImage() { g_patch_image_in_flight.store(0, std::memory_order_release); }
+    ScopedPatchImage(std::uint64_t base, std::uint32_t thread) noexcept {
+        g_patch_image_thread.store(thread, std::memory_order_relaxed);
+        g_patch_image_in_flight.store(base, std::memory_order_release);
+    }
+    ~ScopedPatchImage() {
+        g_patch_image_in_flight.store(0, std::memory_order_release);
+        g_patch_image_thread.store(0, std::memory_order_relaxed);
+    }
     ScopedPatchImage(const ScopedPatchImage&) = delete;
     ScopedPatchImage& operator=(const ScopedPatchImage&) = delete;
 };

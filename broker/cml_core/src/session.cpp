@@ -1,6 +1,7 @@
 #include "cml/core/session.h"
 
 #include <algorithm>
+#include <map>
 #include <utility>
 
 #include "cml/core/module_event_diag_ids.h"
@@ -168,6 +169,14 @@ void Session::apply_unloaded(const ipc::ModuleEntry& module) {
 }
 
 void Session::handle_module_events(const ipc::ModuleEvents& events, const std::function<void()>& after_step, SessionOutcome& outcome) {
+    // The step hook runs only where the list between two events matters: after an event whose base comes up again later in this
+    // message (an unload and a load of the same base: the reload service must see the image gone before it sees it back). The
+    // caller observes the session once after the whole message, which covers everything else (a resync of 400 modules is one
+    // observation, not 400).
+    std::map<std::uint64_t, std::size_t> last_at_base;
+    for (std::size_t i = 0; i < events.events.size(); ++i) {
+        last_at_base[events.events[i].module.base] = i;
+    }
     for (std::size_t i = 0; i < events.events.size(); ++i) {
         const ipc::ModuleEvent& event = events.events[i];
         if (event.kind == ipc::ModuleEventKind::Loaded) {
@@ -185,7 +194,7 @@ void Session::handle_module_events(const ipc::ModuleEvents& events, const std::f
                     static_cast<unsigned long long>(events.events[i - 1].seq), static_cast<unsigned long long>(event.seq),
                     event.module.path.c_str());
         }
-        if (after_step) {
+        if (after_step && last_at_base[event.module.base] > i) {
             after_step();
         }
     }

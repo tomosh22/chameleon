@@ -154,7 +154,7 @@ VOID NTAPI on_loader_notification(ULONG reason, const LoaderNotificationData* da
     const char16_t* path = name != nullptr ? reinterpret_cast<const char16_t*>(name->Buffer) : nullptr;
     const std::size_t units = name != nullptr && name->Buffer != nullptr ? name->Length / sizeof(wchar_t) : 0;
     const std::uint32_t kind = reason == kLoaderReasonLoaded ? kRawEventLoaded : kRawEventUnloaded;
-    const bool patch = base != 0 && base == g_patch_image_in_flight.load(std::memory_order_acquire);
+    const bool patch = is_patch_image_event(base, static_cast<std::uint32_t>(GetCurrentThreadId()));  // reads the TEB only
     ring->push([&](RawModuleEvent& slot, std::uint64_t seq) { fill_raw_event(slot, seq, kind, base, size, path, units, patch); });
 }
 
@@ -694,13 +694,13 @@ bool Agent::send_module_list(ipc::PipeConnection& connection, bool session_start
     ipc::ModuleList list;
     list.request_id = next_id_.fetch_add(1, std::memory_order_relaxed);
     const std::uint64_t seq_mark = queue_seq_.load(std::memory_order_acquire);
+    std::vector<DrainedEvent> before_list;
     if (session_start && module_ring_ != nullptr) {
-        // WP-48: the new broker knows nothing yet; the list taken next covers everything the ring holds so far. Drained BEFORE the
-        // list is taken, so a change during it stays in the ring and is reported by the next poll (a load the list has as well is
-        // redundant there, see track_modules).
-        const std::size_t dropped = drain_module_ring().size();
+        // WP-48: the new broker knows nothing yet. What the ring holds so far is drained BEFORE the list is taken (a change during it
+        // stays in the ring and is reported by the next poll; a load the list has as well is redundant there, see track_modules) and
+        // applied to the list, which can still show an image whose unload notification was delivered (apply_before_list).
+        before_list = drain_module_ring();
         ring_lost_seen_ = module_ring_->lost();
-        CML_LOG(Debug, "module events: %llu from before the session dropped (the module list covers them)", static_cast<unsigned long long>(dropped));
     }
     Result<std::vector<proc::ModuleInfo>> modules = enumerate_loaded_modules();
     for (int attempt = 1; !modules && attempt < kEnumerateAttempts; ++attempt) {
@@ -711,13 +711,16 @@ bool Agent::send_module_list(ipc::PipeConnection& connection, bool session_start
         modules = enumerate_loaded_modules();
     }
     if (modules) {
-        list.modules = to_entries(*modules);
+        list.modules = session_start ? apply_before_list(before_list, to_entries(*modules)) : to_entries(*modules);
+        CML_LOG(Debug, "module events: %llu from before the session applied to its module list", static_cast<unsigned long long>(before_list.size()));
     } else {
         // Send what we have (nothing, at the start of a session) and keep the session: polled_seq_
         // stays as it is, so the next flush polls again, and the next poll sends the difference.
         CML_LOG(Warn, "cannot enumerate the loaded modules (%s); sending the list we have",
                 modules.error().format().c_str());
         list.modules = module_track_.known;
+        // WP-48: the notifications drained for this list are not lost: the next poll applies them (to a list nobody trusts yet).
+        module_track_.deferred.insert(module_track_.deferred.begin(), before_list.begin(), before_list.end());
     }
     {
         // Register before sending so the Reply cannot race the registration.
@@ -850,7 +853,10 @@ bool Agent::poll_modules(ipc::PipeConnection& connection) {
         CML_LOG(Debug, "%s", modules.error().format().c_str());
     }
     const bool quiet = !module_ring_->has_pending();
-    const ModulePollReport report = track_modules(module_track_, drained, lost, modules ? &snapshot : nullptr, quiet);
+    // While the broker has no full list (the session's could not be built, or was refused: full_list_pending_), the snapshot is
+    // reported at once: a request naming a module must find it known (polled_seq_), and a difference is no disagreement then.
+    const ModulePollReport report =
+        track_modules(module_track_, drained, lost, modules ? &snapshot : nullptr, quiet, /*known_trusted=*/!full_list_pending_);
     if (!drained.empty()) {
         CML_LOG(Debug, "module events: drained=%llu (seq %llu..%llu) reported=%llu patch_images=%llu redundant=%llu lost=%llu",
                 static_cast<unsigned long long>(drained.size()), static_cast<unsigned long long>(drained.front().seq),
@@ -877,9 +883,9 @@ bool Agent::poll_modules(ipc::PipeConnection& connection) {
                     module_events::ids::kListDisagrees, static_cast<unsigned long long>(report.events.size()));
             break;
     }
-    if (report.need_full_list) {
+    if (report.need_full_list && !full_list_pending_) {
         full_list_pending_ = true;  // no list to complete the report from: send the whole list at the next poll
-        full_list_not_before_ = 0;
+        full_list_not_before_ = 0;  // (one already pending keeps its back-off)
     }
     if (!send_module_report(connection, report)) {
         return false;
@@ -887,8 +893,8 @@ bool Agent::poll_modules(ipc::PipeConnection& connection) {
     if (!report.events.empty()) {
         ranges_dirty_.store(true, std::memory_order_release);
     }
-    if (!report.need_full_list) {
-        polled_seq_ = seq_mark;
+    if (!report.need_full_list && !report.deferred) {
+        polled_seq_ = seq_mark;  // everything loaded before seq_mark is reported (a deferred load is not yet)
     }
     return true;
 }
@@ -942,28 +948,14 @@ bool Agent::send_module_report(ipc::PipeConnection& connection, const ModulePoll
         }
         return true;
     }
-    std::size_t next = 0;
-    bool first = true;
-    while (first || next < report.events.size()) {
-        ipc::ModuleEvents message;
-        if (report.resync_reason != 0) {
-            message.flags = ipc::kModuleEventsResync;
-            message.reason = report.resync_reason;
-        }
-        message.lost = first ? report.lost : 0;
-        std::size_t bytes = 0;
-        while (next < report.events.size() && message.events.size() < kMaxEventsPerMessage &&
-               (message.events.empty() || bytes + report.events[next].module.path.size() + 32 <= kMaxEventBytesPerMessage)) {
-            bytes += report.events[next].module.path.size() + 32;
-            CML_LOG(Trace, "module event: %s seq=%llu base=0x%llx path=%s", event_kind_name(report.events[next].kind),
-                    static_cast<unsigned long long>(report.events[next].seq), static_cast<unsigned long long>(report.events[next].module.base),
-                    report.events[next].module.path.c_str());
-            message.events.push_back(report.events[next++]);
-        }
+    for (const ipc::ModuleEvent& event : report.events) {
+        CML_LOG(Trace, "module event: %s seq=%llu base=0x%llx path=%s", event_kind_name(event.kind), static_cast<unsigned long long>(event.seq),
+                static_cast<unsigned long long>(event.module.base), event.module.path.c_str());
+    }
+    for (const ipc::ModuleEvents& message : to_messages(report, kMaxEventsPerMessage, kMaxEventBytesPerMessage)) {
         if (!send_message(connection, message)) {
             return false;
         }
-        first = false;
     }
     return true;
 }

@@ -649,10 +649,11 @@ Result<void> PatchLoader::try_load_candidate(const ipc::PatchCandidate& candidat
                     candidate.path.c_str());
         }
     }
-    // 2. Load. WP-48: the loader notification of the patch image (at the base it was linked for) is marked as the patch loader's own
-    // and never reported as a module load; so is its unload below, after a mismatch. An image that lands elsewhere is reported
-    // loaded and unloaded like any module, which is consistent (and rare: CML4202).
-    const ScopedPatchImage in_flight(candidate.image_base);
+    // 2. Load. WP-48: the loader notification of the patch image (at the base it was linked for, on this thread) is marked as the
+    // patch loader's own and never reported as a module load; so is its unload below, after a mismatch. An image that lands
+    // elsewhere is reported loaded and unloaded like any module, which is consistent (and rare: CML4202); so is an application DLL
+    // another thread loads at this base while the range is released (the marker names this thread).
+    const ScopedPatchImage in_flight(candidate.image_base, static_cast<std::uint32_t>(GetCurrentThreadId()));
     HMODULE module = LoadLibraryExW(wide_path.c_str(), nullptr, 0);
     if (module == nullptr) {
         const DWORD error = GetLastError();
@@ -718,7 +719,7 @@ PatchLoader::Patch* PatchLoader::find_patch(std::uint64_t image_base) {
 Result<void> PatchLoader::unload_locked(std::size_t index) {
     const AddressRange range = patches_[index].range;
     if (!patches_[index].released) {
-        const ScopedPatchImage in_flight(range.base);  // WP-48: the unload notification of a patch image is not a module unload
+        const ScopedPatchImage in_flight(range.base, static_cast<std::uint32_t>(GetCurrentThreadId()));  // WP-48: the unload notification of a patch image is not a module unload
         if (!FreeLibrary(patches_[index].module)) {
             const DWORD error = GetLastError();
             patches_[index].busy = false;

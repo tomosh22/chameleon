@@ -47,9 +47,10 @@ public:
 
     // Handles one message from the agent. Every incoming message is logged at info level; a
     // request gets exactly one reply (Welcome for Hello, Reply for the others).
-    // WP-48: a ModuleEvents is applied one event at a time, and `after_step` (when set) runs after each one, with the module list
-    // as it is after that event: the connection thread publishes the session there and lets the reload service see it, so an
-    // unload and a load of the same image at the same base are two changes (the WP-45 re-enable path), never none.
+    // WP-48: a ModuleEvents is applied one event at a time, and `after_step` (when set) runs after each event whose base comes up
+    // again later in the same message, with the module list as it is after that event: the connection thread publishes the session
+    // there and lets the reload service see it, so an unload and a load of the same image at the same base are two changes (the
+    // WP-45 re-enable path), never none. The caller observes once more after the message, as for every message.
     SessionOutcome on_message(const ipc::Message& message, const std::function<void()>& after_step = {});
 
     std::uint64_t agent_id() const noexcept { return agent_id_; }
