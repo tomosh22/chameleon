@@ -1431,6 +1431,14 @@ CML4720–4739 (agent; amended: 4700–4719 belong to WP-36), CML5620–5629 (br
 forces every application to rebuild). A pre-WP-48 agent gets the old Welcome layout and CML5621. **Acceptance:** the `plugin_reload` fixture gains a step that frees and loads the
 DLL within 50 ms; the edit is re-applied in all 8 cells; WP10-REPEAT stays 25/25.
 
+**Ruling (WP-48 reviews; ADR-0018 convergence):** reconciling loader notifications with module-list snapshots by timing
+(which poll drained an unload, whether a list may lag) kept producing windows in which a reload was missed or a live image was
+reported as reloaded. The arbiter is now ground truth the agent owns: its hook records. Before an unload or load at a base is
+judged redundant or as a reload, the agent checks, under the installer's mutex and with no thread suspended, whether the jump bytes
+it wrote at that module's recorded targets are still in memory: present means the image is the live, hooked one (redundant; never
+`forget_range`), absent means it was replaced (report Unloaded then Loaded). A module with no hook records carries no edit a reload
+could lose, so either answer is safe for it. Snapshot timing heuristics may stay as hints but never override the check.
+
 ### WP-49: hook narrowing verifies jump tables (R-46)
 
 **Decision.** A jump table in a function's own code (cl `/Od` switch: ADDR32NB entries to labels in the same function) is
