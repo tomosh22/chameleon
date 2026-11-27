@@ -625,15 +625,19 @@ TEST_CASE("WP-48: no install can come between reconcile's probe and its forget")
     // Inside reconcile (mutex held, records classified, nothing forgotten yet) another thread starts the re-apply's install. It must
     // wait for the whole reconcile; then it is a first install over the fresh image and its record survives.
     struct Context {
-        Installer* installer;
-        const Placed* fn;
-        const Placed* repl;
+        Installer* installer = nullptr;
+        const Placed* fn = nullptr;
+        const Placed* repl = nullptr;
         std::thread thread;
         std::atomic<bool> done{false};
         bool finished_inside = false;
         BatchResult result;
         HookOutcome outcome;
-    } ctx{&installer, &fn, &repl_2};
+    };
+    Context ctx;
+    ctx.installer = &installer;
+    ctx.fn = &fn;
+    ctx.repl = &repl_2;
     InstallerOptions options;
     options.test_context = &ctx;
     options.test_in_reconcile = [](void* p) {
