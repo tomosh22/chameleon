@@ -15,6 +15,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <ostream>
 #include <span>
 #include <string>
 #include <vector>
@@ -186,7 +187,7 @@ std::vector<std::byte> link_old(const Compiled& c) {
         } else if (r.target->section_number > 0 && !same_section) {
             w32(code, at, 0);  // clang-cl's table in .rdata: never read, the function is not judged
         } else {
-            FAIL("unexpected relocation " << coff::reloc_type_name(r.reloc.type) << " to '" << name << "' at +" << at);
+            FAIL("unexpected relocation " << std::string(coff::reloc_type_name(r.reloc.type)) << " to '" << name << "' at +" << at);
         }
     }
     return one_section_image(code);
@@ -288,14 +289,14 @@ void run_opt(const char* opt) {
             CHECK(changed.reason == NarrowReason::TargetChanged);
             CHECK(changed.detail.find("jump-table reference") != std::string::npos);
         }
-        REQUIRE_MESSAGE(prior != nullptr, why);
+        REQUIRE_MESSAGE(static_cast<bool>(prior), why);
         CHECK(judge(plain, function, *old, prior).reason == NarrowReason::Unchanged);
         CHECK(judge(swapped, function, *old, prior).reason != NarrowReason::Unchanged);
     } else {
         // clang-cl: a table in .rdata keeps the function unverifiable (hooked as before); without a table it is plain code.
         if (plain.shape == Shape::OtherSection) {
             CHECK(same.reason == NarrowReason::Unverifiable);
-            CHECK(prior == nullptr);
+            CHECK_FALSE(static_cast<bool>(prior));
         } else {
             CHECK(same.reason == NarrowReason::Unchanged);
         }
