@@ -784,6 +784,134 @@ TEST_CASE("300 hooks are applied in a single stop of the world") {
     CHECK(installer.hook_count() == 0);
 }
 
+TEST_CASE("WP-50: the batch timing counts the jobs and pages and its phases fit in the total") {
+    Arena arena(16);
+    std::vector<Placed> olds;
+    const Placed repl_1 = arena.place_padded(lea_ret(1000), 8, 8);
+    const Placed repl_2 = arena.place_padded(lea_ret(2000), 8, 8);
+    for (int i = 0; i < 40; ++i) {
+        olds.push_back(arena.place_padded((i % 2 == 0) ? cl_release(i) : cl_debug(i), 8, 8));
+    }
+    arena.seal();
+    std::vector<HookRequest> to_1;
+    std::vector<HookRequest> mixed;
+    for (std::size_t i = 0; i < olds.size(); ++i) {
+        to_1.push_back({olds[i].entry, repl_1.entry, "fn"});
+        mixed.push_back({olds[i].entry, i < 10 ? repl_2.entry : repl_1.entry, "fn"});  // 10 re-pointed, 30 unchanged
+    }
+    const auto phases_fit = [](const BatchTiming& t) {
+        const std::uint64_t phases = t.lock_us + t.plan_us + t.protect_us + t.stop_us + t.check_us + t.write_us + t.step_us + t.resume_us +
+                                     t.retry_wait_us + t.unprotect_us + t.commit_us;
+        // Each phase is rounded down to whole microseconds on its own, so their sum may exceed the total by one per phase.
+        return phases <= t.total_us + 11 && t.probe_us <= t.plan_us + 1 && t.write_max_us <= t.write_us &&
+               t.enumerate_us + t.suspend_us + t.context_us <= t.stop_us + 3;
+    };
+    Installer installer;
+    std::vector<HookOutcome> out;
+
+    BatchResult r = installer.install(to_1.data(), to_1.size(), out);
+    REQUIRE_MESSAGE(r.ok(), describe(r, out));
+    CHECK(r.timing.installs == 40);
+    CHECK(r.timing.repoints == 0);
+    CHECK(r.timing.unchanged == 0);
+    CHECK(r.timing.reverts == 0);
+    CHECK(r.timing.pages >= 1);
+    CHECK(r.timing.pages <= 80);  // one or two per job
+    CHECK(r.timing.total_us > 0);
+    CHECK(phases_fit(r.timing));
+
+    r = installer.install(mixed.data(), mixed.size(), out);
+    REQUIRE_MESSAGE(r.ok(), describe(r, out));
+    CHECK(r.timing.installs == 0);
+    CHECK(r.timing.repoints == 10);
+    CHECK(r.timing.unchanged == 30);
+    CHECK(phases_fit(r.timing));
+
+    r = installer.install(mixed.data(), mixed.size(), out);  // nothing to write: no window at all
+    REQUIRE(r.ok());
+    CHECK(r.timing.unchanged == 40);
+    CHECK(r.timing.pages == 0);
+    CHECK(r.timing.stop_us == 0);
+    CHECK(r.timing.write_us == 0);
+    CHECK(r.stats.attempts == 0);
+
+    r = installer.revert(to_1.data(), to_1.size(), out);
+    REQUIRE(r.ok());
+    CHECK(r.timing.reverts == 40);
+    CHECK(phases_fit(r.timing));
+    CHECK(installer.hook_count() == 0);
+
+    // A refused batch still says what it spent planning (and never opened a window).
+    const HookRequest bad[2] = {{olds[0].entry, repl_1.entry, "fn"}, {olds[0].entry, repl_2.entry, "fn"}};
+    r = installer.install(bad, 2, out);
+    CHECK_FALSE(r.ok());
+    CHECK(r.timing.stop_us == 0);
+    CHECK(r.timing.total_us >= r.timing.plan_us);
+}
+
+TEST_CASE("WP-50: planning with the per-batch VirtualQuery cache decides exactly as planning without it") {
+    Arena arena(16);
+    std::vector<Placed> olds;
+    const Placed repl = arena.place_padded(lea_ret(1000), 8, 8);
+    for (int i = 0; i < 60; ++i) {
+        // Both strategies, entries with and without padding.
+        const Bytes code = (i % 3 == 0) ? cl_release(i) : (i % 3 == 1) ? cl_debug(i) : push_first(i);
+        olds.push_back(arena.place_padded(code, (i % 2 == 0) ? 8 : 0, 8));
+    }
+    const Placed tiny = arena.place_padded(xor_ret(), 0, 0);  // refused: shorter than 5 bytes, no padding
+    arena.seal();
+    std::vector<HookRequest> good;
+    for (const Placed& p : olds) {
+        good.push_back({p.entry, repl.entry, "fn"});
+    }
+    std::vector<HookRequest> refused = good;
+    refused.push_back({tiny.entry, repl.entry, "tiny"});
+    refused.push_back({olds[0].entry + 1, olds[1].entry, "dup-area"});
+    const std::uint8_t data_byte = 0;
+    std::vector<HookRequest> not_code = good;
+    not_code.push_back({olds[2].entry, &data_byte, "data"});  // the replacement is not executable
+    InstallerOptions uncached_options;
+    uncached_options.test_no_region_cache = true;
+
+    struct Seen {
+        bool ok;
+        std::uint32_t diag;
+        std::vector<int> status;
+        std::vector<int> strategy;
+        std::vector<std::uint32_t> codes;
+        std::uint32_t queries;
+    };
+    const auto run = [&](const std::vector<HookRequest>& requests, bool cached) {
+        Installer installer(cached ? InstallerOptions{} : uncached_options);
+        std::vector<HookOutcome> out;
+        const BatchResult r = installer.install(requests.data(), requests.size(), out);
+        Seen s{r.ok(), r.diag.code, {}, {}, {}, r.timing.queries};
+        for (const HookOutcome& o : out) {
+            s.status.push_back(static_cast<int>(o.status));
+            s.strategy.push_back(static_cast<int>(o.strategy));
+            s.codes.push_back(o.diag.code);
+        }
+        if (r.ok()) {
+            REQUIRE(installer.revert(requests.data(), requests.size(), out).ok());
+        }
+        return s;
+    };
+    for (const std::vector<HookRequest>* requests : {&good, &refused, &not_code}) {
+        const Seen with = run(*requests, true);
+        const Seen without = run(*requests, false);
+        CHECK(with.ok == without.ok);
+        CHECK(with.diag == without.diag);
+        CHECK(with.status == without.status);
+        CHECK(with.strategy == without.strategy);
+        CHECK(with.codes == without.codes);
+        CHECK(with.queries < without.queries);  // the arena's code is a few regions, asked about many times
+        CHECK(with.queries >= 1);
+    }
+    CHECK(run(good, true).ok);
+    CHECK_FALSE(run(refused, true).ok);
+    CHECK_FALSE(run(not_code, true).ok);
+}
+
 TEST_CASE("two threads installing at once are serialised") {
     Arena arena;
     const Placed a = arena.place_padded(cl_release(0), 8, 8);

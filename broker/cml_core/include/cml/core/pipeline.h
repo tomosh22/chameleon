@@ -72,6 +72,12 @@ struct ReloadOptions {
     // client listens for `exception` events AND crash_handler is on.
     bool crash_handler = true;
     bool break_with_debugger = false;          // also hold the fault when a debugger is attached to the application
+    // WP-50 (R-47): read the module file the reload compares function bodies with as soon as the module's index is ready, in the
+    // background, instead of in the first reload's plan stage (the copy is kept for the module's state either way).
+    bool prefetch_module_image = true;
+    // WP-50 (R-55): an index of a module file this session indexed before, unchanged (size, last-write time, PDB GUID/age), takes
+    // the earlier index's file lists and include graph instead of scanning again (ScanCache).
+    bool cache_include_scan = true;
 };
 
 // Replaceable effects.

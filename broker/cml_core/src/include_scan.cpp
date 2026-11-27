@@ -1,6 +1,8 @@
 #include "cml/core/include_scan.h"
 
+#include <bit>
 #include <cctype>
+#include <chrono>
 #include <fstream>
 
 #include "cml/core/source_baseline.h"
@@ -234,16 +236,65 @@ ScanFileReader disk_file_reader() {
 
 IncludeScanner::IncludeScanner(ScanFileReader reader) : reader_(std::move(reader)) {}
 
-const std::vector<IncludeDirective>* IncludeScanner::includes_of(const std::string& normalised_path) {
-    auto it = parsed_.find(normalised_path);
-    if (it == parsed_.end()) {
-        std::optional<std::vector<IncludeDirective>> parsed;
-        if (std::optional<std::string> text = reader_(normalised_path)) {
-            parsed = parse_includes(*text);
-        }
-        it = parsed_.emplace(normalised_path, std::move(parsed)).first;
+std::uint32_t IncludeScanner::dir_id(const std::string& normalised_dir) {
+    const auto it = dir_ids_.find(normalised_dir);
+    if (it != dir_ids_.end()) {
+        return it->second;
     }
-    return it->second ? &*it->second : nullptr;
+    const auto id = static_cast<std::uint32_t>(dirs_.size());
+    dirs_.push_back(normalised_dir);
+    resolved_.emplace_back();
+    dir_ids_.emplace(normalised_dir, id);
+    return id;
+}
+
+std::uint32_t IncludeScanner::file_id(const std::string& normalised_path) {
+    const auto it = file_ids_.find(normalised_path);
+    if (it != file_ids_.end()) {
+        return it->second;
+    }
+    using Clock = std::chrono::steady_clock;
+    const auto ms = [](Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    File file;
+    file.path = normalised_path;
+    file.system = is_system_path(normalised_path);
+    const Clock::time_point t0 = Clock::now();
+    std::optional<std::string> text = reader_(normalised_path);
+    const Clock::time_point t1 = Clock::now();
+    stats_.read_ms += ms(t0, t1);
+    if (text) {
+        file.includes = parse_includes(*text);
+        file.readable = true;
+        stats_.parse_ms += ms(t1, Clock::now());
+        ++stats_.found;
+    } else {
+        ++stats_.missing;
+    }
+    const auto id = static_cast<std::uint32_t>(files_.size());
+    file.dir = dir_id(std::string(path::parent_directory(std::string_view(normalised_path))));
+    files_.push_back(std::move(file));
+    file_ids_.emplace(normalised_path, id);
+    return id;
+}
+
+std::int64_t IncludeScanner::resolve(std::uint32_t dir, const std::string& name) {
+    ++stats_.lookups;
+    {
+        const auto it = resolved_[dir].find(name);
+        if (it != resolved_[dir].end()) {
+            return it->second;
+        }
+    }
+    ++stats_.resolved;
+    const std::uint32_t id = file_id(pdb::normalize_path(name, dirs_[dir]));  // may intern a directory: resolved_ may grow
+    const std::int64_t answer = files_[id].readable ? static_cast<std::int64_t>(id) : -1;
+    resolved_[dir].emplace(name, answer);
+    return answer;
+}
+
+const std::vector<IncludeDirective>* IncludeScanner::includes_of(const std::string& normalised_path) {
+    const File& file = files_[file_id(normalised_path)];
+    return file.readable ? &file.includes : nullptr;
 }
 
 std::vector<std::string> IncludeScanner::normalised_dirs(const ScanRoots& roots) const {
@@ -273,55 +324,191 @@ std::string IncludeScanner::resolve_forced(const ScanRoots& roots, const std::st
 
 std::set<std::string> IncludeScanner::walk(const std::vector<Start>& starts, const std::vector<std::string>& dirs) {
     // Every file keeps the union of the directories of the files that include it, directly or not: a quoted include is
-    // searched in the including file's directory, then in those of the files further up the include stack, then in -I.
-    std::map<std::string, std::set<std::string>> stack_dirs;
-    std::vector<std::string> work;
-    std::set<std::string> found;
-    const auto reach = [&](const std::string& file, const std::set<std::string>& inherited) {
-        if (is_system_path(file) || includes_of(file) == nullptr) {
+    // searched in the including file's directory, then in those of the files further up the include stack (in the order of
+    // their paths: the first of them, by path, that has the file answers), then in -I.
+    //
+    // WP-50 (R-55): directories are ids and a file's set of them is a bit set, so taking the union is a few word operations.
+    // A file is expanded again whenever it is reached with directories it had not searched yet; only those can change what its
+    // includes resolve to, so the second and later expansions look at them alone: an include answered by the file's own
+    // directory keeps that answer (searched first); one answered by a stack directory changes only to a new stack directory
+    // whose path sorts before it; one answered by -I, or not at all, changes to the new stack directory with the smallest path
+    // that has it. That is the answer a full search would give. An unchanged answer is passed only the new directories (the
+    // file it names has all the others already).
+    using Bits = std::vector<std::uint64_t>;
+    const auto set_bit = [](Bits& b, std::uint32_t i) {
+        const std::size_t w = i / 64;
+        if (b.size() <= w) {
+            b.resize(w + 1, 0);
+        }
+        const std::uint64_t m = std::uint64_t{1} << (i % 64);
+        const bool fresh = (b[w] & m) == 0;
+        b[w] |= m;
+        return fresh;
+    };
+    const auto merge = [](Bits& into, const Bits& from) {  // into |= from; true when into grew
+        if (into.size() < from.size()) {
+            into.resize(from.size(), 0);
+        }
+        bool grew = false;
+        for (std::size_t w = 0; w < from.size(); ++w) {
+            const std::uint64_t add = from[w] & ~into[w];
+            if (add != 0) {
+                into[w] |= add;
+                grew = true;
+            }
+        }
+        return grew;
+    };
+    const auto for_each_bit = [](const Bits& b, const auto& fn) {
+        for (std::size_t w = 0; w < b.size(); ++w) {
+            std::uint64_t word = b[w];
+            while (word != 0) {
+                const unsigned bit = static_cast<unsigned>(std::countr_zero(word));
+                word &= word - 1;
+                fn(static_cast<std::uint32_t>(w * 64 + bit));
+            }
+        }
+    };
+    const auto before_path = [this](std::uint32_t a, std::uint32_t b) { return dirs_[a] < dirs_[b]; };
+
+    std::unordered_map<std::uint32_t, Bits> stack_dirs;
+    std::vector<std::uint32_t> work;
+    std::vector<char> found_flag;
+    std::vector<std::uint32_t> found;
+    std::vector<std::uint32_t> search;  // -I, as ids
+    search.reserve(dirs.size());
+    for (const std::string& d : dirs) {
+        search.push_back(dir_id(d));
+    }
+    const auto reach = [&](std::uint32_t file, const Bits& inherited) {
+        if (files_[file].system || !files_[file].readable) {
             return;
         }
-        std::set<std::string>& mine = stack_dirs[file];
-        const std::size_t before = mine.size();
-        mine.insert(inherited.begin(), inherited.end());
-        mine.insert(std::string(path::parent_directory(std::string_view(file))));
-        const bool is_new = found.insert(file).second;
-        if (is_new || mine.size() != before) {
+        Bits& mine = stack_dirs[file];
+        bool grew = merge(mine, inherited);
+        grew = set_bit(mine, files_[file].dir) || grew;
+        if (found_flag.size() <= file) {
+            found_flag.resize(files_.size() + 1, 0);
+        }
+        const bool is_new = found_flag[file] == 0;
+        if (is_new) {
+            found_flag[file] = 1;
+            found.push_back(file);
+        }
+        if (is_new || grew) {
             work.push_back(file);  // new, or reached with directories it has not searched yet
         }
     };
     for (const Start& s : starts) {
-        reach(s.file, s.inherited_dirs);
+        Bits inherited;
+        for (const std::string& d : s.inherited_dirs) {
+            set_bit(inherited, dir_id(d));
+        }
+        reach(file_id(s.file), inherited);
     }
+
+    enum class From : std::uint8_t { None, Here, Stack, Search };
+    struct Answer {
+        std::int64_t hit = -1;
+        From from = From::None;
+        std::uint32_t dir = 0;  // From::Stack: the directory that answered
+    };
+    struct Expanded {
+        Bits seen;
+        std::vector<Answer> answers;
+    };
+    std::unordered_map<std::uint32_t, Expanded> expanded;
+    // The stack directory with the smallest path among `candidates` that has `name` (and, with a bound, sorts before it).
+    const auto best_stack_hit = [&](const Bits& candidates, const std::string& name, const Answer* bound, Answer* out) {
+        bool any = false;
+        for_each_bit(candidates, [&](std::uint32_t d) {
+            if (bound != nullptr && !before_path(d, bound->dir)) {
+                return;
+            }
+            if (any && !before_path(d, out->dir)) {
+                return;
+            }
+            const std::int64_t hit = resolve(d, name);
+            if (hit >= 0) {
+                out->hit = hit;
+                out->from = From::Stack;
+                out->dir = d;
+                any = true;
+            }
+        });
+        return any;
+    };
     for (std::size_t next = 0; next < work.size(); ++next) {
-        const std::string current = work[next];
-        const std::vector<IncludeDirective>* includes = includes_of(current);
-        if (includes == nullptr) {
+        const std::uint32_t current = work[next];
+        const Bits searched = stack_dirs[current];  // copy: reach() mutates the map
+        const std::uint32_t here = files_[current].dir;
+        const std::size_t count = files_[current].includes.size();
+        const auto previous = expanded.find(current);
+        if (previous == expanded.end()) {
+            Expanded first{searched, std::vector<Answer>(count)};
+            for (std::size_t k = 0; k < count; ++k) {
+                // By index and by copy of the name: resolve() may read files (files_ grows, references into it would dangle).
+                const bool angled = files_[current].includes[k].angled;
+                const std::string name = files_[current].includes[k].name;
+                Answer& a = first.answers[k];
+                if (!angled) {
+                    a.hit = resolve(here, name);
+                    if (a.hit >= 0) {
+                        a.from = From::Here;
+                    } else {
+                        best_stack_hit(searched, name, nullptr, &a);
+                    }
+                }
+                for (std::size_t i = 0; a.hit < 0 && i < search.size(); ++i) {
+                    a.hit = resolve(search[i], name);
+                    if (a.hit >= 0) {
+                        a.from = From::Search;
+                    }
+                }
+                if (a.hit >= 0) {
+                    reach(static_cast<std::uint32_t>(a.hit), searched);
+                }
+            }
+            expanded.emplace(current, std::move(first));
             continue;
         }
-        const std::set<std::string> searched = stack_dirs[current];  // copy: reach() mutates the map
-        const std::string here(path::parent_directory(std::string_view(current)));
-        for (const IncludeDirective& inc : *includes) {
-            std::string hit;
-            const auto try_dir = [&](const std::string& d) {
-                if (!hit.empty()) return;
-                const std::string c = pdb::normalize_path(inc.name, d);
-                if (includes_of(c) != nullptr) hit = c;
-            };
-            if (!inc.angled) {
-                try_dir(here);
-                for (const std::string& d : searched) try_dir(d);
+        Expanded& again = previous->second;
+        Bits added(searched.size(), 0);
+        bool any_added = false;
+        for (std::size_t w = 0; w < searched.size(); ++w) {
+            added[w] = searched[w] & ~(w < again.seen.size() ? again.seen[w] : 0);
+            any_added = any_added || added[w] != 0;
+        }
+        if (!any_added) {
+            continue;  // queued twice before it was expanded: the first expansion already used everything
+        }
+        for (std::size_t k = 0; k < count; ++k) {
+            const bool angled = files_[current].includes[k].angled;
+            const std::string name = files_[current].includes[k].name;
+            Answer& a = again.answers[k];
+            bool changed = false;
+            if (!angled && a.from != From::Here) {
+                Answer better;
+                if (best_stack_hit(added, name, a.from == From::Stack ? &a : nullptr, &better)) {
+                    a = better;
+                    changed = true;
+                }
             }
-            for (const std::string& d : dirs) try_dir(d);
-            if (!hit.empty()) {
-                reach(hit, searched);
+            if (a.hit >= 0) {
+                reach(static_cast<std::uint32_t>(a.hit), changed ? searched : added);
             }
         }
+        again.seen = searched;
     }
-    return found;
+    std::set<std::string> paths;
+    for (const std::uint32_t id : found) {
+        paths.insert(files_[id].path);
+    }
+    return paths;
 }
 
 std::set<std::string> IncludeScanner::dependencies(const ScanRoots& roots) {
+    ++stats_.walks;
     if (roots.source.empty()) {
         return {};
     }
@@ -339,6 +526,7 @@ std::set<std::string> IncludeScanner::dependencies(const ScanRoots& roots) {
 }
 
 std::set<std::string> IncludeScanner::pch_files(const ScanRoots& roots) {
+    ++stats_.walks;
     const std::string source = roots.source.empty() ? std::string() : pdb::normalize_path(roots.source, roots.cwd);
     const std::string source_dir(path::parent_directory(std::string_view(source)));
     std::vector<Start> starts;

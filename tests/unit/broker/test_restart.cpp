@@ -609,6 +609,56 @@ TEST_CASE("restart: the old process prepares, is terminated, the new one registe
     CHECK(rig.events->diag_ids("error").empty());
 }
 
+TEST_CASE("WP-50: the restart result breaks the restart down by stage, the stages add up to the total, and the line names them") {
+    QuietLogs quiet;
+    Rig rig;
+    Result<Value> result = rig.service.restart(args_for(100, 10000));
+    REQUIRE(result.has_value());
+    const Value* stages = result->find("stages_ms");
+    REQUIRE(stages != nullptr);
+    double sum = 0;
+    for (const char* name : {"prepare", "takeover", "terminate", "relaunch", "register", "module_list", "reenable", "carry", "reapply"}) {
+        const Value* v = stages->find(name);
+        REQUIRE_MESSAGE(v != nullptr, name);
+        CHECK(v->as_double() >= 0.0);
+        sum += v->as_double();
+    }
+    CHECK(stages->find("held") == nullptr);  // only with hold_new
+    for (const char* name : {"index", "restore"}) {
+        if (const Value* v = stages->find(name)) {
+            sum += v->as_double();
+        }
+    }
+    const Value* total = stages->find("total");
+    REQUIRE(total != nullptr);
+    CHECK(sum <= total->as_double() + 0.5);
+    CHECK(sum >= total->as_double() - 50.0);  // the rest is the result's own assembly
+
+    const Value* indexes = result->find("indexes");
+    REQUIRE(indexes != nullptr);
+    CHECK(indexes->items().size() == result->find("modules")->items().size());
+    for (const Value& entry : indexes->items()) {
+        CHECK(!entry.get_string("module").empty());
+        CHECK(entry.find("wait_ms") != nullptr);
+        CHECK(!entry.get_string("state").empty());
+    }
+
+    const std::string line = result->get_string("timing");
+    CHECK(line.rfind("RESTART-TIMING old_pid=100 new_pid=200 total_ms=", 0) == 0);
+    std::size_t at = 0;
+    for (const char* key : {" prepare_ms=", " takeover_ms=", " terminate_ms=", " relaunch_ms=", " register_ms=", " module_list_ms=", " reenable_ms=", " carry_ms=",
+                            " reapply_ms="}) {
+        const std::size_t found = line.find(key, at);
+        CHECK_MESSAGE(found != std::string::npos, key);
+        if (found != std::string::npos) {
+            at = found;
+        }
+    }
+    if (!indexes->items().empty()) {
+        CHECK(line.find(" index_module=") != std::string::npos);
+    }
+}
+
 TEST_CASE("restart: when the application enables all its modules by itself the broker asks for nothing") {
     QuietLogs quiet;
     Rig rig;
