@@ -1233,3 +1233,178 @@ TEST_CASE("types: type_size keys definitions by the exact unique name; definitio
     CHECK(idx->type_size(large) == std::optional<std::uint64_t>(32));  // 4092e8b: 8, the first definition without the discriminator
     CHECK_FALSE(idx->type_size(odd).has_value());
 }
+
+// ---- WP-51 (R-54): the inline sites of a procedure (PdbIndex::proc_inlinees) -------------------------------------------
+
+namespace {
+
+Bytes inline_site(std::uint32_t inlinee, bool second_form = false) {
+    Bytes b;
+    put32(b, 0);  // parent
+    put32(b, 0);  // end
+    put32(b, inlinee);
+    if (second_form) {
+        put32(b, 3);  // S_INLINESITE2: invocations
+    }
+    b.push_back(0x0B);  // an annotation (code offset): read past
+    b.push_back(0x04);
+    return b;
+}
+
+// What clang 18 -O2 writes for o2_step (planner_pairing_o2, docs/wp/WP-51.md): the statics first, then an inline site of the
+// closure's call operator with a nested site of a free function; a second procedure inlined nothing.
+struct InlineWorld {
+    TypeSet types;
+    std::uint32_t closure = 0, call = 0, proc_void = 0, rtti = 0, rtti_ctor = 0;
+    std::uint32_t id_call = 0, id_make = 0, id_ctor = 0, id_string = 0;
+    Spec spec;
+};
+
+InlineWorld inline_world() {
+    InlineWorld w;
+    const std::uint32_t args = w.types.add(kLfArgList, lf_arglist({}));
+    w.proc_void = w.types.add(kLfProcedure, lf_procedure(kTVoid, args, 0));
+    w.closure = w.types.add(kLfClass, lf_udt("o2_step::<lambda_0>", ".?AV<lambda_0>@?0??o2_step@@YAXXZ@", true));
+    const std::uint32_t this_ptr = w.types.add(kLfPointer, lf_pointer(w.closure, kPtr64 | 0x400));
+    w.call = w.types.add(kLfMFunction, lf_mfunction(kTInt, w.closure, this_ptr, args, 0));
+    w.rtti = w.types.add(kLfClass, lf_udt("JPH::RTTI", ".?AVRTTI@JPH@@", true));
+    const std::uint32_t rtti_this = w.types.add(kLfPointer, lf_pointer(w.rtti, kPtr64 | 0x400));
+    w.rtti_ctor = w.types.add(kLfMFunction, lf_mfunction(kTVoid, w.rtti, rtti_this, args, 0));
+    w.id_call = w.spec.ipi.record(kLfMFuncId, lf_mfunc_id(w.closure, w.call, "operator()"));
+    w.id_make = w.spec.ipi.record(kLfFuncId, lf_func_id(w.proc_void, "o2_make"));
+    w.id_ctor = w.spec.ipi.record(kLfMFuncId, lf_mfunc_id(w.rtti, w.rtti_ctor, "RTTI"));
+    w.id_string = w.spec.ipi.string_id("not a function");
+    w.spec.sections = {{".text", 0x1000, 0x1000, 0x1000, 0x60000020}, {".data", 0x400, 0x3000, 0x400, 0xC0000040}};
+    return w;
+}
+
+Module inline_module() {
+    Module m;
+    m.name = "C:\\proj\\obj\\lambdas.cpp.obj";
+    m.symbols.objname(m.name);
+    return m;
+}
+
+}  // namespace
+
+TEST_CASE("inlinees: every inline site of a procedure, at any depth, resolved through the IPI and the TPI") {
+    TempDir dir;
+    InlineWorld w = inline_world();
+    Module m = inline_module();
+    m.symbols.proc(0x1110, "o2_step", 1, 0x100, 0x80, 0, w.proc_void);
+    m.symbols.data(0x110C, "sname", 2, 0x10);
+    m.symbols.data(0x110C, "sname", 2, 0x20);
+    m.symbols.add(0x114D, inline_site(w.id_call));
+    m.symbols.add(0x114D, inline_site(w.id_make));        // nested: o2_make inlined into the call operator
+    m.symbols.add(0x114E, Bytes());
+    m.symbols.add(0x114E, Bytes());
+    m.symbols.add(0x115D, inline_site(w.id_call, true));  // the second lambda's site, S_INLINESITE2 form
+    m.symbols.add(0x114E, Bytes());
+    m.symbols.block();
+    m.symbols.add(0x114D, inline_site(w.id_ctor));        // inside a block, still the procedure's
+    m.symbols.add(0x114E, Bytes());
+    m.symbols.end();
+    m.symbols.end();
+    m.symbols.proc(0x1110, "plain", 1, 0x200, 0x20, 0, w.proc_void);
+    m.symbols.data(0x110C, "own", 2, 0x30);
+    m.symbols.end();
+    w.spec.modules.push_back(std::move(m));
+    w.types.add_to(w.spec.tpi);
+    const auto idx = open_spec(dir, w.spec);
+    const std::vector<SymbolView> procs = procs_of(*idx);
+    REQUIRE(procs.size() == 2);
+
+    const auto got = idx->proc_inlinees(procs[0]);
+    REQUIRE_MESSAGE(got.has_value(), (got.has_value() ? std::string() : got.error().format()));
+    CHECK(got->sites == 4);
+    CHECK(got->complete);
+    REQUIRE(got->inlinees.size() == 3);
+    const PdbIndex::Inlinee& call = got->inlinees[0];
+    CHECK(call.id == w.id_call);
+    CHECK(call.readable);
+    CHECK(call.member);
+    CHECK(call.name == "operator()");
+    CHECK(call.class_name == "o2_step::<lambda_0>");
+    CHECK(call.class_unique == ".?AV<lambda_0>@?0??o2_step@@YAXXZ@");
+    CHECK(call.sites == 2);
+    CHECK(call.depth == 1);
+    CHECK(call.signature_known);
+    CHECK(call.signature.find("<lambda_0>") != std::string::npos);
+    const PdbIndex::Inlinee& make = got->inlinees[1];
+    CHECK(make.readable);
+    CHECK_FALSE(make.member);
+    CHECK(make.name == "o2_make");
+    CHECK(make.class_unique.empty());
+    CHECK(make.depth == 2);
+    CHECK(make.sites == 1);
+    const PdbIndex::Inlinee& ctor = got->inlinees[2];
+    CHECK(ctor.name == "RTTI");
+    CHECK(ctor.class_unique == ".?AVRTTI@JPH@@");
+    CHECK(ctor.depth == 1);
+
+    const auto none = idx->proc_inlinees(procs[1]);
+    REQUIRE(none.has_value());
+    CHECK(none->sites == 0);
+    CHECK(none->inlinees.empty());
+}
+
+TEST_CASE("inlinees: an inlinee that cannot be read is listed as unreadable, never left out") {
+    TempDir dir;
+    InlineWorld w = inline_world();
+    const std::uint32_t lost_class = w.spec.ipi.record(kLfMFuncId, lf_mfunc_id(0x7FFF, w.call, "operator()"));
+    Module m = inline_module();
+    m.symbols.proc(0x1110, "f", 1, 0x100, 0x80, 0, w.proc_void);
+    m.symbols.add(0x114D, inline_site(0x1FFF));       // not in the IPI
+    m.symbols.add(0x114E, Bytes());
+    m.symbols.add(0x114D, inline_site(w.id_string));  // an LF_STRING_ID, not a function id
+    m.symbols.add(0x114E, Bytes());
+    m.symbols.add(0x114D, inline_site(lost_class));   // its class is not in the TPI
+    m.symbols.add(0x114E, Bytes());
+    m.symbols.add(0x114D, Bytes(8, 0));               // too short to name an inlinee
+    m.symbols.add(0x114E, Bytes());
+    m.symbols.end();
+    w.spec.modules.push_back(std::move(m));
+    w.types.add_to(w.spec.tpi);
+    const auto idx = open_spec(dir, w.spec);
+    const auto got = idx->proc_inlinees(procs_of(*idx)[0]);
+    REQUIRE(got.has_value());
+    CHECK(got->sites == 4);
+    REQUIRE(got->inlinees.size() == 4);
+    for (const PdbIndex::Inlinee& e : got->inlinees) {
+        CAPTURE(e.why);
+        CHECK_FALSE(e.readable);
+        CHECK_FALSE(e.why.empty());
+    }
+    CHECK(got->inlinees[0].why.find("does not hold") != std::string::npos);
+    CHECK(got->inlinees[1].why.find("neither LF_FUNC_ID nor LF_MFUNC_ID") != std::string::npos);
+    CHECK(got->inlinees[2].why.find("cannot be read from the TPI") != std::string::npos);
+    CHECK(got->inlinees[3].why.find("too short") != std::string::npos);
+}
+
+TEST_CASE("inlinees: a procedure that is not in its module, or a module without an end record, is an error") {
+    TempDir dir;
+    InlineWorld w = inline_world();
+    Module m = inline_module();
+    m.symbols.proc(0x1110, "f", 1, 0x100, 0x80, 0, w.proc_void);
+    m.symbols.add(0x114D, inline_site(w.id_call));
+    m.symbols.add(0x114E, Bytes());
+    // no S_END
+    w.spec.modules.push_back(std::move(m));
+    w.types.add_to(w.spec.tpi);
+    const auto idx = open_spec(dir, w.spec);
+    const std::vector<SymbolView> procs = procs_of(*idx);
+    REQUIRE(procs.size() == 1);
+    const auto open_ended = idx->proc_inlinees(procs[0]);
+    REQUIRE_FALSE(open_ended.has_value());
+    CHECK(open_ended.error().code == dg::kBadModuleSymbols);
+    SymbolView elsewhere = procs[0];
+    elsewhere.offset = 0x900;  // no procedure record there
+    const auto missing = idx->proc_inlinees(elsewhere);
+    REQUIRE_FALSE(missing.has_value());
+    CHECK(missing.error().code == dg::kBadModuleSymbols);
+    SymbolView data = procs[0];
+    data.kind = cml::pdb::SymbolKind::LocalData;
+    const auto not_proc = idx->proc_inlinees(data);
+    REQUIRE_FALSE(not_proc.has_value());
+    CHECK(not_proc.error().code == dg::kCompilandOutOfRange);
+}

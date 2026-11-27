@@ -143,6 +143,34 @@ public:
     };
     Result<std::vector<LocalTypeUse>> compiland_local_types(std::uint32_t ci) const;
 
+    // WP-51 (R-54): the functions `proc` (a proc symbol of this index) inlined: every S_INLINESITE / S_INLINESITE2 between
+    // its record and its S_END, at any depth, with the inlinee each names resolved through the IPI stream (LF_FUNC_ID /
+    // LF_MFUNC_ID) and, for a member function, its class through the TPI. clang records the function-local statics of
+    // inlined code as plain records of the outermost procedure, so these sites are the only trace of whose code a record
+    // there may be. Walks the compiland's module stream up to the end of the procedure; nothing is cached. An inline site
+    // whose inlinee cannot be read is listed with `readable == false` (never left out). CML1413 when the stream is
+    // unreadable or the procedure's record is not found.
+    struct Inlinee {
+        std::uint32_t id = 0;           // the IPI index the inline site names
+        bool readable = false;          // false: `why`
+        bool member = false;            // LF_MFUNC_ID (else LF_FUNC_ID)
+        std::string name;               // as recorded: "operator()", "__invoke", "RTTI", "b_helper"
+        std::string class_name;         // member: the class's name ("o2_step::<lambda_0>")
+        std::string class_unique;       // member: its unique name without the unit's discriminator ("" when it has none)
+        bool signature_known = false;   // the canonical signature of the inlinee's type (type_records.h)
+        std::string signature;
+        std::uint32_t sites = 0;        // inline sites of the procedure that name this inlinee
+        std::uint32_t depth = 0;        // the smallest nesting depth of those sites (1: directly in the procedure)
+        std::string why;
+    };
+    struct ProcInlinees {
+        std::uint32_t sites = 0;           // inline-site records of the procedure
+        std::vector<Inlinee> inlinees;     // one per distinct id, in the order of first appearance
+        bool complete = true;              // false: more than kMaxProcInlinees distinct inlinees (the rest are not listed)
+    };
+    static constexpr std::size_t kMaxProcInlinees = 4096;
+    Result<ProcInlinees> proc_inlinees(const SymbolView& proc) const;
+
     // ---- Types (WP-37, lazy) -------------------------------------------------------------
     // The type records of this PDB: find_type reads the TPI stream, find_id the IPI stream. Opening an index reads no
     // type record; the first lookup reads the stream header and the type-index offset table of the hash stream, and
