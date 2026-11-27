@@ -3144,6 +3144,90 @@ TEST_CASE("atomic reload (WP-47 review): a compiland that fails when it is prepa
     check_nothing_live(rig);
 }
 
+TEST_CASE("atomic reload (WP-47 review): the agent lost with InstallHooks in flight keeps that patch as possibly live (CML3655)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    two_dependent_units(rig);
+    rig.silent_hooks_at = 2;  // main.cpp's hooks reach the agent, which then disconnects instead of answering
+    rig.on_hooks = [&rig](int n) {
+        if (n == 2) {
+            std::thread([&rig] { rig.link->close(); }).detach();
+        }
+    };
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message.find("(compiland 2 of 2, main.cpp)") != std::string::npos);
+    CHECK(r.error().message.find("1 compiland(s) of this reload were applied before it, its hooks reached the agent, so it may be live, 0 other(s) were not") !=
+          std::string::npos);
+    CHECK(r.error().message.find("nothing of this reload was applied") == std::string::npos);
+    CHECK(diag_count(rig, "CML3655", "warning") == 1);
+    CHECK(rig.events->count("patch_applied") == 0);
+    // Never unloaded (a live hook may target it), recorded as installed and in the batch.
+    for (const ipc::ReleaseRange& rr : rig.seen<ipc::ReleaseRange>()) {
+        CHECK(rr.mode != ipc::ReleaseMode::UnloadPatch);
+    }
+    REQUIRE(rig.module->batches.size() == 1);
+    CHECK(rig.module->batches[0].patches.size() == 2);
+    const auto accepted = rig.module->index->accepted_for_testing();
+    REQUIRE_FALSE(accepted.empty());
+    CHECK(accepted.back().count("C:\\proj\\logic.cpp") == 0);
+    CHECK(accepted.back().count("C:\\proj\\main.cpp") == 0);
+}
+
+TEST_CASE("atomic reload (WP-47 review): a compiland that plans to nothing when it is prepared again for a relink is not re-baselined") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    REQUIRE(rig.reload().has_value());  // logic.cpp's compute_value as make_object() has it is live (patch 1, its code recorded)
+    two_dependent_units(rig);
+    rig.load_collisions = static_cast<int>(rig.seen<ipc::LoadPatch>().size()) + 1;  // logic.cpp's next load finds its range taken
+    int links = 0;
+    rig.link_fails = [&rig, &links](const std::string& path) {
+        // main.cpp's first link: logic.cpp's object file now holds what patch 1 already runs, so its preparation for the relink plans
+        // to nothing.
+        if (path.find("main.cpp") != std::string::npos && ++links == 1) {
+            for (const std::string& out : rig.compile_outputs) {
+                if (out.find("main.cpp") == std::string::npos) {
+                    const std::vector<std::byte> same = make_object();
+                    std::ofstream o(out, std::ios::binary | std::ios::trunc);
+                    o.write(reinterpret_cast<const char*>(same.data()), static_cast<std::streamsize>(same.size()));
+                }
+            }
+        }
+        return false;
+    };
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML5318");
+    CHECK(r.error().message.find("planned to nothing") != std::string::npos);
+    CHECK(rig.module->generation == 1);  // patch 1 only
+    const auto accepted = rig.module->index->accepted_for_testing();
+    REQUIRE_FALSE(accepted.empty());
+    CHECK(accepted.back().count("C:\\proj\\logic.cpp") == 0);
+    CHECK(accepted.back().count("C:\\proj\\main.cpp") == 0);
+}
+
+TEST_CASE("atomic reload (WP-47 review): an unchanged compiland of a failed reload is not re-baselined") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.changed();
+    REQUIRE(rig.reload().has_value());  // patch 1: compute_value as make_object() has it
+    // logic.cpp recompiles to what patch 1 runs (nothing to load, compared with the live code), main.cpp is refused.
+    rig.object = make_object();
+    rig.second_object = make_object({}, false, "no_such_function_anywhere");
+    rig.changed_both();
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML3200");
+    const auto accepted = rig.module->index->accepted_for_testing();
+    REQUIRE_FALSE(accepted.empty());
+    CHECK(accepted.back().count("C:\\proj\\logic.cpp") == 0);
+    CHECK(accepted.back().count("C:\\proj\\main.cpp") == 0);
+}
+
 TEST_CASE("set-option compile_on_save validates, reports the previous value and starts and stops the watcher (WP-14)") {
     QuietLogs quiet;
     Rig rig;

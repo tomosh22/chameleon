@@ -631,7 +631,9 @@ private:
         std::map<std::uint32_t, bool> unit_ok;
         bool before_applied = true;  // every compiland with effect so far was applied
         for (const std::unique_ptr<Staged>& s : staged_) {
-            const bool ok = s->prepared && (s->has_effect ? (s->applied && !hold_back_) : (!s->after_pending || before_applied));
+            // A compiland that loaded nothing counts only for a reload that succeeded (WP-47 review): after a failure or a lost agent
+            // its comparison may have been against what is not live, so its files are compiled again next time (safe).
+            const bool ok = s->prepared && (s->has_effect ? (s->applied && !hold_back_) : (!failure && !hold_back_ && (!s->after_pending || before_applied)));
             unit_ok[units[s->unit].compiland] = ok;
             before_applied = before_applied && (!s->has_effect || (s->applied && !hold_back_));
         }
@@ -1303,6 +1305,28 @@ private:
         for (const std::unique_ptr<Staged>& t : staged_) {
             applied += t->applied ? 1 : 0;
         }
+        if (link_.closed() && !applied_.empty()) {
+            // Nothing can be rolled back or confirmed any more: the applied compilands stay recorded (the batch), but none of the
+            // reload's files is re-baselined and no `patch_applied` is published (hold_back_). A compiland whose hooks reached the
+            // agent before it went away (live_unconfirmed) may be live: it is neither "applied" nor "not applied".
+            const std::size_t maybe = s.live_unconfirmed ? 1 : 0;
+            const std::size_t left = with_effect - applied - maybe;
+            CML_LOG(Trace, "reload: applying compiland %s%s failed (%s) and the agent is gone: %zu applied compiland(s) stay recorded, %zu possibly live, %zu not applied",
+                    unit_name(s).c_str(), unit_suffix(s).c_str(), d.id().c_str(), applied, maybe, left);
+            hold_back_ = true;
+            applied_events_.clear();
+            const std::string state = std::to_string(applied) + " compiland(s) of this reload were applied before it, " +
+                                      (maybe != 0 ? std::string("its hooks reached the agent, so it may be live, ") : std::string()) + std::to_string(left) +
+                                      (maybe != 0 ? " other(s) were not" : " were not");
+            emit(Diag::make(ar::kAgentLostPartly,
+                            "the agent of process " + std::to_string(pid_) + " disconnected while compiland " + std::to_string(s.unit + 1) + " of " +
+                                std::to_string(units_->size()) + " of " + module_.name + " (" + unit_name(s) + ", " + d.id() + ") was applied: " + state +
+                                ", and nothing could be rolled back; if the process still runs, it runs a part of the edit",
+                            "Restart the application (or hot-restart it); if it still runs, enable the module again and reload: the reload's files are compiled again."),
+                 "warning", "load");
+            d.message += unit_suffix(s) + "; the agent is gone: " + state;
+            return d;
+        }
         if (s.live_unconfirmed) {
             const std::size_t left = with_effect - applied - 1;
             CML_LOG(Trace, "reload: compiland %s%s may still become live (%s): no roll-back; %zu applied before it, %zu not applied", unit_name(s).c_str(),
@@ -1324,25 +1348,6 @@ private:
             if (with_effect > 1) {
                 d.message += unit_suffix(s) + "; nothing of this reload was applied";
             }
-            return d;
-        }
-        if (link_.closed()) {
-            // Nothing can be rolled back or confirmed any more: the applied compilands stay recorded (the batch), but none of the
-            // reload's files is re-baselined and no `patch_applied` is published (hold_back_).
-            const std::size_t left = with_effect - applied;
-            CML_LOG(Trace, "reload: applying compiland %s%s failed (%s) and the agent is gone: %zu applied compiland(s) stay recorded, %zu not applied",
-                    unit_name(s).c_str(), unit_suffix(s).c_str(), d.id().c_str(), applied, left);
-            hold_back_ = true;
-            applied_events_.clear();
-            emit(Diag::make(ar::kAgentLostPartly,
-                            "the agent of process " + std::to_string(pid_) + " disconnected while compiland " + std::to_string(s.unit + 1) + " of " +
-                                std::to_string(units_->size()) + " of " + module_.name + " (" + unit_name(s) + ", " + d.id() + ") was applied: " +
-                                std::to_string(applied) + " compiland(s) of the reload were applied before it, " + std::to_string(left) +
-                                " were not, and nothing could be rolled back; if the process still runs, it runs a part of the edit",
-                            "Restart the application (or hot-restart it); if it still runs, enable the module again and reload: the reload's files are compiled again."),
-                 "warning", "load");
-            d.message += unit_suffix(s) + "; the agent is gone: " + std::to_string(applied) + " compiland(s) of this reload were applied before it, " +
-                         std::to_string(left) + " were not";
             return d;
         }
         // The WP-22 revert of this reload's batch: re-points what an older patch also hooked, restores the original bytes of the rest,
@@ -1580,6 +1585,12 @@ private:
                     return fail("hooks", Diag::make(pd::kHooksTimeout, "the agent did not confirm the hooks in time: " + answer.error().message,
                                                     "In synchronised mode the application must call SyncPoint(); the patch stays loaded and the hooks may still apply."));
                 }
+                if (link_.closed()) {
+                    // WP-47 review: the agent went away with the request in flight; it may have installed the hooks before. Treated
+                    // like a timeout: the patch is never unloaded and counts as possibly live (after_apply_failure, CML3655).
+                    keep_unconfirmed(s);
+                    return fail("hooks", answer.error());
+                }
                 abandon();
                 return fail("hooks", answer.error());
             }
@@ -1625,6 +1636,7 @@ private:
             }
             Result<void> r = prepare(*staged_[j], report);
             if (r && j == k && !staged_[k]->has_effect) {
+                staged_[k]->reset();  // not prepared: its files must not be re-baselined (WP-47 review)
                 r = fail("link", Diag::make(pd::kStageFailed, "compiland " + unit_name(*staged_[k]) + " planned to nothing when it was prepared again for a relink",
                                             "This is a bug in the broker; see the broker log."));
             }
