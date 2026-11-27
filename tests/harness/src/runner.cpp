@@ -907,6 +907,10 @@ private:
                 const ipc::ControlEvent& e = **event;
                 seen += (seen.empty() ? "" : ", ") + e.name;
                 if (e.name == step.event) {
+                    if (step.event_absent) {  // WP-47: e.g. no `patch_applied` for a refused reload
+                        return StepOutcome::fail(cml::ids::kExpectEventTimeout,
+                                                 "a '" + step.event + "' event arrived, which must not: " + ipc::json::serialize(e.body));
+                    }
                     return StepOutcome::pass("event " + ipc::json::serialize(e.body));
                 }
                 continue;
@@ -914,6 +918,9 @@ private:
             if (left <= 0) {
                 if (limit_ms < static_cast<std::uint32_t>(step.within_s) * 1000u) {
                     return scenario_timeout();
+                }
+                if (step.event_absent) {
+                    return StepOutcome::pass("no '" + step.event + "' event within " + std::to_string(step.within_s) + " s (events seen: " + (seen.empty() ? "none" : seen) + ")");
                 }
                 return StepOutcome::fail(cml::ids::kExpectEventTimeout,
                                          "no '" + step.event + "' event within " + std::to_string(step.within_s) + " s (events seen: " +

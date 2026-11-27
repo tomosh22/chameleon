@@ -76,6 +76,8 @@ within_s = 60                  # 1..3600, default 60
 kind = "expect_event"          # an event of this name (patch_applied, diag, log); needs capability "subscribe"
 event = "patch_applied"        # events of other names are consumed on the way
 within_s = 10
+absent = true                  # optional (WP-47): NO event of this name may arrive; every event not consumed yet is read, then
+                               # the step waits within_s more (a refused reload's events have arrived when it answered)
 
 # WP-16: several processes under one broker, and the reload's result counters
 [[step]]
