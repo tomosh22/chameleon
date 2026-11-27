@@ -849,47 +849,67 @@ TEST_CASE("WP-50: the batch timing counts the jobs and pages and its phases fit 
     CHECK(r.timing.total_us >= r.timing.plan_us);
 }
 
-TEST_CASE("WP-50: prefetch_code_pages asks for every target page once, by the API or by reading a byte of each") {
+TEST_CASE("WP-50: planning with the per-batch VirtualQuery cache decides exactly as planning without it") {
     Arena arena(16);
-    std::vector<Placed> placed;
-    for (int i = 0; i < 20; ++i) {
-        placed.push_back(arena.place_padded(cl_release(i), 8, 8));
+    std::vector<Placed> olds;
+    const Placed repl = arena.place_padded(lea_ret(1000), 8, 8);
+    for (int i = 0; i < 60; ++i) {
+        // Both strategies, entries with and without padding.
+        const Bytes code = (i % 3 == 0) ? cl_release(i) : (i % 3 == 1) ? cl_debug(i) : push_first(i);
+        olds.push_back(arena.place_padded(code, (i % 2 == 0) ? 8 : 0, 8));
     }
+    const Placed tiny = arena.place_padded(xor_ret(), 0, 0);  // refused: shorter than 5 bytes, no padding
     arena.seal();
-    std::vector<const void*> targets;
-    for (const Placed& p : placed) {
-        targets.push_back(p.entry);
-        targets.push_back(p.entry);  // listed twice: still one page
+    std::vector<HookRequest> good;
+    for (const Placed& p : olds) {
+        good.push_back({p.entry, repl.entry, "fn"});
     }
-    std::vector<std::uintptr_t> expected;
-    for (const Placed& p : placed) {
-        const auto t = reinterpret_cast<std::uintptr_t>(p.entry);
-        for (std::uintptr_t page = (t - kLookBehind) & ~std::uintptr_t{0xFFF}; page <= ((t + kLookAhead - 1) & ~std::uintptr_t{0xFFF}); page += 0x1000) {
-            expected.push_back(page);
+    std::vector<HookRequest> refused = good;
+    refused.push_back({tiny.entry, repl.entry, "tiny"});
+    refused.push_back({olds[0].entry + 1, olds[1].entry, "dup-area"});
+    const std::uint8_t data_byte = 0;
+    std::vector<HookRequest> not_code = good;
+    not_code.push_back({olds[2].entry, &data_byte, "data"});  // the replacement is not executable
+    InstallerOptions uncached_options;
+    uncached_options.test_no_region_cache = true;
+
+    struct Seen {
+        bool ok;
+        std::uint32_t diag;
+        std::vector<int> status;
+        std::vector<int> strategy;
+        std::vector<std::uint32_t> codes;
+        std::uint32_t queries;
+    };
+    const auto run = [&](const std::vector<HookRequest>& requests, bool cached) {
+        Installer installer(cached ? InstallerOptions{} : uncached_options);
+        std::vector<HookOutcome> out;
+        const BatchResult r = installer.install(requests.data(), requests.size(), out);
+        Seen s{r.ok(), r.diag.code, {}, {}, {}, r.timing.queries};
+        for (const HookOutcome& o : out) {
+            s.status.push_back(static_cast<int>(o.status));
+            s.strategy.push_back(static_cast<int>(o.strategy));
+            s.codes.push_back(o.diag.code);
         }
+        if (r.ok()) {
+            REQUIRE(installer.revert(requests.data(), requests.size(), out).ok());
+        }
+        return s;
+    };
+    for (const std::vector<HookRequest>* requests : {&good, &refused, &not_code}) {
+        const Seen with = run(*requests, true);
+        const Seen without = run(*requests, false);
+        CHECK(with.ok == without.ok);
+        CHECK(with.diag == without.diag);
+        CHECK(with.status == without.status);
+        CHECK(with.strategy == without.strategy);
+        CHECK(with.codes == without.codes);
+        CHECK(with.queries < without.queries);  // the arena's code is a few regions, asked about many times
+        CHECK(with.queries >= 1);
     }
-    std::sort(expected.begin(), expected.end());
-    expected.erase(std::unique(expected.begin(), expected.end()), expected.end());
-
-    const PrefetchResult api = prefetch_code_pages(targets, true);
-    CHECK(api.pages == expected.size());
-    CHECK(api.ranges >= 1);
-    CHECK(api.ranges <= api.pages);
-    // Windows 8 and later have PrefetchVirtualMemory; were it to fail, the pages are read instead (never an error).
-    CHECK((api.method == PrefetchResult::Method::Api || (api.method == PrefetchResult::Method::Touch && api.error != 0)));
-
-    const PrefetchResult touch = prefetch_code_pages(targets, false);
-    CHECK(touch.method == PrefetchResult::Method::Touch);
-    CHECK(touch.pages == expected.size());
-    CHECK(touch.touched == touch.pages);
-
-    // An address that is not mapped is skipped by the fallback, not faulted on.
-    const PrefetchResult unmapped = prefetch_code_pages({reinterpret_cast<const void*>(std::uintptr_t{0x10000})}, false);
-    CHECK(unmapped.method == PrefetchResult::Method::Touch);
-    CHECK(unmapped.touched < unmapped.pages);
-
-    CHECK(prefetch_code_pages({}, true).method == PrefetchResult::Method::None);
-    CHECK(std::string(to_string(PrefetchResult::Method::Api)) == "api");
+    CHECK(run(good, true).ok);
+    CHECK_FALSE(run(refused, true).ok);
+    CHECK_FALSE(run(not_code, true).ok);
 }
 
 TEST_CASE("two threads installing at once are serialised") {

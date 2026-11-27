@@ -360,9 +360,9 @@ TEST_CASE("WP-50: the timing of an InstallHooks reaches the broker as a Log line
     std::string line = timing_line(lines, 31);  // received before the answer: collect() stops at the answer
     REQUIRE_MESSAGE(!line.empty(), "no WP50-HOOKS line before the answer");
     CHECK(line.find(" op=install hooks=2 installed=2 repointed=0 unchanged=0 reverted=0 ") != std::string::npos);
-    // WP-50: the targets' pages were asked for before the batch (by PrefetchVirtualMemory, or by reading them if it failed).
-    CHECK((line.find(" prefetch=api prefetch_pages=") != std::string::npos || line.find(" prefetch=touch prefetch_pages=") != std::string::npos));
-    CHECK(line.find(" prefetch_pages=0 ") == std::string::npos);
+    // WP-50: the planning's VirtualQuery calls are counted (the region cache answers most of them).
+    CHECK(line.find(" query_us=") != std::string::npos);
+    CHECK(line.find(" queries=0 ") == std::string::npos);
     CHECK(line.find(" pages=") != std::string::npos);
     CHECK(line.find(" status=0 total_us=") != std::string::npos);
     CHECK(line.find(" stop_us=") != std::string::npos);

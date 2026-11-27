@@ -30,7 +30,7 @@ struct BatchTiming {
     std::uint64_t plan_us = 0;        // 1 + 1b: reading the bytes, choosing strategies, the batch checks
     std::uint64_t probe_us = 0;       //   of plan_us: ReadProcessMemory / VirtualQuery on the targets and the replacements
     std::uint64_t query_us = 0;       //     of probe_us: VirtualQuery (is_code); the rest is ReadProcessMemory
-    std::uint32_t queries = 0;        //     VirtualQuery calls
+    std::uint32_t queries = 0;        //     VirtualQuery calls (WP-50: one per memory region and batch; the cache answers the rest)
     std::uint64_t protect_us = 0;     // 2: VirtualProtect to writable
     std::uint64_t enumerate_us = 0;   // 3: NtGetNextThread (ThreadSet::Timing::enumerate)
     std::uint64_t suspend_us = 0;     // 3: SuspendThread (also when an offender is stopped again, which is inside step_us)
@@ -55,7 +55,6 @@ struct BatchTiming {
 // The phases of one request around the installer (dispatch.cpp), in microseconds.
 struct DispatchTiming {
     std::uint64_t wait_us = 0;       // from the request's arrival to the start of the work (the SyncPoint queue in synchronised mode)
-    std::uint64_t prefetch_us = 0;   // WP-50: bringing the targets' pages into memory (prefetch_code_pages), threads running
     std::uint64_t collect_us = 0;    // user_hooks::Session: the hook records of the enabled modules and the patch images
     std::uint64_t prepatch_us = 0;   // the application's pre-patch hooks
     std::uint64_t build_us = 0;      // the installer's requests from the message
@@ -74,8 +73,6 @@ struct HooksTimingLine {
     std::uint32_t status = 0;
     unsigned threads = 0;
     unsigned attempts = 0;
-    const char* prefetch = "none";      // WP-50: "api", "touch" or "none"
-    std::uint32_t prefetch_pages = 0;
     BatchTiming batch_timing;
     DispatchTiming dispatch;
 };
@@ -113,8 +110,7 @@ inline std::string format_hooks_timing(const HooksTimingLine& l) {
     } else {
         append(out, " status=CML%u", l.status);
     }
-    append(out, " total_us=%llu wait_us=%llu prefetch_us=%llu prefetch=%s prefetch_pages=%u", ull(d.total_us), ull(d.wait_us), ull(d.prefetch_us),
-           l.prefetch, l.prefetch_pages);
+    append(out, " total_us=%llu wait_us=%llu", ull(d.total_us), ull(d.wait_us));
     append(out, " collect_us=%llu prepatch_us=%llu build_us=%llu", ull(d.collect_us), ull(d.prepatch_us), ull(d.build_us));
     append(out, " install_us=%llu lock_us=%llu plan_us=%llu probe_us=%llu query_us=%llu queries=%u protect_us=%llu", ull(d.install_us), ull(b.lock_us),
            ull(b.plan_us), ull(b.probe_us), ull(b.query_us), b.queries, ull(b.protect_us));

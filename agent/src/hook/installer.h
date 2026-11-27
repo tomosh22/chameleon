@@ -113,6 +113,8 @@ struct InstallerOptions {
     void (*test_before_stop)(void* context) = nullptr;
     void (*test_after_resume)(void* context) = nullptr;
     void* test_context = nullptr;
+    // Tests only (WP-50): plan with a VirtualQuery per question instead of the per-batch region cache, to compare the two.
+    bool test_no_region_cache = false;
 };
 
 struct HookInfo {
@@ -194,23 +196,7 @@ private:
 // process shares one registry. Created on first use, never destroyed.
 Installer& process_installer();
 
-// WP-50 (R-47): brings the code pages around the targets (the bytes plan_hook reads: kLookBehind before the entry to
-// kLookAhead after it) into memory before a batch is planned. The first InstallHooks of a session otherwise pages in every
-// target on its own (one hard fault per never-run page, one after the other: 229 ms for 275 targets in the WP-39 benchmark).
-// PrefetchVirtualMemory asks for all of them in one call; where it is not available, or fails, each page is read once with
-// ReadProcessMemory (one byte into a local, no allocation; an unreadable page is skipped). Never called with threads suspended
-// (the caller runs it before the installer); a failure is never an error (`error` records it, the batch goes on). The page list
-// itself is built before anything is read.
-struct PrefetchResult {
-    enum class Method : std::uint8_t { None, Api, Touch };
-    Method method = Method::None;  // None: no target
-    std::uint32_t pages = 0;       // distinct pages asked for
-    std::uint32_t ranges = 0;      // contiguous runs of them
-    std::uint32_t touched = 0;     // Touch: pages that could be read
-    std::uint32_t error = 0;       // GetLastError of a PrefetchVirtualMemory that failed (then Touch was used)
-};
-PrefetchResult prefetch_code_pages(const std::vector<const void*>& targets, bool use_api = true);
-const char* to_string(PrefetchResult::Method method) noexcept;
+
 
 }  // namespace cml::agent::hook
 

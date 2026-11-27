@@ -131,24 +131,6 @@ void Agent::apply_install_hooks(const ipc::InstallHooks& request, long long rece
     CML_LOG(Info, "hooks: request %llu: %s %llu function(s)", static_cast<unsigned long long>(request.request_id),
             revert ? "revert" : "install", static_cast<unsigned long long>(count));
 
-    // WP-50 (R-47, approved by the orchestrator): the targets' code pages are asked for all at once, before anything reads them
-    // (the pre-patch hooks run meanwhile, then the installer plans) and with every thread running. Never an error.
-    if (count != 0) {
-        std::vector<const void*> targets;
-        targets.reserve(count);
-        for (const ipc::HookSpec& h : request.hooks) {
-            targets.push_back(address_of(h.old_entry));
-        }
-        const hook::PrefetchResult prefetched = hook::prefetch_code_pages(targets);
-        timing.prefetch = hook::to_string(prefetched.method);
-        timing.prefetch_pages = prefetched.pages;
-        if (prefetched.error != 0) {
-            CML_LOG(Info, "hooks: request %llu: PrefetchVirtualMemory failed (Win32 error %u); %u of %u page(s) were read instead",
-                    static_cast<unsigned long long>(request.request_id), prefetched.error, prefetched.touched, prefetched.pages);
-        }
-    }
-    timing.dispatch.prefetch_us = lap();
-
     // WP-17: pre-patch hooks of the application run before the first byte is changed, post-patch hooks after
     // the installation succeeded, both on this thread (the SyncPoint thread in synchronised mode). Nothing of
     // this runs while threads are suspended: the installer opens and closes its window inside install().

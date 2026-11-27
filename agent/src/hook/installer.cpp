@@ -175,16 +175,62 @@ Diag make_diag(const Failure& f, const HookRequest& request) {
     }
 }
 
-bool is_code(const void* address) noexcept {
-    MEMORY_BASIC_INFORMATION info;
-    if (VirtualQuery(address, &info, sizeof(info)) == 0) {
-        return false;
-    }
+// Whether memory with these attributes holds code we may read (and hook).
+bool is_code_region(const MEMORY_BASIC_INFORMATION& info) noexcept {
     if (info.State != MEM_COMMIT || (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
         return false;
     }
     return (info.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
 }
+
+bool is_code(const void* address) noexcept {
+    MEMORY_BASIC_INFORMATION info;
+    if (VirtualQuery(address, &info, sizeof(info)) == 0) {
+        return false;
+    }
+    return is_code_region(info);
+}
+
+// WP-50 (R-47): the answers of VirtualQuery during the planning of one batch. Every page of the range VirtualQuery reports
+// ([BaseAddress, BaseAddress + RegionSize)) has the same attributes, so an address inside a range already reported gets the
+// same answer without another call. The first query into the large code region of a module that was never changed is
+// expensive (it measures the whole region); a batch of new hooks asks three times per target. Lives in one planning pass
+// (under the installer's mutex, before any VirtualProtect or write of the batch); a failed query is not remembered.
+class RegionCache {
+public:
+    explicit RegionCache(bool enabled) : enabled_(enabled) {}
+    bool is_code(const void* address, std::uint32_t* queries) {
+        const auto a = reinterpret_cast<std::uintptr_t>(address);
+        if (enabled_) {
+            for (const Region& r : regions_) {
+                if (a >= r.begin && a < r.end) {
+                    return r.code;
+                }
+            }
+        }
+        MEMORY_BASIC_INFORMATION info;
+        ++*queries;
+        if (VirtualQuery(address, &info, sizeof(info)) == 0) {
+            return false;
+        }
+        const bool code = is_code_region(info);
+        if (enabled_) {
+            const auto begin = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
+            regions_.push_back(Region{begin, begin + info.RegionSize, code});
+        }
+        return code;
+    }
+    void clear() { regions_.clear(); }
+
+private:
+    struct Region {
+        std::uintptr_t begin;
+        std::uintptr_t end;
+        bool code;
+    };
+    bool enabled_;
+    std::vector<Region> regions_;
+};
 
 // ReadProcessMemory on the own process: fails with an error (and a count of what it did copy)
 // instead of faulting when the range is not fully readable.
@@ -648,12 +694,12 @@ BatchResult Installer::apply_locked(bool reverting, const HookRequest* requests,
     result.timing.lock_us = to_us(since - called);
     long long probing = 0;  // ticks inside ReadProcessMemory / VirtualQuery while planning
     long long querying = 0;  // of them: inside VirtualQuery (is_code)
-    std::uint32_t queries = 0;
-    const auto timed_is_code = [&querying, &queries](const void* address) {
+    std::uint32_t queries = 0;  // VirtualQuery calls made (the region cache answers the rest)
+    RegionCache regions(!options_.test_no_region_cache);
+    const auto timed_is_code = [&querying, &queries, &regions](const void* address) {
         const long long q0 = ticks();
-        const bool code = is_code(address);
+        const bool code = regions.is_code(address, &queries);
         querying += ticks() - q0;
-        ++queries;
         return code;
     };
     const auto lap = [&since]() {
@@ -690,6 +736,33 @@ BatchResult Installer::apply_locked(bool reverting, const HookRequest* requests,
     records_.reserve(records_.size() + count);  // the commit below must not allocate while jobs are half applied
     bool any_failed = false;
     std::uint32_t first_failed = 0;
+
+    // WP-50 (R-47): the region cache is filled in ascending address order first, so that one VirtualQuery of the lowest
+    // address of a region answers every later question inside it (VirtualQuery reports the range from the queried page to
+    // the region's end). Only the addresses planning may ask about; the answers are the ones planning would get.
+    if (!options_.test_no_region_cache && !reverting) {
+        std::vector<std::uintptr_t> asked;
+        asked.reserve(count * 4);
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto t = reinterpret_cast<std::uintptr_t>(requests[i].target);
+            const auto r = reinterpret_cast<std::uintptr_t>(requests[i].replacement);
+            if (r != 0) {
+                asked.push_back(r);
+            }
+            if (t > kMinPadding) {
+                asked.push_back(t - kMinPadding);
+                asked.push_back(t - 1);
+                asked.push_back(t);
+            }
+        }
+        std::sort(asked.begin(), asked.end());
+        asked.erase(std::unique(asked.begin(), asked.end()), asked.end());
+        const long long warm_started = ticks();
+        for (const std::uintptr_t a : asked) {
+            (void)timed_is_code(reinterpret_cast<const void*>(a));
+        }
+        probing += ticks() - warm_started;
+    }
 
     for (std::size_t i = 0; i < count; ++i) {
         Job& job = jobs[i];
@@ -930,6 +1003,7 @@ BatchResult Installer::apply_locked(bool reverting, const HookRequest* requests,
         }
     }
 
+    regions.clear();  // planning is over: the batch's own VirtualProtect and writes come next
     result.timing.plan_us = lap();
     result.timing.probe_us = to_us(probing);
     result.timing.query_us = to_us(querying);
@@ -1166,93 +1240,6 @@ BatchResult Installer::apply_locked(bool reverting, const HookRequest* requests,
     CML_LOG(Info, "hooks: %s %llu hook(s): attempts=%u retries=%u threads=%u window=%ums",
             reverting ? "reverted" : "applied", static_cast<unsigned long long>(count), result.stats.attempts,
             result.stats.retries, result.stats.threads, result.stats.window_ms);
-    return result;
-}
-
-// ---- WP-50: prefetching the targets' pages -------------------------------------------------------------------------------
-
-namespace {
-
-// The layout of WIN32_MEMORY_RANGE_ENTRY (declared by the SDK only for _WIN32_WINNT >= 0x0602).
-struct MemoryRange {
-    void* address;
-    SIZE_T bytes;
-};
-using PrefetchVirtualMemoryFn = BOOL(WINAPI*)(HANDLE process, ULONG_PTR count, MemoryRange* ranges, ULONG flags);
-
-PrefetchVirtualMemoryFn prefetch_api() {
-    static const PrefetchVirtualMemoryFn fn = [] {
-        PrefetchVirtualMemoryFn found = nullptr;
-        for (const wchar_t* dll : {L"kernel32.dll", L"kernelbase.dll"}) {
-            if (HMODULE module = GetModuleHandleW(dll); module != nullptr && found == nullptr) {
-                found = reinterpret_cast<PrefetchVirtualMemoryFn>(reinterpret_cast<void (*)()>(GetProcAddress(module, "PrefetchVirtualMemory")));
-            }
-        }
-        return found;
-    }();
-    return fn;
-}
-
-}  // namespace
-
-const char* to_string(PrefetchResult::Method method) noexcept {
-    switch (method) {
-        case PrefetchResult::Method::Api: return "api";
-        case PrefetchResult::Method::Touch: return "touch";
-        case PrefetchResult::Method::None: break;
-    }
-    return "none";
-}
-
-PrefetchResult prefetch_code_pages(const std::vector<const void*>& targets, bool use_api) {
-    PrefetchResult result;
-    std::vector<std::uintptr_t> pages;
-    pages.reserve(targets.size() * 2);
-    for (const void* target : targets) {
-        const auto t = reinterpret_cast<std::uintptr_t>(target);
-        if (t < kLookBehind) {
-            continue;
-        }
-        const std::uintptr_t first = (t - kLookBehind) & ~(kPageSize - 1);
-        const std::uintptr_t last = (t + kLookAhead - 1) & ~(kPageSize - 1);
-        for (std::uintptr_t p = first; p <= last; p += kPageSize) {
-            pages.push_back(p);
-        }
-    }
-    std::sort(pages.begin(), pages.end());
-    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
-    if (pages.empty()) {
-        return result;
-    }
-    result.pages = static_cast<std::uint32_t>(pages.size());
-    std::vector<MemoryRange> ranges;
-    for (const std::uintptr_t p : pages) {
-        if (!ranges.empty() && reinterpret_cast<std::uintptr_t>(ranges.back().address) + ranges.back().bytes == p) {
-            ranges.back().bytes += kPageSize;
-        } else {
-            ranges.push_back(MemoryRange{reinterpret_cast<void*>(p), kPageSize});
-        }
-    }
-    result.ranges = static_cast<std::uint32_t>(ranges.size());
-    if (use_api) {
-        if (const PrefetchVirtualMemoryFn fn = prefetch_api(); fn != nullptr) {
-            if (fn(GetCurrentProcess(), ranges.size(), ranges.data(), 0) != 0) {
-                result.method = PrefetchResult::Method::Api;
-                return result;
-            }
-            result.error = GetLastError();
-        }
-    }
-    // The fallback: read one byte of every page (ReadProcessMemory fails instead of faulting on a page that cannot be read).
-    result.method = PrefetchResult::Method::Touch;
-    const HANDLE process = GetCurrentProcess();
-    for (const std::uintptr_t p : pages) {
-        std::uint8_t byte = 0;
-        SIZE_T got = 0;
-        if (ReadProcessMemory(process, reinterpret_cast<const void*>(p), &byte, 1, &got) != 0 && got == 1) {
-            ++result.touched;
-        }
-    }
     return result;
 }
 
