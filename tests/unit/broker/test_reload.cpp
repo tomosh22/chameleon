@@ -1716,18 +1716,18 @@ TEST_CASE("WP-50: the module file is read in the background once the index is re
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
     }
-    REQUIRE_MESSAGE(prefetched != nullptr, "no background read within 10 s of the index being ready");
+    REQUIRE_MESSAGE((prefetched != nullptr), "no background read within 10 s of the index being ready");
 
     // The reload compares with the copy read in the background: no second read.
     rig.changed();
     REQUIRE(rig.reload().has_value());
     {
         std::lock_guard<std::mutex> lock(rig.module->mutex);
-        CHECK(rig.module->image == prefetched);
+        CHECK((rig.module->image == prefetched));
     }
     const ModuleState::ImageRead again = rig.module->ensure_image(false);
     CHECK_FALSE(again.read_now);
-    CHECK(again.image == prefetched);
+    CHECK((again.image == prefetched));
 
     // Disabled: the state drops its copy, and a background read that comes late stores nothing.
     const std::shared_ptr<ModuleState> old = rig.module;
@@ -1737,22 +1737,22 @@ TEST_CASE("WP-50: the module file is read in the background once the index is re
     rig.session.on_message(disable);
     rig.link->publish(rig.session);
     rig.service->on_session_changed(1);
-    CHECK(rig.service->module_state(1, rig.exe) == nullptr);
+    CHECK((rig.service->module_state(1, rig.exe) == nullptr));
     {
         std::lock_guard<std::mutex> lock(old->mutex);
-        CHECK(old->image == nullptr);
+        CHECK((old->image == nullptr));
         CHECK(old->image_released);
     }
     const ModuleState::ImageRead late = old->ensure_image(true);
     CHECK_FALSE(late.read_now);
-    CHECK(late.image == nullptr);
+    CHECK((late.image == nullptr));
     // A reload's own read still works (it compares, but keeps nothing on a released state).
     const ModuleState::ImageRead own = old->ensure_image(false);
     CHECK(own.read_now);
-    CHECK(own.image != nullptr);
+    CHECK((own.image != nullptr));
     {
         std::lock_guard<std::mutex> lock(old->mutex);
-        CHECK(old->image == nullptr);
+        CHECK((old->image == nullptr));
     }
 }
 
@@ -1761,9 +1761,9 @@ TEST_CASE("WP-50: a module file that cannot be read is reported by the read, not
     state.path = "C:\\no\\such\\dir\\missing_module.exe";
     const ModuleState::ImageRead background = state.ensure_image(true);
     CHECK(background.read_now);
-    CHECK(background.image == nullptr);
+    CHECK((background.image == nullptr));
     CHECK(background.error.has_value());
-    CHECK(state.image == nullptr);
+    CHECK((state.image == nullptr));
 }
 
 TEST_CASE("disabling a module or losing the agent drops its state") {

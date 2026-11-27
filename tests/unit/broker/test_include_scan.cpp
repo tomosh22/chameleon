@@ -315,7 +315,7 @@ TEST_CASE("WP-50: the scan cache hits only for the same module stamp; a changed 
     stamp.pdb.guid[0] = 0x3C;
     stamp.pdb.age = 1;
     std::string reason;
-    CHECK(cache.find("C:\\Game\\bin\\game.exe", stamp, &reason) == nullptr);
+    CHECK((cache.find("C:\\Game\\bin\\game.exe", stamp, &reason) == nullptr));
     CHECK(reason == "absent");
 
     auto first = std::make_shared<ScanResult>();
@@ -326,12 +326,12 @@ TEST_CASE("WP-50: the scan cache hits only for the same module stamp; a changed 
 
     // The same file, spelled differently: a hit, the very result stored.
     std::shared_ptr<const ScanResult> hit = cache.find("c:/game/BIN/game.exe", stamp, &reason);
-    CHECK(hit == first);
+    CHECK((hit == first));
     CHECK(reason.empty());
 
     const auto misses_with = [&](ModuleFileStamp changed, const char* expected) {
         std::string why;
-        CHECK(cache.find("C:\\Game\\bin\\game.exe", changed, &why) == nullptr);
+        CHECK((cache.find("C:\\Game\\bin\\game.exe", changed, &why) == nullptr));
         CHECK(why == expected);
     };
     ModuleFileStamp s = stamp;
@@ -357,18 +357,18 @@ TEST_CASE("WP-50: the scan cache hits only for the same module stamp; a changed 
     auto second = std::make_shared<ScanResult>();
     cache.store("C:\\Game\\bin\\game.exe", relinked, second);
     CHECK(cache.size() == 1);
-    CHECK(cache.find("C:\\Game\\bin\\game.exe", relinked, &reason) == second);
+    CHECK((cache.find("C:\\Game\\bin\\game.exe", relinked, &reason) == second));
     misses_with(stamp, "mtime");
 
     // Bounded: the least recently used module file goes.
     for (std::size_t i = 0; i < ScanCache::kMaxEntries + 4; ++i) {
         cache.store("C:\\other\\m" + std::to_string(i) + ".dll", stamp, std::make_shared<ScanResult>());
         if (i % 4 == 0) {
-            CHECK(cache.find("C:\\Game\\bin\\game.exe", relinked, &reason) == second);  // kept in use
+            CHECK((cache.find("C:\\Game\\bin\\game.exe", relinked, &reason) == second));  // kept in use
         }
     }
     CHECK(cache.size() == ScanCache::kMaxEntries);
-    CHECK(cache.find("C:\\Game\\bin\\game.exe", relinked, &reason) == second);
-    CHECK(cache.find("C:\\other\\m1.dll", stamp, &reason) == nullptr);
+    CHECK((cache.find("C:\\Game\\bin\\game.exe", relinked, &reason) == second));
+    CHECK((cache.find("C:\\other\\m1.dll", stamp, &reason) == nullptr));
     CHECK(reason == "absent");
 }
