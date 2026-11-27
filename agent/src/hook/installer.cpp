@@ -369,35 +369,105 @@ std::size_t Installer::forget_range(std::uint64_t base, std::uint64_t size) {
     return dropped;
 }
 
-Installer::RangeHooks Installer::hooks_in_range(std::uint64_t base, std::uint64_t size) const {
+namespace {
+
+enum class RecordBytes : std::uint8_t { Ours, Original, Unmapped, Other };
+
+// Committed memory at `address` (an image that is still mapped, or whatever occupies the range now)?
+bool committed(std::uintptr_t address) noexcept {
+    MEMORY_BASIC_INFORMATION info;
+    return VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) != 0 && info.State == MEM_COMMIT;
+}
+
+// Reads `length` bytes at `address` and compares them with `ours` and `original`.
+RecordBytes classify_bytes(std::uintptr_t address, std::size_t length, const std::uint8_t* ours, const std::uint8_t* original) noexcept {
+    if (length == 0) {
+        return RecordBytes::Ours;
+    }
+    if (!committed(address) || !committed(address + length - 1)) {
+        return RecordBytes::Unmapped;
+    }
+    std::uint8_t bytes[5] = {};
+    std::size_t got = 0;
+    if (length > sizeof(bytes) || !read_code(reinterpret_cast<const void*>(address), bytes, length, &got) || got != length) {
+        return RecordBytes::Other;  // mapped but unreadable (no access, a guard page): no proof
+    }
+    if (std::memcmp(bytes, ours, length) == 0) {
+        return RecordBytes::Ours;
+    }
+    if (std::memcmp(bytes, original, length) == 0) {
+        return RecordBytes::Original;
+    }
+    return RecordBytes::Other;
+}
+
+}  // namespace
+
+Installer::Reconciled Installer::reconcile_range(std::uint64_t base, std::uint64_t size, bool module_gone) {
+    Reconciled out;
     if (size == 0) {
-        return RangeHooks::None;
+        return out;
     }
     std::lock_guard<std::mutex> lock(mutex_);
     const std::uint64_t end = base + size;
-    bool any = false;
-    for (const Record& r : records_) {
+    const auto in_range = [&](const Record& r) {
         const std::uint64_t target = static_cast<std::uint64_t>(r.target);
-        if (target < base || target >= end) {
+        return target >= base && target < end;
+    };
+    // 1. Classify, and mark what goes. The entry and the padding must both read "ours" for the hook to be live; either one no longer
+    //    being committed, or the entry (and the padding, when there is one) reading the record's original bytes, proves the image
+    //    was replaced.
+    for (Record& r : records_) {
+        r.forget = false;
+        if (!in_range(r)) {
             continue;
         }
-        any = true;
-        std::uint8_t bytes[5] = {};
-        std::size_t got = 0;
-        if (r.entry_length == 0 || r.entry_length > sizeof(bytes) ||
-            !read_code(reinterpret_cast<const void*>(r.target), bytes, r.entry_length, &got) || got != r.entry_length ||
-            std::memcmp(bytes, r.current_entry, r.entry_length) != 0) {
-            return RangeHooks::Absent;
+        const RecordBytes entry = classify_bytes(r.target, r.entry_length, r.current_entry, r.original_entry);
+        const RecordBytes padding = classify_bytes(r.target - r.padding_length, r.padding_length, r.current_padding, r.original_padding);
+        RecordBytes verdict = RecordBytes::Other;
+        if (entry == RecordBytes::Unmapped || padding == RecordBytes::Unmapped) {
+            verdict = RecordBytes::Unmapped;
+        } else if (entry == RecordBytes::Ours && padding == RecordBytes::Ours) {
+            verdict = RecordBytes::Ours;
+        } else if (entry == RecordBytes::Original && (padding == RecordBytes::Original || r.padding_length == 0)) {
+            verdict = RecordBytes::Original;
         }
-        if (r.padding_length != 0) {
-            if (r.padding_length > sizeof(bytes) ||
-                !read_code(reinterpret_cast<const void*>(r.target - r.padding_length), bytes, r.padding_length, &got) ||
-                got != r.padding_length || std::memcmp(bytes, r.current_padding, r.padding_length) != 0) {
-                return RangeHooks::Absent;
-            }
+        switch (verdict) {
+            case RecordBytes::Ours:
+                ++out.ours;
+                break;
+            case RecordBytes::Original:
+                ++out.original;
+                r.forget = true;
+                break;
+            case RecordBytes::Unmapped:
+                ++out.unmapped;
+                r.forget = true;
+                break;
+            case RecordBytes::Other:
+                if (out.other++ == 0) {
+                    out.other_target = r.target;
+                    std::memcpy(out.other_name, r.name, sizeof(out.other_name));
+                    out.other_name[sizeof(out.other_name) - 1] = '\0';
+                }
+                break;
         }
     }
-    return any ? RangeHooks::Present : RangeHooks::None;
+    if (module_gone && out.ours == 0) {
+        for (Record& r : records_) {
+            r.forget = r.forget || in_range(r);  // the module is gone and nothing of ours is left there: the rest goes too (WP-45)
+        }
+    }
+    if (options_.test_in_reconcile != nullptr) {
+        options_.test_in_reconcile(options_.test_context);
+    }
+    // 2. Forget what was marked, in the same locked section (an install cannot come between the probe and the forget).
+    const auto first = std::remove_if(records_.begin(), records_.end(), [](const Record& r) { return r.forget; });
+    out.forgotten = static_cast<std::size_t>(records_.end() - first);
+    records_.erase(first, records_.end());  // stays sorted: remove_if keeps the order of what it keeps
+    const bool any = out.ours + out.original + out.unmapped + out.other != 0;
+    out.verdict = out.forgotten != 0 ? Reconciled::Verdict::Replaced : (any ? Reconciled::Verdict::Live : Reconciled::Verdict::None);
+    return out;
 }
 
 Installer::Record* Installer::find_record(std::uintptr_t target) {

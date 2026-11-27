@@ -206,7 +206,8 @@ void adopt_full_list(ModuleTrackState& state, std::vector<ipc::ModuleEntry> list
 }
 
 ModulePollReport track_modules(ModuleTrackState& state, const std::vector<DrainedEvent>& drained, std::uint64_t lost,
-                               const std::vector<ipc::ModuleEntry>* snapshot, bool quiet, bool known_trusted, const HookProbe& probe) {
+                               const std::vector<ipc::ModuleEntry>* snapshot, bool quiet, bool known_trusted, const HookProbe& probe,
+                               std::uint64_t now_ms) {
     ModulePollReport report;
     report.lost = lost;
     std::uint32_t resync = lost > 0 ? module_events::ids::kRingOverflow : 0u;
@@ -241,7 +242,7 @@ ModulePollReport track_modules(ModuleTrackState& state, const std::vector<Draine
             continue;  // something else reported that base gone meanwhile
         }
         if (probe_of(probe, *at) == ImageHooks::Present) {
-            if (--recheck.polls_left > 0) {
+            if (now_ms < recheck.deadline_ms) {
                 held_bases.push_back(recheck.event.module.base);
                 state.rechecks.push_back(std::move(recheck));
             } else {
@@ -278,7 +279,7 @@ ModulePollReport track_modules(ModuleTrackState& state, const std::vector<Draine
             if (probe_of(probe, *at) == ImageHooks::Present) {
                 // The image at that base still carries the agent's hooks: either the loader has not unmapped it yet, or this unload
                 // is of an earlier image (a stale event). Never forgotten on a guess: checked again at the next polls.
-                state.rechecks.push_back(ModuleTrackState::Recheck{event, kHookedUnloadRechecks});
+                state.rechecks.push_back(ModuleTrackState::Recheck{event, now_ms + kHookedUnloadRecheckMs});
                 held_bases.push_back(base);
                 continue;
             }

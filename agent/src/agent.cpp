@@ -573,6 +573,7 @@ bool Agent::run_session(ipc::PipeConnection& connection) {
     }
     module_track_ = ModuleTrackState{};
     broker_events_ = false;
+    warned_foreign_.clear();
     last_module_poll_ = GetTickCount64();
     polled_seq_ = 0;  // a new broker knows no modules: every queued request polls first
     full_list_pending_ = false;
@@ -724,8 +725,9 @@ bool Agent::send_module_list(ipc::PipeConnection& connection, bool session_start
             // untrusted poll, which also reports the snapshot diff against that view at once (an empty one after a first list that
             // could not be built), exactly as poll_modules does in that state.
             const ModulePollReport pre =
-                track_modules(module_track_, before_list, 0, &snapshot, /*quiet=*/false, /*known_trusted=*/false, hook_probe());
-            if (!send_module_report(connection, pre)) {
+                track_modules(module_track_, before_list, 0, &snapshot, /*quiet=*/false, /*known_trusted=*/false, hook_probe(),
+                              GetTickCount64());
+            if (!send_module_report(connection, pre, &snapshot)) {
                 return false;
             }
             list.modules = list_with_hooked(module_track_.known, snapshot, hook_probe());
@@ -877,7 +879,7 @@ bool Agent::poll_modules(ipc::PipeConnection& connection) {
     // While the broker has no full list (the session's could not be built, or was refused: full_list_pending_), the snapshot is
     // reported at once: a request naming a module must find it known (polled_seq_), and a difference is no disagreement then.
     const ModulePollReport report = track_modules(module_track_, drained, lost, modules ? &snapshot : nullptr, quiet,
-                                                  /*known_trusted=*/!full_list_pending_, hook_probe());
+                                                  /*known_trusted=*/!full_list_pending_, hook_probe(), GetTickCount64());
     if (!drained.empty()) {
         CML_LOG(Debug, "module events: drained=%llu (seq %llu..%llu) reported=%llu patch_images=%llu redundant=%llu lost=%llu",
                 static_cast<unsigned long long>(drained.size()), static_cast<unsigned long long>(drained.front().seq),
@@ -908,7 +910,7 @@ bool Agent::poll_modules(ipc::PipeConnection& connection) {
         full_list_pending_ = true;  // no list to complete the report from: send the whole list at the next poll
         full_list_not_before_ = 0;  // (one already pending keeps its back-off)
     }
-    if (!send_module_report(connection, report)) {
+    if (!send_module_report(connection, report, modules ? &snapshot : nullptr)) {
         return false;
     }
     if (!report.events.empty()) {
@@ -927,7 +929,8 @@ bool Agent::poll_by_snapshot(ipc::PipeConnection& connection, const std::vector<
     for (const ipc::ModuleEntry& module : delta.unloaded) {
         // WP-45: the hooks of an unloaded image went with it. Forget their records BEFORE the broker hears of the unload, so a re-apply to
         // the image loaded again (often at the same base) is planned as a first install, never as a re-point of a jump that is gone.
-        const std::size_t dropped = hook::process_installer().forget_range(module.base, module.size);
+        // WP-48: through the reconcile, which keeps a record whose jump is still in memory (the list says the module is gone).
+        const std::size_t dropped = reconcile_hooks(module, /*module_gone=*/true);
         CML_LOG(Debug, "module unloaded: base=0x%llx size=0x%llx hook_records_dropped=%llu", static_cast<unsigned long long>(module.base),
                 static_cast<unsigned long long>(module.size), static_cast<unsigned long long>(dropped));
         if (!send_message(connection, ipc::ModuleUnloaded{module})) {
@@ -946,7 +949,8 @@ bool Agent::poll_by_snapshot(ipc::PipeConnection& connection, const std::vector<
     return true;
 }
 
-bool Agent::send_module_report(ipc::PipeConnection& connection, const ModulePollReport& report) {
+bool Agent::send_module_report(ipc::PipeConnection& connection, const ModulePollReport& report,
+                               const std::vector<ipc::ModuleEntry>* snapshot) {
     if (report.events.empty() && report.resync_reason == 0) {
         return true;
     }
@@ -954,9 +958,15 @@ bool Agent::send_module_report(ipc::PipeConnection& connection, const ModulePoll
         if (event.kind != ipc::ModuleEventKind::Unloaded) {
             continue;
         }
-        // WP-45: forget the hook records of the image BEFORE the broker hears of the unload (see poll_by_snapshot). With loader events
-        // this also covers an unload followed by a load at the same base inside one poll, which the module list never shows.
-        const std::size_t dropped = hook::process_installer().forget_range(event.module.base, event.module.size);
+        // WP-45: the hook records of the image go BEFORE the broker hears of the unload (see poll_by_snapshot). WP-48 (ADR-0044, review
+        // round 4): never by an unconditional forget_range. The probe already reconciled the range when the tracker judged this event
+        // (records reading their original bytes, or no longer mapped, are gone; records whose jump is in memory stay). Here the range
+        // is reconciled once more, and only for an unload that is certain (the module list no longer shows the module at that base
+        // and no record reads "ours") are the remaining records dropped too (the WP-45 forget).
+        const bool listed = snapshot != nullptr && std::any_of(snapshot->begin(), snapshot->end(), [&event](const ipc::ModuleEntry& m) {
+            return m.base == event.module.base && m.size == event.module.size && m.path == event.module.path;
+        });
+        const std::size_t dropped = reconcile_hooks(event.module, /*module_gone=*/snapshot != nullptr && !listed);
         CML_LOG(Debug, "module unloaded: base=0x%llx size=0x%llx seq=%llu hook_records_dropped=%llu",
                 static_cast<unsigned long long>(event.module.base), static_cast<unsigned long long>(event.module.size),
                 static_cast<unsigned long long>(event.seq), static_cast<unsigned long long>(dropped));
@@ -1035,19 +1045,45 @@ void Agent::unregister_module_notifications() {
 }
 
 HookProbe Agent::hook_probe() {
-    // ADR-0044 ruling (review round 3): the hook bytes are the arbiter. The installer's mutex is taken inside (never with a thread
-    // suspended: a batch holds it for its whole window); the agent thread runs this, outside any batch.
-    return [](const ipc::ModuleEntry& module) {
-        switch (hook::process_installer().hooks_in_range(module.base, module.size)) {
-            case hook::Installer::RangeHooks::Present:
+    // ADR-0044 ruling (refined in review round 4): the hook bytes are the arbiter, probed and forgotten in one locked section of the
+    // installer (reconcile_range). Runs on the agent thread, outside any batch.
+    return [this](const ipc::ModuleEntry& module) {
+        const hook::Installer::Reconciled result = reconcile_hooks_full(module, /*module_gone=*/false);
+        switch (result.verdict) {
+            case hook::Installer::Reconciled::Verdict::Live:
                 return ImageHooks::Present;
-            case hook::Installer::RangeHooks::Absent:
+            case hook::Installer::Reconciled::Verdict::Replaced:
                 return ImageHooks::Absent;
-            case hook::Installer::RangeHooks::None:
+            case hook::Installer::Reconciled::Verdict::None:
                 break;
         }
         return ImageHooks::None;
     };
+}
+
+hook::Installer::Reconciled Agent::reconcile_hooks_full(const ipc::ModuleEntry& module, bool module_gone) {
+    const hook::Installer::Reconciled result = hook::process_installer().reconcile_range(module.base, module.size, module_gone);
+    if (result.forgotten != 0) {
+        CML_LOG(Debug, "hook records of %s at 0x%llx reconciled: ours=%llu original=%llu unmapped=%llu other=%llu forgotten=%llu%s",
+                module.path.c_str(), static_cast<unsigned long long>(module.base), static_cast<unsigned long long>(result.ours),
+                static_cast<unsigned long long>(result.original), static_cast<unsigned long long>(result.unmapped),
+                static_cast<unsigned long long>(result.other), static_cast<unsigned long long>(result.forgotten),
+                module_gone ? " (module gone)" : "");
+    }
+    if (result.other != 0 && result.forgotten == 0 &&
+        std::find(warned_foreign_.begin(), warned_foreign_.end(), result.other_target) == warned_foreign_.end()) {
+        warned_foreign_.push_back(result.other_target);  // once per hooked function, not every poll
+        CML_LOG(Warn, "CML%u: the hooked function %s at 0x%llx in %s holds neither the agent's jump nor its original bytes (a breakpoint, "
+                      "or another tool's detour; %llu such hook(s) in the module): the hook record is kept, and the module is not taken for "
+                      "a new image",
+                module_events::ids::kForeignHookBytes, result.other_name[0] != '\0' ? result.other_name : "(unnamed)",
+                static_cast<unsigned long long>(result.other_target), module.path.c_str(), static_cast<unsigned long long>(result.other));
+    }
+    return result;
+}
+
+std::size_t Agent::reconcile_hooks(const ipc::ModuleEntry& module, bool module_gone) {
+    return reconcile_hooks_full(module, module_gone).forgotten;
 }
 
 std::vector<DrainedEvent> Agent::drain_module_ring() {

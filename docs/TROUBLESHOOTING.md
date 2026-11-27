@@ -1694,6 +1694,13 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 - **What to do:** Nothing for the session; a module with such a path that stays loaded is reported normally. Use shorter paths if the module is one you edit.  
 - **Raised by:** `agent/src/module_event_ids.h`
 
+### CML4724
+
+- **Cause:** (warning, agent) A function the agent hooked holds neither the agent's jump nor the function's original bytes. A debugger set a breakpoint on it, another tool detoured it, or its page cannot be read. That is no proof that the module was freed and loaded again, so the hook record is kept and the module is still taken for the hooked image. It is logged once per function and session. (A record whose bytes read the original ones, or whose range is no longer mapped, proves a new image and is forgotten.)  
+- **Message:** `the hooked function <name> at <address> in <module> holds neither the agent's jump nor its original bytes (a breakpoint, or another tool's detour; <n> such hook(s) in the module): the hook record is kept, and the module is not taken for a new image`  
+- **What to do:** Usually nothing: remove the breakpoint when you are done. If another tool hooks the same functions, the two will overwrite each other. Use one of them for those functions, or hot-restart after the other tool is gone.  
+- **Raised by:** `agent/src/module_event_ids.h`
+
 
 ## CML5200 to CML5299
 

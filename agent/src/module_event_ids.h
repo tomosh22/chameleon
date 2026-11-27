@@ -21,5 +21,8 @@ inline constexpr std::uint32_t kListDisagrees = 4722;
 // A loaded module whose path was longer than a ring slot holds is gone again before the poll could read its full path: this
 // report is completed from a module-list diff.
 inline constexpr std::uint32_t kPathUnresolved = 4723;
+// A hooked function's bytes are neither the agent's jump nor the function's original bytes (a debugger's breakpoint, another tool's
+// detour), or cannot be read: no proof that the module was replaced, so the hook record is kept (review round 4).
+inline constexpr std::uint32_t kForeignHookBytes = 4724;
 
 }  // namespace cml::agent::module_events::ids

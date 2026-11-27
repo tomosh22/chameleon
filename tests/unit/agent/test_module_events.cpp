@@ -423,7 +423,7 @@ TEST_CASE("WP-48 review 3: a load at a base whose unload was seen is never redun
 
 namespace {
 
-// A stand-in for Installer::hooks_in_range: what the probe finds at each base (None where nothing is set).
+// A stand-in for Installer::reconcile_range's verdict: what the probe finds at each base (None where nothing is set).
 struct FakeHooks {
     std::vector<std::pair<std::uint64_t, ImageHooks>> at;
     void set(std::uint64_t base, ImageHooks hooks) {
@@ -523,9 +523,10 @@ TEST_CASE("WP-48 review round 3 (3): a live, hooked image survives stale older e
     REQUIRE(state.rechecks.size() == 1);            // checked again (the loader may not have unmapped it yet) ...
     REQUIRE(state.deferred.size() == 1);            // ... and the load at that base waits behind it, in order
     const std::vector<ModuleEntry> all = {kGame, kPlugin, kOther};
-    for (unsigned poll = 0; poll < kHookedUnloadRechecks + 2; ++poll) {
-        report = track_modules(state, {}, 0, &all, true, true, hooks.probe());
+    for (std::uint64_t now : {std::uint64_t{500}, std::uint64_t{1000}, std::uint64_t{1999}, kHookedUnloadRecheckMs}) {
+        report = track_modules(state, {}, 0, &all, true, true, hooks.probe(), now);
         CHECK(report.events.empty());
+        CHECK(state.rechecks.size() == (now < kHookedUnloadRecheckMs ? 1u : 0u));
     }
     CHECK(state.rechecks.empty());  // dropped as stale: the hooks never went
     CHECK(state.deferred.empty());  // the load was redundant once it could be judged (the hooked image is live)
@@ -685,4 +686,62 @@ TEST_CASE("WP-48 review 4: a report split over several ModuleEvents carries the 
     REQUIRE(one.size() == 1);
     CHECK(one[0].events.empty());
     CHECK(one[0].reason == module_events::ids::kPathUnresolved);
+}
+
+TEST_CASE("WP-48 review round 4: a busy ring makes many polls in a moment; a hooked unload's recheck still waits about 2 s") {
+    FakeHooks hooks;
+    hooks.set(kPlugin.base, ImageHooks::Present);
+    ModuleTrackState state;
+    state.known = {kGame, kPlugin};
+    const std::vector<ModuleEntry> snapshot = {kGame, kPlugin};
+    const std::uint64_t drained_at = 100000;
+    ModulePollReport report = track_modules(state, {unloaded(3, kPlugin)}, 0, &snapshot, true, true, hooks.probe(), drained_at);
+    REQUIRE(state.rechecks.size() == 1);
+    // A burst: 200 polls within 5 ms (the ring drained as soon as it is half full).
+    for (int poll = 0; poll < 200; ++poll) {
+        report = track_modules(state, {loaded(static_cast<std::uint64_t>(10 + poll), module(0x300000000ull + static_cast<std::uint64_t>(poll) * 0x10000ull,
+                                                                                               0x1000, "C:\\game\\burst.dll"))},
+                               0, &snapshot, false, true, hooks.probe(), drained_at + static_cast<std::uint64_t>(poll) / 40);
+        CHECK(unloads_of(report, kPlugin.base) == 0);
+    }
+    CHECK(state.rechecks.size() == 1);  // still waiting: time, not polls
+    report = track_modules(state, {}, 0, &snapshot, false, true, hooks.probe(), drained_at + kHookedUnloadRecheckMs - 1);
+    CHECK(state.rechecks.size() == 1);
+    SUBCASE("the hooks go before the deadline: the unload is reported with its own sequence number") {
+        hooks.set(kPlugin.base, ImageHooks::Absent);
+        report = track_modules(state, {}, 0, &snapshot, false, true, hooks.probe(), drained_at + kHookedUnloadRecheckMs - 1);
+        REQUIRE(unloads_of(report, kPlugin.base) == 1);
+        CHECK(report.events[0].seq == 3);
+    }
+    SUBCASE("they stay to the deadline: stale, dropped, never reported") {
+        report = track_modules(state, {}, 0, &snapshot, false, true, hooks.probe(), drained_at + kHookedUnloadRecheckMs);
+        CHECK(state.rechecks.empty());
+        CHECK(unloads_of(report, kPlugin.base) == 0);
+        CHECK(report.hooked_live == 1);
+    }
+}
+
+TEST_CASE("WP-48 review round 4: the tracker's verdicts follow the installer's (mixed and A2-only records, foreign bytes, unmapped)") {
+    // reconcile_range itself is tested in unit.agent_hook; here the verdicts it returns drive the reports. Mixed A1/A2 records and
+    // A2-only records over a fresh image both come back Replaced (Absent); foreign bytes (int3) come back Live (Present).
+    const std::vector<ModuleEntry> snapshot = {kGame, kPlugin};
+    SUBCASE("replaced (some record read its original bytes, or the range was unmapped): unload and load reported") {
+        FakeHooks hooks;
+        hooks.set(kPlugin.base, ImageHooks::Absent);
+        ModuleTrackState state;
+        state.known = {kGame, kPlugin};
+        const ModulePollReport report = track_modules(state, {unloaded(1, kPlugin), loaded(2, kPlugin)}, 0, &snapshot, true, true, hooks.probe());
+        REQUIRE(report.events.size() == 2);
+        CHECK(report.events[0].kind == ModuleEventKind::Unloaded);
+        CHECK(report.events[1].kind == ModuleEventKind::Loaded);
+    }
+    SUBCASE("foreign bytes only (a breakpoint over our jump): live, nothing reported, nothing forgotten") {
+        FakeHooks hooks;
+        hooks.set(kPlugin.base, ImageHooks::Present);
+        ModuleTrackState state;
+        state.known = {kGame, kPlugin};
+        const ModulePollReport report = track_modules(state, {loaded(2, kPlugin)}, 0, &snapshot, true, true, hooks.probe());
+        CHECK(report.events.empty());
+        CHECK(report.hooked_live == 1);
+    }
 }

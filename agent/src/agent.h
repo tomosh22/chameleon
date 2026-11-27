@@ -203,11 +203,15 @@ private:
     void register_module_notifications();
     void unregister_module_notifications();
     std::vector<DrainedEvent> drain_module_ring();
-    // The arbiter of what is live (ADR-0044 ruling): the hook installer's records and the bytes they wrote (Installer::hooks_in_range).
-    static HookProbe hook_probe();
-    // Sends what one poll found: forget_range for every unloaded image first (WP-45), then a ModuleEvents (a broker that speaks
-    // agent ABI 3) or the same events as ModuleUnloaded / ModuleLoaded (an older broker).
-    bool send_module_report(ipc::PipeConnection& connection, const ModulePollReport& report);
+    // The arbiter of what is live (ADR-0044 ruling, refined): the hook installer's records and the bytes they wrote, probed and
+    // forgotten in one locked section (Installer::reconcile_range). Warns once per function whose bytes are foreign (CML4724).
+    HookProbe hook_probe();
+    hook::Installer::Reconciled reconcile_hooks_full(const ipc::ModuleEntry& module, bool module_gone);
+    std::size_t reconcile_hooks(const ipc::ModuleEntry& module, bool module_gone);  // the number of records forgotten
+    // Sends what one poll found: the hook records of every unloaded image are reconciled first (WP-45: before the broker hears of the
+    // unload; dropped entirely only when the unload is certain: `snapshot` no longer lists the module), then a ModuleEvents (a broker
+    // that speaks agent ABI 3) or the same events as ModuleUnloaded / ModuleLoaded (an older broker).
+    bool send_module_report(ipc::PipeConnection& connection, const ModulePollReport& report, const std::vector<ipc::ModuleEntry>* snapshot);
     bool poll_by_snapshot(ipc::PipeConnection& connection, const std::vector<ipc::ModuleEntry>& current);
     bool send_message(ipc::PipeConnection& connection, const ipc::Message& message);
     void handle_message(const ipc::Message& message);
@@ -349,6 +353,7 @@ private:
     std::uint64_t ring_lost_seen_ = 0;  // ModuleRing::lost() as of the last drain
     bool broker_events_ = false;        // the broker's Welcome accepts ModuleEvents (agent ABI 3)
     std::vector<ipc::ModuleEntry> known_before_list_;  // module_track_.known before the last ModuleList: kept when the broker refuses it
+    std::vector<std::uintptr_t> warned_foreign_;  // hooked functions already warned about (CML4724), per session
     ULONGLONG last_module_poll_ = 0;
     std::uint64_t polled_seq_ = 0;  // queue_seq_ as of the last module poll
     // Back-off state, agent thread only (see run() and poll_modules()).
