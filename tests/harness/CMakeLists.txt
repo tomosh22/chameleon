@@ -112,6 +112,7 @@ cml_add_unit_test(harness
         tests/test_wp43_scenarios.cpp
         tests/test_wp44_scenarios.cpp
         tests/test_wp45_scenarios.cpp
+        tests/test_wp47_scenarios.cpp
     LIBS cmltest_core)
 target_compile_definitions(cml_test_harness PRIVATE
     "CML_HARNESS_SCENARIOS_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/scenarios\""

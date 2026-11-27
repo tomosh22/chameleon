@@ -1,0 +1,82 @@
+# Scenario `atomic_reload` (WP-47, ADR-0044, R-52): a refused multi-compiland reload applies nothing. The edit of scale.h (a header
+# that holds no code) recompiles tu_a.cpp, tu_b.cpp and tu_c.cpp; it also makes tu_c.cpp, the third, define a new thread_local, which
+# the planner refuses (CML3400). Before WP-47 tu_a.cpp and tu_b.cpp were patched first (a=22 b=202 c=1001 and two patch_applied
+# events while the reply was ok:false); now the three are planned and linked first, the refusal applies none of them, and no
+# patch_applied is published. Once the thread_local is gone again the same header edit reloads all three.
+name = "atomic_reload"
+description = "fixture atomic_reload: scale.h edit over 3 TUs, the 3rd refused (CML3400) -> nothing applied, a=11 b=101 c=1001; without the thread_local all 3 reload"
+fixture = "atomic_reload"
+timeout_s = 300
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ a=11 b=101 c=1001 frames=\\d+"
+within_s = 15
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_atomic_reload.exe"
+within_s = 15
+
+# kScale 1 -> 2 and the new thread_local in tu_c.cpp.
+[[step]]
+kind = "edit"
+patch = "edits/scale_2_tls.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_error = "CML3400"
+
+# Nothing was applied: no patch_applied (the events of the refused reload are read here, and 3 s more) ...
+[[step]]
+kind = "expect_event"
+event = "patch_applied"
+absent = true
+within_s = 3
+
+# ... the three compilands keep their old code, and the application keeps running.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ a=11 b=101 c=1001 frames=\\d+"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ a=11 b=101 c=1001 frames=\\d+"
+within_s = 10
+
+# The refusing part undone (CML_EXTRA_TLS back to 0, kScale stays 2): the same edit reloads all three compilands.
+[[step]]
+kind = "edit"
+patch = "edits/stacked/no_tls.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_result_key = "patched"
+expect_result_value = 3
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ a=22 b=202 c=2002 frames=\\d+"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ a=22 b=202 c=2002 frames=\\d+"
+within_s = 10
+
+[[step]]
+kind = "expect_event"
+event = "patch_applied"
+within_s = 10
+
+# The main thread's thread_local only ever grew: the process was never restarted.
+[[step]]
+kind = "expect_monotonic"
+key = "frames"
+min_samples = 20
