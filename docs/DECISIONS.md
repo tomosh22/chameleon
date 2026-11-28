@@ -1605,5 +1605,85 @@ clang's `??_B<scope>@51` bitmask guards of inline functions' statics under `-fno
 built with clang-cl `-fno-threadsafe-statics` keeps an inline function's static across a reload in the clang-cl cells; unit
 tests with real names; corpus `fail=0`.
 
+**Rulings (wave 14, ADR-0018 where noted):**
+- WP-57 spike ruling (06:35 UTC 2026-11-28). Clang drops a fully inlined call operator, so the patch has no call
+  operator to compare, and closure identity proves nothing: spike cases s10 and s11 differ only in code. The only proof is WP-53's
+  "caller unchanged".
+  - Ruling: with PlanInput::prove_inlined_owners set, a risky own static is listed in BindPlan::inlined_owner_statics and kept
+    only when WP-25's comparator proves the caller unchanged under the plan (one verdict per procedure, shared with WP-53);
+    otherwise it is refused with CML3207.
+  - The comparator gains a callee step for the WP-53 and WP-57 proofs only (hook narrowing unchanged). The old target must start
+    an old procedure of the same size, recursion counts as equal, and the step is capped; reaching the cap means "cannot judge".
+  - An R-54 edit with identical machine code (s7) is accepted. Any edit of the caller itself stays refused, as an accepted
+    limitation. cl's position evidence stays R-65.
+- WP-57 review rulings (b1be388):
+  - The callee's size comes from the PDB whenever it lies in the module image.
+  - A callee that is not a COMDAT and has only an earlier patch's record is refused (unknown-old-size).
+  - A listed pairing never teaches the layout (learn_delta).
+- WP-59 rulings:
+  - Item 0 (pre-existing, default flags): an inline function's external `$TSS` guards were bound by public name whatever the edit did. Now they are tied to their block's statics, and a bound one is kept by name without a code proof only when its block has a single guarded static on both sides; otherwise it goes to prove_bitmask_guards.
+  - A constant-initialised static and a dynamic one cannot be told apart, so both are refused (R-69: read the tested bit from the code).
+  - The single-guard residual is accepted: when it misfires, the static keeps its live value.
+  - Round 2: require_bound_guards covers external function-local statics, and TLS guards tie only TLS statics.
+
 WP-56..WP-59 start together; WP-56, WP-57 and WP-59 share `bind_plan.cpp` (whoever merges second merges main and re-runs CI).
 Rules as in ADR-0043.
+
+**Wave 14 rulings (close-out):**
+- WP-58's first Windows run (771a7dc) failed twice in its own code: its tests read a file opened by `fopen_s`, which shares nothing,
+  and cmltest read a reload's evidence lines from the log before the background writer had written them. Both were fixed at the
+  root in aa15044 (`_fsopen(..., _SH_DENYNO)`; `cml::log_flush()` before every control answer and event, a 2 ms gather time).
+- aa15044's only red cell was `unit.agent` "WP-48 review 1" (windows-2025 msvc RelWithDebInfo). WP-58 changes no agent code, so
+  the failure is not counted against WP-58. It is filed as R-71 (agent, wave 15) with the evidence, and the job was re-run on the
+  same head. "Flake" is not its root cause; R-71 must find one.
+
+## ADR-0047 Wave 15: pairing correctness for inlined helpers, the agent's first-list race, lock order, guard bits (WP-60..WP-63)
+
+**Date:** 2026-11-28 · **Status:** Accepted (wave 14 closed with #91)
+
+Wave 14 (ADR-0046) closed R-59, R-62, R-66, R-67 and R-68. Wave 15 starts again with the open pairing-correctness item (R-57,
+which can pair a new static with live state that is not its own), then the agent race found on WP-58's CI (R-71), the lock-order
+inversion found by WP-58's TSan run (R-70, with a TSan job so it stays found) and WP-59's guard-bit over-refusal (R-69). R-64 and
+R-65 (more identity evidence, which only remove over-refusals) wait. "Refuse what cannot be proven" stands.
+
+| WP | Roadmap | Title | Branch | Review |
+|---|---|---|---|---|
+| WP-60 | R-57 | A new static of a caller never takes an inlined, deleted helper's static | `wp/60-inlined-helpers` | high (bind planner) |
+| WP-61 | R-71 | The agent reports a module before a request that names it when the first list could not be built | `wp/61-first-list` | high (agent) |
+| WP-62 | R-70 | Lock order of fault injection and AgentLink::send; a TSan CI job | `wp/62-lock-order` | medium |
+| WP-63 | R-69 | Read which guard bit or guard a static tests from the patch's code | `wp/63-guard-bits` | high (bind planner) |
+
+### WP-60: a caller's new static never takes an inlined, deleted helper's static (R-57)
+
+**Decision.** The same rule as R-54/R-61 (WP-51/WP-53/WP-57): a `static` helper inlined into its caller records its statics as the
+caller's, so a new static of the caller whose old record may be an inlined helper's (the caller's inline sites name a helper
+with a same-named static, or cannot be read) is kept only when WP-25 proves the caller unchanged under the plan
+(`inlined_owner_statics`); otherwise CML3207. WP-51's `WP51-WOULD-REFUSE` counts say how wide this is on the corpus; report them.
+**Acceptance:** a fixture (clang-cl -O2, and cl `/Ob2`) that deletes an inlined helper and gives its caller a same-named static is
+refused in every cell; an unchanged caller with an inlined helper keeps its own static; WP-51/53/57 tests unchanged; corpus
+`fail=0` with the refusal count per cell.
+
+### WP-61: the agent's first-list race (R-71)
+
+**Decision.** Find the root cause of the "WP-48 review 1" failure with the agent's Debug log captured in the test, then fix the
+agent where a path sends a request before the module is reported (the broker would refuse it against an empty list), or else
+the test's timing assumption. **Acceptance:** the root cause stated with evidence; the test (and any new one for the path) passes
+50 runs in a row on a Windows cell (WP10-REPEAT style); unit.agent green in all cells.
+
+### WP-62: lock order of fault injection and AgentLink::send; a TSan job (R-70)
+
+**Decision.** Establish whether the order TSan reports (`inject_failure` fault_injection.cpp:671 against `AgentLink::send`
+agent_link.cpp:110) can occur in the release broker. Fix the order either way, and add a Linux TSan CI job for the portable
+suites (unit.broker_core and the other suites that build on Linux), failing on any report. **Acceptance:** the TSan job green
+with no suppressions for this pair; the analysis in `docs/wp/WP-62.md`.
+
+### WP-63: read the guard bit or guard each static tests (R-69)
+
+**Decision.** For an inline function's statics, read from the patch's code which `??_B` bit or `$TSS` guard each static's
+initialisation tests. A constant-initialised static then has no tested guard and is told apart from a dynamic one, and WP-59's
+CML3600 refusal of that case becomes a bind where the code proves the tie. **Acceptance:** WP-59's refused case (an inline function
+keeping `static int n = 0;` and gaining a dynamic static) reloads with both statics kept, in the clang-cl cells with and without
+`-fno-threadsafe-statics` and in cl; unreadable code still refuses; corpus `fail=0`.
+
+WP-60..WP-63 start together. WP-60 and WP-63 share `bind_plan.cpp` (whoever merges second merges main and re-runs CI). WP-61 and
+WP-62 both touch the agent link; WP-62 must not change agent behaviour. Rules as in ADR-0043.
