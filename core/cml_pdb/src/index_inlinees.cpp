@@ -68,6 +68,17 @@ void resolve_inlinee(const TypeSource& types, PdbIndex::Inlinee& e) {
         }
         e.class_name.assign(name);
         e.class_unique = without_tu_discriminator(unique);
+    } else if (const std::uint32_t scope = rd32(r.body); scope != 0) {
+        // WP-60 (R-57): the parent scope, an LF_STRING_ID (its first field the substring list, then the name).
+        TypeRecord s;
+        const std::size_t slen = scope >= 0x1000 && types.find_id(scope, s) && s.kind == cv::LF_STRING_ID && s.body_len > 4
+                                     ? cv::cstr_len(s.body + 4, s.body_len - 4)
+                                     : 0;
+        if (slen == 0 || slen == s.body_len - 4) {
+            e.scope_known = false;
+        } else {
+            e.scope.assign(reinterpret_cast<const char*>(s.body + 4), slen);
+        }
     }
     const FunctionSignature sig = function_signature(types, e.id, true);
     e.signature_known = sig.known;

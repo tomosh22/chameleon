@@ -157,6 +157,10 @@ public:
         std::string name;               // as recorded: "operator()", "__invoke", "RTTI", "b_helper"
         std::string class_name;         // member: the class's name ("o2_step::<lambda_0>")
         std::string class_unique;       // member: its unique name without the unit's discriminator ("" when it has none)
+        // WP-60 (R-57): a function's parent scope (LF_FUNC_ID: the LF_STRING_ID it names, "JPH", "`anonymous namespace'"; ""
+        // for none). false: the record names a scope that cannot be read (the inlinee stays readable; only its scope is unknown).
+        bool scope_known = true;
+        std::string scope;
         bool signature_known = false;   // the canonical signature of the inlinee's type (type_records.h)
         std::string signature;
         std::uint32_t sites = 0;        // inline sites of the procedure that name this inlinee

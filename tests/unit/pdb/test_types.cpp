@@ -1381,6 +1381,41 @@ TEST_CASE("inlinees: an inlinee that cannot be read is listed as unreadable, nev
     CHECK(got->inlinees[3].why.find("too short") != std::string::npos);
 }
 
+TEST_CASE("inlinees (WP-60): a function's parent scope is read from its LF_STRING_ID; one that cannot be read leaves it readable") {
+    TempDir dir;
+    InlineWorld w = inline_world();
+    const std::uint32_t anon = w.spec.ipi.string_id("`anonymous namespace'");
+    const std::uint32_t in_anon = w.spec.ipi.record(kLfFuncId, lf_func_id(w.proc_void, "hs", anon));
+    const std::uint32_t odd_scope = w.spec.ipi.record(kLfFuncId, lf_func_id(w.proc_void, "odd", w.id_make));  // a function id, not a string
+    const std::uint32_t lost_scope = w.spec.ipi.record(kLfFuncId, lf_func_id(w.proc_void, "lost", 0x1FFF));   // not in the IPI
+    Module m = inline_module();
+    m.symbols.proc(0x1110, "f", 1, 0x100, 0x80, 0, w.proc_void);
+    for (const std::uint32_t id : {w.id_make, in_anon, odd_scope, lost_scope, w.id_ctor}) {
+        m.symbols.add(0x114D, inline_site(id));
+        m.symbols.add(0x114E, Bytes());
+    }
+    m.symbols.end();
+    w.spec.modules.push_back(std::move(m));
+    w.types.add_to(w.spec.tpi);
+    const auto idx = open_spec(dir, w.spec);
+    const auto got = idx->proc_inlinees(procs_of(*idx)[0]);
+    REQUIRE(got.has_value());
+    REQUIRE(got->inlinees.size() == 5);
+    for (const PdbIndex::Inlinee& e : got->inlinees) {
+        CAPTURE(e.name);
+        CHECK(e.readable);
+        CHECK(e.signature_known);
+    }
+    CHECK(got->inlinees[0].scope_known);  // no scope
+    CHECK(got->inlinees[0].scope.empty());
+    CHECK(got->inlinees[1].scope_known);
+    CHECK(got->inlinees[1].scope == "`anonymous namespace'");
+    CHECK_FALSE(got->inlinees[2].scope_known);
+    CHECK_FALSE(got->inlinees[3].scope_known);
+    CHECK(got->inlinees[4].scope_known);  // a member: its class names it, no scope is read
+    CHECK(got->inlinees[4].scope.empty());
+}
+
 TEST_CASE("inlinees: a procedure that is not in its module, or a module without an end record, is an error") {
     TempDir dir;
     InlineWorld w = inline_world();
