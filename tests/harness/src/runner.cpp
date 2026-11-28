@@ -854,12 +854,8 @@ private:
         if (proc == nullptr) {
             return StepOutcome::fail(cml::ids::kScenarioFailed, "no process '" + step.process + "' was launched");
         }
-        const std::string output = read_whole_file(proc->stdout_file);
-        cml::Result<std::string> checked = check_monotonic(output, step.key, static_cast<std::size_t>(step.min_samples));
-        if (!checked) {
-            return StepOutcome::fail(checked.error());
-        }
         if (step.since_reload > 0) {  // WP-52: the state continued across the last reload; waits up to within_s for the samples
+            // (WP-57: for the samples of the whole output as well, which are judged only once the window has them or ends.)
             const std::uint32_t limit_ms = std::min<std::uint32_t>(static_cast<std::uint32_t>(step.within_s) * 1000u, remaining_ms());
             const Clock::time_point until = Clock::now() + std::chrono::milliseconds(limit_ms);
             for (;;) {
@@ -867,7 +863,7 @@ private:
                 const std::size_t at = std::min(proc->reload_cursor, now.size());
                 const std::string_view before = std::string_view(now).substr(0, at);
                 const std::string_view after = std::string_view(now).substr(at);
-                const bool enough = tick_values(after, step.key).size() >= static_cast<std::size_t>(step.since_reload);
+                const bool enough = monotonic_samples_ready(now, at, step.key, static_cast<std::size_t>(step.min_samples), static_cast<std::size_t>(step.since_reload));
                 if (enough || Clock::now() >= until || supervisor_.exit_code(proc->id).has_value()) {
                     cml::Result<std::string> whole = check_monotonic(now, step.key, static_cast<std::size_t>(step.min_samples));
                     if (!whole) {
@@ -881,6 +877,11 @@ private:
                 }
                 Sleep(kPollMs);
             }
+        }
+        const std::string output = read_whole_file(proc->stdout_file);
+        cml::Result<std::string> checked = check_monotonic(output, step.key, static_cast<std::size_t>(step.min_samples));
+        if (!checked) {
+            return StepOutcome::fail(checked.error());
         }
         return StepOutcome::pass(*checked);
     }

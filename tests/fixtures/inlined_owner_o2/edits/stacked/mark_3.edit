@@ -1,0 +1,8 @@
+--- a/sorted.cpp
++++ b/sorted.cpp
+@@ -50,4 +50,4 @@
+ int io_mark()
+ {
+-    return 2;
++    return 3;
+ }

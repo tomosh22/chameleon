@@ -282,6 +282,23 @@ struct InlinedLambdaStatic {
     BindSource how = BindSource::None;  // the step that made the pairing
 };
 
+// WP-57 (R-59, ADR-0046): an own static of a function whose old procedure holds its record and inlined closure code (WP-51's
+// risk: a call operator, an invoker, a template over a closure, unreadable inline sites), paired with that record because the
+// caller proves it (PlanInput::prove_inlined_owners). The record may be the static of a lambda the edit deleted (R-54): clang-cl
+// records an inlined lambda's statics as plain records of the calling procedure, in the shape of the function's own. The
+// pipeline keeps the pairing only while the patch's version of the procedure is the old code under the plan
+// (hook_narrowing.h: prove_inlined_owner_statics); otherwise CML3207.
+struct InlinedOwnerStatic {
+    std::string symbol;                 // decorated name of the patch's static
+    std::string display;
+    std::uint32_t record_rva = kNoRva;  // the old record it is paired with
+    std::string record;                 // the record's name
+    std::string proc;                   // the old procedure that holds the record (the static's own function)
+    std::uint32_t proc_rva = kNoRva;    // its entry: the hook of the patch's version of it is found by this
+    std::string risk;                   // WP-51's verdict on the procedure's inline sites
+    std::string step;                   // where the pairing was checked ("pass A", "closure", a pass-B source)
+};
+
 struct BindPlan {
     std::string object_name;
     std::string module_name;
@@ -313,6 +330,7 @@ struct BindPlan {
     std::vector<BitmaskGuard> bitmask_guards;  // WP-40, see BitmaskGuard
     std::vector<HashedLambda> hashed_lambdas;  // WP-46, see HashedLambda
     std::vector<InlinedLambdaStatic> inlined_lambda_statics;  // WP-53, see InlinedLambdaStatic
+    std::vector<InlinedOwnerStatic> inlined_owner_statics;    // WP-57, see InlinedOwnerStatic
 
     PlanSummary summary() const;
     // `BINDPLAN <label> hooks=N bind_old_data=N thunks=N new=N fixups=N` (the CI evidence line).
@@ -393,6 +411,10 @@ struct PlanInput {
     // WP-55 (R-62): the verdicts on inline sites of earlier plans against the same module image (optional). Read before the
     // module stream is walked, filled with what was walked.
     InlineVerdictCache* inline_verdicts = nullptr;
+    // WP-57 (R-59): the caller proves an own static that WP-51 finds at risk by the code of its procedure (the pipeline does,
+    // with prove_inlined_owner_statics), so the planner pairs and lists it (BindPlan::inlined_owner_statics) instead of
+    // refusing it with CML3207. Off: refused as WP-51 does.
+    bool prove_inlined_owners = false;
 };
 
 // Builds the plan. On failure returns the first error; with `all_errors` every error is collected
