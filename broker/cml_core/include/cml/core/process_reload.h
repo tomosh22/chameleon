@@ -9,7 +9,8 @@
 //   prepare  every module is swept, compiled, planned, verified and linked (ModuleReload::prepare, the prepare phase of WP-47) before
 //            any is applied. The refusal of one leaves every module of the process unchanged: the modules prepared before it give
 //            their address space back and re-baseline nothing, the ones after it are not prepared (CML3656, which says whether it was a
-//            refusal of the planner, a proof or the link, or another failure such as a compile error). Its id stays the reply's.
+//            refusal, a CML3xxx of the planner, a proof, the anchor, the link or the fix-ups, or another failure such as a compile
+//            error, the deadline or an injected fault). Its id stays the reply's.
 //   apply    then module by module (each one all or nothing over its compilands, WP-47). When applying module k fails, the modules this
 //            reload applied before it are rolled back with the WP-22 batch revert of this reload (revert_module, scope last, only this
 //            reload's batch), newest first (CML3657; CML3658 when a roll-back fails, CML3659 when it is not confirmed), and the modules
@@ -18,8 +19,8 @@
 //   events   `patch_applied` of the process is published once every module of it is applied, never for a module that was rolled back
 //            or is not announced. What stays live after a failure is announced: the modules before an unconfirmed module (CML3660) and
 //            that module's own compilands applied before its unconfirmed one (WP-47's CML3653).
-//   baseline a rolled-back module's source baseline is what it was before the reload: the stamps it had come back (WP-22) and files
-//            the reload re-baselined that it did not track before are forgotten again.
+//   baseline a rolled-back module's source baseline is what it was before the reload (the WP-22 revert puts back the stamps the
+//            batch replaced; a sweep only reports files the baseline tracks, so those are all the reload re-baselined).
 //
 // A process with one module runs PatchPipeline::patch_module() exactly as before.
 

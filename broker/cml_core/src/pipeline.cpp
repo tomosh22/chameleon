@@ -277,7 +277,6 @@ public:
     std::vector<Event> take_applied_events() { return std::move(held_events_); }
     ModuleState& module() const noexcept { return module_; }
     const std::string& failed_stage() const noexcept { return failed_stage_; }
-    const std::vector<std::string>& accepted_files() const noexcept { return accepted_files_; }
 
 private:
     // ADR-0017: with the option set the broker's mapping of the PDB ends when the run of this module does, whatever its outcome.
@@ -396,7 +395,6 @@ private:
     bool hold_events_ = false;        // `patch_applied` goes to held_events_, not to the bus
     std::vector<Event> held_events_;
     std::string failed_stage_;        // the stage of the last failure ("sweep", "compile", "plan", "link", ...)
-    std::vector<std::string> accepted_files_;  // the files finish() re-baselined
 
     Result<void> prepare_steps() {
         PatchReport& report = report_;
@@ -760,10 +758,6 @@ private:
             batch.reload_id = ctx_.reload_id;
         }
         module_.index->accept(accepted);
-        accepted_files_.clear();
-        for (const auto& entry : accepted) {
-            accepted_files_.push_back(entry.first);
-        }
         if (!batch.patches.empty()) {
             std::lock_guard<std::mutex> lock(module_.mutex);
             module_.batches.push_back(std::move(batch));
@@ -2072,7 +2066,6 @@ Result<PatchReport> ModuleReload::apply() { return impl_->run.apply_phase(); }
 Diag ModuleReload::abandon(Diag why) { return impl_->run.abandon(std::move(why)); }
 bool ModuleReload::may_be_live() const { return impl_->run.may_be_live(); }
 const std::string& ModuleReload::failed_stage() const { return impl_->run.failed_stage(); }
-const std::vector<std::string>& ModuleReload::accepted_files() const { return impl_->run.accepted_files(); }
 std::vector<Event> ModuleReload::take_applied_events() { return impl_->run.take_applied_events(); }
 ModuleState& ModuleReload::module() const { return impl_->run.module(); }
 

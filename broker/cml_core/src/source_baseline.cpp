@@ -233,14 +233,6 @@ std::map<std::string, FileStamp> SourceBaseline::stamps_of(const std::vector<std
     return out;
 }
 
-void SourceBaseline::forget(const std::vector<std::string>& files) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (const std::string& f : files) {
-        stamps_.erase(f);
-        originals_.erase(f);
-    }
-}
-
 std::size_t SourceBaseline::size() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return stamps_.size();

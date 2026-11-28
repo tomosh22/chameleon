@@ -3777,58 +3777,49 @@ TEST_CASE("cross-module reload (WP-54 review): unconfirmed hooks in the plugin's
     CHECK(rig.events->count("patch_applied") == 2);  // app.exe's and plugin.dll's first compiland (1 in 8f1316a)
 }
 
-TEST_CASE("cross-module reload (WP-54 review): a rolled-back exe forgets a header its baseline did not track before, and the next reload patches both") {
+// Needs a source file the module index tracks (the real sweep): pdb::normalize_path makes every path a Windows one, so only on
+// Windows (as the WP-45 tests below).
+#if defined(_WIN32)
+TEST_CASE("cross-module reload (WP-54 review): a rolled-back exe gets back the baseline stamps it had, so the next reload patches both modules") {
     QuietLogs quiet;
-    Rig rig;
+    Rig rig(false, std::string(), false, true);  // logic.cpp is a real file, tracked by both modules' baselines; the real sweep runs
     rig.enable_with_plugin();
-    const std::string header = "C:\\proj\\scale.h";  // found by the include scan only: not in app.exe's baseline before
-    REQUIRE(rig.module->index->baseline_stamps({header}).empty());
-    rig.object = make_object({}, true);
-    rig.second_object = make_object();
-    rig.module->index->set_sweep_override_for_testing([header]() -> Result<ModuleIndex::Sweep> {
-        ModuleIndex::Sweep s;
-        s.changed = {header};
-        s.compilands = {0};
-        s.file_compilands[header] = {0};
-        s.stamps[header] = FileStamp{7, 8, 9};
-        return s;
-    });
-    Rig::changed_unit(*rig.plugin_module, 1, kMain);
+    const std::string tracked = pdb::normalize_path(rig.logic_src);  // the baseline's spelling of the file
+    const auto stamp_of = [&tracked](ModuleState& m) {
+        const auto stamps = m.index->baseline_stamps({tracked});
+        REQUIRE(stamps.count(tracked) == 1);
+        return stamps.at(tracked);
+    };
+    const FileStamp exe_before = stamp_of(*rig.module);
+    const FileStamp plugin_before = stamp_of(*rig.plugin_module);
+    rig.write_logic(2);  // logic.cpp is compiland 0 of both modules
     rig.hooks_status_at[2] = ipc::fault::ids::kAgentHookInstall;  // plugin.dll's InstallHooks fails: app.exe is rolled back
     Result<Value> r = rig.reload();
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().id() == "CML4652");
     CHECK(diag_count(rig, "CML3657", "warning") == 1);
-    check_neither_live(rig);
-    // app.exe's finish() had re-baselined the header; the roll-back forgets it again (8f1316a kept {7, 8, 9}).
-    CHECK(rig.module->index->baseline_stamps({header}).empty());
-    check_both_reload(rig);
+    CHECK(generation_of_module(*rig.module) == 0);
+    CHECK(generation_of_module(*rig.plugin_module) == 0);
+    // app.exe's finish() had re-baselined logic.cpp; the roll-back put the stamp it replaced back, and plugin.dll never took it.
+    const FileStamp exe_after = stamp_of(*rig.module);
+    const FileStamp plugin_after = stamp_of(*rig.plugin_module);
+    CHECK(exe_after.hash == exe_before.hash);
+    CHECK(exe_after.size == exe_before.size);
+    CHECK(exe_after.mtime == exe_before.mtime);
+    CHECK(plugin_after.hash == plugin_before.hash);
+    // So the real sweep finds the edit again in both modules, and the reload applies it to both.
+    rig.hooks_status_at.clear();
+    Result<Value> again = rig.reload();
+    REQUIRE_MESSAGE(again.has_value(), again.error().format());
+    CHECK(again->get_integer("modules_patched") == 2);
+    CHECK(generation_of_module(*rig.module) == 1);
+    CHECK(generation_of_module(*rig.plugin_module) == 1);
+    CHECK(stamp_of(*rig.module).hash != exe_before.hash);  // re-baselined now
 }
 
-TEST_CASE("cross-module reload (WP-54 review): the agent lost after the exe was applied forgets the exe's newly tracked files too") {
-    QuietLogs quiet;
-    Rig rig;
-    rig.enable_with_plugin();
-    const std::string header = "C:\\proj\\scale.h";
-    rig.object = make_object({}, true);
-    rig.second_object = make_object();
-    rig.module->index->set_sweep_override_for_testing([header]() -> Result<ModuleIndex::Sweep> {
-        ModuleIndex::Sweep s;
-        s.changed = {header};
-        s.compilands = {0};
-        s.file_compilands[header] = {0};
-        s.stamps[header] = FileStamp{7, 8, 9};
-        return s;
-    });
-    Rig::changed_unit(*rig.plugin_module, 1, kMain);
-    rig.close_on_load_at = 2;
-    Result<Value> r = rig.reload();
-    REQUIRE_FALSE(r.has_value());
-    CHECK(diag_count(rig, "CML3661", "warning") == 1);
-    CHECK(rig.module->index->baseline_stamps({header}).empty());
-}
+#endif  // _WIN32
 
-TEST_CASE("cross-module reload (WP-54 review): CML3656 names a compile error a failure, at stage compile, and a planner refusal a refusal, at stage plan") {
+TEST_CASE("cross-module reload (WP-54 review): CML3656 goes by the diagnostic: a compile error or an injected fault is a failure, a planner refusal a refusal") {
     QuietLogs quiet;
     {
         Rig rig;
@@ -3857,6 +3848,27 @@ TEST_CASE("cross-module reload (WP-54 review): CML3656 names a compile error a f
         CHECK(notes[0].first == "plan");
         CHECK(notes[0].second.find("was refused at module 2 of 2 (plugin.dll, CML3200)") != std::string::npos);
     }
+#if defined(CML_FAULT_INJECTION)
+    {
+        // An injected fault at stage plan (CML5966) is a failure, not a refusal: the diagnostic decides, not the stage.
+        Rig rig;
+        rig.enable_with_plugin();
+        cross_module(rig, make_object());
+        rig.compile_hook = [&rig] {
+            if (rig.compile_calls == 2) {  // plugin.dll's compile: app.exe has been planned already
+                REQUIRE(rig.service->faults().arm(ipc::fault::Stage::BindPlan, 1, std::nullopt).has_value());
+            }
+        };
+        Result<Value> r = rig.reload();
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().id() == "CML5966");
+        const auto notes = diag_events(rig, "CML3656");
+        REQUIRE(notes.size() == 1);
+        CHECK(notes[0].first == "plan");
+        CHECK(notes[0].second.find("stopped at module 2 of 2 (plugin.dll), which failed while it was prepared (stage plan, CML5966)") != std::string::npos);
+        CHECK(notes[0].second.find("refused") == std::string::npos);
+    }
+#endif
 }
 
 TEST_CASE("cross-module reload (WP-54 review): with release_pdb_after_reload a module's PDB is released when its own run ends, not with the process's") {

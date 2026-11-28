@@ -103,26 +103,6 @@ private:
             }
         }
     }
-    // WP-54 review: module `i`'s source baseline back to what it was before this reload. The WP-22 revert (and restore_baseline)
-    // puts back the stamps the baseline had; a file the reload re-baselined that the baseline did not track before is forgotten
-    // again, so that the next sweep cannot take it for applied.
-    void forget_new_baseline(std::size_t i, const std::map<std::string, FileStamp>& before) {
-        ModuleState& m = *modules_[i];
-        if (!m.index) {
-            return;
-        }
-        std::vector<std::string> unknown;
-        for (const std::string& f : runs_[i]->accepted_files()) {
-            if (before.count(f) == 0) {
-                unknown.push_back(f);
-            }
-        }
-        if (!unknown.empty()) {
-            CML_LOG(Trace, "reload: %s%s: %zu re-baselined file(s) its baseline did not track before are forgotten again", m.name.c_str(), where(i).c_str(),
-                    unknown.size());
-            m.index->forget_baseline(unknown);
-        }
-    }
     // The baseline this reload's batch of module `i` replaced (empty when the module holds no batch of this reload).
     std::map<std::string, FileStamp> baseline_before(std::size_t i) {
         ModuleState& m = *modules_[i];
@@ -132,11 +112,11 @@ private:
         }
         return {};
     }
-    // A failure of a module's prepare phase is a refusal when the planner, a code proof or the link refused (stages plan and link),
-    // not a compile error, a sweep, the agent's reservation, the deadline or a cancellation.
-    static bool is_refusal(const std::string& stage, const Diag& d) {
-        return (stage == "plan" || stage == "link") && d.code != pipeline::diag::kReloadTimeout;
-    }
+    // A failure of a module's prepare phase is a refusal when its diagnostic is one of the bind / link range CML3xxx: the bind
+    // planner, a code proof, the anchor, the link or the fix-ups refused the edit. Anything else is a failure: the PDB (CML1xxx), the
+    // compiler (CML2xxx), the agent (CML4xxx, e.g. its reservation) and the broker's own CML5xxx (the deadline, no room in the
+    // reservation, no linker driver, an injected fault, a cancellation, the agent lost).
+    static bool is_refusal(const Diag& d) { return d.code >= 3000 && d.code <= 3999; }
 
     // The modules after `k`: a prepared one is abandoned (`why`), one with nothing to compile keeps its report, one that was never
     // prepared gets `why` as well.
@@ -166,7 +146,7 @@ private:
         const std::size_t n = modules_.size();
         std::vector<std::size_t> waiting;  // prepared before it, never applied
         const std::string stage = runs_[k]->failed_stage().empty() ? std::string("sweep") : runs_[k]->failed_stage();
-        const bool refusal = is_refusal(stage, d);
+        const bool refusal = is_refusal(d);
         // " was refused (CML3400)" / " failed while it was prepared (stage compile, CML2200)"
         const std::string what = refusal ? " was refused (" + d.id() + ")" : " failed while it was prepared (stage " + stage + ", " + d.id() + ")";
         const Diag why = Diag::make(ar::kModuleRefusedNothingApplied, "not applied: module " + modules_[k]->name + where(k) + what,
@@ -194,7 +174,7 @@ private:
                             " were planned and linked, none was loaded; " + std::to_string(n - k - 1) + " after it were not prepared); the process runs what it ran before",
                         std::string(refusal ? "Fix what the refusal names" : "Fix what the failure names") +
                             ", then reload: the edit is applied to every module then. Files the reload did not apply are compiled again."),
-             "warning", refusal ? "plan" : stage.c_str());
+             "warning", refusal && (stage == "plan" || stage == "link") ? "plan" : stage.c_str());
         d.message += " (module " + std::to_string(k + 1) + " of " + std::to_string(n) + ", " + modules_[k]->name + "); no module of process " + std::to_string(pid_) +
                      " was applied";
         return finish(std::move(d));
@@ -225,7 +205,6 @@ private:
                 if (modules_[i]->index) {
                     modules_[i]->index->restore_baseline(before);
                 }
-                forget_new_baseline(i, before);
                 (void)runs_[i]->take_applied_events();
             }
             const Diag why = Diag::make(ar::kModulesAgentLost, "not applied: the agent of process " + std::to_string(pid_) + " disconnected", "Restart the application.");
@@ -288,7 +267,6 @@ private:
             const std::size_t i = *it;
             ModuleState& m = *modules_[i];
             (void)runs_[i]->take_applied_events();  // never announced
-            const std::map<std::string, FileStamp> before = baseline_before(i);
             RevertOptions ro;
             ro.timeout_ms = ctx_.options != nullptr ? ctx_.options->hooks_timeout_ms : 30000;
             const std::int64_t left = std::chrono::duration_cast<std::chrono::milliseconds>(ctx_.deadline - Clock::now()).count();
@@ -310,7 +288,6 @@ private:
                 CML_LOG(Trace, "reload: the roll-back of %s%s failed: %s", m.name.c_str(), where(i).c_str(), back.error().format().c_str());
                 continue;
             }
-            forget_new_baseline(i, before);  // the revert put the stamps the baseline had back
             for (const Diag& w : back->warnings) {
                 emit(w, "warning", "rollback");
             }
