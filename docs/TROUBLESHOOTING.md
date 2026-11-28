@@ -56,9 +56,14 @@ revert, restart).
      could not be read (locked by an editor's save, a read error), and `reason=changed-during-scan:<path>` means a file
      changed while the index was built. Those compilands are not kept (`skipped`: none was), and the next index scans them
      again. A file over the scanner's 8 MiB limit is not read, but it is not a failed read either: it is kept with its stamp
-     like any other input (WP-55). A file or directory changed within 2 s of being stamped is also checked by its contents
-     (or its names), because a same-size edit in the same clock tick keeps its size and time. Set-option `cache_include_scan`
-     false scans every time.
+     like any other input (WP-55). A file or directory changed within 2 s of being stamped, or with a time later than the
+     stamp, is also checked by its contents (or its names), because a same-size edit in the same clock tick keeps its size and
+     time. Files on a remote drive or UNC path are always checked by content, because their times come from another
+     machine's clock. On a local disk the cache assumes that file times come from the same clock as the broker's. If a tool
+     writes a file and then sets its time explicitly to more than 2 s in the past, while keeping its size, the cache cannot see
+     that edit. Touch the file, or set `cache_include_scan` false. `reason=unlistable:<dir>` means a directory the scan
+     searched changed recently and could not be listed (access denied), so the compilands that depend on it are scanned
+     again by every index. Set-option `cache_include_scan` false scans every time.
    * `WP55-INLINE-CACHE module=... object=... kept=... read=... entries=...`: the bind planner's verdicts on what an old
      procedure inlined (WP-51) that this plan asked for and took from an earlier plan against the same module image (`kept`),
      and those it read from the PDB (`read`, unreadable ones included). They are kept per module state and dropped with it (disable, unload, a new

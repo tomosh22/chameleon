@@ -513,6 +513,103 @@ TEST_CASE("WP-55 (review): when the second pass is disproved too, nothing is reu
     CHECK(build_index(w, cache)->status().scan_cache == "warm");
 }
 
+namespace {
+// Rewrites `path` and puts its time back: the edit lands in the same clock tick as far as any stamp can tell.
+void rewrite_in_same_tick(const std::string& path, const std::string& text) {
+    std::error_code ec;
+    const fs::file_time_type t = fs::last_write_time(fs::path(path), ec);
+    write_text(path, text);
+    fs::last_write_time(fs::path(path), t, ec);
+}
+// shared.h before and after: the same size, so that only the content tells them apart.
+const char* const kSharedBefore = "#pragma once\n// xxxxxxxxxxxxx\n";
+const char* const kSharedAfter = "#pragma once\n#include \"new.h\"\n";
+
+// app.cpp and good.cpp both include shared.h (and new.h exists already, so the edit changes no directory).
+void shared_world(World& w) {
+    write_text(w.dir.file("new.h"), "#pragma once\nint fresh();\n");
+    write_text(w.dir.file("shared.h"), kSharedBefore);
+    write_text(w.dir.file("app.cpp"), "#include \"shared.h\"\nint app() { return 1; }\n");
+    write_text(w.dir.file("good.cpp"), "#include \"shared.h\"\nint good() { return 1; }\n");
+    bump_mtime(w.dir.file("app.cpp"));
+    bump_mtime(w.dir.file("good.cpp"));
+}
+
+bool sweeps_to(const std::shared_ptr<ModuleIndex>& index, std::uint32_t ci) {
+    Result<ModuleIndex::Sweep> swept = index->sweep();
+    REQUIRE(swept.has_value());
+    return std::find(swept->compilands.begin(), swept->compilands.end(), ci) != swept->compilands.end();
+}
+}  // namespace
+
+TEST_CASE("WP-55 (convergence): a shared racy file edited in the same tick after the lookup disproves the reused part, whichever part interns it first") {
+    QuietLogs quiet;
+    for (const bool scanned_first : {true, false}) {
+        CAPTURE(scanned_first);
+        World w;
+        shared_world(w);
+        const auto cache = std::make_shared<ScanCache>();
+        static_assert(kPlain < kLibGood, "app.cpp's compiland is visited before good.cpp's");
+        CHECK(build_index(w, cache)->status().scan_cache == "cold");
+        // The edited compiland is scanned; the other is reused. app.cpp's (kPlain) is visited first: with app.cpp edited the
+        // part scanned now interns shared.h first, with good.cpp edited the reused part does.
+        const std::string edited = scanned_first ? "app.cpp" : "good.cpp";
+        write_text(w.dir.file(edited), scanned_first ? "#include \"shared.h\"\nint app() { return 22; }\n" : "#include \"shared.h\"\nint good() { return 22; }\n");
+        bump_mtime(w.dir.file(edited));
+        std::vector<int> passes;
+        const std::shared_ptr<ModuleIndex> index = build_index(w, cache, nullptr, [&](int pass) {
+            passes.push_back(pass);
+            if (pass == 1) {
+                rewrite_in_same_tick(w.dir.file("shared.h"), kSharedAfter);  // same size, same time: only the content differs
+            }
+        });
+        CHECK(passes == std::vector<int>{1, 2});
+        CHECK(index->status().scan_cache == "partial");
+        CHECK(index->status().scan_rescanned == 2);
+        // Both compilands see the new include.
+        write_text(w.dir.file("new.h"), "#pragma once\nint fresh(int);\n");
+        bump_mtime(w.dir.file("new.h"));
+        CHECK(sweeps_to(index, kPlain));
+        CHECK(sweeps_to(index, kLibGood));
+    }
+}
+
+TEST_CASE("WP-55 (convergence): a directory that gains a file in the same tick after the lookup disproves the reused part that searched it") {
+    QuietLogs quiet;
+    World w;
+    // good.cpp includes late.h, which does not exist yet: its part depends on the directory (a file created there is found).
+    write_text(w.dir.file("shared.h"), "#pragma once\n");
+    write_text(w.dir.file("app.cpp"), "#include \"shared.h\"\nint app() { return 1; }\n");
+    write_text(w.dir.file("good.cpp"), "#include \"late.h\"\nint good() { return 1; }\n");
+    bump_mtime(w.dir.file("app.cpp"));
+    bump_mtime(w.dir.file("good.cpp"));
+    const auto cache = std::make_shared<ScanCache>();
+    const std::shared_ptr<ModuleIndex> first = build_index(w, cache);
+    CHECK(first->status().scan_cache == "cold");
+    CHECK_FALSE(tracks_file(first, w.dir.file("late.h")));
+
+    write_text(w.dir.file("app.cpp"), "#include \"shared.h\"\nint app() { return 2; }\n");
+    bump_mtime(w.dir.file("app.cpp"));
+    std::vector<int> passes;
+    const std::shared_ptr<ModuleIndex> index = build_index(w, cache, nullptr, [&](int pass) {
+        passes.push_back(pass);
+        if (pass == 1) {
+            // late.h appears; the directory's time is put back (the same tick): only its names tell.
+            std::error_code ec;
+            const fs::file_time_type t = fs::last_write_time(fs::path(w.dir.dir()), ec);
+            write_text(w.dir.file("late.h"), "#pragma once\n");
+            fs::last_write_time(fs::path(w.dir.dir()), t, ec);
+        }
+    });
+    CHECK(passes == std::vector<int>{1, 2});
+    CHECK(index->status().scan_cache == "partial");
+    CHECK(index->status().scan_rescanned == 2);
+    CHECK(tracks_file(index, w.dir.file("late.h")));
+    write_text(w.dir.file("late.h"), "#pragma once\nint late();\n");
+    bump_mtime(w.dir.file("late.h"));
+    CHECK(sweeps_to(index, kLibGood));
+}
+
 TEST_CASE("WP-55 (R-63): a header over the size limit is cached with its stamp; a file locked against reading keeps its compiland out of the cache") {
     QuietLogs quiet;
     World w;

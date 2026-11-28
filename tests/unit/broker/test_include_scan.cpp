@@ -11,6 +11,12 @@
 #include "cml/core/include_scan.h"
 #include "cml/core/module_index.h"
 
+#if defined(_WIN32)
+#include <windows.h>
+
+#include <sddl.h>
+#endif
+
 using namespace cml;
 using namespace cml::core;
 
@@ -805,3 +811,90 @@ TEST_CASE("WP-55 (review): a same-size edit within the stamp's clock tick is cau
     CHECK_FALSE(settled.has_content);
     CHECK(scan_input_holds(settled));
 }
+
+TEST_CASE("WP-55 (convergence): a directory's names are hashed by their native bytes; a name the code page cannot hold is fine") {
+    namespace fs = std::filesystem;
+    ScratchDir d;
+    // Japanese and Greek: no single-byte Windows code page holds both, so path::string() would throw there.
+    const fs::path odd = d.root / "src" / fs::path(u8"\u65e5\u672c\u8a9e_\u03b1\u03b2.h");
+    {
+        std::ofstream out(odd, std::ios::binary);
+        out << "#pragma once\n";
+    }
+    const std::optional<std::uint64_t> first = scan_directory_hash(d.dir());
+    REQUIRE(first.has_value());
+    const ScanInput stamp = stamp_scan_input(d.dir());
+    CHECK(stamp.racy);
+    CHECK(stamp.has_content);
+    CHECK_FALSE(stamp.unlistable);
+    CHECK(scan_input_holds(stamp));
+    // Another such name in the same tick (the directory's time put back): the names differ.
+    std::error_code ec;
+    const fs::file_time_type t = fs::last_write_time(fs::path(d.dir()), ec);
+    {
+        std::ofstream out(d.root / "src" / fs::path(u8"\u65e5\u672c\u8a9e_\u03b3.h"), std::ios::binary);
+        out << "#pragma once\n";
+    }
+    fs::last_write_time(fs::path(d.dir()), t, ec);
+    CHECK(same_scan_input(probe_scan_input(d.dir()), stamp));
+    CHECK_FALSE(scan_input_holds(stamp));
+    const std::optional<std::uint64_t> second = scan_directory_hash(d.dir());
+    REQUIRE(second.has_value());
+    CHECK(*second != *first);
+}
+
+TEST_CASE("WP-55 (convergence): a directory that cannot be listed never holds; remote paths are always racy") {
+    // A directory that cannot be listed has no hash at all (never a constant one).
+    ScratchDir d;
+    CHECK_FALSE(scan_directory_hash((d.root / "gone").string()).has_value());
+    ScanInput unlistable = stamp_scan_input(d.dir());
+    REQUIRE(unlistable.directory);
+    unlistable.unlistable = true;  // as stamp_scan_input marks a racy directory whose listing failed
+    CHECK_FALSE(scan_input_holds(unlistable));
+
+    CHECK(scan_path_is_remote("\\\\server\\share\\src\\a.h"));
+    CHECK(scan_path_is_remote("//server/share/src/a.h"));
+    CHECK(scan_path_is_remote("\\\\?\\UNC\\server\\share\\a.h"));
+    CHECK_FALSE(scan_path_is_remote("\\\\?\\c:\\src\\a.h"));
+    CHECK_FALSE(scan_path_is_remote("c:\\src\\a.h"));
+    CHECK_FALSE(scan_path_is_remote("relative\\a.h"));
+    CHECK_FALSE(scan_path_is_remote(d.dir()));  // the temp directory is local
+}
+
+#if defined(_WIN32)
+TEST_CASE("WP-55 (convergence): a recently changed directory that cannot be listed makes the part that used it uncacheable") {
+    // A directory whose ACL denies listing (FILE_LIST_DIRECTORY) to everyone, readable otherwise: its stamp can be taken, its
+    // names cannot.
+    ScratchDir d;
+    const std::wstring dir = (d.root / "src" / "nolist").wstring();
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    REQUIRE(ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(D;OICI;0x1;;;WD)(A;OICI;GA;;;WD)", SDDL_REVISION_1, &sd, nullptr));
+    sa.lpSecurityDescriptor = sd;
+    const BOOL made = CreateDirectoryW(dir.c_str(), &sa);
+    LocalFree(sd);
+    REQUIRE(made);
+    struct Allow {
+        std::wstring dir;
+        ~Allow() {
+            // Give the directory an ACL that allows everything again, so that the scratch directory can be removed.
+            PSECURITY_DESCRIPTOR open = nullptr;
+            if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;OICI;GA;;;WD)", SDDL_REVISION_1, &open, nullptr)) {
+                SetFileSecurityW(dir.c_str(), DACL_SECURITY_INFORMATION, open);
+                LocalFree(open);
+            }
+        }
+    } allow{dir};
+    const std::string path = (d.root / "src" / "nolist").string();
+    CHECK_FALSE(scan_directory_hash(path).has_value());
+    ScanInputRecorder rec;
+    const ScanInput& stamp = rec.before(path);
+    CHECK(stamp.exists);
+    CHECK(stamp.racy);  // just created
+    CHECK(stamp.unlistable);
+    CHECK_FALSE(stamp.has_content);
+    CHECK(rec.not_cacheable(path) == "unlistable:" + path);
+    CHECK_FALSE(scan_input_holds(stamp));
+}
+#endif

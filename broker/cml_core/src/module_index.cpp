@@ -1,11 +1,16 @@
 #include "cml/core/module_index.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cctype>
 #include <filesystem>
 #include <set>
 #include <unordered_map>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 #include "cml/core/include_scan.h"
 #include "cml/core/pipeline_diag_ids.h"
@@ -160,19 +165,59 @@ std::uint64_t scan_content_hash(std::string_view text) {
     return hash64(text);
 }
 
-std::uint64_t scan_directory_hash(const std::string& path) {
-    std::vector<std::string> names;
+std::optional<std::uint64_t> scan_directory_hash(const std::string& path) {
+    // (Review: the names' native bytes; path::string() throws on Windows for a name the code page cannot represent.)
+    using Native = std::filesystem::path::string_type;
+    std::vector<Native> names;
     std::error_code ec;
-    for (std::filesystem::directory_iterator it(std::filesystem::path(path), ec), end; !ec && it != end; it.increment(ec)) {
-        names.push_back(it->path().filename().string());
+    std::filesystem::directory_iterator it(std::filesystem::path(path), ec);
+    for (const std::filesystem::directory_iterator end; !ec && it != end; it.increment(ec)) {
+        names.push_back(it->path().filename().native());
+    }
+    if (ec) {
+        return std::nullopt;  // cannot be listed: never a constant hash
     }
     std::sort(names.begin(), names.end());
-    std::string joined = ec ? std::string("\x01unreadable") : std::string();
-    for (const std::string& n : names) {
-        joined += n;
-        joined += '\0';
+    std::string bytes;
+    for (const Native& n : names) {
+        bytes.append(reinterpret_cast<const char*>(n.data()), n.size() * sizeof(Native::value_type));
+        bytes.append(sizeof(Native::value_type), '\0');
     }
-    return hash64(joined);
+    return hash64(bytes);
+}
+
+bool scan_path_is_remote(const std::string& path) {
+    const auto sep = [](char c) { return c == '\\' || c == '/'; };
+    if (path.size() >= 2 && sep(path[0]) && sep(path[1])) {
+        // \\?\C:\... and \\.\C:\... name a local drive; \\?\UNC\... and \\server\share\... are remote.
+        if (path.size() >= 4 && (path[2] == '?' || path[2] == '.') && sep(path[3])) {
+            const std::string rest = path.substr(4);
+            if (rest.size() >= 4 && (rest.compare(0, 3, "UNC") == 0 || rest.compare(0, 3, "unc") == 0) && sep(rest[3])) {
+                return true;
+            }
+            return scan_path_is_remote(rest);
+        }
+        return true;
+    }
+#if defined(_WIN32)
+    if (path.size() >= 2 && path[1] == ':' && std::isalpha(static_cast<unsigned char>(path[0])) != 0) {
+        // One query per drive letter and process (a mapped drive keeps its type while the broker runs).
+        static std::mutex mutex;
+        static std::array<signed char, 26> remote = [] {
+            std::array<signed char, 26> a{};
+            a.fill(-1);
+            return a;
+        }();
+        const std::size_t d = static_cast<std::size_t>(std::tolower(static_cast<unsigned char>(path[0])) - 'a');
+        std::lock_guard<std::mutex> lock(mutex);
+        if (remote[d] < 0) {
+            const wchar_t root[] = {static_cast<wchar_t>(L'a' + d), L':', L'\\', L'\0'};
+            remote[d] = GetDriveTypeW(root) == DRIVE_REMOTE ? 1 : 0;
+        }
+        return remote[d] == 1;
+    }
+#endif
+    return false;
 }
 
 ScanInput stamp_scan_input(const std::string& path) {
@@ -184,15 +229,22 @@ ScanInput stamp_scan_input(const std::string& path) {
     // stale graph hit. A recent time, or one in the future, is not trusted alone.)
     const auto now = std::filesystem::file_time_type::clock::now();
     const auto window = std::chrono::duration_cast<std::filesystem::file_time_type::duration>(std::chrono::seconds(kScanRacyWindowSeconds));
-    in.racy = in.mtime >= static_cast<long long>((now - window).time_since_epoch().count());
+    // (Convergence ruling: a remote path's times come from another clock, so it is always racy. A local time later than now is
+    // racy too: the file system's clock and the broker's are the same one.)
+    in.racy = scan_path_is_remote(path) || in.mtime >= static_cast<long long>((now - window).time_since_epoch().count());
     if (in.racy && in.directory) {
-        in.content = scan_directory_hash(path);
-        in.has_content = true;
+        const std::optional<std::uint64_t> names = scan_directory_hash(path);
+        in.unlistable = !names.has_value();
+        in.content = names.value_or(0);
+        in.has_content = names.has_value();
     }
     return in;
 }
 
 bool scan_input_holds(const ScanInput& recorded) {
+    if (recorded.unlistable) {
+        return false;
+    }
     if (!same_scan_input(probe_scan_input(recorded.path), recorded)) {
         return false;
     }
@@ -200,7 +252,8 @@ bool scan_input_holds(const ScanInput& recorded) {
         return true;
     }
     if (recorded.directory) {
-        return scan_directory_hash(recorded.path) == recorded.content;
+        const std::optional<std::uint64_t> names = scan_directory_hash(recorded.path);
+        return names && *names == recorded.content;
     }
     const std::optional<std::string> text = disk_file_reader()(recorded.path);
     return text && scan_content_hash(*text) == recorded.content;
@@ -254,6 +307,9 @@ ScanFileReader ScanInputRecorder::wrap(ScanFileReader disk) {
 std::string ScanInputRecorder::not_cacheable(const std::string& path) {
     if (unreadable_.count(path) != 0) {
         return "unreadable:" + path;
+    }
+    if (const ScanInput* was = stamped(path); was != nullptr && was->unlistable) {
+        return "unlistable:" + path;
     }
     auto it = rechecked_.find(path);
     if (it == rechecked_.end()) {
@@ -517,9 +573,9 @@ std::optional<ScanResult> ModuleIndex::scan_files(const pdb::PdbIndex& index, co
     scanner.set_tracing(stamping);
     ScanResult out;
 
-    // The paths of the result, once each. `problem` (per path) is why a part that refers to it must not be cached: the path met
-    // again with another stamp (it changed between the lookup that vouched for a reused part and this scan; the entry keeps the
-    // first stamp), or used before it was stamped.
+    // The paths of the result, once each. `problem` (per path) is why a part that refers to it must not be cached: used before
+    // it was stamped. (Which stamp of a path the table keeps does not matter: after the checks below every part that is kept has
+    // found its own stamps of the path true now, so they agree.)
     std::unordered_map<std::string, std::uint32_t> table;
     std::vector<std::string> problem;
     const auto intern = [&](const ScanInput& in) -> std::uint32_t {
@@ -527,8 +583,6 @@ std::optional<ScanResult> ModuleIndex::scan_files(const pdb::PdbIndex& index, co
         if (added) {
             out.inputs.push_back(in);
             problem.emplace_back();
-        } else if (stamping && problem[it->second].empty() && !same_scan_input(out.inputs[it->second], in)) {
-            problem[it->second] = "changed-during-scan:" + in.path;
         }
         return it->second;
     };
@@ -575,7 +629,9 @@ std::optional<ScanResult> ModuleIndex::scan_files(const pdb::PdbIndex& index, co
         }
         remap.assign(previous.result->inputs.size(), kUnmapped);
     }
+    std::vector<const CompilandScan*> reused_from;  // per element of out.compilands: the entry's part it was taken from, or null
     const auto reuse = [&](const CompilandScan& old) {
+        reused_from.push_back(&old);
         CompilandScan c = old;
         for (std::vector<std::uint32_t>* v : {&c.files, &c.deps, &c.pch, &c.inputs}) {
             for (std::uint32_t& i : *v) {
@@ -618,6 +674,7 @@ std::optional<ScanResult> ModuleIndex::scan_files(const pdb::PdbIndex& index, co
             c.files.assign(files.begin(), files.end());
             out.compilands.push_back(std::move(c));
             scanned_now.push_back(1);
+            reused_from.push_back(nullptr);
             ++out.rescanned;
         };
         // WP-26b: a real object is reloadable when its build environment is recorded, whether or not it came from an archive.
@@ -722,31 +779,41 @@ std::optional<ScanResult> ModuleIndex::scan_files(const pdb::PdbIndex& index, co
         spec_.after_scan_for_testing();
     }
     // WP-50 (review): each input of a part scanned now is stamped again (once); a part with an input whose stamp differs, or
-    // that met a file it could not read, is not cacheable. A reused part's inputs were checked by the lookup before it was used;
-    // it, too, is not kept when one of them came back with another stamp from a part scanned now (`problem`).
+    // that met a file it could not read (or a directory it could not list), is not cacheable.
+    // Convergence ruling: each reused part is checked on its own, against the stamps it was stored with, every file and
+    // directory, by content where racy (scan_input_holds), whichever stamp the table kept. One that fails changed after the
+    // lookup: its graph may be stale, so it must not reach this index; the caller scans it again (`disproved`).
     if (stamping) {
-        // A racy stamp copied into the table before the scan read the file gets the content it read; a reused part's racy stamp
-        // whose content differs from what this scan read changed after the lookup (`problem`).
+        // A racy stamp copied into the table before the scan read the file gets the content it read.
         for (std::size_t i = 0; i < out.inputs.size(); ++i) {
             ScanInput& in = out.inputs[i];
-            if (!in.racy || in.directory) {
+            if (!in.racy || in.directory || in.has_content) {
                 continue;
             }
-            const ScanInput* now = recorder.stamped(in.path);
-            if (now == nullptr || !now->has_content) {
-                continue;
-            }
-            if (!in.has_content) {
+            if (const ScanInput* now = recorder.stamped(in.path); now != nullptr && now->has_content && same_scan_input(*now, in)) {
                 in.content = now->content;
                 in.has_content = true;
-            } else if (in.content != now->content && problem[i].empty()) {
-                problem[i] = "changed-during-scan:" + in.path;
             }
         }
+        std::vector<signed char> old_holds(previous.result ? previous.result->inputs.size() : 0, -1);
         std::vector<char> checked(out.inputs.size(), 0);
         std::vector<std::string> verdict(out.inputs.size());
         for (std::size_t k = 0; k < out.compilands.size(); ++k) {
             CompilandScan& c = out.compilands[k];
+            if (const CompilandScan* old = reused_from[k]) {
+                for (const std::uint32_t j : old->inputs) {
+                    if (old_holds[j] < 0) {
+                        old_holds[j] = scan_input_holds(previous.result->inputs[j]) ? 1 : 0;
+                    }
+                    if (old_holds[j] == 0) {
+                        c.not_cacheable = "changed-after-lookup:" + previous.result->inputs[j].path;
+                        if (disproved != nullptr) {
+                            disproved->insert(c.compiland);
+                        }
+                        break;
+                    }
+                }
+            }
             for (const std::uint32_t i : c.inputs) {
                 if (!c.not_cacheable.empty()) {
                     break;
@@ -754,8 +821,6 @@ std::optional<ScanResult> ModuleIndex::scan_files(const pdb::PdbIndex& index, co
                 if (!problem[i].empty()) {
                     c.not_cacheable = problem[i];
                     if (scanned_now[k] == 0 && disproved != nullptr) {
-                        // (Review: a reused part whose input changed after the lookup holds a stale graph; it must not reach
-                        // this index either. The caller scans it again.)
                         disproved->insert(c.compiland);
                     }
                     break;

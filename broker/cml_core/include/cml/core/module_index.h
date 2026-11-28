@@ -134,12 +134,17 @@ struct ScanInput {
     bool racy = false;
     bool has_content = false;
     std::uint64_t content = 0;
+    // A racy directory whose names could not be listed: it never holds, and a part that depends on it is not cached.
+    bool unlistable = false;
 };
 inline constexpr long long kScanRacyWindowSeconds = 2;
+// Whether `path` is on a remote file system (a UNC path; on Windows also a drive whose type is DRIVE_REMOTE): its times come
+// from another machine's clock, so its stamps are always racy and checked by content.
+bool scan_path_is_remote(const std::string& path);
 // What `path` is now (the stamp only: never racy, no content).
 ScanInput probe_scan_input(const std::string& path);
-// What `path` is now, as a stamp taken before a use: racy when its time is recent, and then, for a directory, with the hash of
-// its names (a file's content is added by ScanInputRecorder::wrap when the scan reads it).
+// What `path` is now, as a stamp taken before a use: racy when its time is recent or later than now, or when it is remote, and
+// then, for a directory, with the hash of its names (a file's content is added by ScanInputRecorder::wrap when the scan reads it).
 ScanInput stamp_scan_input(const std::string& path);
 // Whether two stamps of the same path agree (existence, kind, size, time).
 bool same_scan_input(const ScanInput& a, const ScanInput& b);
@@ -147,7 +152,8 @@ bool same_scan_input(const ScanInput& a, const ScanInput& b);
 bool scan_input_holds(const ScanInput& recorded);
 // The hash scan_input_holds() compares: of a file's text (as the scan reads it), or of a directory's sorted names.
 std::uint64_t scan_content_hash(std::string_view text);
-std::uint64_t scan_directory_hash(const std::string& path);
+// Of the names' native bytes (no conversion that could fail); nullopt when the directory cannot be listed.
+std::optional<std::uint64_t> scan_directory_hash(const std::string& path);
 // "" when every input is still as recorded, else the first path that differs (changed, created or removed).
 std::string changed_scan_input(const std::vector<ScanInput>& inputs);
 
