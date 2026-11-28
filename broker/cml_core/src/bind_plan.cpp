@@ -547,6 +547,8 @@ private:
     bool external_tss_alone_in_block(const Sym& guard, std::uint32_t static_pos, std::string& why);
     std::set<std::uint32_t> external_guards_to_prove_;  // bound external `$TSS` guards that only the function's code proves
     bool old_tss_loaded_ = false;
+    bool patch_tss_counted_ = false;
+    std::map<std::string, std::size_t> patch_tss_per_scope_;  // the patch's external `$TSS` guards: scope -> how many
     bool old_tss_listed_ = false;
     std::map<std::string, std::set<std::uint32_t>> old_tss_numbers_;  // the old image's `?$TSS<n>@<scope>@4HA` publics: scope -> numbers
 
@@ -1896,13 +1898,16 @@ bool Planner::old_scope_has_guard_record(const Sym& st) {
 //   * the static's own scope cannot be read, and the patch has an untied guard;
 //   * the old image records a guard in the procedure that holds the static's old record (cl records its guards).
 // A static none of these applies to has no guard (`static int n = 0;`). Statics whose tied guard already carries an
-// error (CML3600, ...) and thread-locals (WP-24, CML3400) are left to those diagnostics.
+// error (CML3600, ...) and thread-locals (WP-24, CML3400) are left to those diagnostics. WP-59 (review round 2): external
+// function-local statics (an inline function's) are checked like internal ones, and thread-local guards tie nothing here.
 std::set<std::uint32_t> Planner::require_bound_guards(const std::vector<std::uint32_t>& untied) {
     std::set<std::uint32_t> implicated;
     std::map<std::uint32_t, std::vector<std::uint32_t>> tied_to;  // static -> the guards tied to it
     for (std::uint32_t pos = 0; pos < syms_.size(); ++pos) {
         const Sym& g = syms_[pos];
-        if (g.defined && g.dec.type == SymbolType::Data && is_guard_variable(g.name)) {  // WP-59: external guards as well
+        // WP-59: external guards as well. A thread-local guard is not an ordinary static's (review round 2, item 2): its
+        // statics are thread-locals, which this rule leaves to WP-24.
+        if (g.defined && g.dec.type == SymbolType::Data && is_guard_variable(g.name) && !(g.dec.section != 0 && secs_[g.dec.section - 1].tls)) {
             for (const std::uint32_t st : guard_scope_statics(g)) {
                 tied_to[st].push_back(pos);
             }
@@ -1914,9 +1919,10 @@ std::set<std::uint32_t> Planner::require_bound_guards(const std::vector<std::uin
     };
     for (std::uint32_t pos = 0; pos < syms_.size(); ++pos) {
         const Sym& s = syms_[pos];
-        // WP-59 (R-67): an external static counts where a guard is tied to it (an inline function's, by its external guard).
-        if (!s.defined || (!s.is_static && tied_to.count(pos) == 0) || s.dec.type != SymbolType::Data || s.name.size() < 2 || s.name[0] != '?' || s.name[1] == '?' ||
-            is_guard_variable(s.name) || s.diagnosed || !s.decided || s.dec.decision != DecisionKind::BindOldData) {
+        // WP-59 (R-67; review round 2, item 1): external function-local statics (an inline function's) are checked as the
+        // internal ones are, whether a guard is tied to them or not: an untied guard may be theirs.
+        if (!s.defined || s.dec.type != SymbolType::Data || s.name.size() < 2 || s.name[0] != '?' || s.name[1] == '?' || is_guard_variable(s.name) || s.diagnosed ||
+            !s.decided || s.dec.decision != DecisionKind::BindOldData) {
             continue;
         }
         if (s.dec.section != 0 && secs_[s.dec.section - 1].tls) {
@@ -4295,7 +4301,7 @@ void Planner::settle_external_guard(Sym& sy, std::vector<std::uint32_t>& untied)
     if (bitmask) {
         return;  // the old bitmask, kept only while the function is unchanged (bitmask_guards)
     }
-    std::string why;
+    std::string why = bound == 1 ? std::string() : "its block has " + std::to_string(bound) + " statics";
     if (bound == 1 && external_tss_alone_in_block(sy, the_static, why)) {
         CML_LOG(Trace, "bind: external guard %s: the only guard of its block, and the only one of that block in the old image, tied to its only static %s: bound by its name",
                 sy.name.c_str(), syms_[the_static].name.c_str());
@@ -4318,13 +4324,19 @@ bool Planner::external_tss_alone_in_block(const Sym& guard, std::uint32_t static
         why = "its name cannot be read";
         return false;
     }
-    for (const Sym& other : syms_) {
-        std::uint32_t n = 0;
-        std::string_view sc;
-        if (&other != &guard && other.defined && !other.is_static && tss_guard_parts(other.name, n, sc) && sc == scope) {
-            why = "the patch has another guard in its block, " + other.name;
-            return false;
+    if (!patch_tss_counted_) {
+        patch_tss_counted_ = true;
+        for (const Sym& other : syms_) {
+            std::uint32_t n = 0;
+            std::string_view sc;
+            if (other.defined && !other.is_static && tss_guard_parts(other.name, n, sc)) {
+                ++patch_tss_per_scope_[std::string(sc)];
+            }
         }
+    }
+    if (const auto p = patch_tss_per_scope_.find(std::string(scope)); p == patch_tss_per_scope_.end() || p->second != 1) {
+        why = "the patch has " + std::to_string(p == patch_tss_per_scope_.end() ? 0 : p->second) + " guards in its block";
+        return false;
     }
     if (!old_tss_loaded_) {
         old_tss_loaded_ = true;

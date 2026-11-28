@@ -34,6 +34,7 @@
 #include "cml/pdb/index.h"
 #include "cml/pe/pe.h"
 #include "doctest.h"
+#include "worlds.h"
 
 using namespace cml;
 using namespace cml::core;
@@ -349,4 +350,42 @@ TEST_CASE("WP-59 (review item 0): an inline function's only static and guard (a 
     CHECK(c.decision(guard).decision == DecisionKind::BindOldData);
     CHECK(c.plan.bitmask_guards.empty());
     CHECK(c.proof.empty());
+}
+
+TEST_CASE("WP-59 (review round 2, item 1): an external bound static next to an ambiguous untied guard is refused (ns::get(ns::Bar), unknown compiler)") {
+    // `ns::get(ns::Bar)`'s static x and a new guard of its block, written by a compiler the planner does not know. x's name
+    // spells ns::Bar `Bar@2` (x, get, ns in the table); the guard's `2` is ns where `$TSS0` is counted (it ties x) and Bar
+    // where it is not (it ties nothing). The guard is tied to none, is not in the old image and is new; x is bound by its
+    // public. 036e906 exempted external statics that no guard is tied to: x kept its live object next to a fresh guard
+    // (the warning CML3211 only), and its initialiser ran again. Now x is checked as an internal static is: refused.
+    const char* const x = "?x@?1??get@ns@@YAHUBar@2@@Z@4UObj@@A";
+    const char* const guard = "?$TSS0@?1??get@ns@@YAHUBar@2@@Z@4HA";
+    cml_bind_test::SynthWorld w = cml_bind_test::basic_world(false);
+    w.pub_data(x, 0x14);
+    w.open();
+    cml_bind_test::SynthObj o;
+    const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", cml_bind_test::kData, 0x40));
+    o.symbol(x, 0x14, bss, false, true);
+    o.symbol(guard, 0x18, bss, false, true);
+    o.compile3("Test Compiler 19.44");
+    cml_bind_test::Built b = o.build();
+    std::vector<Diag> errors;
+    BindPlan partial;
+    auto r = plan_bind(w.input(b), &errors, &partial);
+    REQUIRE_FALSE(r.has_value());
+    const Diag* e = nullptr;
+    for (const Diag& d : errors) {
+        e = d.code == diag::kGuardUnmatched ? &d : e;
+    }
+    REQUIRE(e != nullptr);
+    CAPTURE(e->message);
+    CHECK(e->id() == "CML3211");
+    CHECK(contains(e->message, "ns::get::x"));
+    CHECK(contains(e->message, "which reading is right is not known"));
+    const SymbolDecision* xd = partial.find_decision(x);
+    REQUIRE(xd != nullptr);
+    CHECK(xd->decision == DecisionKind::BindOldData);
+    const SymbolDecision* gd = partial.find_decision(guard);
+    REQUIRE(gd != nullptr);
+    CHECK(gd->decision == DecisionKind::PatchNewData);
 }
