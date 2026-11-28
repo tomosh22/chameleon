@@ -42,5 +42,5 @@ foreach ($c in $cases) {
   Write-Host "--- patch object: .debug`$S symbols of f and of the call operators"
   & $ReadObj --codeview "$Out\$c.new.obj" 2>&1 | ForEach-Object { Write-Host $_ }
   Write-Host "--- plan (this commit's planner)"
-  & $Plan "$Out\$c.pdb" "$Out\$c.new.obj" "$c.old.obj" 2>&1 | ForEach-Object { Write-Host $_ }
+  & $Plan "$Out\$c.pdb" "$Out\$c.new.obj" "$c.old.obj" "$Out\$c.exe" 2>&1 | ForEach-Object { Write-Host $_ }
 }
