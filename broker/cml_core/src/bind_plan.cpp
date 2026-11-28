@@ -1865,7 +1865,10 @@ std::string Planner::helper_by_patch(const InlineVerdict& v, const InlineHelper&
         return "its scope cannot be read";
     }
     // (Review of 5624b28) Name and signature do not tell template instantiations apart (`tc<A>` and `tc<B>` are both `tc`): the
-    // helper must be the only inlinee of its name and signature on both sides.
+    // helper must be the only inlinee of its name and signature on both sides. On real clang output this count rarely separates
+    // them: clang merges identical LF_FUNC_ID records, so `tc<A>` and `tc<B>` of one signature share one id (one inlinee). The
+    // backstop is the patch-side scope check below (any static of the name in a function of the helper's name, template arguments
+    // left out) and the accepted residual; the synthetic test of two ids of one name and signature exercises the count itself.
     std::size_t old_same = 0;
     for (const InlineHelper& o : v.helpers) {
         old_same += o.name == h.name && o.signature == h.signature ? 1u : 0u;
@@ -1889,7 +1892,18 @@ std::string Planner::helper_by_patch(const InlineVerdict& v, const InlineHelper&
     const pdb::PdbIndex::Inlinee* same = nullptr;
     std::size_t new_same = 0;
     for (const pdb::PdbIndex::Inlinee& e : *sites) {
-        if (!e.readable || !e.signature_known || e.signature != h.signature) {
+        // (Convergence review) An inlinee of the patch's function that cannot be read, whose signature is unknown, or a free
+        // function of the helper's bare name whose scope is unknown may be another candidate: no proof.
+        if (!e.readable) {
+            return "an inline site of the patch's function cannot be read (" + e.why + "), so the helper cannot be shown to be the only candidate";
+        }
+        if (!e.signature_known) {
+            return "the signature of '" + e.name + "', inlined by the patch's function, cannot be read, so the helper cannot be shown to be the only candidate";
+        }
+        if (!e.member && !e.scope_known && e.name == h.unqualified) {
+            return "the scope of '" + e.name + "', inlined by the patch's function, cannot be read, so the helper cannot be shown to be the only candidate";
+        }
+        if (e.signature != h.signature) {
             continue;
         }
         const std::string qualified = e.member ? e.class_name + "::" + e.name : (e.scope_known ? (e.scope.empty() ? e.name : e.scope + "::" + e.name) : std::string());

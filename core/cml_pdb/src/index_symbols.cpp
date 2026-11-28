@@ -763,7 +763,9 @@ Result<C13Inlinees> PdbIndex::compiland_inlinee_lines(std::uint32_t ci) const {
                           "Rebuild the module so the linker regenerates the PDB.");
     }
     if (Result<void> r = read_c13_inlinees(std::span<const std::uint8_t>(data, c.c13_bytes), out); !r) {
-        return r.error();
+        // (Convergence review) The reader's message is an object's; a module stream's is the linker's to regenerate.
+        return Diag::make(diag::kBadModuleSymbols, "The line information of module '" + std::string(c.object_name) + "' in '" + impl.path + "' is malformed: " + r.error().message,
+                          "Rebuild the module so the linker regenerates the PDB.");
     }
     return out;
 }

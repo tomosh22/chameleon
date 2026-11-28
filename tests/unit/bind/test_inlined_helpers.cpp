@@ -441,7 +441,7 @@ TEST_CASE("R-57 (synthetic): which inlinees put an own static to the proof") {
         CHECK(listed_counter(p)->helper == "ns::Clamp");
         CHECK(contains(listed_counter(p)->risk, "holds a static 'counter'"));
     }
-    SUBCASE("two inlinees of one name and signature (instantiations the records do not tell apart): not proven by the patch") {
+    SUBCASE("synthetic: two ids of one name and signature (clang itself merges such records into one id): not proven by the patch") {
         const BindPlan p = plan_main([](SynthWorld& w, OldTypes& t) {
             const std::uint32_t one = w.spec.ipi.record(tp::kLfFuncId, tp::lf_func_id(t.fn_int, "tt"));
             const std::uint32_t two = w.spec.ipi.record(tp::kLfFuncId, tp::lf_func_id(t.fn_int, "tt"));  // a second id of the same content
