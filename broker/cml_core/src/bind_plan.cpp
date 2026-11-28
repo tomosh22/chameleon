@@ -1492,6 +1492,24 @@ bool Planner::refuse_inlined_owner(Sym& sy, const pdb::SymbolView& record, const
         }
         return false;
     }
+    if (in_.prove_inlined_owners) {
+        // WP-57 (R-59, ADR-0046): the caller proves the pairing by the code of the procedure (prove_inlined_owner_statics):
+        // an unchanged procedure used the record as the patch uses this static, whatever the record was. Paired and listed.
+        const pdb::SymbolView& p = comp_syms_[record.parent_proc];
+        InlinedOwnerStatic s;
+        s.symbol = sy.name;
+        s.display = sy.dec.display;
+        s.record_rva = record.rva;
+        s.record = std::string(record.name);
+        s.proc = std::string(p.name);
+        s.proc_rva = p.rva;
+        s.risk = v.risk;
+        s.step = step;
+        CML_LOG(Trace, "WP57-LISTED static='%s' record rva=%s proc='%s' rva=%s risk=%s (%s): paired, the code of the procedure must prove it", sy.dec.display.c_str(),
+                hex(record.rva).c_str(), s.proc.c_str(), hex(p.rva).c_str(), v.risk.c_str(), step);
+        plan_.inlined_owner_statics.push_back(std::move(s));
+        return false;
+    }
     ++wp51_refused_;
     CML_LOG(Info, "WP51-OWN-STATIC static='%s' refused (%s; %s)", sy.dec.display.c_str(), v.risk.c_str(), step);
     error(diag::kAmbiguousStatic,
