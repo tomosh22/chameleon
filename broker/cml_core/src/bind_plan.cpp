@@ -280,22 +280,33 @@ std::size_t block_prefix_length(std::string_view scope) noexcept {
 // WP-52 (R-60): this compares the scopes as written, which is only right where neither spells a name by a back-reference
 // (clang counts the guard's own name differently, bind_names.h local_scope_key). The planner compares the resolved scopes
 // (scope_keys_cover) and uses this only for names the resolver cannot read (the comparison before WP-52).
-bool raw_guard_covers(std::string_view guard, std::string_view name) noexcept {
-    const std::size_t at = guard.find('@');
-    if (at == std::string_view::npos || guard.size() < at + 5 || guard.compare(0, 2, "?$") != 0) {
-        return false;
+// WP-59 (R-67): clang's bitmask of an inline function's statics, `??_B<scope>@5<n>`, is read as `?$S1@<scope>@4IA`.
+bool raw_guard_covers(std::string_view guard, std::string_view name) {
+    std::string inline_scope;
+    std::string_view scope;  // "<scope>@4"
+    bool bitmask = false;
+    if (is_inline_bitmask_guard(guard)) {
+        inline_scope = std::string(inline_bitmask_scope(guard)) + "@4";
+        scope = inline_scope;
+        bitmask = true;
+    } else {
+        const std::size_t at = guard.find('@');
+        if (at == std::string_view::npos || guard.size() < at + 5 || guard.compare(0, 2, "?$") != 0) {
+            return false;
+        }
+        const std::string_view tail = guard.substr(guard.size() - 4);
+        if (tail != "@4HA" && tail != "@4IA") {
+            return false;
+        }
+        scope = guard.substr(at + 1, guard.size() - at - 3);
+        bitmask = guard[2] == 'S';
     }
-    const std::string_view tail = guard.substr(guard.size() - 4);
-    if (tail != "@4HA" && tail != "@4IA") {
-        return false;
-    }
-    const std::string_view scope = guard.substr(at + 1, guard.size() - at - 3);  // "<scope>@4"
     const std::size_t name_at = name.find('@');
     if (name.empty() || name[0] != '?' || name_at == std::string_view::npos) {
         return false;
     }
     const std::string_view rest = name.substr(name_at + 1);
-    if (guard[2] == 'S') {
+    if (bitmask) {
         const std::size_t g_block = block_prefix_length(scope);
         const std::size_t s_block = block_prefix_length(rest);
         if (g_block == 0 || s_block == 0) {
@@ -318,15 +329,21 @@ bool scope_keys_cover(const LocalScopeKey& guard, const LocalScopeKey& name, boo
 // WP-40 (second high review): is `guard` a bitmask `?$S<n>@<scope>@4IA`, and the decorated name of the function whose
 // statics it guards ("?$S1@?1??f@@YAHXZ@4IA" -> "?f@@YAHXZ"; a lambda's: "??R<lambda_0>@?0??f@@YAXXZ@QEBA@XZ"). Empty when
 // `guard` is not a bitmask or its scope cannot be read.
+// WP-59 (R-67): clang's `??_B<scope>@5<n>` of an inline function as well ("??_B?1??counter@@YAHXZ@51" -> "?counter@@YAHXZ").
 std::string bitmask_function(std::string_view guard) {
-    if (guard.size() < 8 || guard.compare(0, 3, "?$S") != 0 || guard[3] < '0' || guard[3] > '9' || guard.substr(guard.size() - 4) != "@4IA") {
-        return {};
+    std::string_view scope;  // "?1??f@@YAHXZ"
+    if (is_inline_bitmask_guard(guard)) {
+        scope = inline_bitmask_scope(guard);
+    } else {
+        if (guard.size() < 8 || guard.compare(0, 3, "?$S") != 0 || guard[3] < '0' || guard[3] > '9' || guard.substr(guard.size() - 4) != "@4IA") {
+            return {};
+        }
+        const std::size_t at = guard.find('@');
+        if (at == std::string_view::npos || guard.size() < at + 1 + 4) {
+            return {};
+        }
+        scope = guard.substr(at + 1, guard.size() - at - 1 - 4);
     }
-    const std::size_t at = guard.find('@');
-    if (at == std::string_view::npos || guard.size() < at + 1 + 4) {
-        return {};
-    }
-    const std::string_view scope = guard.substr(at + 1, guard.size() - at - 1 - 4);  // "?1??f@@YAHXZ"
     const std::size_t block = block_prefix_length(scope);
     if (block == 0 || block + 1 >= scope.size() || scope[block] != '?') {
         return {};
@@ -489,6 +506,7 @@ private:
     int clang_minor_ = -1;
     std::string compiler_version_;
     void settle_guards();
+    void settle_inline_bitmask(Sym& sy, std::vector<std::uint32_t>& untied);  // WP-59 (R-67): clang's `??_B` of an inline function
 
     // WP-37 (ADR-0042): canonical signatures, read lazily on both sides. The old side is the module PDB's type stream,
     // the new side the patch object's .debug$S / .debug$T (or its type server PDB): cml/core/bind_types.h.
@@ -1750,7 +1768,9 @@ const std::vector<std::uint32_t>& Planner::guard_scope_statics(const Sym& guard)
     if (const auto it = guard_statics_.find(gpos); it != guard_statics_.end()) {
         return it->second;
     }
-    const bool bitmask = guard.name.compare(0, 3, "?$S") == 0;
+    // WP-59 (R-67): clang's `??_B` of an inline function is a bitmask too; it and that function's statics are external.
+    const bool inline_bitmask = is_inline_bitmask_guard(guard.name);
+    const bool bitmask = inline_bitmask || guard.name.compare(0, 3, "?$S") == 0;
     const GuardSpelling spelling = guard_spelling(bitmask);
     const std::array<bool, 2> use = {spelling != GuardSpelling::Counted, spelling != GuardSpelling::NotCounted};
     const ScopeKeys gk = scope_keys(gpos);
@@ -1758,7 +1778,7 @@ const std::vector<std::uint32_t>& Planner::guard_scope_statics(const Sym& guard)
     std::array<std::vector<std::uint32_t>, 2> tied;
     for (std::uint32_t pos = 0; pos < syms_.size(); ++pos) {
         const Sym& s = syms_[pos];
-        if (!s.defined || !s.is_static || s.dec.type != SymbolType::Data || s.name.empty() || s.name[0] != '?' || is_guard_variable(s.name)) {
+        if (!s.defined || (!s.is_static && !inline_bitmask) || s.dec.type != SymbolType::Data || s.name.empty() || s.name[0] != '?' || is_guard_variable(s.name)) {
             continue;
         }
         const std::optional<LocalScopeKey>& sk = scope_keys(pos)[0];
@@ -1834,7 +1854,7 @@ std::set<std::uint32_t> Planner::require_bound_guards(const std::vector<std::uin
     std::map<std::uint32_t, std::vector<std::uint32_t>> tied_to;  // static -> the guards tied to it
     for (std::uint32_t pos = 0; pos < syms_.size(); ++pos) {
         const Sym& g = syms_[pos];
-        if (g.defined && g.is_static && g.dec.type == SymbolType::Data && is_guard_variable(g.name)) {
+        if (g.defined && (g.is_static || is_inline_bitmask_guard(g.name)) && g.dec.type == SymbolType::Data && is_guard_variable(g.name)) {
             for (const std::uint32_t st : guard_scope_statics(g)) {
                 tied_to[st].push_back(pos);
             }
@@ -1846,8 +1866,9 @@ std::set<std::uint32_t> Planner::require_bound_guards(const std::vector<std::uin
     };
     for (std::uint32_t pos = 0; pos < syms_.size(); ++pos) {
         const Sym& s = syms_[pos];
-        if (!s.defined || !s.is_static || s.dec.type != SymbolType::Data || s.name.size() < 2 || s.name[0] != '?' || s.name[1] == '?' || is_guard_variable(s.name) ||
-            s.diagnosed || !s.decided || s.dec.decision != DecisionKind::BindOldData) {
+        // WP-59 (R-67): an external static counts where a guard is tied to it (an inline function's, by its `??_B` bitmask).
+        if (!s.defined || (!s.is_static && tied_to.count(pos) == 0) || s.dec.type != SymbolType::Data || s.name.size() < 2 || s.name[0] != '?' || s.name[1] == '?' ||
+            is_guard_variable(s.name) || s.diagnosed || !s.decided || s.dec.decision != DecisionKind::BindOldData) {
             continue;
         }
         if (s.dec.section != 0 && secs_[s.dec.section - 1].tls) {
@@ -4127,6 +4148,77 @@ void Planner::refuse_reset_statics() {
     }
 }
 
+// WP-59 (R-67, ADR-0046): clang's bitmask `??_B<scope>@5<n>` of an inline function's statics (no thread-safe statics). Like
+// those statics it is external, in a COMDAT of its own, and decide_defined() bound it to the old bitmask by its public symbol
+// or made it new, as ordinary data. Its bits go to the function's statics in the order they are declared, so the old bitmask
+// is right only for exactly the old statics; the rules of cl's `$S1` apply (ADR-0043 ruling), and the layout never places it:
+//   * a static of its function refused: the bitmask is not bound either;
+//   * statics bound to the running process next to new ones: refused (CML3600), with the old bitmask or a fresh one;
+//   * every static new: a new bitmask, also where the old image has one of that name (its bits are other statics');
+//   * every static bound: the old bitmask, found by its name; the old image has none (its statics were constant-initialised,
+//     or the bitmask is named after another first static): refused (CML3600), a fresh one would construct them again;
+//   * no static tied: kept as decided (bound by its name, or new and tied to no static: CML3211 below, as a `$TSS`).
+// A bound bitmask is then proven by the code of its function (bitmask_guards, prove_bitmask_guards), as `$S1`.
+void Planner::settle_inline_bitmask(Sym& sy, std::vector<std::uint32_t>& untied) {
+    const bool found = sy.decided && sy.dec.decision == DecisionKind::BindOldData;
+    const std::vector<std::uint32_t> scope = guard_scope_statics(sy);
+    std::size_t refused = 0;
+    std::size_t fresh = 0;
+    std::size_t bound = 0;
+    std::string a_new;
+    std::string a_bound;
+    for (const std::uint32_t pos : scope) {
+        const Sym& st = syms_[pos];
+        if (st.decided && st.dec.decision == DecisionKind::PatchFresh) {
+            continue;  // read-only data: no state, no guard
+        }
+        if (st.diagnosed) {
+            ++refused;
+        } else if (st.decided && st.dec.decision == DecisionKind::BindOldData) {
+            ++bound;
+            a_bound = a_bound.empty() ? describe(st) : a_bound;
+        } else {
+            ++fresh;
+            a_new = a_new.empty() ? describe(st) : a_new;
+        }
+    }
+    CML_LOG(Trace, "bind: inline bitmask %s: %zu static(s) of its function (%zu bound, %zu new, %zu refused), %s", sy.name.c_str(), scope.size(), bound, fresh, refused,
+            found ? "an old bitmask of its name is in the old image" : "no old bitmask of its name");
+    if (refused != 0) {
+        sy.diagnosed = true;
+        decide(sy, DecisionKind::PatchNewData, BindSource::None, SymbolType::Data, {}, "bitmask guard of a static that is refused");
+        return;
+    }
+    if (bound != 0 && fresh != 0) {
+        error(diag::kGuardMismatch,
+              "the bitmask guard " + describe(sy) + " in " + in_.object_name + " (an inline function's statics without thread-safe initialisation) guards statics of which some are bound to the running process (" +
+                  a_bound + ") and some are new (" + a_new +
+                  "); its bits go to the function's statics in the order they are declared, so with the old bitmask a new static could take an old one's bit and never be constructed, and with a fresh one the old statics would be constructed again",
+              "Declare the new static in another function (or keep this function's statics as they are), or hot-restart.");
+        sy.diagnosed = true;
+        decide(sy, DecisionKind::PatchNewData, BindSource::None, SymbolType::Data, {}, "bitmask guard of a function with new and bound statics (CML3600)");
+        return;
+    }
+    if (bound == 0) {
+        if (fresh != 0) {
+            decide(sy, DecisionKind::PatchNewData, BindSource::None, SymbolType::Data, {},
+                   std::string("bitmask guard of new statics: new") + (found ? " (the old bitmask of that name belongs to other statics)" : ""));
+        } else if (!found) {
+            untied.push_back(static_cast<std::uint32_t>(&sy - syms_.data()));
+        }
+        return;
+    }
+    if (found) {
+        return;  // the old bitmask, kept only while the function is unchanged (bitmask_guards)
+    }
+    error(diag::kGuardMismatch,
+          "the bitmask guard " + describe(sy) + " in " + in_.object_name + " (an inline function's statics without thread-safe initialisation) cannot be bound to the old bitmask of " + a_bound +
+              ", which is bound to the running process: the old image has no bitmask of that name (there the function's statics were constant-initialised, or its first static was another one); with a fresh bitmask the old object would be constructed a second time",
+          "Keep this function's statics as they are (or declare the new one in another function), or hot-restart.");
+    sy.diagnosed = true;
+    decide(sy, DecisionKind::PatchNewData, BindSource::None, SymbolType::Data, {}, "bitmask guard of bound statics that is not in the old image (CML3600)");
+}
+
 // Pass C, and the rule that ties every guard variable to the statics of its scope (WP-40, ADR-0043 point 1 and 2). A
 // guard `?$TSS0@<scope>@4HA` (or cl's `?$S1@<scope>@4IA` without thread-safe statics) guards the statics declared in
 // the same block, `?<name>@<scope>@4...`. Binding a guard to the old guard while its static is new makes the patch use
@@ -4151,7 +4243,14 @@ void Planner::refuse_reset_statics() {
 void Planner::settle_guards() {
     std::vector<std::uint32_t> untied;  // WP-52: guards tied to no static (new)
     for (Sym& sy : syms_) {
-        if (!sy.defined || !sy.is_static || sy.dec.type != SymbolType::Data || !is_guard_variable(sy.name) || sy.diagnosed) {
+        if (!sy.defined || sy.dec.type != SymbolType::Data || !is_guard_variable(sy.name) || sy.diagnosed) {
+            continue;
+        }
+        if (is_inline_bitmask_guard(sy.name)) {
+            settle_inline_bitmask(sy, untied);
+            continue;
+        }
+        if (!sy.is_static) {
             continue;
         }
         const bool by_record = sy.decided && sy.dec.decision == DecisionKind::BindOldData && sy.dec.source != BindSource::CompilandLayout;
@@ -4320,7 +4419,7 @@ void Planner::settle_guards() {
     for (const Sym& sy : syms_) {
         if (sy.defined && sy.decided && !sy.diagnosed && sy.dec.decision == DecisionKind::BindOldData && is_guard_variable(sy.name)) {
             const std::string function = bitmask_function(sy.name);
-            if (!function.empty() || (sy.name.size() > 3 && sy.name.compare(0, 3, "?$S") == 0 && sy.name[3] >= '0' && sy.name[3] <= '9')) {
+            if (!function.empty() || is_inline_bitmask_guard(sy.name) || (sy.name.size() > 3 && sy.name.compare(0, 3, "?$S") == 0 && sy.name[3] >= '0' && sy.name[3] <= '9')) {
                 plan_.bitmask_guards.push_back({sy.name, function});
                 CML_LOG(Trace, "bind: bitmask guard %s is bound to the old one: the code of '%s' must be unchanged", sy.name.c_str(), function.c_str());
             }
