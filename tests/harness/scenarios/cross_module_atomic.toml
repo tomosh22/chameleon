@@ -1,0 +1,99 @@
+# Scenario `cross_module_atomic` (WP-54, ADR-0045, R-56): a refused reload across the modules of one process applies nothing. The
+# edit of scale.h (a header that holds no code, included through shared.h by exe_part.cpp in the exe and by plugin.cpp in the plugin
+# DLL) recompiles a translation unit in each module; it also makes plugin.cpp define a new thread_local, which the planner refuses
+# (CML3400). The exe is prepared (and, before WP-54, applied) first: before WP-54 the exe was patched (exe=22 and a patch_applied
+# event) while the reply was the DLL's refusal. Now both modules are prepared before either is applied, the refusal applies neither,
+# and no patch_applied is published. Once the thread_local is gone again the same header edit reloads both modules.
+name = "cross_module_atomic"
+description = "fixture cross_module_atomic: scale.h edit over an exe TU and a DLL TU, the DLL's refused (CML3400) -> nothing applied, exe=11 plugin=101; without the thread_local both modules reload"
+fixture = "cross_module_atomic"
+timeout_s = 300
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ exe=11 plugin=101 frames=\\d+"
+within_s = 15
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_cross_module_atomic.exe"
+within_s = 30
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_cross_module_atomic_plugin.dll"
+within_s = 30
+
+# kScale 1 -> 2 and the new thread_local in plugin.cpp (the DLL).
+[[step]]
+kind = "edit"
+patch = "edits/scale_2_tls.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_error = "CML3400"
+
+# Nothing was applied to either module: no patch_applied (the events of the refused reload are read here, and 3 s more) ...
+[[step]]
+kind = "expect_event"
+event = "patch_applied"
+absent = true
+within_s = 3
+
+# ... the exe and the DLL keep their old code, and the application keeps running.
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ exe=11 plugin=101 frames=\\d+"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ exe=11 plugin=101 frames=\\d+"
+within_s = 10
+
+# The refusing part undone (CML_PLUGIN_TLS back to 0, kScale stays 2): the same edit reloads both modules.
+[[step]]
+kind = "edit"
+patch = "edits/stacked/no_tls.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_result_key = "modules_patched"
+expect_result_value = 2
+
+[[step]]
+kind = "expect_reload_result"
+key = "processes_patched"
+value = 1
+
+# One COFF object held at a time over both modules (the reload drops each one once it is linked).
+[[step]]
+kind = "expect_reload_result"
+key = "objects_held_peak"
+value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ exe=22 plugin=202 frames=\\d+"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ exe=22 plugin=202 frames=\\d+"
+within_s = 10
+
+[[step]]
+kind = "expect_event"
+event = "patch_applied"
+within_s = 10
+
+# The DLL's thread_local only ever grew: the process was never restarted.
+[[step]]
+kind = "expect_monotonic"
+key = "frames"
+min_samples = 20

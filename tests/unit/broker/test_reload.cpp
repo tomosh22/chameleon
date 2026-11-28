@@ -341,10 +341,10 @@ struct Rig {
             r.message = text;
             l.deliver(r);
         };
-        if (std::holds_alternative<ipc::ReserveRange>(m)) {
+        if (const auto* reserve = std::get_if<ipc::ReserveRange>(&m)) {
             ipc::ReserveRangeResult r;
             r.request_id = id;
-            r.blocks.push_back({0x13F000000ull, 64ull << 20});
+            r.blocks.push_back({reserve->module_base - 0x1000000ull, 64ull << 20});  // 0x13F000000 for app.exe; WP-54: near plugin.dll too
             l.deliver(r);
         } else if (const auto* load = std::get_if<ipc::LoadPatch>(&m)) {
             int nth_load = 0;  // WP-47
@@ -498,6 +498,62 @@ struct Rig {
         REQUIRE(module2 != nullptr);
         REQUIRE(module2->index->status().state == IndexState::Ready);
     }
+    // WP-54: a second module of the first process, plugin.dll at kPluginBase, built from the same PDB (its compilands are logic.cpp
+    // and main.cpp as well). app.exe sorts before it, so a reload prepares and applies app.exe first.
+    static constexpr std::uint64_t kPluginBase = 0x180000000ull;
+    std::string plugin;
+    std::shared_ptr<ModuleState> plugin_module;
+    void enable_with_plugin() {
+        plugin = dir.file("plugin.dll");
+        testpdb::write_file(plugin, testpdb::build_pe(kGuid, 5, "C:\\build\\app.pdb"));
+        if (!said_hello) {
+            ipc::Hello hello;
+            hello.request_id = 1;
+            hello.pid = kPid;
+            session.on_message(hello);
+            said_hello = true;
+        }
+        ipc::ModuleList list;
+        list.request_id = 2;
+        list.modules.push_back({kModuleBase, 0x4000, exe});
+        list.modules.push_back({kPluginBase, 0x4000, plugin});
+        list.modules.push_back({0x7FF800000000ull, 0x90000, "C:\\Windows\\System32\\ntdll.dll"});
+        session.on_message(list);
+        std::uint64_t request = 3;
+        for (const std::string* path : {&exe, &plugin}) {
+            ipc::EnableModule enable_module;
+            enable_module.request_id = request++;
+            enable_module.path = *path;
+            session.on_message(enable_module);
+        }
+        link->publish(session);
+        service->on_session_changed(1);
+        Value args = Value::object();
+        args.set("for", Value::string("index"));
+        args.set("timeout_ms", Value::integer(20000));
+        Result<Value> waited = service->wait(args);
+        REQUIRE_MESSAGE(waited.has_value(), waited.error().format());
+        module = service->module_state(1, exe);
+        plugin_module = service->module_state(1, plugin);
+        REQUIRE(module != nullptr);
+        REQUIRE(plugin_module != nullptr);
+        REQUIRE(module->index->status().state == IndexState::Ready);
+        REQUIRE(plugin_module->index->status().state == IndexState::Ready);
+    }
+    // The next sweep of `m` reports `file` (compiland `ci`) as changed.
+    static void changed_unit(ModuleState& m, std::uint32_t ci, const std::string& file) {
+        m.index->set_sweep_override_for_testing([ci, file]() -> Result<ModuleIndex::Sweep> {
+            ModuleIndex::Sweep s;
+            s.changed = {file};
+            s.compilands = {ci};
+            s.file_compilands[file] = {ci};
+            s.stamps[file] = FileStamp{1, 2, 3};
+            s.checked = 1;
+            s.hashed = 1;
+            return s;
+        });
+    }
+
     void changed_on(ModuleState& m, const std::string& file = "C:\\proj\\logic.cpp") {
         m.index->set_sweep_override_for_testing([file]() -> Result<ModuleIndex::Sweep> {
             ModuleIndex::Sweep s;
@@ -3402,6 +3458,253 @@ TEST_CASE("atomic reload (WP-47 review): an unchanged compiland of a failed relo
     REQUIRE_FALSE(accepted.empty());
     CHECK(accepted.back().count("C:\\proj\\logic.cpp") == 0);
     CHECK(accepted.back().count("C:\\proj\\main.cpp") == 0);
+}
+
+// ---- WP-54 (ADR-0045, R-56): a reload across several modules of one process applies nothing when one module is refused ----------
+
+namespace {
+
+constexpr const char* kLogic = "C:\\proj\\logic.cpp";
+constexpr const char* kMain = "C:\\proj\\main.cpp";
+
+// app.exe and plugin.dll of one process, both enabled. The edit recompiles logic.cpp in app.exe (prepared and applied first: it sorts
+// first) and main.cpp in plugin.dll; both hook compute_value. `plugin_object` is what main.cpp compiles to.
+void cross_module(Rig& rig, std::vector<std::byte> plugin_object) {
+    rig.object = make_object({}, true);
+    rig.second_object = std::move(plugin_object);
+    Rig::changed_unit(*rig.module, 0, kLogic);
+    Rig::changed_unit(*rig.plugin_module, 1, kMain);
+}
+
+std::uint64_t generation_of_module(ModuleState& m) {
+    std::lock_guard<std::mutex> lock(m.mutex);
+    return m.generation;
+}
+
+// Nothing of the reload is live in either module, and nothing was announced.
+void check_neither_live(Rig& rig) {
+    for (ModuleState* m : {rig.module.get(), rig.plugin_module.get()}) {
+        CHECK(generation_of_module(*m) == 0);
+        std::lock_guard<std::mutex> lock(m->mutex);
+        CHECK(m->hooked.empty());
+        CHECK(m->code.empty());
+        CHECK(m->batches.empty());
+    }
+    CHECK_FALSE(rig.module->registry.find("?new_helper@@YAHXZ").has_value());
+    CHECK(rig.service->generation() == 0);
+    CHECK(rig.events->count("patch_applied") == 0);
+}
+
+// The same edit without the cause: both modules are applied in one reload.
+void check_both_reload(Rig& rig) {
+    rig.hooks_status_at.clear();
+    rig.silent_hooks_at = 0;
+    rig.close_on_load_at = 0;
+    rig.link_fails = nullptr;
+    cross_module(rig, make_object());
+    const std::size_t loads_before = rig.seen<ipc::LoadPatch>().size();
+    const int applied_before = rig.events->count("patch_applied");
+    Result<Value> r = rig.reload();
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    CHECK(r->get_integer("patched") == 2);
+    CHECK(r->get_integer("modules_patched") == 2);
+    CHECK(r->get_integer("processes_patched") == 1);
+    CHECK(r->get_integer("objects_held_peak") == 1);
+    CHECK(rig.seen<ipc::LoadPatch>().size() == loads_before + 2);
+    CHECK(rig.events->count("patch_applied") == applied_before + 2);
+    CHECK(rig.module->is_hooked(kModuleBase + 0x1010));
+    CHECK(rig.plugin_module->is_hooked(Rig::kPluginBase + 0x1010));
+}
+
+}  // namespace
+
+TEST_CASE("cross-module reload (WP-54): the plugin refused while it is prepared applies nothing to the exe either (CML3656)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable_with_plugin();
+    cross_module(rig, make_object({}, false, "no_such_function_anywhere"));  // plugin.dll's main.cpp cannot be planned (CML3200)
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML3200");
+    CHECK(r.error().message.find("(module 2 of 2, plugin.dll); no module of process 4711 was applied") != std::string::npos);
+    CHECK(r.error().message.find("(2 of 2 modules failed)") != std::string::npos);
+    CHECK(rig.link_calls == 1);                    // app.exe's logic.cpp was planned and linked ...
+    CHECK(rig.seen<ipc::LoadPatch>().empty());     // ... and never loaded (before WP-54 it was applied before plugin.dll was planned)
+    CHECK(rig.seen<ipc::InstallHooks>().empty());
+    CHECK(rig.seen<ipc::ReleaseRange>().empty());
+    CHECK(rig.events->diag_ids() == std::vector<std::string>{"CML3200"});
+    CHECK(diag_count(rig, "CML3656", "warning") == 1);
+    CHECK(diag_count(rig, "CML3650", "warning") == 0);  // one compiland per module
+    check_neither_live(rig);
+    // app.exe's file was not re-baselined.
+    const auto accepted = rig.module->index->accepted_for_testing();
+    REQUIRE_FALSE(accepted.empty());
+    CHECK(accepted.back().count(kLogic) == 0);
+
+    // The slice app.exe's patch was linked into was given back: the reload of the fixed edit loads it there, and patches both.
+    const std::uint64_t exe_base = rig.link_bases.front();
+    check_both_reload(rig);
+    CHECK(rig.seen<ipc::LoadPatch>().front().candidates[0].image_base == exe_base);
+}
+
+TEST_CASE("cross-module reload (WP-54): a refusal in the first module leaves the second unprepared") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable_with_plugin();
+    cross_module(rig, make_object());
+    rig.object = make_object({}, false, "no_such_function_anywhere");  // app.exe's logic.cpp is refused
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML3200");
+    CHECK(r.error().message.find("(module 1 of 2, app.exe)") != std::string::npos);
+    CHECK(rig.compile_calls == 1);  // plugin.dll was not even compiled
+    CHECK(rig.link_calls == 0);
+    CHECK(diag_count(rig, "CML3656", "warning") == 1);
+    check_neither_live(rig);
+}
+
+TEST_CASE("cross-module reload (WP-54): a module with nothing to compile changes nothing: the refusal of the other reads as for one module") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable_with_plugin();
+    cross_module(rig, make_object({}, false, "no_such_function_anywhere"));
+    rig.unchanged();  // app.exe: nothing changed
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML3200");
+    CHECK(r.error().message.find("module 2 of 2") == std::string::npos);
+    CHECK(r.error().message.find("(1 of 2 modules failed)") != std::string::npos);
+    CHECK(diag_count(rig, "CML3656", "warning") == 0);
+    check_neither_live(rig);
+}
+
+TEST_CASE("cross-module reload (WP-54): applying the plugin fails, so the exe applied before it is rolled back (CML3657)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable_with_plugin();
+    cross_module(rig, make_object());
+    rig.hooks_status_at[2] = ipc::fault::ids::kAgentHookInstall;  // plugin.dll's InstallHooks (app.exe's is the first)
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML4652");
+    CHECK(r.error().message.find("(module 2 of 2, plugin.dll); the 1 module(s) of this reload applied before it (app.exe) were rolled back") != std::string::npos);
+    // app.exe was applied, plugin.dll failed and was unloaded, then app.exe's hook was reverted to the original bytes (quietly) and its
+    // image un-committed.
+    CHECK(rig.seen<ipc::LoadPatch>().size() == 2);
+    const auto hooks = rig.seen<ipc::InstallHooks>();
+    REQUIRE(hooks.size() == 3);
+    CHECK(hooks[0].flags == 0);
+    CHECK(hooks[1].flags == 0);
+    REQUIRE(hooks[1].hooks.size() == 1);
+    CHECK(hooks[1].hooks[0].old_entry == Rig::kPluginBase + 0x1010);
+    CHECK(hooks[2].flags == ipc::kInstallHooksRevert);
+    REQUIRE(hooks[2].hooks.size() == 1);
+    CHECK(hooks[2].hooks[0].old_entry == kModuleBase + 0x1010);
+    const auto releases = rig.seen<ipc::ReleaseRange>();
+    REQUIRE(releases.size() == 2);
+    CHECK(releases[0].mode == ipc::ReleaseMode::UnloadPatch);  // plugin.dll's patch
+    CHECK(releases[1].mode == ipc::ReleaseMode::Uncommit);     // app.exe's, rolled back
+    CHECK(diag_count(rig, "CML3657", "warning") == 1);
+    CHECK(rig.events->count("patch_reverted") == 0);  // nothing of it had been announced
+    check_neither_live(rig);
+    check_both_reload(rig);
+}
+
+TEST_CASE("cross-module reload (WP-54): when the exe's roll-back fails too the reply is CML3658 and its batch stays for `revert`") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable_with_plugin();
+    cross_module(rig, make_object());
+    rig.hooks_status_at[2] = ipc::fault::ids::kAgentHookInstall;
+    rig.hooks_status_at[3] = 4305;  // the roll-back's restoring of app.exe's compute_value: a thread would not leave the function
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML3658");
+    CHECK(r.error().message.find("CML4652") != std::string::npos);
+    CHECK(r.error().message.find("CML5851") != std::string::npos);
+    CHECK(r.error().message.find("app.exe stay(s) recorded as this reload's batch") != std::string::npos);
+    CHECK(diag_count(rig, "CML3658", "error") == 1);
+    CHECK(diag_count(rig, "CML3657", "warning") == 0);
+    CHECK(generation_of_module(*rig.module) == 1);  // app.exe is live
+    CHECK(rig.module->is_hooked(kModuleBase + 0x1010));
+    REQUIRE(rig.module->batches.size() == 1);
+    CHECK(generation_of_module(*rig.plugin_module) == 0);
+    CHECK(rig.plugin_module->batches.empty());
+    CHECK(rig.events->count("patch_applied") == 0);
+
+    rig.hooks_status_at.clear();
+    Result<Value> reverted = revert_with(rig, "last");
+    REQUIRE_MESSAGE(reverted.has_value(), reverted.error().format());
+    CHECK(generation_of_module(*rig.module) == 0);
+    CHECK_FALSE(rig.module->is_hooked(kModuleBase + 0x1010));
+}
+
+TEST_CASE("cross-module reload (WP-54): a roll-back the agent does not confirm in time is CML3659, never CML3657") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable_with_plugin();
+    rig.option("hooks_timeout_ms", Value::integer(300));
+    cross_module(rig, make_object());
+    rig.hooks_status_at[2] = ipc::fault::ids::kAgentHookInstall;
+    rig.silent_hooks_at = 3;  // the roll-back's InstallHooks gets no answer (synchronised mode before SyncPoint())
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML3659");
+    CHECK(r.error().message.find("CML5852") != std::string::npos);
+    CHECK(diag_count(rig, "CML3659", "error") == 1);
+    CHECK(diag_count(rig, "CML3657", "warning") == 0);
+    check_neither_live(rig);  // the broker's state follows the roll-back
+}
+
+TEST_CASE("cross-module reload (WP-54): the plugin's hooks unconfirmed in time stop the reload there; the exe stays applied (CML3660)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable_with_plugin();
+    rig.option("hooks_timeout_ms", Value::integer(300));
+    cross_module(rig, make_object());
+    rig.silent_hooks_at = 2;  // plugin.dll's hooks: no HooksInstalled
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML5309");
+    CHECK(diag_count(rig, "CML3660", "warning") == 1);
+    CHECK(rig.seen<ipc::InstallHooks>().size() == 2);  // nothing was rolled back
+    CHECK(generation_of_module(*rig.module) == 1);
+    CHECK(rig.events->count("patch_applied") == 1);    // app.exe's: it is live
+    CHECK(rig.plugin_module->is_hooked(Rig::kPluginBase + 0x1010));  // recorded as installed: it may become live
+}
+
+TEST_CASE("cross-module reload (WP-54): the agent lost while the plugin is applied rolls nothing back and announces nothing (CML3661)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable_with_plugin();
+    cross_module(rig, make_object());
+    rig.close_on_load_at = 2;  // plugin.dll's LoadPatch: the agent disconnects
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().message.find("the agent is gone: 1 module(s) of this reload were applied before it (app.exe), 0 after it were not") != std::string::npos);
+    CHECK(diag_count(rig, "CML3661", "warning") == 1);
+    CHECK(rig.events->count("patch_applied") == 0);
+    CHECK(rig.seen<ipc::InstallHooks>().size() == 1);  // nothing was rolled back
+    CHECK(rig.module->batches.size() == 1);            // app.exe's stays recorded
+}
+
+TEST_CASE("cross-module reload (WP-54): processes stay independent; a refusal in one leaves the modules of the other applied") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable_with_plugin();
+    rig.enable2();  // a second process running app.exe only
+    cross_module(rig, make_object());
+    Rig::changed_unit(*rig.module2, 0, kLogic);
+    rig.link_fails = [](const std::string& path) { return path.find("p4712") != std::string::npos; };  // the second process's link
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML3350");
+    CHECK(r.error().message.find("(1 of 3 modules failed)") != std::string::npos);
+    CHECK(diag_count(rig, "CML3656", "warning") == 0);
+    CHECK(generation_of_module(*rig.module) == 1);
+    CHECK(generation_of_module(*rig.plugin_module) == 1);
+    CHECK(generation_of_module(*rig.module2) == 0);
+    CHECK(rig.events->count("patch_applied") == 2);
 }
 
 TEST_CASE("set-option compile_on_save validates, reports the previous value and starts and stops the watcher (WP-14)") {

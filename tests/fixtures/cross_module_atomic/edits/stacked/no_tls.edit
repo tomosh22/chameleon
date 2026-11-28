@@ -1,0 +1,10 @@
+--- a/scale.h
++++ b/scale.h
+@@ -7,6 +7,6 @@
+ constexpr int kScale = 2;
+ 
+ // 1: plugin.cpp (in the DLL) defines a new thread_local (refused by the planner, CML3400).
+-#define CML_PLUGIN_TLS 1
++#define CML_PLUGIN_TLS 0
+ 
+ // end of scale.h

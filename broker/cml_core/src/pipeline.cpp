@@ -223,16 +223,64 @@ public:
     Run(const PipelineEnv& env, AgentLink& link, ModuleState& module, const PipelineContext& ctx)
         : env_(env), link_(link), module_(module), ctx_(ctx), options_(*ctx.options) {}
 
+    ~Run() {
+        // ADR-0017: with the option set the broker's mapping of the PDB ends with the reload, whatever its outcome.
+        if (release_pdb_ && module_.index) {
+            module_.index->release_pdb();
+        }
+    }
+    Run(const Run&) = delete;
+    Run& operator=(const Run&) = delete;
+
+    // patch_module(): both phases at once.
     Result<PatchReport> execute() {
-        const Clock::time_point t_start = Clock::now();
-        Result<PatchReport> r = run();
+        if (Result<void> p = prepare_phase(); !p) {
+            return p.error();
+        }
+        return apply_phase();
+    }
+
+    // ---- WP-54 (ADR-0045): the two phases of the run, so that the reload service prepares every module of a process first ----
+    // prepare_phase: sweep, compile, and prepare every compiland (WP-47: plan, proofs, link, fix-ups; nothing changes in the process
+    // but the module's reservation). An error ends the run: a refused compiland has given the address space back and nothing is
+    // re-baselined. After a success apply_phase() or abandon() follows.
+    Result<void> prepare_phase() {
+        const Clock::time_point t0 = Clock::now();
+        Result<void> r = prepare_steps();
+        phase_ms_ += ms_between(t0, Clock::now());
+        return r;
+    }
+    Result<PatchReport> apply_phase() {
+        const Clock::time_point t0 = Clock::now();
+        Result<PatchReport> r = state_ == State::Done ? Result<PatchReport>(report_) : state_ == State::Prepared ? apply_steps() : Result<PatchReport>(not_prepared());
+        state_ = State::Finished;
+        phase_ms_ += ms_between(t0, Clock::now());
         if (r) {
-            r->times.total = ms_between(t_start, Clock::now());
+            r->times.total = phase_ms_;
         }
         return r;
     }
+    // Another module of the process was refused or failed (process_reload.cpp): nothing of this module is applied. Its staged
+    // compilands give their address space back and none of its files is re-baselined (as after a refusal of its own).
+    Diag abandon(Diag why) {
+        if (state_ == State::Prepared) {
+            CML_LOG(Trace, "reload: %s is not applied: %s", module_.name.c_str(), why.format().c_str());
+            state_ = State::Finished;
+            release_ranges(0);
+            (void)finish(why);
+        }
+        return why;
+    }
+    bool prepared() const noexcept { return state_ == State::Prepared; }
+    bool may_be_live() const noexcept { return maybe_live_; }
+    void hold_events() noexcept { hold_events_ = true; }
+    std::vector<Event> take_applied_events() { return std::move(held_events_); }
+    ModuleState& module() const noexcept { return module_; }
 
 private:
+    Diag not_prepared() const {
+        return Diag::make(pd::kStageFailed, "the reload of " + module_.name + " was not prepared, or applied already", "This is a bug in the broker; see the broker log.");
+    }
     // ---- helpers -----------------------------------------------------------------------------------------
     std::int64_t remaining_ms() const {
         return std::chrono::duration_cast<std::chrono::milliseconds>(ctx_.deadline - Clock::now()).count();
@@ -322,9 +370,22 @@ private:
     const pdb::PdbIndex* pdb_ = nullptr;
     std::string workdir_;
     std::vector<Unit>* units_ = nullptr;
+    // WP-54: what the run keeps between its two phases (locals of one function before).
+    enum class State { Failed, Done, Prepared, Finished };
+    State state_ = State::Failed;     // Done: nothing to compile, report_ is final; Prepared: apply_phase() or abandon() is next
+    PatchReport report_;
+    ModuleIndex::Sweep swept_;
+    std::vector<Unit> units_store_;
+    std::shared_ptr<const pdb::PdbIndex> pdb_hold_;
+    bool release_pdb_ = false;        // ADR-0017 (~Run)
+    std::uint64_t generation_before_ = 0;
+    double phase_ms_ = 0;             // times.total: the two phases (not the time a run waits for the other modules of its process)
+    bool maybe_live_ = false;         // a failed apply: the failed compiland may still become live (CML5309 / CML4656)
+    bool hold_events_ = false;        // `patch_applied` goes to held_events_, not to the bus
+    std::vector<Event> held_events_;
 
-    Result<PatchReport> run() {
-        PatchReport report;
+    Result<void> prepare_steps() {
+        PatchReport& report = report_;
         const LinkSnapshot snap = link_.snapshot();
         pid_ = snap.pid;
         report.pid = snap.pid;
@@ -367,24 +428,19 @@ private:
         if (!pdb_result) {
             return fail("sweep", pdb_result.error());
         }
-        const std::shared_ptr<const pdb::PdbIndex> pdb = *pdb_result;
-        // ADR-0017: with the option set the broker's mapping of the PDB ends with the reload, whatever its outcome.
-        struct ReleaseGuard {
-            ModuleIndex& index;
-            bool release;
-            ~ReleaseGuard() {
-                if (release) {
-                    index.release_pdb();
-                }
-            }
-        } release_guard{*module_.index, options_.release_pdb_after_reload};
+        pdb_hold_ = *pdb_result;
+        const std::shared_ptr<const pdb::PdbIndex>& pdb = pdb_hold_;
+        // ADR-0017: with the option set the broker's mapping of the PDB ends with the reload, whatever its outcome (~Run).
+        release_pdb_ = options_.release_pdb_after_reload;
         if (const std::optional<Diag> f = injected(ipc::fault::Stage::ChangeDetection)) {
             return fail("sweep", *f);
         }
-        Result<ModuleIndex::Sweep> swept = module_.index->sweep();
-        if (!swept) {
-            return fail("sweep", swept.error());
+        Result<ModuleIndex::Sweep> sweep_result = module_.index->sweep();
+        if (!sweep_result) {
+            return fail("sweep", sweep_result.error());
         }
+        swept_ = std::move(*sweep_result);
+        ModuleIndex::Sweep* const swept = &swept_;
         report.changed_files = swept->changed;
         for (const std::string& f : swept->unmapped) {
             warn(report, "sweep",
@@ -448,7 +504,8 @@ private:
             // Nothing to compile. Files that map to no compiland are accepted so they are not reported again.
             module_.index->accept(swept->stamps);
             report.patched = false;
-            return report;
+            state_ = State::Done;
+            return Result<void>();
         }
         report.compilands = swept->compilands.size();
 
@@ -463,7 +520,7 @@ private:
         if (!workdir) {
             return workdir.error();
         }
-        std::vector<Unit> units;
+        std::vector<Unit>& units = units_store_;
         std::vector<toolchain::CompileRequest> requests;
         std::vector<std::size_t> fresh;  // index in `units` of requests[k]
         std::optional<Diag> first_error;
@@ -588,7 +645,7 @@ private:
         // they were applied (their new functions and globals, hooks and code records: the overlay below). The apply (load,
         // fix-ups, initialisers, hooks) then runs per compiland; a failure there rolls back what this reload had applied (the
         // WP-22 revert of its batch).
-        const std::uint64_t generation_before = [&] {
+        generation_before_ = [&] {
             std::lock_guard<std::mutex> lock(module_.mutex);
             return module_.generation;
         }();
@@ -605,26 +662,45 @@ private:
         }
         if (failure) {
             release_ranges(0);
-        } else {
-            std::size_t with_effect = 0;
-            for (const std::unique_ptr<Staged>& s : staged_) {
-                with_effect += s->has_effect ? 1 : 0;
+            Result<PatchReport> finished = finish(failure);
+            return finished.error();
+        }
+        std::size_t with_effect = 0;
+        for (const std::unique_ptr<Staged>& s : staged_) {
+            with_effect += s->has_effect ? 1 : 0;
+        }
+        CML_LOG(Trace, "reload: all %zu compilands of %s are planned, linked and verified (%zu to apply)", staged_.size(), module_.name.c_str(), with_effect);
+        state_ = State::Prepared;
+        return Result<void>();
+    }
+
+    // The apply loop over the staged compilands (WP-47), then finish().
+    Result<PatchReport> apply_steps() {
+        state_ = State::Finished;
+        PatchReport& report = report_;
+        std::optional<Diag> failure;
+        CML_LOG(Trace, "reload: applying the compilands of %s", module_.name.c_str());
+        for (std::size_t i = 0; i < staged_.size() && !failure; ++i) {
+            if (!staged_[i]->has_effect) {
+                continue;
             }
-            CML_LOG(Trace, "reload: all %zu compilands of %s are planned, linked and verified (%zu to apply); applying", staged_.size(), module_.name.c_str(), with_effect);
-            for (std::size_t i = 0; i < staged_.size() && !failure; ++i) {
-                if (!staged_[i]->has_effect) {
-                    continue;
-                }
-                if (Result<void> applied = apply(i, report); !applied) {
-                    release_ranges(i);
-                    failure = after_apply_failure(applied.error(), i, generation_before);
-                }
-            }
-            if (!failure) {
-                add_plan_counts(report);
+            if (Result<void> applied = apply(i, report); !applied) {
+                release_ranges(i);
+                failure = after_apply_failure(applied.error(), i, generation_before_);
             }
         }
+        if (!failure) {
+            add_plan_counts(report);
+        }
+        return finish(failure);
+    }
 
+    // The end of the run, whatever its outcome: re-baselining, the batch, `patch_applied`, the CML3450 / CML3451 notes.
+    Result<PatchReport> finish(const std::optional<Diag>& failure) {
+        PatchReport& report = report_;
+        const std::vector<Unit>& units = units_store_;
+        const ModuleIndex::Sweep* const swept = &swept_;
+        const std::uint64_t generation_before = generation_before_;
         // Re-baseline the files whose every compiland is live (applied, or unchanged against the running code); the others are
         // processed again next time. A compiland that loaded nothing counts only when its comparison did not rely on a compiland
         // staged before it that was then not applied.
@@ -675,8 +751,11 @@ private:
             module_.batches.push_back(std::move(batch));
         }
         // WP-47: `patch_applied` is published once the reload's compilands are live, never for one that a later failure rolled back.
-        if (ctx_.events != nullptr) {
-            for (Event& e : applied_events_) {
+        // WP-54: for a module of a process with several, once every module of the process is (the caller takes them).
+        for (Event& e : applied_events_) {
+            if (hold_events_) {
+                held_events_.push_back(std::move(e));
+            } else if (ctx_.events != nullptr) {
                 ctx_.events->publish(std::move(e));
             }
         }
@@ -1349,6 +1428,7 @@ private:
             return d;
         }
         if (s.live_unconfirmed) {
+            maybe_live_ = true;  // WP-54: the other modules of the process are not rolled back either
             const std::size_t left = with_effect - applied - 1;
             CML_LOG(Trace, "reload: compiland %s%s may still become live (%s): no roll-back; %zu applied before it, %zu not applied", unit_name(s).c_str(),
                     unit_suffix(s).c_str(), d.id().c_str(), applied, left);
@@ -1464,7 +1544,7 @@ private:
                 }
             }
             if (!sp->has_effect) {
-                ++report.units_unchanged;  // WP-25: run() turns "every unit unchanged" into the CML3450 / CML3451 warning
+                ++report.units_unchanged;  // WP-25: finish() turns "every unit unchanged" into the CML3450 / CML3451 warning
                 for (const std::string& n : c.data_changes) {
                     report.data_changes.push_back(n);
                 }
@@ -1949,9 +2029,31 @@ private:
 
 }  // namespace
 
-Result<PatchReport> PatchPipeline::patch_module(AgentLink& link, ModuleState& module, const PipelineContext& context) {
+Result<PatchReport> PatchPipeline::patch_module(AgentLink& link, ModuleState& module, const PipelineContext& context) const {
     Run run(env_, link, module, context);
     return run.execute();
 }
+
+// ---- WP-54: ModuleReload ----------------------------------------------------------------------------------------------------
+
+struct ModuleReload::Impl {
+    Impl(const PipelineEnv& env, AgentLink& link, ModuleState& module, const PipelineContext& context) : run(env, link, module, context) {}
+    Run run;
+};
+
+ModuleReload::ModuleReload(const PatchPipeline& pipeline, AgentLink& link, ModuleState& module, const PipelineContext& context, bool events_held)
+    : impl_(std::make_unique<Impl>(pipeline.env(), link, module, context)) {
+    if (events_held) {
+        impl_->run.hold_events();
+    }
+}
+ModuleReload::~ModuleReload() = default;
+Result<void> ModuleReload::prepare() { return impl_->run.prepare_phase(); }
+bool ModuleReload::prepared() const { return impl_->run.prepared(); }
+Result<PatchReport> ModuleReload::apply() { return impl_->run.apply_phase(); }
+Diag ModuleReload::abandon(Diag why) { return impl_->run.abandon(std::move(why)); }
+bool ModuleReload::may_be_live() const { return impl_->run.may_be_live(); }
+std::vector<Event> ModuleReload::take_applied_events() { return impl_->run.take_applied_events(); }
+ModuleState& ModuleReload::module() const { return impl_->run.module(); }
 
 }  // namespace cml::core
