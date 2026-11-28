@@ -412,9 +412,10 @@ Asm cl_bitmask(const std::string& options = "") {
     return s;
 }
 
-GuardCodeReading read(const Asm& a, const char* guard, GuardCodeKind kind, std::string_view data_reference = {}) {
+GuardCodeReading read(const Asm& a, const char* guard, GuardCodeKind kind, std::string_view data_reference = {},
+                      const std::map<std::string, std::int32_t, std::less<>>& cands = candidates()) {
     const std::vector<GuardCodeSection> code = {a.section(".text$mn")};
-    const GuardCodeReading r = read_guard_code(code, guard, 9, kind, candidates(), data_reference);
+    const GuardCodeReading r = read_guard_code(code, guard, 9, kind, cands, data_reference);
     if (!r.proved) {
         MESSAGE(r.why);
     }
@@ -462,12 +463,12 @@ TEST_CASE("R-69 (reader): shapes that are not read refuse") {
     };
     const std::vector<Bad> bad = {
         {"the guard's address hoisted into rbx", cl_thread_safe("h"), kG, GuardCodeKind::ThreadSafe, "by an instruction that is not read"},
-        {"calls written in the bracket too", cl_thread_safe("c"), kG, GuardCodeKind::ThreadSafe, "refers to 2 of them"},
-        {"no candidate written in the bracket", cl_thread_safe("n"), kG, GuardCodeKind::ThreadSafe, "refers to none"},
+        {"calls written in the bracket too", cl_thread_safe("c"), kG, GuardCodeKind::ThreadSafe, "writes 2 of them"},
+        {"no candidate written in the bracket", cl_thread_safe("n"), kG, GuardCodeKind::ThreadSafe, "writes none"},
         {"a jump into the bracket", cl_thread_safe("j"), kG, GuardCodeKind::ThreadSafe, "is entered from"},
         {"a stored value that is no or of a constant", cl_bitmask("v"), kM, GuardCodeKind::Bitmask, "not an or"},
         {"two bits set at once", cl_bitmask("3"), kM, GuardCodeKind::Bitmask, "not one bit"},
-        {"calls written in the region too", cl_bitmask("c"), kM, GuardCodeKind::Bitmask, "refers to 2 of them"},
+        {"calls written in the region too", cl_bitmask("c"), kM, GuardCodeKind::Bitmask, "writes 2 of them"},
         {"a bitmask read as a thread-safe guard", cl_bitmask(), kM, GuardCodeKind::ThreadSafe, "not read"},
     };
     for (const Bad& b : bad) {
@@ -497,7 +498,7 @@ TEST_CASE("R-69 (reader): the guard in data, through a section symbol, behind un
         a.relocs.push_back(sec);
         const GuardCodeReading r = read(a, kM, GuardCodeKind::Bitmask);
         CHECK_FALSE(r.proved);
-        CHECK(contains(r.why, "through its section symbol"));
+        CHECK(contains(r.why, "through another symbol"));
     }
     {
         // A relocation inside a run of nops: the sweep stops there, and the guard's uses behind it are not decoded.
@@ -516,7 +517,7 @@ TEST_CASE("R-69 (reader): the guard in data, through a section symbol, behind un
         a.bytes.insert(a.bytes.end(), rest.bytes.begin(), rest.bytes.end());
         const GuardCodeReading r = read(a, kM, GuardCodeKind::Bitmask);
         CHECK_FALSE(r.proved);
-        CHECK(contains(r.why, "behind code that was not decoded"));
+        CHECK(contains(r.why, "does not decode completely"));
     }
     {
         Asm a;
@@ -548,6 +549,106 @@ TEST_CASE("R-69 (reader): a candidate whose address is put in a register is repo
     REQUIRE(r.proved);
     CHECK(r.statics == std::set<std::string>{kA});
     CHECK(r.address_taken == std::set<std::string>{kCalls});
+}
+
+TEST_CASE("R-69 (review 1): a ternary initialiser: the claim is the static the region writes, not one it only reads") {
+    // `static int calls = pick(x) ? 1 : make_int(2);` next to new statics x and a: the store to calls sits behind the
+    // jmp/join of the ternary, and the region reads x first. Until review 1 the region stopped at the jmp and pinned the bit
+    // on x (calls would then be bound next to a fresh bitmask and initialised again); now it follows the branches to the join
+    // and counts only what it writes.
+    const char* const kX = "?x@?1??counter@@YAHXZ@4HA";
+    Asm s;
+    s.raw({0x8B, 0x05}).rel(kM);                   // mov eax, [rip+M]
+    s.raw({0xA8, 0x02});                           // test al, 2
+    const std::uint32_t jne_done = s.here();
+    s.raw({0x75, 0x00});                           // jne done
+    s.raw({0x83, 0xC8, 0x02});                     // or eax, 2
+    s.raw({0x89, 0x05}).rel(kM);                   // mov [rip+M], eax
+    s.raw({0x8B, 0x0D}).rel(kX);                   // mov ecx, [rip+x]
+    s.raw({0xE8}).rel("?pick@@YAHH@Z");            // call pick
+    s.raw({0x85, 0xC0});                           // test eax, eax
+    const std::uint32_t jne_one = s.here();
+    s.raw({0x75, 0x00});                           // jne L1
+    s.raw({0xB9, 0x02, 0, 0, 0});                  // mov ecx, 2
+    s.raw({0xE8}).rel("?make_int@@YAHH@Z");        // call make_int
+    const std::uint32_t jmp_join = s.here();
+    s.raw({0xEB, 0x00});                           // jmp L2
+    const std::uint32_t one = s.here();
+    s.raw({0xB8, 0x01, 0, 0, 0});                  // L1: mov eax, 1
+    const std::uint32_t join = s.here();
+    s.raw({0x89, 0x05}).rel(kCalls);               // L2: mov [rip+calls], eax
+    const std::uint32_t done = s.here();
+    s.raw({0x8B, 0x05}).rel(kCalls);               // done: mov eax, [rip+calls]
+    s.raw({0xC3});                                 // ret
+    s.jump8(jne_done, done);
+    s.jump8(jne_one, one);
+    s.jump8(jmp_join, join);
+    const GuardCodeReading r = read(s, kM, GuardCodeKind::Bitmask, {}, {{kCalls, 3}, {kA, 4}, {kX, 5}});
+    REQUIRE(r.proved);
+    CHECK(r.statics == std::set<std::string>{kCalls});
+    REQUIRE(r.claims.size() == 1);
+    CHECK(r.claims[0].bits == 0x2u);
+}
+
+TEST_CASE("R-69 (review residual b): the register a claim stores must be loaded from the guard") {
+    // `mov eax, [other]; ... or eax, 1; mov [M], eax`: the store could set any bits; refused. The cl shape (loaded from the
+    // guard before the test) is proved (above).
+    Asm s;
+    s.raw({0x8B, 0x05}).rel("?other@@3HA");        // mov eax, [rip+other]
+    s.raw({0xA8, 0x01});                           // test al, 1
+    const std::uint32_t jne = s.here();
+    s.raw({0x75, 0x00});                           // jne done
+    s.raw({0x83, 0xC8, 0x01});                     // or eax, 1
+    s.raw({0x89, 0x05}).rel(kM);                   // mov [rip+M], eax
+    s.raw({0x48, 0x89, 0x05}).rel(kA);             // mov [rip+a], rax
+    const std::uint32_t done = s.here();
+    s.raw({0xC3});                                 // done: ret
+    s.jump8(jne, done);
+    const GuardCodeReading r = read(s, kM, GuardCodeKind::Bitmask);
+    CHECK_FALSE(r.proved);
+    CHECK(contains(r.why, "is not shown to hold the guard"));
+}
+
+TEST_CASE("R-69 (review 3, 4, 2): an alias of the guard, bts of a 64-bit form or a bit beyond 31, a candidate behind a decoder stop") {
+    {
+        Asm a = cl_bitmask();
+        a.raw({0x8B, 0x05}).rel("$guard_alias", 0, 0, 9);  // mov eax, [rip+label in the guard's section]
+        a.raw({0xC3});
+        const GuardCodeReading r = read(a, kM, GuardCodeKind::Bitmask);
+        CHECK_FALSE(r.proved);
+        CHECK(contains(r.why, "refers to the guard's section through another symbol"));
+    }
+    {
+        Asm a = cl_bitmask();
+        a.raw({0x0F, 0xBA, 0x2D}).rel(kM, 1).raw({0x21});  // bts dword ptr [rip+M], 33
+        a.raw({0xC3});
+        const GuardCodeReading r = read(a, kM, GuardCodeKind::Bitmask);
+        CHECK_FALSE(r.proved);
+        CHECK(contains(r.why, "in a form that is not read"));
+    }
+    {
+        Asm a = cl_bitmask();
+        a.raw({0x48, 0x0F, 0xBA, 0x2D}).rel(kM, 1).raw({0x02});  // bts qword ptr [rip+M], 2
+        a.raw({0xC3});
+        const GuardCodeReading r = read(a, kM, GuardCodeKind::Bitmask);
+        CHECK_FALSE(r.proved);
+        CHECK(contains(r.why, "in a form that is not read"));
+    }
+    {
+        // The guard's uses all decode; behind them, data the sweep cannot pass, then `lea rcx, [calls]`.
+        Asm a = cl_bitmask();
+        a.raw({0x90, 0x90, 0x90, 0x90, 0x90});
+        GuardCodeReloc jt;
+        jt.offset = a.here() - 4;
+        jt.width = 4;
+        jt.target = "$LN7";
+        a.relocs.push_back(jt);
+        a.raw({0x48, 0x8D, 0x0D}).rel(kCalls);  // lea rcx, [rip+calls]
+        a.raw({0xC3});
+        const GuardCodeReading r = read(a, kM, GuardCodeKind::Bitmask);
+        CHECK_FALSE(r.proved);
+        CHECK(contains(r.why, "does not decode completely"));
+    }
 }
 
 TEST_CASE("R-69 (reader): one bit per static, one static per bit") {

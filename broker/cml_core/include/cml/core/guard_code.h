@@ -11,28 +11,32 @@
 // Two kinds of guard:
 //   * a bitmask (`??_B<scope>@5<n>`: clang-cl and cl without thread-safe statics): a claim is the store that sets ONE bit,
 //     `or r32, imm` / `bts r32, imm8` immediately followed by `mov [guard], r32` (or `mov [guard], r8` after `or r8, imm8`),
-//     or `or [guard], imm` / `bts [guard], imm8` directly. Its region runs from the claim to the first instruction that is
-//     a branch target, refers to the guard again, or ends the flow (jmp, ret, int3/ud2): the code that runs once the bit
-//     is set, in the layout both compilers use (clang: an out-of-line block that jumps back; cl: a block skipped by a jne).
+//     where on every path back from the `or` the register is loaded from the guard (`mov r32, [guard]`, `mov r8, [guard+n]`)
+//     with only test / cmp / bt / jumps between; or `or [guard], imm` / `bts [guard], imm8` (32-bit, bit < 32) directly.
 //     Other uses: loads, `test`, `cmp`, `bt` (reads), and the clearing of a bit after an initialiser threw (`and` / `btr`,
 //     an EH funclet's), which claims nothing.
 //   * a thread-safe guard (`?$TSS<n>@<block>@4HA`, both compilers' default): a claim is `lea rcx, [guard]` immediately
-//     followed by a call of `_Init_thread_header`; its region runs to `lea rcx, [guard]` + `call _Init_thread_footer`, in a
-//     straight line (no jmp, ret or trap before it, no branch into it from outside, no second header). Other uses: loads and
-//     `cmp` (reads), `lea rcx, [guard]` + `call _Init_thread_abort` (an EH funclet's).
-// A claim's static is the ONE candidate static (the statics the guard's name ties: its function's or its block's) that the
-// region refers to; a region that refers to none or to more than one is not read. Every reference to the guard in every
-// code section of the patch must be one of these forms, in an instruction the sweep decoded (the agent's length decoder,
-// from the start of the section and from every function symbol, as WP-36's SiteProver: every relocation must be exactly a
-// displacement or an immediate of one decoded instruction). A guard referenced from data other than debug information,
-// through a section symbol, or at an offset that is not its own is not read; nor is one without any claim. Each bit (or the
-// thread-safe guard) must belong to one static, and each static to one bit.
+//     followed by a call of `_Init_thread_header`, reached only from that lea. Other uses: loads and `cmp` (reads),
+//     `lea rcx, [guard]` + `call _Init_thread_footer` (the end of a region) or `_Init_thread_abort` (an EH funclet's).
+// A claim's region is every instruction reachable from it (direct branches followed, calls return) that the code cannot
+// reach from any function start without passing the claim, up to the next use of the guard (a bitmask) or the guard's
+// footer (thread-safe: every path must end there or rejoin the rest of the code, none at a ret). Nothing may enter the
+// region from outside it. Its static is the ONE candidate (the statics the guard's name ties: its function's or its
+// block's) that the region WRITES: a store or read-modify-write to it, or its address formed (`lea`, an immediate) as for a
+// constructor; a candidate it only reads does not count, and a region that writes none or several is not read. Every
+// function of a section that uses the guard must decode completely (the agent's length decoder, from the start of the
+// section and from every function symbol, as WP-36's SiteProver: every relocation exactly a displacement or an immediate
+// of one decoded instruction), with no indirect jump, and every use of the guard must be one of these forms. A guard
+// referenced from data other than debug information, through another symbol of its section, or at an offset that is not
+// its own is not read; nor is one without any claim; nor a section that uses the guard and names another symbol of a
+// candidate's section. Each bit (or the thread-safe guard) must belong to one static, and each static to one bit.
 //
 // What it proves: the statics initialised under the guard, and so the statics of its scope that are not (no claim's region
-// refers to them: constant-initialised, or guarded by another guard of their block). It also lists the candidates whose
+// writes them: constant-initialised, or guarded by another guard of their block). It also lists the candidates whose
 // address the code puts in a register or an immediate (`address_taken`): a region could write such a static through that
 // address while naming another, so the planner keeps a bound static only when its address is not taken. The residual
-// (docs/wp/WP-63.md): a region that writes a static through an address read from memory or returned by a call.
+// (docs/wp/WP-63.md): a region that writes a static through an address read from memory or returned by a call (the
+// initialiser of a new static writing a kept one: it runs once, the program's own semantics).
 
 #include <cstddef>
 #include <cstdint>

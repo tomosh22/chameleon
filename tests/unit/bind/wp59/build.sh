@@ -15,8 +15,11 @@ CLANG_CL=${2:-clang-cl}
 LLD_LINK=${3:-lld-link}
 mkdir -p "$W"
 W=$(cd "$W" && pwd -P)
+case "$W" in
+  /) echo "build.sh: refusing work dir '$W': it is /" >&2; exit 2 ;;
+esac
 case "$W/" in
-  "/" | "$HERE/"*) echo "build.sh: refusing work dir '$W': it is /, $HERE or inside it" >&2; exit 2 ;;
+  "$HERE/"*) echo "build.sh: refusing work dir '$W': it is $HERE or inside it" >&2; exit 2 ;;
 esac
 case "$HERE/" in
   "$W/"*) echo "build.sh: refusing work dir '$W': it contains $HERE" >&2; exit 2 ;;
