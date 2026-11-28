@@ -1543,6 +1543,67 @@ that reload (WP-22 batch revert, per module, newest first). Different processes 
   largest).
 - Unit tests cover each invalidation (changed input, unreadable file, module unload).
 
+**Ruling (WP-52 convergence, ADR-0018):** the CML3211 error is decided per static, not per guard: every function-local
+static of the patch bound to the running process that needs a guard must have a tied guard bound to the old one, or the reload is
+refused (CML3211, naming the static); an untied guard no such refusal names stays a warning. No function matching decides the
+error (this supersedes the round-1 ruling that kept the warning when a scope could not be read, which was the unsafe direction).
+Names are read with the spelling of the compiler that wrote them: the patch object's own S_COMPILE3; clang counts `$TSS<n>` from
+19.1.0 (clang 19.0.x is unknown); with an unknown compiler a guard is tied only when both readings tie the same statics.
+
+**Ruling (WP-52, silent resets):** WP-52's cl fixture showed a nested lambda's static and its guard both decided new with no
+diagnostic, so a reload reset live state (pre-existing; R-66 is the clang form). A function-local static of the patch decided new
+while the old compiland holds a data record of the same base name in a procedure of the same outermost function (the function, its
+lambdas' call operators, procedures they were inlined into; counted as the same when it cannot be told) is refused with CML3207.
+A static whose name has no record in that function stays new. Binding such statics instead of refusing them is R-68.
+
 WP-52..WP-55 start together (four at once). WP-52 and WP-53 share `broker/cml_core/src/bind_plan.cpp`, and WP-54 and WP-55
 share `reload_service.cpp`: whoever merges second merges main and re-runs CI. Rules as in ADR-0043: one PR per WP, CI on the
 Windows matrix is the only acceptance, the orchestrator reads the logs; "refuse what cannot be proven" stands.
+
+## ADR-0046 Wave 14: bind what wave 13 refuses, narrow WP-51, planner cost (WP-56..WP-59)
+
+**Date:** 2026-11-28 · **Status:** Accepted (wave 13 closed with #85)
+
+Wave 13 (ADR-0045) closed R-56, R-58, R-60, R-61, R-63 and R-66 (by refusal). Its rulings traded correctness for over-refusal in
+three places: nested lambdas' statics (WP-52, R-68), any own static of a function that inlined closure code (WP-51, R-59) and
+clang's bitmask guards that are not recognised (R-67). Wave 14 turns proven cases of those back into reloads, and finds where the
+bind planner's extra cost on Jolt clang-cl comes from (R-62). "Refuse what cannot be proven" stands: every narrowing needs a proof.
+
+| WP | Roadmap | Title | Branch | Review |
+|---|---|---|---|---|
+| WP-56 | R-68 | Bind a nested lambda's static instead of refusing it | `wp/56-nested-statics` | high (bind planner) |
+| WP-57 | R-59 | WP-51 refuses an own static only when the patch cannot prove the inlined closure unchanged | `wp/57-narrow-inlined` | high (bind planner) |
+| WP-58 | R-62 | Bind-planner cost on Jolt clang-cl | `wp/58-plan-cost` | medium |
+| WP-59 | R-67 | clang's `??_B` bitmask guards are guards | `wp/59-bitmask-guards` | high (bind planner) |
+
+### WP-56: bind a nested lambda's static instead of refusing it (R-68)
+
+**Decision.** WP-37/WP-40's closure comparisons compare a static's decorated scope after `??R` with closure unique names after
+resolving back-references on both (WP-52's `local_scope_key` reader), and a static of a fully inlined nested lambda is looked for
+in the chain of enclosing procedures. Where the static's record is then found and proven its own, it binds; otherwise WP-52's
+refusal (CML3207) stays. **Acceptance:** `planner_pairing_o2`'s nest step binds under cl and clang-cl in all 8 cells (no refusal,
+no reset); unit tests with WP-52's cl names and R-66's clang shape bind; WP-52's refusal tests that have no proof still refuse;
+corpus `fail=0`.
+
+### WP-57: WP-51 refuses an own static only when the inlined closure cannot be proven unchanged (R-59)
+
+**Decision.** Spike first: what the patch gives to prove that every closure the old procedure inlined still exists with the same
+identity and code (WP-25's comparator on the patch's call operators against the old inline sites' code, closure numbering, rule
+(d)). The orchestrator rules on the spike before code. **Acceptance:** a function with a `static` and a `std::sort` with an
+unchanged lambda reloads; R-54's edit (the lambda deleted) is still refused; WP-51's unit tests unchanged; corpus `fail=0`.
+
+### WP-58: bind-planner cost on Jolt clang-cl (R-62)
+
+**Decision.** Profile the planner on the Jolt clang-cl corpus's two largest reloads (418 / 865 ms against 336 / 709 ms before
+WP-51) and remove the cost that is not a correctness check, with every verdict unchanged. **Acceptance:** `plan_ms` of those two
+reloads at or below 336 / 709 ms in the corpus cell; per-stage timings in `WP50-PLAN`; no planner test changes.
+
+### WP-59: clang's `??_B` bitmask guards are guards (R-67)
+
+**Decision.** `is_guard_variable` and the guard rules (settle_guards, require_bound_guards, prove_bitmask_guards) recognise
+clang's `??_B<scope>@51` bitmask guards of inline functions' statics under `-fno-threadsafe-statics`. **Acceptance:** a fixture
+built with clang-cl `-fno-threadsafe-statics` keeps an inline function's static across a reload in the clang-cl cells; unit
+tests with real names; corpus `fail=0`.
+
+WP-56..WP-59 start together; WP-56, WP-57 and WP-59 share `bind_plan.cpp` (whoever merges second merges main and re-runs CI).
+Rules as in ADR-0043.
