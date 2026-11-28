@@ -683,6 +683,12 @@ private:
     // own procedure (not in the function an inlined lambda's static is looked for in, WP-40) and that procedure inlined a
     // risky inlinee, the static is refused (CML3207) and true is returned.
     bool refuse_inlined_owner(Sym& sy, const pdb::SymbolView& record, const std::string& encl, const char* step);
+    // WP-53 (R-61): the record of a call operator of `sy`'s own closure (rule (d)'s pairing applied) at `record`'s address,
+    // in another procedure than `record`'s (cl's twin, WP-40), or null. The data records of call operators by RVA are
+    // indexed once per compiland.
+    const pdb::SymbolView* own_closure_twin(const Sym& sy, const pdb::SymbolView& record);
+    std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> op_records_by_rva_;
+    bool op_records_indexed_ = false;
     std::optional<OldRef> resolve_name(Sym& sy);  // the undefined-symbol chain
 
     void decide(Sym& sy, DecisionKind kind, BindSource source, SymbolType type, const TargetAddress& addr, std::string reason);
@@ -1348,6 +1354,41 @@ std::string Planner::own_closure_scope(const Sym& sy) const {
         }
     }
     return scope;
+}
+
+const pdb::SymbolView* Planner::own_closure_twin(const Sym& sy, const pdb::SymbolView& record) {
+    if (!op_records_indexed_) {
+        op_records_indexed_ = true;
+        for (std::uint32_t i = 0; i < comp_syms_.size(); ++i) {
+            const pdb::SymbolView& v = comp_syms_[i];
+            if (pdb::is_data_kind(v.kind) && v.rva != pdb::kNoRva && v.parent_proc != pdb::kNoSymbol && v.parent_proc < comp_syms_.size() &&
+                last_component(comp_syms_[v.parent_proc].name) == "operator()") {
+                op_records_by_rva_[v.rva].push_back(i);
+            }
+        }
+    }
+    const auto at = op_records_by_rva_.find(record.rva);
+    if (at == op_records_by_rva_.end()) {
+        return nullptr;
+    }
+    const std::string scope = own_closure_scope(sy);
+    for (const std::uint32_t i : at->second) {
+        const pdb::SymbolView& v = comp_syms_[i];
+        if (&v == &record || v.parent_proc == record.parent_proc) {
+            continue;
+        }
+        // The call operator's closure, by its type (the unique name without ".?AV" and the unit's discriminator), must begin
+        // the static's decorated scope: display names do not tell lambdas apart (clang names them `f::<lambda_0>` alike),
+        // and a record of another closure's call operator is that closure's (o's static, inlined into k), not a twin.
+        const ClosureId id = closure_of(v);
+        if (id.known && !id.tail.empty() && !scope.empty() && starts_with(scope, id.tail)) {
+            return &v;
+        }
+        CML_LOG(Trace, "WP53-NOT-TWIN static='%s' record rva=%s in '%s': closure %s is not the static's own (%s)", sy.dec.display.c_str(), hex(v.rva).c_str(),
+                std::string(comp_syms_[v.parent_proc].name).c_str(), id.known ? (id.tail.empty() ? "(none)" : id.tail.c_str()) : ("unknown: " + id.why).c_str(),
+                scope.c_str());
+    }
+    return nullptr;
 }
 
 bool Planner::refuse_inlined_owner(Sym& sy, const pdb::SymbolView& record, const std::string& encl, const char* step) {
@@ -3861,6 +3902,49 @@ void Planner::bridge_statics() {
             }
         }
     }
+    // WP-53 (R-61, ADR-0045): a static of a call operator paired with a record directly in the procedure its lambda was
+    // inlined into (WP-40's in-caller pairing, by the layout or by its place in the function) is that lambda's static or
+    // the procedure's own, and nothing in the records tells which (clang-cl writes both alike). The pairing stands only if
+    // the code of that procedure proves it: it is listed for the pipeline (prove_inlined_lambda_statics), which refuses it
+    // (CML3207) unless the patch's version of the procedure is the old code under the plan. A record of a call operator at
+    // the same address (cl's twin, WP-40) identifies the lambda by itself: such a pairing is the closure step's and is
+    // not listed.
+    for (const auto& [key, g] : groups) {
+        if (g.is_func || g.encl != "operator()") {
+            continue;
+        }
+        const std::string enclosing = lambda_enclosing(g.display, g.base);
+        if (enclosing.empty()) {
+            continue;
+        }
+        for (const std::uint32_t pos : g.members) {
+            const auto m = matched.find(pos);
+            if (m == matched.end() || syms_[pos].decided || !is_inlined_record(m->second.view, enclosing)) {
+                continue;
+            }
+            const pdb::SymbolView& record = *m->second.view;
+            // (Review of bb63263: only a call operator of the static's OWN closure makes a twin; any record in a procedure named
+            // `operator()` at that address was taken for one, so a static of an outer lambda o that was also inlined into
+            // another lambda k left the pairing unproven.)
+            if (const pdb::SymbolView* twin = own_closure_twin(syms_[pos], record)) {
+                CML_LOG(Trace, "WP53-TWIN static='%s' record rva=%s: the call operator '%s' of its own closure records it at that address too; not listed",
+                        syms_[pos].dec.display.c_str(), hex(record.rva).c_str(), std::string(comp_syms_[twin->parent_proc].name).c_str());
+                continue;
+            }
+            const pdb::SymbolView& proc = comp_syms_[record.parent_proc];
+            InlinedLambdaStatic s;
+            s.symbol = syms_[pos].name;
+            s.display = syms_[pos].dec.display;
+            s.record_rva = record.rva;
+            s.proc = std::string(proc.name);
+            s.proc_rva = proc.rva;
+            s.how = m->second.how;
+            CML_LOG(Trace, "WP53-LISTED static='%s' record rva=%s in '%s' (rva %s) paired by %s: proven by the code of '%s' or refused", s.display.c_str(), hex(s.record_rva).c_str(),
+                    s.proc.c_str(), hex(s.proc_rva).c_str(), to_string(s.how), s.proc.c_str());
+            plan_.inlined_lambda_statics.push_back(std::move(s));
+        }
+    }
+
     if (wp51_procs_ != 0) {
         CML_LOG(Info, "WP51-INLINEES object=%s procs=%zu sites=%zu closures=%zu unreadable=%zu refused=%zu would_refuse=%zu", in_.object_name.c_str(), wp51_procs_, wp51_sites_,
                 wp51_closures_, wp51_unreadable_, wp51_refused_, wp51_would_refuse_);

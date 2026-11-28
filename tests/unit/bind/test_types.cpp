@@ -2449,6 +2449,8 @@ TEST_CASE("inlined lambdas under cl /O2 /Ob2: a static recorded both in its oper
     CHECK(decision(*r, static_in_lambda("$TSS0", 1)).old_address.rva == 0x3028);
     CHECK(decision(*r, static_in_lambda("sname", 2)).old_address.rva == 0x3030);
     CHECK(decision(*r, static_in_lambda("$TSS0", 2)).old_address.rva == 0x3038);
+    // WP-53: the twin record in the call operator identifies the lambda; nothing is left for the code proof.
+    CHECK(r->inlined_lambda_statics.empty());
 }
 
 TEST_CASE("inlined lambdas under cl /O2 /Ob2: a caller's record at ANOTHER address than the operator's is not the same variable") {

@@ -207,4 +207,14 @@ std::vector<Diag> prove_bitmask_guards(const NarrowInput& input);
 // `WP46-HASHED-LAMBDAS object=... closures=N unchanged=N changed=N unknown=N proven=unchanged|one-changed|refused`.
 std::vector<Diag> prove_hashed_lambdas(const NarrowInput& input);
 
+// WP-53 (R-61, ADR-0045). For every BindPlan::inlined_lambda_statics entry (a lambda's static bound to a record directly in
+// the procedure it was inlined into, which may as well be that procedure's own static): the patch's version of the
+// procedure (the hook whose old entry is the procedure's) is compared with the old code, by the rules above and with the
+// plan's decisions. Unchanged proves the pairing: the old procedure used that record exactly as the new one uses the
+// lambda's static. Anything else (changed, not hooked, not comparable, an earlier patch's code that differs) gives one
+// CML3207 per listed static of that procedure. One verdict per procedure. Logs `WP53-INLINED-PROOF static=... proc=...
+// proven=unchanged|refused` (trace) per static and `WP53-INLINED object=... listed=N proven=N refused=N skipped=N` (Info, when the
+// plan lists any).
+std::vector<Diag> prove_inlined_lambda_statics(const NarrowInput& input);
+
 }  // namespace cml::core
