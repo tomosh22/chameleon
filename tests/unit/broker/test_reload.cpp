@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -2072,23 +2073,7 @@ TEST_CASE("the PDB index can be released and mapped again (ADR-0017)") {
     CHECK(rig.module->index->pdb() == nullptr);
 }
 
-// ---- failure injection (WP-28, ADR-0035) -----------------------------------------------------------------------
-
-#if defined(CML_FAULT_INJECTION)
-
 namespace {
-
-Value inject_args(const std::string& stage, int count = 0, int pid = 0) {
-    Value args = Value::object();
-    args.set("stage", Value::string(stage));
-    if (count != 0) {
-        args.set("count", Value::integer(count));
-    }
-    if (pid != 0) {
-        args.set("pid", Value::integer(pid));
-    }
-    return args;
-}
 
 // WP-62: joins a thread a test started, also when a REQUIRE leaves the test early (a joinable std::thread terminates the binary).
 struct JoinOnExit {
@@ -2131,6 +2116,26 @@ private:
     bool done_ = false;
     std::thread thread_;
 };
+
+}  // namespace
+
+// ---- failure injection (WP-28, ADR-0035) -----------------------------------------------------------------------
+
+#if defined(CML_FAULT_INJECTION)
+
+namespace {
+
+Value inject_args(const std::string& stage, int count = 0, int pid = 0) {
+    Value args = Value::object();
+    args.set("stage", Value::string(stage));
+    if (count != 0) {
+        args.set("count", Value::integer(count));
+    }
+    if (pid != 0) {
+        args.set("pid", Value::integer(pid));
+    }
+    return args;
+}
 
 }  // namespace
 
@@ -3107,6 +3112,49 @@ TEST_CASE("a session directory the user supplied is never removed; the temporary
         temp.service.reset();
     }
     CHECK_FALSE(std::filesystem::exists(std::filesystem::path(default_dir)));
+}
+
+
+TEST_CASE("an index thread that outlives the service never calls into it (WP-62): its Ready callback is closed by ~ReloadService") {
+    // Before WP-62 the index's on_change called rearm_save_watcher() on the service whenever its thread reached Ready, and that thread
+    // runs on as long as anybody holds the ModuleState (here the rig): a call into a destroyed service, which TSan reported as a race
+    // with ~ReloadService. The index thread is held right before its Ready callback (a latch, not a sleep) while the service goes.
+    QuietLogs quiet;
+    Rig rig;
+    std::promise<void> at_ready;
+    std::future<void> reached = at_ready.get_future();
+    std::promise<void> release;
+    std::shared_future<void> released = release.get_future().share();
+    std::atomic<bool> held{false};
+    std::atomic<bool> service_gone{false};
+    std::atomic<int> entered_after_destruction{0};
+    std::atomic<int> entered_alive{0};
+    ReloadService::IndexCallbackHooks hooks;
+    hooks.before = [&](const IndexStatus& s) {
+        if (s.state == IndexState::Ready && !held.exchange(true)) {
+            at_ready.set_value();
+            released.wait();
+        }
+    };
+    hooks.entered = [&](const IndexStatus&) {
+        if (service_gone) {
+            ++entered_after_destruction;
+        } else {
+            ++entered_alive;
+        }
+    };
+    rig.service->set_index_callback_hooks_for_testing(hooks);
+    const HangWatchdog watchdog(std::chrono::seconds(60), "the service's destruction while its index thread waits to report Ready");
+    rig.enable();  // the index is Ready (its status is set before the callback runs); its thread waits in `before`
+    reached.wait();
+    std::weak_ptr<ModuleState> state = rig.module;  // the rig still holds it: the index thread is not joined by ~ReloadService
+    rig.service.reset();
+    service_gone = true;
+    release.set_value();  // the index thread goes on into its Ready callback
+    rig.module.reset();   // the last holder: ~ModuleIndex joins the thread, after its callback has returned
+    CHECK(state.expired());
+    CHECK(entered_after_destruction.load() == 0);
+    CHECK(entered_alive.load() > 0);  // the earlier status changes did enter while the service was alive
 }
 
 TEST_CASE("status never shows an enabled module as ready before its index exists") {

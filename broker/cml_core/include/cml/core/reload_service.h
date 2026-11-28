@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "cml/core/agent_link.h"
+#include "cml/core/callback_gate.h"
 #include "cml/core/event_bus.h"
 #include "cml/core/fault_injection.h"
 #include "cml/core/module_state.h"
@@ -182,6 +183,13 @@ public:
     void set_drop_hook_for_testing(std::function<void()> hook);
     // Tests: called on the background-read thread (WP-50) after it let go of the state and before it reads the module file.
     void set_prefetch_hook_for_testing(std::function<void()> hook);
+    // WP-62 (tests): for the indexes started after this call, on the index's thread at every status change: `before` runs before the
+    // callback enters this service, `entered` once it has (this service is alive until it returns). Neither runs under a lock.
+    struct IndexCallbackHooks {
+        std::function<void(const IndexStatus&)> before;
+        std::function<void(const IndexStatus&)> entered;
+    };
+    void set_index_callback_hooks_for_testing(IndexCallbackHooks hooks);
     // Tests: every baseline kept for `pid`, whoever stored it (nothing is dropped).
     std::vector<std::pair<std::string, BaselineSnapshot>> kept_baselines_for_testing(std::uint32_t pid) const;
     // What a module's state hands on (to its next instance, or through a restart): the index's baseline (Ready) with the baseline it was
@@ -218,6 +226,11 @@ private:
 
     PatchPipeline pipeline_;
     EventBus* events_;
+    // WP-62: what the module indexes call back into this service (on_change, on_audit, on_skipped_archive_members) runs inside a scope
+    // of this gate. ~ReloadService closes it before anything else: a callback in flight returns first, and a later one does nothing.
+    // A ModuleState (and its index thread) can outlive this service whenever anyone else still holds it; a reference count does not
+    // decide whether the callback may run.
+    std::shared_ptr<CallbackGate> index_callbacks_ = std::make_shared<CallbackGate>();
     std::string session_dir_;
     bool session_dir_made_ = false;
     bool keep_session_dir_ = false;
@@ -268,6 +281,7 @@ private:
     std::map<std::uint64_t, AgentIdentity> identities_;
     std::map<std::uint32_t, std::uint64_t> registered_by_pid_;
     std::function<void()> drop_hook_;  // guarded by mutex_ (set_drop_hook_for_testing)
+    IndexCallbackHooks index_hooks_;   // WP-62: guarded by mutex_ (set_index_callback_hooks_for_testing)
     // Agents `a` and `b` are provably the same process: the same agent, or both identities known (creation time read) and equal.
     bool proven_same_locked(std::uint64_t a, std::uint64_t b) const;
     // A carry may be consumed, merged into or handed to a restart by `agent_id` only if the agent that stored it is provably the same
