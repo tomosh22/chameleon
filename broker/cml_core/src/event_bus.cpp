@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <utility>
 
+#include "cml/util/log.h"
+
 namespace cml::core {
 
 Event make_diag_event(const Diag& diag, const char* severity, const std::string& stage, std::uint32_t pid) {
@@ -116,6 +118,11 @@ void EventBus::publish(const Event& event) {
                 targets.push_back(s.listener);
             }
         }
+    }
+    // WP-58: as for a control answer, what was logged before the event is in the log file before a listener has the event (not
+    // for the log hub's own `log` events, which it publishes after each record).
+    if (!targets.empty() && event.name != "log") {
+        log_flush();
     }
     for (const std::shared_ptr<EventListener>& l : targets) {
         l->on_event(event);

@@ -218,6 +218,9 @@ ipc::ControlResponse handle_control_request(const ipc::ControlRequest& request, 
 }
 
 std::string encode_control_response(const ipc::ControlResponse& response) {
+    // WP-58: what was logged before the answer is in the log file before the client has the answer (the broker writes the file
+    // from a thread of its own; a client may read it as soon as it has the answer).
+    log_flush();
     Result<std::string> encoded = ipc::encode_response(response);
     if (!encoded) {
         // Only possible when the answer is above 1 MiB.

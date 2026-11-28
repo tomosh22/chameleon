@@ -14,6 +14,8 @@ enum class LogLevel : int { Trace = 0, Debug, Info, Warn, Error, Off };
 
 // A sink receives fully formatted messages. `user` is the pointer given to set_log_sink.
 using LogSink = void (*)(void* user, LogLevel level, const char* file, int line, const char* message);
+// WP-58: makes everything the sink was given readable where it writes (a file written by a thread of its own); `user` as above.
+using LogFlush = void (*)(void* user);
 
 // Thread-safe. The level is atomic; sink and user pointer are published together as one unit.
 void set_log_level(LogLevel level) noexcept;
@@ -25,9 +27,18 @@ bool log_enabled(LogLevel level) noexcept;
 // previous sink with the previous `user` pointer, so keep the old `user` object (and sink code)
 // alive until no thread can still be inside a log call, e.g. until process exit or a point where
 // logging threads are quiescent. LogLevel::Off is a threshold only; CML_LOG(Off, ...) never emits.
-void set_log_sink(LogSink sink, void* user) noexcept;
+void set_log_sink(LogSink sink, void* user, LogFlush flush = nullptr) noexcept;
+
+// WP-58: calls the installed sink's flush, if it has one: every record logged before the call is readable where the sink
+// writes it when this returns. Called before the broker answers a control request or publishes an event, so that a client
+// that reads the log after an answer finds what was logged before it.
+void log_flush() noexcept;
 
 const char* to_string(LogLevel level) noexcept;
+
+// WP-58: the records log_write has dispatched on the calling thread since the thread started, for attributing a stage's
+// cost to its logging (records of other threads, such as concurrent units or the pipe servers, are not counted).
+unsigned long long log_records_written() noexcept;
 
 #if defined(__GNUC__) || defined(__clang__)
 #define CML_PRINTF_LIKE(fmt_index, first_arg) __attribute__((format(printf, fmt_index, first_arg)))

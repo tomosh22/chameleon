@@ -14,7 +14,10 @@ revert, restart).
 1. Check the module against the build requirements: `cml_broker check <module.exe|module.dll>`. Every `FAIL` and `WARN`
    line names its id; most "it does not reload" reports end here (see `docs/BUILD_REQUIREMENTS.md`).
 2. Run the broker with `--verbose --log broker.log` and read the lines before the diagnostic. Every decision of the bind
-   planner is logged at `trace`.
+   planner is logged at `trace`. (WP-58: with `--log FILE` a thread of the broker writes the file, gathering up to 2 ms
+   of records into one write. A warning or an error is in the file before the broker goes on; everything logged before a
+   control answer or an event is in the file before the client has it; the file is complete when the broker exits. A broker
+   that crashes or is killed can lose the `trace`, `debug` and `info` lines of its last few milliseconds.)
 3. Look for the diagnostic in the `diag` events or the reload response: the `id`, `message` and `action` fields are the
    text shown below.
 4. Hot-restart (`restart`) is the way out when a change cannot be patched in place (`docs/KNOWN_LIMITATIONS.md`).
@@ -35,7 +38,13 @@ revert, restart).
      first query of the code region.
    * `WP50-PLAN module=... object_ms=... image_ms=... bind_ms=... export_parses=... prove_ms=... narrow_ms=...
      pdb_*_ms=...`: the plan stage of one recompiled object, split up (`image_ms` is near 0 once the module file was read in
-     the background).
+     the background). WP-58 splits `bind_ms` into the bind planner's stages: `bind_compiland_ms` (finding the compiland),
+     `bind_symbols_ms` (the object's sections, symbols and relocations), `bind_defined_ms` (external definitions: registry
+     and publics), `bind_statics_ms` (statics, guards and lambdas; of it `bind_candidates_ms` the old records of each group,
+     `bind_inline_ms` WP-51's inline-site verdicts, `bind_guards_ms` the guards, `bind_reset_ms` WP-52's check of new
+     statics), `bind_tls_ms`, `bind_undefined_ms`, `bind_fixups_ms`, `bind_init_ms` and `bind_assemble_ms` (both plans
+     when rule (d) plans a unit twice). `bind_log_lines` and `log_lines` count the records the planner and the whole plan
+     stage logged on the unit's thread: at `trace` every decision and fix-up is one, and their cost is part of each stage.
    * `WP50-ONEOFF what=module-image|linker-detection|reserve-range ms=...`: work done once per module at its first reload.
      The module file is normally read in the background once the index is ready (`image=background`; `kept=0` when the
      module was disabled during the read, whose copy is then dropped); `image=reload` means the first reload had to read it
