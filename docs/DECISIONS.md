@@ -1431,6 +1431,19 @@ CML4720–4739 (agent; amended: 4700–4719 belong to WP-36), CML5620–5629 (br
 forces every application to rebuild). A pre-WP-48 agent gets the old Welcome layout and CML5621. **Acceptance:** the `plugin_reload` fixture gains a step that frees and loads the
 DLL within 50 ms; the edit is re-applied in all 8 cells; WP10-REPEAT stays 25/25.
 
+**Ruling (WP-48 reviews; ADR-0018 convergence):** reconciling loader notifications with module-list snapshots by timing
+(which poll drained an unload, whether a list may lag) kept producing windows in which a reload was missed or a live image was
+reported as reloaded. The arbiter is now ground truth the agent owns: its hook records. Before an unload or load at a base is
+judged redundant or as a reload, the agent checks, under the installer's mutex and with no thread suspended, whether the jump bytes
+it wrote at that module's recorded targets are still in memory: present means the image is the live, hooked one (redundant; never
+`forget_range`), absent means it was replaced (report Unloaded then Loaded). A module with no hook records carries no edit a reload
+could lose, so either answer is safe for it. Snapshot timing heuristics may stay as hints but never override the check.
+**Refined (WP-48 final check):** the check is per record and three-way, in one call under the installer's mutex that also does the
+forgetting: bytes equal to what the agent wrote → live; bytes equal to the record's saved original bytes (a fresh image at the same
+base) → replaced, and only those records are forgotten; anything else (a debugger's int3, a third-party detour) → not proof of a
+replacement, the record is kept and a warning logged. An image counts as replaced when at least one record reads as original. A stale
+unload is re-checked for a bounded time (about 2 s), not a number of polls.
+
 ### WP-49: hook narrowing verifies jump tables (R-46)
 
 **Decision.** A jump table in a function's own code (cl `/Od` switch: ADDR32NB entries to labels in the same function) is
@@ -1447,6 +1460,89 @@ shows, within the broker and the agent's logging. R-55 is added to the roadmap: 
 minutes*. **Acceptance:** the breakdown lines in CI for both; the first reload in the WP-39 benchmark within 300 ms of later ones;
 the Godot hot-restart under 60 s, or a measured, documented reason why not.
 
-WP-47..WP-50 start together (four at once). **WP-51 (R-54, split from WP-46):** an own static of a function that inlined a lambda never takes that lambda's static. Spike first: from the old image's `S_INLINESITE`/`S_INLINESITE2` inlinees (IPI `LF_FUNC_ID`/`LF_MFUNC_ID`), decide per function whether it inlined a call operator of one of its closures; refuse only then (CML3207), and treat unreadable inline-site data as a risk. Acceptance: the R-54 unit test, Jolt and ImGui clang-cl corpus cells unchanged (`fail=0`). It starts in the first free wave-12 slot. Shared file: `broker/cml_core/src/pipeline.cpp` (WP-47 and WP-49); whoever merges
+WP-47..WP-50 start together (four at once). **WP-51 (R-54, split from WP-46):** an own static of a function that inlined a lambda never takes that lambda's static. Spike first: from the old image's `S_INLINESITE`/`S_INLINESITE2` inlinees (IPI `LF_FUNC_ID`/`LF_MFUNC_ID`), decide per function whether it inlined a call operator of one of its closures; refuse only then (CML3207), and treat unreadable inline-site data as a risk. Acceptance: the R-54 unit test, Jolt and ImGui clang-cl corpus cells unchanged (`fail=0`). It starts in the first free wave-12 slot. **Ruling (WP-51 spike):** the risk is read per procedure from the old procedure's own `S_INLINESITE` tree (found by the record's address, so overloads and C-linkage scopes need no name matching): any inlinee that is a member of a closure class at any depth (call operator, `__invoke`, invoker, unknown members), any inlinee mentioning `<lambda_`, a template over a closure, or unreadable data. A static of a function that is not a lambda but is inlined (R-57) is measured first with a log-only line, not refused. **Ruling (WP-51 high review):** a static is checked against a procedure only when that procedure is the static's own enclosing function (the same closure for a lambda's static, not any call operator); where that identity cannot be established the static is refused as before. The rule's breadth stays as ruled: any own static of a function that inlined closure code (a `std::sort` or `std::call_once` with a lambda, unreadable inlinees) is refused on any edit of its TU, whether or not the lambda changed. That is an accepted over-refusal, recorded in KNOWN_LIMITATIONS, and narrowing it with proof from the patch is R-59. A static refused by the closure step needs no further bookkeeping: CML3207 refuses the module's reload (WP-47). Shared file: `broker/cml_core/src/pipeline.cpp` (WP-47 and WP-49); whoever merges
 second merges main and re-runs. Rules as in ADR-0043: one PR per WP, CI on the Windows matrix is the only acceptance, the
 orchestrator reads the logs; "refuse what cannot be proven" stands.
+
+## ADR-0045 Wave 13: pairing correctness first, then reload atomicity across modules and reload cost (WP-52..WP-55)
+
+**Date:** 2026-11-28 · **Status:** Accepted (wave 12 closed with #80)
+
+Wave 12 (ADR-0044) closed R-46, R-47, R-52, R-53, R-54 and R-55. Its reviews found two pre-existing ways the bind planner can
+hand a patch the wrong state or construct live state again (R-60, R-61). A wrong pairing is the worst outcome the product has
+(ADR-0043), so they lead. R-10 (dogfooding) has still produced no findings. R-59 waits for WP-53's evidence, because narrowing
+WP-51's refusal and closing its mirror read the same inline-site data. R-57 stays log-only: there were no would-refuse cases in
+the corpus.
+
+| WP | Roadmap | Title | Branch | Review |
+|---|---|---|---|---|
+| WP-52 | R-60 | A nested lambda's guard is tied to its bound static | `wp/52-nested-guards` | high (bind planner) |
+| WP-53 | R-61 | A new static of an inlined lambda never takes its caller's deleted static | `wp/53-inlined-mirror` | high (bind planner) |
+| WP-54 | R-56 | A reload across several modules of one process applies nothing when one module is refused | `wp/54-cross-module-atomic` | high (pipeline, hooks) |
+| WP-55 | R-58, R-62, R-63 | Reload and restart caches: per-compiland include scan, inline-site verdicts, over-size files | `wp/55-caches` | medium |
+
+### WP-52: a nested lambda's guard is tied to its bound static (R-60)
+
+**Decision.** `guard_scope_statics` compares a `$TSS` guard's decorated scope with its statics' scopes after resolving the
+back-references of both, so clang-cl's `...QEBA?A?3@XZ@4HA` and `...QEBA?A?4@XZ@4UObj@@A` name the same scope. A static bound
+to the running process whose guard still cannot be tied is refused (CML3211 as an error, not a warning): the patch must never
+run a bound static's initializer again. **Acceptance:**
+- A unit test with real clang 18 names (WP-51's nested case) binds the inner static and its guard together; it fails on main.
+- A unit test with a guard that cannot be tied refuses with CML3211.
+- A clang-cl `/O2` fixture with a static in a nested lambda keeps its value across a reload in the clang-cl cells (harmless in
+  the cl cells).
+- Every corpus cell stays at `fail=0`.
+
+### WP-53: a new static of an inlined lambda never takes its caller's deleted static (R-61)
+
+**Decision.** Spike first: list what the old image and the patch give to tell a record of `f` that is `f`'s own static from one
+that is an inlined lambda's static (record count per name, type, the old procedure's inline sites, the closure's other
+statics), for clang-cl `-O2` and cl `/O2`. Then pair a lambda's static with a record of its caller only where that evidence
+proves it is the lambda's, and refuse otherwise (CML3207). The orchestrator rules on the spike before code is written.
+**Ruling (WP-53 spike):** under clang-cl, no evidence in the old image separates a record of `f` that is an inlined lambda's
+static from `f`'s own: record count, type, inline sites, the closure's other statics, the layout and the patch's structure all
+failed. The code does separate them. A lambda's static paired with a record directly in its caller's procedure P (no call-operator
+record) is refused with CML3207 unless (1a) cl's twin record exists (WP-40's closure step), or (2) the pipeline proves P unchanged
+with WP-25's comparator under the plan (`BindPlan::inlined_lambda_statics`, beside `prove_bitmask_guards`). An R-61 edit whose
+machine code is identical (spike case c7) is accepted, because the running program cannot tell it apart. cl's inline-site position
+evidence (1b) is deferred to R-65, the build tree's original `.obj` as evidence to R-64. First, WP-53 checks whether WP-51's
+`proc_inlinees` can return an empty list for a procedure that has inline sites under clang-cl + link.exe (seen in the spike).
+If it can, R-54 is undetected there; that is fixed first, and anything unparsable is reported as unreadable.
+
+**Acceptance:**
+- A unit test of the R-61 edit is refused.
+- WP-40's lambda-static-in-caller case still binds.
+- Jolt and ImGui clang-cl corpus cells stay at `fail=0`.
+- `WP53-*` log lines count the refusals in every corpus cell.
+
+### WP-54: a reload across several modules of one process applies nothing when one module is refused (R-56)
+
+**Decision.** `reload_service` runs WP-47's prepare phase for every module of a reload in one process before it applies any. A
+refused module leaves every module of that process unchanged. A failure during apply rolls back the modules already applied in
+that reload (WP-22 batch revert, per module, newest first). Different processes stay independent. Range CML3656–3669.
+**Acceptance:**
+- A cmltest scenario edits a header shared by the exe and a plugin DLL, with the DLL's unit refused. It shows no
+  `patch_applied` and the old values in both modules, in all 8 cells.
+- `atomic_reload` and `plugin_reload` stay green.
+- There is a unit test per failure point.
+
+### WP-55: reload and restart caches (R-58, R-62, R-63)
+
+**Decision.**
+- **R-63:** a file over the scanner's size limit is recorded as a scan input with its stamp, because it reads the same every
+  time. Only a read that might succeed later (sharing violation, I/O error) keeps a scan out of the cache.
+- **R-58:** cache entries are per compiland. After an edit, only the compilands whose inputs changed are scanned again.
+- **R-62:** WP-51's inline-site verdicts are cached per module image and compiland across reloads (the old image does not
+  change), and dropped with the module.
+- All three keep WP-50's stamp-before-use rule.
+
+**Acceptance:**
+- In the godot-gdextension corpus cell, the hot-restart logs a scan-cache hit for every unchanged compiland of the editor
+  executable (`WP50-SCAN-CACHE`), and the restart time is reported against WP-50's 11.6 s.
+- In Jolt clang-cl, `plan_ms` for the second and later reloads of the same TU drops below main's (336.3 / 709.0 ms for the two
+  largest).
+- Unit tests cover each invalidation (changed input, unreadable file, module unload).
+
+WP-52..WP-55 start together (four at once). WP-52 and WP-53 share `broker/cml_core/src/bind_plan.cpp`, and WP-54 and WP-55
+share `reload_service.cpp`: whoever merges second merges main and re-runs CI. Rules as in ADR-0043: one PR per WP, CI on the
+Windows matrix is the only acceptance, the orchestrator reads the logs; "refuse what cannot be proven" stands.
