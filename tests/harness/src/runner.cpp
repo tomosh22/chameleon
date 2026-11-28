@@ -724,6 +724,15 @@ private:
                         options_.config.c_str());
             std::fflush(stdout);
         }
+        // WP-49 evidence: how many distinct entries the planner wanted to hook, how many of them narrowing found identical to the
+        // running code, and how many hooks were installed (planned - dropped = installed for a reload that applied a patch).
+        if (const ipc::json::Value* planned = response->result.find("hooks_planned"); planned != nullptr && planned->is_integer()) {
+            std::printf("WP49-HOOKS hooks_planned=%lld hooks_dropped=%lld hooks_installed=%lld fixture=%s compiler=%s config=%s\n",
+                        static_cast<long long>(planned->as_integer()), static_cast<long long>(response->result.get_integer("hooks_dropped")),
+                        static_cast<long long>(response->result.get_integer("hooks_installed")), scenario_.fixture.c_str(), report_.compiler.c_str(),
+                        options_.config.c_str());
+            std::fflush(stdout);
+        }
         {
             std::ofstream out(options_.artifacts_dir / "reload-result.json", std::ios::binary | std::ios::app);
             out << ipc::json::serialize(response->result) << "\n";
@@ -763,6 +772,9 @@ private:
         proc->cursor = read_whole_file(proc->stdout_file).size();  // what the hooks and the new process print belongs to the restart
         const std::uint32_t old_pid = supervisor_.pid(proc->id);
         const RestartStepOutcome restarted = run_restart_step(*control_, capabilities_, old_pid, step, limit_ms, control_pipe_);
+        // WP-50 (R-55): the broker's evidence of the restart (WP50-RESTART: the stages; WP50-INDEX: the new process's index builds;
+        // WP50-HOOKS: the re-applying reload) goes to the job log like a reload's.
+        print_broker_evidence();
         if (!restarted.ok) {
             return StepOutcome::fail(restarted.diag_code, restarted.detail);
         }
@@ -959,6 +971,17 @@ private:
     StepOutcome expect_reload_result(const Step& step) {
         if (!has_reload_result_) {
             return StepOutcome::fail(cml::ids::kResultMismatch, "no reload ran before this step");
+        }
+        if (!step.compiler.empty()) {  // WP-49
+            const std::string family = compiler_family(report_.compiler);
+            if (family.empty()) {
+                return StepOutcome::fail(cml::ids::kResultMismatch, "the expectation " + step.key + " = " + std::to_string(step.result_value) + " is for " + step.compiler +
+                                                                        ", and this cell's compiler '" + report_.compiler + "' is neither cl nor clang-cl");
+            }
+            if (family != step.compiler) {
+                return StepOutcome::pass("not checked: the expectation " + step.key + " = " + std::to_string(step.result_value) + " is for " + step.compiler +
+                                         ", this cell is " + family);
+            }
         }
         const ipc::json::Value* member = last_reload_result_.find(step.key);
         if (member == nullptr || !member->is_integer() || member->as_integer() != step.result_value) {

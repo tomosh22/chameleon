@@ -66,7 +66,7 @@ endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     target_compile_definitions(cml_test_pdb PRIVATE CML_TEST_COMPILER_IS_CL=1)  # cl.exe, not clang-cl
 endif()
-cml_add_unit_test(ipc SOURCES lib/test_ipc.cpp lib/test_ipc_hooks.cpp lib/test_ipc_loader.cpp lib/test_ipc_compile.cpp lib/test_ipc_exception.cpp lib/test_ipc_restart.cpp lib/test_ipc_fault.cpp LIBS cml_ipc)
+cml_add_unit_test(ipc SOURCES lib/test_ipc.cpp lib/test_ipc_hooks.cpp lib/test_ipc_loader.cpp lib/test_ipc_compile.cpp lib/test_ipc_exception.cpp lib/test_ipc_restart.cpp lib/test_ipc_fault.cpp lib/test_ipc_module_events.cpp LIBS cml_ipc)
 cml_add_unit_test(proc SOURCES lib/test_proc.cpp lib/test_proc_address_space.cpp LIBS cml_proc)
 if(WIN32)
     # WP-11: named-pipe transport tests (real pipes, in-process client and server threads).
@@ -79,7 +79,7 @@ cml_add_unit_test(watch SOURCES lib/test_watch.cpp watch/test_coalesce.cpp watch
 # end-to-end tests load cml_agent.dll through Chameleon_API.h like an application would and talk to
 # an in-process broker (cml_core's ConnectionServer).
 cml_add_unit_test(agent
-    SOURCES agent/test_sync_queue.cpp agent/test_module_diff.cpp agent/test_fault.cpp
+    SOURCES agent/test_sync_queue.cpp agent/test_module_diff.cpp agent/test_module_events.cpp agent/test_fault.cpp
     LIBS cml_agent_core)
 if(WIN32)
     # WP-10: out-of-process hang watchdog (the in-process one is stopped together with every other thread
@@ -114,6 +114,14 @@ cml_add_unit_test(broker_core
         # WP-20: crash -> patch -> continue (broker side)
         broker/test_exceptions.cpp
     LIBS cml_core)
+# WP-49: hook narrowing on switch objects of this cell's compiler at /Od and /O2 (broker/jump_tables/objects.cmake). Local
+# override for portable syntax-check builds: CML_TEST_JUMP_TABLE_OBJECTS = a directory holding switches_<Od|O2>_<plain|swapped>.obj.
+if(MSVC)
+    include(broker/jump_tables/objects.cmake)
+elseif(CML_TEST_JUMP_TABLE_OBJECTS)
+    target_sources(cml_test_broker_core PRIVATE broker/test_jump_tables.cpp)
+    target_compile_definitions(cml_test_broker_core PRIVATE "CML_JT_OBJ_DIR=\"${CML_TEST_JUMP_TABLE_OBJECTS}\"")
+endif()
 add_subdirectory(bind)  # WP-07: unit.bind
 add_subdirectory(reexecute)  # WP-23: unit.reexecute (recipe builder, wire format, broker decision, fixture PDB records)
 add_subdirectory(ui)    # WP-19: unit.ui (broker UI view model, parsing, settings)

@@ -22,6 +22,25 @@ namespace {
 constexpr std::uintptr_t kPageSize = 0x1000;  // x64
 constexpr unsigned kYieldOnlyRetries = 4;     // retries that only yield; later ones sleep 1 ms
 
+// WP-50: the performance counter (window-safe: no lock, no allocation) and its conversion, done after the window.
+inline long long ticks() noexcept {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return now.QuadPart;
+}
+
+std::uint64_t to_us(long long elapsed) noexcept {
+    static const long long frequency = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return f.QuadPart > 0 ? f.QuadPart : 1;
+    }();
+    if (elapsed <= 0) {
+        return 0;
+    }
+    return static_cast<std::uint64_t>(elapsed / frequency * 1000000 + (elapsed % frequency) * 1000000 / frequency);
+}
+
 // One contiguous store into code.
 struct Write {
     std::uint8_t* address = nullptr;
@@ -156,16 +175,54 @@ Diag make_diag(const Failure& f, const HookRequest& request) {
     }
 }
 
-bool is_code(const void* address) noexcept {
-    MEMORY_BASIC_INFORMATION info;
-    if (VirtualQuery(address, &info, sizeof(info)) == 0) {
-        return false;
-    }
+// Whether memory with these attributes holds code we may read (and hook).
+bool is_code_region(const MEMORY_BASIC_INFORMATION& info) noexcept {
     if (info.State != MEM_COMMIT || (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
         return false;
     }
     return (info.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
 }
+
+// WP-50 (R-47): the answers of VirtualQuery during the planning of one batch. Every page of the range VirtualQuery reports
+// ([BaseAddress, BaseAddress + RegionSize)) has the same attributes, so an address inside a range already reported gets the
+// same answer without another call. The first query into the large code region of a module that was never changed is
+// expensive (it measures the whole region); a batch of new hooks asks three times per target. Lives in one planning pass
+// (under the installer's mutex, before any VirtualProtect or write of the batch); a failed query is not remembered.
+class RegionCache {
+public:
+    explicit RegionCache(bool enabled) : enabled_(enabled) {}
+    bool is_code(const void* address, std::uint32_t* queries) {
+        const auto a = reinterpret_cast<std::uintptr_t>(address);
+        if (enabled_) {
+            for (const Region& r : regions_) {
+                if (a >= r.begin && a < r.end) {
+                    return r.code;
+                }
+            }
+        }
+        MEMORY_BASIC_INFORMATION info;
+        ++*queries;
+        if (VirtualQuery(address, &info, sizeof(info)) == 0) {
+            return false;
+        }
+        const bool code = is_code_region(info);
+        if (enabled_) {
+            const auto begin = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
+            regions_.push_back(Region{begin, begin + info.RegionSize, code});
+        }
+        return code;
+    }
+    void clear() { regions_.clear(); }
+
+private:
+    struct Region {
+        std::uintptr_t begin;
+        std::uintptr_t end;
+        bool code;
+    };
+    bool enabled_;
+    std::vector<Region> regions_;
+};
 
 // ReadProcessMemory on the own process: fails with an error (and a count of what it did copy)
 // instead of faulting when the range is not fully readable.
@@ -330,6 +387,13 @@ struct Installer::Report {
     unsigned threads = 0;
     unsigned passes = 0;
     unsigned window_ms = 0;
+    // WP-50: counter ticks of this attempt's phases (BatchTiming says what each is).
+    long long stop = 0;
+    long long check = 0;
+    long long write = 0;
+    long long write_max = 0;
+    long long step = 0;
+    ThreadSet::Timing threads_timing;
 };
 
 Installer::Installer(const InstallerOptions& options) : options_(options) {
@@ -367,6 +431,107 @@ std::size_t Installer::forget_range(std::uint64_t base, std::uint64_t size) {
     const std::size_t dropped = static_cast<std::size_t>(records_.end() - first);
     records_.erase(first, records_.end());  // stays sorted: remove_if keeps the order of what it keeps
     return dropped;
+}
+
+namespace {
+
+enum class RecordBytes : std::uint8_t { Ours, Original, Unmapped, Other };
+
+// Committed memory at `address` (an image that is still mapped, or whatever occupies the range now)?
+bool committed(std::uintptr_t address) noexcept {
+    MEMORY_BASIC_INFORMATION info;
+    return VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) != 0 && info.State == MEM_COMMIT;
+}
+
+// Reads `length` bytes at `address` and compares them with `ours` and `original`.
+RecordBytes classify_bytes(std::uintptr_t address, std::size_t length, const std::uint8_t* ours, const std::uint8_t* original) noexcept {
+    if (length == 0) {
+        return RecordBytes::Ours;
+    }
+    if (!committed(address) || !committed(address + length - 1)) {
+        return RecordBytes::Unmapped;
+    }
+    std::uint8_t bytes[5] = {};
+    std::size_t got = 0;
+    if (length > sizeof(bytes) || !read_code(reinterpret_cast<const void*>(address), bytes, length, &got) || got != length) {
+        return RecordBytes::Other;  // mapped but unreadable (no access, a guard page): no proof
+    }
+    if (std::memcmp(bytes, ours, length) == 0) {
+        return RecordBytes::Ours;
+    }
+    if (std::memcmp(bytes, original, length) == 0) {
+        return RecordBytes::Original;
+    }
+    return RecordBytes::Other;
+}
+
+}  // namespace
+
+Installer::Reconciled Installer::reconcile_range(std::uint64_t base, std::uint64_t size, bool module_gone) {
+    Reconciled out;
+    if (size == 0) {
+        return out;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const std::uint64_t end = base + size;
+    const auto in_range = [&](const Record& r) {
+        const std::uint64_t target = static_cast<std::uint64_t>(r.target);
+        return target >= base && target < end;
+    };
+    // 1. Classify, and mark what goes. The entry and the padding must both read "ours" for the hook to be live; either one no longer
+    //    being committed, or the entry (and the padding, when there is one) reading the record's original bytes, proves the image
+    //    was replaced.
+    for (Record& r : records_) {
+        r.forget = false;
+        if (!in_range(r)) {
+            continue;
+        }
+        const RecordBytes entry = classify_bytes(r.target, r.entry_length, r.current_entry, r.original_entry);
+        const RecordBytes padding = classify_bytes(r.target - r.padding_length, r.padding_length, r.current_padding, r.original_padding);
+        RecordBytes verdict = RecordBytes::Other;
+        if (entry == RecordBytes::Unmapped || padding == RecordBytes::Unmapped) {
+            verdict = RecordBytes::Unmapped;
+        } else if (entry == RecordBytes::Ours && padding == RecordBytes::Ours) {
+            verdict = RecordBytes::Ours;
+        } else if (entry == RecordBytes::Original && (padding == RecordBytes::Original || r.padding_length == 0)) {
+            verdict = RecordBytes::Original;
+        }
+        switch (verdict) {
+            case RecordBytes::Ours:
+                ++out.ours;
+                break;
+            case RecordBytes::Original:
+                ++out.original;
+                r.forget = true;
+                break;
+            case RecordBytes::Unmapped:
+                ++out.unmapped;
+                r.forget = true;
+                break;
+            case RecordBytes::Other:
+                if (out.other++ == 0) {
+                    out.other_target = r.target;
+                    std::memcpy(out.other_name, r.name, sizeof(out.other_name));
+                    out.other_name[sizeof(out.other_name) - 1] = '\0';
+                }
+                break;
+        }
+    }
+    if (module_gone && out.ours == 0) {
+        for (Record& r : records_) {
+            r.forget = r.forget || in_range(r);  // the module is gone and nothing of ours is left there: the rest goes too (WP-45)
+        }
+    }
+    if (options_.test_in_reconcile != nullptr) {
+        options_.test_in_reconcile(options_.test_context);
+    }
+    // 2. Forget what was marked, in the same locked section (an install cannot come between the probe and the forget).
+    const auto first = std::remove_if(records_.begin(), records_.end(), [](const Record& r) { return r.forget; });
+    out.forgotten = static_cast<std::size_t>(records_.end() - first);
+    records_.erase(first, records_.end());  // stays sorted: remove_if keeps the order of what it keeps
+    const bool any = out.ours + out.original + out.unmapped + out.other != 0;
+    out.verdict = out.forgotten != 0 ? Reconciled::Verdict::Replaced : (any ? Reconciled::Verdict::Live : Reconciled::Verdict::None);
+    return out;
 }
 
 Installer::Record* Installer::find_record(std::uintptr_t target) {
@@ -440,7 +605,10 @@ void Installer::attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, 
     const ULONGLONG deadline = started + options_.window_budget_ms;
 
     threads_.set_test_knobs(options_.test_expire_after_checks, options_.test_step_limit);
+    threads_.reset_timing();
+    long long phase_started = ticks();
     ThreadSet::Result stopped = threads_.suspend_all(deadline, options_.max_passes, options_.test_fake_new_thread_passes);
+    report->stop += ticks() - phase_started;
     report->passes = std::max(report->passes, threads_.passes());
     unsigned steps = 0;
     while (stopped == ThreadSet::Result::Ok) {
@@ -449,7 +617,10 @@ void Installer::attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, 
         heap::set_alloc_forbidden(true);
         std::size_t thread_index = 0;
         std::size_t job_index = 0;
-        if (!find_conflict(jobs, count, &thread_index, &job_index)) {
+        phase_started = ticks();
+        const bool conflict = find_conflict(jobs, count, &thread_index, &job_index);
+        report->check += ticks() - phase_started;
+        if (!conflict) {
             // WP-28: failure injection (stage hook-install; WP-43: revert-repoint and revert-restore for the requests of a revert). One
             // lock-free atomic decrement and a constant table read: nothing here allocates or takes a lock. Nothing was written; the threads
             // are resumed below and the batch fails with the stage's diagnostic.
@@ -458,6 +629,7 @@ void Installer::attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, 
                 break;
             }
             // Nobody is inside any window. Verify, then write.
+            phase_started = ticks();
             bool intact = true;
             for (std::size_t j = 0; j < count && intact; ++j) {
                 if (jobs[j].op == Op::Unchanged) {
@@ -472,6 +644,7 @@ void Installer::attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, 
                     }
                 }
             }
+            report->check += ticks() - phase_started;
             if (intact) {
                 if (options_.test_in_window != nullptr) {
                     options_.test_in_window(options_.test_context);
@@ -481,10 +654,14 @@ void Installer::attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, 
                     if (jobs[j].op == Op::Unchanged) {
                         continue;
                     }
+                    const long long w0 = ticks();
                     for (int w = 0; w < jobs[j].write_count; ++w) {
                         apply_write(jobs[j].writes[w]);
                         FlushInstructionCache(process, jobs[j].writes[w].address, jobs[j].writes[w].length);
                     }
+                    const long long spent = ticks() - w0;
+                    report->write += spent;
+                    report->write_max = std::max(report->write_max, spent);
                 }
                 report->done = true;
             }
@@ -511,6 +688,7 @@ void Installer::attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, 
         // Let only the offenders run (everything else stays stopped), yield once so that they can
         // get out of the way, stop them again and re-check. Application threads that run now may use
         // the agent heap, hence the flag was cleared above.
+        const long long step_started = ticks();
         std::size_t offenders[64];
         std::size_t offender_count = 0;
         for (std::size_t t = 0; t < threads_.size() && offender_count < 64; ++t) {
@@ -541,11 +719,14 @@ void Installer::attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, 
                 break;
             }
         }
+        report->step += ticks() - step_started;
         if (report->diag != 0 || stopped != ThreadSet::Result::Ok) {
             break;
         }
         // The offenders may have started threads of their own.
+        phase_started = ticks();
         stopped = threads_.suspend_all(deadline, options_.max_passes, options_.test_fake_new_thread_passes);
+        report->stop += ticks() - phase_started;
         report->passes = std::max(report->passes, threads_.passes());
     }
     heap::set_alloc_forbidden(false);
@@ -557,6 +738,7 @@ void Installer::attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, 
         report->error = threads_.failed_error();
     }
     threads_.resume_all();
+    report->threads_timing = threads_.timing();
     const ULONGLONG elapsed = GetTickCount64() - started;
     report->window_ms = std::max<unsigned>(report->window_ms, static_cast<unsigned>(elapsed));
     if (options_.test_after_resume != nullptr) {
@@ -590,8 +772,35 @@ struct Interval {
 
 BatchResult Installer::apply(bool reverting, const HookRequest* requests, std::size_t count,
                              std::vector<HookOutcome>& outcomes, ipc::fault::Stage inject) {
+    const long long called = ticks();
+    BatchResult result = apply_locked(reverting, requests, count, outcomes, inject, called);
+    result.timing.total_us = to_us(ticks() - called);  // WP-50: every way out of the batch, the lock included
+    return result;
+}
+
+BatchResult Installer::apply_locked(bool reverting, const HookRequest* requests, std::size_t count,
+                                    std::vector<HookOutcome>& outcomes, ipc::fault::Stage inject, long long called) {
     std::lock_guard<std::mutex> lock(mutex_);
     BatchResult result;
+    // WP-50: the phase boundaries. `since` is the start of the current phase (apply() fills total_us).
+    long long since = ticks();
+    result.timing.lock_us = to_us(since - called);
+    long long probing = 0;  // ticks inside ReadProcessMemory / VirtualQuery while planning
+    long long querying = 0;  // of them: inside VirtualQuery (is_code)
+    std::uint32_t queries = 0;  // VirtualQuery calls made (the region cache answers the rest)
+    RegionCache regions(!options_.test_no_region_cache);
+    const auto timed_is_code = [&querying, &queries, &regions](const void* address) {
+        const long long q0 = ticks();
+        const bool code = regions.is_code(address, &queries);
+        querying += ticks() - q0;
+        return code;
+    };
+    const auto lap = [&since]() {
+        const long long now = ticks();
+        const long long spent = now - since;
+        since = now;
+        return to_us(spent);
+    };
     outcomes.assign(count, HookOutcome{});
     auto fail_all = [&](Diag diag) {
         for (HookOutcome& outcome : outcomes) {
@@ -620,6 +829,33 @@ BatchResult Installer::apply(bool reverting, const HookRequest* requests, std::s
     records_.reserve(records_.size() + count);  // the commit below must not allocate while jobs are half applied
     bool any_failed = false;
     std::uint32_t first_failed = 0;
+
+    // WP-50 (R-47): the region cache is filled in ascending address order first, so that one VirtualQuery of the lowest
+    // address of a region answers every later question inside it (VirtualQuery reports the range from the queried page to
+    // the region's end). Only the addresses planning may ask about; the answers are the ones planning would get.
+    if (!options_.test_no_region_cache && !reverting) {
+        std::vector<std::uintptr_t> asked;
+        asked.reserve(count * 4);
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto t = reinterpret_cast<std::uintptr_t>(requests[i].target);
+            const auto r = reinterpret_cast<std::uintptr_t>(requests[i].replacement);
+            if (r != 0) {
+                asked.push_back(r);
+            }
+            if (t > kMinPadding) {
+                asked.push_back(t - kMinPadding);
+                asked.push_back(t - 1);
+                asked.push_back(t);
+            }
+        }
+        std::sort(asked.begin(), asked.end());
+        asked.erase(std::unique(asked.begin(), asked.end()), asked.end());
+        const long long warm_started = ticks();
+        for (const std::uintptr_t a : asked) {
+            (void)timed_is_code(reinterpret_cast<const void*>(a));
+        }
+        probing += ticks() - warm_started;
+    }
 
     for (std::size_t i = 0; i < count; ++i) {
         Job& job = jobs[i];
@@ -674,7 +910,10 @@ BatchResult Installer::apply(bool reverting, const HookRequest* requests, std::s
             continue;
         }
 
-        if (!is_code(request.replacement)) {
+        long long probe_started = ticks();
+        const bool replacement_is_code = timed_is_code(request.replacement);
+        probing += ticks() - probe_started;
+        if (!replacement_is_code) {
             failure.reason = BadArgument::NotCode;
             reject(ids::kBadArgument);
             continue;
@@ -716,7 +955,9 @@ BatchResult Installer::apply(bool reverting, const HookRequest* requests, std::s
         }
 
         // A new hook: read the bytes around the entry and choose a strategy.
-        if (!is_code(request.target)) {
+        probe_started = ticks();
+        if (!timed_is_code(request.target)) {
+            probing += ticks() - probe_started;
             reject(ids::kCodeUnreadable);
             continue;
         }
@@ -735,8 +976,9 @@ BatchResult Installer::apply(bool reverting, const HookRequest* requests, std::s
         PlanEnvironment environment;
         environment.entry_two_byte_aligned = (target & 1) == 0;
         // Only worth a VirtualQuery when the bytes say the padding is there at all.
-        environment.padding_executable = before_len < kMinPadding || (is_code(reinterpret_cast<const void*>(target - kMinPadding)) &&
-                                                                      is_code(reinterpret_cast<const void*>(target - 1)));
+        environment.padding_executable = before_len < kMinPadding || (timed_is_code(reinterpret_cast<const void*>(target - kMinPadding)) &&
+                                                                      timed_is_code(reinterpret_cast<const void*>(target - 1)));
+        probing += ticks() - probe_started;
         const HookPlan plan = plan_hook(before, before_len, at, at_len, environment);
         if (plan.strategy == Strategy::None) {
             failure.code = plan.diag;
@@ -854,6 +1096,22 @@ BatchResult Installer::apply(bool reverting, const HookRequest* requests, std::s
         }
     }
 
+    regions.clear();  // planning is over: the batch's own VirtualProtect and writes come next
+    result.timing.plan_us = lap();
+    result.timing.probe_us = to_us(probing);
+    result.timing.query_us = to_us(querying);
+    result.timing.queries = queries;
+    for (const Job& job : jobs) {
+        if (job.failure.code != 0) {
+            continue;
+        }
+        switch (job.op) {
+            case Op::Install: ++result.timing.installs; break;
+            case Op::Repoint: ++result.timing.repoints; break;
+            case Op::Unchanged: ++result.timing.unchanged; break;
+            case Op::Revert: ++result.timing.reverts; break;
+        }
+    }
     if (any_failed) {
         // Nothing has been touched. Name the failures; everything else is "not attempted".
         bool have_first = false;
@@ -927,8 +1185,10 @@ BatchResult Installer::apply(bool reverting, const HookRequest* requests, std::s
             }
             job.protected_ok = true;
             protected_jobs = i + 1;
+            result.timing.pages += static_cast<std::uint32_t>(job.protect_pages);
         }
     }
+    result.timing.protect_us = lap();
     auto restore_protection = [&]() {
         for (std::size_t i = protected_jobs; i-- > 0;) {
             Job& job = jobs[i];
@@ -946,6 +1206,7 @@ BatchResult Installer::apply(bool reverting, const HookRequest* requests, std::s
     for (std::size_t i = 0; i < count; ++i) {
         if (jobs[i].failure.code == ids::kWriteFailed) {
             restore_protection();
+            result.timing.unprotect_us = lap();
             for (std::size_t k = 0; k < count; ++k) {
                 outcomes[k].status = k == i ? HookStatus::Failed : HookStatus::NotAttempted;
                 outcomes[k].diag = k == i ? make_diag(jobs[i].failure, requests[i])
@@ -967,6 +1228,15 @@ BatchResult Installer::apply(bool reverting, const HookRequest* requests, std::s
         for (;;) {
             report = Report{};
             attempt(jobs.data(), count, &conflicts, &report, inject);
+            result.timing.stop_us += to_us(report.stop);
+            result.timing.check_us += to_us(report.check);
+            result.timing.write_us += to_us(report.write);
+            result.timing.write_max_us = std::max(result.timing.write_max_us, to_us(report.write_max));
+            result.timing.step_us += to_us(report.step);
+            result.timing.enumerate_us += to_us(report.threads_timing.enumerate);
+            result.timing.suspend_us += to_us(report.threads_timing.suspend);
+            result.timing.context_us += to_us(report.threads_timing.context);
+            result.timing.resume_us += to_us(report.threads_timing.resume);
             ++result.stats.attempts;
             result.stats.threads = std::max(result.stats.threads, report.threads);
             result.stats.passes = std::max(result.stats.passes, report.passes);
@@ -980,19 +1250,23 @@ BatchResult Installer::apply(bool reverting, const HookRequest* requests, std::s
                 break;
             }
             // Let the whole application run, then look again.
+            const long long wait_started = ticks();
             if (result.stats.attempts <= kYieldOnlyRetries) {
                 SwitchToThread();
             } else {
                 Sleep(1);
             }
+            result.timing.retry_wait_us += to_us(ticks() - wait_started);
         }
         result.stats.retries = conflicts;
     } else {
         report.done = true;
     }
 
+    since = ticks();  // the window phases were summed per attempt above
     // ---- 4. protection back, registry, outcomes ----
     restore_protection();
+    result.timing.unprotect_us = lap();
 
     if (!report.done) {
         Diag diag;
@@ -1055,6 +1329,7 @@ BatchResult Installer::apply(bool reverting, const HookRequest* requests, std::s
                 break;
         }
     }
+    result.timing.commit_us = lap();
     CML_LOG(Info, "hooks: %s %llu hook(s): attempts=%u retries=%u threads=%u window=%ums",
             reverting ? "reverted" : "applied", static_cast<unsigned long long>(count), result.stats.attempts,
             result.stats.retries, result.stats.threads, result.stats.window_ms);

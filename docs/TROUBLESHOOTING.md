@@ -18,6 +18,42 @@ revert, restart).
 3. Look for the diagnostic in the `diag` events or the reload response: the `id`, `message` and `action` fields are the
    text shown below.
 4. Hot-restart (`restart`) is the way out when a change cannot be patched in place (`docs/KNOWN_LIMITATIONS.md`).
+5. Slow, not failing (WP-50): the broker log says where the time went, in lines that start with a `WP50-` tag.
+   * `WP50-INDEX module=... pdb_ms=... audit_ms=... scan_ms=... scan_read_ms=... scan_missing=... baseline_ms=...`: one
+     per PDB index (enabling a module, and again in the new process of a hot-restart). `scan_ms` is the include scan
+     (ADR-0013): with thousands of translation units it is most of the time, `scan_missing` counts the include-path
+     candidates that do not exist. `pdb_ms` is the PDB, `baseline_ms` the hashes of the tracked sources.
+   * `WP50-RESTART old_pid=... total_ms=... prepare_ms=... terminate_ms=... relaunch_ms=... register_ms=... reenable_ms=...
+     index_ms=... reapply_ms=... index_module=...`: one per hot-restart (also the `timing` and `stages_ms` members of the
+     `restart` result). `index_ms` is the wait for the new process's indexes; their own phases follow (`index_*_ms`).
+   * `WP50-HOOKS side=agent ...` and `side=broker ...`: one each per `InstallHooks`. The agent's line splits the request
+     into the wait, the application hooks, planning (`plan_us`, `probe_us`), `VirtualProtect` (`protect_us`), stopping the
+     threads (`stop_us` = `enumerate_us` + `suspend_us` + `context_us`), the writes (`write_us`, slowest hook
+     `write_max_us`) and resuming; the broker's line gives the round trip it saw. `batch=1` is the first of the process.
+     `query_us` / `queries`: of `probe_us`, the time in and the number of VirtualQuery calls. The installer answers
+     VirtualQuery once per memory region and batch (WP-50); a first batch of new hooks into a large module still pays for the
+     first query of the code region.
+   * `WP50-PLAN module=... object_ms=... image_ms=... bind_ms=... export_parses=... prove_ms=... narrow_ms=...
+     pdb_*_ms=...`: the plan stage of one recompiled object, split up (`image_ms` is near 0 once the module file was read in
+     the background).
+   * `WP50-ONEOFF what=module-image|linker-detection|reserve-range ms=...`: work done once per module at its first reload.
+     The module file is normally read in the background once the index is ready (`image=background`; `kept=0` when the
+     module was disabled during the read, whose copy is then dropped); `image=reload` means the first reload had to read it
+     itself (set-option `prefetch_module_image` false, the reload came first, or the module was disabled while it ran).
+   * `WP50-SCAN-CACHE hit|miss module=... reason=... inputs=... check_ms=...`: whether an index took the file lists and include
+     graph of an earlier index of the same module file (a hot-restart's new process, a module loaded again). `miss
+     reason=size|mtime|pdb` means the module file was rebuilt since; `absent` that this broker had not indexed it before;
+     `file-changed:<path>` that a file the earlier scan read, or a directory it searched, changed since (an edited source, a
+     header created or removed), so the graph may be stale and is built again. On a hit, `inputs` files and directories were
+     checked in `check_ms`. `store=skipped reason=unreadable:<path>` means the scan met a file that exists but could not be
+     read (locked by an editor's save, over 8 MiB, a read error), and `reason=changed-during-scan:<path>` means a file changed
+     while the index was built. Such a scan is not kept, and the next index of the module scans again. Set-option
+     `cache_include_scan` false scans every time.
+   * The two set-options of WP-50 (control command `set-option {"name":..., "value": true|false}`, both default `true`):
+     `prefetch_module_image` (read the module file for the function comparison in the background once its index is
+     ready; applies to modules enabled afterwards) and `cache_include_scan` (reuse the file lists and include graph of an unchanged
+     module file this broker indexed before; applies to indexes started afterwards). Turn one off only to rule it out when
+     looking for a problem.
 
 ## Ids raised by the integrations
 
@@ -783,11 +819,12 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 
 ### CML3207
 
-- **Cause:** Static matches several old symbols. The reason follows a colon in the message. Same-named function-local statics of several lambdas (a macro such as Godot's `SNAME`) are told apart by their lambda as long as the function has the same lambdas as before; when a lambda with such a static was added or removed, the compiler's lambda numbers may have shifted. Several statics of one name in one function (declared in different blocks) are placed by the layout of their object section where that is known; where it is not (under cl every function-local static is a section of its own) they are matched by their place in the function (with the warning `CML3570`) only when the function has the same number of them as before, each has the same type and sits in the same block; otherwise this error names what differs, also when the guard variable of such a static has no record in the old image (clang-cl records none): the patch would then construct the old object a second time. The message also says so when the debug records needed for either could not be read (`CML1430` to `CML1434`). Since WP-40 also for a function-local static of a function `f` itself whose name is the name of a static of one of `f`'s lambdas, in the patch or in the running program: a compiler records the static of an inlined lambda in the function it was inlined into, under the same name, so a record of that name in `f` cannot be proven to be this static's (for instance after an inlined lambda was deleted and `f` got a static of its static's name).  
+- **Cause:** Static matches several old symbols. The reason follows a colon in the message. Same-named function-local statics of several lambdas (a macro such as Godot's `SNAME`) are told apart by their lambda as long as the function has the same lambdas as before; when a lambda with such a static was added or removed, the compiler's lambda numbers may have shifted. Several statics of one name in one function (declared in different blocks) are placed by the layout of their object section where that is known; where it is not (under cl every function-local static is a section of its own) they are matched by their place in the function (with the warning `CML3570`) only when the function has the same number of them as before, each has the same type and sits in the same block; otherwise this error names what differs, also when the guard variable of such a static has no record in the old image (clang-cl records none): the patch would then construct the old object a second time. The message also says so when the debug records needed for either could not be read (`CML1430` to `CML1434`). Since WP-40 also for a function-local static of a function `f` itself whose name is the name of a static of one of `f`'s lambdas, in the patch or in the running program: a compiler records the static of an inlined lambda in the function it was inlined into, under the same name, so a record of that name in `f` cannot be proven to be this static's (for instance after an inlined lambda was deleted and `f` got a static of its static's name). Since WP-51 (R-54) also for a function-local static whose only old record lies in its function's procedure when that procedure, in the running program, inlined a lambda's code (a call operator, `__invoke` or an invoker of any lambda, at any depth, or a template over a closure type), or when its inline sites cannot be read: clang-cl at `-O2` keeps no procedure for a lambda it inlined everywhere and records the lambda's static in the caller under its plain name, so after the lambda was deleted the record may be its live object. A function that inlined only other code (Jolt's `GetRTTIOfType`, ImGui's `main`) pairs as before. The broker log names the inlinee (`WP51-OWN-STATIC`).  
 - **Message:** `static data '<...>' (<...>) matches <...> records named '<...>' in compiland <...> but the patch object defines <...> of them<...>`  
 - **Message:** `static data '<...>' (<...>) in <...> cannot be paired with the <...> record(s) named '<...>' of its function in compiland <...>: <...>, and a record of that name in the function may be that lambda's (a compiler records the static of an inlined lambda in the function it was inlined into), so none is provably this static's`  
+- **Message:** `static data '<...>' (<...>) in <...> cannot be paired with the record '<...>' at rva <...> of its function in compiland <...>: '<...>' (rva <...>) inlined '<...>', a lambda's code, and a compiler records the statics of inlined code as records of the calling procedure under their own names, so the record may be that code's static and not this one`  
 - **What to do:** Rename one of the statics, keep their number unchanged, or hot-restart.  
-  Other variants of the advice: Rename the static (or the lambda's static), or hot-restart.  
+  Other variants of the advice: Rename the static (or the lambda's static), or hot-restart. Rename the static, or hot-restart.  
 - **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
 
 ### CML3208
@@ -1708,6 +1745,41 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 - **What to do:** The patch was placed too far from the data it refers to; reserve address space nearer the module (or reload) so the patch lands within 2 GiB.  
 - **Raised by:** `agent/src/loader/fixup_diag_ids.h`
 
+### CML4720
+
+- **Cause:** (warning, agent) The agent could not register for the loader's module notifications (`LdrRegisterDllNotification` is missing or failed, there was no memory for the notification ring, or the test option `CML_TEST_NO_LOADER_NOTIFICATIONS` is set). It falls back to comparing the process's module list every 500 ms, as agents before WP-48 did. A DLL that is freed and loaded again between two of those comparisons (FreeLibrary + LoadLibrary at the same base) is not seen: the new image runs its original code and the session's edits are not re-applied to it.  
+- **Message:** `loader notifications are switched off (...)` / `LdrRegisterDllNotification is not available; ...` / `LdrRegisterDllNotification failed (NTSTATUS 0x...); module changes are seen by a module-list diff every 500 ms, so a module freed and loaded again in between keeps running its original code`  
+- **What to do:** Unset `CML_TEST_NO_LOADER_NOTIFICATIONS` if it is set. Otherwise report it with the agent log (`CML_AGENT_LOG`) and the Windows version. Until then, leave more than half a second between freeing a module and loading it again, or hot-restart after loading it again.  
+- **Raised by:** `agent/src/module_event_ids.h`
+
+### CML4721
+
+- **Cause:** (warning, agent) More modules were loaded and unloaded between two drains of the agent's notification ring (256 events; it is drained every 500 ms, and as soon as it is half full) than it holds, so loader notifications were lost. The agent completed that report from the process's module list. A module freed and loaded again at the same base in that moment may not be seen and may run its original code. The broker reports the same moment as CML5620.  
+- **Message:** `<n> loader notification(s) did not fit the agent's ring (256 slots); the module changes of this poll are completed from the module list, so a module freed and loaded again in that time may run its original code`  
+- **What to do:** Usually nothing: bursts like this happen while a program starts and loads many DLLs, before any module is edited. If a module you edited was freed and loaded again in that moment, load it again (or hot-restart) to get the session's edits re-applied.  
+- **Raised by:** `agent/src/module_event_ids.h`
+
+### CML4722
+
+- **Cause:** (warning, agent) What the agent had reported from the loader's notifications and the process's module list disagreed in two quiet polls in a row (nothing was loaded or unloaded in between), so the module list was taken as the truth and the difference reported. This should not happen; a single disagreement is normal while a load or unload is under way and is never reported.  
+- **Message:** `the agent's module events and the process's module list disagreed twice in a row; the list is taken as the truth (<n> change(s) reported from it)`  
+- **What to do:** Nothing is needed for the session to go on. Report it with the agent log (`CML_LOG_LEVEL=debug`, `CML_AGENT_LOG`): it is a defect in how the agent reads the loader's notifications.  
+- **Raised by:** `agent/src/module_event_ids.h`
+
+### CML4723
+
+- **Cause:** (warning, agent) A module whose full path is longer than a notification slot holds (520 characters) was loaded and unloaded again before the agent's next poll, so its path could not be read from the module list either. The agent completed that report from the module list.  
+- **Message:** `a module with a path longer than 520 characters was loaded and unloaded again before the agent could read its path; the module changes of this poll are completed from the module list`  
+- **What to do:** Nothing for the session; a module with such a path that stays loaded is reported normally. Use shorter paths if the module is one you edit.  
+- **Raised by:** `agent/src/module_event_ids.h`
+
+### CML4724
+
+- **Cause:** (warning, agent) A function the agent hooked holds neither the agent's jump nor the function's original bytes. A debugger set a breakpoint on it, another tool detoured it, or its page cannot be read. That is no proof that the module was freed and loaded again, so the hook record is kept and the module is still taken for the hooked image. It is logged once per function and session. (A record whose bytes read the original ones, or whose range is no longer mapped, proves a new image and is forgotten.)  
+- **Message:** `the hooked function <name> at <address> in <module> holds neither the agent's jump nor its original bytes (a breakpoint, or another tool's detour; <n> such hook(s) in the module): the hook record is kept, and the module is not taken for a new image`  
+- **What to do:** Usually nothing: remove the breakpoint when you are done. If another tool hooks the same functions, the two will overwrite each other. Use one of them for those functions, or hot-restart after the other tool is gone.  
+- **Raised by:** `agent/src/module_event_ids.h`
+
 
 ## CML5200 to CML5299
 
@@ -2386,6 +2458,20 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 - **What to do:** Fix what the index diagnostic says, then run `reload` (or load the module again).  
 - **Raised by:** `broker/cml_core/include/cml/core/reenable_diag_ids.h`
 
+### CML5620
+
+- **Cause:** (warning, broker; also a `diag` event, stage `modules`) The agent of a process reported some of its module changes from a comparison of module lists instead of the loader's notifications: its notification ring overflowed (CML4721), a path could not be resolved (CML4723), or its list and the process's disagreed (CML4722). A module of that process freed and loaded again at the same base in that moment was not seen: it runs its original code, and the session's edits were not re-applied to it.  
+- **Message:** `the agent of process <pid> reported <n> module change(s) from a module-list diff (agent CML<id>, <n> loader notification(s) lost): a module freed and loaded again at the same base in that time was not seen and runs its original code`  
+- **What to do:** If a module of this process was freed and loaded again just then, load it again (or hot-restart) to get the session's edits re-applied. The agent's warning (forwarded to the broker log) names the cause.  
+- **Raised by:** `broker/cml_core/include/cml/core/module_event_diag_ids.h`
+
+### CML5621
+
+- **Cause:** (warning, broker log) An agent registered with an agent ABI before 3 (a `cml_agent.dll` from before WP-48). It reports module changes from a comparison of module lists every 500 ms, so a module freed and loaded again in between (FreeLibrary + LoadLibrary at the same base) is not seen and keeps running its original code. Everything else works with that agent.  
+- **Message:** `the agent of process <pid> speaks agent ABI <n>, which reports module changes from a module-list diff every 500 ms: a module freed and loaded again in between is not seen and keeps running its original code`  
+- **What to do:** Use `cml_agent.dll` from the same Chameleon build as the broker. The application does not need to be rebuilt: the agent's C interface (`CML_AGENT_ABI_VERSION`) did not change.  
+- **Raised by:** `broker/cml_core/include/cml/core/module_event_diag_ids.h`
+
 ### CML5650
 
 - **Cause:** a hook record points outside its image: skipped.  
@@ -2654,7 +2740,7 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 
 - **Cause:** The new process did not register in time (left running).  
 - **Message:** `the new process (pid <...>) did not register within <...> ms; it was left running; its next restart enables its modules and re-applies the session's edits once it has registered`  
-- **What to do:** Check that the application creates its agent at start-up (and that it can reach the broker); raise 'registration_timeout_ms' if it starts slowly. Since WP-43 the broker remembers the modules and edits of that restart: once the process has registered, its next `restart` enables the modules and re-applies the edits.  
+- **What to do:** Check that the application creates its agent at start-up (and that it can reach the broker); raise 'registration_timeout_ms' if it starts slowly. Since WP-43 the broker remembers the modules and edits of that restart: once the process has registered, its next `restart` enables the modules and re-applies the edits. The same budget also covers the new process's PDB indexes and the re-apply: when a restart that did register runs out of it, the broker log's `WP50-INDEX` and `WP50-RESTART` lines say which stage took the time (first steps, item 5).  
 - **Raised by:** `broker/cml_core/include/cml/core/restart_diag_ids.h`
 
 ### CML5809

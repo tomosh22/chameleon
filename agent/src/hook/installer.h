@@ -45,6 +45,7 @@
 #include "cml/ipc/fault_stages.h"
 #include "cml/util/diag.h"
 #include "hook_plan.h"
+#include "hook_timing.h"
 #include "thread_set.h"
 
 namespace cml::agent::hook {
@@ -78,9 +79,12 @@ struct BatchStats {
     unsigned window_ms = 0;        // longest time the world was stopped
 };
 
+// WP-50 (R-47): BatchTiming (where the time of one batch went) is in hook_timing.h, portable so that its log line is tested on every host.
+
 struct BatchResult {
     Diag diag;  // code 0 = every hook of the batch was applied
     BatchStats stats;
+    BatchTiming timing;  // WP-50
     bool ok() const noexcept { return diag.code == 0; }
 };
 
@@ -108,7 +112,12 @@ struct InstallerOptions {
     // heap, the agent heap and the loader lock exactly while the world is stopped, then let go).
     void (*test_before_stop)(void* context) = nullptr;
     void (*test_after_resume)(void* context) = nullptr;
+    // Tests only (WP-48): called inside reconcile_range with the batch mutex held, after the records are classified and before any
+    // is forgotten (a test shows that an install started meanwhile waits for the whole call).
+    void (*test_in_reconcile)(void* context) = nullptr;
     void* test_context = nullptr;
+    // Tests only (WP-50): plan with a VirtualQuery per question instead of the per-batch region cache, to compare the two.
+    bool test_no_region_cache = false;
 };
 
 struct HookInfo {
@@ -144,6 +153,34 @@ public:
     // erases (no allocation). Returns the number of records dropped.
     std::size_t forget_range(std::uint64_t base, std::uint64_t size);
 
+    // WP-48 (ADR-0044 ruling, refined: the hook bytes are the arbiter, probed and forgotten in ONE locked section): reconciles the
+    // records whose target lies in [base, base + size) with the image mapped there now. Each record's bytes (entry and padding) are
+    // read and classified:
+    //   ours:     what this installer wrote: the hook is live; kept;
+    //   original: what the record saved before its first write, which is what a fresh image at the same base shows: replaced;
+    //             THIS record is forgotten;
+    //   unmapped: the target is no longer committed memory (VirtualQuery): replaced; forgotten;
+    //   other:    anything else (a debugger's int3, another tool's detour), or committed but unreadable: no proof of a replacement;
+    //             kept, and counted (the first one is named) so that the caller can warn.
+    // With `module_gone` (the caller knows the module was unloaded: it is reported unloaded and the module list no longer shows it)
+    // and no record reading "ours", every record left in the range is forgotten too (the WP-45 forget, for a range something else
+    // occupies now). Verdict: Replaced when something was forgotten, Live when records are left, None when there were none.
+    // Takes the batch mutex for the whole call, so no install or revert can come between the probe and the forget, and it never runs
+    // while threads are suspended; reads with VirtualQuery and ReadProcessMemory on the own process (fails instead of faulting);
+    // erases only (no allocation).
+    struct Reconciled {
+        enum class Verdict : std::uint8_t { None, Live, Replaced };
+        Verdict verdict = Verdict::None;
+        std::size_t ours = 0;
+        std::size_t original = 0;
+        std::size_t unmapped = 0;
+        std::size_t other = 0;
+        std::size_t forgotten = 0;
+        std::uintptr_t other_target = 0;  // the first record classified "other"
+        char other_name[48] = {};
+    };
+    Reconciled reconcile_range(std::uint64_t base, std::uint64_t size, bool module_gone = false);
+
     bool ready() const noexcept { return ready_; }
     std::size_t hook_count() const;
     bool find(const void* target, HookInfo* info) const;
@@ -166,11 +203,15 @@ private:
         std::uint32_t window_before = 0;
         std::uint32_t window_after = 0;
         char name[48] = {};
+        bool forget = false;  // WP-48: marked by reconcile_range's first pass, erased by its second (under the same lock)
     };
     struct Job;
     struct Report;
 
     BatchResult apply(bool revert, const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes, ipc::fault::Stage inject);
+    // `called`: the counter when apply() was entered (WP-50: the wait for the mutex is the batch's lock_us).
+    BatchResult apply_locked(bool revert, const HookRequest* requests, std::size_t count, std::vector<HookOutcome>& outcomes, ipc::fault::Stage inject,
+                             long long called);
     void attempt(Job* jobs, std::size_t count, unsigned* conflicts_seen, Report* report, ipc::fault::Stage inject) noexcept;
     bool find_conflict(const Job* jobs, std::size_t count, std::size_t* thread_index, std::size_t* job_index) const noexcept;
     Record* find_record(std::uintptr_t target);
@@ -186,6 +227,8 @@ private:
 // The process-wide installer used by the agent: hooks are process state, so every agent in the
 // process shares one registry. Created on first use, never destroyed.
 Installer& process_installer();
+
+
 
 }  // namespace cml::agent::hook
 

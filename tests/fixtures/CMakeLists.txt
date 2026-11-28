@@ -65,3 +65,4 @@ add_subdirectory(planner_pairing_o2)  # WP-40 (/O2 /Ob2)
 add_subdirectory(legacy_lambdas)      # WP-46 (cl legacy lambda processor, C++17)
 add_subdirectory(plugin_reload)       # WP-45
 add_subdirectory(atomic_reload)       # WP-47 (a header edit over three TUs, the third refused)
+add_subdirectory(jump_tables)         # WP-49 (switches: jump tables in the function's own code under cl)

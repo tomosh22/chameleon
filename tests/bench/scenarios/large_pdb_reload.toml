@@ -12,6 +12,8 @@
 #   1. the program runs with the agent; the broker indexes the PDB and hashes the tracked sources (900 translation units, 24 headers, main.cpp);
 #   2. src/tu_0450.cpp (1000 functions; bench_reload_value() is its last one) is edited and reloaded five times
 #      (1 -> 2 -> ... -> 6); after each reload the program prints the new value;
+#      WP-49: each of these reloads installs exactly one hook (before WP-49: 275, the functions with a switch were never
+#      found identical);
 #   3. perf_report: median over the five reloads of (total - compile) must stay under 3000 ms (plan target 1500 ms, CI
 #      threshold with ADR-0009's 2x slack), and the broker's peak private bytes under 1.5 x the PDB size + 32 MiB. A reload
 #      whose timing lacks a stage, or holds a non-number, fails the step (nothing is read as 0). The numbers go to
@@ -52,6 +54,12 @@ within_s = 600
 expect_result_key = "patched"
 expect_result_value = 1
 
+# WP-49: the edit changes one function; the TU's other 999 (274 of them with a cl /Od jump table) equal the running code.
+[[step]]
+kind = "expect_reload_result"
+key = "hooks_installed"
+value = 1
+
 [[step]]
 kind = "expect_stdout"
 regex = "TICK n=\\d+ value=2 tus=\\d+"
@@ -66,6 +74,12 @@ kind = "reload"
 within_s = 600
 expect_result_key = "patched"
 expect_result_value = 1
+
+# WP-49: the edit changes one function; the TU's other 999 (274 of them with a cl /Od jump table) equal the running code.
+[[step]]
+kind = "expect_reload_result"
+key = "hooks_installed"
+value = 1
 
 [[step]]
 kind = "expect_stdout"
@@ -82,6 +96,12 @@ within_s = 600
 expect_result_key = "patched"
 expect_result_value = 1
 
+# WP-49: the edit changes one function; the TU's other 999 (274 of them with a cl /Od jump table) equal the running code.
+[[step]]
+kind = "expect_reload_result"
+key = "hooks_installed"
+value = 1
+
 [[step]]
 kind = "expect_stdout"
 regex = "TICK n=\\d+ value=4 tus=\\d+"
@@ -97,6 +117,12 @@ within_s = 600
 expect_result_key = "patched"
 expect_result_value = 1
 
+# WP-49: the edit changes one function; the TU's other 999 (274 of them with a cl /Od jump table) equal the running code.
+[[step]]
+kind = "expect_reload_result"
+key = "hooks_installed"
+value = 1
+
 [[step]]
 kind = "expect_stdout"
 regex = "TICK n=\\d+ value=5 tus=\\d+"
@@ -111,6 +137,12 @@ kind = "reload"
 within_s = 600
 expect_result_key = "patched"
 expect_result_value = 1
+
+# WP-49: the edit changes one function; the TU's other 999 (274 of them with a cl /Od jump table) equal the running code.
+[[step]]
+kind = "expect_reload_result"
+key = "hooks_installed"
+value = 1
 
 [[step]]
 kind = "expect_stdout"

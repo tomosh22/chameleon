@@ -9,6 +9,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <fstream>
+#include <functional>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -301,6 +302,14 @@ struct Rig {
         };
         pipeline_env = env;
         service = std::make_unique<ReloadService>(std::move(env), &bus, default_session_dir ? std::string() : dir.subdir("session"));
+        {
+            // WP-50: the tests decide when the module file is read (several rewrite it after the enable); the background read has
+            // tests of its own.
+            Value off = Value::object();
+            off.set("name", Value::string("prefetch_module_image"));
+            off.set("value", Value::boolean(false));
+            REQUIRE(service->set_option(off).has_value());
+        }
         link = std::make_shared<AgentLink>(1, [this](const ipc::Message& m) { return agent(m); });
         session.set_answer_sink([this](const ipc::Message& m) { return link->deliver(m); });
         service->attach(link);
@@ -1727,6 +1736,173 @@ TEST_CASE("the index of a module whose PDB is missing fails with the PDB's own d
     Result<Value> r = rig.reload();
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().code == status.error->code);
+}
+
+TEST_CASE("WP-50: the module file is read in the background once the index is ready, the first reload uses that copy, and a drop releases it") {
+    QuietLogs quiet;
+    Rig rig;
+    Value on = Value::object();
+    on.set("name", Value::string("prefetch_module_image"));
+    on.set("value", Value::boolean(true));
+    REQUIRE(rig.service->set_option(on).has_value());
+    rig.enable();
+    std::shared_ptr<const pe::OwnedImage> prefetched;
+    for (int i = 0; i < 500 && prefetched == nullptr; ++i) {
+        prefetched = rig.module->image_slot->stored();
+        if (prefetched == nullptr) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    REQUIRE_MESSAGE((prefetched != nullptr), "no background read within 10 s of the index being ready");
+
+    // The reload compares with the copy read in the background: no second read.
+    rig.changed();
+    REQUIRE(rig.reload().has_value());
+    CHECK((rig.module->image_slot->stored() == prefetched));
+    CHECK(rig.module->image_slot->reads() == 1);
+    const ModuleState::ImageRead again = rig.module->ensure_image(false);
+    CHECK_FALSE(again.read_now);
+    CHECK((again.image == prefetched));
+
+    // Disabled: the state drops its copy, and a background read that comes late stores nothing.
+    const std::shared_ptr<ModuleState> old = rig.module;
+    ipc::DisableModule disable;
+    disable.request_id = 9;
+    disable.path = rig.exe;
+    rig.session.on_message(disable);
+    rig.link->publish(rig.session);
+    rig.service->on_session_changed(1);
+    CHECK((rig.service->module_state(1, rig.exe) == nullptr));
+    CHECK((old->image_slot->stored() == nullptr));
+    CHECK(old->image_slot->released());
+    const ModuleState::ImageRead late = old->ensure_image(true);
+    CHECK_FALSE(late.read_now);
+    CHECK((late.image == nullptr));
+    // A reload's own read still works (it compares, but keeps nothing on a released state).
+    const ModuleState::ImageRead own = old->ensure_image(false);
+    CHECK(own.read_now);
+    CHECK((own.image != nullptr));
+    CHECK((old->image_slot->stored() == nullptr));
+}
+
+TEST_CASE("WP-50 (review): a disable during the background read destroys the state on the disabling thread at once; the read keeps nothing") {
+    QuietLogs quiet;
+    // Declared before the rig: the service's reader thread may call the hook until the rig is gone.
+    std::mutex m;
+    std::condition_variable cv;
+    bool entered = false;
+    bool go = false;
+    const auto release = [&] {
+        {
+            std::lock_guard<std::mutex> lock(m);
+            go = true;
+        }
+        cv.notify_all();
+    };
+    Rig rig;
+    // Whatever fails below (a REQUIRE leaves the test early), the reader is let go before the rig's destructor joins it; and it
+    // never waits longer than 30 s on its own.
+    struct Release {
+        std::function<void()> f;
+        ~Release() { f(); }
+    } release_on_exit{release};
+    rig.option("prefetch_module_image", Value::boolean(true));
+    rig.service->set_prefetch_hook_for_testing([&] {
+        std::unique_lock<std::mutex> lock(m);
+        entered = true;
+        cv.notify_all();
+        cv.wait_for(lock, std::chrono::seconds(30), [&] { return go; });
+    });
+    rig.enable();
+    {
+        std::unique_lock<std::mutex> lock(m);
+        REQUIRE_MESSAGE(cv.wait_for(lock, std::chrono::seconds(10), [&] { return entered; }), "the background read did not start");
+    }
+    // The reader is about to read (it waits in the hook). It holds the slot, not the state.
+    const std::weak_ptr<ModuleState> weak = rig.module;
+    const std::weak_ptr<ModuleIndex> index = rig.module->index;
+    const std::shared_ptr<ModuleImageSlot> slot = rig.module->image_slot;
+    rig.module.reset();
+    ipc::DisableModule disable;
+    disable.request_id = 9;
+    disable.path = rig.exe;
+    rig.session.on_message(disable);
+    rig.link->publish(rig.session);
+    rig.service->on_session_changed(1);
+    CHECK(weak.expired());   // destroyed here, by the disabling thread, while the read is still pending
+    CHECK(index.expired());  // its index joined and its PDB released with it
+    CHECK(slot->released());
+    release();
+    // The read finds the slot released: it reads nothing and stores nothing.
+    for (int i = 0; i < 50; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(slot->reads() == 0);
+    CHECK((slot->stored() == nullptr));
+    rig.service->set_prefetch_hook_for_testing(nullptr);
+}
+
+TEST_CASE("WP-50 (review): the background read is queued once per state, on the change into Ready") {
+    QuietLogs quiet;
+    std::atomic<int> reads{0};
+    Rig rig;
+    rig.option("prefetch_module_image", Value::boolean(true));
+    rig.service->set_prefetch_hook_for_testing([&] { ++reads; });
+    rig.enable();
+    for (int i = 0; i < 500 && rig.module->image_slot->stored() == nullptr; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    REQUIRE((rig.module->image_slot->stored() != nullptr));
+    // Later reloads queue no further read, and the reload uses the copy (the guard also holds should Ready be reported again).
+    rig.changed();
+    REQUIRE(rig.reload().has_value());
+    rig.unchanged();
+    REQUIRE(rig.reload().has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(reads.load() == 1);
+    CHECK(rig.module->image_slot->reads() == 1);
+    rig.service->set_prefetch_hook_for_testing(nullptr);
+}
+
+TEST_CASE("WP-50 (review): a reload of a released state reads the module file once for all of its units") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.option("narrow_hooks", Value::boolean(false));  // both units patch
+    // The state is released while a reload runs on it (disabled meanwhile): nothing is stored, so each unit used to read again.
+    rig.module->release_image();
+    rig.changed_both();
+    rig.second_object = make_object();
+    Result<Value> r = rig.reload();
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    REQUIRE(rig.module->batches.size() == 1);
+    CHECK(rig.module->batches[0].patches.size() == 2);
+    CHECK(rig.module->image_slot->reads() == 1);
+    CHECK((rig.module->image_slot->stored() == nullptr));
+}
+
+TEST_CASE("WP-50 (review): the units of a reload share the stored copy: one read for two units, none for the next reload") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    rig.option("narrow_hooks", Value::boolean(false));
+    rig.changed_both();
+    rig.second_object = make_object();
+    REQUIRE(rig.reload().has_value());
+    CHECK(rig.module->image_slot->reads() == 1);
+    rig.changed();
+    REQUIRE(rig.reload().has_value());
+    CHECK(rig.module->image_slot->reads() == 1);
+}
+
+TEST_CASE("WP-50: a module file that cannot be read is reported by the read, not stored") {
+    ModuleState state;
+    state.path = "C:\\no\\such\\dir\\missing_module.exe";
+    const ModuleState::ImageRead background = state.ensure_image(true);
+    CHECK(background.read_now);
+    CHECK((background.image == nullptr));
+    CHECK(background.error.has_value());
+    CHECK((state.image_slot->stored() == nullptr));
 }
 
 TEST_CASE("disabling a module or losing the agent drops its state") {
@@ -3876,8 +4052,7 @@ void use_rich_module_file(Rig& rig) {
     std::ofstream out(rig.exe, std::ios::binary | std::ios::trunc);
     out.write(reinterpret_cast<const char*>(pe.data()), static_cast<std::streamsize>(pe.size()));
     out.close();
-    std::lock_guard<std::mutex> lock(rig.module->mutex);
-    rig.module->image.reset();  // the pipeline reads the file again
+    rig.module->image_slot->forget_for_testing();  // the pipeline reads the file again
 }
 
 Value module_report(const Value& result) { return result.find("patches")->items().at(0); }
@@ -4378,6 +4553,118 @@ TEST_CASE("WP-45: a reload asked for while a re-apply runs waits for it instead 
     CHECK(user->get_integer("patched") == 0);  // the re-apply did it
     CHECK(diag_messages(rig, "CML5304").empty());
     wait_idle(rig);
+}
+
+// --- WP-48 (ADR-0044): module events -------------------------------------------------------------------------------------------
+
+namespace {
+
+// What the connection thread does with a message (connection_server.cpp): a ModuleEvents is applied one event at a time, and the
+// service sees the session after every step.
+void agent_says_stepped(Rig& rig, const ipc::Message& m) {
+    const auto observe = [&rig] {
+        rig.link->publish(rig.session);
+        rig.service->on_session_changed(1);
+    };
+    rig.session.on_message(m, observe);
+    observe();
+}
+
+ipc::ModuleEvents unload_and_load(const std::string& path, std::uint64_t first_seq) {
+    ipc::ModuleEvents events;
+    ipc::ModuleEvent gone;
+    gone.kind = ipc::ModuleEventKind::Unloaded;
+    gone.seq = first_seq;
+    gone.module = {kModuleBase, 0x4000, path};
+    ipc::ModuleEvent back = gone;
+    back.kind = ipc::ModuleEventKind::Loaded;
+    back.seq = first_seq + 1;
+    events.events = {gone, back};
+    return events;
+}
+
+}  // namespace
+
+TEST_CASE("WP-48: an unload and a load at the same base in one ModuleEvents take the WP-45 re-enable path: the edits are re-applied (R-53)") {
+    QuietLogs quiet;
+    Rig rig(false, std::string(), false, true);
+    {
+        ipc::Hello hello;
+        hello.request_id = 1;
+        hello.pid = kPid;
+        hello.agent_abi_version = ipc::kAgentAbiModuleEvents;
+        rig.session.on_message(hello);
+        rig.said_hello = true;
+    }
+    rig.enable();
+    rig.write_logic(22);
+    Result<Value> first = rig.reload();
+    REQUIRE_MESSAGE(first.has_value(), first.error().format());
+    REQUIRE(first->get_integer("patched") == 1);
+    REQUIRE(rig.compile_calls == 1);
+
+    // FreeLibrary + LoadLibrary between two agent polls: one message, the module list before and after it is the same.
+    agent_says_stepped(rig, unload_and_load(rig.exe, 7));
+    wait_idle(rig);
+    const std::shared_ptr<ModuleState> again = current_state(rig);
+    CHECK(again->instance == 2);  // a new instance: the old state was dropped and its baseline kept (the carry)
+    CHECK(again->index->carried_files() == 1);
+    CHECK(generation_of(*again) == 1);  // re-applied
+    CHECK(rig.compile_calls == 2);
+    CHECK(rig.seen<ipc::InstallHooks>().size() == 2);
+    CHECK_FALSE(rig.service->has_carry_for_testing(kPid, rig.exe));
+    CHECK(diag_messages(rig, "CML5600").empty());
+    CHECK(rig.session.module_events_applied() == 2);
+
+    // The next edit links in the new instance's own directory, as after a free + load the poll saw (WP-45, F-42.2).
+    rig.option("narrow_hooks", Value::boolean(false));
+    rig.write_logic(333);
+    Result<Value> second = rig.reload();
+    REQUIRE_MESSAGE(second.has_value(), second.error().format());
+    CHECK(second->get_integer("patched") == 1);
+}
+
+TEST_CASE("WP-48: the same two events seen as one change of the module list (what the 500 ms diff saw) change nothing: why they are stepped") {
+    QuietLogs quiet;
+    Rig rig(false, std::string(), false, true);
+    rig.enable();
+    rig.write_logic(22);
+    REQUIRE(rig.reload().has_value());
+    REQUIRE(rig.compile_calls == 1);
+    agent_says(rig, unload_and_load(rig.exe, 7));  // the service looks only once, after both events
+    wait_idle(rig);
+    CHECK(current_state(rig)->instance == 1);
+    CHECK(rig.compile_calls == 1);
+}
+
+TEST_CASE("WP-48: an agent of ABI 2 (before WP-48) still works: ModuleUnloaded and ModuleLoaded take the re-enable path as before") {
+    QuietLogs quiet;
+    Rig rig(false, std::string(), false, true);
+    {
+        ipc::Hello hello;
+        hello.request_id = 1;
+        hello.pid = kPid;
+        hello.agent_abi_version = ipc::kAgentAbiSnapshots;
+        const SessionOutcome outcome = rig.session.on_message(hello);
+        REQUIRE(outcome.replies.size() == 1);
+        CHECK(std::get<ipc::Welcome>(outcome.replies[0]).agent_abi_version == 0);
+        REQUIRE(outcome.warnings.size() == 1);
+        CHECK(outcome.warnings[0].code == 5621);
+        rig.said_hello = true;
+    }
+    rig.enable();
+    rig.write_logic(22);
+    Result<Value> first = rig.reload();
+    REQUIRE_MESSAGE(first.has_value(), first.error().format());
+    REQUIRE(first->get_integer("patched") == 1);
+    unload_exe(rig);
+    load_exe(rig);
+    wait_idle(rig);
+    const std::shared_ptr<ModuleState> again = current_state(rig);
+    CHECK(again->instance == 2);
+    CHECK(generation_of(*again) == 1);
+    CHECK(rig.compile_calls == 2);
+    CHECK(diag_messages(rig, "CML5600").empty());
 }
 #endif  // _WIN32
 

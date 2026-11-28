@@ -8,10 +8,12 @@
 #
 # Output: `START pid=<pid> restarted=<0|1>` once; `TICK n=<k> value=<v> loaded=<0|1> gen=<g> pid=<pid> restarted=<0|1>` every 100 ms
 # (value 0 while the plugin is not loaded; gen counts the LoadLibraryW calls of this process); `LOADED gen=<g> ok=<0|1> base=<p>`,
-# `UNLOADED gen=<g> freed=<0|1> gone=<0|1>` and `AGENT exe|plugin enabled=<0|1> ...` when they happen.
+# `UNLOADED gen=<g> freed=<0|1> gone=<0|1>[ quick=1]`, `QUICK gap_ms=<ms> same_base=<0|1>` (WP-48, --quick-reload-at) and
+# `AGENT exe|plugin enabled=<0|1> ...` when they happen.
 #
-# Scenarios: plugin_reload (edit, FreeLibrary + LoadLibrary: the edit is still in effect; a second edit links; a re-apply that fails
-# is CML5600), plugin_late_load (hot-restart, the new process loads the plugin later: the edit is re-applied then; a failure is CML5600).
+# Scenarios: plugin_reload (edit, FreeLibrary + LoadLibrary: the edit is still in effect; a second edit links; WP-48: FreeLibrary +
+# LoadLibrary inside one agent poll keeps it too; a re-apply that fails is CML5600), plugin_late_load (hot-restart, the new process
+# loads the plugin later: the edit is re-applied then; a failure is CML5600).
 cml_add_fixture_dll(fixture_plugin_reload_plugin SOURCES plugin.cpp)
 cml_add_fixture(plugin_reload SOURCES main.cpp)
 add_dependencies(fixture_plugin_reload fixture_plugin_reload_plugin)

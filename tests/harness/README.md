@@ -95,6 +95,8 @@ regex = "TICK"
 kind = "expect_reload_result"  # an integer member of the last reload's result (compiled, compile_reused, load_attempts,
 key = "compiled"               # modules_patched, processes_patched, patched, hooks_installed, ...)
 value = 1
+compiler = "cl"                # optional (WP-49): "cl" or "clang-cl"; the expectation holds for that compiler only, the other
+                               # compiler's cells pass the step without checking
 
 # WP-22: undo reloads
 [[step]]
