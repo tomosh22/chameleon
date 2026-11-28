@@ -61,7 +61,7 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-51 | An own static never takes an inlined, deleted lambda's static (R-54; ADR-0044) | 12 | done | wp/51-inline-sites | #81 (18e158d) | ci 14/14, corpus 8/8, fuzz at 94c2484 (runs 46067810797, 46067811807, 46067810641) verified: every corpus cell pass, jolt and imgui clang-cl unchanged (18/18, 14/14), every WP51-INLINEES summary refused=0 would_refuse=0; jolt clang-cl plan_ms 419.3 / 883.8 on the largest reloads (R-62) |
 | WP-52 | A nested lambda's guard is tied to its bound static (R-60; ADR-0045) | 13 | in progress | wp/52-nested-guards | — | — |
 | WP-53 | A new static of an inlined lambda never takes its caller's deleted static (R-61; ADR-0045) | 13 | done | wp/53-inlined-mirror | #83 (70f7e7d) | ci 14/14, corpus all cells, fuzz at f3be1cb (runs 46091116595, 46091122825, 46091125315) verified: every corpus cell pass, jolt clang-cl 18/18 and imgui clang-cl 14/14, no CML3207 and no WP53-INLINED lines (no in-caller lambda-static pairings in the corpus) |
-| WP-54 | A reload across several modules of one process applies nothing when one is refused (R-56; ADR-0045) | 13 | in progress | wp/54-cross-module-atomic | — | — |
+| WP-54 | A reload across several modules of one process applies nothing when one is refused (R-56; ADR-0045) | 13 | done | wp/54-cross-module-atomic | #84 (391b28a) | ci 14/14, corpus all cells, fuzz at 2f3b5b4 (runs 46095410629, 46095412437, 46095414783) verified: `cross_module_atomic passed=18`, `atomic_reload passed=15`, `plugin_reload passed=36` in all 8 matrix cells; every corpus cell pass |
 | WP-55 | Reload and restart caches (R-58, R-62, R-63; ADR-0045) | 13 | in progress | wp/55-caches | — | — |
 
 ## Orchestrator integration work

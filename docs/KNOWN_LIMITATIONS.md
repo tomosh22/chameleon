@@ -85,8 +85,10 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
 - **A reload of several compilands is atomic per module (WP-47, R-52).** Every compiland of a module is planned, proven and
   linked before any is applied; a refusal applies nothing (CML3650). A failure while applying rolls back what that reload applied
   (CML3651); a roll-back that fails or is not confirmed is CML3652/CML3654, and if hooks were not confirmed (CML5309/CML4656) or the
-  agent was lost mid-apply the reply says which compilands may be live (CML3653/CML3655). A reload across several modules or
-  processes is still applied module by module (R-56).
+  agent was lost mid-apply the reply says which compilands may be live (CML3653/CML3655). Since WP-54 (R-56) a reload across
+  several modules of one process prepares all of them before applying any: a refused module applies nothing (CML3656), and an apply
+  failure rolls back the modules already applied, newest first (CML3657; a roll-back that fails or is unconfirmed is CML3658/CML3659,
+  unconfirmed hooks CML3660, a lost agent CML3661). Different processes are still reloaded independently.
 - **Modules freed and loaded again, or enabled late after a hot-restart (WP-45).** A module instance enabled after the session has
   accepted edits for its sources (FreeLibrary + LoadLibrary, or a module the restarted process loads later, CML5809) gets those
   edits re-applied by a re-apply reload once its index is ready; each instance has its own patch work directory. A re-apply that
