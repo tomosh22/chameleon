@@ -126,6 +126,7 @@ struct Proc {
     std::size_t id = 0;  // Supervisor id
     fs::path stdout_file;
     std::size_t cursor = 0;  // expect_stdout reads from here
+    std::size_t reload_cursor = 0;  // WP-52: where the output stood when the last reload began
 };
 
 class ScenarioRun {
@@ -669,6 +670,7 @@ private:
         // Output printed from now on belongs to the reloaded program.
         for (Proc& p : procs_) {
             p.cursor = read_whole_file(p.stdout_file).size();
+            p.reload_cursor = p.cursor;
         }
         ipc::json::Value args = ipc::json::Value::object();
         args.set("timeout_ms", ipc::json::Value::integer(limit_ms));
@@ -683,6 +685,9 @@ private:
                 return StepOutcome::fail(cml::ids::kReloadFailed, "the reload succeeded, expected the refusal " + step.expect_error);
             }
             const ipc::ControlDiag& d = *response->diag;
+            // WP-52: a refused reload has no result; a later expect_reload_result must not read the previous reload's.
+            has_reload_result_ = false;
+            last_reload_result_ = ipc::json::Value::object();
             if (!one_of(d.id, step.expect_error)) {
                 return StepOutcome::fail(cml::ids::kReloadFailed, "the reload was refused with " + d.id + ": " + d.message + ", expected " + step.expect_error);
             }
@@ -701,6 +706,9 @@ private:
                 std::printf("RELOAD-OUTCOME refused id=%s fixture=%s compiler=%s config=%s\n", d.id.c_str(), scenario_.fixture.c_str(), report_.compiler.c_str(),
                             options_.config.c_str());
                 std::fflush(stdout);
+                // WP-52: a refused reload has no result; a later expect_reload_result must not read the previous reload's.
+                has_reload_result_ = false;
+                last_reload_result_ = ipc::json::Value::object();
                 return StepOutcome::pass("reload refused, which this step allows: " + d.id + ": " + d.message);
             }
             return StepOutcome::fail(cml::ids::kReloadFailed, "reload failed: " + d.id + ": " + d.message + " What to do: " + d.action);
@@ -851,6 +859,29 @@ private:
         if (!checked) {
             return StepOutcome::fail(checked.error());
         }
+        if (step.since_reload > 0) {  // WP-52: the state continued across the last reload; waits up to within_s for the samples
+            const std::uint32_t limit_ms = std::min<std::uint32_t>(static_cast<std::uint32_t>(step.within_s) * 1000u, remaining_ms());
+            const Clock::time_point until = Clock::now() + std::chrono::milliseconds(limit_ms);
+            for (;;) {
+                const std::string now = read_whole_file(proc->stdout_file);
+                const std::size_t at = std::min(proc->reload_cursor, now.size());
+                const std::string_view before = std::string_view(now).substr(0, at);
+                const std::string_view after = std::string_view(now).substr(at);
+                const bool enough = tick_values(after, step.key).size() >= static_cast<std::size_t>(step.since_reload);
+                if (enough || Clock::now() >= until || supervisor_.exit_code(proc->id).has_value()) {
+                    cml::Result<std::string> whole = check_monotonic(now, step.key, static_cast<std::size_t>(step.min_samples));
+                    if (!whole) {
+                        return StepOutcome::fail(whole.error());
+                    }
+                    cml::Result<std::string> continued = check_continues(before, after, step.key, static_cast<std::size_t>(step.since_reload));
+                    if (!continued) {
+                        return StepOutcome::fail(continued.error());
+                    }
+                    return StepOutcome::pass(*whole + "; " + *continued);
+                }
+                Sleep(kPollMs);
+            }
+        }
         return StepOutcome::pass(*checked);
     }
 
@@ -969,9 +1000,8 @@ private:
 
     // An integer member of the most recent reload's result (WP-16: "compiled", "compile_reused", "processes", ...).
     StepOutcome expect_reload_result(const Step& step) {
-        if (!has_reload_result_) {
-            return StepOutcome::fail(cml::ids::kResultMismatch, "no reload ran before this step");
-        }
+        // WP-52: the compiler is checked first, so that the other compiler's cells pass the step even where the reload before
+        // it was refused (allow_error), which leaves no result.
         if (!step.compiler.empty()) {  // WP-49
             const std::string family = compiler_family(report_.compiler);
             if (family.empty()) {
@@ -982,6 +1012,9 @@ private:
                 return StepOutcome::pass("not checked: the expectation " + step.key + " = " + std::to_string(step.result_value) + " is for " + step.compiler +
                                          ", this cell is " + family);
             }
+        }
+        if (!has_reload_result_) {
+            return StepOutcome::fail(cml::ids::kResultMismatch, "no reload ran before this step, or the last one was refused");
         }
         const ipc::json::Value* member = last_reload_result_.find(step.key);
         if (member == nullptr || !member->is_integer() || member->as_integer() != step.result_value) {

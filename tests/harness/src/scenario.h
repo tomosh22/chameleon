@@ -63,6 +63,9 @@ struct Step {
     // passes the step without checking (the number differs where the compilers lay out the same code differently).
     std::string compiler;
     int min_samples = 10;  // ExpectMonotonic: at least this many samples of the key in the whole output
+    // ExpectMonotonic (WP-52): when > 0, also at least this many samples since the last reload, the first of them not below
+    // the last sample before it (the reload continued the state).
+    int since_reload = 0;
     // Reload: the result object of the reload command must hold this integer member (e.g. "initializers_run" = 1).
     std::string result_key;
     long long result_value = 0;

@@ -13,8 +13,8 @@ namespace cml_bind_test {
 //   main.cpp.obj  (compiland 1): fixture_note @0x1100, g_tick @0x3080
 //   CRT           (compiland 2): __security_cookie @0x3100, __security_check_cookie @0x1200, ...
 // `open_now` false: the caller adds module records first and calls open() itself.
-inline SynthWorld basic_world(bool open_now = true) {
-    SynthWorld w;
+inline SynthWorld basic_world(bool open_now = true, const std::string& tu_compiler = "Test Compiler 19.44", std::uint16_t tu_frontend_major = 19) {
+    SynthWorld w(tu_compiler, tu_frontend_major);
     w.proc(w.tu(), "compute_value", 0x10);
     w.proc(w.tu(), "helper", 0x40, 0x10, true);
     w.proc(w.main_obj(), "fixture_note", 0x100);
