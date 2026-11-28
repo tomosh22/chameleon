@@ -1,6 +1,9 @@
 // The event bus and the structured log sink (WP-12).
 #include <atomic>
 #include <cstdio>
+#if defined(_WIN32)
+#include <share.h>  // _SH_DENYNO
+#endif
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -9,6 +12,7 @@
 #include <vector>
 
 #include "../pdb/test_util.h"
+#include "cml/core/control_server.h"
 #include "cml/core/event_bus.h"
 #include "cml/core/log_hub.h"
 #include "cml/ipc/json.h"
@@ -29,6 +33,17 @@ std::FILE* open_scratch(const std::string& path) {
 #if defined(_WIN32)
     std::FILE* f = nullptr;
     return fopen_s(&f, path.c_str(), "w+b") == 0 ? f : nullptr;
+#else
+    return std::fopen(path.c_str(), "w+b");
+#endif
+}
+
+// WP-58 (review): a file another handle may read while this one is open. MSVC's fopen_s opens a file without sharing, so
+// std::ifstream cannot open it while the hub writes it (the tests that read back through the same FILE* do not need this);
+// the broker's own log file is opened with _wfsopen(..., _SH_DENYWR), which lets readers in.
+std::FILE* open_shared(const std::string& path) {
+#if defined(_WIN32)
+    return _fsopen(path.c_str(), "w+b", _SH_DENYNO);
 #else
     return std::fopen(path.c_str(), "w+b");
 #endif
@@ -251,7 +266,7 @@ TEST_CASE("log hub: the background writer writes every record in order, a warnin
     SinkGuard guard;
     testpdb::TempDir dir;
     const std::string path = dir.file("log_bg.txt");
-    std::FILE* file = open_scratch(path);
+    std::FILE* file = open_shared(path);
     REQUIRE(file != nullptr);
     {
         LogHub::Options options;
@@ -319,7 +334,7 @@ TEST_CASE("log hub: a record logged while the background writer stops is written
     SinkGuard guard;
     testpdb::TempDir dir;
     const std::string path = dir.file("log_stop.txt");
-    std::FILE* file = open_scratch(path);
+    std::FILE* file = open_shared(path);
     REQUIRE(file != nullptr);
     constexpr int kRecords = 4000;
     {
@@ -369,7 +384,7 @@ TEST_CASE("log hub: the sequence numbers of the file rise, with several threads 
     SinkGuard guard;
     testpdb::TempDir dir;
     const std::string path = dir.file("log_seq.json");
-    std::FILE* file = open_scratch(path);
+    std::FILE* file = open_shared(path);
     REQUIRE(file != nullptr);
     {
         LogHub::Options options;
@@ -436,4 +451,46 @@ TEST_CASE("log hub: a LogSinkScope puts the default sink back on an early return
     CHECK(hub.records() == 3);
     CML_LOG(Info, "after the normal return");
     CHECK(hub.records() == 3);
+}
+
+// WP-58 (review, pdb-benchmark): a client reads the broker log as soon as it has an answer (cmltest's evidence lines after each
+// reload) or an event. What was logged before the answer or the event is in the file by then, whatever the writer gathers.
+TEST_CASE("log hub: what was logged before a control answer or an event is in the file when the client has it") {
+    SinkGuard guard;
+    testpdb::TempDir dir;
+    const std::string path = dir.file("log_answer.txt");
+    std::FILE* file = open_shared(path);
+    REQUIRE(file != nullptr);
+    {
+        LogHub::Options options;
+        options.file = file;
+        options.background_writer = true;
+        LogHub hub(options);
+        set_log_level(LogLevel::Trace);
+        const LogSinkScope scope(hub);
+        for (int round = 0; round < 20; ++round) {
+            const std::string mark = "WP50-HOOKS side=broker request=" + std::to_string(round);
+            CML_LOG(Info, "%s", mark.c_str());
+            CML_LOG(Trace, "after %d", round);
+            const std::string answer = handle_control_line(R"({"id":1,"cmd":"status"})", ControlContext{});
+            CHECK(answer.find("\"ok\":true") != std::string::npos);
+            const std::string now = read_text(path);
+            CHECK(now.find(mark) != std::string::npos);
+            CHECK(now.find("after " + std::to_string(round)) != std::string::npos);
+        }
+        // An event: the listener reads the file when it is called.
+        EventBus bus;
+        struct Reader final : EventListener {
+            std::string path;
+            bool found = false;
+            void on_event(const Event&) override { found = read_text(path).find("before the event") != std::string::npos; }
+        };
+        auto reader = std::make_shared<Reader>();
+        reader->path = path;
+        bus.subscribe(reader, {"diag"});
+        CML_LOG(Debug, "before the event");
+        bus.publish(make_diag_event(Diag::make(3200, "m", "a"), "error", "plan", 1));
+        CHECK(reader->found);
+    }
+    std::fclose(file);
 }

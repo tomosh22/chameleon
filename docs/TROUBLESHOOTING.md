@@ -14,9 +14,10 @@ revert, restart).
 1. Check the module against the build requirements: `cml_broker check <module.exe|module.dll>`. Every `FAIL` and `WARN`
    line names its id; most "it does not reload" reports end here (see `docs/BUILD_REQUIREMENTS.md`).
 2. Run the broker with `--verbose --log broker.log` and read the lines before the diagnostic. Every decision of the bind
-   planner is logged at `trace`. (WP-58: with `--log FILE` a thread of the broker writes the file, gathering up to 20 ms
-   of records into one write; a warning or an error is in the file before the broker goes on, and the file is complete
-   when the broker exits. A crash of the broker itself can lose the last few milliseconds of `trace` and `debug` lines.)
+   planner is logged at `trace`. (WP-58: with `--log FILE` a thread of the broker writes the file, gathering up to 2 ms
+   of records into one write. A warning or an error is in the file before the broker goes on; everything logged before a
+   control answer or an event is in the file before the client has it; the file is complete when the broker exits. A broker
+   that crashes or is killed can lose the `trace`, `debug` and `info` lines of its last few milliseconds.)
 3. Look for the diagnostic in the `diag` events or the reload response: the `id`, `message` and `action` fields are the
    text shown below.
 4. Hot-restart (`restart`) is the way out when a change cannot be patched in place (`docs/KNOWN_LIMITATIONS.md`).

@@ -13,10 +13,11 @@
 // forwarded again.
 //
 // WP-58 (R-62): with Options::background_writer the file is written by a thread of the hub. A record is formatted and
-// queued in order by the thread that logs it; the writer gathers what is logged within a few milliseconds (kGatherMs) into
-// one write and flushes it, so that a stage logging a decision per symbol at trace does not pay a file write per record. A
-// record at Warn or above is on disk before its log call returns, as everything logged before it. A caller that reads the
-// file itself calls flush() first; the destructor writes what is queued.
+// queued in order by the thread that logs it; the writer gathers what is logged within 2 ms (kGatherMs) into one write and
+// flushes it, so that a stage logging a decision per symbol at trace does not pay a file write per record. A record at Warn
+// or above is on disk before its log call returns, as everything logged before it. A caller that reads the file itself calls
+// flush() first (the broker does before every control answer and event: cml::log_flush); the destructor writes what is
+// queued.
 
 #include <atomic>
 #include <chrono>
@@ -70,6 +71,8 @@ public:
 
     // The cml::LogSink function; `user` is the LogHub.
     static void sink(void* user, LogLevel level, const char* file, int line, const char* message);
+    // WP-58: the cml::LogFlush function (flush()); `user` is the LogHub.
+    static void flush_sink(void* user);
 
     // Forward records of at least `min_level` as `log` events (nullptr detaches).
     void attach_events(EventBus* bus, LogLevel min_level = LogLevel::Info);
@@ -110,7 +113,7 @@ private:
 // default sink back before the hub is destroyed, on every return path (a log call after that never reaches a destroyed hub).
 class LogSinkScope {
 public:
-    explicit LogSinkScope(LogHub& hub) noexcept { set_log_sink(LogHub::sink, &hub); }
+    explicit LogSinkScope(LogHub& hub) noexcept { set_log_sink(LogHub::sink, &hub, LogHub::flush_sink); }
     ~LogSinkScope() { set_log_sink(nullptr, nullptr); }
     LogSinkScope(const LogSinkScope&) = delete;
     LogSinkScope& operator=(const LogSinkScope&) = delete;

@@ -11,7 +11,7 @@ namespace cml::core {
 namespace {
 thread_local bool t_in_sink = false;
 // WP-58: how long the background writer gathers records into one write (a record reaches the file at most this much later).
-constexpr int kGatherMs = 20;
+constexpr int kGatherMs = 2;
 
 std::string lower_level(LogLevel level) {
     std::string s = to_string(level);
@@ -102,6 +102,8 @@ void LogHub::flush() {
 void LogHub::sink(void* user, LogLevel level, const char* file, int line, const char* message) {
     static_cast<LogHub*>(user)->write(level, file, line, message);
 }
+
+void LogHub::flush_sink(void* user) { static_cast<LogHub*>(user)->flush(); }
 
 void LogHub::attach_events(EventBus* bus, LogLevel min_level) {
     std::lock_guard<std::mutex> lock(mutex_);
