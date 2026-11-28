@@ -101,5 +101,6 @@ fixtures" to "works on your project".
 3. **Then:** fixes from R-10 as they come; R-46, R-47.
    **Wave 12 (Eng), done (ADR-0044):** WP-47 = R-52, WP-48 = R-53, WP-49 = R-46, WP-50 = R-47 + R-55; WP-51 = R-54 (split from WP-46).
    New from wave 12: R-56..R-63 (R-60 and R-61 are pairing-correctness items).
+   **Wave 13 (Eng), in progress (ADR-0045):** WP-52 = R-60, WP-53 = R-61, WP-54 = R-56, WP-55 = R-58 + R-62 + R-63; R-59 waits for WP-53.
 4. **Before first sale (User + Eng):** R-32, R-33, R-34, R-35.
 5. **After GA:** R-20 / R-21 per the positioning decision, R-23 research.
