@@ -70,6 +70,30 @@ TEST_CASE("check_continues: the first sample after the last reload is not below 
     CHECK_FALSE(check_continues("", after, "nest", 1).has_value());      // nothing before
 }
 
+TEST_CASE("monotonic_samples_ready: expect_monotonic with since_reload waits for the whole output's samples too (WP-57)") {
+    // inlined_owner_o2 (CI 46118970268): 9 samples in all, 3 since the reload, when the step ran 0.1 s after the reload.
+    std::string before;
+    for (int i = 1; i <= 6; ++i) {
+        before += "TICK count=" + std::to_string(800000 + i) + "\n";
+    }
+    std::string now = before;
+    for (int i = 7; i <= 9; ++i) {
+        now += "TICK count=" + std::to_string(800000 + i) + "\nnoise\n";
+    }
+    CHECK_FALSE(monotonic_samples_ready(now, before.size(), "count", 20, 10));  // too few of both: keep waiting
+    for (int i = 10; i <= 16; ++i) {
+        now += "TICK count=" + std::to_string(800000 + i) + "\n";
+    }
+    CHECK_FALSE(monotonic_samples_ready(now, before.size(), "count", 20, 10));  // 10 since the reload, 16 in all
+    CHECK(monotonic_samples_ready(now, before.size(), "count", 16, 10));
+    for (int i = 17; i <= 20; ++i) {
+        now += "TICK count=" + std::to_string(800000 + i) + "\n";
+    }
+    CHECK(monotonic_samples_ready(now, before.size(), "count", 20, 10));
+    CHECK_FALSE(monotonic_samples_ready(now, before.size(), "count", 20, 15));  // 14 since the reload
+    CHECK(monotonic_samples_ready(now, now.size() + 10, "count", 20, 0));      // a cursor past the end: nothing since
+}
+
 TEST_CASE("scenario: expect_monotonic takes since_reload (WP-52)") {
     const std::string head = "name = \"x\"\nfixture = \"statics\"\n[[step]]\nkind = \"launch\"\n[[step]]\nkind = \"expect_monotonic\"\nkey = \"nest\"\n";
     cml::Result<Scenario> r = parse_scenario(head + "since_reload = 20\n");

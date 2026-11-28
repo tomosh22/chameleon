@@ -26,4 +26,10 @@ cml::Result<std::string> check_monotonic(std::string_view output, std::string_vi
 // restart it). Returns a one-line summary ("nest: 812 before the reload, 813 after, 40 samples since") or CML5427.
 cml::Result<std::string> check_continues(std::string_view before, std::string_view after, std::string_view key, std::size_t min_after);
 
+// WP-57: an expect_monotonic step with since_reload waits (up to within_s) until this is true: `output` (the whole output) holds
+// at least `min_samples` values of `key` and its part from `reload_cursor` on (since the last reload) at least `since_reload`.
+// Only then are check_monotonic and check_continues judged, so a fixture that has printed few lines by the time the step runs
+// (a scenario soon after its launch) is given the window instead of failing at once.
+bool monotonic_samples_ready(std::string_view output, std::size_t reload_cursor, std::string_view key, std::size_t min_samples, std::size_t since_reload);
+
 }  // namespace cmltest

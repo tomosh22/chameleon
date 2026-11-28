@@ -53,6 +53,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "cml/coff/coff.h"
@@ -124,6 +125,9 @@ struct NarrowDecision {
     NarrowReason reason = NarrowReason::Unchanged;
     std::string detail;   // e.g. "byte 12 differs", "relocation to 'g' resolves to 0x..., expected 0x..."
     bool from_prior = false;  // WP-25: judged against the record of an earlier patch (not against the module file)
+    // WP-57: kept because the callee step could not prove a called new static function to be the old code there (the inlined-
+    // static proofs say "cannot be proven unchanged", not "changed").
+    bool unproven = false;
 };
 
 struct NarrowInput {
@@ -140,6 +144,16 @@ struct NarrowInput {
     // when the entry is hooked, else the entry itself when an earlier patch defined the function). Null: nothing is
     // known, and an entry that is hooked or defined by a patch is kept. May be empty.
     std::function<std::shared_ptr<const CodeImage>(std::uint64_t old_va)> prior_code;
+    // WP-57 (ADR-0046), the callee step of the inlined-static proofs (prove_inlined_lambda_statics,
+    // prove_inlined_owner_statics; hook narrowing never uses it). A relocation of the judged code to a static function the
+    // patch introduces (PatchNewFunction: a template instantiation over a closure, which the planner never pairs) counts as
+    // the old code's target when that target starts an old procedure of the same code size (`old_proc_size`: the code size
+    // of the old procedure that starts exactly at an RVA, nullopt when none does) and the new function compares equal with it
+    // by the same rules, recursively. A pair being compared counts as equal (recursion); more than `max_callee_pairs` pairs
+    // in one judgement cannot be judged. Logs `WP57-CALLEE caller=... callee=... old va=... verdict=...` (trace).
+    bool follow_new_callees = false;
+    std::function<std::optional<std::uint32_t>(std::uint32_t rva)> old_proc_size;
+    std::size_t max_callee_pairs = 64;
 };
 
 struct NarrowResult {
@@ -215,6 +229,19 @@ std::vector<Diag> prove_hashed_lambdas(const NarrowInput& input);
 // CML3207 per listed static of that procedure. One verdict per procedure. Logs `WP53-INLINED-PROOF static=... proc=...
 // proven=unchanged|refused` (trace) per static and `WP53-INLINED object=... listed=N proven=N refused=N skipped=N` (Info, when the
 // plan lists any).
-std::vector<Diag> prove_inlined_lambda_statics(const NarrowInput& input);
+// WP-57: with `verdicts`, the verdicts per procedure ((its old entry RVA, its name) -> "" proven, else why not; a procedure
+// without an RVA is never kept) are taken from and
+// added to it, so prove_inlined_owner_statics on the same plan judges each procedure once. Both proofs use the callee step
+// (NarrowInput::old_proc_size).
+using InlinedProcVerdicts = std::map<std::pair<std::uint32_t, std::string>, std::string>;  // (entry RVA, procedure name)
+std::vector<Diag> prove_inlined_lambda_statics(const NarrowInput& input, InlinedProcVerdicts* verdicts = nullptr);
+
+// WP-57 (R-59, ADR-0046). For every BindPlan::inlined_owner_statics entry (an own static of a function whose old procedure
+// holds its record and inlined closure code, which may as well be the static of a lambda the edit deleted, R-54): the same
+// proof as WP-53's, on the static's own procedure. Unchanged under the plan proves the pairing; anything else gives one
+// CML3207 per listed static, with WP-51's message and why the proof failed. Logs `WP57-OWNER-PROOF static=... proc=...
+// proven=unchanged|refused` (trace) and `WP57-OWNER object=... listed=N proven=N refused=N skipped=N` (Info, when the plan
+// lists any).
+std::vector<Diag> prove_inlined_owner_statics(const NarrowInput& input, InlinedProcVerdicts* verdicts = nullptr);
 
 }  // namespace cml::core
