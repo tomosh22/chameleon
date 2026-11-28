@@ -756,6 +756,190 @@ TEST_CASE("R-54 second review: a call operator whose closure name is spelled wit
     CHECK(decision(partial, gx).decision != DecisionKind::BindOldData);
 }
 
+namespace {
+// The index of the procedure `name` in the TU's symbols (what InlineVerdictCache is keyed by), and its RVA.
+std::pair<std::uint32_t, std::uint32_t> proc_of(const SynthWorld& w, const std::string& name) {
+    const auto syms = w.index->compiland_symbols(0);
+    REQUIRE(syms.has_value());
+    for (const cml::pdb::SymbolView& v : *syms) {
+        if (cml::pdb::is_proc_kind(v.kind) && v.name == name) {
+            return {v.index, v.rva};
+        }
+    }
+    FAIL("no procedure " << name);
+    return {0, 0};
+}
+}  // namespace
+
+TEST_CASE("WP-55 (R-62): the verdicts on inline sites are kept across the plans of one image and decide as a fresh read does") {
+    SUBCASE("a refusal: the second plan takes the verdict from the cache and refuses with the same message") {
+        SynthWorld w = basic_world(false);
+        OldTypes t;
+        const std::uint32_t call = t.member(w.spec.ipi, "o2_step::<lambda_0>", kClosure, "operator()");
+        const std::uint32_t make = t.function(w.spec.ipi, "o2_make");
+        proc_inlining(w, "o2_step", 0x60, t.fn_void, {{"sname", 0x20}}, {{call, make}});
+        open_with(w, t);
+        Built b = own_static_patch();
+        std::vector<cml::Diag> fresh_errors;
+        REQUIRE_FALSE(plan_bind(w.input(b), &fresh_errors).has_value());  // without a cache
+        REQUIRE_FALSE(fresh_errors.empty());
+
+        InlineVerdictCache cache;
+        for (int round = 0; round < 3; ++round) {
+            CAPTURE(round);
+            PlanInput in = w.input(b);
+            in.inline_verdicts = &cache;
+            std::vector<cml::Diag> errors;
+            BindPlan partial;
+            REQUIRE_FALSE(plan_bind(in, &errors, &partial).has_value());
+            REQUIRE(count_code(errors, diag::kAmbiguousStatic) == 1);
+            CHECK(errors[0].message == fresh_errors[0].message);
+            CHECK(decision(partial, kOwn).decision != DecisionKind::BindOldData);
+            CHECK(cache.stores() == 1);  // read once, by the first plan
+            CHECK(cache.hits() == static_cast<std::uint64_t>(round));
+            CHECK(cache.kept() == static_cast<std::uint64_t>(round));  // WP55-INLINE-CACHE kept=
+            CHECK(cache.reads() == 1);                                 // ... read=
+        }
+        CHECK(cache.size() == 1);
+    }
+    SUBCASE("a pairing: the second plan pairs the same way from the cache") {
+        SynthWorld w = basic_world(false);
+        OldTypes t;
+        const std::uint32_t ctor = t.member(w.spec.ipi, "JPH::RTTI", ".?AVRTTI@JPH@@", "RTTI");
+        proc_inlining(w, "JPH::GetRTTIOfType", 0x60, t.fn_void, {{"rtti", 0x20}}, {{ctor}});
+        open_with(w, t);
+        SynthObj o;
+        const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+        const std::string rtti = "?rtti@?1??GetRTTIOfType@JPH@@YAPEAVRTTI@2@PEAVSphereShape@2@@Z@4V32@A";
+        o.symbol(rtti, 0x20, bss, false, false);
+        Built b = o.build();
+        InlineVerdictCache cache;
+        for (int round = 0; round < 2; ++round) {
+            PlanInput in = w.input(b);
+            in.inline_verdicts = &cache;
+            auto r = plan_bind(in);
+            REQUIRE_MESSAGE(r.has_value(), err(r));
+            CHECK(decision(*r, rtti).decision == DecisionKind::BindOldData);
+            CHECK(decision(*r, rtti).source == BindSource::CompilandStatic);
+            CHECK(decision(*r, rtti).old_address.rva == 0x3020);
+        }
+        CHECK(cache.stores() == 1);
+        CHECK(cache.hits() == 1);
+        CHECK(cache.kept() == 1);
+        CHECK(cache.reads() == 1);
+    }
+    SUBCASE("a changed input: a verdict kept for another image, or for another procedure at that place, is not used") {
+        // A function that inlined nothing, and a poisoned cache that says it inlined a lambda: used, it would refuse.
+        SynthWorld w = basic_world(false);
+        OldTypes t;
+        proc_inlining(w, "o2_step", 0x60, t.fn_void, {{"sname", 0x20}}, {});
+        open_with(w, t);
+        const auto [proc, rva] = proc_of(w, "o2_step");
+        CachedInlineVerdict poison;
+        poison.proc_rva = rva;
+        poison.proc_name = "o2_step";
+        poison.risk = "POISON inlined a lambda's code";
+        poison.closures = 1;
+        Built b = own_static_patch();
+        const auto plan_with = [&](InlineVerdictCache& cache) {
+            PlanInput in = w.input(b);
+            in.inline_verdicts = &cache;
+            std::vector<cml::Diag> errors;
+            auto r = plan_bind(in, &errors);
+            return r.has_value() ? std::string() : (errors.empty() ? r.error().message : errors[0].message);
+        };
+        // The same identity, compiland, procedure, RVA and name: taken (this shows the planner reads the cache).
+        {
+            InlineVerdictCache cache;
+            cache.store(w.index->id(), 0, proc, poison);
+            CHECK(contains(plan_with(cache), "POISON"));
+            CHECK(cache.hits() == 1);
+        }
+        // Another PDB identity (the module was relinked and its PDB mapped again): not used, read afresh and kept for this one.
+        {
+            InlineVerdictCache cache;
+            cml::pdb::PdbId other = w.index->id();
+            other.age += 1;
+            cache.store(other, 0, proc, poison);
+            CHECK(plan_with(cache).empty());  // paired, as without a cache
+            CHECK(cache.hits() == 0);
+            CHECK(cache.kept() == 0);
+            CHECK(cache.reads() == 1);  // read afresh
+            CHECK(cache.size() == 1);  // the stale entry went with its image
+            CHECK_FALSE(cache.find(other, 0, proc, rva, "o2_step").has_value());
+            CHECK(cache.find(w.index->id(), 0, proc, rva, "o2_step").has_value());
+        }
+        // Another procedure at that index (another RVA or name): not used.
+        {
+            InlineVerdictCache cache;
+            CachedInlineVerdict moved = poison;
+            moved.proc_rva = rva + 0x10;
+            cache.store(w.index->id(), 0, proc, moved);
+            CHECK(plan_with(cache).empty());
+            CachedInlineVerdict renamed = poison;
+            renamed.proc_name = "o2_other";
+            InlineVerdictCache by_name;
+            by_name.store(w.index->id(), 0, proc, renamed);
+            CHECK(plan_with(by_name).empty());
+        }
+        // An image of unknown identity is never kept.
+        {
+            InlineVerdictCache cache;
+            cache.store(cml::pdb::PdbId{}, 0, proc, poison);
+            CHECK(cache.size() == 0);
+            CHECK_FALSE(cache.find(cml::pdb::PdbId{}, 0, proc, rva, "o2_step").has_value());
+        }
+    }
+    SUBCASE("kept= counts the verdicts asked for, not the batch's probes; read= every verdict judged from a read") {
+        // Two procedures hold a record named like the patch's static; only o2_step's verdict is asked for. o2_other's verdict is
+        // in the cache already: the batch probes it (a hit) but nobody asked for it, so it is not `kept`.
+        SynthWorld w = basic_world(false);
+        OldTypes t;
+        proc_inlining(w, "o2_step", 0x60, t.fn_void, {{"sname", 0x20}}, {});
+        proc_inlining(w, "o2_other", 0x90, t.fn_void, {{"sname", 0x30}}, {});
+        open_with(w, t);
+        const auto [other, other_rva] = proc_of(w, "o2_other");
+        CachedInlineVerdict clean;
+        clean.proc_rva = other_rva;
+        clean.proc_name = "o2_other";
+        InlineVerdictCache cache;
+        cache.store(w.index->id(), 0, other, clean);
+        Built b = own_static_patch();
+        PlanInput in = w.input(b);
+        in.inline_verdicts = &cache;
+        auto r = plan_bind(in);
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        CHECK(decision(*r, kOwn).old_address.rva == 0x3020);
+        CHECK(cache.hits() == 1);   // the probe of o2_other
+        CHECK(cache.kept() == 0);   // ... not asked for
+        CHECK(cache.reads() == 1);  // o2_step, read
+        // The next plan asks for o2_step again: from the cache, and counted.
+        auto again = plan_bind(in);
+        REQUIRE_MESSAGE(again.has_value(), err(again));
+        CHECK(cache.kept() == 1);
+        CHECK(cache.reads() == 1);
+    }
+    SUBCASE("an inlinee that cannot be read is part of the image: the verdict is kept and refuses again from the cache") {
+        SynthWorld w = basic_world(false);
+        OldTypes t;
+        proc_inlining(w, "o2_step", 0x60, t.fn_void, {{"sname", 0x20}}, {{0x1777}});  // an inlinee not in the IPI
+        open_with(w, t);
+        Built b = own_static_patch();
+        InlineVerdictCache cache;
+        for (int round = 0; round < 2; ++round) {
+            PlanInput in = w.input(b);
+            in.inline_verdicts = &cache;
+            std::vector<cml::Diag> errors;
+            REQUIRE_FALSE(plan_bind(in, &errors).has_value());
+            REQUIRE(count_code(errors, diag::kAmbiguousStatic) == 1);
+        }
+        CHECK(cache.stores() == 1);
+        CHECK(cache.hits() == 1);
+        CHECK(cache.kept() == 1);
+        CHECK(cache.reads() == 1);
+    }
+}
+
 // ---- WP-52 (ADR-0045 ruling): a new static never silently replaces a live one of its function (cl nested, R-66) --------
 
 namespace {

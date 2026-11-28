@@ -38,6 +38,8 @@
 
 #include <cstdint>
 #include <map>
+#include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -323,6 +325,53 @@ struct BindPlan {
 // Planning
 // ---------------------------------------------------------------------------------------------
 
+// WP-55 (R-62): WP-51's verdict on an old procedure's inline sites (what it inlined, read from the module stream through
+// PdbIndex::procs_inlinees), kept across the reloads of one module image. The image does not change while it is loaded, so
+// neither do its procedures' inline sites, and a verdict taken from here is the one the planner would read again. Owned by the
+// module's state (ModuleState) and dropped with it (disable, unload; a module loaded again is a new state). Keyed by the PDB's
+// identity (GUID and age), the compiland and the procedure's index in its symbols; each entry also holds the procedure's RVA and
+// name, and a lookup that finds another procedure there finds nothing. A store under another PDB identity drops every entry of
+// the old one. A verdict whose inline sites could not be read is not kept. Thread-safe.
+struct CachedInlineVerdict {
+    std::uint32_t proc_rva = 0;
+    std::string proc_name;
+    std::string risk;
+    std::string wider;
+    const char* wider_kind = "";  // a string literal of the planner
+    std::vector<std::string> closure_tails;
+    std::uint32_t sites = 0;
+    std::size_t inlinees = 0;
+    std::size_t closures = 0;
+    std::size_t unreadable = 0;
+};
+class InlineVerdictCache {
+public:
+    // The verdict on procedure `proc` (its index in compiland_symbols(compiland)) when one is kept for this image and it still
+    // names a procedure at `rva` called `name`.
+    std::optional<CachedInlineVerdict> find(const pdb::PdbId& image, std::uint32_t compiland, std::uint32_t proc, std::uint32_t rva,
+                                            std::string_view name) const;
+    // A zero identity (an image of unknown identity) is never kept.
+    void store(const pdb::PdbId& image, std::uint32_t compiland, std::uint32_t proc, CachedInlineVerdict verdict);
+    std::size_t size() const;
+    std::uint64_t hits() const;    // find() calls that found a verdict (the planner's batch probes included)
+    std::uint64_t stores() const;  // verdicts stored
+    // What the planner reports (WP55-INLINE-CACHE): verdicts of procedures it asked about that came from here, and verdicts it
+    // judged from a read of the module stream (whether or not the sites could be read, and whether or not they were kept).
+    void count_kept();
+    void count_read();
+    std::uint64_t kept() const;
+    std::uint64_t reads() const;
+
+private:
+    mutable std::mutex mutex_;
+    pdb::PdbId image_;
+    std::map<std::pair<std::uint32_t, std::uint32_t>, CachedInlineVerdict> entries_;  // (compiland, proc)
+    mutable std::uint64_t hits_ = 0;
+    std::uint64_t stores_ = 0;
+    std::uint64_t kept_ = 0;
+    std::uint64_t reads_ = 0;
+};
+
 struct PlanInput {
     const coff::Object* object = nullptr;        // the new object, as the compiler wrote it
     std::string object_name;                     // for messages ("logic.cpp.obj")
@@ -338,6 +387,9 @@ struct PlanInput {
     // WP-40 (rule (d)): closure of the patch -> old closure, where the code of the call operators showed that lambdas
     // changed places (pair_lambdas_by_code). Their statics, guards and call operators are paired across the numbers.
     std::map<std::string, std::string> closure_pairing;
+    // WP-55 (R-62): the verdicts on inline sites of earlier plans against the same module image (optional). Read before the
+    // module stream is walked, filled with what was walked.
+    InlineVerdictCache* inline_verdicts = nullptr;
 };
 
 // Builds the plan. On failure returns the first error; with `all_errors` every error is collected

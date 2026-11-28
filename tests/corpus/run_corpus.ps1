@@ -161,8 +161,8 @@ function Add-ReloadTiming([string]$EditId, $Result) {
 # prepare, takeover, terminate, relaunch, register, module_list, reenable, carry, index, restore, reapply, and the index build
 # of the module the restart waited for longest). Prints
 #   WP50-RESTART project=<project> compiler=<compiler> edit=<id> old_pid=... new_pid=... total_ms=... <stage>_ms=... index_...
-# and the broker's WP50-INDEX lines (where each index build went: PDB, build checks, include scan, source hashes). A result
-# without the line is a broker that predates WP-50: said, not failed.
+# and the broker's WP50-INDEX lines (where each index build went: PDB, build checks, include scan, source hashes), with the
+# WP50-SCAN-CACHE and WP55-SCAN-RESCAN lines (WP-55: which compilands the scan cache reused). A result without the line is a broker that predates WP-50: said, not failed.
 function Write-RestartTiming([string]$EditId, $Result) {
     $t = [string]$Result.timing
     if ($t -match '^RESTART-TIMING (.*)$') {
@@ -174,8 +174,10 @@ function Write-RestartTiming([string]$EditId, $Result) {
     $script:RestartTimings.Add($line)
     $bl = Join-Path $out 'broker.log'
     if (Test-Path $bl) {
-        foreach ($m in @(Select-String -Path $bl -Pattern 'WP50-INDEX .*$')) {
-            $index = 'WP50-INDEX ' + ($m.Line -replace '^.*?WP50-INDEX ', '')
+        # WP-55 (R-58): with the scan cache's verdict of each index (WP50-SCAN-CACHE: how many compilands it reused) and the
+        # compilands it scanned again (WP55-SCAN-RESCAN).
+        foreach ($m in @(Select-String -Path $bl -Pattern '(WP50-INDEX|WP50-SCAN-CACHE|WP55-SCAN-RESCAN) .*$')) {
+            $index = $m.Line -replace '^.*?(?=(WP50-INDEX|WP50-SCAN-CACHE|WP55-SCAN-RESCAN) )', ''
             if (-not $script:RestartTimings.Contains($index)) {
                 Write-Host $index
                 $script:RestartTimings.Add($index)

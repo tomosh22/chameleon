@@ -1980,6 +1980,46 @@ TEST_CASE("disabling a module or losing the agent drops its state") {
     CHECK(r.error().id() == "CML5300");
 }
 
+TEST_CASE("WP-55 (R-62): the inline-site verdicts kept for a module go with its state: an unload drops them, the next instance starts empty") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    std::shared_ptr<ModuleState> state = rig.service->module_state(1, rig.exe);
+    REQUIRE(state != nullptr);
+    pdb::PdbId image;
+    {
+        Result<std::shared_ptr<const pdb::PdbIndex>> mapped = state->index->acquire_pdb();
+        REQUIRE(mapped.has_value());
+        image = (*mapped)->id();
+    }
+    REQUIRE_FALSE(image.is_zero());
+    bind::CachedInlineVerdict verdict;
+    verdict.proc_rva = 0x1000;
+    verdict.proc_name = "f";
+    state->inline_verdicts.store(image, 0, 1, verdict);
+    REQUIRE(state->inline_verdicts.size() == 1);
+    CHECK(state->inline_verdicts.find(image, 0, 1, 0x1000, "f").has_value());
+
+    // FreeLibrary: the service drops the state, and with it the verdicts (nothing else holds it).
+    ipc::ModuleUnloaded unloaded;
+    unloaded.module = {kModuleBase, 0x4000, rig.exe};
+    rig.session.on_message(unloaded);
+    rig.link->publish(rig.session);
+    rig.service->on_session_changed(1);
+    CHECK(rig.service->module_state(1, rig.exe) == nullptr);
+    const std::weak_ptr<ModuleState> gone = state;
+    state.reset();
+    rig.module.reset();
+    CHECK(gone.expired());
+
+    // Loaded and enabled again: a new state whose cache is empty, although the image is the same file.
+    rig.enable();
+    const std::shared_ptr<ModuleState> again = rig.service->module_state(1, rig.exe);
+    REQUIRE(again != nullptr);
+    CHECK(again->inline_verdicts.size() == 0);
+    CHECK_FALSE(again->inline_verdicts.find(image, 0, 1, 0x1000, "f").has_value());
+}
+
 TEST_CASE("the PDB index can be released and mapped again (ADR-0017)") {
     QuietLogs quiet;
     Rig rig;

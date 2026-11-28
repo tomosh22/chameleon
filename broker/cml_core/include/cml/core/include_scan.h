@@ -59,7 +59,9 @@ struct ScanRoots {
 ScanRoots scan_roots_from_record(const toolchain::CompileRecord& record);
 
 using ScanFileReader = std::function<std::optional<std::string>(const std::string& path)>;
-// std::ifstream-based; files over 8 MiB are treated as unreadable.
+// The size over which disk_file_reader() does not read a file (8 MiB).
+inline constexpr std::uint64_t kScanMaxFileBytes = 8u * 1024u * 1024u;
+// std::ifstream-based; files over kScanMaxFileBytes are treated as unreadable.
 ScanFileReader disk_file_reader();
 
 class IncludeScanner {
@@ -96,6 +98,16 @@ public:
     };
     const Stats& stats() const noexcept { return stats_; }
 
+    // WP-55 (R-58): what one walk depended on. While tracing, every path a walk asks about is noted (read now or answered from
+    // the scanner's memory, found or not), once; take_touched() hands over the ids noted since the last call. The answer of a
+    // walk depends on nothing but these paths: whether each exists and can be read, and the contents of those that can.
+    void set_tracing(bool on) noexcept { tracing_ = on; }
+    std::vector<std::uint32_t> take_touched();
+    const std::string& path_of(std::uint32_t file) const { return files_[file].path; }
+    bool readable(std::uint32_t file) const { return files_[file].readable; }
+    // The normalised directory of the path (path::parent_directory; may be empty).
+    const std::string& directory_of(std::uint32_t file) const { return dirs_[files_[file].dir]; }
+
 private:
     struct Start {
         std::string file;
@@ -121,14 +133,28 @@ private:
     std::uint32_t dir_id(const std::string& normalised_dir);
     // The id of `name` searched in directory `dir` when that file can be read, else -1. Answered once per (dir, name).
     std::int64_t resolve(std::uint32_t dir, const std::string& name);
+    void touch(std::uint32_t file) {
+        if (tracing_) {
+            if (touched_mark_.size() <= file) {
+                touched_mark_.resize(files_.size() + 1, 0);
+            }
+            if (touched_mark_[file] == 0) {
+                touched_mark_[file] = 1;
+                touched_.push_back(file);
+            }
+        }
+    }
 
     ScanFileReader reader_;
     std::vector<File> files_;
     std::unordered_map<std::string, std::uint32_t> file_ids_;
     std::vector<std::string> dirs_;
     std::unordered_map<std::string, std::uint32_t> dir_ids_;
-    std::vector<std::unordered_map<std::string, std::int64_t>> resolved_;  // by directory id: include name -> file id or -1
+    std::vector<std::unordered_map<std::string, std::uint32_t>> resolved_;  // by directory id: include name -> file id
     Stats stats_;
+    bool tracing_ = false;
+    std::vector<std::uint32_t> touched_;
+    std::vector<char> touched_mark_;  // by file id: noted in touched_
 };
 
 }  // namespace cml::core
