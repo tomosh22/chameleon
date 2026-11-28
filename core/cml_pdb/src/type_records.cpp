@@ -872,27 +872,44 @@ Result<void> read_c13_inlinees(std::span<const std::uint8_t> subsections, C13Inl
     constexpr std::uint32_t kFileChecksums = 0xF4;
     const std::uint8_t* d = subsections.data();
     const std::uint64_t size = subsections.size();
+    const auto bad = [](const char* why) {
+        return Diag::make(diag::kBadObjectSymbols, std::string("C13 line information is malformed (") + why + ").", "Recompile the translation unit.");
+    };
     std::uint64_t off = 0;
-    while (size - off >= 8) {
+    // (Review of 5624b28) The header must fit: `off` is rounded up to 4 after each subsection and may pass `size`.
+    while (off + 8 <= size) {
         const std::uint32_t kind = rd32(d + off);
         const std::uint32_t len = rd32(d + off + 4);
         const std::uint64_t begin = off + 8;
         if (len > size - begin) {
-            return Diag::make(diag::kBadObjectSymbols, "A C13 line subsection leaves its section.", "Recompile the translation unit.");
+            return bad("a subsection leaves its section");
         }
         if (kind == kFileChecksums) {
             if (out.checksum_tables++ == 0) {
                 out.checksums.assign(d + begin, d + begin + len);
             }
         } else if (kind == kInlineeLines && len >= 4) {
-            // Signature 0: (inlinee, file id, line); 1 (extra files): then a count and that many more file ids.
+            // Signature 0: (inlinee, file id, line); 1 (CV_INLINEE_SOURCE_LINE_SIGNATURE_EX): then a count and that many more
+            // file ids, every one of them kept (review of 5624b28).
             const std::uint32_t signature = rd32(d + begin);
             const std::uint64_t entry = signature == 1 ? 16 : 12;
             const std::uint64_t end = begin + len;
             std::uint64_t at = begin + 4;
-            while (signature <= 1 && at <= end && end - at >= entry) {
-                out.lines.emplace_back(rd32(d + at), rd32(d + at + 4));
-                at += signature == 1 ? 16 + static_cast<std::uint64_t>(rd32(d + at + 12)) * 4 : 12;
+            while (signature <= 1 && end - at >= entry) {
+                std::vector<std::uint32_t> files{rd32(d + at + 4)};
+                std::uint64_t next = at + 12;
+                if (signature == 1) {
+                    const std::uint64_t extra = rd32(d + at + 12);
+                    if (extra > (end - at - 16) / 4) {
+                        return bad("an inlinee's extra files leave their subsection");
+                    }
+                    for (std::uint64_t k = 0; k < extra; ++k) {
+                        files.push_back(rd32(d + at + 16 + k * 4));
+                    }
+                    next = at + 16 + extra * 4;
+                }
+                out.lines.emplace_back(rd32(d + at), std::move(files));
+                at = next;
             }
         }
         off = (begin + len + 3) & ~static_cast<std::uint64_t>(3);
@@ -900,32 +917,39 @@ Result<void> read_c13_inlinees(std::span<const std::uint8_t> subsections, C13Inl
     return Result<void>();
 }
 
-std::optional<FileChecksum> inlinee_file(const C13Inlinees& c13, std::uint32_t inlinee) {
+std::optional<std::vector<FileChecksum>> inlinee_files(const C13Inlinees& c13, std::uint32_t inlinee) {
     if (c13.checksum_tables != 1) {
         return std::nullopt;
     }
-    std::optional<std::uint32_t> file;
+    const std::vector<std::uint32_t>* files = nullptr;
     for (const auto& [id, f] : c13.lines) {
         if (id != inlinee) {
             continue;
         }
-        if (file && *file != f) {
+        if (files != nullptr && *files != f) {
             return std::nullopt;
         }
-        file = f;
+        files = &f;
     }
-    // An entry: name offset u32, checksum size u8, kind u8, the checksum.
-    if (!file || static_cast<std::uint64_t>(*file) + 6 > c13.checksums.size()) {
+    if (files == nullptr || files->empty()) {
         return std::nullopt;
     }
-    const std::uint8_t* e = c13.checksums.data() + *file;
-    const std::size_t n = e[4];
-    if (e[5] == 0 || n == 0 || static_cast<std::uint64_t>(*file) + 6 + n > c13.checksums.size()) {
-        return std::nullopt;
+    std::vector<FileChecksum> out;
+    for (const std::uint32_t file : *files) {
+        // An entry: name offset u32, checksum size u8, kind u8, the checksum.
+        if (static_cast<std::uint64_t>(file) + 6 > c13.checksums.size()) {
+            return std::nullopt;
+        }
+        const std::uint8_t* e = c13.checksums.data() + file;
+        const std::size_t n = e[4];
+        if (e[5] == 0 || n == 0 || static_cast<std::uint64_t>(file) + 6 + n > c13.checksums.size()) {
+            return std::nullopt;  // a file recorded without a checksum: nothing can be compared
+        }
+        FileChecksum c;
+        c.kind = e[5];
+        c.bytes.assign(e + 6, e + 6 + n);
+        out.push_back(std::move(c));
     }
-    FileChecksum out;
-    out.kind = e[5];
-    out.bytes.assign(e + 6, e + 6 + n);
     return out;
 }
 

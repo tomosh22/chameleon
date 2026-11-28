@@ -70,9 +70,10 @@ public:
     // any depth), each inlinee resolved through the object's types (PdbIndex::resolve_inlinee). nullptr: no procedure record,
     // two of them, the types unreadable, or a site that cannot be read.
     const std::vector<pdb::PdbIndex::Inlinee>* inlinees_of(std::uint32_t section, std::uint32_t value);
-    // WP-60: the checksum of the source file of inlinee `id` (an id of the object's types), from the inlinee lines and the file
-    // checksums of the object's .debug$S sections (pdb::inlinee_file). nullopt: not recorded, or not unambiguously.
-    std::optional<pdb::FileChecksum> inlinee_file(std::uint32_t id);
+    // WP-60: the checksums of the source files of inlinee `id` (an id of the object's types), from the inlinee lines and the file
+    // checksums of the object's .debug$S sections (pdb::inlinee_files). nullopt: not recorded, not unambiguously, or a C13
+    // section of the object could not be read.
+    std::optional<std::vector<pdb::FileChecksum>> inlinee_files(std::uint32_t id);
 
     // Where the types came from; NotRead before the first at().
     ObjectTypeOrigin origin() const noexcept { return origin_; }
@@ -94,7 +95,8 @@ private:
         bool inlinees_resolved = false;
         std::vector<pdb::PdbIndex::Inlinee> inlinees;
     };
-    pdb::C13Inlinees c13_;  // WP-60: the inlinee lines and file checksums of every .debug$S section
+    pdb::C13Inlinees c13_;           // WP-60: the inlinee lines and file checksums of every .debug$S section
+    std::size_t c13_bad_sections_ = 0;  // WP-60: C13 sections whose line information could not be read
 
     void load();
     void unreadable(std::uint32_t diag_id, std::string why);

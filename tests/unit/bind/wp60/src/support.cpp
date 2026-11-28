@@ -4,8 +4,13 @@ Obj make(int id) { Obj o; o.v = id; o.hits = 0; return o; }
 volatile int g_sink;
 void sink(int v) { g_sink = v; }
 int (*volatile g_ext_glob)(int) = &ext_glob;  // keeps an out-of-line (global) copy of ext_glob in this compiland (h13)
+#ifdef WP60_C_CASE  // a case compiled as C (h15): its functions have C linkage
+extern "C" void f(int* a, int n);
+extern "C" void g(void);
+#else
 extern void f(int* a, int n);
 extern void g();
+#endif
 int main() { int a[4] = {3, 1, 2, 4}; f(a, 4); g(); return 0; }
 extern "C" {
 int _tls_index = 0;

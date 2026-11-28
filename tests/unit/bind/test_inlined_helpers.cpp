@@ -209,6 +209,7 @@ TEST_CASE("R-57: a helper in an anonymous-namespace class, and one whose own pro
         const Diag d = check_refused(c, "h");
         CHECK(contains(d.message, "its own procedure (rva "));
         CHECK(contains(d.message, "holds a static 'x'"));
+        CHECK_FALSE(contains(d.message, "the patch does not prove"));  // (review of 5624b28) that evidence stands, the patch is not asked
     }
 }
 
@@ -263,6 +264,32 @@ TEST_CASE("R-57: the patch proves a helper from an unchanged header (h10, h8), a
         const Diag d = check_refused(c, "hx");
         CHECK(contains(d.message, "its source file changed (the checksums its inlinee lines name differ)"));
     }
+}
+
+TEST_CASE("R-57 (review of 5624b28): a C helper's static, spelled `h15_h.rx`, stops the patch proof (h15)") {
+    // A C translation unit (clang-cl /TC): `static inline int h15_h(void) { static int rx; ... }` from an unchanged header, still
+    // called by f, which gains its own `rx`. The patch spells the helper's static "h15_h.rx" (no Microsoft decoration); 5624b28
+    // looked only for decorated names, cleared the helper and paired f's new rx with the helper's live one.
+    const Case c("h15_c_helper");
+    const InlinedOwnerStatic* s = c.listed("f.rx");
+    REQUIRE(s != nullptr);
+    CHECK(s->helper == "h15_h");
+    CHECK(contains(s->risk, "the patch defines the static 'h15_h.rx' of 'h15_h'"));
+    REQUIRE(c.owner_proof.size() == 1);
+    CHECK(c.owner_proof.front().id() == "CML3207");
+    CHECK(contains(c.owner_proof.front().message, "the code of 'f' changed"));
+}
+
+TEST_CASE("R-57 (review of 5624b28): accepted residual, a helper's static removed through a type of the edited file (h16)") {
+    // `template <class T> int tc(int)` (h16.h, unchanged) keeps `static int x` only `if constexpr (T::kHas)`; the edited file
+    // flips its anonymous-namespace Cfg::kHas to false and declares `x` in f, which still calls tc<Cfg>. The records cannot show
+    // template arguments, the header's checksum is unchanged and the patch's tc<Cfg> has no static: the patch proof clears the
+    // helper and f's new `x` pairs with tc<Cfg>'s old one. Ruled an accepted, documented residual (the edit is contrived); this
+    // test asserts today's behaviour so that a future fix shows up here.
+    const Case c("h16_if_constexpr");
+    REQUIRE(c.planned);
+    CHECK(c.plan.inlined_owner_statics.empty());
+    CHECK(c.decision("?x@?1??f@@YAXPEAHH@Z@4HA").decision == DecisionKind::BindOldData);
 }
 
 TEST_CASE("R-57 (review of 8609b97): nothing is cleared by linkage (h11, h13)") {
@@ -413,6 +440,15 @@ TEST_CASE("R-57 (synthetic): which inlinees put an own static to the proof") {
         REQUIRE(listed_counter(p) != nullptr);
         CHECK(listed_counter(p)->helper == "ns::Clamp");
         CHECK(contains(listed_counter(p)->risk, "holds a static 'counter'"));
+    }
+    SUBCASE("two inlinees of one name and signature (instantiations the records do not tell apart): not proven by the patch") {
+        const BindPlan p = plan_main([](SynthWorld& w, OldTypes& t) {
+            const std::uint32_t one = w.spec.ipi.record(tp::kLfFuncId, tp::lf_func_id(t.fn_int, "tt"));
+            const std::uint32_t two = w.spec.ipi.record(tp::kLfFuncId, tp::lf_func_id(t.fn_int, "tt"));  // a second id of the same content
+            proc_inlining(w, "main", 0x60, t.fn_int, 0x1110, {{"counter", 0x20}}, {one, two});
+        });
+        REQUIRE(listed_counter(p) != nullptr);
+        CHECK(contains(listed_counter(p)->risk, "2 inlinees of the old procedure have its name and signature"));
     }
     SUBCASE("a helper whose scope cannot be read: listed") {
         const BindPlan p = plan_main([](SynthWorld& w, OldTypes& t) {

@@ -123,10 +123,21 @@ void ObjectSignatures::load() {
                 continue;
             }
             const std::span<const std::uint8_t> bytes = bytes_of(sec.data);
-            if (bytes.size() > 4) {
-                // WP-60: the inlinee lines and file checksums (a malformed run is skipped; inlinee_file then finds nothing).
-                if (Result<void> lines = pdb::read_c13_inlinees(bytes.subspan(4), c13_); !lines) {
+            if (bytes.size() > 4 && rd32(bytes.data()) == 4) {
+                // WP-60: the inlinee lines and file checksums of a C13 section, kept only when the whole section reads (review of
+                // 5624b28); a section that does not is skipped and counted, so inlinee_files finds nothing of it.
+                pdb::C13Inlinees section_lines;
+                if (Result<void> lines = pdb::read_c13_inlinees(bytes.subspan(4), section_lines); !lines) {
+                    ++c13_bad_sections_;
                     CML_LOG(Debug, "bind: inlinee lines of %s: .debug$S section %u skipped: %s", object_name_.c_str(), sec.index, lines.error().message.c_str());
+                } else {
+                    if (c13_.checksum_tables == 0 && section_lines.checksum_tables != 0) {
+                        c13_.checksums = std::move(section_lines.checksums);
+                    }
+                    c13_.checksum_tables += section_lines.checksum_tables;
+                    for (auto& line : section_lines.lines) {
+                        c13_.lines.push_back(std::move(line));
+                    }
                 }
             }
             Result<std::vector<pdb::ObjectProc>> procs = pdb::read_object_procs(bytes);
@@ -244,11 +255,14 @@ const std::vector<pdb::PdbIndex::Inlinee>* ObjectSignatures::inlinees_of(std::ui
     return &p.inlinees;
 }
 
-std::optional<pdb::FileChecksum> ObjectSignatures::inlinee_file(std::uint32_t id) {
+std::optional<std::vector<pdb::FileChecksum>> ObjectSignatures::inlinee_files(std::uint32_t id) {
     if (!loaded_) {
         load();
     }
-    return pdb::inlinee_file(c13_, id);
+    if (c13_bad_sections_ != 0) {
+        return std::nullopt;  // a section that could not be read may hold this inlinee's lines or the checksum table
+    }
+    return pdb::inlinee_files(c13_, id);
 }
 
 std::optional<std::uint64_t> ObjectSignatures::function_of_static(std::uint32_t section, std::uint32_t value, bool* several) {

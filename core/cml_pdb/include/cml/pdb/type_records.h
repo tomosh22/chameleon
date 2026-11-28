@@ -232,16 +232,19 @@ struct FileChecksum {
     bool operator==(const FileChecksum& o) const { return kind == o.kind && bytes == o.bytes; }
 };
 struct C13Inlinees {
-    std::vector<std::pair<std::uint32_t, std::uint32_t>> lines;  // (inlinee id, file id: offset into the checksum subsection)
+    // (inlinee id, its file ids: offsets into the checksum subsection; the first is the file of its lines, the rest the extra files
+    // of CV_INLINEE_SOURCE_LINE_SIGNATURE_EX)
+    std::vector<std::pair<std::uint32_t, std::vector<std::uint32_t>>> lines;
     std::vector<std::uint8_t> checksums;                         // the first DEBUG_S_FILECHKSMS subsection seen
     std::size_t checksum_tables = 0;                             // how many were seen (an object may have one per section)
 };
 // Appends the inlinee lines and the file checksum subsection of a run of C13 subsections (a module stream's C13 block, or an
 // object's .debug$S section after its 4-byte signature). CML1433 when a subsection leaves the span.
 Result<void> read_c13_inlinees(std::span<const std::uint8_t> subsections, C13Inlinees& out);
-// The checksum of the file the inlinee's lines name. nullopt: no entry for it, entries naming different files, more than one
-// checksum subsection, an entry outside the checksum subsection, or a file recorded without a checksum (kind 0).
-std::optional<FileChecksum> inlinee_file(const C13Inlinees& c13, std::uint32_t inlinee);
+// The checksums of every file the inlinee's lines name, the file of its lines first, then its extra files. nullopt: no entry
+// for it, entries naming different files, more than one checksum subsection, an entry outside the checksum subsection, or any
+// of its files recorded without a checksum (kind 0).
+std::optional<std::vector<FileChecksum>> inlinee_files(const C13Inlinees& c13, std::uint32_t inlinee);
 
 // Statistics of the lazily read type streams of a PdbIndex / TypeServerPdb (logs, tests, the benchmark).
 struct TypeStreamStats {

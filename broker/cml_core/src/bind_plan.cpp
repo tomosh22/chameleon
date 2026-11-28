@@ -830,12 +830,12 @@ private:
     // (Review of 8609b97) The patch proof that clears a helper: the patch's own procedure of the static's function still inlines
     // the helper (same qualified name and signature), the helper's source file has the old checksum, and the patch defines no
     // other function-local static of the record's name ("" when proven, else why not).
-    std::string helper_by_patch(const InlineHelper& h, const pdb::SymbolView& record, const Sym& sy);
+    std::string helper_by_patch(const InlineVerdict& v, const InlineHelper& h, const pdb::SymbolView& record, const Sym& sy);
     std::unordered_map<std::string, std::vector<std::uint32_t>> procs_by_name_;  // the compiland's procedures by name (WP-60)
     bool procs_by_name_indexed_ = false;
     bool old_c13_read_ = false;                      // WP-60: the old compiland's inlinee lines, read once
     std::optional<pdb::C13Inlinees> old_c13_;
-    std::size_t wp60_by_patch_ = 0;     // helpers cleared by the patch proof
+    std::size_t wp60_by_patch_ = 0;     // own statics (as checked/cleared count them) of which the patch proof cleared a helper
     std::size_t wp60_checked_ = 0;  // own statics whose procedure inlined a helper and no closure code
     std::size_t wp60_risky_ = 0;    // ... of which a helper may hold a static of the record's name
     std::size_t wp60_listed_ = 0;   // ... listed for the proof (PlanInput::prove_inlined_owners)
@@ -1855,24 +1855,39 @@ bool Planner::refuse_inlined_owner(Sym& sy, const pdb::SymbolView& record, const
     return true;
 }
 
-std::string Planner::helper_by_patch(const InlineHelper& h, const pdb::SymbolView& record, const Sym& sy) {
-    // (Review of 8609b97, 1a) The patch's procedure of the static's function inlines the same helper, the helper's source file is
-    // unchanged (the checksum its inlinee lines name, old against new), and the patch defines no other function-local static of
-    // the record's name: then the helper and its statics are what they were, and none of them is the record.
+std::string Planner::helper_by_patch(const InlineVerdict& v, const InlineHelper& h, const pdb::SymbolView& record, const Sym& sy) {
+    // (Review of 8609b97, 1a) The patch's procedure of the static's function inlines the same helper, the helper's source files are
+    // unchanged (the checksums its inlinee lines name, old against new), and the patch defines no other function-local static of
+    // the record's name in its scope: then the helper and its statics are what they were, and none of them is the record.
+    // Residual (accepted, review of 5624b28): a helper whose statics depend on context the edited file defines (macros, or a
+    // template body through `if constexpr` or other types of the edited file) with unchanged source files.
     if (!h.name_known) {
         return "its scope cannot be read";
+    }
+    // (Review of 5624b28) Name and signature do not tell template instantiations apart (`tc<A>` and `tc<B>` are both `tc`): the
+    // helper must be the only inlinee of its name and signature on both sides.
+    std::size_t old_same = 0;
+    for (const InlineHelper& o : v.helpers) {
+        old_same += o.name == h.name && o.signature == h.signature ? 1u : 0u;
+    }
+    if (old_same != 1) {
+        return std::to_string(old_same) + " inlinees of the old procedure have its name and signature (template instantiations are not told apart)";
+    }
+    if (sy.dec.section == 0) {
+        return "the static has no section in the patch";
     }
     ObjectSignatures& debug = object_debug();
     bool several = false;
     const std::optional<std::uint64_t> fn = debug.function_of_static(sy.dec.section, sy.s->value, &several);
     if (!fn) {
-        return "no procedure record of the patch declares the static";
+        return several ? "several procedure records of the patch declare the static" : "no procedure record of the patch declares the static";
     }
     const std::vector<pdb::PdbIndex::Inlinee>* sites = debug.inlinees_of(static_cast<std::uint32_t>(*fn >> 32), static_cast<std::uint32_t>(*fn & 0xFFFFFFFFu));
     if (sites == nullptr) {
         return "the patch's inline sites of the function cannot be read";
     }
     const pdb::PdbIndex::Inlinee* same = nullptr;
+    std::size_t new_same = 0;
     for (const pdb::PdbIndex::Inlinee& e : *sites) {
         if (!e.readable || !e.signature_known || e.signature != h.signature) {
             continue;
@@ -1880,25 +1895,31 @@ std::string Planner::helper_by_patch(const InlineHelper& h, const pdb::SymbolVie
         const std::string qualified = e.member ? e.class_name + "::" + e.name : (e.scope_known ? (e.scope.empty() ? e.name : e.scope + "::" + e.name) : std::string());
         if (qualified == h.name) {
             same = &e;
-            break;
+            ++new_same;
         }
     }
     if (same == nullptr) {
         return "the patch's function no longer inlines it";
+    }
+    if (new_same != 1) {
+        return std::to_string(new_same) + " inlinees of the patch's function have its name and signature (template instantiations are not told apart)";
     }
     if (!old_c13_read_) {
         old_c13_read_ = true;
         Result<pdb::C13Inlinees> lines = pdb_.compiland_inlinee_lines(ci_);
         if (lines) {
             old_c13_ = std::move(lines).value();
+        } else {
+            CML_LOG(Debug, "WP60-PATCH-PROOF compiland=%u: the old line information cannot be read (%s); no helper is proven by the patch", ci_,
+                    lines.error().message.c_str());
         }
     }
-    const std::optional<pdb::FileChecksum> old_file = old_c13_ ? pdb::inlinee_file(*old_c13_, h.id) : std::nullopt;
-    const std::optional<pdb::FileChecksum> new_file = debug.inlinee_file(same->id);
-    if (!old_file || !new_file) {
-        return "the checksum of its source file is not recorded on both sides";
+    const std::optional<std::vector<pdb::FileChecksum>> old_files = old_c13_ ? pdb::inlinee_files(*old_c13_, h.id) : std::nullopt;
+    const std::optional<std::vector<pdb::FileChecksum>> new_files = debug.inlinee_files(same->id);
+    if (!old_files || !new_files) {
+        return "the checksums of its source files are not recorded on both sides";
     }
-    if (!(*old_file == *new_file)) {
+    if (*old_files != *new_files) {
         return "its source file changed (the checksums its inlinee lines name differ)";
     }
     const std::string& base = comp_last(&record);
@@ -1911,8 +1932,18 @@ std::string Planner::helper_by_patch(const InlineHelper& h, const pdb::SymbolVie
     const std::string helper_last = bare(h.unqualified);
     const std::string suffix = "::" + base;
     for (const Sym& other : syms_) {
-        if (&other == &sy || !other.defined || other.dec.type == SymbolType::Function || is_guard_variable(other.name) || base_identifier(other.name) != base ||
-            !starts_with(other.name, "?" + base + "@?")) {
+        if (&other == &sy || !other.defined || other.dec.type == SymbolType::Function || is_guard_variable(other.name)) {
+            continue;
+        }
+        if (!other.name.empty() && other.name[0] != '?') {
+            // (Review of 5624b28) clang-cl's spelling of a C translation unit's static ("h.rx", WP-26c): its function is named.
+            const CStaticName c = c_static_name(other.name);
+            if (c.base == base && !c.encl.empty() && c.encl == helper_last) {
+                return "the patch defines the static '" + other.name + "' of '" + h.unqualified + "'";
+            }
+            continue;
+        }
+        if (base_identifier(other.name) != base || !starts_with(other.name, "?" + base + "@?")) {
             continue;
         }
         const std::string& d = other.dec.display;
@@ -1921,8 +1952,9 @@ std::string Planner::helper_by_patch(const InlineHelper& h, const pdb::SymbolVie
             return "the patch defines a function-local static '" + base + "' of '" + h.unqualified + "' or of a function it cannot name (" + other.name + ")";
         }
     }
-    CML_LOG(Trace, "WP60-PATCH-PROOF helper='%s' record='%s': the patch still inlines it from an unchanged file and defines no other static of the name (residual: a "
-            "helper body that depends on macros the edited file defines)", h.name.c_str(), base.c_str());
+    CML_LOG(Trace, "WP60-PATCH-PROOF helper='%s' record='%s': the patch still inlines it from unchanged files and defines no other static of the name (accepted "
+            "residual: statics that depend on context the edited file defines, macros or a template body through `if constexpr` or the file's types)", h.name.c_str(),
+            base.c_str());
     return {};
 }
 
@@ -1951,8 +1983,10 @@ std::string Planner::helper_risk(const InlineVerdict& v, const pdb::SymbolView& 
         CML_LOG(Trace, "WP60-HELPER record='%s' rva=%s proc=%s helper='%s' kind=%s cleared (%s)", std::string(record.name).c_str(), hex(record.rva).c_str(), where.c_str(),
                 h.name.c_str(), h.kind, why);
     };
+    bool by_patch = false;
     for (const InlineHelper& h : v.helpers) {
         std::string why;
+        bool holds = false;  // positive evidence: the helper's own procedure holds a static of the name (review of 5624b28)
         if (!h.name_known) {
             why = "the scope of '" + h.name + "' cannot be read, so no procedure of the compiland can be shown to be it";
         } else {
@@ -1981,6 +2015,7 @@ std::string Planner::helper_risk(const InlineVerdict& v, const pdb::SymbolView& 
                     const pdb::SymbolView& rec = comp_syms_[r];
                     if (pdb::is_data_kind(rec.kind) && std::find(own.begin(), own.end(), rec.parent_proc) != own.end()) {
                         why = "its own procedure (rva " + hex(comp_syms_[rec.parent_proc].rva) + ") holds a static '" + base + "' (rva " + hex(rec.rva) + ")";
+                        holds = true;
                         break;
                     }
                 }
@@ -1990,10 +2025,17 @@ std::string Planner::helper_risk(const InlineVerdict& v, const pdb::SymbolView& 
                 }
             }
         }
-        const std::string patch_why = helper_by_patch(h, record, sy);
+        if (holds) {
+            // The evidence stands: the patch proof is not asked.
+            CML_LOG(Trace, "WP60-HELPER record='%s' rva=%s proc=%s helper='%s' kind=%s risky: %s", std::string(record.name).c_str(), hex(record.rva).c_str(), where.c_str(),
+                    h.name.c_str(), h.kind, why.c_str());
+            helper = h.name;
+            return where + " inlined '" + h.name + "', a helper function (" + h.kind + "), and " + why;
+        }
+        const std::string patch_why = helper_by_patch(v, h, record, sy);
         if (patch_why.empty()) {
-            ++wp60_by_patch_;
-            cleared(h, "the patch proof: still inlined from an unchanged file, no other static of the name");
+            by_patch = true;
+            cleared(h, "the patch proof: still inlined from unchanged files, no other static of the name");
             continue;
         }
         CML_LOG(Trace, "WP60-HELPER record='%s' rva=%s proc=%s helper='%s' kind=%s risky: %s; not proven by the patch: %s", std::string(record.name).c_str(),
@@ -2001,6 +2043,7 @@ std::string Planner::helper_risk(const InlineVerdict& v, const pdb::SymbolView& 
         helper = h.name;
         return where + " inlined '" + h.name + "', a helper function (" + h.kind + "), and " + why + ", and the patch does not prove it unchanged (" + patch_why + ")";
     }
+    wp60_by_patch_ += by_patch ? 1u : 0u;
     return {};
 }
 

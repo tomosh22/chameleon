@@ -1459,7 +1459,7 @@ TEST_CASE("inlinee lines (WP-60): the source file checksum of an inlinee, from C
     }
     Bytes ex;  // signature 1: (inlinee, file id, line, extra count, extra file ids)
     put32(ex, 1);
-    for (const std::uint32_t v : {0x1004u, 32u, 9u, 2u, 0u, 24u, 0x1005u, 0u, 4u, 0u}) {
+    for (const std::uint32_t v : {0x1004u, 32u, 9u, 1u, 0u, 0x1005u, 0u, 4u, 0u, 0x1006u, 0u, 5u, 1u, 24u}) {
         put32(ex, v);
     }
     Bytes all;
@@ -1470,25 +1470,29 @@ TEST_CASE("inlinee lines (WP-60): the source file checksum of an inlinee, from C
     cml::pdb::C13Inlinees c13;
     REQUIRE(cml::pdb::read_c13_inlinees(std::span<const std::uint8_t>(all.data(), all.size()), c13).has_value());
     CHECK(c13.checksum_tables == 1);
-    CHECK(c13.lines.size() == 6);
-    const auto f1 = cml::pdb::inlinee_file(c13, 0x1001);
+    CHECK(c13.lines.size() == 7);
+    const auto f1 = cml::pdb::inlinee_files(c13, 0x1001);
     REQUIRE(f1.has_value());
-    CHECK(f1->kind == 1);
-    CHECK(f1->bytes == std::vector<std::uint8_t>(16, 0xA1));
-    CHECK_FALSE(cml::pdb::inlinee_file(c13, 0x1002).has_value());  // recorded without a checksum
-    CHECK_FALSE(cml::pdb::inlinee_file(c13, 0x1003).has_value());  // two entries naming different files
-    const auto f4 = cml::pdb::inlinee_file(c13, 0x1004);           // the extra-files form
+    REQUIRE(f1->size() == 1);
+    CHECK((*f1)[0].kind == 1);
+    CHECK((*f1)[0].bytes == std::vector<std::uint8_t>(16, 0xA1));
+    CHECK_FALSE(cml::pdb::inlinee_files(c13, 0x1002).has_value());  // recorded without a checksum
+    CHECK_FALSE(cml::pdb::inlinee_files(c13, 0x1003).has_value());  // two entries naming different files
+    const auto f4 = cml::pdb::inlinee_files(c13, 0x1004);           // the extra-files form: its file, then the extra one
     REQUIRE(f4.has_value());
-    CHECK(f4->bytes == std::vector<std::uint8_t>(16, 0xB2));
-    CHECK((cml::pdb::inlinee_file(c13, 0x1005) == cml::pdb::inlinee_file(c13, 0x1001)));
-    CHECK_FALSE(cml::pdb::inlinee_file(c13, 0x1FFF).has_value());  // no entry
+    REQUIRE(f4->size() == 2);
+    CHECK((*f4)[0].bytes == std::vector<std::uint8_t>(16, 0xB2));
+    CHECK((*f4)[1].bytes == std::vector<std::uint8_t>(16, 0xA1));
+    CHECK((cml::pdb::inlinee_files(c13, 0x1005) == cml::pdb::inlinee_files(c13, 0x1001)));  // no extra files
+    CHECK_FALSE(cml::pdb::inlinee_files(c13, 0x1006).has_value());  // an extra file without a checksum
+    CHECK_FALSE(cml::pdb::inlinee_files(c13, 0x1FFF).has_value());  // no entry
 
     cml::pdb::C13Inlinees twice = c13;  // a second checksum table: the file ids are no longer unambiguous
     Bytes more;
     subsection(more, 0xF4, sums);
     REQUIRE(cml::pdb::read_c13_inlinees(std::span<const std::uint8_t>(more.data(), more.size()), twice).has_value());
     CHECK(twice.checksum_tables == 2);
-    CHECK_FALSE(cml::pdb::inlinee_file(twice, 0x1001).has_value());
+    CHECK_FALSE(cml::pdb::inlinee_files(twice, 0x1001).has_value());
 
     Bytes cut;
     put32(cut, 0xF6);
@@ -1496,6 +1500,27 @@ TEST_CASE("inlinee lines (WP-60): the source file checksum of an inlinee, from C
     put32(cut, 0);
     cml::pdb::C13Inlinees bad;
     CHECK_FALSE(cml::pdb::read_c13_inlinees(std::span<const std::uint8_t>(cut.data(), cut.size()), bad).has_value());
+
+    // (Review of 5624b28) A 10-byte block: one header with len 2, rounded up past the end; nothing is read past the span.
+    Bytes ten;
+    put32(ten, 0xF6);
+    put32(ten, 2);
+    ten.push_back(0);
+    ten.push_back(0);
+    cml::pdb::C13Inlinees small;
+    CHECK(cml::pdb::read_c13_inlinees(std::span<const std::uint8_t>(ten.data(), ten.size()), small).has_value());
+    CHECK(small.lines.empty());
+
+    // Extra files that leave their subsection.
+    Bytes long_ex;
+    put32(long_ex, 1);
+    for (const std::uint32_t v : {0x1007u, 0u, 1u, 1000u}) {
+        put32(long_ex, v);
+    }
+    Bytes overrun;
+    subsection(overrun, 0xF6, long_ex);
+    cml::pdb::C13Inlinees over;
+    CHECK_FALSE(cml::pdb::read_c13_inlinees(std::span<const std::uint8_t>(overrun.data(), overrun.size()), over).has_value());
 }
 
 TEST_CASE("inlinees: a procedure that is not in its module, or a module without an end record, is an error") {

@@ -20,15 +20,26 @@ if [ "$W_ABS" = "/" ] || [ "$W_ABS" = "$(pwd -P)" ] || [ "$W_ABS" = "$HERE" ] ||
 fi
 rm -rf "$W"
 mkdir -p "$W"
-cp "$HERE"/src/*.cpp "$HERE"/src/*.h "$W"/
+cp "$HERE"/src/*.cpp "$HERE"/src/*.c "$HERE"/src/*.h "$W"/
 W=$(cd "$W" && pwd)
 cd "$W"
 CL=("$CLANG_CL" --target=x86_64-pc-windows-msvc /O2 /Ob2 /Z7 /std:c++17 /c /GS- '-fdebug-compilation-dir=C:\wp60' "/clang:-fdebug-prefix-map=$W=C:\\wp60" /clang:-gno-codeview-command-line)
 "${CL[@]}" support.cpp /Fosupport.obj
-for c in h1_r57 h2_r57_samecode h3_helper_other h4_helper_edit h5_outofline h6_outofline_x h7_internal_class h8_external_member h10_external_free h11_member_template h12_header_changed h13_external_global h14_two_owners; do
+for c in h1_r57 h2_r57_samecode h3_helper_other h4_helper_edit h5_outofline h6_outofline_x h7_internal_class h8_external_member h10_external_free h11_member_template h12_header_changed h13_external_global h14_two_owners h16_if_constexpr; do
   "${CL[@]}" "$c.old.cpp" "/Fo$c.old.obj"
   "${CL[@]}" "$c.new.cpp" "/Fo$c.new.obj"
   "$LLD_LINK" /DEBUG /NODEFAULTLIB /ENTRY:main /SUBSYSTEM:console '/pdbsourcepath:C:\wp60' "/OUT:$c.exe" "/PDB:$c.pdb" "/PDBALTPATH:$c.pdb" support.obj "$c.old.obj"
+  cp "$c.exe" "$c.pdb" "$HERE"/
+  cp "$c.new.obj" "$HERE/$c.patch.obj"
+done
+# (Review of 5624b28) Cases compiled as C (clang-cl /TC spells a function-local static "f.rx"), linked with a support object whose
+# declarations of f and g have C linkage.
+"${CL[@]}" support.cpp /DWP60_C_CASE /Fosupport_c.obj
+CC=("$CLANG_CL" --target=x86_64-pc-windows-msvc /O2 /Ob2 /Z7 /TC /c /GS- '-fdebug-compilation-dir=C:\wp60' "/clang:-fdebug-prefix-map=$W=C:\\wp60" /clang:-gno-codeview-command-line)
+for c in h15_c_helper; do
+  "${CC[@]}" "$c.old.c" "/Fo$c.old.obj"
+  "${CC[@]}" "$c.new.c" "/Fo$c.new.obj"
+  "$LLD_LINK" /DEBUG /NODEFAULTLIB /ENTRY:main /SUBSYSTEM:console '/pdbsourcepath:C:\wp60' "/OUT:$c.exe" "/PDB:$c.pdb" "/PDBALTPATH:$c.pdb" support_c.obj "$c.old.obj"
   cp "$c.exe" "$c.pdb" "$HERE"/
   cp "$c.new.obj" "$HERE/$c.patch.obj"
 done

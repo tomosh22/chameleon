@@ -665,6 +665,11 @@ private:
     StepOutcome reload(const Step& given) {
         // WP-60: an expect_error for one compiler only: in a cell of the other compiler it is an allow_error.
         Step adjusted;
+        if (!given.compiler.empty() && compiler_family(report_.compiler).empty()) {
+            // (Review of 5624b28) As expect_reload_result: a compiler that is neither cl nor clang-cl cannot be matched.
+            return StepOutcome::fail(cml::ids::kResultMismatch, "the expect_error " + given.expect_error + " is for " + given.compiler + ", and this cell's compiler '" +
+                                                                    report_.compiler + "' is neither cl nor clang-cl");
+        }
         const bool other_compiler = !given.compiler.empty() && !given.expect_error.empty() && compiler_family(report_.compiler) != given.compiler;
         if (other_compiler) {
             adjusted = given;
