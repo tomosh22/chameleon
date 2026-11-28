@@ -242,6 +242,9 @@ struct LambdaSet {
 // bitmask is right only when those statics are the same set in the same order as in the old image. The records cannot
 // show that (a static made constant-initialised keeps its record); the code of the function can: the pipeline proves
 // that `function` is unchanged (hook_narrowing.h: prove_bitmask_guards), or refuses the reload (CML3600).
+// WP-59 (R-67): clang's `??_B<scope>@5<n>`, the external bitmask of an inline function's statics, is listed the same way,
+// and so is an inline function's external thread-safe guard `?$TSS<n>@<scope>@4HA` bound by its name where nothing else
+// proves which static it belongs to (its block has several statics or guards; bind_plan.cpp settle_external_guard).
 struct BitmaskGuard {
     std::string guard;     // decorated name of the bitmask
     std::string function;  // decorated name of the function whose statics it guards ("" when it cannot be read)
