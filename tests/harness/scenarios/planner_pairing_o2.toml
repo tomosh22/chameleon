@@ -91,12 +91,14 @@ min_samples = 20
 # WP-52 (R-60, ADR-0045): nest_4 recompiles nested.cpp, whose nested lambda's static `nested` is bound to the running one.
 # clang 18 spells its guard's scope with other back-references than the static's; until WP-52 the guard was tied to no
 # static, got a fresh one (warning CML3211) and the patch constructed the live static again (nest back to 700001, nmade
-# 2). Now the guard is placed with its static: under clang-cl the reload applies (patched = 1) and nest keeps counting.
-# Under cl the planner does not find the static's old record (the outer closure is a back-reference in its name, R-68):
-# until the WP-52 ruling the static and its guard were new and the reload reset nest to 700001 (CI 46093165335); now the
-# static decided new next to an old record of its name in its function is refused (CML3207) and nest keeps counting in the
-# old code. (CML3207 / CML3211 / CML3600 are allowed; under clang-cl the next step requires the reload to apply.) Never a
-# value that drops, nor a second construction.
+# 2). Now the guard is placed with its static.
+# WP-56 (R-68, R-66; ADR-0046): under cl the static names its outer closure by a back-reference to its own table, the
+# inner closure's unique name by one to that name's: the closure step now compares them resolved and pairs `nested` (and
+# its guard) with the inner call operator's record; until WP-56 the static was decided new, which the WP-52 ruling refused
+# (CML3207, after CI 46093165335 had shown the reset). `nested2` (o2_nest2_step, the nest inlined all the way under
+# clang-cl) is recorded two lambdas up, in o2_nest2_step itself: the planner searches the chain of enclosing procedures and
+# the code of o2_nest2_step, which the edit leaves alone, proves the record. So the reload applies in every cell (no
+# refusal is allowed), and nest and nest2 keep counting (nmade and n2made stay 1).
 [[step]]
 kind = "edit"
 patch = "edits/nest_4.edit"
@@ -104,23 +106,29 @@ patch = "edits/nest_4.edit"
 [[step]]
 kind = "reload"
 within_s = 120
-allow_error = "CML3207|CML3211|CML3600"
 
 [[step]]
 kind = "expect_reload_result"
 key = "patched"
 value = 1
-compiler = "clang-cl"
 
-# nest continues from its last value before the reload (since_reload) and never drops; nmade stays 1.
+# nest and nest2 continue from their last values before the reload (since_reload) and never drop; nmade and n2made stay 1;
+# nmark=4 shows the patched code runs.
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ mark=[12] a=10\\d{4} b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=1 made=3 nest=7\\d{5} nmade=1 nmark=[14]\\b"
+regex = "TICK n=\\d+ mark=[12] a=10\\d{4} b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=1 made=3 nest=7\\d{5} nmade=1 nmark=4 nest2=8\\d{5} n2made=1\\b"
 within_s = 10
 
 [[step]]
 kind = "expect_monotonic"
 key = "nest"
+min_samples = 20
+since_reload = 10
+within_s = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "nest2"
 min_samples = 20
 since_reload = 10
 within_s = 20

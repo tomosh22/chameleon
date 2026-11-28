@@ -182,6 +182,35 @@ TEST_CASE("local_scope_key: templates, parameter types, anonymous namespaces (cl
     CHECK(rest_of("?$TSS0@?1??m@K@@QEBAHH@Z@4HA") == rest_of("?kx@?1??m@K@@QEBAHH@Z@4UObj@@A"));
 }
 
+TEST_CASE("resolved_qualified_name (WP-56, R-68): a closure's unique name and its static's scope, resolved, begin alike") {
+    // cl (planner_pairing_o2/nested.cpp, CI): the static's table starts with `nested`, so the outer closure `<lambda_1>` is
+    // its `1`; the inner closure's unique name has a table of its own, where it is `0`.
+    const char* nested = "?nested@?1???R<lambda_1>@?1???R1?1??o2_nest_step@@YAXXZ@QEBA@XZ@QEBA@XZ@4UO2Name@@A";
+    const std::optional<std::string> closure = resolved_qualified_name("<lambda_1>@?1???R0?1??o2_nest_step@@YAXXZ@QEBA@XZ@");
+    REQUIRE(closure.has_value());
+    CHECK(*closure == "<lambda_1>@?1???R<lambda_1>@?1??o2_nest_step@@YAXXZ@QEBA@XZ@");
+    const std::string scope = rest_of(nested);
+    REQUIRE(scope.size() > 3);
+    CHECK(scope.compare(0, 3, "??R") == 0);
+    CHECK(scope.compare(3, closure->size(), *closure) == 0);
+    // As written they differ (the comparison before WP-56).
+    CHECK(std::string(call_operator_scope(nested)).compare(0, 21, "<lambda_1>@?1???R0?1?") != 0);
+    // The outer closure, and what follows the closing '@' is kept as written (cl's discriminator).
+    CHECK((resolved_qualified_name("<lambda_1>@?1??o2_nest_step@@YAXXZ@") == std::optional<std::string>("<lambda_1>@?1??o2_nest_step@@YAXXZ@")));
+    CHECK((resolved_qualified_name("<lambda_1>@?1??f@?A0x790cee12@@YAXXZ@`790cee12") == std::optional<std::string>("<lambda_1>@?1??f@?A0x790cee12@@YAXXZ@`790cee12")));
+    // A back-reference outside the table, or nothing to read: no name.
+    CHECK_FALSE(resolved_qualified_name("<lambda_1>@?1???R5?1??f@@YAXXZ@QEBA@XZ@").has_value());
+    CHECK_FALSE(resolved_qualified_name("").has_value());
+    CHECK_FALSE(resolved_qualified_name("@").has_value());
+    // A call operator's own decorated name: its table starts with the closure (an operator's name is not memorised).
+    const std::optional<std::string> op = resolved_decorated_name("??R<lambda_1>@?1???R0?1??o2_nest_step@@YAXXZ@QEBA@XZ@QEBA@XZ");
+    REQUIRE(op.has_value());
+    CHECK(*op == "??R<lambda_1>@?1???R<lambda_1>@?1??o2_nest_step@@YAXXZ@QEBA@XZ@QEBA@XZ");
+    CHECK(scope.compare(0, op->size(), *op) == 0);
+    CHECK_FALSE(resolved_decorated_name("??R<lambda_1>@?1???R7?1??f@@YAXXZ@QEBA@XZ@QEBA@XZ").has_value());
+    CHECK_FALSE(resolved_decorated_name("f").has_value());
+}
+
 TEST_CASE("local_scope_key: cl counts the guard's own name (Jolt's GetRTTIOfType, Godot's SceneTree)") {
     const char* guard = "?$TSS0@?1??GetRTTIOfType@JPH@@YAPEAVRTTI@2@PEAVSphereShape@2@@Z@4HA";
     const char* rtti = "?rtti@?1??GetRTTIOfType@JPH@@YAPEAVRTTI@2@PEAVSphereShape@2@@Z@4V32@A";

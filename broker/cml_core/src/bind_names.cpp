@@ -1067,6 +1067,34 @@ std::optional<LocalScopeKey> local_scope_key(std::string_view d, bool guard_name
     return key;
 }
 
+std::optional<std::string> resolved_qualified_name(std::string_view qualified) {
+    if (qualified.empty() || qualified[0] == '@') {
+        return std::nullopt;
+    }
+    BackrefReader r;
+    r.s = qualified;
+    std::string out;
+    if (!r.chain(out) || !r.ok) {
+        return std::nullopt;
+    }
+    out.append(qualified.substr(r.i));
+    return out;
+}
+
+std::optional<std::string> resolved_decorated_name(std::string_view decorated) {
+    if (decorated.size() < 2 || decorated[0] != '?') {
+        return std::nullopt;
+    }
+    BackrefReader r;
+    r.s = decorated;
+    std::string out;
+    if (!r.symbol(out) || !r.ok) {
+        return std::nullopt;
+    }
+    out.append(decorated.substr(r.i));
+    return out;
+}
+
 std::string initializer_target_prefix(std::string_view d) {
     if (!starts_with(d, "??__E")) {
         return {};

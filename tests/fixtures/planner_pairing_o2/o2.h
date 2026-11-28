@@ -24,3 +24,7 @@ void o2_nest_step();
 int o2_nest_value();  // 700000 + n
 int o2_nest_made();   // stays 1
 int o2_nest_mark();
+// WP-56 (R-66): the same nest inlined all the way (no noinline).
+void o2_nest2_step();
+int o2_nest2_value();  // 800000 + n
+int o2_nest2_made();   // stays 1

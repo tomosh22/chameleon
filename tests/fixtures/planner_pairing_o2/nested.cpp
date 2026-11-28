@@ -7,8 +7,13 @@
 // refused. Either way `nest` keeps counting from where it was and `nmade` stays 1.
 //
 // The outer lambda is kept out of line under clang (WP-51's repro: the inner one is inlined into it, and clang-cl records
-// the static in the outer call operator, where the planner looks for it). Inlined all the way into o2_nest_step(), the
-// record would sit two lambdas up, where the planner does not look yet (docs/wp/WP-52.md, deferred). cl ignores this.
+// the static in the outer call operator, where the planner looks for it). cl ignores this; it spells the outer closure in
+// the static's name as a back-reference to the name's own table and in the inner closure's unique name to that name's, so
+// the closure comparisons see the two alike only with the back-references resolved (WP-56, R-68).
+//
+// WP-56 (R-66): o2_nest2_step() is the same nest without the noinline. clang-cl inlines both lambdas into it and records
+// `nested2` as a plain record of o2_nest2_step(), two lambdas up from its call operator: the planner searches the chain of
+// enclosing procedures, and the pairing stands because the edit leaves o2_nest2_step() unchanged (WP-53's proof).
 #include "o2.h"
 
 #if defined(__clang__)
@@ -45,6 +50,42 @@ void o2_nest_step()
     };
     g_o2_nest = outer();
     ++s_nest_calls;
+}
+
+int s_nest2_made = 0;
+int g_o2_nest2 = 0;
+
+O2Name o2_nest2_make(int id)
+{
+    ++s_nest2_made;
+    O2Name n;
+    n.id = id;
+    n.hits = 0;
+    return n;
+}
+
+void o2_nest2_step()
+{
+    auto outer = []() {
+        auto inner = [] {
+            static O2Name nested2 = o2_nest2_make(800000);
+            return &nested2;
+        };
+        O2Name* n = inner();
+        n->hits += 1;
+        return n->id + n->hits;
+    };
+    g_o2_nest2 = outer();
+}
+
+int o2_nest2_value()
+{
+    return g_o2_nest2;
+}
+
+int o2_nest2_made()
+{
+    return s_nest2_made;
 }
 
 int o2_nest_value()
