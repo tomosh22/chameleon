@@ -20,16 +20,21 @@
 //     `lea rcx, [guard]` + `call _Init_thread_footer` (the end of a region) or `_Init_thread_abort` (an EH funclet's).
 // A claim's region is every instruction reachable from it (direct branches followed, calls return) that the code cannot
 // reach from any function start without passing the claim, up to the next use of the guard (a bitmask) or the guard's
-// footer (thread-safe: every path must end there or rejoin the rest of the code, none at a ret). Nothing may enter the
-// region from outside it. Its static is the ONE candidate (the statics the guard's name ties: its function's or its
-// block's) that the region WRITES: a store or read-modify-write to it, or its address formed (`lea`, an immediate) as for a
-// constructor; a candidate it only reads does not count, and a region that writes none or several is not read. Every
+// footer (thread-safe: every path must end there or rejoin the rest of the code; none may end at a ret, a tail call or the
+// end of the section, only at a trap right behind a call, an inlined throw). Nothing may enter the region from outside it,
+// and a function start counts as entered from outside. Its static is the ONE candidate (the statics the guard's name ties:
+// its function's or its block's) that the region WRITES: any instruction that references a candidate writes it unless it
+// is on an explicit list of pure reads (mov/movzx/movsx loads, cmp, test, bt, the ALU forms that read memory into a
+// register, the SSE loads; so a store, a read-modify-write, cmpxchg8b/16b, an x87 store or `lea` all write); a candidate
+// the region only reads does not count, and a region that writes none or several is not read. A register stored to the
+// guard after an `or` (a claim) or an `and` (a release) must be loaded from the guard on every path back. Every
 // function of a section that uses the guard must decode completely (the agent's length decoder, from the start of the
 // section and from every function symbol, as WP-36's SiteProver: every relocation exactly a displacement or an immediate
 // of one decoded instruction), with no indirect jump, and every use of the guard must be one of these forms. A guard
-// referenced from data other than debug information, through another symbol of its section, or at an offset that is not
-// its own is not read; nor is one without any claim; nor a section that uses the guard and names another symbol of a
-// candidate's section. Each bit (or the thread-safe guard) must belong to one static, and each static to one bit.
+// referenced from data other than debug information (by its name or its section), through ANY other symbol of its section
+// (an alias: a section symbol, a label, another name; in any code section), or at an offset that is not its own is not
+// read; nor is one without any claim; nor a section that uses the guard and names another symbol of a candidate's section.
+// Each bit (or the thread-safe guard) must belong to one static, and each static to one bit.
 //
 // What it proves: the statics initialised under the guard, and so the statics of its scope that are not (no claim's region
 // writes them: constant-initialised, or guarded by another guard of their block). It also lists the candidates whose
@@ -60,7 +65,7 @@ struct GuardCodeReloc {
     std::uint32_t width = 0;       // bytes the relocation patches (4 or 8); 0 = not known (fits no operand)
     std::int8_t rel_tail = -1;     // REL32_k: k (bytes between the field and the end of the instruction); -1: not REL32*
     std::string target;            // the decorated name of the target symbol
-    bool target_is_section = false;  // the target is a section symbol (`.bss`, ...)
+    bool target_is_section = false;  // the target is a section symbol (`.bss`, ...); informational: any alias refuses
     std::int32_t target_section = 0;  // the target's section number (1-based; <= 0: undefined, absolute, ...)
 };
 
@@ -77,7 +82,7 @@ struct GuardClaim {
     std::uint32_t at = 0;    // the claim (the store, or the header call)
     std::uint32_t end = 0;   // the end of its region
     std::uint32_t bits = 0;  // a bitmask's bit (one bit set); 0 for a thread-safe guard
-    std::string static_name; // the one candidate its region refers to
+    std::string static_name; // the one candidate its region writes
 };
 
 struct GuardCodeReading {
@@ -92,10 +97,11 @@ struct GuardCodeReading {
     std::size_t references = 0;     // the guard's references that were read
 };
 
-// `code`: every code section of the patch that refers to the guard (others are skipped). `guard_section`: the guard's own
-// section (a relocation to that section's symbol is not read). `candidates`: name -> section of the statics the guard's
-// name ties. `data_reference`: a non-code, non-debug section of the patch refers to the guard (then nothing is proved).
-GuardCodeReading read_guard_code(std::span<const GuardCodeSection> code, std::string_view guard, std::int32_t guard_section, GuardCodeKind kind,
+// `code`: the code sections of the patch that refer to the guard or to its section (others are skipped). `guard_section`:
+// the guard's own section (any relocation into it that does not name the guard refuses). `candidates`: name -> section of
+// the statics the guard's name ties. `data_reference`: a non-code, non-debug section of the patch refers to the guard or
+// to its section (then nothing is proved).
+GuardCodeReading read_guard_code(std::span<const GuardCodeSection* const> code, std::string_view guard, std::int32_t guard_section, GuardCodeKind kind,
                                  const std::map<std::string, std::int32_t, std::less<>>& candidates, std::string_view data_reference = {});
 
 }  // namespace cml::core::bind

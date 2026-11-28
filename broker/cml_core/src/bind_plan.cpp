@@ -616,7 +616,9 @@ private:
                                                               std::set<std::uint32_t>& address_taken);
     std::map<std::uint32_t, GuardCodeSection> guard_code_cache_;  // the code sections described so far, by index into secs_
     std::vector<std::vector<std::uint32_t>> guard_code_starts_;      // per section: the offsets of its function symbols
-    bool guard_code_starts_built_ = false;
+    bool guard_code_index_built_ = false;
+    std::unordered_map<std::string_view, std::vector<std::uint32_t>> sections_by_target_;  // symbol name -> sections referring to it
+    std::unordered_map<std::int32_t, std::vector<std::uint32_t>> sections_by_target_section_;  // symbol's section -> sections
     // (guard, static) pairs that the guard's name ties and its code proves it does not guard (a constant-initialised static
     // next to a new dynamic one): require_bound_guards does not count the guard as the static's.
     std::set<std::pair<std::uint32_t, std::uint32_t>> code_untied_;
@@ -4791,31 +4793,47 @@ void Planner::settle_external_guard(Sym& sy, std::vector<std::uint32_t>& untied)
 // of the guard is not read. `address_taken`: the candidates whose address the code that uses the guard materialises.
 std::optional<std::set<std::uint32_t>> Planner::guard_code_statics(const Sym& guard, const std::vector<std::uint32_t>& scope, bool bitmask, std::string& why,
                                                                    std::set<std::uint32_t>& address_taken) {
-    // WP-58 lesson: nothing here may cost the plans that never read a guard's code. The function symbols are bucketed by
-    // section once (on the first reading), and a section is described (its relocations copied) only when it refers to the
-    // guard or to the guard's section.
-    if (!guard_code_starts_built_) {
-        guard_code_starts_built_ = true;
+    // WP-58 lesson: nothing here may cost the plans that never read a guard's code. On the first reading of a plan, one pass
+    // buckets the function symbols by section and indexes which sections refer to which symbol name and which symbol
+    // section; a section is described (its relocations copied) only when it refers to the guard or to the guard's section,
+    // once, and the reader gets pointers to those descriptions.
+    if (!guard_code_index_built_) {
+        guard_code_index_built_ = true;
         guard_code_starts_.assign(secs_.size(), {});
         for (const coff::Symbol& s : obj_.symbols()) {
             if (s.section_number > 0 && static_cast<std::size_t>(s.section_number) <= secs_.size() && s.is_function() && (s.is_external() || s.is_static())) {
                 guard_code_starts_[static_cast<std::size_t>(s.section_number) - 1].push_back(s.value);
             }
         }
+        for (std::uint32_t i = 0; i < relocs_.size(); ++i) {
+            for (const coff::ResolvedRelocation& rr : relocs_[i]) {
+                if (rr.reloc.type == coff::RelocType::Absolute) {
+                    continue;
+                }
+                std::vector<std::uint32_t>& by_name = sections_by_target_[rr.target->name];
+                if (by_name.empty() || by_name.back() != i) {
+                    by_name.push_back(i);
+                }
+                std::vector<std::uint32_t>& by_section = sections_by_target_section_[rr.target->section_number];
+                if (by_section.empty() || by_section.back() != i) {
+                    by_section.push_back(i);
+                }
+            }
+        }
     }
     const std::int32_t guard_section = guard.s->section_number;
-    const auto refers_to_guard = [&](const coff::ResolvedRelocation& rr) {
-        return rr.reloc.type != coff::RelocType::Absolute && (rr.target->name == guard.name || (guard_section > 0 && rr.target->section_number == guard_section));
-    };
-    std::vector<GuardCodeSection> code;
+    std::set<std::uint32_t> referring;  // the sections that refer to the guard or to its section
+    if (const auto it = sections_by_target_.find(guard.name); it != sections_by_target_.end()) {
+        referring.insert(it->second.begin(), it->second.end());
+    }
+    if (const auto it = sections_by_target_section_.find(guard_section); guard_section > 0 && it != sections_by_target_section_.end()) {
+        referring.insert(it->second.begin(), it->second.end());
+    }
+    std::vector<const GuardCodeSection*> code;
     // Data that holds the guard's address, or an alias of it (debug information aside), may be used to write it: nothing is
     // proved then.
     std::string data_reference;
-    for (std::size_t i = 0; i < secs_.size(); ++i) {
-        const bool refers = std::any_of(relocs_[i].begin(), relocs_[i].end(), refers_to_guard);
-        if (!refers) {
-            continue;
-        }
+    for (const std::uint32_t i : referring) {
         if (!secs_[i].code) {
             if (data_reference.empty() && !starts_with(secs_[i].name, ".debug$")) {
                 data_reference = "section " + std::to_string(i + 1) + " (" + secs_[i].name + ")";
@@ -4847,7 +4865,7 @@ std::optional<std::set<std::uint32_t>> Planner::guard_code_statics(const Sym& gu
             cs.function_starts = guard_code_starts_[i];
             cached = guard_code_cache_.emplace(static_cast<std::uint32_t>(i), std::move(cs)).first;
         }
-        code.push_back(cached->second);
+        code.push_back(&cached->second);
     }
     std::map<std::string, std::int32_t, std::less<>> candidates;
     std::map<std::string, std::uint32_t> pos_of;

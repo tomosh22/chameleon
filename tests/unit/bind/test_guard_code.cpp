@@ -4,9 +4,12 @@
 // the external `?$TSS<n>@<block>@4HA` of one static with them) are external. A constant-initialised static defines the same
 // symbols as a dynamic one, so WP-59 (ADR-0046) refused (CML3600) an inline function that keeps `static int calls = 0;` and
 // gains a dynamic static: its guard's name ties it to calls (bound) and to the new static. guard_code.cpp reads which
-// statics are initialised under the guard: the bit a store sets (or the _Init_thread_header / _Init_thread_footer bracket)
-// and the one static the code behind it refers to. Where every static it initialises is new, the guard is new and the bound
-// constant-initialised static keeps its live value; anything else, and any use that is not read, refuses as before.
+// statics are initialised under the guard: the bit a store sets in a register loaded from the guard (or the
+// _Init_thread_header / _Init_thread_footer bracket), and the one static that the code reached only through it WRITES (any
+// reference counts as a write unless the instruction is a pure read). Any other symbol of the guard's section (an alias)
+// refuses. Where every static the guard initialises is new and no bound static's address is taken, the guard is new and
+// the bound constant-initialised static keeps its live value; anything else, and any use that is not read, refuses as
+// before.
 //
 // Two halves:
 //   * real clang-cl 18 images: tests/unit/bind/wp63/<case>.{exe,pdb,patch.obj} (built by tests/unit/bind/wp63/build.sh; the
@@ -321,7 +324,8 @@ std::map<std::string, std::int32_t, std::less<>> candidates() { return {{kCalls,
 //   done: inc dword ptr [calls]; mov eax,[calls]; ret
 // `options`: 'h' hoists the guard's address into rbx (lea rbx,[G]; mov rcx,rbx), 'c' writes calls in the bracket too,
 // 'n' writes another static instead of a, 'j' adds a jump from behind the function into the bracket, 'z' a jmp to the next
-// instruction after the call of make (clang -O0).
+// instruction after the call of make (clang -O0), 't' a branch out of the bracket to a tail call behind the function,
+// 'x' a branch to an inlined throw behind the function (`call _CxxThrowException; int3`).
 Asm cl_thread_safe(const std::string& options = "") {
     Asm s;
     s.raw({0x48, 0x83, 0xEC, 0x28});                   // sub rsp, 28h
@@ -352,6 +356,12 @@ Asm cl_thread_safe(const std::string& options = "") {
     if (options.find('c') != std::string::npos) {
         s.raw({0x89, 0x05}).rel(kCalls);                // mov [rip+calls], eax
     }
+    std::uint32_t out_jne = 0xFFFFFFFFu;
+    if (options.find('t') != std::string::npos || options.find('x') != std::string::npos) {
+        s.raw({0x85, 0xC0});                            // test eax, eax
+        out_jne = s.here();
+        s.raw({0x75, 0x00});                            // jne out (behind the function)
+    }
     s.raw({0x48, 0x8D, 0x0D}).rel(kG);                  // lea rcx, [rip+G]
     s.raw({0xE8}).rel("_Init_thread_footer");           // call _Init_thread_footer
     const std::uint32_t done = s.here();
@@ -363,6 +373,15 @@ Asm cl_thread_safe(const std::string& options = "") {
         const std::uint32_t back = s.here();
         s.raw({0xEB, 0x00});                            // jmp inside
         s.jump8(back, inside);
+    }
+    if (out_jne != 0xFFFFFFFFu) {
+        s.jump8(out_jne, s.here());
+        if (options.find('t') != std::string::npos) {
+            s.raw({0xE9}).rel("?elsewhere@@YAXXZ");     // out: jmp elsewhere (a tail call)
+        } else {
+            s.raw({0xE8}).rel("_CxxThrowException");    // out: call _CxxThrowException
+            s.raw({0xCC});                              // int3
+        }
     }
     s.jump8(jle, done);
     s.jump8(jne, done);
@@ -414,7 +433,8 @@ Asm cl_bitmask(const std::string& options = "") {
 
 GuardCodeReading read(const Asm& a, const char* guard, GuardCodeKind kind, std::string_view data_reference = {},
                       const std::map<std::string, std::int32_t, std::less<>>& cands = candidates()) {
-    const std::vector<GuardCodeSection> code = {a.section(".text$mn")};
+    const GuardCodeSection section = a.section(".text$mn");
+    const std::vector<const GuardCodeSection*> code = {&section};
     const GuardCodeReading r = read_guard_code(code, guard, 9, kind, cands, data_reference);
     if (!r.proved) {
         MESSAGE(r.why);
@@ -451,6 +471,59 @@ TEST_CASE("R-69 (reader): a jmp to the next instruction inside a region falls th
     const GuardCodeReading m = read(cl_bitmask("z"), kM, GuardCodeKind::Bitmask);
     REQUIRE(m.proved);
     CHECK(m.statics == std::set<std::string>{kA});
+}
+
+TEST_CASE("R-69 (review 2, items 3 and 5): a bracket path that leaves by a tail call refuses; one that ends in an inlined throw reads") {
+    const GuardCodeReading t = read(cl_thread_safe("t"), kG, GuardCodeKind::ThreadSafe);
+    CHECK_FALSE(t.proved);
+    CHECK(contains(t.why, "before its _Init_thread_footer"));
+    const GuardCodeReading x = read(cl_thread_safe("x"), kG, GuardCodeKind::ThreadSafe);
+    REQUIRE(x.proved);
+    CHECK(x.statics == std::set<std::string>{kA});
+}
+
+TEST_CASE("R-69 (review 2, item 1): a register stored to the guard after an `and` must hold the guard too") {
+    // `mov eax, 1; and eax, 0xFF; mov [M], eax`: a release that writes any bits; refused.
+    Asm a = cl_bitmask();
+    a.raw({0xB8, 0x01, 0, 0, 0});        // mov eax, 1
+    a.raw({0x25, 0xFF, 0, 0, 0});        // and eax, 0FFh
+    a.raw({0x89, 0x05}).rel(kM);         // mov [rip+M], eax
+    a.raw({0xC3});
+    const GuardCodeReading r = read(a, kM, GuardCodeKind::Bitmask);
+    CHECK_FALSE(r.proved);
+    CHECK(contains(r.why, "is not shown to hold the guard"));
+}
+
+TEST_CASE("R-69 (review 2, item 2): an instruction not on the list of pure reads writes the candidate (cmpxchg16b)") {
+    // cl_bitmask's region writes a, then `cmpxchg16b [calls]`: two written statics (or an instruction not read); refused.
+    Asm a;
+    a.raw({0x8B, 0x05}).rel(kM);                   // mov eax, [rip+M]
+    a.raw({0xA8, 0x01});                           // test al, 1
+    const std::uint32_t jne = a.here();
+    a.raw({0x75, 0x00});                           // jne done
+    a.raw({0x83, 0xC8, 0x01});                     // or eax, 1
+    a.raw({0x89, 0x05}).rel(kM);                   // mov [rip+M], eax
+    a.raw({0x48, 0x89, 0x05}).rel(kA);             // mov [rip+a], rax
+    a.raw({0x48, 0x0F, 0xC7, 0x0D}).rel(kCalls);   // cmpxchg16b [rip+calls]
+    const std::uint32_t done = a.here();
+    a.raw({0xC3});                                 // done: ret
+    a.jump8(jne, done);
+    const GuardCodeReading r = read(a, kM, GuardCodeKind::Bitmask);
+    CHECK_FALSE(r.proved);
+    CHECK((contains(r.why, "writes 2 of them") || contains(r.why, "not read") || contains(r.why, "not known to the decoder")));
+}
+
+TEST_CASE("R-69 (review 2, item 4): a function start is entered from outside: A's load falling into B's `or` proves nothing") {
+    Asm a;
+    a.raw({0x8B, 0x05}).rel(kM);                   // A: mov eax, [rip+M]  (falls through into B)
+    a.starts.push_back(a.here());                  // B:
+    a.raw({0x83, 0xC8, 0x01});                     //    or eax, 1
+    a.raw({0x89, 0x05}).rel(kM);                   //    mov [rip+M], eax
+    a.raw({0x48, 0x89, 0x05}).rel(kA);             //    mov [rip+a], rax
+    a.raw({0xC3});                                 //    ret
+    const GuardCodeReading r = read(a, kM, GuardCodeKind::Bitmask);
+    CHECK_FALSE(r.proved);
+    CHECK(contains(r.why, "from outside"));
 }
 
 TEST_CASE("R-69 (reader): shapes that are not read refuse") {

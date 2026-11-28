@@ -22,6 +22,8 @@ struct Ops {
     bool ok = false;            // parsed (legacy encoding, layout checked against the decoder)
     bool p66 = false;           // operand-size prefix
     bool other_prefix = false;  // F0, F2, F3, a segment override or 67
+    bool simd_prefix = false;   // only F2 / F3 among them (the mandatory prefixes of SSE instructions)
+    bool f3 = false;            // an F3 among them
     std::uint8_t rex = 0;
     bool map0f = false;
     std::uint8_t op = 0;
@@ -67,6 +69,8 @@ Ops parse_ops(const std::uint8_t* p, std::uint32_t len, const lde::DecodeResult&
             o.p66 = true;
             o.rex = 0;
         } else if (is_other_prefix(b)) {
+            o.simd_prefix = (b == 0xF2 || b == 0xF3) && (!o.other_prefix || o.simd_prefix);
+            o.f3 = o.f3 || b == 0xF3;
             o.other_prefix = true;
             o.rex = 0;
         } else if ((b & 0xF0) == 0x40) {
@@ -213,41 +217,48 @@ std::uint32_t reg_op_with_immediate(const Ops& o, bool want_or, std::uint64_t& o
     return kNone;
 }
 
-// Does the instruction write the memory its ModRM operand names (or form its address, `lea`)? Legacy encodings; an
-// instruction that is not parsed is not answered here (the caller refuses it).
-bool writes_operand(const Ops& o) {
-    if (!o.has_modrm) {
+// Does the instruction only READ the memory its ModRM operand names? Review round 2: the test is inverted, so that an
+// instruction counts as a write of the candidate it references unless it is on this explicit list of pure reads: mov /
+// movzx / movsx / movsxd loads, cmp, test, bt, the ALU and imul forms that read memory into a register, and the SSE loads
+// (movups/movss/movsd, movaps, movlps/movhps, movq/movdqa/movdqu, F3 movq, comiss/ucomiss). Anything else (a store, a
+// read-modify-write, cmpxchg8b/16b, shld/shrd, stmxcsr, fxsave/xsave, an x87 store, lea, ...) is a write.
+bool reads_only(const Ops& o) {
+    if (!o.ok || !o.has_modrm) {
         return false;
     }
     const unsigned r = o.reg & 7u;
     if (!o.map0f) {
+        if (o.other_prefix) {
+            return false;
+        }
         switch (o.op) {
-            case 0x00: case 0x01: case 0x08: case 0x09: case 0x10: case 0x11: case 0x18: case 0x19:
-            case 0x20: case 0x21: case 0x28: case 0x29: case 0x30: case 0x31:
-            case 0x86: case 0x87: case 0x88: case 0x89: case 0x8D: case 0x8F: case 0xC6: case 0xC7:
-            case 0xC0: case 0xC1: case 0xD0: case 0xD1: case 0xD2: case 0xD3:
+            case 0x8A: case 0x8B: case 0x63:                                   // mov r, m; movsxd
+            case 0x38: case 0x39: case 0x3A: case 0x3B:                         // cmp
+            case 0x84: case 0x85:                                               // test
+            case 0x02: case 0x03: case 0x0A: case 0x0B: case 0x12: case 0x13:   // add/or/adc r, m
+            case 0x1A: case 0x1B: case 0x22: case 0x23: case 0x2A: case 0x2B:   // sbb/and/sub r, m
+            case 0x32: case 0x33: case 0x69: case 0x6B:                         // xor r, m; imul r, m, imm
                 return true;
             case 0x80: case 0x81: case 0x83:
-                return r != 7;
+                return r == 7;  // cmp m, imm
             case 0xF6: case 0xF7:
-                return r == 2 || r == 3;
-            case 0xFE: case 0xFF:
-                return r == 0 || r == 1;
+                return r == 0;  // test m, imm
             default:
                 return false;
         }
     }
-    if (o.op >= 0x90 && o.op <= 0x9F) {
-        return true;  // setcc
+    if (o.other_prefix && !o.simd_prefix) {
+        return false;
     }
     switch (o.op) {
-        case 0x11: case 0x13: case 0x17: case 0x29: case 0x2B: case 0x7F: case 0xD6: case 0xE7: case 0xC3:
-        case 0xAB: case 0xB3: case 0xBB: case 0xB0: case 0xB1: case 0xC0: case 0xC1:
-            return true;
-        case 0x7E:
-            return o.p66 && !o.other_prefix;  // movd r/m32, xmm (F3 0F 7E is a load)
+        case 0xB6: case 0xB7: case 0xBE: case 0xBF: case 0xAF: case 0xA3:  // movzx, movsx, imul r, m, bt m, r
+            return !o.other_prefix;
         case 0xBA:
-            return r >= 5;
+            return r == 4 && !o.other_prefix;  // bt m, imm
+        case 0x10: case 0x12: case 0x16: case 0x28: case 0x6F: case 0x2E: case 0x2F:
+            return true;  // SSE loads and compares (with or without 66 / F2 / F3)
+        case 0x7E:
+            return o.f3;  // F3 0F 7E movq xmm, m64 (without it: movd m, mm/xmm, a store)
         default:
             return false;
     }
@@ -432,6 +443,11 @@ bool Reader::section(const GuardCodeSection& cs, GuardCodeReading& out) {
         const std::int64_t tail = static_cast<std::int64_t>(insn.start) + insn.length - (static_cast<std::int64_t>(rel.offset) + 4);
         return static_cast<std::int64_t>(a) + tail - rel.rel_tail;
     };
+    // A function start is entered from outside the section's code (its callers): an extra predecessor no walk can see.
+    std::vector<bool> is_entry(code.size(), false);
+    for (const std::uint32_t e : entries) {
+        is_entry[e] = true;
+    }
     const auto memory_operand = [&](const Insn& insn, const GuardCodeReloc& rel) {
         const Ops& o = insn.ops;
         return o.ok && o.riprel && (insn.flags & lde::kInsnRipRel) != 0 && rel.offset == insn.start + o.disp_at;
@@ -471,7 +487,7 @@ bool Reader::section(const GuardCodeSection& cs, GuardCodeReading& out) {
             }
             if (!o.map0f && o.op == 0x8D && rex_w && o.reg == 1) {
                 // lea rcx, [guard], then the call of the CRT's guard functions (their first argument).
-                if (i + 1 >= code.size() || pred[i + 1].size() != 1 || pred[i + 1][0] != i) {
+                if (i + 1 >= code.size() || pred[i + 1].size() != 1 || pred[i + 1][0] != i || is_entry[i + 1]) {
                     return fail(out, "the address of the guard is loaded at " + where(i) + " and not passed straight to a call");
                 }
                 const Insn& call = code[i + 1];
@@ -548,7 +564,7 @@ bool Reader::section(const GuardCodeSection& cs, GuardCodeReading& out) {
             if (at + width > 4) {
                 return fail(out, "the guard is written at " + where(i) + " beyond its four bytes");
             }
-            if (i == 0 || pred[i].size() != 1 || pred[i][0] != i - 1) {
+            if (i == 0 || pred[i].size() != 1 || pred[i][0] != i - 1 || is_entry[i]) {
                 return fail(out, "the store to the guard at " + where(i) + " can be reached other than from the instruction before it");
             }
             const Insn& prev = code[i - 1];
@@ -565,23 +581,26 @@ bool Reader::section(const GuardCodeSection& cs, GuardCodeReading& out) {
                 continue;
             }
             if (reg_op_with_immediate(prev.ops, false, bits, pw) == reg && pw == width) {
-                insn.use = Use::Release;
+                insn.use = Use::Release;  // proven below like a claim: `and` of a register that holds the guard
+                insn.claim_reg = reg;
+                insn.claim_width = width;
                 continue;
             }
             return fail(out, "the value stored to the guard at " + where(i) + " is not an or (or and) of a constant by the instruction before it, " + where(i - 1));
         }
         return fail(out, "the guard is used at " + where(i) + " by an instruction that is not read");
     }
-    // A claim stored from a register sets one bit in the guard's value only if the register holds that value: on every path
-    // back from the `or`, the register is loaded from the guard (`mov r32, [guard]`, `mov r8, [guard+n]` for a byte) with
-    // nothing between that could write it.
+    // A claim (or a release) stored from a register sets one bit (clears bits) in the guard's value only if the register
+    // holds that value: on every path back from the `or` (`and`), the register is loaded from the guard (`mov r32, [guard]`,
+    // `mov r8, [guard+n]` for a byte) with nothing between that could write it. A function start on the way is entered from
+    // outside, where the register holds anything.
     const auto loaded_from_guard = [&](std::uint32_t claim, std::string& why) {
         const std::uint32_t or_at = claim - 1;
         const Insn& store = code[claim];
         std::vector<std::uint32_t> todo = pred[or_at];
         std::set<std::uint32_t> seen;
-        if (todo.empty()) {
-            why = "nothing before the `or` at " + where(or_at) + " loads the register from the guard";
+        if (todo.empty() || is_entry[or_at]) {
+            why = "a path to the `or`/`and` at " + where(or_at) + " enters it from outside without loading the register from the guard";
             return false;
         }
         while (!todo.empty()) {
@@ -601,11 +620,12 @@ bool Reader::section(const GuardCodeSection& cs, GuardCodeReading& out) {
                 }
             }
             if (!preserves_registers(in)) {
-                why = "the register the `or` at " + where(or_at) + " sets a bit in is not shown to hold the guard: " + where(p) + " comes before it without a load of the guard";
+                why = "the register the `or`/`and` at " + where(or_at) + " works on is not shown to hold the guard: " + where(p) +
+                      " comes before it without a load of the guard";
                 return false;
             }
-            if (pred[p].empty()) {
-                why = "a path to the `or` at " + where(or_at) + " starts at " + where(p) + " without loading the register from the guard";
+            if (pred[p].empty() || is_entry[p]) {
+                why = "a path to the `or`/`and` at " + where(or_at) + " starts at " + where(p) + " without loading the register from the guard";
                 return false;
             }
             todo.insert(todo.end(), pred[p].begin(), pred[p].end());
@@ -616,15 +636,17 @@ bool Reader::section(const GuardCodeSection& cs, GuardCodeReading& out) {
     // the claim (the code that runs only once the bit is set or the header returned), up to the next use of the guard
     // (a bitmask) or the guard's footer (thread-safe). Nothing may enter it from outside. Its static is the one candidate
     // it writes (a store, or its address formed for a constructor); reads do not count.
+    for (std::uint32_t c = 0; c < code.size(); ++c) {
+        std::string why;
+        if ((code[c].use == Use::Claim || code[c].use == Use::Release) && code[c].claim_reg != kNone && !loaded_from_guard(c, why)) {
+            return fail(out, why);
+        }
+    }
     std::set<std::uint32_t> footers;
     for (std::uint32_t c = 0; c < code.size(); ++c) {
         const bool thread_safe = kind_ == GuardCodeKind::ThreadSafe;
         if (thread_safe ? code[c].use != Use::Header : code[c].use != Use::Claim) {
             continue;
-        }
-        std::string why;
-        if (!thread_safe && code[c].claim_reg != kNone && !loaded_from_guard(c, why)) {
-            return fail(out, why);
         }
         const std::uint32_t from = thread_safe ? c + 1 : c;  // the instruction the region follows (the header's call)
         // What the code reaches without the claim.
@@ -659,8 +681,15 @@ bool Reader::section(const GuardCodeSection& cs, GuardCodeReading& out) {
                 if (insn.use != Use::None && insn.use != Use::Read) {
                     return fail(out, "the region of the guard's _Init_thread_header at " + where(c) + " reaches another use of the guard at " + where(x));
                 }
-                if ((insn.flags & (lde::kInsnRet | lde::kInsnTrap)) != 0) {
-                    return fail(out, "the region of the guard's _Init_thread_header at " + where(c) + " ends at " + where(x) + " before its _Init_thread_footer");
+                if (succ[x].empty()) {
+                    // A path that ends here leaves the bracket without its footer (a ret, a tail call, the end of the
+                    // section), unless it is a trap right behind a call that does not return (`call _CxxThrowException;
+                    // int3`: an inlined throw).
+                    const bool noreturn = (insn.flags & lde::kInsnTrap) != 0 && x > 0 && (code[x - 1].flags & lde::kInsnCall) != 0 &&
+                                          pred[x].size() == 1 && pred[x][0] == x - 1;
+                    if (!noreturn) {
+                        return fail(out, "the region of the guard's _Init_thread_header at " + where(c) + " leaves it at " + where(x) + " before its _Init_thread_footer");
+                    }
                 }
             } else if (insn.use != Use::None) {
                 continue;  // the guard again: the region ends
@@ -689,7 +718,7 @@ bool Reader::section(const GuardCodeSection& cs, GuardCodeReading& out) {
                 if (!code[x].ops.ok) {
                     return fail(out, "the region of the claim at " + where(c) + " refers to " + relocs[k].target + " at " + where(x) + " in an instruction that is not read");
                 }
-                if (!memory_operand(code[x], relocs[k]) || writes_operand(code[x].ops)) {
+                if (!memory_operand(code[x], relocs[k]) || !reads_only(code[x].ops)) {
                     written.insert(relocs[k].target);
                 }
             }
@@ -720,7 +749,7 @@ bool Reader::section(const GuardCodeSection& cs, GuardCodeReading& out) {
 
 }  // namespace
 
-GuardCodeReading read_guard_code(std::span<const GuardCodeSection> code, std::string_view guard, std::int32_t guard_section, GuardCodeKind kind,
+GuardCodeReading read_guard_code(std::span<const GuardCodeSection* const> code, std::string_view guard, std::int32_t guard_section, GuardCodeKind kind,
                                  const std::map<std::string, std::int32_t, std::less<>>& candidates, std::string_view data_reference) {
     GuardCodeReading out;
     if (!data_reference.empty()) {
@@ -728,8 +757,8 @@ GuardCodeReading read_guard_code(std::span<const GuardCodeSection> code, std::st
         return out;
     }
     Reader reader(guard, guard_section, kind, candidates);
-    for (const GuardCodeSection& cs : code) {
-        if (!reader.section(cs, out)) {
+    for (const GuardCodeSection* cs : code) {
+        if (!reader.section(*cs, out)) {
             return out;
         }
     }
