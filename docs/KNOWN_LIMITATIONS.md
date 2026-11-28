@@ -137,10 +137,11 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
   deletes the helper and declares a static of that name in the caller pairs the new static with the helper's live object, as R-54
   did for lambdas; the planner refuses that only for a lambda's code (CML3207, WP-51). `WP51-WOULD-REFUSE` lines in the broker log
   count how often a rule for helpers would fire (none on the corpus).
-- **A nested lambda's bound static can be constructed a second time (R-60, pre-existing).** clang-cl spells an inner lambda's `$TSS`
-  guard scope with other back-reference numbers than its static's, so the guard is decided new (CML3211 warning only) while the
-  static is bound to the running process; the patch runs the static's initializer again over the live object. Hot-restart after
-  editing a TU with a function-local static inside a nested lambda under clang-cl.
+- **Nested lambdas' statics (WP-52, R-60, R-66).** A guard is tied to its static with back-references resolved, in the spelling of
+  the compiler that wrote the patch object (clang counts `$TSS<n>` from 19.1.0; an unknown compiler ties only where both readings
+  agree). A bound static that needs a guard and has no bound one is refused (CML3211, an error). A function-local static that would
+  be new while its function has an old record of that name is refused (CML3207): under cl a static in a nested lambda, and under
+  clang a fully inlined nested lambda's static, cannot be hot-reloaded until R-68; hot-restart instead.
 - Hot-restart include-scan cache (WP-50, R-55): a module whose include graph reaches a file over 8 MiB (Godot's generated
   `doc_translations.gen.cpp`) or a file that cannot be read is scanned again on every index (`WP50-SCAN-CACHE store=skipped`;
   R-63). A module whose scanned inputs changed is scanned again whole (R-58).
