@@ -25,11 +25,13 @@ cml_add_unit_test(bind
         test_hashed_code.cpp  # WP-46: lambdas cl names by a hash, proven by the code of their functions (CML3630)
         test_inlined_lambdas.cpp  # WP-51: an own static never takes an inlined lambda's record (R-54, CML3207)
         test_inlined_mirror.cpp  # WP-53: a lambda's static never takes its caller's deleted static (R-61, CML3207; wp53/)
+        test_bitmask_inline.cpp  # WP-59: clang's `??_B` bitmask of an inline function's statics is a guard (R-67; wp59/)
         test_inlined_owners.cpp  # WP-57: an own static next to inlined closure code, proven by its function's code (R-59; wp57/)
     LIBS cml_core)
 target_compile_definitions(cml_test_bind PRIVATE "CML_BIND_GOLDEN_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/golden\""
                                                "CML_BIND_WP53_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/wp53\""
-                                               "CML_BIND_WP57_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/wp57\"")
+                                               "CML_BIND_WP57_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/wp57\""
+                                               "CML_BIND_WP59_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/wp59\"")
 if(NOT MSVC)
     target_link_libraries(cml_test_bind PRIVATE Threads::Threads)
 endif()

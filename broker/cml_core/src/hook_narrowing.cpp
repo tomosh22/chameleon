@@ -1346,10 +1346,22 @@ std::vector<Diag> prove_bitmask_guards(const NarrowInput& input) {
             why = "the code of '" + bind::display_name(bg.function) + "' changed (" + to_string(d.reason) + (d.detail.empty() ? std::string() : ": " + d.detail) + ")";
         }
         CML_LOG(Info, "WP40-BITMASK guard=%s function='%s' proven=refused", bg.guard.c_str(), bg.function.empty() ? "?" : bind::display_name(bg.function).c_str());
-        out.push_back(Diag::make(bind::diag::kGuardMismatch,
-                                 "the bitmask guard '" + bg.guard + "' (no thread-safe statics) cannot be bound to the running program's: its bits go to the function's dynamically initialised statics in the order they are reached, which only an unchanged function proves to be as before, and " +
-                                     why + "; with the old bitmask a static could be constructed again or never",
-                                 "Leave this function unchanged while the program runs (edit other functions of the file), or hot-restart."));
+        // WP-59 (review item 4): what makes the old guard right depends on its kind.
+        std::string message;
+        if (bind::is_inline_bitmask_guard(bg.guard)) {
+            message = "the bitmask guard '" + bg.guard +
+                      "' (an inline function's statics without thread-safe initialisation) cannot be bound to the running program's: its bits go to the function's statics in the order they are declared, constant-initialised ones included, which only an unchanged function proves to be as before, and " +
+                      why + "; with the old bitmask a static could be constructed again or never";
+        } else if (bg.guard.compare(0, 5, "?$TSS") == 0) {
+            message = "the guard '" + bg.guard +
+                      "' of an inline function's static cannot be bound to the running program's guard of that name: the function's guards are numbered by their statics' place in it, in the order they are declared, so only an unchanged function proves the name still belongs to the same static, and " +
+                      why + "; with the old guard a static could be constructed again or never";
+        } else {
+            message = "the bitmask guard '" + bg.guard +
+                      "' (no thread-safe statics) cannot be bound to the running program's: its bits go to the function's dynamically initialised statics in the order they are reached, which only an unchanged function proves to be as before, and " +
+                      why + "; with the old bitmask a static could be constructed again or never";
+        }
+        out.push_back(Diag::make(bind::diag::kGuardMismatch, message, "Leave this function unchanged while the program runs (edit other functions of the file), or hot-restart."));
     }
     return out;
 }
