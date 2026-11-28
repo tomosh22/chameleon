@@ -363,6 +363,7 @@ bool Reader::section(const GuardCodeSection& cs, GuardCodeReading& out) {
     const std::uint64_t size = cs.data.size();
     std::vector<Insn> code;                 // every instruction of the section, in order
     std::vector<std::uint32_t> entries;     // the indices of the function starts
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> internal_refs;  // (target, from) of relocation-free code addresses
     std::vector<bool> consumed(relocs.size(), false);
     // The sweep (as WP-36's SiteProver): linear, from every start to the next; every relocation it passes must be exactly
     // the 32-bit displacement of one decoded instruction or lie wholly inside its immediate. Every function of a section
@@ -412,6 +413,29 @@ bool Reader::section(const GuardCodeSection& cs, GuardCodeReading& out) {
                 }
                 insn.jump_to = static_cast<std::uint32_t>(to);
             }
+            // Review round 4: code addresses the assembler resolved inside the section carry no relocation. A rel32 call
+            // without one, and a RIP-relative operand without one that lands in the section, name a place that is entered
+            // (or whose address escapes): entries from outside.
+            if (insn.relocs.empty() && o.ok && !o.map0f && o.op == 0xE8) {
+                const std::int64_t to = static_cast<std::int64_t>(end) + o.imm;
+                if (to < 0 || static_cast<std::uint64_t>(to) > size) {
+                    return fail(out, "the call at +" + hex(off) + " in " + cs.name + " leaves its section without a relocation");
+                }
+                internal_refs.push_back({static_cast<std::uint32_t>(to), static_cast<std::uint32_t>(off)});
+            } else if (o.ok && o.riprel && r.disp_size == 4) {
+                bool relocated = false;
+                for (const std::uint32_t k : insn.relocs) {
+                    relocated = relocated || relocs[k].offset == off + o.disp_at;
+                }
+                if (!relocated) {
+                    std::int32_t disp = 0;
+                    std::memcpy(&disp, base + off + o.disp_at, 4);
+                    const std::int64_t to = static_cast<std::int64_t>(end) + disp;
+                    if (to >= 0 && static_cast<std::uint64_t>(to) < size) {
+                        internal_refs.push_back({static_cast<std::uint32_t>(to), static_cast<std::uint32_t>(off)});
+                    }
+                }
+            }
             code.push_back(std::move(insn));
             off = end;
         }
@@ -434,7 +458,20 @@ bool Reader::section(const GuardCodeSection& cs, GuardCodeReading& out) {
         is_start[e] = true;
         is_entry[e] = true;
     }
+    for (const auto& [to, from] : internal_refs) {
+        if (to == size) {
+            continue;
+        }
+        const std::uint32_t k = index_of(to);
+        if (k == kNone) {
+            return fail(out, "the code at +" + hex(from) + " in " + cs.name + " names +" + hex(to) + " without a relocation, inside an instruction");
+        }
+        is_entry[k] = true;
+    }
     for (const GuardEntryRef& ref : cs.entry_refs) {
+        if (ref.state_key) {
+            continue;  // an EH state key (ip2state) is a lookup key, never a control target (review round 4)
+        }
         bool hit = false;
         for (const std::uint32_t o : ref.offsets) {
             if (o == size) {
@@ -446,7 +483,7 @@ bool Reader::section(const GuardCodeSection& cs, GuardCodeReading& out) {
                 hit = true;
             }
         }
-        if (!hit && !ref.state_key) {
+        if (!hit) {
             return fail(out, ref.from + " points into the middle of an instruction in " + cs.name + " (+" + hex(ref.offsets.empty() ? 0u : ref.offsets.front()) + ")");
         }
     }
@@ -722,6 +759,9 @@ bool Reader::section(const GuardCodeSection& cs, GuardCodeReading& out) {
                 continue;  // already seen, or a join with the rest of the code
             }
             const Insn& insn = code[x];
+            if (!thread_safe && insn.use != Use::None) {
+                continue;  // the guard again: the bitmask region ends (before anything else is asked of it)
+            }
             if (falls_off[x] || leaves[x]) {
                 return fail(out, "the region of the claim at " + where(c) + " leaves its function at " + where(x) +
                                      (leaves[x] ? " (a branch out of the section)" : " (it runs on into the next function)"));
@@ -751,8 +791,6 @@ bool Reader::section(const GuardCodeSection& cs, GuardCodeReading& out) {
                         return fail(out, "the region of the guard's _Init_thread_header at " + where(c) + " leaves it at " + where(x) + " before its _Init_thread_footer");
                     }
                 }
-            } else if (insn.use != Use::None) {
-                continue;  // the guard again: the region ends
             }
             in_region[x] = true;
             last = std::max(last, x);

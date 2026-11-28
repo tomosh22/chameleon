@@ -75,8 +75,10 @@ struct GuardCodeReloc {
 // there (any type: a label, a static, a section symbol) or the target of a relocation from any linked section of the
 // object. `offsets`: where it may be (one offset, or for a REL32 whose instruction is not known the offsets that its tail
 // allows: relocation_target_offsets). Every one of them that is an instruction start is an entry: entered from outside.
-// None at an instruction start: refused (control lands inside an instruction), unless `state_key` (a relocation from
-// `.xdata`: clang's ip2state keys sit one byte behind a call's return address, they are lookup keys, not entries).
+// None at an instruction start: refused (control lands inside an instruction). A `state_key` (a relocation inside an
+// `$ip2state$` table of `.xdata`: clang's keys sit one byte behind a call's return address) is a lookup key, never a
+// control target: ignored wherever it lands (review round 4). The reader adds, from the section's own code, the target of
+// every relocation-free rel32 call and RIP-relative operand inside the section.
 struct GuardEntryRef {
     std::vector<std::uint32_t> offsets;
     bool state_key = false;

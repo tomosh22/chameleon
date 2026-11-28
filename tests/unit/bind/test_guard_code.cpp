@@ -634,6 +634,81 @@ TEST_CASE("R-69 (review 3, item 6): xchg with a candidate writes it") {
     CHECK(contains(r.why, "writes 2 of them"));
 }
 
+TEST_CASE("R-69 (review 4, item 1): relocation-free code addresses into the section are entries") {
+    // cl_bitmask's `or eax, 1` is at +0x0a. Behind the function: a relocation-free `call rel32` to it, a relocation-free
+    // `lea rax, [rip+disp]` to it, and one into the middle of an instruction (+0x0b).
+    for (const std::uint32_t target : {0x0Au, 0x0Bu}) {
+        for (const bool call : {true, false}) {
+            CAPTURE(target);
+            CAPTURE(call);
+            Asm a = cl_bitmask();
+            const std::uint32_t at = a.here();
+            const std::uint32_t len = call ? 5u : 7u;
+            const std::int32_t disp = static_cast<std::int32_t>(target) - static_cast<std::int32_t>(at + len);
+            if (call) {
+                a.raw({0xE8});                                   // call rel32 (no relocation)
+            } else {
+                a.raw({0x48, 0x8D, 0x05});                       // lea rax, [rip+disp32] (no relocation)
+            }
+            for (int i = 0; i < 4; ++i) {
+                a.bytes.push_back(static_cast<std::uint8_t>((static_cast<std::uint32_t>(disp) >> (8 * i)) & 0xFFu));
+            }
+            a.raw({0xC3});
+            const GuardCodeReading r = read(a, kM, GuardCodeKind::Bitmask);
+            CHECK_FALSE(r.proved);
+            if (target == 0x0Bu) {
+                CHECK(contains(r.why, "without a relocation, inside an instruction"));
+            } else {
+                CHECK(contains(r.why, "from outside"));
+            }
+        }
+    }
+}
+
+TEST_CASE("R-69 (review 4, item 5): entry refs inside an instruction, EH state keys, catch handlers, a REL32 behind a ModRM") {
+    {
+        Asm a = cl_bitmask();  // +0x0b is inside `or eax, 1`
+        GuardEntryRef ref;
+        ref.offsets = {0x0B};
+        ref.from = "a relocation";
+        a.entries.push_back(ref);
+        const GuardCodeReading r = read(a, kM, GuardCodeKind::Bitmask);
+        CHECK_FALSE(r.proved);
+        CHECK(contains(r.why, "points into the middle of an instruction"));
+    }
+    {
+        // The same offsets as an EH state key (clang's ip2state: one byte behind a call), and one exactly at the `or`:
+        // lookup keys, never control targets.
+        Asm a = cl_bitmask();
+        GuardEntryRef ref;
+        ref.offsets = {0x0B};
+        ref.state_key = true;
+        a.entries.push_back(ref);
+        ref.offsets = {0x0A};
+        a.entries.push_back(ref);
+        const GuardCodeReading r = read(a, kM, GuardCodeKind::Bitmask);
+        CHECK(r.proved);
+    }
+    {
+        Asm a = cl_bitmask();
+        GuardCodeSection section = a.section(".text$mn");
+        section.outside_model = "its function '?counter@@YAHXZ' has catch handlers ('$tryMap$?counter@@YAHXZ'), whose continuations re-enter it: not read";
+        const std::vector<const GuardCodeSection*> code = {&section};
+        const GuardCodeReading r = read_guard_code(code, kM, 9, GuardCodeKind::Bitmask, candidates());
+        CHECK_FALSE(r.proved);
+        CHECK(contains(r.why, "has catch handlers"));
+    }
+    {
+        // `mov eax, [rip+sym+0x10]` (8B 05 field): the tail is not known, so every offset from a to a+4.
+        const std::uint8_t field[4] = {0x10, 0, 0, 0};
+        CHECK(relocation_target_offsets(0x0004, std::span<const std::byte>(reinterpret_cast<const std::byte*>(field), 4), 0x8B, 0x05, 0x20) ==
+              std::vector<std::uint32_t>{0x30, 0x31, 0x32, 0x33, 0x34});
+        // REL32_1 (cl, an imm8 behind): the tail is at least 1.
+        CHECK(relocation_target_offsets(0x0005, std::span<const std::byte>(reinterpret_cast<const std::byte*>(field), 4), 0x83, 0x3D, 0x20) ==
+              std::vector<std::uint32_t>{0x30, 0x31, 0x32, 0x33});
+    }
+}
+
 TEST_CASE("R-69 (reader): shapes that are not read refuse") {
     struct Bad {
         const char* what;

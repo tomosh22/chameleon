@@ -4891,6 +4891,26 @@ std::optional<std::set<std::uint32_t>> Planner::guard_code_statics(const Sym& gu
                     }
                 }
             }
+            // Review round 4: a relocation is an EH state key only inside the extent of an `$ip2state$...` table symbol (up
+            // to the next symbol of its section, or the section's end); any other one that lands inside an instruction refuses.
+            const auto in_ip2state = [&](std::uint32_t sec, std::uint32_t at) {
+                const std::vector<const coff::Symbol*>& syms = guard_code_symbols_[sec];
+                for (const coff::Symbol* t : syms) {
+                    if (t->name.rfind("$ip2state$", 0) != 0 || at < t->value) {
+                        continue;
+                    }
+                    std::uint64_t end = secs_[sec].sec->data.size();
+                    for (const coff::Symbol* o : syms) {
+                        if (o->value > t->value && o->value < end) {
+                            end = o->value;
+                        }
+                    }
+                    if (at < end) {
+                        return true;
+                    }
+                }
+                return false;
+            };
             if (const auto by = sections_by_target_section_.find(static_cast<std::int32_t>(i + 1)); by != sections_by_target_section_.end()) {
                 for (const std::uint32_t j : by->second) {
                     const coff::ByteSpan from_data = secs_[j].sec->data;
@@ -4910,7 +4930,7 @@ std::optional<std::set<std::uint32_t>> Planner::guard_code_statics(const Sym& gu
                         if (ref.offsets.empty()) {
                             continue;  // SECTION, SECREL, ...: no offset in the code
                         }
-                        ref.state_key = starts_with(secs_[j].name, ".xdata");
+                        ref.state_key = in_ip2state(j, at);
                         ref.from = "the relocation at +" + hex(at) + " of " + secs_[j].name + " (section " + std::to_string(j + 1) + ") to '" + std::string(rr.target->name) + "'";
                         cs.entry_refs.push_back(std::move(ref));
                     }
