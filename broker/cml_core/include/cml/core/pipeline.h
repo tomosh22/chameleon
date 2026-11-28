@@ -223,6 +223,10 @@ public:
     Diag abandon(Diag why);
     // After a failed apply(): the compiland that failed may still become live (CML5309 / CML4656: WP-47's CML3653 case).
     bool may_be_live() const;
+    // The stage of the last failure ("sweep", "compile", "plan", "link", "reserve", ...), empty when nothing failed.
+    const std::string& failed_stage() const;
+    // The files the module's reload re-baselined (after apply(); WP-54: a roll-back forgets those its baseline did not track before).
+    const std::vector<std::string>& accepted_files() const;
     // The `patch_applied` events of an applied module (events_held).
     std::vector<Event> take_applied_events();
     ModuleState& module() const;

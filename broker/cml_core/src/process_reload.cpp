@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -93,6 +94,50 @@ private:
             }
         }
     }
+    // The `patch_applied` events module `i` holds: its compilands that are live although its reload failed (WP-47's CML3653: hooks
+    // that may still become live after earlier compilands were applied; those are recorded and were announced before WP-54).
+    void publish_events_of(std::size_t i) {
+        for (Event& e : runs_[i]->take_applied_events()) {
+            if (ctx_.events != nullptr) {
+                ctx_.events->publish(std::move(e));
+            }
+        }
+    }
+    // WP-54 review: module `i`'s source baseline back to what it was before this reload. The WP-22 revert (and restore_baseline)
+    // puts back the stamps the baseline had; a file the reload re-baselined that the baseline did not track before is forgotten
+    // again, so that the next sweep cannot take it for applied.
+    void forget_new_baseline(std::size_t i, const std::map<std::string, FileStamp>& before) {
+        ModuleState& m = *modules_[i];
+        if (!m.index) {
+            return;
+        }
+        std::vector<std::string> unknown;
+        for (const std::string& f : runs_[i]->accepted_files()) {
+            if (before.count(f) == 0) {
+                unknown.push_back(f);
+            }
+        }
+        if (!unknown.empty()) {
+            CML_LOG(Trace, "reload: %s%s: %zu re-baselined file(s) its baseline did not track before are forgotten again", m.name.c_str(), where(i).c_str(),
+                    unknown.size());
+            m.index->forget_baseline(unknown);
+        }
+    }
+    // The baseline this reload's batch of module `i` replaced (empty when the module holds no batch of this reload).
+    std::map<std::string, FileStamp> baseline_before(std::size_t i) {
+        ModuleState& m = *modules_[i];
+        std::lock_guard<std::mutex> lock(m.mutex);
+        if (!m.batches.empty() && m.batches.back().reload_id == ctx_.reload_id) {
+            return m.batches.back().baseline_before;
+        }
+        return {};
+    }
+    // A failure of a module's prepare phase is a refusal when the planner, a code proof or the link refused (stages plan and link),
+    // not a compile error, a sweep, the agent's reservation, the deadline or a cancellation.
+    static bool is_refusal(const std::string& stage, const Diag& d) {
+        return (stage == "plan" || stage == "link") && d.code != pipeline::diag::kReloadTimeout;
+    }
+
     // The modules after `k`: a prepared one is abandoned (`why`), one with nothing to compile keeps its report, one that was never
     // prepared gets `why` as well.
     void not_applied_after(std::size_t k, const Diag& why) {
@@ -120,9 +165,12 @@ private:
     ProcessReload refused(std::size_t k, Diag d) {
         const std::size_t n = modules_.size();
         std::vector<std::size_t> waiting;  // prepared before it, never applied
-        const Diag why = Diag::make(ar::kModuleRefusedNothingApplied,
-                                    "not applied: module " + modules_[k]->name + where(k) + " was refused (" + d.id() + ")",
-                                    "Fix what the refusal names, then reload.");
+        const std::string stage = runs_[k]->failed_stage().empty() ? std::string("sweep") : runs_[k]->failed_stage();
+        const bool refusal = is_refusal(stage, d);
+        // " was refused (CML3400)" / " failed while it was prepared (stage compile, CML2200)"
+        const std::string what = refusal ? " was refused (" + d.id() + ")" : " failed while it was prepared (stage " + stage + ", " + d.id() + ")";
+        const Diag why = Diag::make(ar::kModuleRefusedNothingApplied, "not applied: module " + modules_[k]->name + where(k) + what,
+                                    refusal ? "Fix what the refusal names, then reload." : "Fix what the failure names, then reload.");
         for (std::size_t j = 0; j < k; ++j) {
             if (runs_[j]->prepared()) {
                 waiting.push_back(j);
@@ -132,18 +180,21 @@ private:
             }
         }
         not_applied_after(k, why);
-        CML_LOG(Trace, "reload: module %s%s refused (%s): no module of the process is applied (%zu prepared before it, %zu not prepared after it)",
-                modules_[k]->name.c_str(), where(k).c_str(), d.id().c_str(), waiting.size(), n - k - 1);
+        CML_LOG(Trace, "reload: module %s%s%s: no module of the process is applied (%zu prepared before it, %zu not prepared after it)",
+                modules_[k]->name.c_str(), where(k).c_str(), what.c_str(), waiting.size(), n - k - 1);
         if (waiting.empty() && k + 1 == n) {
             return finish(std::move(d));  // no other module of the process had anything to apply: as for a reload of one module
         }
+        const std::string at = refusal ? "was refused at module " + std::to_string(k + 1) + " of " + std::to_string(n) + " (" + modules_[k]->name + ", " + d.id() + ")"
+                                       : "stopped at module " + std::to_string(k + 1) + " of " + std::to_string(n) + " (" + modules_[k]->name +
+                                             "), which failed while it was prepared (stage " + stage + ", " + d.id() + ")";
         emit(Diag::make(ar::kModuleRefusedNothingApplied,
-                        "the reload of process " + std::to_string(pid_) + " was refused at module " + std::to_string(k + 1) + " of " + std::to_string(n) + " (" +
-                            modules_[k]->name + ", " + d.id() + "): none of its modules was applied (" + std::to_string(waiting.size()) + " module(s) before it" +
-                            (waiting.empty() ? std::string() : " (" + names_of(modules_, waiting) + ")") + " were planned and linked, none was loaded; " +
-                            std::to_string(n - k - 1) + " after it were not prepared); the process runs what it ran before",
-                        "Fix what the refusal names, then reload: the edit is applied to every module then. Files the reload did not apply are compiled again."),
-             "warning", "plan");
+                        "the reload of process " + std::to_string(pid_) + " " + at + ": none of its modules was applied (" + std::to_string(waiting.size()) +
+                            " module(s) before it" + (waiting.empty() ? std::string() : " (" + names_of(modules_, waiting) + ")") +
+                            " were planned and linked, none was loaded; " + std::to_string(n - k - 1) + " after it were not prepared); the process runs what it ran before",
+                        std::string(refusal ? "Fix what the refusal names" : "Fix what the failure names") +
+                            ", then reload: the edit is applied to every module then. Files the reload did not apply are compiled again."),
+             "warning", refusal ? "plan" : stage.c_str());
         d.message += " (module " + std::to_string(k + 1) + " of " + std::to_string(n) + ", " + modules_[k]->name + "); no module of process " + std::to_string(pid_) +
                      " was applied";
         return finish(std::move(d));
@@ -159,8 +210,10 @@ private:
             after += runs_[j]->prepared() ? 1 : 0;
         }
         if (applied.empty() && after == 0) {
-            // No other module of the process had anything to apply: as for a reload of one module.
+            // No other module of the process had anything to apply: as for a reload of one module, including the `patch_applied` of
+            // its compilands that stay live (WP-47's CML3653).
             not_applied_after(k, d);
+            publish_events_of(k);
             return finish(std::move(d));
         }
 
@@ -168,11 +221,11 @@ private:
             // Nothing can be rolled back. The modules applied before stay recorded (their batches), but none of their files is
             // re-baselined (the baseline they replaced comes back) and nothing of them is announced (WP-47's CML3655, per process).
             for (const std::size_t i : applied) {
-                ModuleState& m = *modules_[i];
-                std::lock_guard<std::mutex> lock(m.mutex);
-                if (!m.batches.empty() && m.batches.back().reload_id == ctx_.reload_id && m.index) {
-                    m.index->restore_baseline(m.batches.back().baseline_before);
+                const std::map<std::string, FileStamp> before = baseline_before(i);
+                if (modules_[i]->index) {
+                    modules_[i]->index->restore_baseline(before);
                 }
+                forget_new_baseline(i, before);
                 (void)runs_[i]->take_applied_events();
             }
             const Diag why = Diag::make(ar::kModulesAgentLost, "not applied: the agent of process " + std::to_string(pid_) + " disconnected", "Restart the application.");
@@ -200,7 +253,7 @@ private:
             const Diag why = Diag::make(ar::kModulesStoppedPartly, "not applied: module " + modules_[k]->name + where(k) + " may still become live (" + d.id() + ")",
                                         "Let the application reach SyncPoint(), then reload.");
             not_applied_after(k, why);
-            publish_events(k);
+            publish_events(k + 1);  // the modules before it, and module k's compilands that stay live (WP-47's CML3653)
             CML_LOG(Trace, "reload: module %s%s may still become live (%s): no roll-back; %zu module(s) applied before it, %zu not applied after it",
                     modules_[k]->name.c_str(), where(k).c_str(), d.id().c_str(), applied.size(), after);
             emit(Diag::make(ar::kModulesStoppedPartly,
@@ -235,6 +288,7 @@ private:
             const std::size_t i = *it;
             ModuleState& m = *modules_[i];
             (void)runs_[i]->take_applied_events();  // never announced
+            const std::map<std::string, FileStamp> before = baseline_before(i);
             RevertOptions ro;
             ro.timeout_ms = ctx_.options != nullptr ? ctx_.options->hooks_timeout_ms : 30000;
             const std::int64_t left = std::chrono::duration_cast<std::chrono::milliseconds>(ctx_.deadline - Clock::now()).count();
@@ -256,6 +310,7 @@ private:
                 CML_LOG(Trace, "reload: the roll-back of %s%s failed: %s", m.name.c_str(), where(i).c_str(), back.error().format().c_str());
                 continue;
             }
+            forget_new_baseline(i, before);  // the revert put the stamps the baseline had back
             for (const Diag& w : back->warnings) {
                 emit(w, "warning", "rollback");
             }

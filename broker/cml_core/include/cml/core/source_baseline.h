@@ -84,6 +84,9 @@ public:
     void accept(const std::map<std::string, FileStamp>& stamps);
     // The recorded stamps of the given files (those that are tracked). WP-22: a revert puts them back.
     std::map<std::string, FileStamp> stamps_of(const std::vector<std::string>& files) const;
+    // WP-54: no longer tracks `files` (their stamps and originals go). A roll-back of a reload uses it for the files the reload
+    // re-baselined that the baseline did not track before, so that the baseline is what it was before the reload.
+    void forget(const std::vector<std::string>& files);
 
     // WP-21. The state to carry into the baseline of a restarted process.
     BaselineSnapshot session_snapshot() const;

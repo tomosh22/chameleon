@@ -3707,6 +3707,196 @@ TEST_CASE("cross-module reload (WP-54): processes stay independent; a refusal in
     CHECK(rig.events->count("patch_applied") == 2);
 }
 
+namespace {
+
+// plugin.dll's next sweep reports logic.cpp (compiland 0) and main.cpp (compiland 1): two compilands of the plugin.
+void plugin_both_units(Rig& rig) {
+    rig.plugin_module->index->set_sweep_override_for_testing([]() -> Result<ModuleIndex::Sweep> {
+        ModuleIndex::Sweep s;
+        s.changed = {kLogic, kMain};
+        s.compilands = {0, 1};
+        s.file_compilands[kLogic] = {0};
+        s.file_compilands[kMain] = {1};
+        s.stamps[kLogic] = FileStamp{1, 2, 3};
+        s.stamps[kMain] = FileStamp{4, 5, 6};
+        return s;
+    });
+}
+
+// The diag events of `id`: their stage and message.
+std::vector<std::pair<std::string, std::string>> diag_events(Rig& rig, const std::string& id) {
+    std::lock_guard<std::mutex> lock(rig.events->mutex);
+    std::vector<std::pair<std::string, std::string>> out;
+    for (const Event& e : rig.events->events) {
+        if (e.name == "diag" && e.body.get_string("id") == id) {
+            out.emplace_back(e.body.get_string("stage"), e.body.get_string("message"));
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("cross-module reload (WP-54 review): the plugin's first compiland stays live when its second one's hooks are unconfirmed: it is announced") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable_with_plugin();
+    rig.option("hooks_timeout_ms", Value::integer(300));
+    rig.object = make_object({}, true);
+    rig.second_object = make_object("?new_helper@@YAHXZ");
+    rig.unchanged();  // app.exe has nothing to compile: the reload reads as one of plugin.dll alone
+    plugin_both_units(rig);
+    rig.silent_hooks_at = 2;  // plugin.dll's second compiland: no HooksInstalled
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML5309");
+    CHECK(diag_count(rig, "CML3653", "warning") == 1);
+    CHECK(diag_count(rig, "CML3660", "warning") == 0);
+    CHECK(generation_of_module(*rig.plugin_module) == 1);  // the first compiland is live and recorded ...
+    CHECK(rig.events->count("patch_applied") == 1);        // ... and announced, as before WP-54 (0 in 8f1316a)
+}
+
+TEST_CASE("cross-module reload (WP-54 review): unconfirmed hooks in the plugin's second compiland announce the exe and the plugin's first (CML3660)") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable_with_plugin();
+    rig.option("hooks_timeout_ms", Value::integer(300));
+    rig.object = make_object({}, true);
+    rig.second_object = make_object("?new_helper@@YAHXZ");
+    Rig::changed_unit(*rig.module, 0, kLogic);
+    plugin_both_units(rig);
+    rig.silent_hooks_at = 3;  // app.exe's hooks (1), plugin.dll's first (2), plugin.dll's second: no answer
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML5309");
+    CHECK(diag_count(rig, "CML3653", "warning") == 1);
+    CHECK(diag_count(rig, "CML3660", "warning") == 1);
+    CHECK(rig.seen<ipc::InstallHooks>().size() == 3);  // nothing was rolled back
+    CHECK(generation_of_module(*rig.module) == 1);
+    CHECK(generation_of_module(*rig.plugin_module) == 1);
+    CHECK(rig.events->count("patch_applied") == 2);  // app.exe's and plugin.dll's first compiland (1 in 8f1316a)
+}
+
+TEST_CASE("cross-module reload (WP-54 review): a rolled-back exe forgets a header its baseline did not track before, and the next reload patches both") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable_with_plugin();
+    const std::string header = "C:\\proj\\scale.h";  // found by the include scan only: not in app.exe's baseline before
+    REQUIRE(rig.module->index->baseline_stamps({header}).empty());
+    rig.object = make_object({}, true);
+    rig.second_object = make_object();
+    rig.module->index->set_sweep_override_for_testing([header]() -> Result<ModuleIndex::Sweep> {
+        ModuleIndex::Sweep s;
+        s.changed = {header};
+        s.compilands = {0};
+        s.file_compilands[header] = {0};
+        s.stamps[header] = FileStamp{7, 8, 9};
+        return s;
+    });
+    Rig::changed_unit(*rig.plugin_module, 1, kMain);
+    rig.hooks_status_at[2] = ipc::fault::ids::kAgentHookInstall;  // plugin.dll's InstallHooks fails: app.exe is rolled back
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().id() == "CML4652");
+    CHECK(diag_count(rig, "CML3657", "warning") == 1);
+    check_neither_live(rig);
+    // app.exe's finish() had re-baselined the header; the roll-back forgets it again (8f1316a kept {7, 8, 9}).
+    CHECK(rig.module->index->baseline_stamps({header}).empty());
+    check_both_reload(rig);
+}
+
+TEST_CASE("cross-module reload (WP-54 review): the agent lost after the exe was applied forgets the exe's newly tracked files too") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable_with_plugin();
+    const std::string header = "C:\\proj\\scale.h";
+    rig.object = make_object({}, true);
+    rig.second_object = make_object();
+    rig.module->index->set_sweep_override_for_testing([header]() -> Result<ModuleIndex::Sweep> {
+        ModuleIndex::Sweep s;
+        s.changed = {header};
+        s.compilands = {0};
+        s.file_compilands[header] = {0};
+        s.stamps[header] = FileStamp{7, 8, 9};
+        return s;
+    });
+    Rig::changed_unit(*rig.plugin_module, 1, kMain);
+    rig.close_on_load_at = 2;
+    Result<Value> r = rig.reload();
+    REQUIRE_FALSE(r.has_value());
+    CHECK(diag_count(rig, "CML3661", "warning") == 1);
+    CHECK(rig.module->index->baseline_stamps({header}).empty());
+}
+
+TEST_CASE("cross-module reload (WP-54 review): CML3656 names a compile error a failure, at stage compile, and a planner refusal a refusal, at stage plan") {
+    QuietLogs quiet;
+    {
+        Rig rig;
+        rig.enable_with_plugin();
+        cross_module(rig, make_object());
+        rig.compile_hook = [&rig] { rig.fail_compile = rig.compile_calls == 2; };  // plugin.dll's compile (app.exe's is the first)
+        rig.compile_errors = {};
+        Result<Value> r = rig.reload();
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().id() == "CML2200");
+        CHECK(rig.seen<ipc::LoadPatch>().empty());
+        const auto notes = diag_events(rig, "CML3656");
+        REQUIRE(notes.size() == 1);
+        CHECK(notes[0].first == "compile");
+        CHECK(notes[0].second.find("stopped at module 2 of 2 (plugin.dll), which failed while it was prepared (stage compile, CML2200)") != std::string::npos);
+        CHECK(notes[0].second.find("refused") == std::string::npos);
+    }
+    {
+        Rig rig;
+        rig.enable_with_plugin();
+        cross_module(rig, make_object({}, false, "no_such_function_anywhere"));
+        Result<Value> r = rig.reload();
+        REQUIRE_FALSE(r.has_value());
+        const auto notes = diag_events(rig, "CML3656");
+        REQUIRE(notes.size() == 1);
+        CHECK(notes[0].first == "plan");
+        CHECK(notes[0].second.find("was refused at module 2 of 2 (plugin.dll, CML3200)") != std::string::npos);
+    }
+}
+
+TEST_CASE("cross-module reload (WP-54 review): with release_pdb_after_reload a module's PDB is released when its own run ends, not with the process's") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable_with_plugin();
+    rig.option("release_pdb_after_reload", Value::boolean(true));
+    // app.exe has nothing to compile: its run ends with its prepare, before plugin.dll is compiled.
+    rig.unchanged();
+    Rig::changed_unit(*rig.plugin_module, 1, kMain);
+    rig.second_object = make_object();
+    int exe_mapped_during_plugin = -1;
+    rig.compile_hook = [&rig, &exe_mapped_during_plugin] { exe_mapped_during_plugin = rig.module->index->pdb() != nullptr ? 1 : 0; };
+    Result<Value> r = rig.reload();
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    CHECK(exe_mapped_during_plugin == 0);  // 1 in 8f1316a: released only when the whole process's reload ended
+    CHECK(rig.plugin_module->index->pdb() == nullptr);
+
+}
+
+TEST_CASE("cross-module reload (WP-54 review): with release_pdb_after_reload the exe's PDB is released once the exe is applied, before the plugin") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable_with_plugin();
+    rig.option("release_pdb_after_reload", Value::boolean(true));
+    cross_module(rig, make_object());
+    int exe_mapped_at_plugin_hooks = -1;
+    rig.on_hooks = [&rig, &exe_mapped_at_plugin_hooks](int n) {
+        if (n == 2) {  // plugin.dll's InstallHooks
+            exe_mapped_at_plugin_hooks = rig.module->index->pdb() != nullptr ? 1 : 0;
+        }
+    };
+    Result<Value> r = rig.reload();
+    REQUIRE_MESSAGE(r.has_value(), r.error().format());
+    CHECK(r->get_integer("modules_patched") == 2);
+    CHECK(exe_mapped_at_plugin_hooks == 0);  // 1 in 8f1316a
+    CHECK(rig.module->index->pdb() == nullptr);
+    CHECK(rig.plugin_module->index->pdb() == nullptr);
+}
+
 TEST_CASE("set-option compile_on_save validates, reports the previous value and starts and stops the watcher (WP-14)") {
     QuietLogs quiet;
     Rig rig;

@@ -223,12 +223,7 @@ public:
     Run(const PipelineEnv& env, AgentLink& link, ModuleState& module, const PipelineContext& ctx)
         : env_(env), link_(link), module_(module), ctx_(ctx), options_(*ctx.options) {}
 
-    ~Run() {
-        // ADR-0017: with the option set the broker's mapping of the PDB ends with the reload, whatever its outcome.
-        if (release_pdb_ && module_.index) {
-            module_.index->release_pdb();
-        }
-    }
+    ~Run() { release_pdb_now(); }
     Run(const Run&) = delete;
     Run& operator=(const Run&) = delete;
 
@@ -248,12 +243,16 @@ public:
         const Clock::time_point t0 = Clock::now();
         Result<void> r = prepare_steps();
         phase_ms_ += ms_between(t0, Clock::now());
+        if (!r || state_ == State::Done) {
+            release_pdb_now();  // the run of this module is over (WP-54 review: not at the end of the whole process)
+        }
         return r;
     }
     Result<PatchReport> apply_phase() {
         const Clock::time_point t0 = Clock::now();
         Result<PatchReport> r = state_ == State::Done ? Result<PatchReport>(report_) : state_ == State::Prepared ? apply_steps() : Result<PatchReport>(not_prepared());
         state_ = State::Finished;
+        release_pdb_now();
         phase_ms_ += ms_between(t0, Clock::now());
         if (r) {
             r->times.total = phase_ms_;
@@ -268,6 +267,7 @@ public:
             state_ = State::Finished;
             release_ranges(0);
             (void)finish(why);
+            release_pdb_now();
         }
         return why;
     }
@@ -276,8 +276,19 @@ public:
     void hold_events() noexcept { hold_events_ = true; }
     std::vector<Event> take_applied_events() { return std::move(held_events_); }
     ModuleState& module() const noexcept { return module_; }
+    const std::string& failed_stage() const noexcept { return failed_stage_; }
+    const std::vector<std::string>& accepted_files() const noexcept { return accepted_files_; }
 
 private:
+    // ADR-0017: with the option set the broker's mapping of the PDB ends when the run of this module does, whatever its outcome.
+    void release_pdb_now() {
+        pdb_ = nullptr;
+        pdb_hold_.reset();  // the run's own reference keeps nothing mapped either
+        if (release_pdb_ && module_.index) {
+            module_.index->release_pdb();
+        }
+        release_pdb_ = false;
+    }
     Diag not_prepared() const {
         return Diag::make(pd::kStageFailed, "the reload of " + module_.name + " was not prepared, or applied already", "This is a bug in the broker; see the broker log.");
     }
@@ -311,6 +322,7 @@ private:
     }
     Diag fail(const char* stage, Diag d) {
         emit(d, "error", stage);
+        failed_stage_ = stage;  // WP-54: the stage of the run's last failure
         return d;
     }
     // WP-28: an armed failure-injection stage of the broker (cml/ipc/fault_stages.h) turns into its diagnostic here.
@@ -383,6 +395,8 @@ private:
     bool maybe_live_ = false;         // a failed apply: the failed compiland may still become live (CML5309 / CML4656)
     bool hold_events_ = false;        // `patch_applied` goes to held_events_, not to the bus
     std::vector<Event> held_events_;
+    std::string failed_stage_;        // the stage of the last failure ("sweep", "compile", "plan", "link", ...)
+    std::vector<std::string> accepted_files_;  // the files finish() re-baselined
 
     Result<void> prepare_steps() {
         PatchReport& report = report_;
@@ -746,6 +760,10 @@ private:
             batch.reload_id = ctx_.reload_id;
         }
         module_.index->accept(accepted);
+        accepted_files_.clear();
+        for (const auto& entry : accepted) {
+            accepted_files_.push_back(entry.first);
+        }
         if (!batch.patches.empty()) {
             std::lock_guard<std::mutex> lock(module_.mutex);
             module_.batches.push_back(std::move(batch));
@@ -2053,6 +2071,8 @@ bool ModuleReload::prepared() const { return impl_->run.prepared(); }
 Result<PatchReport> ModuleReload::apply() { return impl_->run.apply_phase(); }
 Diag ModuleReload::abandon(Diag why) { return impl_->run.abandon(std::move(why)); }
 bool ModuleReload::may_be_live() const { return impl_->run.may_be_live(); }
+const std::string& ModuleReload::failed_stage() const { return impl_->run.failed_stage(); }
+const std::vector<std::string>& ModuleReload::accepted_files() const { return impl_->run.accepted_files(); }
 std::vector<Event> ModuleReload::take_applied_events() { return impl_->run.take_applied_events(); }
 ModuleState& ModuleReload::module() const { return impl_->run.module(); }
 
