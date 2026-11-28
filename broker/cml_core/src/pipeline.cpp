@@ -964,6 +964,14 @@ private:
                 return first_failure("plan", unproven, unproven.front());
             }
         }
+        // WP-53 (R-61, ADR-0045): a lambda's static bound to a record directly in the procedure that inlined it stands only
+        // while that procedure's code is the old code (the record may be the procedure's own static); otherwise CML3207.
+        if (!plan.inlined_lambda_statics.empty()) {
+            const std::vector<Diag> unproven = prove_inlined_lambda_statics(narrow_input(s, image.get()));
+            if (!unproven.empty()) {
+                return first_failure("plan", unproven, unproven.front());
+            }
+        }
         for (const Diag& w : plan.warnings) {
             warn(report, "plan", w);
         }

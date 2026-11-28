@@ -1,6 +1,7 @@
 // WP-40 (ADR-0043, R-48): bind-planner pairing defects that ended in a wrong pairing or a silent re-initialisation.
 // Each case below failed on main (2456392) and states what main did. Synthetic objects (WP-06 writer) against
 // synthetic PDBs (WP-04 builder); the shapes are the ones clang 18 + lld and the CI logs of WP-37 showed.
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -78,6 +79,19 @@ TEST_CASE("inlined lambdas: their statics are found in the calling procedure and
     }
     CHECK(r->new_globals.empty());
     CHECK(r->warnings.empty());
+    // WP-53 (R-61): both pairings are with records directly in ls_step, which ls_step's own statics would have too; the
+    // pipeline proves them by ls_step's code (test_inlined_mirror.cpp) or refuses them.
+    REQUIRE(r->inlined_lambda_statics.size() == 2);
+    for (int n = 0; n < 2; ++n) {
+        CAPTURE(n);
+        const auto it = std::find_if(r->inlined_lambda_statics.begin(), r->inlined_lambda_statics.end(),
+                                     [&](const InlinedLambdaStatic& e) { return e.symbol == lambda_static("sname", n); });
+        REQUIRE(it != r->inlined_lambda_statics.end());
+        const InlinedLambdaStatic& s = *it;
+        CHECK(s.record_rva == 0x3020 + 0x10 * static_cast<std::uint32_t>(n));
+        CHECK(s.proc == "ls_step");
+        CHECK(s.how == BindSource::CompilandRva);
+    }
 }
 
 TEST_CASE("inlined lambdas: without a known layout the statics are refused, and their guards are never bound") {
