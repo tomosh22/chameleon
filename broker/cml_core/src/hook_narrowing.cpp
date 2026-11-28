@@ -109,6 +109,25 @@ public:
 
     std::optional<Keep> capture_code(const std::string& symbol, CodeImage* out) const { return capture(symbol, out); }
 
+    // WP-56: does the patch's function of `h` refer to `symbol` (a relocation inside the function that names it)?
+    bool refers_to(const bind::HookEntry& h, const std::string& symbol) const {
+        Loc loc;
+        if (locate(h.new_symbol, &loc)) {
+            return false;
+        }
+        std::string relocs_error;
+        const std::vector<coff::ResolvedRelocation>* relocs = relocs_of(*loc.sec, &relocs_error);
+        if (relocs == nullptr) {
+            return false;
+        }
+        for (const coff::ResolvedRelocation& r : *relocs) {
+            if (r.reloc.virtual_address >= loc.start && r.reloc.virtual_address < loc.start + loc.len && r.target != nullptr && r.target->name == symbol) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     NarrowDecision judge(const bind::HookEntry& h) const {
         NarrowDecision out;
         out.symbol = h.new_symbol;
@@ -1432,6 +1451,10 @@ std::vector<Diag> prove_inlined_lambda_statics(const NarrowInput& input, Inlined
     std::size_t proven = 0;
     std::size_t refused = 0;
     std::size_t skipped = 0;  // re-decided after the listing (refused or unbound by a later step): nothing to prove
+    // WP-56: one comparator for the refers-to checks of every listed static.
+    NarrowInput refs_input = input;
+    refs_input.enabled = true;
+    const Narrower refs(refs_input);
     for (const bind::InlinedLambdaStatic& s : plan.inlined_lambda_statics) {
         const bind::SymbolDecision* d = plan.find_decision(s.symbol);
         if (d == nullptr || d->decision != bind::DecisionKind::BindOldData || d->old_address.rva != s.record_rva) {
@@ -1439,7 +1462,26 @@ std::vector<Diag> prove_inlined_lambda_statics(const NarrowInput& input, Inlined
             ++skipped;
             continue;
         }
-        const std::string why = verdict_of(s);
+        std::string why = verdict_of(s);
+        // WP-56 (ADR-0046): an unchanged procedure proves the record only where the patch's version of it uses the static: the old
+        // code then used the record at the same places (the static is bound to its address). A procedure that does not refer
+        // to the static (another lambda's call operator, whose canonical name is the same; a caller that no longer inlines the
+        // lambda) says nothing about whose the record is.
+        // (Review: a procedure without a hook is not proven either; verdict_of refuses it first, and this does not rely on that.)
+        if (why.empty()) {
+            const bind::HookEntry* hook = nullptr;
+            for (const bind::HookEntry& h : plan.hooks) {
+                if (s.proc_rva != bind::kNoRva && h.old_rva == s.proc_rva) {
+                    hook = &h;
+                    break;
+                }
+            }
+            if (hook == nullptr) {
+                why = "'" + s.proc + "' has no hook to show it refers to the static";
+            } else if (!refs.refers_to(*hook, s.symbol)) {
+                why = "the patch's '" + s.proc + "' does not refer to the static, so its unchanged code does not show whose the record is";
+            }
+        }
         CML_LOG(Trace, "WP53-INLINED-PROOF static='%s' record rva=%s proc='%s' by=%s proven=%s%s%s", s.display.c_str(), hex(s.record_rva).c_str(), s.proc.c_str(), bind::to_string(s.how),
                 why.empty() ? "unchanged" : "refused", why.empty() ? "" : " ", why.c_str());
         if (why.empty()) {

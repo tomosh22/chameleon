@@ -15,6 +15,7 @@
 
 #include "cml/core/bind_diag_ids.h"
 #include "cml/core/bind_plan.h"
+#include "cml/core/hook_narrowing.h"
 #include "doctest.h"
 #include "synth.h"
 #include "worlds.h"
@@ -457,6 +458,7 @@ struct GuardCase {
     std::vector<cml::Diag> errors;
     BindPlan partial;
     cml::Result<BindPlan> r = cml::Result<BindPlan>(BindPlan{});
+    Built object;  // WP-56: the patch, for the pipeline's proof (prove_inlined_lambda_statics)
 };
 
 // A world (module compiled by `module_compiler`) whose TU has the file-scope `s_a` (0x10, teaches the layout) and the
@@ -480,6 +482,7 @@ GuardCase plan_guards(const char* module_compiler, const char* patch_compiler, c
     Built b = o.build();
     GuardCase c;
     c.r = plan_bind(w.input(b), &c.errors, &c.partial);
+    c.object = std::move(b);
     return c;
 }
 
@@ -952,6 +955,37 @@ const char* const kClNestedGuard = "?$TSS0@?1???R<lambda_1>@?1???R1?1??o2_nest_s
 const char* const kClangNested = "?nested@?1???R<lambda_1>@?0???R<lambda_0>@?0??o2_nest_step@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?4@XZ@4UO2Name@@A";
 const char* const kClangNestedGuard = "?$TSS0@?1???R<lambda_1>@?0???R<lambda_0>@?0??o2_nest_step@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?3@XZ@4HA";
 
+// WP-56: paired with the record of o2_nest_step at 0x3020 (by the layout), its guard placed with it, and listed for the
+// pipeline's proof by the code of o2_nest_step; without that code (the synthetic world has none: o2_nest_step is not a
+// function of the patch) the proof refuses it, CML3207.
+void check_bound_pending_proof(const GuardCase& c, const std::string& name, const std::string& display) {
+    REQUIRE_MESSAGE(c.r.has_value(), err(c.r));
+    CHECK(c.errors.empty());
+    const SymbolDecision d = decision(*c.r, name);
+    CAPTURE(d.reason);
+    CHECK(d.decision == DecisionKind::BindOldData);
+    CHECK(d.old_address.rva == 0x3020);
+    CHECK(d.source == BindSource::CompilandRva);
+    const SymbolDecision g = decision(*c.r, name == kClNested ? kClNestedGuard : kClangNestedGuard);
+    CHECK(g.decision == DecisionKind::BindOldData);
+    CHECK(g.old_address.rva == 0x3028);
+    REQUIRE(c.r->inlined_lambda_statics.size() == 1);
+    CHECK(c.r->inlined_lambda_statics[0].symbol == name);
+    CHECK(c.r->inlined_lambda_statics[0].display == display);
+    CHECK(c.r->inlined_lambda_statics[0].proc == "o2_nest_step");
+    CHECK(c.r->inlined_lambda_statics[0].record_rva == 0x3020);
+    NarrowInput ni;
+    ni.object = &c.object.obj();
+    ni.plan = &*c.r;
+    ni.old_image = nullptr;
+    ni.is_hooked = [](std::uint64_t) { return false; };
+    const std::vector<cml::Diag> proof = prove_inlined_lambda_statics(ni);
+    REQUIRE(proof.size() == 1);
+    CAPTURE(proof[0].message);
+    CHECK(proof[0].id() == "CML3207");
+    CHECK(contains(proof[0].message, "only an unchanged 'o2_nest_step' proves the record is this lambda's"));
+}
+
 void check_reset_refused(const GuardCase& c, const std::string& name) {
     REQUIRE_FALSE(c.r.has_value());
     REQUIRE(count_code(c.errors, diag::kAmbiguousStatic) == 1);
@@ -973,9 +1007,12 @@ void check_reset_refused(const GuardCase& c, const std::string& name) {
 
 TEST_CASE("WP-52 ruling: cl's nested lambda static, decided new, is refused while its function records a static of its name") {
     // CI (857fa31, cl /O2): the static and its guard were decided new (new_globals=2) and the reload reset `nest` to 700001.
-    SUBCASE("the record in the function's own procedure (both lambdas inlined)") {
+    SUBCASE("the record in the function's own procedure (both lambdas inlined): WP-56, paired and proven by code, or refused") {
+        // WP-52: refused (the planner looked one level up only). WP-56 (R-66): the chain of enclosing procedures is searched,
+        // the record of o2_nest_step pairs by the layout, and the pairing waits for the code of o2_nest_step (WP-53).
         GuardCase c = plan_guards(kCl, kCl, "o2_nest_step", {{"nested", 0x20}}, {{kClNested, 0x20}, {kClNestedGuard, 0x28}});
-        check_reset_refused(c, kClNested);
+        // (The plan shows display_name's reading of cl's name; the planner compares the resolved one.)
+        check_bound_pending_proof(c, kClNested, "1?1??o2_nest_step::operator()::<lambda_1>::operator()::nested");
     }
     SUBCASE("the record in the outer lambda's call operator, the only one of its name and no types to check: paired, not new") {
         // (The rule applies only to a static decided new; this one is found, as before. In CI the closure types of the old
@@ -987,12 +1024,15 @@ TEST_CASE("WP-52 ruling: cl's nested lambda static, decided new, is refused whil
     }
 }
 
-TEST_CASE("WP-52 ruling (R-66): clang 18's fully inlined nested lambda, its static recorded two levels up, is refused") {
-    // clang-cl 18 /O2 without the fixture's noinline: `nested` is a record of o2_nest_step itself; the planner looks one level
-    // up (the outer call operator, which has no procedure) and decided the static new: a silent reset.
+TEST_CASE("WP-56 (R-66): clang 18's fully inlined nested lambda, its static recorded two levels up, pairs and waits for the proof") {
+    // clang-cl 18 /O2 without the fixture's noinline: `nested` is a record of o2_nest_step itself. WP-52: the planner looked
+    // one level up (the outer call operator, which has no procedure), decided the static new, and its ruling refused that
+    // (CML3207). WP-56: every procedure of the chain is searched; the record pairs by the layout and is listed for the code
+    // proof of o2_nest_step, which refuses it where the code cannot be judged (real images: test_nested_inlined.cpp).
     GuardCase c = plan_guards(kClang18, kClang18, "o2_nest_step", {{"nested", 0x20}}, {{kClangNested, 0x20}, {kClangNestedGuard, 0x28}});
-    check_reset_refused(c, kClangNested);
+    check_bound_pending_proof(c, kClangNested, "o2_nest_step::<lambda_0>::operator()::<lambda_1>::operator()::nested");
 }
+
 
 TEST_CASE("WP-52 ruling: a static whose name no procedure of its function records is new, as before") {
     const std::string fresh = "?fresh_one@?1???R<lambda_1>@?0???R<lambda_0>@?0??o2_nest_step@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?4@XZ@4UO2Name@@A";
@@ -1003,4 +1043,208 @@ TEST_CASE("WP-52 ruling: a static whose name no procedure of its function record
     GuardCase d = plan_guards(kClang18, kClang18, "other_function", {{"nested", 0x20}}, {{kClangNested, 0x30}});
     REQUIRE_MESSAGE(d.r.has_value(), err(d.r));
     CHECK(decision(*d.r, kClangNested).decision == DecisionKind::PatchNewData);
+}
+
+// ---- WP-56 (R-68, ADR-0046): cl's nested lambda, its closure compared with the back-references resolved ------------------
+//
+// cl /O2 for planner_pairing_o2/nested.cpp (link without /OPT:REF, as the fixtures; the module PDB of CI run 46115540265,
+// windows-2025 msvc RelWithDebInfo, llvm-pdbutil): both call operators keep their procedures, and the inner lambda's
+// `nested` and its `$TSS0` are records of the inner call operator, and again (inside the inline sites, at the same addresses)
+// of the outer one and of o2_nest_step. The names, the procedures' display names and the unique names below are that PDB's. The static's decorated name spells the outer closure as a
+// back-reference to its table, whose slot 0 is the static's own name (`??R1?1??`: `<lambda_1>`), the inner closure's unique
+// name to its own table (`??R0?1??`). WP-37/40 compared the two as written: no closure matched, `nested` and its guard were
+// new (CI 857fa31: the reload reset `nest`), then WP-52 refused that (CML3207).
+
+namespace {
+
+const char* const kClOuterUnique = ".?AV<lambda_1>@?1??o2_nest_step@@YAXXZ@";
+const char* const kClInnerUnique = ".?AV<lambda_1>@?1???R0?1??o2_nest_step@@YAXXZ@QEBA@XZ@";
+const char* const kClOuterProc = "`o2_nest_step'::`2'::<lambda_1>::operator()";
+const char* const kClInnerProc = "``o2_nest_step'::`2'::<lambda_1>::operator()'::`2'::<lambda_1>::operator()";
+
+// A call operator procedure `name` at `text_offset` of the closure (`cls`, `unique`) with the static records `statics`.
+void typed_operator(SynthWorld& w, OldTypes& t, const std::string& name, std::uint32_t text_offset, const std::string& cls, const std::string& unique,
+                    const std::vector<std::pair<std::string, std::uint32_t>>& statics) {
+    const std::uint32_t c = t.tpi.add(tp::kLfClass, tp::lf_udt(cls, unique, true));
+    const std::uint32_t this_ptr = t.tpi.add(tp::kLfPointer, tp::lf_pointer(c, tp::kPtr64 | 0x400));
+    const std::uint32_t fn = t.tpi.add(tp::kLfMFunction, tp::lf_mfunction(tp::kTInt, c, this_ptr, t.args, 0));
+    proc_inlining(w, name, text_offset, fn, statics, {});
+}
+
+struct ClNested {
+    std::string inner_unique = kClInnerUnique;
+    bool outer_copy = true;   // the outer call operator records the inlined static too
+    bool caller_copy = true;  // and o2_nest_step
+};
+
+// The old image of the cl build, and the patch (nest_4: another function of nested.cpp edited) with `symbols`.
+GuardCase plan_cl_nested(const ClNested& shape, const std::vector<std::pair<std::string, std::uint32_t>>& symbols) {
+    SynthWorld w = basic_world(false, kCl);
+    w.data(w.tu(), "`anonymous namespace'::s_a", 0x10);
+    OldTypes t;
+    const std::vector<std::pair<std::string, std::uint32_t>> records = {{"nested", 0x20}, {"$TSS0", 0x28}};
+    typed_operator(w, t, kClInnerProc, 0x60, "``o2_nest_step'::`2'::<lambda_1>::operator()'::`2'::<lambda_1>", shape.inner_unique, records);
+    typed_operator(w, t, kClOuterProc, 0x90, "`o2_nest_step'::`2'::<lambda_1>", kClOuterUnique, shape.outer_copy ? records : std::vector<std::pair<std::string, std::uint32_t>>{});
+    if (shape.caller_copy) {
+        proc_inlining(w, "o2_nest_step", 0xC0, t.fn_void, records, {});
+    }
+    open_with(w, t);
+    SynthObj o;
+    const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+    o.symbol("?s_a@?A0x1@@3HA", 0x10, bss, false, false);
+    for (const auto& [name, offset] : symbols) {
+        o.symbol(name, offset, bss, false, false);
+    }
+    o.compile3(kCl);
+    Built b = o.build();
+    GuardCase c;
+    c.r = plan_bind(w.input(b), &c.errors, &c.partial);
+    c.object = std::move(b);
+    return c;
+}
+
+}  // namespace
+
+TEST_CASE("WP-56 (R-68): cl's nested lambda static pairs with its own call operator's record, its guard with it") {
+    // main (910f203): no closure matched the back-referenced scope, so `nested` was new and the WP-52 rule refused it (CML3207,
+    // "would be new in the patch"); before WP-52 the reload reset it.
+    SUBCASE("records in both call operators and in o2_nest_step (cl without /OPT:REF)") {
+        GuardCase c = plan_cl_nested({}, {{kClNested, 0x20}, {kClNestedGuard, 0x28}});
+        REQUIRE_MESSAGE(c.r.has_value(), err(c.r));
+        const SymbolDecision d = decision(*c.r, kClNested);
+        CAPTURE(d.reason);
+        CHECK(d.decision == DecisionKind::BindOldData);
+        CHECK(d.source == BindSource::CompilandClosure);
+        CHECK(d.old_address.rva == 0x3020);
+        const SymbolDecision g = decision(*c.r, kClNestedGuard);
+        CAPTURE(g.reason);
+        CHECK(g.decision == DecisionKind::BindOldData);
+        CHECK(g.source == BindSource::CompilandClosure);
+        CHECK(g.old_address.rva == 0x3028);
+        // The record of its own closure's call operator identifies it: nothing waits for a proof.
+        CHECK(c.r->inlined_lambda_statics.empty());
+        CHECK(c.errors.empty());
+        CHECK(count_code(c.r->warnings, diag::kGuardUnmatched) == 0);
+    }
+    SUBCASE("only the inner call operator records it") {
+        ClNested shape;
+        shape.outer_copy = false;
+        shape.caller_copy = false;
+        GuardCase c = plan_cl_nested(shape, {{kClNested, 0x20}, {kClNestedGuard, 0x28}});
+        REQUIRE_MESSAGE(c.r.has_value(), err(c.r));
+        CHECK(decision(*c.r, kClNested).decision == DecisionKind::BindOldData);
+        CHECK(decision(*c.r, kClNested).old_address.rva == 0x3020);
+        CHECK(decision(*c.r, kClNestedGuard).old_address.rva == 0x3028);
+    }
+}
+
+TEST_CASE("WP-56 (R-68): a closure whose resolved name is another lambda's does not take the static") {
+    // The inner call operator's closure resolves to `<lambda_2>` of a `<lambda_2>` (its `0` is its own first name), the static's
+    // to `<lambda_1>` of `<lambda_1>`: the record is not its closure's, and the static is refused (CML3207), never paired.
+    ClNested shape;
+    shape.inner_unique = ".?AV<lambda_2>@?1???R0?1??o2_nest_step@@YAXXZ@QEBA@XZ@";
+    // (`0` there is `<lambda_2>`, so the outer closure reads `<lambda_2>` too: another function altogether.)
+    GuardCase c = plan_cl_nested(shape, {{kClNested, 0x20}, {kClNestedGuard, 0x28}});
+    REQUIRE_FALSE(c.r.has_value());
+    CHECK(decision(c.partial, kClNested).decision != DecisionKind::BindOldData);
+    CHECK(decision(c.partial, kClNestedGuard).decision != DecisionKind::BindOldData);
+    REQUIRE(count_code(c.errors, diag::kAmbiguousStatic) == 2);
+    CHECK(contains(c.errors[0].message + c.errors[1].message, kClNested));
+}
+
+TEST_CASE("WP-56 (R-68): two lambdas of one function tied only by the resolved names are not paired by number") {
+    // A second inner lambda `<lambda_2>` with a static `nested` of its own: their numbers would be confirmed by the code of their
+    // call operators (rule (d)), which finds closures as written; the resolved pairing is not made (refused).
+    SynthWorld w = basic_world(false, kCl);
+    w.data(w.tu(), "`anonymous namespace'::s_a", 0x10);
+    OldTypes t;
+    typed_operator(w, t, kClInnerProc, 0x60, "``o2_nest_step'::`2'::<lambda_1>::operator()'::`2'::<lambda_1>", kClInnerUnique, {{"nested", 0x20}});
+    typed_operator(w, t, "``o2_nest_step'::`2'::<lambda_1>::operator()'::`2'::<lambda_2>::operator()", 0x90,
+                   "``o2_nest_step'::`2'::<lambda_1>::operator()'::`2'::<lambda_2>", ".?AV<lambda_2>@?1???R<lambda_1>@?1??o2_nest_step@@YAXXZ@QEBA@XZ@", {{"nested", 0x30}});
+    open_with(w, t);
+    SynthObj o;
+    const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+    o.symbol("?s_a@?A0x1@@3HA", 0x10, bss, false, false);
+    // (The outer closure `<lambda_1>` is not in this name's table, slot 1 is `<lambda_2>`: cl writes it out.)
+    const std::string second = "?nested@?1???R<lambda_2>@?1???R<lambda_1>@?1??o2_nest_step@@YAXXZ@QEBA@XZ@QEBA@XZ@4UO2Name@@A";
+    o.symbol(kClNested, 0x20, bss, false, false);
+    o.symbol(second, 0x30, bss, false, false);
+    o.compile3(kCl);
+    Built b = o.build();
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    auto r = plan_bind(w.input(b), &errors, &partial);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(decision(partial, kClNested).source != BindSource::CompilandClosure);
+    CHECK(decision(partial, second).source != BindSource::CompilandClosure);
+    bool named = false;
+    for (const cml::Diag& d : errors) {
+        named = named || contains(d.message, "cannot be confirmed by the code of their call operators");
+    }
+    CHECK(named);
+}
+
+TEST_CASE("WP-56 (review of 6dc968a, finding 2): a lambda added next to one tied by the resolved names refuses both") {
+    // Old: the inner `<lambda_1>` with `nested`. The patch adds `<lambda_2>` with a `nested` of its own next to it: the set of
+    // the lambdas that hold the name changed, so the numbers may have shifted, and `<lambda_1>`'s static, tied to the old record
+    // by the resolved names only, is not paired either (no single-lambda exemption without the same set).
+    SynthWorld w = basic_world(false, kCl);
+    w.data(w.tu(), "`anonymous namespace'::s_a", 0x10);
+    OldTypes t;
+    typed_operator(w, t, kClInnerProc, 0x60, "``o2_nest_step'::`2'::<lambda_1>::operator()'::`2'::<lambda_1>", kClInnerUnique, {{"nested", 0x20}});
+    open_with(w, t);
+    SynthObj o;
+    const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+    o.symbol("?s_a@?A0x1@@3HA", 0x10, bss, false, false);
+    const std::string added = "?nested@?1???R<lambda_2>@?1???R<lambda_1>@?1??o2_nest_step@@YAXXZ@QEBA@XZ@QEBA@XZ@4UO2Name@@A";
+    o.symbol(kClNested, 0x20, bss, false, false);
+    o.symbol(added, 0x30, bss, false, false);
+    o.compile3(kCl);
+    Built b = o.build();
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    auto r = plan_bind(w.input(b), &errors, &partial);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(decision(partial, kClNested).decision != DecisionKind::BindOldData);
+    CHECK(decision(partial, added).decision != DecisionKind::BindOldData);
+    bool named = false;
+    for (const cml::Diag& d : errors) {
+        named = named || (d.id() == "CML3207" && contains(d.message, kClNested) && contains(d.message, "are not the same as in the old image"));
+    }
+    CHECK(named);
+}
+
+TEST_CASE("WP-52 ruling, kept by WP-56: cl's nested static recorded only in o2_nest_step, without a layout, is still refused") {
+    // cl puts every function-local static in a COMDAT section of its own, so no section layout places it, and a record in the
+    // procedure that inlined the lambdas does not say whose it is (WP-40, WP-53 (1b) deferred). The chain search finds the
+    // record; nothing pairs it, and the static is refused.
+    SynthWorld w = basic_world(false, kCl);
+    w.data(w.tu(), "`anonymous namespace'::s_a", 0x10);
+    OldTypes t;
+    proc_inlining(w, "o2_nest_step", 0x60, t.fn_void, {{"nested", 0x20}}, {});
+    open_with(w, t);
+    SynthObj o;
+    const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+    o.symbol("?s_a@?A0x1@@3HA", 0x10, bss, false, false);
+    const std::int32_t own = static_cast<std::int32_t>(o.section(".bss", kData | coff::scn::LnkComdat, 0x10, coff::ComdatSelection::Any));
+    o.symbol(kClNested, 0, own, false, false);
+    o.compile3(kCl);
+    Built b = o.build();
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    auto r = plan_bind(w.input(b), &errors, &partial);
+    REQUIRE_FALSE(r.has_value());
+    REQUIRE(count_code(errors, diag::kAmbiguousStatic) == 1);
+    CAPTURE(errors[0].message);
+    CHECK(contains(errors[0].message, kClNested));
+    CHECK(contains(errors[0].message, "does not say which lambda each belongs to"));
+    CHECK(decision(partial, kClNested).decision != DecisionKind::BindOldData);
+}
+
+TEST_CASE("WP-52 ruling, kept by WP-56: a record of the static's name in its function outside the chain still refuses the reset") {
+    // A member of a class local to the outer lambda records `nested`: not a procedure the chain search takes (not a call
+    // operator, not an enclosing function), so the static is new, and the WP-52 rule refuses it.
+    GuardCase c = plan_guards(kClang18, kClang18, "o2_nest_step::<lambda_0>::operator()::Local::run", {{"nested", 0x20}},
+                              {{kClangNested, 0x20}, {kClangNestedGuard, 0x28}});
+    check_reset_refused(c, kClangNested);
 }

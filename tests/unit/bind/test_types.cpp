@@ -3430,3 +3430,88 @@ TEST_CASE("hash-named lambdas (WP-46 final review): a template over the edited l
         CHECK(decision(*r, hashed_static(kEdited3)).old_address.rva == 0x3030);
     }
 }
+
+// ---- WP-56 (R-68, review of 6dc968a, finding 3): rule (d) step 1 finds a call operator whose names repeat in its types ----
+//
+// Two lambdas in `JPH::Foo::bar()` (which returns `JPH::Baz *`), each with a static `x`, whose call operators return
+// `JPH::Baz *` too. The names of the function's scope come back in the return types, each spelled by a back-reference to the
+// table of its own decorated name: the static's (which starts with `x`) writes JPH as `4` and the call operator's return type
+// as `54`, the closure's unique name and the call operator's own name write `3` and `43`. Read resolved, the static's scope
+// begins with its closure and with its call operator, so rule (d) step 1 compares the signatures of the old and the new call
+// operator of each number. (Where the signatures agree, the numbers still need the code comparison of step 2, which finds
+// closures as written: the pairing is refused, WP-56's rule for resolved-only pairings.)
+
+namespace {
+
+std::string jph_static(int n) {
+    return "?x@?1???R<lambda_" + std::to_string(n) + ">@?1??bar@Foo@JPH@@QEAAPEAVBaz@4@XZ@QEBAPEAV54@XZ@4HA";
+}
+std::string jph_operator(int n) { return "??R<lambda_" + std::to_string(n) + ">@?1??bar@Foo@JPH@@QEAAPEAVBaz@3@XZ@QEBAPEAV43@XZ"; }
+std::string jph_display(int n) { return "`JPH::Foo::bar'::`2'::<lambda_" + std::to_string(n) + ">::operator()"; }
+
+std::uint32_t jph_call_operator(Types& t, int n, const std::vector<std::uint32_t>& args) {
+    const std::string unique = ".?AV<lambda_" + std::to_string(n) + ">@?1??bar@Foo@JPH@@QEAAPEAVBaz@3@XZ@";
+    const std::uint32_t cls = t.set.add(tp::kLfClass, tp::lf_udt("JPH::Foo::bar::<lambda_" + std::to_string(n) + ">", unique, true));
+    const std::uint32_t const_cls = t.set.add(tp::kLfModifier, tp::lf_modifier(cls, 1));
+    const std::uint32_t this_ptr = t.set.add(tp::kLfPointer, tp::lf_pointer(const_cls, tp::kPtr64 | 0x400));
+    const std::uint32_t list = t.args(args);
+    return t.set.add(tp::kLfMFunction, tp::lf_mfunction(tp::kTInt, cls, this_ptr, list, static_cast<std::uint16_t>(args.size())));
+}
+
+// Old: <lambda_1>() and <lambda_2>(int). The patch: the same, or (swapped) the two expressions exchanged.
+bool plan_jph(bool swapped, std::vector<cml::Diag>& errors, BindPlan& partial) {
+    SynthWorld w;
+    Types old_types;
+    const std::uint32_t op1 = jph_call_operator(old_types, 1, {});
+    const std::uint32_t op2 = jph_call_operator(old_types, 2, {tp::kTInt});
+    old_proc(w, jph_display(1), 0x60, op1, {{"x", 0x20}});
+    old_proc(w, jph_display(2), 0x70, op2, {{"x", 0x30}});
+    old_types.set.add_to(w.spec.tpi);
+    w.open();
+    Types t;
+    const std::uint32_t new_op1 = jph_call_operator(t, 1, swapped ? std::vector<std::uint32_t>{tp::kTInt} : std::vector<std::uint32_t>{});
+    const std::uint32_t new_op2 = jph_call_operator(t, 2, swapped ? std::vector<std::uint32_t>{} : std::vector<std::uint32_t>{tp::kTInt});
+    StaticsObj o;
+    o.proc(jph_operator(1), jph_display(1), false, new_op1);
+    o.end();
+    o.proc(jph_operator(2), jph_display(2), false, new_op2);
+    o.end();
+    o.symbol(jph_static(1));
+    o.symbol(jph_static(2));
+    Built b = o.build(t.set.debug_t());
+    auto r = plan_bind(w.input(b), &errors, &partial);
+    if (r) {
+        partial = *r;
+    }
+    return r.has_value();
+}
+
+bool any_error(const std::vector<cml::Diag>& errors, const std::string& text) {
+    bool found = false;
+    for (const cml::Diag& e : errors) {
+        found = found || (e.id() == "CML3207" && contains(e.message, text));
+    }
+    return found;
+}
+
+}  // namespace
+
+TEST_CASE("WP-56 (R-68): the call operators of lambdas whose names repeat in their return types are found, their signatures compared") {
+    SUBCASE("swapped: step 1 sees the other signature (CML3207)") {
+        // Before the review fix the call operator was looked for as written, not found, and step 1 skipped.
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        REQUIRE_FALSE(plan_jph(true, errors, partial));
+        CHECK(any_error(errors, "has another signature than the old one of that number"));
+        for (int n = 1; n <= 2; ++n) {
+            CHECK(decision(partial, jph_static(n)).decision != DecisionKind::BindOldData);
+        }
+    }
+    SUBCASE("in place: the signatures agree, and the numbers are not confirmed by code: refused") {
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        REQUIRE_FALSE(plan_jph(false, errors, partial));
+        CHECK_FALSE(any_error(errors, "has another signature"));
+        CHECK(any_error(errors, "cannot be confirmed by the code of their call operators"));
+    }
+}
