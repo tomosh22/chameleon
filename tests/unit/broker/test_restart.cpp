@@ -247,7 +247,8 @@ struct Rig {
     // WP-44 (R-51)
     std::map<std::uint32_t, int> exited_after_checks;     // pid -> has_exited answers false this many times, then true (a late handle)
     std::atomic<int> exit_checks{0};                      // has_exited calls
-    std::function<void(const ipc::ArmFault&)> on_arm;     // runs when the old agent receives ArmFault, before it answers
+    std::function<void(const ipc::ArmFault&)> on_arm;     // runs when the old agent receives ArmFault, before it answers (WP-62: on its own thread)
+    std::vector<std::thread> agent_threads;               // WP-62: the threads that run on_arm and answer (added under `mutex`, joined by ~Rig)
     std::vector<ipc::ArmFault> arms;                      // ArmFault messages the old agent received
     // WP-45
     std::string new_process_lacks;          // a module the relaunched process has not loaded (it loads it lazily, later)
@@ -280,6 +281,19 @@ struct Rig {
         old_agent->register_process(100, "", {kExe, kDll, kOther}, {kExe, kDll});
     }
     ~Rig() {
+        for (;;) {  // WP-62: on_arm's threads first (a hook may start more of them)
+            std::vector<std::thread> hooks;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                hooks.swap(agent_threads);
+            }
+            if (hooks.empty()) {
+                break;
+            }
+            for (std::thread& t : hooks) {
+                t.join();
+            }
+        }
         for (std::thread& t : threads) {
             t.join();
         }
@@ -300,12 +314,20 @@ struct Rig {
                 std::lock_guard<std::mutex> lock(mutex);
                 arms.push_back(*arm);
             }
-            if (on_arm) {
-                on_arm(*arm);
-            }
             ipc::Reply reply;
             reply.request_id = arm->request_id;
             reply.message = arm->count == 0 ? "disarmed" : "armed";
+            if (on_arm) {
+                // WP-62 (R-70): the hook and the answer run on a thread of their own once the send has returned, as a real agent
+                // answers from its own process: a hook may call inject_failure, which takes the failure-injection gate, and that must
+                // never be taken under the link's send lock.
+                std::lock_guard<std::mutex> lock(mutex);
+                agent_threads.emplace_back([hook = on_arm, request = *arm, reply, agent = old_agent] {
+                    hook(request);
+                    agent->to_broker(reply);
+                });
+                return;
+            }
             old_agent->to_broker(reply);
             return;
         }

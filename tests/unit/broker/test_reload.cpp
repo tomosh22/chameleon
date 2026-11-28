@@ -8,8 +8,11 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -137,7 +140,8 @@ struct Rig {
     bool close_on_load = false;
     std::uint32_t arm_status = 0;               // WP-28: status of the Reply to ArmFault (failure injection)
     std::uint32_t arm_status2 = 0;              // WP-28: the same for the second process
-    std::function<void(const ipc::ArmFault&)> on_arm;  // WP-44: runs when an agent receives ArmFault, before it answers
+    std::function<void(const ipc::ArmFault&)> on_arm;  // WP-44: runs when an agent receives ArmFault, before it answers (WP-62: on its own thread)
+    std::vector<std::thread> agent_threads;            // WP-62: the threads that run on_arm and answer (joined by ~Rig, under `mutex` while added)
     // WP-47: failures of one compiland of several. The n-th InstallHooks of the first process (from 1, revert requests included)
     // answers with that status, or not at all; `on_hooks(n)` runs before it answers; a link of an object whose path holds
     // `fail_link_of` fails (CML3350).
@@ -314,6 +318,26 @@ struct Rig {
         session.set_answer_sink([this](const ipc::Message& m) { return link->deliver(m); });
         service->attach(link);
     }
+    ~Rig() { join_agent_threads(); }
+    Rig(const Rig&) = delete;
+    Rig& operator=(const Rig&) = delete;
+
+    // WP-62: waits for the scripted agent's hook threads (on_arm).
+    void join_agent_threads() {
+        for (;;) {  // a hook may make the broker send another ArmFault, which adds a thread
+            std::vector<std::thread> threads;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                threads.swap(agent_threads);
+            }
+            if (threads.empty()) {
+                return;
+            }
+            for (std::thread& t : threads) {
+                t.join();
+            }
+        }
+    }
 
     // The scripted agent of the first process; agent_on() serves any link (WP-22: a second process).
     Result<void> agent(const ipc::Message& m) { return agent_on(*link, m); }
@@ -405,10 +429,22 @@ struct Rig {
                 l.deliver(r);
             }
         } else if (const auto* arm = std::get_if<ipc::ArmFault>(&m)) {
-            if (on_arm) {
-                on_arm(*arm);
-            }
             const std::uint32_t arm_result = (link2 && &l == link2.get()) ? arm_status2 : arm_status;
+            if (on_arm) {
+                // WP-62 (R-70): the hook and the answer run on a thread of their own once the send has returned, as a real agent answers
+                // from its own process. Nothing a hook does runs under the link's send lock: a hook may call inject_failure (or start an
+                // operation), which takes the failure-injection gate, and that must never be taken under a send lock.
+                ipc::Reply answer;
+                answer.request_id = id;
+                answer.status = arm_result;
+                answer.message = arm_result != 0 ? "not an injection stage of the agent" : "armed";
+                std::lock_guard<std::mutex> lock(mutex);
+                agent_threads.emplace_back([hook = on_arm, request = *arm, answer = std::move(answer), target = &l] {
+                    hook(request);
+                    target->deliver(answer);
+                });
+                return Result<void>();
+            }
             reply(arm_result, arm_result != 0 ? "not an injection stage of the agent" : "armed");
         } else if (const auto* release = std::get_if<ipc::ReleaseRange>(&m)) {
             if (release->mode == ipc::ReleaseMode::Uncommit && uncommit_status != 0) {
@@ -2037,6 +2073,52 @@ TEST_CASE("the PDB index can be released and mapped again (ADR-0017)") {
     CHECK(rig.module->index->pdb() == nullptr);
 }
 
+namespace {
+
+// WP-62: joins a thread a test started, also when a REQUIRE leaves the test early (a joinable std::thread terminates the binary).
+struct JoinOnExit {
+    std::thread& thread;
+    ~JoinOnExit() {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+};
+
+// WP-62: a test that would hang ends the binary with a message after `limit` instead (the threads that hang cannot be joined).
+class HangWatchdog {
+public:
+    HangWatchdog(std::chrono::seconds limit, const char* what) : what_(what) {
+        thread_ = std::thread([this, limit] {
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (!cv_.wait_for(lock, limit, [this] { return done_; })) {
+                std::fprintf(stderr, "FAILED (hang): %s did not finish within %lld s\n", what_, static_cast<long long>(limit.count()));
+                std::fflush(stderr);
+                std::_Exit(3);
+            }
+        });
+    }
+    ~HangWatchdog() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            done_ = true;
+        }
+        cv_.notify_all();
+        thread_.join();
+    }
+    HangWatchdog(const HangWatchdog&) = delete;
+    HangWatchdog& operator=(const HangWatchdog&) = delete;
+
+private:
+    const char* what_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool done_ = false;
+    std::thread thread_;
+};
+
+}  // namespace
+
 // ---- failure injection (WP-28, ADR-0035) -----------------------------------------------------------------------
 
 #if defined(CML_FAULT_INJECTION)
@@ -2489,6 +2571,182 @@ TEST_CASE("revert injection (R-51 1): while a revert disarms what is left for it
     CHECK_FALSE(rig.service->faults().take_agent_armed(ipc::fault::Stage::RevertRestore, kPid));
 }
 
+// ---- WP-62 (R-70): inject-failure sends ArmFault without holding the gate ------------------------------------------------------
+
+TEST_CASE("revert injection (WP-62): inject-failure lets go of the gate before it sends ArmFault; it is marked as arming until it is done") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    apply_two_patches(rig);
+    int asked = 0;
+    bool gate_free = false;
+    bool arming = false;
+    rig.on_arm = [&](const ipc::ArmFault& arm) {
+        if (arm.count != 0) {
+            // Before WP-62 the gate was held while ArmFault was sent: the order gate -> send lock that TSan reported against
+            // send lock -> gate (the old scripted agent ran this hook inside the send, and the R-51 1 hooks call inject_failure).
+            ++asked;
+            gate_free = rig.service->faults().gate_free_for_testing();
+            arming = rig.service->faults().arming_for_testing();
+        }
+    };
+    REQUIRE(inject_failure(*rig.service, inject_args("revert-restore")).has_value());
+    CHECK(asked == 1);
+    CHECK(gate_free);
+    CHECK(arming);
+    CHECK_FALSE(rig.service->faults().arming_for_testing());
+    CHECK(rig.service->faults().gate_free_for_testing());
+    SUBCASE("an arming the agent refuses ends the arming too, and leaves no record") {
+        gate_free = false;
+        arming = false;
+        rig.arm_status = ipc::fault::ids::kBadRequest;
+        Result<Value> refused = inject_failure(*rig.service, inject_args("revert-uncommit"));
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(asked == 2);
+        CHECK(gate_free);
+        CHECK(arming);
+        CHECK_FALSE(rig.service->faults().arming_for_testing());
+        CHECK_FALSE(rig.service->faults().take_agent_armed(ipc::fault::Stage::RevertUncommit, kPid));
+        rig.arm_status = 0;
+    }
+    // A revert still starts (lock_gate does not wait for an arming that ended) and disarms what was armed for it.
+    rig.on_arm = nullptr;
+    Result<Value> last = revert_with(rig, "last");
+    REQUIRE_MESSAGE(last.has_value(), last.error().format());
+    CHECK_FALSE(rig.service->faults().take_agent_armed(ipc::fault::Stage::RevertRestore, kPid));
+}
+
+TEST_CASE("revert injection (WP-62): a revert that starts while inject-failure sends ArmFault without the gate waits for it and finds the record") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    apply_two_patches(rig);
+    std::optional<Result<Value>> reverted;
+    std::thread reverter;
+    const JoinOnExit join_reverter{reverter};
+    std::atomic<bool> revert_done{false};
+    std::atomic<bool> revert_started_early{false};
+    rig.on_arm = [&](const ipc::ArmFault& arm) {
+        if (arm.count != 1 || reverter.joinable()) {
+            return;
+        }
+        // The record is made and the gate is free (WP-62); a revert asked for now must still wait for the arming to end.
+        reverter = std::thread([&] {
+            reverted.emplace(revert_with(rig, "last"));
+            revert_done = true;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        revert_started_early = rig.service->reload_running() || revert_done.load();
+    };
+    Result<Value> armed = inject_failure(*rig.service, inject_args("revert-restore"));
+    REQUIRE_MESSAGE(armed.has_value(), armed.error().format());
+    REQUIRE(reverter.joinable());
+    reverter.join();
+    CHECK_FALSE(revert_started_early.load());
+    REQUIRE(reverted.has_value());
+    REQUIRE_MESSAGE(reverted->has_value(), reverted->error().format());
+    // The revert's end found the record: the stage was disarmed in the agent, and it is listed as unused.
+    const Value* disarmed = (*reverted)->find("injection_disarmed");
+    REQUIRE(disarmed != nullptr);
+    REQUIRE(disarmed->items().size() == 1);
+    CHECK(disarmed->items()[0].as_string() == "revert-restore");
+    CHECK_FALSE(rig.service->faults().take_agent_armed(ipc::fault::Stage::RevertRestore, kPid));
+    const auto arms = rig.seen<ipc::ArmFault>();
+    REQUIRE(arms.size() == 2);
+    CHECK(arms[0].count == 1);
+    CHECK(arms[1].count == 0);
+}
+
+TEST_CASE("revert injection (WP-62): a hook that calls inject-failure while another inject-failure arms the same agent finishes") {
+    // Under the scripted agent before WP-62 the hook ran inside the link's send, under its send lock: the other inject-failure, once
+    // it is arming, waited for that lock to send its ArmFault, and the hook's inject-failure waited in lock_gate() for that arming to
+    // end. Nothing reported it (the wait is on a condition variable); the test hung. The watchdog makes a hang a failure.
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    apply_two_patches(rig);
+    REQUIRE(inject_failure(*rig.service, inject_args("revert-restore")).has_value());  // `last` only re-points: not reached
+    std::optional<Result<Value>> other_result;
+    std::optional<Result<Value>> during_cleanup;
+    std::thread other;  // a second client's inject-failure
+    const JoinOnExit join_other{other};
+    std::atomic<bool> other_done{false};
+    std::atomic<bool> other_reached{false};
+    rig.on_arm = [&](const ipc::ArmFault& arm) {
+        if (arm.count != 0 || during_cleanup) {
+            return;  // only the revert's end-of-operation ArmFault
+        }
+        // A second client arms a restart stage of this process now: it makes its record and sends ArmFault to the same agent.
+        other = std::thread([&] {
+            other_result.emplace(inject_failure(*rig.service, inject_args("pre-restart-hooks")));
+            other_done = true;
+        });
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!other_done && !rig.service->faults().arming_for_testing() && std::chrono::steady_clock::now() < until) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        other_reached = other_done || rig.service->faults().arming_for_testing();
+        // This client arms the next revert's stage while the revert cleans up: refused busy once the other arming has ended.
+        during_cleanup.emplace(inject_failure(*rig.service, inject_args("revert-restore")));
+    };
+    std::optional<Result<Value>> last;
+    {
+        const HangWatchdog watchdog(std::chrono::seconds(60), "the revert whose cleanup hook calls inject-failure");
+        last.emplace(revert_with(rig, "last"));
+        rig.join_agent_threads();
+        if (other.joinable()) {
+            other.join();
+        }
+    }
+    REQUIRE(last.has_value());
+    REQUIRE_MESSAGE(last->has_value(), last->error().format());
+    CHECK(other_reached.load());
+    REQUIRE(other_result.has_value());
+    REQUIRE_MESSAGE(other_result->has_value(), other_result->error().format());
+    REQUIRE(during_cleanup.has_value());
+    REQUIRE_FALSE(during_cleanup->has_value());
+    CHECK(during_cleanup->error().id() == "CML5978");
+    // The other client's arming stands, with its record; the revert's own stage was disarmed by its end.
+    CHECK(rig.service->faults().take_agent_armed(ipc::fault::Stage::PreRestartHooks, kPid));
+    CHECK_FALSE(rig.service->faults().take_agent_armed(ipc::fault::Stage::RevertRestore, kPid));
+}
+
+TEST_CASE("fault injection (WP-62): {\"stage\":\"none\"} waits for an inject-failure that is arming agents, so no agent is left armed without a record") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    std::optional<Result<Value>> disarm;
+    std::thread disarmer;
+    const JoinOnExit join_disarmer{disarmer};
+    std::atomic<bool> disarm_done{false};
+    std::atomic<bool> disarmed_early{false};
+    rig.on_arm = [&](const ipc::ArmFault& arm) {
+        if (arm.stage != "revert-restore" || arm.count != 1 || disarmer.joinable()) {
+            return;
+        }
+        // The record is made and the ArmFault is on its way: a client disarms everything now. Before WP-62 it cleared the record at once
+        // and its ArmFault could reach the agent first, which left the agent armed with no record (the next revert would not disarm it).
+        disarmer = std::thread([&] {
+            disarm.emplace(inject_failure(*rig.service, inject_args("none")));
+            disarm_done = true;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        disarmed_early = disarm_done.load();
+    };
+    Result<Value> armed = inject_failure(*rig.service, inject_args("revert-restore"));
+    REQUIRE_MESSAGE(armed.has_value(), armed.error().format());
+    REQUIRE(disarmer.joinable());
+    disarmer.join();
+    CHECK_FALSE(disarmed_early.load());  // it waited for the arming to end
+    REQUIRE(disarm.has_value());
+    REQUIRE_MESSAGE(disarm->has_value(), disarm->error().format());
+    CHECK_FALSE(rig.service->faults().take_agent_armed(ipc::fault::Stage::RevertRestore, kPid));
+    const auto arms = rig.seen<ipc::ArmFault>();
+    REQUIRE(arms.size() == 2);
+    CHECK(arms[0].stage == "revert-restore");
+    CHECK(arms[1].stage == "none");  // the agent is disarmed after it was armed
+}
+
 namespace {
 
 // WP-44: a process host that only answers has_exited (the revert tests do not restart anything).
@@ -2854,6 +3112,49 @@ TEST_CASE("a session directory the user supplied is never removed; the temporary
         temp.service.reset();
     }
     CHECK_FALSE(std::filesystem::exists(std::filesystem::path(default_dir)));
+}
+
+
+TEST_CASE("an index thread that outlives the service never calls into it (WP-62): its Ready callback is closed by ~ReloadService") {
+    // Before WP-62 the index's on_change called rearm_save_watcher() on the service whenever its thread reached Ready, and that thread
+    // runs on as long as anybody holds the ModuleState (here the rig): a call into a destroyed service, which TSan reported as a race
+    // with ~ReloadService. The index thread is held right before its Ready callback (a latch, not a sleep) while the service goes.
+    QuietLogs quiet;
+    Rig rig;
+    std::promise<void> at_ready;
+    std::future<void> reached = at_ready.get_future();
+    std::promise<void> release;
+    std::shared_future<void> released = release.get_future().share();
+    std::atomic<bool> held{false};
+    std::atomic<bool> service_gone{false};
+    std::atomic<int> entered_after_destruction{0};
+    std::atomic<int> entered_alive{0};
+    ReloadService::IndexCallbackHooks hooks;
+    hooks.before = [&](const IndexStatus& s) {
+        if (s.state == IndexState::Ready && !held.exchange(true)) {
+            at_ready.set_value();
+            released.wait();
+        }
+    };
+    hooks.entered = [&](const IndexStatus&) {
+        if (service_gone) {
+            ++entered_after_destruction;
+        } else {
+            ++entered_alive;
+        }
+    };
+    rig.service->set_index_callback_hooks_for_testing(hooks);
+    const HangWatchdog watchdog(std::chrono::seconds(60), "the service's destruction while its index thread waits to report Ready");
+    rig.enable();  // the index is Ready (its status is set before the callback runs); its thread waits in `before`
+    reached.wait();
+    std::weak_ptr<ModuleState> state = rig.module;  // the rig still holds it: the index thread is not joined by ~ReloadService
+    rig.service.reset();
+    service_gone = true;
+    release.set_value();  // the index thread goes on into its Ready callback
+    rig.module.reset();   // the last holder: ~ModuleIndex joins the thread, after its callback has returned
+    CHECK(state.expired());
+    CHECK(entered_after_destruction.load() == 0);
+    CHECK(entered_alive.load() > 0);  // the earlier status changes did enter while the service was alive
 }
 
 TEST_CASE("status never shows an enabled module as ready before its index exists") {

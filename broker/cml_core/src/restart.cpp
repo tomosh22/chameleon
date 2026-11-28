@@ -274,7 +274,7 @@ Result<Value> RestartCoordinator::restart(const Value& args, const std::function
     // R-51: the locks are taken here, under the failure-injection gate (an inject-failure that is arming waits for it, or sees this
     // restart as running), and held until finish_injection below has run, so no arming can slip in while this restart cleans up.
 #if defined(CML_FAULT_INJECTION)
-    std::unique_lock<std::mutex> gate(service_.faults().gate());
+    std::unique_lock<std::mutex> gate = service_.faults().lock_gate();  // WP-62: waits for an inject-failure that is arming agents
 #endif
     std::unique_lock<std::mutex> only_one(mutex_, std::try_to_lock);
     std::unique_ptr<ExclusiveRun> no_reloads = service_.lock_reloads();  // the run lock of reloads and reverts (shows as running)

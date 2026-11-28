@@ -105,6 +105,9 @@ ReloadService::ReloadService(PipelineEnv env, EventBus* events, std::string sess
 }
 
 ReloadService::~ReloadService() {
+    // WP-62: first the module indexes' callbacks into this service: one in flight returns, a later one does nothing (an index thread
+    // runs on as long as anybody holds its ModuleState, so joining it below is not enough).
+    index_callbacks_->close();
     {
         // WP-45: first the re-apply worker's stop flag (it starts no reload once it is set), then cancel() aborts a reload it runs.
         std::lock_guard<std::mutex> lock(reapply_mutex_);
@@ -484,7 +487,24 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
         const bool prefetch = options.prefetch_module_image;
         // WP-50: the read is queued once, on the change into Ready (a Ready index reports again on later status changes).
         const auto prefetch_queued = std::make_shared<std::atomic<bool>>(false);
-        spec.on_change = [this, name, weak_state, prefetch, prefetch_queued](const IndexStatus& s) {
+        // WP-62: every callback into this service runs inside a scope of index_callbacks_ (closed by ~ReloadService).
+        const std::shared_ptr<CallbackGate> gate = index_callbacks_;
+        IndexCallbackHooks hooks;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            hooks = index_hooks_;
+        }
+        spec.on_change = [this, gate, hooks, name, weak_state, prefetch, prefetch_queued](const IndexStatus& s) {
+            if (hooks.before) {
+                hooks.before(s);
+            }
+            const CallbackGate::Scope alive(*gate);
+            if (!alive) {
+                return;  // the service is being destroyed, or is gone
+            }
+            if (hooks.entered) {
+                hooks.entered(s);
+            }
             if (s.state == IndexState::Ready) {
                 rearm_save_watcher();  // its tracked files are known now (compile-on-save)
                 if (prefetch && !prefetch_queued->exchange(true)) {
@@ -504,8 +524,17 @@ void ReloadService::on_session_changed(std::uint64_t agent_id) {
             EventBus* bus = events_;
             const std::uint32_t pid = snap.pid;
             // WP-26b: archive members that cannot be reloaded (CML5920), once per module.
-            spec.on_skipped_archive_members = [bus, pid](const Diag& d) { bus->publish(make_diag_event(d, "warning", "enable", pid)); };
-            spec.on_audit = [bus, pid](const ModuleAudit& audit) {
+            const std::shared_ptr<CallbackGate> gate = index_callbacks_;  // WP-62: the bus is this service's for its lifetime only
+            spec.on_skipped_archive_members = [bus, pid, gate](const Diag& d) {
+                if (const CallbackGate::Scope alive(*gate); alive) {
+                    bus->publish(make_diag_event(d, "warning", "enable", pid));
+                }
+            };
+            spec.on_audit = [bus, pid, gate](const ModuleAudit& audit) {
+                const CallbackGate::Scope alive(*gate);
+                if (!alive) {
+                    return;
+                }
                 for (const AuditFinding& f : audit.findings) {
                     if (f.verdict != Verdict::Pass) {
                         bus->publish(make_diag_event(f.diag(), f.verdict == Verdict::Fail ? "error" : "warning", "enable", pid));
@@ -657,6 +686,11 @@ std::vector<std::pair<std::string, BaselineSnapshot>> ReloadService::kept_baseli
 void ReloadService::set_drop_hook_for_testing(std::function<void()> hook) {
     std::lock_guard<std::mutex> lock(mutex_);
     drop_hook_ = std::move(hook);
+}
+
+void ReloadService::set_index_callback_hooks_for_testing(IndexCallbackHooks hooks) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    index_hooks_ = std::move(hooks);
 }
 
 std::vector<std::pair<std::string, BaselineSnapshot>> ReloadService::kept_baselines_for_testing(std::uint32_t pid) const {
@@ -1393,7 +1427,7 @@ Result<Value> ReloadService::revert(const Value& args) {
     // here, under the failure-injection gate, and held until finish_injection below has run (an inject-failure sees the revert running
     // until then); revert_impl refuses busy after checking its arguments when it could not be taken.
 #if defined(CML_FAULT_INJECTION)
-    std::unique_lock<std::mutex> gate(faults_.gate());
+    std::unique_lock<std::mutex> gate = faults_.lock_gate();  // WP-62: waits for an inject-failure that is arming agents
 #endif
     std::optional<ExclusiveRun> exclusive;
     exclusive.emplace(reload_mutex_, running_);

@@ -22,10 +22,31 @@ using ipc::json::Value;
 namespace {
 
 // WP-44: the groups whose operations disarm what is still armed for them at their end (finish_injection). An arming of such a group
-// is recorded and its operation's start is ordered against it (FaultInjector::gate()).
+// is recorded and its operation's start is ordered against it (FaultInjector::lock_gate()).
 bool has_cleanup(const std::string& group) {
     return group == "restart" || group == "revert" || group == "exception-action" || group == "watch";
 }
+
+// WP-62 (R-70): an inject-failure that sends ArmFault without the gate (FaultInjector::begin_arming) ends its arming on every way out.
+class ArmingScope {
+public:
+    ArmingScope() = default;
+    ArmingScope(const ArmingScope&) = delete;
+    ArmingScope& operator=(const ArmingScope&) = delete;
+    ~ArmingScope() {
+        if (faults_ != nullptr) {
+            faults_->end_arming();
+        }
+    }
+    // `gate` is held (FaultInjector::lock_gate()); it is let go of here.
+    void begin(FaultInjector& faults, std::unique_lock<std::mutex>& gate) {
+        faults.begin_arming(gate);
+        faults_ = &faults;
+    }
+
+private:
+    FaultInjector* faults_ = nullptr;
+};
 
 }  // namespace
 
@@ -212,6 +233,35 @@ void FaultInjector::end_operation(const char* group) {
             return;
         }
     }
+}
+
+std::unique_lock<std::mutex> FaultInjector::lock_gate() {
+    std::unique_lock<std::mutex> gate(gate_);
+    gate_cv_.wait(gate, [this] { return !arming_; });
+    return gate;
+}
+
+void FaultInjector::begin_arming(std::unique_lock<std::mutex>& gate) {
+    arming_ = true;
+    gate.unlock();
+}
+
+void FaultInjector::end_arming() {
+    {
+        std::lock_guard<std::mutex> gate(gate_);
+        arming_ = false;
+    }
+    gate_cv_.notify_all();
+}
+
+bool FaultInjector::gate_free_for_testing() {
+    std::unique_lock<std::mutex> gate(gate_, std::try_to_lock);
+    return gate.owns_lock();
+}
+
+bool FaultInjector::arming_for_testing() {
+    std::lock_guard<std::mutex> gate(gate_);
+    return arming_;
 }
 
 bool FaultInjector::operation_running(const char* group) const {
@@ -586,6 +636,7 @@ Result<Value> inject_failure(ReloadService& service, const Value& args) {
     // WP-44: "none" for a pid whose agent is gone clears what is armed or recorded for it, but only when the process host confirms that
     // the process has exited (a live process that is only disconnected stays armed in its agent, so its records stay too: CML5961).
     if (pid && targets.empty() && stage_name == fault::kDisarm && service.faults().armed_for_process(*pid) && service.process_exited(*pid)) {
+        const std::unique_lock<std::mutex> gate = service.faults().lock_gate();  // WP-62: after an inject-failure that is arming agents
         service.faults().disarm_process(*pid);
         CML_LOG(Info, "failure injection: process %u has exited (no agent connected); what was armed or recorded for it is cleared", *pid);
         Value cleared = Value::object();
@@ -606,11 +657,17 @@ Result<Value> inject_failure(ReloadService& service, const Value& args) {
     if (stage_name == fault::kDisarm) {
         // Disarm everything that can be disarmed, then say which agents could not be. WP-44: the persisted armings go as well; with a
         // pid only what can fire for that process (the other processes' armings and records stay).
+        // WP-62: under the gate, so an inject-failure that is arming agents ends first: clearing its records before its ArmFault reaches
+        // the agent would leave the agent armed with no record. Like an arming, the agents' ArmFault goes out without the gate, and
+        // nobody arms meanwhile (ArmingScope).
+        std::unique_lock<std::mutex> gate = service.faults().lock_gate();
         if (pid) {
             service.faults().disarm_process(*pid);
         } else {
             service.faults().disarm_all();
         }
+        ArmingScope disarming;
+        disarming.begin(service.faults(), gate);
         std::vector<std::uint32_t> failed;
         std::string reasons;
         for (const std::shared_ptr<AgentLink>& link : targets) {
@@ -665,10 +722,11 @@ Result<Value> inject_failure(ReloadService& service, const Value& args) {
     // WP-43: a stage with an end-of-operation cleanup is armed for the next operation; arming it while one runs could fire in the middle of
     // it (the undo of a revert's re-pointing, say). R-51: the check and the arming are one step against the start of such an operation
     // (the gate, which the operations take while they start), and each operation disarms what is left while it still counts as running.
+    // WP-62 (R-70): the gate is held for the check and the records only, never while ArmFault goes to an agent (see begin_arming below).
     const bool cleanup = has_cleanup(group);
     std::unique_lock<std::mutex> gate;
     if (cleanup) {
-        gate = std::unique_lock<std::mutex>(service.faults().gate());
+        gate = service.faults().lock_gate();
         const bool busy = (group == "restart" && service.restart_active()) || (group == "revert" && service.reload_running()) ||
                           (group == "exception-action" && service.faults().operation_running("exception-action")) ||
                           (group == "watch" && service.faults().operation_running("watch"));
@@ -701,6 +759,12 @@ Result<Value> inject_failure(ReloadService& service, const Value& args) {
             for (const std::shared_ptr<AgentLink>& link : targets) {
                 service.faults().note_agent_armed(info->stage, link->snapshot().pid, persist);
             }
+        }
+        // WP-62 (R-70): the gate is let go of before the first ArmFault (the send lock of a link is never taken under it); an operation
+        // that starts meanwhile still waits, in lock_gate(), until the last ArmFault (and any undo) is done.
+        ArmingScope arming;
+        if (cleanup) {
+            arming.begin(service.faults(), gate);
         }
         // All or nothing: the agents already armed are disarmed again when one of them refuses.
         std::vector<std::shared_ptr<AgentLink>> armed;

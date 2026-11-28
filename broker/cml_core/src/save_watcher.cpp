@@ -179,7 +179,7 @@ void SaveWatcher::on_batch(const watch::ChangeBatch& batch) {
         FaultInjector* faults;
         explicit Operation(FaultInjector* f) : faults(f) {
             if (faults != nullptr) {
-                std::lock_guard<std::mutex> gate(faults->gate());
+                const std::unique_lock<std::mutex> gate = faults->lock_gate();  // WP-62: waits for an inject-failure that is arming agents
                 faults->begin_operation("watch");
             }
         }
