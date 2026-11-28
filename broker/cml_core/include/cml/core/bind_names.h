@@ -101,6 +101,18 @@ struct LocalScopeKey {
 // Empty when the name is not function-local, or when any part of the scope cannot be read (never a guess).
 std::optional<LocalScopeKey> local_scope_key(std::string_view decorated, bool guard_name_counted);
 
+// WP-56 (R-68): a qualified name with its name back-references written out, read with a back-reference table of its own
+// that starts empty: the name after ".?AV" in a type's unique name (".?AV<lambda_1>@?1???R0?1??f@@YAXXZ@QEBA@XZ@", where
+// `0` is `<lambda_1>`), or the name after "??R" of a call operator's own decorated name (an operator's name is not in the
+// table either). The text after the '@' that closes the qualified name is appended as written. A closure class spells the
+// names of its scope with other digits than the decorated name of one of its statics does (whose table starts with the
+// static's own name), so the two are compared in this form ("<lambda_1>@?1???R<lambda_1>@?1??f@@YAXXZ@QEBA@XZ@"; the
+// static's side is local_scope_key's `rest`). Empty when any part cannot be read (never a guess).
+std::optional<std::string> resolved_qualified_name(std::string_view qualified);
+// The same for a whole decorated function name read from its start ("??R<lambda_1>@?1???R0?1??f@@YAXXZ@QEBA@XZ@QEBA@XZ":
+// a call operator of the inner closure; its name and the encoding as the scope of one of its statics spells them).
+std::optional<std::string> resolved_decorated_name(std::string_view decorated);
+
 // For "??__Eg_tracker@?A0x1@@YAXXZ": the text the global's mangled name (without the leading '?')
 // starts with ("g_tracker@?A0x1@@"). Empty when `decorated` is not a cl dynamic initialiser.
 std::string initializer_target_prefix(std::string_view decorated);
