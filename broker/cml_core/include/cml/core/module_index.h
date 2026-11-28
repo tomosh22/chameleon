@@ -57,8 +57,11 @@ struct IndexStatus {
     std::size_t scan_lookups = 0;
     std::size_t baseline_files = 0;  // files the baseline hashed (= files listed)
     // WP-50: where the file lists and the include scan came from: "cold" (scanned now), "warm" (ScanCache, the same module file
-    // scanned before in this session), "off" (no cache given).
+    // scanned before in this session), "off" (no cache given). WP-55: "partial" when only the compilands whose inputs changed
+    // were scanned and the others came from the cache.
     std::string scan_cache = "off";
+    std::size_t scan_reused = 0;     // WP-55: compilands whose part came from the cache
+    std::size_t scan_rescanned = 0;  //   ... and compilands scanned
 };
 
 class ScanCache;
@@ -90,6 +93,9 @@ struct ModuleIndexSpec {
     // Tests (WP-50): called on the worker thread after the scan of the file lists and includes, before its inputs are compared
     // with the stamps taken while scanning (an edit made "during the scan").
     std::function<void()> after_scan_for_testing;
+    // Tests (WP-55): called on the worker thread after the cache lookup, before each pass of the scan (1, 2, 3: see
+    // ModuleIndex::run), so that an input can change between the lookup that vouched for a part and the scan of another part.
+    std::function<void(int pass)> before_scan_for_testing;
 };
 
 // WP-26b: a compiland that cannot be reloaded although its object is real (no build environment, missing source file).
@@ -121,11 +127,33 @@ struct ScanInput {
     bool directory = false;
     std::uint64_t size = 0;
     long long mtime = 0;
+    // WP-55 (review): a stamp is racy when the path's time is within kScanRacyWindow of the moment the stamp was taken (or
+    // later): the file system's clock moves in ticks (NTFS: the system timer, up to ~16 ms; FAT: 2 s), so a change made after the
+    // stamp in the same tick, with the same size, leaves the stamp as it was. A racy stamp is checked by content as well:
+    // `content` is the hash of what the scan read (a file) or of the names in it (a directory), `has_content` whether it is set.
+    bool racy = false;
+    bool has_content = false;
+    std::uint64_t content = 0;
+    // A racy directory whose names could not be listed: it never holds, and a part that depends on it is not cached.
+    bool unlistable = false;
 };
-// What `path` is now.
+inline constexpr long long kScanRacyWindowSeconds = 2;
+// Whether `path` is on a remote file system (a UNC path; on Windows also a drive whose type is DRIVE_REMOTE): its times come
+// from another machine's clock, so its stamps are always racy and checked by content.
+bool scan_path_is_remote(const std::string& path);
+// What `path` is now (the stamp only: never racy, no content).
 ScanInput probe_scan_input(const std::string& path);
+// What `path` is now, as a stamp taken before a use: racy when its time is recent or later than now, or when it is remote, and
+// then, for a directory, with the hash of its names (a file's content is added by ScanInputRecorder::wrap when the scan reads it).
+ScanInput stamp_scan_input(const std::string& path);
 // Whether two stamps of the same path agree (existence, kind, size, time).
 bool same_scan_input(const ScanInput& a, const ScanInput& b);
+// Whether `recorded` still holds: the same stamp now and, when it is racy with a content hash, the same content.
+bool scan_input_holds(const ScanInput& recorded);
+// The hash scan_input_holds() compares: of a file's text (as the scan reads it), or of a directory's sorted names.
+std::uint64_t scan_content_hash(std::string_view text);
+// Of the names' native bytes (no conversion that could fail); nullopt when the directory cannot be listed.
+std::optional<std::uint64_t> scan_directory_hash(const std::string& path);
 // "" when every input is still as recorded, else the first path that differs (changed, created or removed).
 std::string changed_scan_input(const std::vector<ScanInput>& inputs);
 
@@ -136,17 +164,41 @@ public:
     // The stamp of `path` from the first time it was asked for (taken now if this is the first time).
     const ScanInput& before(const std::string& path);
     bool exists(const std::string& path) { return before(path).exists; }
+    // The stamp before() took for `path`, or null when it was never asked for.
+    const ScanInput* stamped(const std::string& path) const;
     // `disk` with every read stamped first: the file's directory (a file created there later changes its stamp), then the file
-    // (not when its directory does not exist). A read that fails for a file that exists is remembered as unreadable. The
-    // reader refers to this recorder, which must outlive it.
+    // (not when its directory does not exist). A read that fails for a file that exists is remembered as unreadable, unless the
+    // stamp taken before the read says the file is over kScanMaxFileBytes (WP-55, R-63): disk_file_reader() never reads such a
+    // file, so every read gives the same answer until the file's stamp changes, and the file is an input like any other. A
+    // directory is not a failed read either. The reader refers to this recorder, which must outlive it.
     ScanFileReader wrap(ScanFileReader disk);
-    // The first-seen stamps of `paths`, in order. `*not_cacheable` is "unreadable:<path>" when a read failed on a file that
-    // exists, else "changed-during-scan:<path>" for the first path whose stamp now differs, else "".
-    std::vector<ScanInput> finish(const std::vector<std::string>& paths, std::string* not_cacheable);
+    // Why a result that used `path` must not be cached: "unreadable:<path>" when a read of it failed although it existed (a
+    // sharing violation, a read error: it may succeed next time), "changed-during-scan:<path>" when its stamp now differs from
+    // the one taken before it was used, "" when neither. The path is stamped again on the first call for it.
+    std::string not_cacheable(const std::string& path);
 
 private:
     std::map<std::string, ScanInput> before_;
-    std::string unreadable_;
+    std::set<std::string> unreadable_;
+    std::map<std::string, bool> rechecked_;  // path -> its stamp now differs from before_
+};
+
+// WP-55 (R-58): one compiland's part of a scan. Paths are indices into ScanResult::inputs.
+struct CompilandScan {
+    std::uint32_t compiland = 0;
+    bool toolchain = false;              // a member of a toolchain archive: skipped, nothing tracked (is_toolchain_archive)
+    std::optional<SkippedCompiland> skipped;
+    std::vector<std::uint32_t> files;    // the files it makes tracked (unique)
+    std::vector<std::uint32_t> deps;     // the headers its include scan found (ScanResult::header_deps)
+    std::vector<std::uint32_t> pch;      // what it could determine of the precompiled header it builds or uses
+    bool uses_pch = false;               // a /Yu compiland (ScanResult::pch_unverified is decided over the whole module)
+    // Every file and directory its part depends on, with the stamp taken before the scan used it: the files its PDB list names,
+    // an archive member's source, every file its include walks read or were answered about from the scanner's memory (one over
+    // the size limit too), and the directory of every path they asked about that did not exist (a file created there would be
+    // found). Unique.
+    std::vector<std::uint32_t> inputs;
+    // Why this part must not be reused ("" when it may): ScanInputRecorder::not_cacheable() of one of its inputs.
+    std::string not_cacheable;
 };
 
 // What the file-list and include-scan phase of an index build produces (all of it depends only on the PDB, the compile
@@ -158,29 +210,44 @@ struct ScanResult {
     std::set<std::uint32_t> pch_unverified;
     std::vector<SkippedCompiland> skipped;
     std::set<std::uint32_t> skipped_set;
-    // Every file the result was built from (the tracked files, the skipped compilands' sources found absent) and every
-    // directory the include search looked in: a cache hit re-checks them all (ScanCache::find).
-    // Stamped before the scan used each of them (as each file was read); empty without a cache.
+    // WP-55 (R-58): the part of every object compiland (ascending), from which the members above are assembled
+    // (assemble_scan_result). A cache entry is reused compiland by compiland.
+    std::vector<CompilandScan> compilands;
+    // Every path a compiland refers to, once, with the stamp taken before the scan used it (a lookup checks each of them again).
+    // Without a cache only the paths are set.
     std::vector<ScanInput> inputs;
-    // Why this result must not be cached ("" when it may): "unreadable:<path>" (a file that exists could not be read: a sharing
-    // violation, a file over the scanner's size limit, a read error) or "changed-during-scan:<path>" (an input whose stamp after
-    // the scan differs from the one taken before it was used).
-    std::string not_cacheable;
-    IncludeScanner::Stats stats;  // of the scan that produced it
+    IncludeScanner::Stats stats;  // of the scan that produced it (a partial scan: of the compilands it scanned)
     std::size_t files_read = 0;
+    std::size_t reused = 0;     // compilands taken from a cache entry
+    std::size_t rescanned = 0;  // compilands scanned
     double scan_ms = 0;
 };
 
+// Fills files, header_deps, pch_files, pch_unverified, skipped and skipped_set from `compilands` and `inputs`.
+void assemble_scan_result(ScanResult& result);
+
 // WP-50 (R-55): the scan results of the module files this session indexed, so that a module indexed again (the new process of a
 // hot-restart, a module freed and loaded again, a second process of the same executable) is not scanned again while its file is
-// unchanged. A hit also requires every input of the stored scan (ScanResult::inputs) to be as it was: a source edited since (a
-// new #include), a header created or removed, a skipped compiland's source that appeared all make it a miss, and the new scan
-// replaces the entry. Thread-safe; at most kMaxEntries module files (the least recently used goes).
+// unchanged. WP-55 (R-58): a compiland's part is reused while every input of that part is as it was. Only the compilands with a
+// changed input (a source edited since, a header created where an include could now resolve, a skipped member's source that
+// appeared) or with a part that could not be cached are scanned again, and the merged result replaces the entry. Thread-safe;
+// at most kMaxEntries module files (the least recently used goes).
 class ScanCache {
 public:
     static constexpr std::size_t kMaxEntries = 32;
-    // The entry of `module_path` when its stamp equals `stamp` and its inputs are unchanged; otherwise null and `*reason` is
-    // "absent", stamp_difference() or "file-changed:<path>". The inputs are checked outside the lock.
+    struct Lookup {
+        std::shared_ptr<const ScanResult> result;  // the entry of the same module stamp (null: none, or another stamp)
+        // Per element of result->compilands: "" when it can be reused, else why not ("file-changed:<path>",
+        // "not-cached:<reason>").
+        std::vector<std::string> stale;
+        std::size_t reusable = 0;
+        // "" when the whole entry can be used as it is; else "absent", stamp_difference(), "file-changed:<path>" (the first input
+        // that differs) or "not-cached:<reason>" (the first part that could not be cached).
+        std::string reason;
+    };
+    // The entry of `module_path` and what of it is still true. The inputs are stamped again outside the lock, each once.
+    Lookup lookup(const std::string& module_path, const ModuleFileStamp& stamp);
+    // The entry when all of it can be used as it is; otherwise null, and `*reason` is Lookup::reason.
     std::shared_ptr<const ScanResult> find(const std::string& module_path, const ModuleFileStamp& stamp, std::string* reason);
     void store(const std::string& module_path, const ModuleFileStamp& stamp, std::shared_ptr<const ScanResult> result);
     std::size_t size() const;
@@ -285,8 +352,11 @@ private:
     void run();
     void set_status(IndexState state, std::uint32_t percent, std::string phase, std::optional<Diag> error = std::nullopt, bool drop_pdb = false);
     Result<std::shared_ptr<const pdb::PdbIndex>> open_pdb();
-    // The file lists and the include scan of every compiland (WP-50: cached as a ScanResult). nullopt when cancelled.
-    std::optional<ScanResult> scan_files(const pdb::PdbIndex& index);
+    // The file lists and the include scan of every compiland (WP-50: cached as a ScanResult). WP-55: the parts of `previous`
+    // that can be reused are taken from it, the others are scanned. nullopt when cancelled. `*disproved` receives the
+    // compilands of reused parts that an input stamped differently by a part scanned now proved stale (it changed after the
+    // lookup): the result must not be used then, and the caller scans again with those parts stale too.
+    std::optional<ScanResult> scan_files(const pdb::PdbIndex& index, const ScanCache::Lookup& previous, std::set<std::uint32_t>* disproved);
 
     ModuleIndexSpec spec_;
     mutable std::mutex mutex_;

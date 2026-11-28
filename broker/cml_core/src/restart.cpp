@@ -1044,10 +1044,13 @@ Result<Value> RestartCoordinator::restart_impl(const Value& args, const std::fun
                 entry.set("baseline_ms", Value::number(s.baseline_ms));
                 entry.set("baseline_files", Value::integer(static_cast<std::int64_t>(s.baseline_files)));
                 entry.set("cache", Value::string(s.scan_cache));
+                entry.set("scan_reused", Value::integer(static_cast<std::int64_t>(s.scan_reused)));          // WP-55
+                entry.set("scan_rescanned", Value::integer(static_cast<std::int64_t>(s.scan_rescanned)));
                 line += " index_state=" + std::string(to_string(s.state)) + " index_pdb_ms=" + fixed1(s.pdb_ms) + " index_audit_ms=" + fixed1(s.audit_ms) +
                         " index_scan_ms=" + fixed1(s.scan_ms) + " index_scan_read_ms=" + fixed1(s.scan_read_ms) + " index_scan_found=" + std::to_string(s.scan_found) +
                         " index_scan_missing=" + std::to_string(s.scan_missing) + " index_baseline_ms=" + fixed1(s.baseline_ms) +
-                        " index_baseline_files=" + std::to_string(s.baseline_files) + " index_cache=" + s.scan_cache;
+                        " index_baseline_files=" + std::to_string(s.baseline_files) + " index_cache=" + s.scan_cache +
+                        " index_scan_reused=" + std::to_string(s.scan_reused) + " index_scan_rescanned=" + std::to_string(s.scan_rescanned);
             } else {
                 entry.set("state", Value::string("absent"));
                 line += " index_state=absent";

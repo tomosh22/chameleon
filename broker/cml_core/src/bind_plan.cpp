@@ -669,10 +669,13 @@ private:
         std::size_t closures = 0;
         std::size_t unreadable = 0;
         bool asked = false;  // counted in the WP51-INLINEES summary (a verdict of the batch nobody asked for is not)
+        bool cached = false;  // WP-55: taken from PlanInput::inline_verdicts
     };
     std::map<std::uint32_t, InlineVerdict> inline_verdicts_;  // by the procedure's index in comp_syms_
     const InlineVerdict& inline_verdict(std::uint32_t proc);
     void judge_inlinees(std::uint32_t proc, const Result<pdb::PdbIndex::ProcInlinees>& sites);
+    // WP-55 (R-62): the verdict an earlier plan against the same image kept (PlanInput::inline_verdicts), into inline_verdicts_.
+    bool cached_verdict(std::uint32_t proc);
     bool inline_batch_done_ = false;
     std::set<std::string> wp51_static_bases_;  // the names of the patch's static data: the records a batch is read for
     // WP-51 (review): the closure a lambda's static belongs to, as the decorated scope spells it after "??R" (without the
@@ -1237,6 +1240,9 @@ void Planner::judge_inlinees(std::uint32_t proc, const Result<pdb::PdbIndex::Pro
     InlineVerdict& v = inline_verdicts_[proc];
     const pdb::SymbolView& p = comp_syms_[proc];
     const std::string where = "'" + std::string(p.name) + "' (rva " + hex(p.rva) + ")";
+    if (in_.inline_verdicts != nullptr) {
+        in_.inline_verdicts->count_read();  // WP-55: a verdict judged from a read (kept below only when the sites could be read)
+    }
     if (!sites) {
         v.risk = "the inline sites of " + where + " cannot be read (" + sites.error().message + ")";
         v.unreadable = 1;
@@ -1289,12 +1295,44 @@ void Planner::judge_inlinees(std::uint32_t proc, const Result<pdb::PdbIndex::Pro
     }
     v.sites = sites->sites;
     v.inlinees = sites->inlinees.size();
+    if (in_.inline_verdicts != nullptr) {
+        // WP-55 (R-62): kept for the next plans against this image (only a verdict whose sites could be read).
+        in_.inline_verdicts->store(pdb_.id(), ci_, proc,
+                                   CachedInlineVerdict{p.rva, std::string(p.name), v.risk, v.wider, v.wider_kind, v.closure_tails, v.sites, v.inlinees, v.closures, v.unreadable});
+    }
     CML_LOG(Trace, "WP51-BATCH proc=%s sites=%u inlinees=%zu closures=%zu unreadable=%zu verdict=%s", where.c_str(), sites->sites, sites->inlinees.size(), v.closures,
             v.unreadable, v.risk.empty() ? "no-closure" : "risk");
 }
 
+bool Planner::cached_verdict(std::uint32_t proc) {
+    if (in_.inline_verdicts == nullptr || proc >= comp_syms_.size()) {
+        return false;
+    }
+    const pdb::SymbolView& p = comp_syms_[proc];
+    std::optional<CachedInlineVerdict> kept = in_.inline_verdicts->find(pdb_.id(), ci_, proc, p.rva, p.name);
+    if (!kept) {
+        return false;
+    }
+    InlineVerdict& v = inline_verdicts_[proc];
+    v.risk = std::move(kept->risk);
+    v.wider = std::move(kept->wider);
+    v.wider_kind = kept->wider_kind;
+    v.closure_tails = std::move(kept->closure_tails);
+    v.sites = kept->sites;
+    v.inlinees = kept->inlinees;
+    v.closures = kept->closures;
+    v.unreadable = kept->unreadable;
+    v.cached = true;
+    CML_LOG(Trace, "WP55-INLINE-CACHE proc='%s' rva=%s verdict=%s (kept from an earlier plan)", std::string(p.name).c_str(), hex(p.rva).c_str(),
+            v.risk.empty() ? "no-closure" : "risk");
+    return true;
+}
+
 const Planner::InlineVerdict& Planner::inline_verdict(std::uint32_t proc) {
     auto found = inline_verdicts_.find(proc);
+    if (found == inline_verdicts_.end() && cached_verdict(proc)) {
+        found = inline_verdicts_.find(proc);
+    }
     if (found == inline_verdicts_.end()) {
         // (Review: one walk of the module stream for every procedure of the compiland that holds a record named like a static
         // of the patch, the only ones a static can be paired into, instead of one walk per procedure asked for.)
@@ -1304,7 +1342,7 @@ const Planner::InlineVerdict& Planner::inline_verdict(std::uint32_t proc) {
             std::set<std::uint32_t> holders;
             for (const pdb::SymbolView& v : comp_syms_) {
                 if (pdb::is_data_kind(v.kind) && v.parent_proc != pdb::kNoSymbol && v.parent_proc < comp_syms_.size() && pdb::is_proc_kind(comp_syms_[v.parent_proc].kind) &&
-                    inline_verdicts_.count(v.parent_proc) == 0 && wp51_static_bases_.count(comp_last(&v)) != 0) {
+                    inline_verdicts_.count(v.parent_proc) == 0 && wp51_static_bases_.count(comp_last(&v)) != 0 && !cached_verdict(v.parent_proc)) {
                     holders.insert(v.parent_proc);
                 }
             }
@@ -1338,6 +1376,9 @@ const Planner::InlineVerdict& Planner::inline_verdict(std::uint32_t proc) {
     if (!v.asked) {
         // (Review: the summary counts only the procedures whose verdict was asked for, not the rest of the batch.)
         v.asked = true;
+        if (v.cached) {
+            in_.inline_verdicts->count_kept();  // WP-55: only verdicts asked for count, not the batch's probes
+        }
         ++wp51_procs_;
         wp51_sites_ += v.sites;
         wp51_closures_ += v.closures;
