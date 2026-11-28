@@ -1499,6 +1499,16 @@ run a bound static's initializer again. **Acceptance:**
 that is an inlined lambda's static (record count per name, type, the old procedure's inline sites, the closure's other
 statics), for clang-cl `-O2` and cl `/O2`. Then pair a lambda's static with a record of its caller only where that evidence
 proves it is the lambda's, and refuse otherwise (CML3207). The orchestrator rules on the spike before code is written.
+**Ruling (WP-53 spike):** under clang-cl, no evidence in the old image separates a record of `f` that is an inlined lambda's
+static from `f`'s own: record count, type, inline sites, the closure's other statics, the layout and the patch's structure all
+failed. The code does separate them. A lambda's static paired with a record directly in its caller's procedure P (no call-operator
+record) is refused with CML3207 unless (1a) cl's twin record exists (WP-40's closure step), or (2) the pipeline proves P unchanged
+with WP-25's comparator under the plan (`BindPlan::inlined_lambda_statics`, beside `prove_bitmask_guards`). An R-61 edit whose
+machine code is identical (spike case c7) is accepted, because the running program cannot tell it apart. cl's inline-site position
+evidence (1b) is deferred to R-65, the build tree's original `.obj` as evidence to R-64. First, WP-53 checks whether WP-51's
+`proc_inlinees` can return an empty list for a procedure that has inline sites under clang-cl + link.exe (seen in the spike).
+If it can, R-54 is undetected there; that is fixed first, and anything unparsable is reported as unreadable.
+
 **Acceptance:**
 - A unit test of the R-61 edit is refused.
 - WP-40's lambda-static-in-caller case still binds.
