@@ -12,7 +12,9 @@
 
 #include "cml/core/agent_link.h"
 #include "cml/core/control_server.h"
+#include "cml/core/event_bus.h"
 #include "cml/core/exception_service.h"
+#include "cml/core/module_event_diag_ids.h"
 #include "cml/core/pipeline.h"
 #include "cml/core/process_registry.h"
 #include "cml/core/reload_service.h"
@@ -73,6 +75,17 @@ void serve_connection(Connection& connection, std::uint64_t agent_id, Shared& sh
     }
     bool exceptions_announced = false;
     std::uint64_t seen_revision = 0;
+    // After every message, and (WP-48) after every event of a ModuleEvents: publish what the session knows and let the reload
+    // service see the change. Order matters: the index (state "loading") must exist before `status` can show the module as
+    // enabled, so the service sees the change first.
+    const auto observe = [&]() {
+        link->publish(session);
+        if (shared.service != nullptr && session.revision() != seen_revision) {
+            seen_revision = session.revision();
+            shared.service->on_session_changed(agent_id);  // starts / drops the PDB index of enabled modules
+        }
+        shared.registry.update_if_changed(session);  // rebuilds only when modules / enabled set changed
+    };
     bool running = true;
     while (running && !stop_requested.load(std::memory_order_acquire)) {
         Result<ipc::PipeConnection::Received> received = connection.pipe.receive(ipc::kInfiniteTimeout);
@@ -83,15 +96,15 @@ void serve_connection(Connection& connection, std::uint64_t agent_id, Shared& sh
         }
         switch (received->status) {
             case ipc::IoStatus::Ok: {
-                SessionOutcome outcome = session.on_message(received->message);
-                // Order matters: the index (state "loading") must exist before `status` can show the module as
-                // enabled, so the service sees the change first.
-                link->publish(session);
-                if (shared.service != nullptr && session.revision() != seen_revision) {
-                    seen_revision = session.revision();
-                    shared.service->on_session_changed(agent_id);  // starts / drops the PDB index of enabled modules
+                SessionOutcome outcome = session.on_message(received->message, observe);
+                observe();
+                for (const Diag& warning : outcome.warnings) {  // WP-48: CML5620, CML5621
+                    CML_LOG(Warn, "agent#%llu: %s", static_cast<unsigned long long>(agent_id), warning.format().c_str());
+                    EventBus* events = shared.service != nullptr ? shared.service->events() : nullptr;
+                    if (events != nullptr && warning.code == module_events::diag::kModuleEventsResync) {
+                        events->publish(make_diag_event(warning, "warning", "modules", session.pid()));
+                    }
                 }
-                shared.registry.update_if_changed(session);  // rebuilds only when modules / enabled set changed
                 for (const ipc::Message& reply : outcome.replies) {
                     CML_LOG(Debug, "agent#%llu -> %s", static_cast<unsigned long long>(agent_id),
                             ipc::describe(reply).c_str());

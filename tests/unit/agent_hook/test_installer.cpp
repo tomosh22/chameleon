@@ -460,6 +460,210 @@ TEST_CASE("WP-45: forget_range drops the records of an unloaded module; a hook o
     }
 }
 
+namespace {
+
+using Verdict = Installer::Reconciled::Verdict;
+
+std::uint64_t addr(const void* p) {
+    return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(p));
+}
+
+}  // namespace
+
+TEST_CASE("WP-48: reconcile_range keeps a live hook, forgets one whose image was replaced (same base, size and path), and nothing else") {
+    for (const bool padded : {true, false}) {
+        INFO((padded ? "strategy 1" : "strategy 2"));
+        Arena arena;
+        const Placed old_fn = arena.place_padded(cl_release(0), padded ? 8 : 0, 16);
+        const Placed other_fn = arena.place_padded(cl_release(0), 8, 16);
+        const Placed new_1 = arena.place_padded(lea_ret(100), 8, 8);
+        const Placed new_2 = arena.place_padded(lea_ret(200), 8, 8);
+        arena.seal();
+        const std::uint64_t image_base = addr(old_fn.entry - kBefore);
+        const std::uint64_t image_size = static_cast<std::uint64_t>(kBefore + kAfter);
+        const std::uint64_t other_base = addr(other_fn.entry - kBefore);
+        const Bytes original = around(old_fn);
+        Installer installer;
+        CHECK(installer.reconcile_range(image_base, image_size).verdict == Verdict::None);  // nothing hooked there
+        HookOutcome outcome;
+        REQUIRE(install_one(installer, old_fn.entry, new_1.entry, "fn", &outcome).ok());
+        REQUIRE(install_one(installer, other_fn.entry, new_1.entry, "other", &outcome).ok());
+        Installer::Reconciled r = installer.reconcile_range(image_base, image_size);
+        CHECK(r.verdict == Verdict::Live);
+        CHECK(r.ours == 1);
+        CHECK(r.forgotten == 0);
+        CHECK(installer.reconcile_range(image_base, 0).verdict == Verdict::None);
+
+        // Re-pointed: the record follows the bytes written, so the image is still the hooked one.
+        REQUIRE(install_one(installer, old_fn.entry, new_2.entry, "fn", &outcome).ok());
+        CHECK(outcome.status == HookStatus::Repointed);
+        CHECK(installer.reconcile_range(image_base, image_size).verdict == Verdict::Live);
+
+        // FreeLibrary + LoadLibrary at the same base (same path and size): the fresh image has its original bytes where the jump was.
+        arena.unseal();
+        std::memcpy(old_fn.entry - kBefore, original.data(), original.size());
+        arena.seal();
+        r = installer.reconcile_range(image_base, image_size);
+        CHECK(r.verdict == Verdict::Replaced);
+        CHECK(r.original == 1);
+        CHECK(r.forgotten == 1);
+        CHECK_FALSE(installer.find(old_fn.entry, nullptr));
+        CHECK(installer.reconcile_range(other_base, image_size).verdict == Verdict::Live);  // the other module is untouched
+        CHECK(installer.find(other_fn.entry, nullptr));
+        CHECK(installer.reconcile_range(image_base, image_size).verdict == Verdict::None);
+
+        // The re-apply to the new image is a first install.
+        REQUIRE(install_one(installer, old_fn.entry, new_2.entry, "fn", &outcome).ok());
+        CHECK(outcome.status == HookStatus::Installed);
+        REQUIRE(revert_one(installer, old_fn.entry, "fn", nullptr).ok());
+        REQUIRE(revert_one(installer, other_fn.entry, "other", nullptr).ok());
+        CHECK(installer.reconcile_range(other_base, image_size).verdict == Verdict::None);
+    }
+}
+
+TEST_CASE("WP-48: records of two instances at one base are judged one by one: only the old instance's are forgotten") {
+    // A1's hook (fn_a1) is over a function the fresh image A2 has its original bytes for; A2's own hook (fn_a2) is live.
+    Arena arena;
+    const Placed fn_a1 = arena.place_padded(cl_release(0), 8, 16);
+    const Placed fn_a2 = arena.place_padded(cl_debug(0), 8, 16);
+    const Placed repl = arena.place_padded(lea_ret(7), 8, 8);
+    arena.seal();
+    const Bytes original_a1 = around(fn_a1);
+    Installer installer;
+    HookOutcome outcome;
+    REQUIRE(install_one(installer, fn_a1.entry, repl.entry, "a1", &outcome).ok());
+    REQUIRE(install_one(installer, fn_a2.entry, repl.entry, "a2", &outcome).ok());
+    arena.unseal();
+    std::memcpy(fn_a1.entry - kBefore, original_a1.data(), original_a1.size());
+    arena.seal();
+    const Installer::Reconciled r = installer.reconcile_range(addr(arena.base()), arena.size());
+    CHECK(r.verdict == Verdict::Replaced);  // the module is reported replaced ...
+    CHECK(r.original == 1);
+    CHECK(r.ours == 1);
+    CHECK(r.forgotten == 1);
+    CHECK_FALSE(installer.find(fn_a1.entry, nullptr));  // ... A1's record goes ...
+    HookInfo kept;
+    REQUIRE(installer.find(fn_a2.entry, &kept));       // ... and A2's live one stays
+    CHECK(kept.replacement == repl.entry);
+    CHECK(fn_a2.as_int()(1) == 8);
+    REQUIRE(revert_one(installer, fn_a2.entry, "a2", nullptr).ok());
+
+    SUBCASE("module_gone forgets the rest only when nothing reads ours") {
+        REQUIRE(install_one(installer, fn_a2.entry, repl.entry, "a2", &outcome).ok());
+        CHECK(installer.reconcile_range(addr(arena.base()), arena.size(), /*module_gone=*/true).forgotten == 0);  // ours: kept
+        CHECK(installer.find(fn_a2.entry, nullptr));
+        REQUIRE(revert_one(installer, fn_a2.entry, "a2", nullptr).ok());
+    }
+}
+
+TEST_CASE("WP-48: a breakpoint over our jump is no proof of a replacement: the record is kept and named") {
+    Arena arena;
+    const Placed fn = arena.place_padded(cl_release(0), 0, 16);  // strategy 2: the 5-byte jump at the entry
+    const Placed repl = arena.place_padded(lea_ret(5), 8, 8);
+    arena.seal();
+    Installer installer;
+    HookOutcome outcome;
+    REQUIRE(install_one(installer, fn.entry, repl.entry, "hooked_fn", &outcome).ok());
+    HookInfo info;
+    REQUIRE(installer.find(fn.entry, &info));
+    arena.unseal();
+    const std::uint8_t saved = fn.entry[0];
+    fn.entry[0] = 0xCC;  // a debugger's int3 over the first byte of our jump
+    arena.seal();
+    Installer::Reconciled r = installer.reconcile_range(addr(arena.base()), arena.size());
+    CHECK(r.verdict == Verdict::Live);
+    CHECK(r.other == 1);
+    CHECK(r.forgotten == 0);
+    CHECK(r.other_target == reinterpret_cast<std::uintptr_t>(fn.entry));
+    CHECK(std::string(r.other_name) == "hooked_fn");
+    CHECK(installer.find(fn.entry, nullptr));
+    // The module reported unloaded and no longer listed: then the record goes (the WP-45 forget).
+    r = installer.reconcile_range(addr(arena.base()), arena.size(), /*module_gone=*/true);
+    CHECK(r.forgotten == 1);
+    CHECK(r.verdict == Verdict::Replaced);
+    arena.unseal();
+    fn.entry[0] = saved;
+    std::memcpy(fn.entry, info.original_entry, info.entry_length);
+    arena.seal();
+}
+
+TEST_CASE("WP-48: a range that is mapped but unreadable is kept; one that is no longer committed is replaced") {
+    Arena arena;
+    const Placed fn = arena.place_padded(cl_release(0), 8, 16);
+    const Placed repl = arena.place_padded(lea_ret(5), 8, 8);
+    arena.seal();
+    Installer installer;
+    HookOutcome outcome;
+    REQUIRE(install_one(installer, fn.entry, repl.entry, "fn", &outcome).ok());
+    arena.seal(PAGE_NOACCESS);  // still committed (a guard set by someone else): no proof
+    Installer::Reconciled r = installer.reconcile_range(addr(arena.base()), arena.size());
+    CHECK(r.verdict == Verdict::Live);
+    CHECK(r.other == 1);
+    CHECK(installer.find(fn.entry, nullptr));
+    REQUIRE(VirtualFree(arena.base(), arena.size(), MEM_DECOMMIT));  // the image is gone: only reserved address space left
+    r = installer.reconcile_range(addr(arena.base()), arena.size());
+    CHECK(r.verdict == Verdict::Replaced);
+    CHECK(r.unmapped == 1);
+    CHECK(r.forgotten == 1);
+    CHECK_FALSE(installer.find(fn.entry, nullptr));
+}
+
+TEST_CASE("WP-48: no install can come between reconcile's probe and its forget") {
+    Arena arena;
+    const Placed fn = arena.place_padded(cl_release(0), 8, 16);
+    const Placed repl_1 = arena.place_padded(lea_ret(100), 8, 8);
+    const Placed repl_2 = arena.place_padded(lea_ret(200), 8, 8);
+    arena.seal();
+    const Bytes original = around(fn);
+    Installer installer;
+    HookOutcome outcome;
+    REQUIRE(install_one(installer, fn.entry, repl_1.entry, "fn", &outcome).ok());
+    arena.unseal();
+    std::memcpy(fn.entry - kBefore, original.data(), original.size());  // a fresh image: the record is stale
+    arena.seal();
+
+    // Inside reconcile (mutex held, records classified, nothing forgotten yet) another thread starts the re-apply's install. It must
+    // wait for the whole reconcile; then it is a first install over the fresh image and its record survives.
+    struct Context {
+        Installer* installer = nullptr;
+        const Placed* fn = nullptr;
+        const Placed* repl = nullptr;
+        std::thread thread;
+        std::atomic<bool> done{false};
+        bool finished_inside = false;
+        BatchResult result;
+        HookOutcome outcome;
+    };
+    Context ctx;
+    ctx.installer = &installer;
+    ctx.fn = &fn;
+    ctx.repl = &repl_2;
+    InstallerOptions options;
+    options.test_context = &ctx;
+    options.test_in_reconcile = [](void* p) {
+        auto* c = static_cast<Context*>(p);
+        c->thread = std::thread([c] {
+            c->result = install_one(*c->installer, c->fn->entry, c->repl->entry, "fn", &c->outcome);
+            c->done.store(true);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        c->finished_inside = c->done.load();
+    };
+    installer.set_test_options(options);
+    const Installer::Reconciled r = installer.reconcile_range(addr(arena.base()), arena.size());
+    ctx.thread.join();
+    installer.set_test_options(InstallerOptions{});
+    CHECK_FALSE(ctx.finished_inside);  // the install waited for the reconcile's lock
+    CHECK(r.forgotten == 1);           // the stale record went ...
+    REQUIRE_MESSAGE(ctx.result.ok(), ctx.result.diag.format());
+    CHECK(ctx.outcome.status == HookStatus::Installed);  // ... and the install that came after it is a first install that stays
+    HookInfo info;
+    REQUIRE(installer.find(fn.entry, &info));
+    CHECK(info.replacement == repl_2.entry);
+    CHECK(fn.as_int()(1) == 201);
+    REQUIRE(revert_one(installer, fn.entry, "fn", nullptr).ok());
+}
+
 TEST_CASE("a batch is all or nothing") {
     Arena arena;
     const Placed good_1 = arena.place_padded(cl_release(0), 8, 8);

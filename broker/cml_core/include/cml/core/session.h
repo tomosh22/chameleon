@@ -15,12 +15,16 @@
 #include <vector>
 
 #include "cml/ipc/messages.h"
+#include "cml/util/diag.h"
 
 namespace cml::core {
 
 struct SessionOutcome {
     std::vector<ipc::Message> replies;  // to send back, in order
     bool close = false;                 // protocol violation: drop the connection after sending
+    // WP-48: warnings for the connection thread to log (and to publish as `diag` events where module_event_diag_ids.h says so):
+    // CML5620 (module changes reported from a module-list diff), CML5621 (an agent without module events).
+    std::vector<Diag> warnings;
 };
 
 // The broker's own requests (ReserveRange, LoadPatch, ApplyFixups, RunInitializers, InstallHooks, ReleaseRange) are
@@ -43,7 +47,11 @@ public:
 
     // Handles one message from the agent. Every incoming message is logged at info level; a
     // request gets exactly one reply (Welcome for Hello, Reply for the others).
-    SessionOutcome on_message(const ipc::Message& message);
+    // WP-48: a ModuleEvents is applied one event at a time, and `after_step` (when set) runs after each event whose base comes up
+    // again later in the same message, with the module list as it is after that event: the connection thread publishes the session
+    // there and lets the reload service see it, so an unload and a load of the same image at the same base are two changes (the
+    // WP-45 re-enable path), never none. The caller observes once more after the message, as for every message.
+    SessionOutcome on_message(const ipc::Message& message, const std::function<void()>& after_step = {});
 
     std::uint64_t agent_id() const noexcept { return agent_id_; }
     bool handshaken() const noexcept { return handshaken_; }
@@ -52,6 +60,12 @@ public:
     const std::string& command_line() const noexcept { return command_line_; }
     // WP-21: CML_RESTART_TOKEN of the process ("" unless the broker relaunched it).
     const std::string& restart_token() const noexcept { return restart_token_; }
+    // WP-48: the wire ABI the agent announced (Hello), and whether it reports the loader's module events (ABI 3 or more).
+    std::uint32_t agent_abi_version() const noexcept { return agent_abi_version_; }
+    bool module_events() const noexcept { return agent_abi_version_ >= ipc::kAgentAbiModuleEvents; }
+    // WP-48: module events applied so far, and ModuleEvents that were resyncs (tests, status).
+    std::uint64_t module_events_applied() const noexcept { return module_events_applied_; }
+    std::uint64_t module_event_resyncs() const noexcept { return module_event_resyncs_; }
     const std::vector<ipc::ModuleEntry>& modules() const noexcept { return modules_; }
     const std::vector<std::string>& enabled_modules() const noexcept { return enabled_; }
     // Incremented whenever what a status report shows changes (handshake, module list, loaded/unloaded
@@ -69,6 +83,9 @@ private:
     SessionOutcome handle_hello(const ipc::Hello& hello);
     ipc::Reply handle_enable(const ipc::EnableModule& request);
     ipc::Reply handle_disable(const ipc::DisableModule& request);
+    void handle_module_events(const ipc::ModuleEvents& events, const std::function<void()>& after_step, SessionOutcome& outcome);
+    void apply_loaded(const ipc::ModuleEntry& module);
+    void apply_unloaded(const ipc::ModuleEntry& module);
     SessionOutcome violation(std::uint64_t request_id, std::string message);
 
     std::uint64_t agent_id_;
@@ -83,6 +100,9 @@ private:
     std::string agent_path_;
     std::string command_line_;
     std::string restart_token_;
+    std::uint32_t agent_abi_version_ = 0;
+    std::uint64_t module_events_applied_ = 0;
+    std::uint64_t module_event_resyncs_ = 0;
     std::vector<ipc::ModuleEntry> modules_;
     std::vector<std::string> enabled_;  // full paths of enabled modules
 };

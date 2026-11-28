@@ -1745,6 +1745,41 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 - **What to do:** The patch was placed too far from the data it refers to; reserve address space nearer the module (or reload) so the patch lands within 2 GiB.  
 - **Raised by:** `agent/src/loader/fixup_diag_ids.h`
 
+### CML4720
+
+- **Cause:** (warning, agent) The agent could not register for the loader's module notifications (`LdrRegisterDllNotification` is missing or failed, there was no memory for the notification ring, or the test option `CML_TEST_NO_LOADER_NOTIFICATIONS` is set). It falls back to comparing the process's module list every 500 ms, as agents before WP-48 did. A DLL that is freed and loaded again between two of those comparisons (FreeLibrary + LoadLibrary at the same base) is not seen: the new image runs its original code and the session's edits are not re-applied to it.  
+- **Message:** `loader notifications are switched off (...)` / `LdrRegisterDllNotification is not available; ...` / `LdrRegisterDllNotification failed (NTSTATUS 0x...); module changes are seen by a module-list diff every 500 ms, so a module freed and loaded again in between keeps running its original code`  
+- **What to do:** Unset `CML_TEST_NO_LOADER_NOTIFICATIONS` if it is set. Otherwise report it with the agent log (`CML_AGENT_LOG`) and the Windows version. Until then, leave more than half a second between freeing a module and loading it again, or hot-restart after loading it again.  
+- **Raised by:** `agent/src/module_event_ids.h`
+
+### CML4721
+
+- **Cause:** (warning, agent) More modules were loaded and unloaded between two drains of the agent's notification ring (256 events; it is drained every 500 ms, and as soon as it is half full) than it holds, so loader notifications were lost. The agent completed that report from the process's module list. A module freed and loaded again at the same base in that moment may not be seen and may run its original code. The broker reports the same moment as CML5620.  
+- **Message:** `<n> loader notification(s) did not fit the agent's ring (256 slots); the module changes of this poll are completed from the module list, so a module freed and loaded again in that time may run its original code`  
+- **What to do:** Usually nothing: bursts like this happen while a program starts and loads many DLLs, before any module is edited. If a module you edited was freed and loaded again in that moment, load it again (or hot-restart) to get the session's edits re-applied.  
+- **Raised by:** `agent/src/module_event_ids.h`
+
+### CML4722
+
+- **Cause:** (warning, agent) What the agent had reported from the loader's notifications and the process's module list disagreed in two quiet polls in a row (nothing was loaded or unloaded in between), so the module list was taken as the truth and the difference reported. This should not happen; a single disagreement is normal while a load or unload is under way and is never reported.  
+- **Message:** `the agent's module events and the process's module list disagreed twice in a row; the list is taken as the truth (<n> change(s) reported from it)`  
+- **What to do:** Nothing is needed for the session to go on. Report it with the agent log (`CML_LOG_LEVEL=debug`, `CML_AGENT_LOG`): it is a defect in how the agent reads the loader's notifications.  
+- **Raised by:** `agent/src/module_event_ids.h`
+
+### CML4723
+
+- **Cause:** (warning, agent) A module whose full path is longer than a notification slot holds (520 characters) was loaded and unloaded again before the agent's next poll, so its path could not be read from the module list either. The agent completed that report from the module list.  
+- **Message:** `a module with a path longer than 520 characters was loaded and unloaded again before the agent could read its path; the module changes of this poll are completed from the module list`  
+- **What to do:** Nothing for the session; a module with such a path that stays loaded is reported normally. Use shorter paths if the module is one you edit.  
+- **Raised by:** `agent/src/module_event_ids.h`
+
+### CML4724
+
+- **Cause:** (warning, agent) A function the agent hooked holds neither the agent's jump nor the function's original bytes. A debugger set a breakpoint on it, another tool detoured it, or its page cannot be read. That is no proof that the module was freed and loaded again, so the hook record is kept and the module is still taken for the hooked image. It is logged once per function and session. (A record whose bytes read the original ones, or whose range is no longer mapped, proves a new image and is forgotten.)  
+- **Message:** `the hooked function <name> at <address> in <module> holds neither the agent's jump nor its original bytes (a breakpoint, or another tool's detour; <n> such hook(s) in the module): the hook record is kept, and the module is not taken for a new image`  
+- **What to do:** Usually nothing: remove the breakpoint when you are done. If another tool hooks the same functions, the two will overwrite each other. Use one of them for those functions, or hot-restart after the other tool is gone.  
+- **Raised by:** `agent/src/module_event_ids.h`
+
 
 ## CML5200 to CML5299
 
@@ -2422,6 +2457,20 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 - **Message:** `module '<...>' (process <...>) runs its original code: the session's edits of <files> were not re-applied because its PDB index failed: <the index's diagnostic>`  
 - **What to do:** Fix what the index diagnostic says, then run `reload` (or load the module again).  
 - **Raised by:** `broker/cml_core/include/cml/core/reenable_diag_ids.h`
+
+### CML5620
+
+- **Cause:** (warning, broker; also a `diag` event, stage `modules`) The agent of a process reported some of its module changes from a comparison of module lists instead of the loader's notifications: its notification ring overflowed (CML4721), a path could not be resolved (CML4723), or its list and the process's disagreed (CML4722). A module of that process freed and loaded again at the same base in that moment was not seen: it runs its original code, and the session's edits were not re-applied to it.  
+- **Message:** `the agent of process <pid> reported <n> module change(s) from a module-list diff (agent CML<id>, <n> loader notification(s) lost): a module freed and loaded again at the same base in that time was not seen and runs its original code`  
+- **What to do:** If a module of this process was freed and loaded again just then, load it again (or hot-restart) to get the session's edits re-applied. The agent's warning (forwarded to the broker log) names the cause.  
+- **Raised by:** `broker/cml_core/include/cml/core/module_event_diag_ids.h`
+
+### CML5621
+
+- **Cause:** (warning, broker log) An agent registered with an agent ABI before 3 (a `cml_agent.dll` from before WP-48). It reports module changes from a comparison of module lists every 500 ms, so a module freed and loaded again in between (FreeLibrary + LoadLibrary at the same base) is not seen and keeps running its original code. Everything else works with that agent.  
+- **Message:** `the agent of process <pid> speaks agent ABI <n>, which reports module changes from a module-list diff every 500 ms: a module freed and loaded again in between is not seen and keeps running its original code`  
+- **What to do:** Use `cml_agent.dll` from the same Chameleon build as the broker. The application does not need to be rebuilt: the agent's C interface (`CML_AGENT_ABI_VERSION`) did not change.  
+- **Raised by:** `broker/cml_core/include/cml/core/module_event_diag_ids.h`
 
 ### CML5650
 

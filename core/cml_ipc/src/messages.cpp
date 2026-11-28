@@ -23,6 +23,8 @@ Diag malformed(const char* type_name, const char* what) {
 
 // Smallest encoded ModuleEntry: base + size + empty string.
 constexpr std::size_t kMinModuleEntryBytes = 8 + 8 + 4;
+// Smallest encoded ModuleEvent (WP-48): kind + seq + the smallest entry.
+constexpr std::size_t kMinModuleEventBytes = 4 + 8 + kMinModuleEntryBytes;
 // Smallest encoded HookSpec (two addresses + empty name) and HookResult (three u32 + empty text).
 constexpr std::size_t kMinHookSpecBytes = 8 + 8 + 4;
 constexpr std::size_t kMinHookResultBytes = 4 + 4 + 4 + 4;
@@ -280,6 +282,9 @@ void encode(Writer& w, const Welcome& m) {
     w.u32(m.protocol_version);
     w.u64(m.agent_id);
     w.str(m.broker_version);
+    if (m.agent_abi_version != 0) {
+        w.u32(m.agent_abi_version);  // WP-48: optional trailing field
+    }
 }
 void encode(Writer& w, const ModuleList& m) {
     w.u64(m.request_id);
@@ -302,6 +307,17 @@ void encode(Writer& w, const ModuleLoaded& m) {
 }
 void encode(Writer& w, const ModuleUnloaded& m) {
     w.entry(m.module);
+}
+void encode(Writer& w, const ModuleEvents& m) {
+    w.u32(m.flags);
+    w.u32(m.reason);
+    w.u64(m.lost);
+    w.u32(static_cast<std::uint32_t>(m.events.size()));
+    for (const ModuleEvent& e : m.events) {
+        w.u32(static_cast<std::uint32_t>(e.kind));
+        w.u64(e.seq);
+        w.entry(e.module);
+    }
 }
 void encode(Writer& w, const Log& m) {
     w.u32(m.level);
@@ -532,6 +548,9 @@ Message decode_welcome(Reader& r) {
     m.protocol_version = r.u32();
     m.agent_id = r.u64();
     m.broker_version = r.str();
+    if (r.ok() && r.remaining() > 0) {
+        m.agent_abi_version = r.u32();  // WP-48: optional trailing field
+    }
     return m;
 }
 Message decode_module_list(Reader& r) {
@@ -575,6 +594,39 @@ Message decode_loaded(Reader& r) {
 Message decode_unloaded(Reader& r) {
     ModuleUnloaded m;
     m.module = r.entry();
+    return m;
+}
+Message decode_module_events(Reader& r) {
+    ModuleEvents m;
+    m.flags = r.u32();
+    if (r.ok() && (m.flags & ~kModuleEventsKnownFlags) != 0) {
+        r.fail("unknown ModuleEvents flags");
+    }
+    m.reason = r.u32();
+    m.lost = r.u64();
+    const std::uint32_t count = r.u32();
+    if (r.ok() && count > kMaxModuleEvents) {
+        r.fail("event count above the limit of 16384");
+    }
+    // As for ModuleList: a lying count must be backed by real payload bytes before anything is reserved.
+    if (r.ok() && static_cast<std::uint64_t>(count) * kMinModuleEventBytes > r.remaining()) {
+        r.fail("event count is larger than the payload can hold");
+    }
+    if (r.ok()) {
+        m.events.reserve(count);
+        for (std::uint32_t i = 0; i < count && r.ok(); ++i) {
+            ModuleEvent e;
+            const std::uint32_t kind = r.u32();
+            if (r.ok() && kind != static_cast<std::uint32_t>(ModuleEventKind::Loaded) &&
+                kind != static_cast<std::uint32_t>(ModuleEventKind::Unloaded)) {
+                r.fail("unknown module event kind");
+            }
+            e.kind = static_cast<ModuleEventKind>(kind);
+            e.seq = r.u64();
+            e.module = r.entry();
+            m.events.push_back(std::move(e));
+        }
+    }
     return m;
 }
 Message decode_log(Reader& r) {
@@ -944,6 +996,7 @@ const char* to_string(MessageType type) noexcept {
         case MessageType::DisableModule: return "DisableModule";
         case MessageType::ModuleLoaded: return "ModuleLoaded";
         case MessageType::ModuleUnloaded: return "ModuleUnloaded";
+        case MessageType::ModuleEvents: return "ModuleEvents";
         case MessageType::ReserveRange: return "ReserveRange";
         case MessageType::ReserveRangeResult: return "ReserveRangeResult";
         case MessageType::ReleaseRange: return "ReleaseRange";
@@ -979,6 +1032,7 @@ bool is_implemented(MessageType type) noexcept {
         case MessageType::DisableModule:
         case MessageType::ModuleLoaded:
         case MessageType::ModuleUnloaded:
+        case MessageType::ModuleEvents:
         case MessageType::InstallHooks:
         case MessageType::HooksInstalled:
         case MessageType::Log:
@@ -1014,6 +1068,7 @@ MessageType type_of(const Message& message) noexcept {
         MessageType operator()(const DisableModule&) const noexcept { return MessageType::DisableModule; }
         MessageType operator()(const ModuleLoaded&) const noexcept { return MessageType::ModuleLoaded; }
         MessageType operator()(const ModuleUnloaded&) const noexcept { return MessageType::ModuleUnloaded; }
+        MessageType operator()(const ModuleEvents&) const noexcept { return MessageType::ModuleEvents; }
         MessageType operator()(const Log&) const noexcept { return MessageType::Log; }
         MessageType operator()(const CompileEvent&) const noexcept { return MessageType::CompileEvent; }
         MessageType operator()(const Restart&) const noexcept { return MessageType::Restart; }
@@ -1204,6 +1259,7 @@ Result<Message> decode_message(std::uint16_t type, std::uint16_t version, const 
         case MessageType::DisableModule: message = decode_disable(reader); break;
         case MessageType::ModuleLoaded: message = decode_loaded(reader); break;
         case MessageType::ModuleUnloaded: message = decode_unloaded(reader); break;
+        case MessageType::ModuleEvents: message = decode_module_events(reader); break;
         case MessageType::Log: message = decode_log(reader); break;
         case MessageType::CompileEvent: message = decode_compile_event(reader); break;
         case MessageType::Restart: message = decode_restart(reader); break;
@@ -1327,7 +1383,8 @@ std::string describe(const Message& message) {
         std::string operator()(const Welcome& m) const {
             return "Welcome request=" + std::to_string(m.request_id) +
                    " protocol=" + std::to_string(m.protocol_version) +
-                   " agent_id=" + std::to_string(m.agent_id) + " broker=" + quoted(m.broker_version);
+                   " agent_id=" + std::to_string(m.agent_id) + " broker=" + quoted(m.broker_version) +
+                   (m.agent_abi_version == 0 ? std::string() : " abi=" + std::to_string(m.agent_abi_version));
         }
         std::string operator()(const ModuleList& m) const {
             return "ModuleList request=" + std::to_string(m.request_id) +
@@ -1347,6 +1404,21 @@ std::string describe(const Message& message) {
         std::string operator()(const ModuleUnloaded& m) const {
             return "ModuleUnloaded base=0x" + hex(m.module.base) + " size=" +
                    std::to_string(m.module.size) + " path=" + quoted(m.module.path);
+        }
+        std::string operator()(const ModuleEvents& m) const {
+            // The first 16 events are listed (a resync can carry thousands), each path clipped as usual.
+            constexpr std::size_t kListed = 16;
+            std::string out = "ModuleEvents flags=" + std::to_string(m.flags) + " reason=" + std::to_string(m.reason) +
+                              " lost=" + std::to_string(m.lost) + " events=" + std::to_string(m.events.size());
+            for (std::size_t i = 0; i < m.events.size() && i < kListed; ++i) {
+                const ModuleEvent& e = m.events[i];
+                out += std::string(e.kind == ModuleEventKind::Loaded ? " [load" : " [unload") + " seq=" + std::to_string(e.seq) +
+                       " base=0x" + hex(e.module.base) + " size=" + std::to_string(e.module.size) + " path=" + quoted(e.module.path) + "]";
+            }
+            if (m.events.size() > kListed) {
+                out += " ... " + std::to_string(m.events.size() - kListed) + " more";
+            }
+            return out;
         }
         std::string operator()(const Log& m) const {
             return "Log level=" + std::to_string(m.level) + " text=" + quoted(m.text);

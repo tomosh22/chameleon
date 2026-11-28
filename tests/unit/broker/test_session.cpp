@@ -3,6 +3,7 @@
 
 #include <string>
 #include <variant>
+#include <vector>
 
 #include "cml/proc/diag_ids.h"
 #include "cml/util/log.h"
@@ -234,4 +235,167 @@ TEST_CASE("same_path normalisation") {
     CHECK_FALSE(Session::same_path("C:\\a\\b.dll", "C:\\a\\c.dll"));
     CHECK_FALSE(Session::same_path("C:\\a\\b.dll", "C:\\a\\b.dll "));
     CHECK(Session::same_path("", ""));
+}
+
+// --- WP-48 (ADR-0044): module events and the agent ABI ---------------------------------------------------------------------------
+
+namespace {
+
+ipc::ModuleEvent module_event(ipc::ModuleEventKind kind, std::uint64_t seq, const ipc::ModuleEntry& module) {
+    ipc::ModuleEvent e;
+    e.kind = kind;
+    e.seq = seq;
+    e.module = module;
+    return e;
+}
+
+const ipc::ModuleEntry kGameDll{0x180000000ull, 0x10000, "C:\\Games\\Demo\\Game.dll"};
+
+bool has_module(const Session& session, const ipc::ModuleEntry& module) {
+    for (const ipc::ModuleEntry& m : session.modules()) {
+        if (m.base == module.base && m.path == module.path) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+TEST_CASE("WP-48: an agent of ABI 3 gets the ABI back in Welcome; an older one gets the old Welcome and CML5621, and still works") {
+    QuietLogs quiet;
+    SUBCASE("ABI 3") {
+        Session session(1, "0.1.0");
+        ipc::Hello h = hello();
+        h.agent_abi_version = ipc::kAgentAbiModuleEvents;
+        const SessionOutcome outcome = session.on_message(h);
+        REQUIRE(outcome.replies.size() == 1);
+        CHECK(std::get<ipc::Welcome>(outcome.replies[0]).agent_abi_version == ipc::kAgentAbiModuleEvents);
+        CHECK(outcome.warnings.empty());
+        CHECK(session.module_events());
+        CHECK(session.agent_abi_version() == 3);
+    }
+    SUBCASE("a newer agent is answered with what this broker speaks") {
+        Session session(1, "0.1.0");
+        ipc::Hello h = hello();
+        h.agent_abi_version = 9;
+        const SessionOutcome outcome = session.on_message(h);
+        CHECK(std::get<ipc::Welcome>(outcome.replies[0]).agent_abi_version == ipc::kAgentAbiVersion);
+    }
+    SUBCASE("ABI 2 (every agent before WP-48)") {
+        Session session(1, "0.1.0");
+        ipc::Hello h = hello();
+        h.agent_abi_version = ipc::kAgentAbiSnapshots;
+        const SessionOutcome outcome = session.on_message(h);
+        REQUIRE(outcome.replies.size() == 1);
+        const auto& welcome = std::get<ipc::Welcome>(outcome.replies[0]);
+        CHECK(welcome.agent_abi_version == 0);  // not written: the old agent's decoder rejects trailing bytes
+        Result<std::vector<std::uint8_t>> frame = ipc::encode_frame(welcome);
+        REQUIRE(frame.has_value());
+        CHECK(frame->size() == ipc::kFrameHeaderSize + 8 + 4 + 8 + 4 + 5);  // exactly the WP-11 layout
+        REQUIRE(outcome.warnings.size() == 1);
+        CHECK(outcome.warnings[0].code == 5621);
+        CHECK(outcome.warnings[0].message.find("agent ABI 2") != std::string::npos);
+        CHECK_FALSE(session.module_events());
+        CHECK_FALSE(outcome.close);
+        // The old messages keep working: list, enable, unload, load.
+        CHECK(only_reply(session.on_message(module_list(2))).status == 0);
+        CHECK(only_reply(session.on_message(enable(3, "Game.dll"))).status == 0);
+        ipc::ModuleUnloaded unloaded;
+        unloaded.module = kGameDll;
+        session.on_message(unloaded);
+        CHECK_FALSE(has_module(session, kGameDll));
+        ipc::ModuleLoaded loaded;
+        loaded.module = kGameDll;
+        session.on_message(loaded);
+        CHECK(has_module(session, kGameDll));
+        CHECK(session.enabled_modules().size() == 1);
+    }
+}
+
+TEST_CASE("WP-48: ModuleEvents is applied one event at a time; the step hook sees the module gone, then back") {
+    QuietLogs quiet;
+    Registered r;
+    REQUIRE(only_reply(r.session.on_message(enable(3, "Game.dll"))).status == 0);
+    ipc::ModuleEvents events;
+    events.events.push_back(module_event(ipc::ModuleEventKind::Unloaded, 11, kGameDll));
+    events.events.push_back(module_event(ipc::ModuleEventKind::Loaded, 12, kGameDll));
+    std::vector<bool> present;
+    std::vector<std::uint64_t> revisions;
+    const std::uint64_t before = r.session.revision();
+    const SessionOutcome outcome = r.session.on_message(events, [&] {
+        present.push_back(has_module(r.session, kGameDll));
+        revisions.push_back(r.session.revision());
+    });
+    CHECK(outcome.replies.empty());  // an event: no answer
+    CHECK(outcome.warnings.empty());
+    CHECK_FALSE(outcome.close);
+    // Review 6: one step, between the unload and the load of the same base; the caller observes the end state after the message.
+    REQUIRE(present.size() == 1);
+    CHECK_FALSE(present[0]);  // after the unload
+    CHECK(revisions[0] > before);
+    CHECK(r.session.revision() > revisions[0]);
+    CHECK(has_module(r.session, kGameDll));  // after the load
+    CHECK(r.session.modules().size() == 3);
+    CHECK(r.session.enabled_modules().size() == 1);  // the enabled set is per path: unchanged
+    CHECK(r.session.module_events_applied() == 2);
+
+    SUBCASE("without a hook it is applied all the same") {
+        ipc::ModuleEvents more;
+        more.events.push_back(module_event(ipc::ModuleEventKind::Unloaded, 13, kGameDll));
+        r.session.on_message(more);
+        CHECK_FALSE(has_module(r.session, kGameDll));
+    }
+}
+
+TEST_CASE("WP-48 review 6: the step hook runs only between events at the same base, not once per event of a large report") {
+    QuietLogs quiet;
+    Registered r;
+    ipc::ModuleEvents events;
+    for (std::uint64_t i = 0; i < 400; ++i) {
+        events.events.push_back(module_event(ipc::ModuleEventKind::Loaded, 0, {0x300000000ull + i * 0x100000ull, 0x4000, "C:\\Games\\Demo\\m.dll"}));
+    }
+    int steps = 0;
+    r.session.on_message(events, [&] { ++steps; });
+    CHECK(steps == 0);
+    CHECK(r.session.modules().size() == 403);
+
+    // Load, unload, load of one base among others: a step after each event whose base comes up again (the first two).
+    ipc::ModuleEvents churn;
+    const ipc::ModuleEntry a{0x400000000ull, 0x4000, "C:\\Games\\Demo\\a.dll"};
+    const ipc::ModuleEntry b{0x410000000ull, 0x4000, "C:\\Games\\Demo\\b.dll"};
+    churn.events = {module_event(ipc::ModuleEventKind::Loaded, 1, a), module_event(ipc::ModuleEventKind::Loaded, 2, b),
+                    module_event(ipc::ModuleEventKind::Unloaded, 3, a), module_event(ipc::ModuleEventKind::Loaded, 4, a)};
+    std::vector<bool> a_present;
+    r.session.on_message(churn, [&] { a_present.push_back(has_module(r.session, a)); });
+    REQUIRE(a_present.size() == 2);
+    CHECK(a_present[0]);
+    CHECK_FALSE(a_present[1]);
+    CHECK(has_module(r.session, a));
+    CHECK(has_module(r.session, b));
+}
+
+TEST_CASE("WP-48: a resync from the agent is the warning CML5620, naming the process and the agent's reason") {
+    QuietLogs quiet;
+    Registered r;
+    ipc::ModuleEvents events;
+    events.flags = ipc::kModuleEventsResync;
+    events.reason = 4721;
+    events.lost = 12;
+    events.events.push_back(module_event(ipc::ModuleEventKind::Loaded, 0, {0x1A0000000ull, 0x4000, "C:\\Games\\Demo\\late.dll"}));
+    const SessionOutcome outcome = r.session.on_message(events);
+    REQUIRE(outcome.warnings.size() == 1);
+    CHECK(outcome.warnings[0].code == 5620);
+    CHECK(outcome.warnings[0].message.find("process 4321") != std::string::npos);
+    CHECK(outcome.warnings[0].message.find("CML4721") != std::string::npos);
+    CHECK(outcome.warnings[0].message.find("12 loader notification(s) lost") != std::string::npos);
+    CHECK(r.session.modules().size() == 4);
+    CHECK(r.session.module_event_resyncs() == 1);
+}
+
+TEST_CASE("WP-48: ModuleEvents before Hello is a protocol violation, like every message") {
+    QuietLogs quiet;
+    Session session(1, "0.1.0");
+    const SessionOutcome outcome = session.on_message(ipc::ModuleEvents{});
+    CHECK(outcome.close);
 }

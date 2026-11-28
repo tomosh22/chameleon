@@ -4554,6 +4554,118 @@ TEST_CASE("WP-45: a reload asked for while a re-apply runs waits for it instead 
     CHECK(diag_messages(rig, "CML5304").empty());
     wait_idle(rig);
 }
+
+// --- WP-48 (ADR-0044): module events -------------------------------------------------------------------------------------------
+
+namespace {
+
+// What the connection thread does with a message (connection_server.cpp): a ModuleEvents is applied one event at a time, and the
+// service sees the session after every step.
+void agent_says_stepped(Rig& rig, const ipc::Message& m) {
+    const auto observe = [&rig] {
+        rig.link->publish(rig.session);
+        rig.service->on_session_changed(1);
+    };
+    rig.session.on_message(m, observe);
+    observe();
+}
+
+ipc::ModuleEvents unload_and_load(const std::string& path, std::uint64_t first_seq) {
+    ipc::ModuleEvents events;
+    ipc::ModuleEvent gone;
+    gone.kind = ipc::ModuleEventKind::Unloaded;
+    gone.seq = first_seq;
+    gone.module = {kModuleBase, 0x4000, path};
+    ipc::ModuleEvent back = gone;
+    back.kind = ipc::ModuleEventKind::Loaded;
+    back.seq = first_seq + 1;
+    events.events = {gone, back};
+    return events;
+}
+
+}  // namespace
+
+TEST_CASE("WP-48: an unload and a load at the same base in one ModuleEvents take the WP-45 re-enable path: the edits are re-applied (R-53)") {
+    QuietLogs quiet;
+    Rig rig(false, std::string(), false, true);
+    {
+        ipc::Hello hello;
+        hello.request_id = 1;
+        hello.pid = kPid;
+        hello.agent_abi_version = ipc::kAgentAbiModuleEvents;
+        rig.session.on_message(hello);
+        rig.said_hello = true;
+    }
+    rig.enable();
+    rig.write_logic(22);
+    Result<Value> first = rig.reload();
+    REQUIRE_MESSAGE(first.has_value(), first.error().format());
+    REQUIRE(first->get_integer("patched") == 1);
+    REQUIRE(rig.compile_calls == 1);
+
+    // FreeLibrary + LoadLibrary between two agent polls: one message, the module list before and after it is the same.
+    agent_says_stepped(rig, unload_and_load(rig.exe, 7));
+    wait_idle(rig);
+    const std::shared_ptr<ModuleState> again = current_state(rig);
+    CHECK(again->instance == 2);  // a new instance: the old state was dropped and its baseline kept (the carry)
+    CHECK(again->index->carried_files() == 1);
+    CHECK(generation_of(*again) == 1);  // re-applied
+    CHECK(rig.compile_calls == 2);
+    CHECK(rig.seen<ipc::InstallHooks>().size() == 2);
+    CHECK_FALSE(rig.service->has_carry_for_testing(kPid, rig.exe));
+    CHECK(diag_messages(rig, "CML5600").empty());
+    CHECK(rig.session.module_events_applied() == 2);
+
+    // The next edit links in the new instance's own directory, as after a free + load the poll saw (WP-45, F-42.2).
+    rig.option("narrow_hooks", Value::boolean(false));
+    rig.write_logic(333);
+    Result<Value> second = rig.reload();
+    REQUIRE_MESSAGE(second.has_value(), second.error().format());
+    CHECK(second->get_integer("patched") == 1);
+}
+
+TEST_CASE("WP-48: the same two events seen as one change of the module list (what the 500 ms diff saw) change nothing: why they are stepped") {
+    QuietLogs quiet;
+    Rig rig(false, std::string(), false, true);
+    rig.enable();
+    rig.write_logic(22);
+    REQUIRE(rig.reload().has_value());
+    REQUIRE(rig.compile_calls == 1);
+    agent_says(rig, unload_and_load(rig.exe, 7));  // the service looks only once, after both events
+    wait_idle(rig);
+    CHECK(current_state(rig)->instance == 1);
+    CHECK(rig.compile_calls == 1);
+}
+
+TEST_CASE("WP-48: an agent of ABI 2 (before WP-48) still works: ModuleUnloaded and ModuleLoaded take the re-enable path as before") {
+    QuietLogs quiet;
+    Rig rig(false, std::string(), false, true);
+    {
+        ipc::Hello hello;
+        hello.request_id = 1;
+        hello.pid = kPid;
+        hello.agent_abi_version = ipc::kAgentAbiSnapshots;
+        const SessionOutcome outcome = rig.session.on_message(hello);
+        REQUIRE(outcome.replies.size() == 1);
+        CHECK(std::get<ipc::Welcome>(outcome.replies[0]).agent_abi_version == 0);
+        REQUIRE(outcome.warnings.size() == 1);
+        CHECK(outcome.warnings[0].code == 5621);
+        rig.said_hello = true;
+    }
+    rig.enable();
+    rig.write_logic(22);
+    Result<Value> first = rig.reload();
+    REQUIRE_MESSAGE(first.has_value(), first.error().format());
+    REQUIRE(first->get_integer("patched") == 1);
+    unload_exe(rig);
+    load_exe(rig);
+    wait_idle(rig);
+    const std::shared_ptr<ModuleState> again = current_state(rig);
+    CHECK(again->instance == 2);
+    CHECK(generation_of(*again) == 1);
+    CHECK(rig.compile_calls == 2);
+    CHECK(diag_messages(rig, "CML5600").empty());
+}
 #endif  // _WIN32
 
 TEST_CASE("WP-45: SourceBaseline::adopt takes stamps and originals over as they are; restore marks the originals changed") {
