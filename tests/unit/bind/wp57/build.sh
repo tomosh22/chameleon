@@ -10,6 +10,15 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 W=${1:?work directory}
 CLANG_CL=${2:-clang-cl}
 LLD_LINK=${3:-lld-link}
+# (Review) the work directory is deleted first: never this directory, one inside it, one that holds it, `.` or `/`.
+W_ABS=$(realpath -m -- "$W")
+case "$W" in
+  . | ./ | / ) echo "build.sh: refusing work directory '$W'" >&2; exit 2 ;;
+esac
+if [ "$W_ABS" = "/" ] || [ "$W_ABS" = "$(pwd -P)" ] || [ "$W_ABS" = "$HERE" ] || [ "${W_ABS#"$HERE"/}" != "$W_ABS" ] || [ "${HERE#"$W_ABS"/}" != "$HERE" ]; then
+  echo "build.sh: refusing work directory '$W' ($W_ABS): it is /, the current directory, $HERE, inside it, or holds it" >&2
+  exit 2
+fi
 rm -rf "$W"
 mkdir -p "$W"
 cp "$HERE"/src/*.cpp "$HERE"/src/*.h "$W"/
@@ -18,7 +27,7 @@ cd "$W"
 INC=(-imsvc /usr/include/c++/13 -imsvc /usr/include/x86_64-linux-gnu/c++/13 -imsvc /usr/include -imsvc /usr/include/x86_64-linux-gnu -Wno-#warnings)
 CL=("$CLANG_CL" --target=x86_64-pc-windows-msvc /O2 /Ob2 /Z7 /std:c++17 /c /GS- "${INC[@]}" '-fdebug-compilation-dir=C:\wp57' "/clang:-fdebug-prefix-map=$W=C:\\wp57" /clang:-gno-codeview-command-line)
 "${CL[@]}" support.cpp /Fosupport.obj
-for c in s1_sort_other s3_once_other s7_r54_samecode s8_both_other s10_r54_keep_sig s11_benign_sig s12_r54_layout s13_callee_changed s14_callee_size s15_callee_same; do
+for c in s1_sort_other s3_once_other s7_r54_samecode s8_both_other s10_r54_keep_sig s11_benign_sig s12_r54_layout s13_callee_changed s14_callee_size s15_callee_same s16_label_cut s17_only_owner; do
   "${CL[@]}" "$c.old.cpp" "/Fo$c.old.obj"
   "${CL[@]}" "$c.new.cpp" "/Fo$c.new.obj"
   "$LLD_LINK" /DEBUG /NODEFAULTLIB /ENTRY:main /SUBSYSTEM:console '/pdbsourcepath:C:\wp57' "/OUT:$c.exe" "/PDB:$c.pdb" "/PDBALTPATH:$c.pdb" support.obj "$c.old.obj"

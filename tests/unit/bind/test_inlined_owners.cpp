@@ -63,11 +63,16 @@ struct Case {
     std::vector<Diag> lambda_proof;  // WP-53
     std::vector<Diag> owner_proof;   // WP-57
 
-    explicit Case(const std::string& n, bool prove_owners = true, std::size_t max_callee_pairs = 64) : name(n) {
+    // `uncomdat`: the section of the function whose decorated name begins so loses its COMDAT flag, as if the patch had been
+    // compiled without /Gy: its extent then runs to the next symbol of the section (a label inside it, here).
+    explicit Case(const std::string& n, bool prove_owners = true, std::size_t max_callee_pairs = 64, const std::string& uncomdat = {}) : name(n) {
         auto p = pdb::PdbIndex::open_pdb(path_of(n + ".pdb"));
         REQUIRE_MESSAGE(p.has_value(), p.error().message);
         pdb = *p;
         object_bytes = read_file(path_of(n + ".patch.obj"));
+        if (!uncomdat.empty()) {
+            clear_comdat(uncomdat);
+        }
         auto o = coff::Object::parse(coff::ByteSpan(object_bytes.data(), object_bytes.size()));
         REQUIRE_MESSAGE(o.has_value(), o.error().message);
         object = std::make_unique<coff::Object>(std::move(*o));
@@ -93,6 +98,21 @@ struct Case {
         InlinedProcVerdicts verdicts;
         lambda_proof = prove_inlined_lambda_statics(ni, &verdicts);
         owner_proof = prove_inlined_owner_statics(ni, &verdicts);
+    }
+
+    void clear_comdat(const std::string& prefix) {
+        auto o = coff::Object::parse(coff::ByteSpan(object_bytes.data(), object_bytes.size()));
+        REQUIRE_MESSAGE(o.has_value(), o.error().message);
+        std::int32_t section = 0;
+        for (const coff::Symbol& sym : o->symbols()) {
+            if (sym.name.substr(0, prefix.size()) == prefix && sym.section_number > 0) {
+                section = sym.section_number;
+            }
+        }
+        REQUIRE(section > 0);
+        const auto u16 = [&](std::size_t at) { return std::to_integer<std::size_t>(object_bytes[at]) | (std::to_integer<std::size_t>(object_bytes[at + 1]) << 8); };
+        const std::size_t header = 20 + u16(16) + 40 * static_cast<std::size_t>(section - 1);
+        object_bytes[header + 37] &= std::byte{0xEF};  // IMAGE_SCN_LNK_COMDAT (0x1000) is bit 4 of the characteristics' second byte
     }
 
     NarrowInput narrow_input() const {
@@ -362,4 +382,203 @@ TEST_CASE("the owner proof refuses a pairing whose procedure is not hooked or wh
     out = prove_inlined_owner_statics(ni);
     REQUIRE(out.size() == 1);
     CHECK(contains(out.front().message, "the old code of 'f' is not available"));
+}
+
+namespace {
+
+const char* const kApply = "??$apply@V<lambda_1>@";
+
+// The decorated name of the patch's apply<lambda_1> and the code records an earlier patch would have kept for f and for it
+// (finalised with `apply_at` as the address of apply's code that f's record calls).
+struct EarlierPatch {
+    std::string apply;
+    std::shared_ptr<const CodeImage> f_record;
+    std::shared_ptr<const CodeImage> apply_record;
+};
+
+EarlierPatch earlier_patch(const Case& c, std::uint64_t f_at, std::uint64_t apply_at) {
+    EarlierPatch e;
+    for (const SymbolDecision& d : c.plan.decisions) {
+        if (d.type == SymbolType::Function && d.name.rfind(kApply, 0) == 0) {
+            e.apply = d.name;
+        }
+    }
+    REQUIRE(!e.apply.empty());
+    const NarrowInput ni = c.narrow_input();
+    const CodeRecorder recorder(ni);
+    const auto address_of = [&](const std::string& name) -> std::optional<std::uint64_t> {
+        if (name == e.apply) {
+            return apply_at;
+        }
+        return name == "?f@@YAXPEAHH@Z" ? std::optional<std::uint64_t>(f_at) : std::nullopt;
+    };
+    std::optional<CodeImage> f_code = recorder.capture("?f@@YAXPEAHH@Z");
+    std::optional<CodeImage> apply_code = recorder.capture(e.apply);
+    REQUIRE(f_code.has_value());
+    REQUIRE(apply_code.has_value());
+    REQUIRE(finalize_code(*f_code, address_of));
+    REQUIRE(finalize_code(*apply_code, address_of));
+    e.f_record = std::make_shared<const CodeImage>(std::move(*f_code));
+    e.apply_record = std::make_shared<const CodeImage>(std::move(*apply_code));
+    return e;
+}
+
+// The old apply<lambda_1>'s entry RVA (where the old f calls it).
+std::uint32_t old_apply_rva(const Case& c) {
+    const Result<std::vector<pdb::SymbolView>> syms = c.pdb->compiland_symbols(c.plan.compiland_index);
+    REQUIRE(syms.has_value());
+    for (const pdb::SymbolView& v : *syms) {
+        if (pdb::is_proc_kind(v.kind) && std::string(v.name).find("apply<") != std::string::npos) {
+            return v.rva;
+        }
+    }
+    return 0;
+}
+
+}  // namespace
+
+TEST_CASE("review: a callee cut at a label (no /Gy) is checked against the PDB's size, not the earlier record's (s16)") {
+    // s16 is s15 with two labels inside apply<lambda_1> (inline asm). With its section a COMDAT the labels change nothing: the
+    // whole section is the function. Without the COMDAT flag (a patch built without /Gy) apply's extent ends at the first
+    // label, so the bytes after it would never be compared; WP-49's check against the old procedure's size refuses it.
+    {
+        const Case c("s16_label_cut");
+        check_reloads(c);
+    }
+    const Case cut("s16_label_cut", true, 64, kApply);
+    REQUIRE(cut.planned);
+    {
+        // Against the module file: the old procedure's size is not the cut extent.
+        const Diag& d = check_refused(cut);
+        CHECK(contains(d.message, "'f' cannot be proven unchanged"));
+        CHECK(contains(d.message, "the old procedure there has"));
+    }
+    const SymbolDecision& f = cut.decision("?f@@YAXPEAHH@Z");
+    const std::uint32_t apply_rva = old_apply_rva(cut);
+    REQUIRE(apply_rva != 0);
+    {
+        // A later reload where an earlier patch hooked the old apply (in the module image): its record was cut at the same
+        // label, so its length proved nothing (b1be388 compared the cut extents and proved f). Now the old procedure's size
+        // from the PDB is the extent to check, and the cut function is refused.
+        const std::uint64_t apply_va = 0x140000000ull + apply_rva;
+        const EarlierPatch e = earlier_patch(cut, 0x150000000ull, apply_va);
+        NarrowInput ni = cut.narrow_input();
+        ni.is_hooked = [&](std::uint64_t va) { return va == f.old_address.va || va == apply_va; };
+        ni.prior_code = [&](std::uint64_t va) -> std::shared_ptr<const CodeImage> {
+            if (va == f.old_address.va) {
+                return e.f_record;
+            }
+            return va == apply_va ? e.apply_record : nullptr;
+        };
+        const std::vector<Diag> out = prove_inlined_owner_statics(ni);
+        REQUIRE(out.size() == 1);
+        CHECK(contains(out.front().message, "'f' cannot be proven unchanged"));
+        CHECK(contains(out.front().message, "size-differs"));
+        CHECK(contains(out.front().message, "the PDB's size"));
+    }
+    {
+        // A later reload where f's earlier-patch copy calls that patch's own copy of apply (outside the module image): only the
+        // record's size is known, so a callee that is not a COMDAT is not compared (UnknownOldSize).
+        const std::uint64_t apply_copy = 0x150001000ull;
+        const EarlierPatch e = earlier_patch(cut, 0x150000000ull, apply_copy);
+        NarrowInput ni = cut.narrow_input();
+        ni.is_hooked = [&](std::uint64_t va) { return va == f.old_address.va; };
+        ni.prior_code = [&](std::uint64_t va) -> std::shared_ptr<const CodeImage> {
+            if (va == f.old_address.va) {
+                return e.f_record;
+            }
+            return va == apply_copy ? e.apply_record : nullptr;
+        };
+        const std::vector<Diag> out = prove_inlined_owner_statics(ni);
+        REQUIRE(out.size() == 1);
+        CHECK(contains(out.front().message, "'f' cannot be proven unchanged"));
+        CHECK(contains(out.front().message, "unknown-old-size"));
+    }
+    {
+        // The same with the COMDAT intact: the callee is its whole section and compares with the earlier copy.
+        const Case whole("s16_label_cut");
+        const SymbolDecision& wf = whole.decision("?f@@YAXPEAHH@Z");
+        const std::uint64_t apply_copy = 0x150001000ull;
+        const EarlierPatch e = earlier_patch(whole, 0x150000000ull, apply_copy);
+        NarrowInput ni = whole.narrow_input();
+        ni.is_hooked = [&](std::uint64_t va) { return va == wf.old_address.va; };
+        ni.prior_code = [&](std::uint64_t va) -> std::shared_ptr<const CodeImage> {
+            if (va == wf.old_address.va) {
+                return e.f_record;
+            }
+            return va == apply_copy ? e.apply_record : nullptr;
+        };
+        CHECK(prove_inlined_owner_statics(ni).empty());
+    }
+}
+
+TEST_CASE("review: a listed pairing teaches no section layout; its guard is placed from another static or not at all") {
+    {
+        // s3: f's own x is listed; its guard (clang-cl records none) is placed by the layout that s_count's ordinary pairing
+        // taught: the delta of the section is s_count's.
+        const Case c("s3_once_other");
+        check_reloads(c);
+        const SymbolDecision* count = nullptr;
+        for (const SymbolDecision& d : c.plan.decisions) {
+            if (d.name.rfind("?s_count@", 0) == 0) {
+                count = &d;
+            }
+        }
+        REQUIRE(count != nullptr);
+        REQUIRE(count->decision == DecisionKind::BindOldData);
+        const SymbolDecision& guard = c.decision(kOwnGuard);
+        CHECK(guard.source == BindSource::CompilandLayout);
+        CHECK(guard.section == count->section);
+        CHECK(static_cast<std::int64_t>(guard.old_address.rva) - guard.value == static_cast<std::int64_t>(count->old_address.rva) - count->value);
+    }
+    {
+        // s17: no other static of the file has a record, so the listed x is the only pairing of its section. Its pairing must
+        // not teach the layout (b1be388 placed the guard from it, and proved f): the guard has no layout to be placed from, and
+        // the plan refuses it (CML3600) rather than bind it from an unproven pairing.
+        const Case c("s17_only_owner");
+        CHECK_FALSE(c.planned);
+        REQUIRE(c.listed(kOwnX) != nullptr);
+        CHECK(c.decision(kOwnGuard).decision != DecisionKind::BindOldData);
+        bool cml3600 = false;
+        for (const Diag& e : c.plan_errors) {
+            cml3600 = cml3600 || e.code == diag::kGuardMismatch;
+        }
+        CHECK(cml3600);
+    }
+}
+
+TEST_CASE("review: the proof says 'cannot be proven unchanged' where it could not judge, 'changed' where the code differs") {
+    {
+        const Case c("s13_callee_changed");
+        const Diag& d = check_refused(c);
+        CHECK(contains(d.message, "'f' cannot be proven unchanged"));
+        CHECK_FALSE(contains(d.message, "the code of 'f' changed"));
+    }
+    {
+        const Case c("s12_r54_layout");
+        const Diag& d = check_refused(c);
+        CHECK(contains(d.message, "the code of 'f' changed"));
+        CHECK_FALSE(contains(d.message, "cannot be proven unchanged"));
+    }
+}
+
+TEST_CASE("review: one verdict per (entry, procedure); a procedure without an RVA is never kept") {
+    const Case c("s3_once_other");
+    REQUIRE(c.planned);
+    BindPlan plan = c.plan;
+    REQUIRE(plan.inlined_owner_statics.size() == 1);
+    NarrowInput ni = c.narrow_input();
+    ni.plan = &plan;
+    InlinedProcVerdicts verdicts;
+    // A verdict kept for the same entry under another name is not this procedure's.
+    verdicts[{plan.inlined_owner_statics[0].proc_rva, "another"}] = "not this one";
+    CHECK(prove_inlined_owner_statics(ni, &verdicts).empty());
+    CHECK(verdicts.count({plan.inlined_owner_statics[0].proc_rva, "f"}) == 1);
+    // Without an RVA the procedure is judged (here: not hooked) and nothing is kept.
+    plan.inlined_owner_statics[0].proc_rva = kNoRva;
+    InlinedProcVerdicts none;
+    const std::vector<Diag> out = prove_inlined_owner_statics(ni, &none);
+    REQUIRE(out.size() == 1);
+    CHECK(contains(out.front().message, "is not paired with a function of the patch"));
+    CHECK(none.empty());
 }

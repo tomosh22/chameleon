@@ -688,6 +688,7 @@ private:
     std::size_t wp51_refused_ = 0;
     std::size_t wp51_would_refuse_ = 0;
     std::set<std::uint32_t> wp51_checked_;  // positions of the statics already judged
+    std::set<std::uint32_t> wp57_listed_;   // WP-57: positions of the statics listed in inlined_owner_statics (they teach no layout)
     // WP-51: a static `sy` of function `encl` about to be paired with `record`. When the record lies directly in `encl`'s
     // own procedure (not in the function an inlined lambda's static is looked for in, WP-40) and that procedure inlined a
     // risky inlinee, the static is refused (CML3207) and true is returned.
@@ -1508,6 +1509,7 @@ bool Planner::refuse_inlined_owner(Sym& sy, const pdb::SymbolView& record, const
         CML_LOG(Trace, "WP57-LISTED static='%s' record rva=%s proc='%s' rva=%s risk=%s (%s): paired, the code of the procedure must prove it", sy.dec.display.c_str(),
                 hex(record.rva).c_str(), s.proc.c_str(), hex(p.rva).c_str(), v.risk.c_str(), step);
         plan_.inlined_owner_statics.push_back(std::move(s));
+        wp57_listed_.insert(pos);  // (review) teaches no layout: learn_delta, the closure step and learn_guard_layout skip it
         return false;
     }
     ++wp51_refused_;
@@ -2018,6 +2020,12 @@ Planner::ClosureId Planner::closure_of(const pdb::SymbolView& local) {
 }
 
 void Planner::learn_delta(const Sym& sy, std::uint32_t old_rva) {
+    if (wp57_listed_.count(static_cast<std::uint32_t>(&sy - syms_.data())) != 0) {
+        // WP-57 (review): a pairing listed for the proof (inlined_owner_statics) is not proven while the plan is made; the
+        // section's other statics and guards are placed only from proven or ordinary pairings.
+        CML_LOG(Trace, "WP57-NO-TEACH static='%s' record rva=%s: listed for the proof, teaches no section layout", sy.dec.display.c_str(), hex(old_rva).c_str());
+        return;
+    }
     if (sy.dec.section == 0 || secs_[sy.dec.section - 1].sec->is_comdat() || delta_conflict_.count(sy.dec.section) != 0) {
         return;
     }
@@ -2109,6 +2117,10 @@ void Planner::learn_guard_layout() {
         const Sym& sy = syms_[pos];
         if (sy.diagnosed || !sy.decided || sy.dec.decision != DecisionKind::BindOldData || sy.dec.old_address.rva != old_rva) {
             continue;  // refused after all (two statics on one record, ...)
+        }
+        if (wp57_listed_.count(pos) != 0) {
+            CML_LOG(Trace, "WP57-NO-TEACH static='%s' record rva=%s: listed for the proof, teaches no guard layout", sy.dec.display.c_str(), hex(old_rva).c_str());
+            continue;  // WP-57 (review): an unproven pairing teaches nothing
         }
         if (sy.dec.section == 0 || secs_[sy.dec.section - 1].sec->is_comdat() || delta_conflict_.count(sy.dec.section) != 0) {
             continue;
@@ -3067,7 +3079,11 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
                     CML_LOG(Trace, "bind: closure statics '%s': %s paired with the old record at rva %s (closure %s)", base.c_str(), sy.name.c_str(), hex(c->rva).c_str(),
                             ids[hits[m][0]].tail.c_str());
                     matched[unmatched[m]] = {c, BindSource::CompilandClosure};
-                    if (!overridden[m]) {
+                    if (wp57_listed_.count(unmatched[m]) != 0) {
+                        // WP-57 (review): listed for the proof, so neither it nor its twin teaches the layout.
+                        CML_LOG(Trace, "WP57-NO-TEACH static='%s' record rva=%s: listed for the proof, teaches no section layout (closure)", sy.dec.display.c_str(),
+                                hex(c->rva).c_str());
+                    } else if (!overridden[m]) {
                         learn_delta(sy, c->rva);
                     } else {
                         // A static paired across the numbers does not sit where the section's positions put its old record;

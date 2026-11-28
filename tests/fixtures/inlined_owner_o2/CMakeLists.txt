@@ -3,7 +3,9 @@
 #
 #   sorted.cpp   io_step(): an own `static Counter` next to a std::sort with a lambda. Until WP-57 the static was refused
 #                (CML3207, WP-51) on any edit of the file; now it pairs because io_step()'s code is the old code (the sort
-#                loop's instantiation over the closure compared with the old one).
+#                loop's instantiation over the closure compared with the old one). s_made and s_top are ordinary statics of
+#                the file: under clang-cl they teach the layout the static's record-less guard is placed from (a pairing
+#                that only the proof can keep teaches none).
 #   edits/       mark_2 (io_mark 1 -> 2), stacked/mark_3 (2 -> 3: io_step compared with the code patch 1 gave it);
 #                scenario tests/harness/scenarios/inlined_owner_o2.toml.
 if(MSVC)
