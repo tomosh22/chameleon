@@ -216,7 +216,8 @@ int run_headless(const Options& options) {
     // a file write per record (a warning or an error is still on disk before its log call returns).
     hub_options.background_writer = !options.log_file.empty();
     cml::core::LogHub hub(hub_options);
-    cml::set_log_sink(cml::core::LogHub::sink, &hub);
+    // WP-58 (review): the sink is the hub's until this function returns, on every path (the early returns below included).
+    const cml::core::LogSinkScope log_sink(hub);
     cml::set_log_level(options.verbose ? cml::LogLevel::Debug : cml::LogLevel::Info);
 
     cml::Result<std::string> pipe_name = cml::ipc::resolve_pipe_name(options.pipe);
@@ -289,7 +290,6 @@ int run_headless(const Options& options) {
     }
     CML_LOG(Info, "cml_broker exiting with code %d", exit_code);
     hub.attach_events(nullptr);
-    cml::set_log_sink(nullptr, nullptr);  // the hub is a local of this function
     hub.flush();  // WP-58: the log is complete before a console-close handler lets the process end
     SetEvent(g_done_event);  // releases a console-close handler that is waiting for the shutdown
     return exit_code;

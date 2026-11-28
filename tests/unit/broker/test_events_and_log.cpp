@@ -1,4 +1,5 @@
 // The event bus and the structured log sink (WP-12).
+#include <atomic>
 #include <cstdio>
 #include <fstream>
 #include <iterator>
@@ -36,6 +37,24 @@ std::FILE* open_scratch(const std::string& path) {
 std::string read_text(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
     return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+// The lines of `text` that hold `tag` followed by a number, those numbers in file order.
+std::vector<int> numbers_after(const std::string& text, const std::string& tag) {
+    std::vector<int> out;
+    for (std::size_t at = 0; at < text.size();) {
+        std::size_t end = text.find('\n', at);
+        if (end == std::string::npos) {
+            end = text.size();
+        }
+        const std::string line = text.substr(at, end - at);
+        at = end + 1;
+        const std::size_t k = line.find(tag);
+        if (k != std::string::npos) {
+            out.push_back(std::stoi(line.substr(k + tag.size())));
+        }
+    }
+    return out;
 }
 
 // Restores the process-wide log sink and level.
@@ -290,4 +309,131 @@ TEST_CASE("log hub: the background writer writes every record in order, a warnin
     CHECK(next[0].second == 500);
     CHECK(next[1].second == 500);
     std::fclose(file);
+}
+
+// WP-58 (review, findings 1 and 2): another thread logs while the background writer stops (what the destructor does first).
+// Every record reaches the file once, in the order that thread logged them: those queued before the writer stopped are in
+// its batches, the later ones are written by the logging thread after the writer's last batch. Under TSan this is also the
+// race of the writer's join against the logging thread (the mode is decided once, in the constructor).
+TEST_CASE("log hub: a record logged while the background writer stops is written after the earlier ones, in order") {
+    SinkGuard guard;
+    testpdb::TempDir dir;
+    const std::string path = dir.file("log_stop.txt");
+    std::FILE* file = open_scratch(path);
+    REQUIRE(file != nullptr);
+    constexpr int kRecords = 4000;
+    {
+        LogHub::Options options;
+        options.file = file;
+        options.background_writer = true;
+        LogHub hub(options);
+        std::atomic<int> logged{0};
+        std::thread other([&] {
+            for (int i = 0; i < kRecords; ++i) {
+                LogHub::sink(&hub, LogLevel::Trace, __FILE__, __LINE__, ("late " + std::to_string(i)).c_str());
+                logged.store(i + 1);
+                if (i % 997 == 0) {
+                    LogHub::sink(&hub, LogLevel::Warn, __FILE__, __LINE__, ("late " + std::to_string(++i)).c_str());
+                    logged.store(i + 1);
+                }
+            }
+        });
+        while (logged.load() < kRecords / 4) {
+            std::this_thread::yield();
+        }
+        hub.stop_writer();  // while `other` logs
+        const int when_stopped = logged.load();
+        other.join();
+        CHECK(when_stopped < kRecords);  // (the writer stopped while the other thread was logging)
+        LogHub::sink(&hub, LogLevel::Trace, __FILE__, __LINE__, "after the stop");
+        hub.flush();
+        hub.stop_writer();  // a second stop does nothing
+        CHECK(hub.records() == static_cast<std::uint64_t>(kRecords) + 1);
+    }
+    const std::string all = read_text(path);
+    const std::vector<int> late = numbers_after(all, ": late ");
+    REQUIRE(late.size() == static_cast<std::size_t>(kRecords));
+    bool ordered = true;
+    for (int i = 0; i < kRecords; ++i) {
+        ordered = ordered && late[static_cast<std::size_t>(i)] == i;
+    }
+    CHECK(ordered);
+    const std::size_t after = all.find("after the stop");
+    CHECK(after != std::string::npos);
+    CHECK(after > all.find(": late " + std::to_string(kRecords - 1)));
+    std::fclose(file);
+}
+
+// WP-58 (review, finding 6): sequence numbers and time stamps rise in the order of the file, whichever thread logs.
+TEST_CASE("log hub: the sequence numbers of the file rise, with several threads logging") {
+    SinkGuard guard;
+    testpdb::TempDir dir;
+    const std::string path = dir.file("log_seq.json");
+    std::FILE* file = open_scratch(path);
+    REQUIRE(file != nullptr);
+    {
+        LogHub::Options options;
+        options.file = file;
+        options.format = LogFormat::Json;
+        options.background_writer = true;
+        LogHub hub(options);
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 4; ++t) {
+            threads.emplace_back([&hub] {
+                for (int i = 0; i < 500; ++i) {
+                    LogHub::sink(&hub, LogLevel::Debug, __FILE__, __LINE__, "x");
+                }
+            });
+        }
+        for (std::thread& t : threads) {
+            t.join();
+        }
+    }
+    const std::string all = read_text(path);
+    std::int64_t last_seq = 0;
+    std::int64_t last_t = 0;
+    std::size_t lines = 0;
+    bool rising = true;
+    for (std::size_t at = 0; at < all.size();) {
+        const std::size_t end = all.find('\n', at);
+        REQUIRE(end != std::string::npos);
+        Result<ipc::json::Value> v = ipc::json::parse(all.substr(at, end - at));
+        at = end + 1;
+        REQUIRE(v.has_value());
+        const std::int64_t seq = v->get_integer("seq");
+        const std::int64_t t = v->get_integer("t_ms");
+        rising = rising && seq == last_seq + 1 && t >= last_t;
+        last_seq = seq;
+        last_t = t;
+        ++lines;
+    }
+    CHECK(lines == 2000);
+    CHECK(rising);
+    std::fclose(file);
+}
+
+// WP-58 (review, finding 5): run_headless installs its hub with a LogSinkScope declared after it, so that an early return
+// puts the default sink back before the hub is destroyed. A log call after the scope never reaches the hub.
+TEST_CASE("log hub: a LogSinkScope puts the default sink back on an early return") {
+    SinkGuard guard;
+    set_log_level(LogLevel::Info);
+    LogHub::Options options;
+    LogHub hub(options);
+    const auto startup = [&hub](bool fail_early) -> int {
+        const LogSinkScope scope(hub);
+        CML_LOG(Info, "starting");
+        if (fail_early) {
+            return 1;  // like run_headless when the pipe name cannot be resolved
+        }
+        CML_LOG(Info, "running");
+        return 0;
+    };
+    CHECK(startup(true) == 1);
+    CHECK(hub.records() == 1);
+    CML_LOG(Info, "after the early return");  // to the default sink (stderr), not to the hub
+    CHECK(hub.records() == 1);
+    CHECK(startup(false) == 0);
+    CHECK(hub.records() == 3);
+    CML_LOG(Info, "after the normal return");
+    CHECK(hub.records() == 3);
 }

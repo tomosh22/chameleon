@@ -43,7 +43,7 @@ revert, restart).
      `bind_inline_ms` WP-51's inline-site verdicts, `bind_guards_ms` the guards, `bind_reset_ms` WP-52's check of new
      statics), `bind_tls_ms`, `bind_undefined_ms`, `bind_fixups_ms`, `bind_init_ms` and `bind_assemble_ms` (both plans
      when rule (d) plans a unit twice). `bind_log_lines` and `log_lines` count the records the planner and the whole plan
-     stage logged: at `trace` every decision and fix-up is one, and their cost is part of each stage.
+     stage logged on the unit's thread: at `trace` every decision and fix-up is one, and their cost is part of each stage.
    * `WP50-ONEOFF what=module-image|linker-detection|reserve-range ms=...`: work done once per module at its first reload.
      The module file is normally read in the background once the index is ready (`image=background`; `kept=0` when the
      module was disabled during the read, whose copy is then dropped); `image=reload` means the first reload had to read it

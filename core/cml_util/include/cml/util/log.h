@@ -29,8 +29,8 @@ void set_log_sink(LogSink sink, void* user) noexcept;
 
 const char* to_string(LogLevel level) noexcept;
 
-// WP-58: the records log_write has dispatched since the process started (every thread), for attributing a stage's cost to
-// its logging. Relaxed: a count, not a synchronisation point.
+// WP-58: the records log_write has dispatched on the calling thread since the thread started, for attributing a stage's
+// cost to its logging (records of other threads, such as concurrent units or the pipe servers, are not counted).
 unsigned long long log_records_written() noexcept;
 
 #if defined(__GNUC__) || defined(__clang__)
