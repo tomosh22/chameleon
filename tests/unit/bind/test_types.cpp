@@ -25,6 +25,14 @@ namespace {
 
 bool contains(const std::string& hay, const std::string& needle) { return hay.find(needle) != std::string::npos; }
 
+std::size_t count_code(const std::vector<cml::Diag>& list, std::uint32_t code) {
+    std::size_t n = 0;
+    for (const cml::Diag& d : list) {
+        n += d.code == code ? 1u : 0u;
+    }
+    return n;
+}
+
 inline constexpr std::uint32_t kDebugChars = 0x42100040u;  // initialised data, discardable, readable, align 1
 
 // Function types used by the tests, added to a TypeSet in a caller-chosen order.
@@ -630,8 +638,12 @@ TEST_CASE("lambda statics: lambdas of a function that had no such static are new
     const std::string in_g = "?1??g@@YAXXZ@";
     SynthObj o;
     const std::uint32_t d = o.section(".data", kData, 0x60);
+    // (WP-52: the old lambdas record their guards, so the patch defines them too, as a compiler does; a bound static
+    // without a bound guard is refused, CML3211.)
     o.symbol(static_in_lambda("sname", 1), 0x20, static_cast<std::int32_t>(d), false, false);
+    o.symbol(static_in_lambda("$TSS0", 1), 0x28, static_cast<std::int32_t>(d), false, false);
     o.symbol(static_in_lambda("sname", 2), 0x30, static_cast<std::int32_t>(d), false, false);
+    o.symbol(static_in_lambda("$TSS0", 2), 0x38, static_cast<std::int32_t>(d), false, false);
     o.symbol(static_in_lambda("sname", 1, in_g), 0x40, static_cast<std::int32_t>(d), false, false);
     o.symbol(static_in_lambda("sname", 2, in_g), 0x50, static_cast<std::int32_t>(d), false, false);
     Built b = o.build();
@@ -675,8 +687,12 @@ TEST_CASE("lambda statics: without type records the planner does what it did bef
         SynthObj o;
         const std::uint32_t d = o.section(".data", kData, 0x40);
         o.symbol("?s_plain@?A0x1@@3HA", 0x10, static_cast<std::int32_t>(d), false, false);
+        // (WP-52: the old lambdas record their guards, so the patch defines them too, as a compiler does; a bound static
+        // without a bound guard is refused, CML3211.)
         o.symbol(static_in_lambda("sname", 1), 0x20, static_cast<std::int32_t>(d), false, false);
+        o.symbol(static_in_lambda("$TSS0", 1), 0x28, static_cast<std::int32_t>(d), false, false);
         o.symbol(static_in_lambda("sname", 2), 0x30, static_cast<std::int32_t>(d), false, false);
+        o.symbol(static_in_lambda("$TSS0", 2), 0x38, static_cast<std::int32_t>(d), false, false);
         Built b = o.build();
         auto r = plan_bind(lw.w.input(b));
         REQUIRE_MESSAGE(r.has_value(), err(r));
@@ -1067,9 +1083,12 @@ TEST_CASE("lambda statics: the reason says which side has several statics of the
     std::vector<cml::Diag> errors;
     auto r = plan_bind(lw.w.input(b), &errors);
     REQUIRE_FALSE(r.has_value());
-    REQUIRE(errors.size() == 2);
+    // (WP-52: plus CML3211 for lambda 2's bound `sname`, whose guard the patch leaves out.)
+    REQUIRE(count_code(errors, diag::kAmbiguousStatic) == 2);
     for (const cml::Diag& e : errors) {
-        CHECK(e.id() == "CML3207");
+        if (e.code != diag::kAmbiguousStatic) {
+            continue;
+        }
         CHECK(contains(e.message, "2 statics named 'sname' of the patch are in the lambda that has one in the old image"));
         CHECK_FALSE(contains(e.message, "the lambda has 1 statics"));
     }
@@ -1493,6 +1512,9 @@ TEST_CASE("statics of one name in two blocks: where the section's layout is know
     // it can only do while that layout is intact.
     const char* const guard = "?$TSS7@?4??get_argument_options@SceneTree@@UEBAXH@Z@4HA";
     o.obj.symbol(guard, 0x30, static_cast<std::int32_t>(d), false, false);
+    // (WP-52: the other block's guard too: the old image records a guard there, and a bound static needs a bound guard.)
+    const char* const guard8 = "?$TSS7@?8??get_argument_options@SceneTree@@UEBAXH@Z@4HA";
+    o.obj.symbol(guard8, 0x38, static_cast<std::int32_t>(d), false, false);
     o.proc(kOptions, "SceneTree::get_argument_options");
     o.block();
     o.record(at_20, "names");
@@ -1532,6 +1554,9 @@ TEST_CASE("statics of one name in two blocks: a known layout that predicts nothi
     o.obj.symbol("?s_new@?A0x1@@3HA", 0x10, static_cast<std::int32_t>(d), false, false);
     const std::uint32_t first = o.obj.symbol(kNames4, 0x40, static_cast<std::int32_t>(d), false, false);
     const std::uint32_t second = o.obj.symbol(kNames8, 0x50, static_cast<std::int32_t>(d), false, false);
+    // (WP-52: their guards, bound by their records; a bound static needs a bound guard.)
+    o.obj.symbol("?$TSS0@?4??get_argument_options@SceneTree@@UEBAXH@Z@4HA", 0x48, static_cast<std::int32_t>(d), false, false);
+    o.obj.symbol("?$TSS1@?8??get_argument_options@SceneTree@@UEBAXH@Z@4HA", 0x58, static_cast<std::int32_t>(d), false, false);
     o.proc(kOptions, "SceneTree::get_argument_options");
     o.block();
     o.record(first, "names");
@@ -1579,7 +1604,8 @@ TEST_CASE("statics of one name in two blocks: a layout that predicts an old reco
     BindPlan partial;
     auto r = plan_bind(w.input(b), &errors, &partial);
     REQUIRE_FALSE(r.has_value());
-    REQUIRE(errors.size() == 1);
+    // (WP-52: plus CML3211 for the bound `names`, whose guard the patch leaves out.)
+    REQUIRE(count_code(errors, diag::kAmbiguousStatic) == 1);
     CHECK(errors[0].id() == "CML3207");
     // (WP-40, R-48 item 10: the reason names the static whose prediction decided, and where it put it.)
     CHECK_MESSAGE(contains(errors[0].message, "on the old record at rva 0x3020 and places no old static named 'names' of 'SceneTree::get_argument_options' at the offset of this one; the layout decides"),

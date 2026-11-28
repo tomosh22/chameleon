@@ -384,8 +384,7 @@ TEST_CASE("R-54 review: an inner lambda's static recorded in the outer call oper
     const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
     o.symbol("?s_count@?A0x1@@3HA", 0x10, bss, false, false);
     const std::string gx = "?gx@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?4@XZ@4UObj@@A";
-    // (Its guard is left out: clang spells the guard's scope with another back-reference number than the static's,
-    // `QEBA?A?3@XZ` against `QEBA?A?4@XZ`, so the planner does not tie them together. Pre-existing, reported with WP-51.)
+    // (Its guard: the R-60 tests below.)
     o.symbol(gx, 0x20, bss, false, false);
     Built b = o.build();
     auto r = plan_bind(w.input(b));
@@ -424,6 +423,222 @@ TEST_CASE("R-61 review (WP-53): a record of another closure's call operator at t
         CHECK(p.inlined_lambda_statics[0].record_rva == 0x3020);
     }
     CHECK(d.decision == DecisionKind::BindOldData);  // (the shape this test is about: the layout pairs it)
+}
+
+// ---- WP-52 (R-60, ADR-0045): the nested lambda's guard is tied to its bound static -------------------------------------
+
+namespace {
+
+// clang 18's names for the nested case (x86_64-pc-windows-msvc -O2, docs/wp/WP-52.md): the guard does not count its own
+// name in the back-reference table, the static counts `gx`, so the same scope reads `?A?3@` in one and `?A?4@` in the other.
+const char* const kNestedGx = "?gx@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?4@XZ@4UObj@@A";
+const char* const kNestedGuard = "?$TSS0@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?3@XZ@4HA";
+// S_COMPILE3 version strings: the planner reads the spelling from the PATCH object's (convergence ruling B).
+const char* const kClang18 = "clang version 18.1.3";
+const char* const kClang19 = "clang version 19.1.5";
+const char* const kClang19Dev = "clang version 19.0.0git (https://github.com/llvm/llvm-project 1234abcd)";
+const char* const kCl = "Microsoft (R) Optimizing Compiler";
+
+// The patch of nested_world: s_count, the inner lambda's `gx` (0x20) and the guard `guard` (0x28), written by `compiler`
+// (none: no S_COMPILE3).
+Built nested_patch(const std::string& guard, const char* compiler = kClang18) {
+    SynthObj o;
+    const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+    o.symbol("?s_count@?A0x1@@3HA", 0x10, bss, false, false);
+    o.symbol(kNestedGx, 0x20, bss, false, false);
+    o.symbol(guard, 0x28, bss, false, false);
+    if (compiler != nullptr) {
+        o.compile3(compiler);
+    }
+    return o.build();
+}
+
+struct GuardCase {
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    cml::Result<BindPlan> r = cml::Result<BindPlan>(BindPlan{});
+};
+
+// A world (module compiled by `module_compiler`) whose TU has the file-scope `s_a` (0x10, teaches the layout) and the
+// procedure `function` with the static records `statics`; the patch (written by `patch_compiler`, none: no S_COMPILE3)
+// defines `s_a` and `symbols` (name, .bss offset).
+GuardCase plan_guards(const char* module_compiler, const char* patch_compiler, const std::string& function,
+                      const std::vector<std::pair<std::string, std::uint32_t>>& statics, const std::vector<std::pair<std::string, std::uint32_t>>& symbols) {
+    SynthWorld w = basic_world(false, module_compiler);
+    w.data(w.tu(), "`anonymous namespace'::s_a", 0x10);
+    w.proc_with_statics(w.tu(), function, 0x50, statics);
+    w.open();
+    SynthObj o;
+    const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+    o.symbol("?s_a@?A0x1@@3HA", 0x10, bss, false, false);
+    for (const auto& [name, offset] : symbols) {
+        o.symbol(name, offset, bss, false, false);
+    }
+    if (patch_compiler != nullptr) {
+        o.compile3(patch_compiler);
+    }
+    Built b = o.build();
+    GuardCase c;
+    c.r = plan_bind(w.input(b), &c.errors, &c.partial);
+    return c;
+}
+
+// Refused with exactly one CML3211, which names `static_name` and says `reason`.
+void check_static_refused(const GuardCase& c, const std::string& static_name, const std::string& reason) {
+    REQUIRE_FALSE(c.r.has_value());
+    REQUIRE(count_code(c.errors, diag::kGuardUnmatched) == 1);
+    const cml::Diag* e = nullptr;
+    for (const cml::Diag& d : c.errors) {
+        e = d.code == diag::kGuardUnmatched ? &d : e;
+    }
+    CAPTURE(e->message);
+    CHECK(e->id() == "CML3211");
+    CHECK(contains(e->message, "the function-local static"));
+    CHECK(contains(e->message, static_name));
+    CHECK(contains(e->message, "no guard of the patch that is bound to the old one is tied to it"));
+    CHECK(contains(e->message, reason));
+    CHECK(contains(e->message, "initialiser would run again"));
+    CHECK_FALSE(contains(e->message, "same function"));
+    CHECK(count_code(c.partial.warnings, diag::kGuardUnmatched) == 0);
+}
+
+// JPH::GetRTTIOfType(JPH::SphereShape *)'s `rtti` and its guard as cl and clang >= 19.1 write them ($TSS0 counted: `2` is
+// JPH in both), and the same guard as clang 18 writes it (`1` is JPH).
+const char* const kRtti = "?rtti@?1??GetRTTIOfType@JPH@@YAPEAVRTTI@2@PEAVSphereShape@2@@Z@4V32@A";
+const char* const kRttiGuardCounted = "?$TSS0@?1??GetRTTIOfType@JPH@@YAPEAVRTTI@2@PEAVSphereShape@2@@Z@4HA";
+const char* const kRttiGuardNotCounted = "?$TSS0@?1??GetRTTIOfType@JPH@@YAPEAVRTTI@1@PEAVSphereShape@1@@Z@4HA";
+
+}  // namespace
+
+TEST_CASE("R-60: the guard of a nested lambda's static is tied to the static and placed with it (clang 18 names)") {
+    // main (d110b5d): the guard was tied to no static (its scope is spelled with other back-references), so it got a fresh
+    // guard with the warning CML3211 while `gx` stayed bound: the patch ran gx's initialiser again over the live object.
+    SynthWorld w = basic_world(false, kClang18);
+    nested_world(w);
+    Built b = nested_patch(kNestedGuard);
+    auto r = plan_bind(w.input(b));
+    REQUIRE_MESSAGE(r.has_value(), err(r));
+    CHECK(decision(*r, kNestedGx).decision == DecisionKind::BindOldData);
+    CHECK(decision(*r, kNestedGx).old_address.rva == 0x3020);
+    const SymbolDecision guard = decision(*r, kNestedGuard);
+    CAPTURE(guard.reason);
+    CHECK(guard.decision == DecisionKind::BindOldData);
+    CHECK(guard.source == BindSource::CompilandLayout);
+    CHECK(guard.old_address.rva == 0x3028);
+    CHECK(count_code(r->warnings, diag::kGuardUnmatched) == 0);
+}
+
+TEST_CASE("R-60 review: the patch object's compiler decides the spelling, not the module's") {
+    SUBCASE("patch by clang 19.1, module by clang 18: the patch's spelling ties the guard") {
+        // In clang 18's reading `2` would be RTTI: another scope, and the bound rtti would be refused.
+        GuardCase c = plan_guards(kClang18, kClang19, "JPH::GetRTTIOfType", {{"rtti", 0x14}}, {{kRtti, 0x14}, {kRttiGuardCounted, 0x18}});
+        REQUIRE_MESSAGE(c.r.has_value(), err(c.r));
+        CHECK(decision(*c.r, kRtti).decision == DecisionKind::BindOldData);
+        CHECK(decision(*c.r, kRttiGuardCounted).decision == DecisionKind::BindOldData);
+        CHECK(decision(*c.r, kRttiGuardCounted).old_address.rva == 0x3018);
+        CHECK(count_code(c.r->warnings, diag::kGuardUnmatched) == 0);
+    }
+    SUBCASE("patch by clang 18, module by clang 19.1: clang 18's spelling") {
+        GuardCase c = plan_guards(kClang19, kClang18, "JPH::GetRTTIOfType", {{"rtti", 0x14}}, {{kRtti, 0x14}, {kRttiGuardNotCounted, 0x18}});
+        REQUIRE_MESSAGE(c.r.has_value(), err(c.r));
+        CHECK(decision(*c.r, kRttiGuardNotCounted).decision == DecisionKind::BindOldData);
+    }
+    SUBCASE("clang 19.0.0git is not known: a match in one reading ties nothing, and the bound static is refused") {
+        GuardCase c = plan_guards(kClang18, kClang19Dev, "JPH::GetRTTIOfType", {{"rtti", 0x14}}, {{kRtti, 0x14}, {kRttiGuardCounted, 0x18}});
+        check_static_refused(c, "rtti", "which reading is right is not known (the object's compiler is 'clang version 19.0.0git");
+        CHECK(decision(c.partial, kRttiGuardCounted).decision == DecisionKind::PatchNewData);
+    }
+    SUBCASE("no S_COMPILE3 in the patch (the module's clang 18 is not used): refused") {
+        GuardCase c = plan_guards(kClang18, nullptr, "JPH::GetRTTIOfType", {{"rtti", 0x14}}, {{kRtti, 0x14}, {kRttiGuardNotCounted, 0x18}});
+        check_static_refused(c, "rtti", "the object records no compiler");
+    }
+}
+
+TEST_CASE("R-60 review: where the compiler is not known, a match in one spelling only ties the guard to nothing (CML3211)") {
+    // The nested names in a patch whose S_COMPILE3 names no compiler the planner knows: clang 18's reading ties the guard to
+    // `gx`, cl's to nothing, and which is right cannot be told. 835ee2c tied it (the one-sided match).
+    SynthWorld w = basic_world(false);
+    nested_world(w);
+    Built b = nested_patch(kNestedGuard, "Test Compiler 19.44");
+    GuardCase c;
+    c.r = plan_bind(w.input(b), &c.errors, &c.partial);
+    check_static_refused(c, "gx", "which reading is right is not known");
+    CHECK(decision(c.partial, kNestedGuard).decision == DecisionKind::PatchNewData);
+}
+
+TEST_CASE("R-60 review: a cl guard is read in cl's spelling only, never tied to another function's static by clang 18's") {
+    // A cl object (cl counts `$TSS0`). `other`'s own static is not in the patch; in clang 18's reading its scope would be
+    // JPH::GetRTTIOfType(JPH::SphereShape *), the scope of `rtti`. 835ee2c took that one-sided match: `other` was tied to
+    // `rtti` and placed by the layout as if it were rtti's guard (next to rtti's real guard). In cl's `1` is GetRTTIOfType.
+    GuardCase c = plan_guards(kCl, kCl, "JPH::GetRTTIOfType", {{"rtti", 0x14}}, {{kRtti, 0x14}, {kRttiGuardCounted, 0x18}, {kRttiGuardNotCounted, 0x1C}});
+    REQUIRE_MESSAGE(c.r.has_value(), err(c.r));
+    CHECK(decision(*c.r, kRtti).decision == DecisionKind::BindOldData);
+    CHECK(decision(*c.r, kRttiGuardCounted).decision == DecisionKind::BindOldData);
+    CHECK(decision(*c.r, kRttiGuardCounted).old_address.rva == 0x3018);
+    const SymbolDecision g = decision(*c.r, kRttiGuardNotCounted);
+    CAPTURE(g.reason);
+    CHECK(g.decision == DecisionKind::PatchNewData);
+    CHECK(count_code(c.r->warnings, diag::kGuardUnmatched) == 1);  // tied to no static, and rtti has its own bound guard
+}
+
+TEST_CASE("R-60: a bound static whose guard cannot be tied is refused (CML3211, an error, naming the static)") {
+    // main: the warning CML3211, a fresh guard, and the plan accepted: the bound `gx` would be constructed again. The guard's
+    // back-reference is outside the table: its scope cannot be read, so it may be gx's.
+    const std::string guard = "?$TSS0@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?7@XZ@4HA";
+    SynthWorld w = basic_world(false, kClang18);
+    nested_world(w);
+    Built b = nested_patch(guard);
+    GuardCase c;
+    c.r = plan_bind(w.input(b), &c.errors, &c.partial);
+    check_static_refused(c, "gx", "cannot be read, so it may be this static's");
+    CHECK(decision(c.partial, guard).decision == DecisionKind::PatchNewData);
+}
+
+TEST_CASE("R-60: a guard tied to no static whose scope differs from every bound static's is still the warning CML3211") {
+    // Both scopes are read and differ, and nothing says `gx` has a guard: a fresh guard runs no bound initialiser again.
+    const char* const guards[] = {
+        "?$TSS0@?1??other@@YAHXZ@4HA",                                                                    // another function
+        "?$TSS0@?2???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?3@XZ@4HA",       // another block
+        "?$TSS0@?1???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@4HA",                                    // the outer lambda's
+    };
+    for (const char* guard : guards) {
+        CAPTURE(guard);
+        SynthWorld w = basic_world(false, kClang18);
+        nested_world(w);
+        Built b = nested_patch(guard);
+        auto r = plan_bind(w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        CHECK(decision(*r, kNestedGx).decision == DecisionKind::BindOldData);
+        CHECK(decision(*r, guard).decision == DecisionKind::PatchNewData);
+        CHECK(count_code(r->warnings, diag::kGuardUnmatched) == 1);
+    }
+}
+
+TEST_CASE("R-60 review: a bound static whose scope cannot be read and has no bound guard is refused next to an untied guard") {
+    // clang 18 names: `pm(void (K::*)())` holds `q`; a member pointer parameter (`P8K@@...`) is a type local_scope_key does
+    // not read. With its own guard both are tied as written and the guard is placed. With only other()'s untied guard, q's
+    // scope cannot be compared with it, so q is refused (convergence ruling: no function is matched).
+    const std::string q = "?q@?1??pm@@YAHP8K@@EAAXXZ@Z@4URegistry@@A";
+    const std::string own = "?$TSS0@?1??pm@@YAHP8K@@EAAXXZ@Z@4HA";
+    GuardCase d = plan_guards(kClang18, kClang18, "pm", {{"q", 0x14}}, {{q, 0x14}, {own, 0x18}});
+    REQUIRE_MESSAGE(d.r.has_value(), err(d.r));
+    CHECK(decision(*d.r, own).decision == DecisionKind::BindOldData);
+    CHECK(count_code(d.r->warnings, diag::kGuardUnmatched) == 0);
+    GuardCase c = plan_guards(kClang18, kClang18, "pm", {{"q", 0x14}}, {{q, 0x14}, {"?$TSS0@?1??other@@YAHXZ@4HA", 0x18}});
+    check_static_refused(c, "pm::q", "its own scope cannot be read");
+}
+
+TEST_CASE("R-60 review: a constant-initialised static needs no guard and does not make an untied guard an error") {
+    // clang 18: `int cinit() { static int n = 0; ... }`, `n` has no guard. An untied guard of another block of cinit (its
+    // static not in the patch): both scopes are read and differ, nothing says n has a guard: the warning. 835ee2c: CML3211.
+    const std::string n = "?n@?1??cinit@@YAHXZ@4HA";
+    GuardCase c = plan_guards(kClang18, kClang18, "cinit", {{"n", 0x14}}, {{n, 0x14}, {"?$TSS0@?2??cinit@@YAHXZ@4HA", 0x18}});
+    REQUIRE_MESSAGE(c.r.has_value(), err(c.r));
+    CHECK(decision(*c.r, n).decision == DecisionKind::BindOldData);
+    CHECK(count_code(c.r->warnings, diag::kGuardUnmatched) == 1);
+    // A guard whose scope cannot be read may be n's, whatever its block: refused (the safe side).
+    GuardCase d = plan_guards(kClang18, kClang18, "cinit", {{"n", 0x14}}, {{n, 0x14}, {"?$TSS0@?2??cinit@@YAHU7@@Z@4HA", 0x18}});
+    check_static_refused(d, "cinit::n", "cannot be read, so it may be this static's");
 }
 
 TEST_CASE("R-54 review: the R-54 edit one level down (the inner lambda deleted, its static's name declared in the outer lambda) is refused") {
@@ -723,4 +938,69 @@ TEST_CASE("WP-55 (R-62): the verdicts on inline sites are kept across the plans 
         CHECK(cache.kept() == 1);
         CHECK(cache.reads() == 1);
     }
+}
+
+// ---- WP-52 (ADR-0045 ruling): a new static never silently replaces a live one of its function (cl nested, R-66) --------
+
+namespace {
+
+// cl's names for the fixture's nested lambda (planner_pairing_o2/nested.cpp, CI run 46093165335): cl counts `$TSS0`, and the
+// outer closure is written as a back-reference (`??R1?1??`), which the closure comparisons of WP-37/40 do not resolve (R-68).
+const char* const kClNested = "?nested@?1???R<lambda_1>@?1???R1?1??o2_nest_step@@YAXXZ@QEBA@XZ@QEBA@XZ@4UO2Name@@A";
+const char* const kClNestedGuard = "?$TSS0@?1???R<lambda_1>@?1???R1?1??o2_nest_step@@YAXXZ@QEBA@XZ@QEBA@XZ@4HA";
+// clang 18's names for the same fixture, both lambdas inlined into o2_nest_step (R-66: the record two levels up).
+const char* const kClangNested = "?nested@?1???R<lambda_1>@?0???R<lambda_0>@?0??o2_nest_step@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?4@XZ@4UO2Name@@A";
+const char* const kClangNestedGuard = "?$TSS0@?1???R<lambda_1>@?0???R<lambda_0>@?0??o2_nest_step@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?3@XZ@4HA";
+
+void check_reset_refused(const GuardCase& c, const std::string& name) {
+    REQUIRE_FALSE(c.r.has_value());
+    REQUIRE(count_code(c.errors, diag::kAmbiguousStatic) == 1);
+    const cml::Diag* e = nullptr;
+    for (const cml::Diag& d : c.errors) {
+        e = d.code == diag::kAmbiguousStatic ? &d : e;
+    }
+    CAPTURE(e->message);
+    CHECK(e->id() == "CML3207");
+    CHECK(contains(e->message, "would be new in the patch"));
+    CHECK(contains(e->message, "records 'nested' at rva 0x3020"));
+    CHECK(contains(e->message, "a procedure of its function 'o2_nest_step'"));
+    CHECK(contains(e->message, "a new static would reset it"));
+    CHECK(decision(c.partial, name).decision == DecisionKind::PatchNewData);
+    CHECK(count_code(c.errors, diag::kGuardUnmatched) == 0);
+}
+
+}  // namespace
+
+TEST_CASE("WP-52 ruling: cl's nested lambda static, decided new, is refused while its function records a static of its name") {
+    // CI (857fa31, cl /O2): the static and its guard were decided new (new_globals=2) and the reload reset `nest` to 700001.
+    SUBCASE("the record in the function's own procedure (both lambdas inlined)") {
+        GuardCase c = plan_guards(kCl, kCl, "o2_nest_step", {{"nested", 0x20}}, {{kClNested, 0x20}, {kClNestedGuard, 0x28}});
+        check_reset_refused(c, kClNested);
+    }
+    SUBCASE("the record in the outer lambda's call operator, the only one of its name and no types to check: paired, not new") {
+        // (The rule applies only to a static decided new; this one is found, as before. In CI the closure types of the old
+        // image are read and do not match the back-referenced scope, R-68, and the static was new.)
+        GuardCase c = plan_guards(kCl, kCl, "`o2_nest_step'::`2'::<lambda_1>::operator()", {{"nested", 0x20}}, {{kClNested, 0x20}, {kClNestedGuard, 0x28}});
+        REQUIRE_MESSAGE(c.r.has_value(), err(c.r));
+        CHECK(decision(*c.r, kClNested).decision == DecisionKind::BindOldData);
+        CHECK(decision(*c.r, kClNestedGuard).decision == DecisionKind::BindOldData);
+    }
+}
+
+TEST_CASE("WP-52 ruling (R-66): clang 18's fully inlined nested lambda, its static recorded two levels up, is refused") {
+    // clang-cl 18 /O2 without the fixture's noinline: `nested` is a record of o2_nest_step itself; the planner looks one level
+    // up (the outer call operator, which has no procedure) and decided the static new: a silent reset.
+    GuardCase c = plan_guards(kClang18, kClang18, "o2_nest_step", {{"nested", 0x20}}, {{kClangNested, 0x20}, {kClangNestedGuard, 0x28}});
+    check_reset_refused(c, kClangNested);
+}
+
+TEST_CASE("WP-52 ruling: a static whose name no procedure of its function records is new, as before") {
+    const std::string fresh = "?fresh_one@?1???R<lambda_1>@?0???R<lambda_0>@?0??o2_nest_step@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?4@XZ@4UO2Name@@A";
+    GuardCase c = plan_guards(kClang18, kClang18, "o2_nest_step", {{"nested", 0x20}}, {{fresh, 0x30}});
+    REQUIRE_MESSAGE(c.r.has_value(), err(c.r));
+    CHECK(decision(*c.r, fresh).decision == DecisionKind::PatchNewData);
+    // Nor a static of that name in another function's procedures.
+    GuardCase d = plan_guards(kClang18, kClang18, "other_function", {{"nested", 0x20}}, {{kClangNested, 0x30}});
+    REQUIRE_MESSAGE(d.r.has_value(), err(d.r));
+    CHECK(decision(*d.r, kClangNested).decision == DecisionKind::PatchNewData);
 }

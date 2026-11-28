@@ -77,4 +77,28 @@ cml::Result<std::string> check_monotonic(std::string_view output, std::string_vi
     return name + ": " + std::to_string(values.size()) + " samples, " + std::to_string(values.front()) + " -> " + std::to_string(values.back());
 }
 
+cml::Result<std::string> check_continues(std::string_view before, std::string_view after, std::string_view key, std::size_t min_after) {
+    const std::vector<long long> old_values = tick_values(before, key);
+    const std::vector<long long> new_values = tick_values(after, key);
+    const std::string name(key);
+    if (old_values.empty()) {
+        return cml::Diag::make(cml::ids::kCounterNotMonotonic, "no TICK sample of '" + name + "' before the last reload",
+                               "Expect the key before the reload, or drop since_reload from this step.");
+    }
+    if (new_values.size() < min_after) {
+        return cml::Diag::make(cml::ids::kCounterNotMonotonic,
+                               "only " + std::to_string(new_values.size()) + " TICK samples of '" + name + "' since the last reload (at least " + std::to_string(min_after) +
+                                   " needed)",
+                               "Run the fixture longer after the reload before this step, or check that it prints the key.");
+    }
+    if (new_values.front() < old_values.back()) {
+        return cml::Diag::make(cml::ids::kCounterNotMonotonic,
+                               "'" + name + "' was " + std::to_string(old_values.back()) + " before the last reload and " + std::to_string(new_values.front()) +
+                                   " after it: the patched code is using its own copy of the state, not the old storage",
+                               "The bind planner must bind this variable to the old image (docs/wp/WP-07.md).");
+    }
+    return name + ": " + std::to_string(old_values.back()) + " before the reload, " + std::to_string(new_values.front()) + " after, " + std::to_string(new_values.size()) +
+           " samples since";
+}
+
 }  // namespace cmltest
