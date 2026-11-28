@@ -487,24 +487,29 @@ TEST_CASE("WP-50 (second review): an input edited after the scan read it makes t
     const std::string source = d.path("a.cpp");
     write_file(source, "#include \"a.h\"\nint a() { return 1; }\n");
     write_file(d.path("a.h"), "#pragma once\n");
+    const std::string nodir = (d.root / "nodir" / "x.h").string();
     const auto run_scan = [&](ScanInputRecorder& rec) {
         const ScanFileReader reader = rec.wrap(disk_file_reader());
         CHECK(reader(source).has_value());
         CHECK(reader(d.path("a.h")).has_value());
-        CHECK_FALSE(reader(d.path("missing.h")).has_value());                   // a candidate that does not exist
-        CHECK_FALSE(reader((d.root / "nodir" / "x.h").string()).has_value());  // in a directory that does not exist
+        CHECK_FALSE(reader(d.path("missing.h")).has_value());  // a candidate that does not exist
+        CHECK_FALSE(reader(nodir).has_value());                // in a directory that does not exist
     };
 
     // Nothing changed: cacheable.
     {
         ScanInputRecorder rec;
         run_scan(rec);
-        std::string why = "unset";
-        const std::vector<ScanInput> inputs = rec.finish({source, d.path("a.h"), d.dir()}, &why);
-        CHECK(why.empty());
-        REQUIRE(inputs.size() == 3);
-        CHECK(inputs[0].exists);
-        CHECK(inputs[2].directory);
+        for (const std::string& p : {source, d.path("a.h"), d.path("missing.h"), d.dir()}) {
+            CHECK(rec.not_cacheable(p).empty());
+        }
+        REQUIRE((rec.stamped(source) != nullptr));
+        CHECK(rec.stamped(source)->exists);
+        REQUIRE((rec.stamped(d.dir()) != nullptr));
+        CHECK(rec.stamped(d.dir())->directory);
+        CHECK((rec.stamped(nodir) == nullptr));  // its directory's stamp covers it
+        REQUIRE((rec.stamped((d.root / "nodir").string()) != nullptr));
+        CHECK_FALSE(rec.stamped((d.root / "nodir").string())->exists);
     }
 
     // The source gains #include "new.h" after the scan read it, before the result is stored.
@@ -514,43 +519,231 @@ TEST_CASE("WP-50 (second review): an input edited after the scan read it makes t
     write_file(source, "#include \"a.h\"\n#include \"new.h\"\nint a() { return 1; }\n");
     std::error_code ec;
     std::filesystem::last_write_time(source, std::filesystem::last_write_time(source, ec) + std::chrono::seconds(2), ec);
-    std::string why;
-    const std::vector<ScanInput> inputs = rec.finish({source, d.path("a.h"), d.dir()}, &why);
-    CHECK(why == "changed-during-scan:" + source);
-    REQUIRE(inputs.size() == 3);
-    CHECK(inputs[0].size == old_size);  // the stamp from before the read, not the edited file's
+    CHECK(rec.not_cacheable(source) == "changed-during-scan:" + source);
+    CHECK(rec.not_cacheable(d.path("a.h")).empty());
+    REQUIRE((rec.stamped(source) != nullptr));
+    CHECK(rec.stamped(source)->size == old_size);  // the stamp from before the read, not the edited file's
 
-    // Even if it were stored, such a result could never hit: the next find sees the source changed.
+    // Even if it were stored, such a part could never be reused: the next lookup sees the source changed.
     ScanCache cache;
     ModuleFileStamp stamp;
     stamp.size = 1;
     auto result = std::make_shared<ScanResult>();
-    result->inputs = inputs;
+    result->inputs = {*rec.stamped(source), *rec.stamped(d.path("a.h")), *rec.stamped(d.dir())};
+    CompilandScan part;
+    part.inputs = {0, 1, 2};
+    result->compilands.push_back(part);
     cache.store("C:\\bin\\m.exe", stamp, result);
     std::string reason;
     CHECK((cache.find("C:\\bin\\m.exe", stamp, &reason) == nullptr));
     CHECK(reason == "file-changed:" + source);
+    const ScanCache::Lookup found = cache.lookup("C:\\bin\\m.exe", stamp);
+    REQUIRE(found.stale.size() == 1);
+    CHECK(found.stale[0] == "file-changed:" + source);
+    CHECK(found.reusable == 0);
 }
 
-TEST_CASE("WP-50 (second review): a file that exists but cannot be read makes the scan uncacheable; a missing file or a directory does not") {
+TEST_CASE("WP-55 (R-63): a file over the size limit is an input with its stamp; only a read that may succeed later makes a part uncacheable") {
     ScratchDir d;
     write_file(d.path("ok.h"), "#pragma once\n");
     write_file(d.path("big.h"), std::string(9u * 1024u * 1024u, ' '));  // over the scanner's 8 MiB limit
-    {
-        ScanInputRecorder rec;
-        const ScanFileReader reader = rec.wrap(disk_file_reader());
-        CHECK(reader(d.path("ok.h")).has_value());
-        CHECK_FALSE(reader(d.path("missing.h")).has_value());
-        CHECK_FALSE(reader(d.dir()).has_value());  // an include naming a directory
-        std::string why = "unset";
-        rec.finish({d.path("ok.h"), d.dir()}, &why);
-        CHECK(why.empty());
-    }
+    write_file(d.path("locked.h"), "#pragma once\n");                     // stands for a sharing violation or a read error
     ScanInputRecorder rec;
-    const ScanFileReader reader = rec.wrap(disk_file_reader());
+    const ScanFileReader disk = disk_file_reader();
+    const std::string locked = d.path("locked.h");
+    const ScanFileReader reader = rec.wrap([&](const std::string& p) -> std::optional<std::string> {
+        if (p == locked) {
+            return std::nullopt;
+        }
+        return disk(p);
+    });
     CHECK(reader(d.path("ok.h")).has_value());
     CHECK_FALSE(reader(d.path("big.h")).has_value());
-    std::string why;
-    rec.finish({d.path("ok.h"), d.dir()}, &why);
-    CHECK(why == "unreadable:" + d.path("big.h"));
+    CHECK_FALSE(reader(d.path("missing.h")).has_value());
+    CHECK_FALSE(reader(d.dir()).has_value());  // an include naming a directory
+    CHECK_FALSE(reader(locked).has_value());
+
+    CHECK(rec.not_cacheable(d.path("ok.h")).empty());
+    CHECK(rec.not_cacheable(d.path("missing.h")).empty());
+    CHECK(rec.not_cacheable(d.dir()).empty());
+    // Over the limit: never read, whatever the attempt, so the same answer every time its stamp holds (was: unreadable:).
+    CHECK(rec.not_cacheable(d.path("big.h")).empty());
+    REQUIRE((rec.stamped(d.path("big.h")) != nullptr));
+    CHECK(rec.stamped(d.path("big.h"))->exists);
+    CHECK(rec.stamped(d.path("big.h"))->size > kScanMaxFileBytes);
+    // A file that exists, is under the limit and still could not be read: may succeed next time.
+    CHECK(rec.not_cacheable(locked) == "unreadable:" + locked);
+
+    // The big file shrinks (and now includes something): its stamp changes, so a part that recorded it is scanned again.
+    ScanCache cache;
+    ModuleFileStamp stamp;
+    stamp.size = 1;
+    auto result = std::make_shared<ScanResult>();
+    result->inputs = {*rec.stamped(d.path("ok.h")), *rec.stamped(d.path("big.h"))};
+    CompilandScan part;
+    part.inputs = {0, 1};
+    result->compilands.push_back(part);
+    cache.store("C:\\bin\\m.exe", stamp, result);
+    std::string reason;
+    CHECK((cache.find("C:\\bin\\m.exe", stamp, &reason) == result));
+    write_file(d.path("big.h"), "#pragma once\n#include \"ok.h\"\n");
+    CHECK((cache.find("C:\\bin\\m.exe", stamp, &reason) == nullptr));
+    CHECK(reason == "file-changed:" + d.path("big.h"));
+}
+
+TEST_CASE("WP-55 (R-58): a scan cache lookup reuses each compiland whose inputs are unchanged; a changed input, an uncached part or another stamp rescans") {
+    ScratchDir d;
+    const std::string a = d.path("a.cpp"), ah = d.path("a.h"), b = d.path("b.cpp"), shared = d.path("shared.h");
+    write_file(a, "#include \"a.h\"\n#include \"shared.h\"\n");
+    write_file(ah, "#pragma once\n");
+    write_file(b, "#include \"shared.h\"\n");
+    write_file(shared, "#pragma once\n");
+    std::error_code ec;
+    const auto bump = [&](const std::string& p) {
+        std::filesystem::last_write_time(p, std::filesystem::last_write_time(p, ec) + std::chrono::seconds(2), ec);
+    };
+    ModuleFileStamp stamp;
+    stamp.size = 4096;
+    stamp.mtime = 1700000000;
+    const std::string exe = "C:\\Game\\bin\\game.exe";
+    ScanCache cache;
+    const auto stored = [&](bool with_uncached) {
+        auto r = std::make_shared<ScanResult>();
+        r->inputs = {probe_scan_input(a), probe_scan_input(ah), probe_scan_input(b), probe_scan_input(shared), probe_scan_input(d.dir())};
+        CompilandScan c0;  // a.cpp: includes a.h and shared.h
+        c0.compiland = 0;
+        c0.inputs = {0, 1, 3};
+        c0.files = {0, 1, 3};
+        c0.deps = {1, 3};
+        CompilandScan c1;  // b.cpp: includes shared.h, and looked for a missing header in the directory
+        c1.compiland = 1;
+        c1.inputs = {2, 3, 4};
+        c1.files = {2, 3};
+        c1.deps = {3};
+        c1.uses_pch = true;  // a /Yu compiland whose precompiled header is unknown
+        CompilandScan c2;  // a toolchain archive member: nothing
+        c2.compiland = 2;
+        c2.toolchain = true;
+        r->compilands = {c0, c1, c2};
+        if (with_uncached) {
+            CompilandScan c3;
+            c3.compiland = 3;
+            c3.not_cacheable = "unreadable:" + ah;
+            c3.skipped = SkippedCompiland{3, "c.obj", "", "no build environment recorded"};
+            r->compilands.push_back(c3);
+        }
+        assemble_scan_result(*r);
+        cache.store(exe, stamp, r);
+        return r;
+    };
+
+    // What the parts assemble to.
+    {
+        const auto r = stored(true);
+        CHECK(r->files == std::set<std::string>{a, ah, b, shared});
+        CHECK(r->header_deps.at(shared) == std::vector<std::uint32_t>{0, 1});
+        CHECK(r->header_deps.at(ah) == std::vector<std::uint32_t>{0});
+        CHECK(r->skipped_set == std::set<std::uint32_t>{2, 3});
+        REQUIRE(r->skipped.size() == 1);
+        CHECK(r->skipped[0].compiland == 3);
+        CHECK(r->pch_unverified == std::set<std::uint32_t>{1});
+        // A part that could not be cached is scanned again, the others are reused.
+        const ScanCache::Lookup l = cache.lookup(exe, stamp);
+        CHECK((l.result == r));
+        REQUIRE(l.stale.size() == 4);
+        CHECK(l.stale[0].empty());
+        CHECK(l.stale[1].empty());
+        CHECK(l.stale[2].empty());
+        CHECK(l.stale[3] == "not-cached:unreadable:" + ah);
+        CHECK(l.reusable == 3);
+        CHECK(l.reason == "not-cached:unreadable:" + ah);
+        std::string reason;
+        CHECK((cache.find(exe, stamp, &reason) == nullptr));
+    }
+    const auto r = stored(false);
+    std::string reason;
+    CHECK((cache.find(exe, stamp, &reason) == r));
+    CHECK(reason.empty());
+
+    // a.cpp edited: only its compiland.
+    write_file(a, "#include \"a.h\"\n#include \"shared.h\"\n#include \"b2.h\"\n");
+    bump(a);
+    ScanCache::Lookup l = cache.lookup(exe, stamp);
+    REQUIRE(l.stale.size() == 3);
+    CHECK(l.stale[0] == "file-changed:" + a);
+    CHECK(l.stale[1].empty());
+    CHECK(l.stale[2].empty());
+    CHECK(l.reusable == 2);
+    CHECK(l.reason == "file-changed:" + a);
+
+    // shared.h edited: both compilands that include it.
+    stored(false);
+    bump(shared);
+    l = cache.lookup(exe, stamp);
+    CHECK(l.stale[0] == "file-changed:" + shared);
+    CHECK(l.stale[1] == "file-changed:" + shared);
+    CHECK(l.stale[2].empty());
+    CHECK(l.reusable == 1);
+
+    // The directory changed (a file created where b.cpp's walk found nothing): only b.cpp's compiland.
+    stored(false);
+    bump(d.dir());
+    l = cache.lookup(exe, stamp);
+    CHECK(l.stale[0].empty());
+    CHECK(l.stale[1] == "file-changed:" + d.dir());
+    CHECK(l.reusable == 2);
+
+    // Another module stamp: nothing is reused.
+    stored(false);
+    ModuleFileStamp relinked = stamp;
+    relinked.mtime += 60;
+    l = cache.lookup(exe, relinked);
+    CHECK((l.result == nullptr));
+    CHECK(l.reusable == 0);
+    CHECK(l.reason == "mtime");
+}
+
+TEST_CASE("WP-55 (R-58): the scanner traces every path a walk asked about, answers from its memory included") {
+    FakeFs fs;
+    fs.files["c:\\proj\\src\\a.cpp"] = "#include \"common.h\"\n#include <lib.h>\n";
+    fs.files["c:\\proj\\src\\b.cpp"] = "#include \"common.h\"\n";
+    fs.files["c:\\proj\\src\\common.h"] = "#include \"inner.h\"\n";
+    fs.files["c:\\proj\\inc\\inner.h"] = "";
+    fs.files["c:\\proj\\inc\\lib.h"] = "";
+    IncludeScanner scanner(fs.reader());
+    scanner.set_tracing(true);
+    const auto touched = [&]() {
+        std::set<std::string> out;
+        for (const std::uint32_t id : scanner.take_touched()) {
+            out.insert(scanner.path_of(id));
+        }
+        return out;
+    };
+    ScanRoots ra;
+    ra.source = "c:\\proj\\src\\a.cpp";
+    ra.cwd = "c:\\proj\\src";
+    ra.include_dirs = {"c:\\proj\\inc"};
+    ScanRoots rb = ra;
+    rb.source = "c:\\proj\\src\\b.cpp";
+
+    CHECK(scanner.dependencies(ra) == std::set<std::string>{"c:\\proj\\src\\common.h", "c:\\proj\\inc\\inner.h", "c:\\proj\\inc\\lib.h"});
+    const std::set<std::string> of_a = touched();
+    CHECK(of_a.count("c:\\proj\\src\\a.cpp") == 1);
+    CHECK(of_a.count("c:\\proj\\src\\common.h") == 1);
+    CHECK(of_a.count("c:\\proj\\src\\inner.h") == 1);  // looked for next to common.h first: missing
+    CHECK(of_a.count("c:\\proj\\inc\\inner.h") == 1);
+    CHECK(of_a.count("c:\\proj\\inc\\lib.h") == 1);
+    const std::size_t read_after_a = scanner.files_read();
+
+    // b.cpp asks the same questions about common.h: answered from memory, nothing read, still traced.
+    CHECK(scanner.dependencies(rb) == std::set<std::string>{"c:\\proj\\src\\common.h", "c:\\proj\\inc\\inner.h"});
+    const std::set<std::string> of_b = touched();
+    CHECK(scanner.files_read() == read_after_a + 1);  // b.cpp itself
+    CHECK(of_b == std::set<std::string>{"c:\\proj\\src\\b.cpp", "c:\\proj\\src\\common.h", "c:\\proj\\src\\inner.h", "c:\\proj\\inc\\inner.h"});
+    CHECK(touched().empty());  // handed over once
+
+    // Not tracing: nothing is noted.
+    scanner.set_tracing(false);
+    scanner.dependencies(ra);
+    CHECK(touched().empty());
 }

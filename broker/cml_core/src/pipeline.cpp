@@ -912,6 +912,9 @@ private:
         in.compiland_index = u.compiland;
         in.registry = &registry;
         in.modules = &process_modules;
+        in.inline_verdicts = &module_.inline_verdicts;  // WP-55 (R-62)
+        const std::uint64_t verdict_hits_before = module_.inline_verdicts.hits();
+        const std::uint64_t verdict_stores_before = module_.inline_verdicts.stores();
         if (const std::optional<Diag> f = injected(ipc::fault::Stage::BindPlan)) {
             return fail("plan", *f);
         }
@@ -1020,6 +1023,14 @@ private:
                     ms_between(plan_bound, plan_proved), ms_between(plan_proved, plan_narrowed), ms_between(plan_narrowed, plan_done), narrowed.planned,
                     pdb_after.module_symbols_ms - pdb_before.module_symbols_ms, pdb_after.publics_ms - pdb_before.publics_ms,
                     pdb_after.buildinfo_ms - pdb_before.buildinfo_ms);
+            // WP-55 (R-62): the verdicts on inline sites this unit's plan took from earlier plans of the image, and those it read.
+            const std::uint64_t verdict_hits = module_.inline_verdicts.hits() - verdict_hits_before;
+            const std::uint64_t verdict_stores = module_.inline_verdicts.stores() - verdict_stores_before;
+            if (verdict_hits != 0 || verdict_stores != 0) {
+                CML_LOG(Info, "WP55-INLINE-CACHE module=%s object=%s kept=%llu read=%llu entries=%zu", module_.name.c_str(),
+                        std::string(path::base_name(std::string_view(u.outcome.object_path))).c_str(), static_cast<unsigned long long>(verdict_hits),
+                        static_cast<unsigned long long>(verdict_stores), module_.inline_verdicts.size());
+            }
         }
         if (!s.has_effect) {
             CML_LOG(Info, "reload: %s changes no code (all %zu planned hooks are identical to the running code); nothing to load", u.source.c_str(),

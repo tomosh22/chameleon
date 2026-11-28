@@ -158,6 +158,10 @@ struct ModuleState {
     ImageRead ensure_image(bool background) { return image_slot->ensure(path, background); }
     void release_image() { image_slot->release(); }
 
+    // WP-55 (R-62): the bind planner's verdicts on the inline sites of this module image's procedures (WP-51), kept for the
+    // reloads of this state and dropped with it. Not under `mutex`: the cache has its own lock.
+    bind::InlineVerdictCache inline_verdicts;
+
     // WP-25: what the patches' functions look like, keyed by the address of the patch code (the new entry of a hook, or the
     // address of a function a patch introduced). `code_running_at(entry)` is the record of the code that runs when `entry`
     // is called: the hook target when the entry is hooked, else the entry itself. Records are never removed: the patch DLLs

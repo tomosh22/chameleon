@@ -5,6 +5,7 @@
 #include <cctype>
 #include <filesystem>
 #include <set>
+#include <unordered_map>
 
 #include "cml/core/include_scan.h"
 #include "cml/core/pipeline_diag_ids.h"
@@ -43,6 +44,9 @@ std::string base_name_of(std::string_view path) {
     const std::size_t slash = path.find_last_of("/\\");
     return std::string(slash == std::string_view::npos ? path : path.substr(slash + 1));
 }
+
+// WP-55: the compilands a partial scan names at Info (the rest at trace).
+constexpr std::size_t kRescanLinesShown = 20;
 
 bool file_exists(const std::string& path) {
     std::error_code ec;
@@ -168,6 +172,11 @@ const ScanInput& ScanInputRecorder::before(const std::string& path) {
     return it->second;
 }
 
+const ScanInput* ScanInputRecorder::stamped(const std::string& path) const {
+    const auto it = before_.find(path);
+    return it == before_.end() ? nullptr : &it->second;
+}
+
 ScanFileReader ScanInputRecorder::wrap(ScanFileReader disk) {
     return [this, disk = std::move(disk)](const std::string& path) -> std::optional<std::string> {
         // A candidate in a directory that does not exist cannot exist either (and the directory appearing is a change of its
@@ -176,66 +185,130 @@ ScanFileReader ScanInputRecorder::wrap(ScanFileReader disk) {
         const bool may_exist = dir.empty() || before(dir).exists || before_.count(path) != 0;
         const ScanInput* file = may_exist ? &before(path) : nullptr;  // std::map: the reference stays valid
         std::optional<std::string> text = disk(path);
-        if (!text && file != nullptr && file->exists && !file->directory && unreadable_.empty()) {
-            unreadable_ = path;
+        // WP-55 (R-63): a file the stamp found over the size limit is never read, whatever happens at the read: the same answer
+        // every time while its stamp holds. Any other failed read of a file that exists may succeed next time.
+        if (!text && file != nullptr && file->exists && !file->directory && file->size <= kScanMaxFileBytes) {
+            unreadable_.insert(path);
         }
         return text;
     };
 }
 
-std::vector<ScanInput> ScanInputRecorder::finish(const std::vector<std::string>& paths, std::string* not_cacheable) {
-    std::vector<ScanInput> out;
-    out.reserve(paths.size());
-    std::string changed;
-    for (const std::string& f : paths) {
-        const ScanInput& was = before(f);  // a path first met here is stamped now (and compared with itself)
-        if (changed.empty() && !same_scan_input(probe_scan_input(f), was)) {
-            changed = f;
-        }
-        out.push_back(was);
+std::string ScanInputRecorder::not_cacheable(const std::string& path) {
+    if (unreadable_.count(path) != 0) {
+        return "unreadable:" + path;
     }
-    if (!unreadable_.empty()) {
-        *not_cacheable = "unreadable:" + unreadable_;
-    } else if (!changed.empty()) {
-        *not_cacheable = "changed-during-scan:" + changed;
-    } else {
-        not_cacheable->clear();
+    auto it = rechecked_.find(path);
+    if (it == rechecked_.end()) {
+        const ScanInput& was = before(path);  // a path first met here is stamped now (and compared with itself)
+        it = rechecked_.emplace(path, !same_scan_input(probe_scan_input(path), was)).first;
+    }
+    return it->second ? "changed-during-scan:" + path : std::string();
+}
+
+void assemble_scan_result(ScanResult& r) {
+    r.files.clear();
+    r.header_deps.clear();
+    r.pch_files.clear();
+    r.pch_unverified.clear();
+    r.skipped.clear();
+    r.skipped_set.clear();
+    const auto at = [&r](std::uint32_t i) -> const std::string& { return r.inputs[i].path; };
+    for (const CompilandScan& c : r.compilands) {
+        if (c.toolchain || c.skipped) {
+            r.skipped_set.insert(c.compiland);
+        }
+        if (c.skipped) {
+            r.skipped.push_back(*c.skipped);
+        }
+        for (const std::uint32_t i : c.files) {
+            r.files.insert(at(i));
+        }
+        for (const std::uint32_t i : c.deps) {
+            r.header_deps[at(i)].push_back(c.compiland);  // compilands ascending, as the scan visits them
+        }
+        for (const std::uint32_t i : c.pch) {
+            r.pch_files.insert(at(i));
+        }
+    }
+    // A /Yu compiland whose precompiled header is unknown cannot be recompiled safely: the .pch it would use may be stale.
+    for (const CompilandScan& c : r.compilands) {
+        if (c.uses_pch && c.pch.empty() && r.pch_files.empty()) {
+            r.pch_unverified.insert(c.compiland);
+        }
+    }
+}
+
+ScanCache::Lookup ScanCache::lookup(const std::string& module_path, const ModuleFileStamp& stamp) {
+    Lookup out;
+    const std::string key = pdb::normalize_path(module_path);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = entries_.find(key);
+        if (it == entries_.end() || !it->second.result) {
+            out.reason = "absent";
+            return out;
+        }
+        const std::string difference = stamp_difference(it->second.stamp, stamp);
+        if (!difference.empty()) {
+            out.reason = difference;
+            return out;
+        }
+        out.result = it->second.result;
+    }
+    // Thousands of stats for a large module: not under the lock, each input once. The entry stays; the scan that follows a
+    // partial or no reuse replaces it.
+    const ScanResult& r = *out.result;
+    std::vector<char> changed(r.inputs.size(), 0);
+    std::string first_changed;
+    for (std::size_t i = 0; i < r.inputs.size(); ++i) {
+        if (!same_scan_input(probe_scan_input(r.inputs[i].path), r.inputs[i])) {
+            changed[i] = 1;
+            if (first_changed.empty()) {
+                first_changed = r.inputs[i].path;
+            }
+        }
+    }
+    out.stale.resize(r.compilands.size());
+    std::string first_uncached;
+    for (std::size_t k = 0; k < r.compilands.size(); ++k) {
+        const CompilandScan& c = r.compilands[k];
+        std::string& stale = out.stale[k];
+        if (!c.not_cacheable.empty()) {
+            stale = "not-cached:" + c.not_cacheable;
+        } else {
+            for (const std::uint32_t i : c.inputs) {
+                if (i >= changed.size()) {
+                    stale = "not-cached:no-input-" + std::to_string(i);  // a malformed entry: never reused
+                    break;
+                }
+                if (changed[i] != 0) {
+                    stale = "file-changed:" + r.inputs[i].path;
+                    break;
+                }
+            }
+        }
+        if (stale.empty()) {
+            ++out.reusable;
+        } else if (first_uncached.empty() && stale.compare(0, 11, "not-cached:") == 0) {
+            first_uncached = stale;
+        }
+    }
+    out.reason = !first_changed.empty() ? "file-changed:" + first_changed : first_uncached;
+    if (out.reason.empty()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = entries_.find(key);
+        if (it != entries_.end() && it->second.result == out.result) {
+            it->second.used = ++clock_;
+        }
     }
     return out;
 }
 
 std::shared_ptr<const ScanResult> ScanCache::find(const std::string& module_path, const ModuleFileStamp& stamp, std::string* reason) {
-    const std::string key = pdb::normalize_path(module_path);
-    std::shared_ptr<const ScanResult> result;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const auto it = entries_.find(key);
-        if (it == entries_.end()) {
-            *reason = "absent";
-            return nullptr;
-        }
-        const std::string difference = stamp_difference(it->second.stamp, stamp);
-        if (!difference.empty()) {
-            *reason = difference;
-            return nullptr;
-        }
-        result = it->second.result;
-    }
-    // Thousands of stats for a large module: not under the lock. The entry stays; the scan that follows a miss replaces it.
-    const std::string changed = result ? changed_scan_input(result->inputs) : std::string();
-    if (!changed.empty()) {
-        *reason = "file-changed:" + changed;
-        return nullptr;
-    }
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        const auto it = entries_.find(key);
-        if (it != entries_.end() && it->second.result == result) {
-            it->second.used = ++clock_;
-        }
-    }
-    reason->clear();
-    return result;
+    Lookup found = lookup(module_path, stamp);
+    *reason = found.reason;
+    return found.reason.empty() ? found.result : nullptr;
 }
 
 void ScanCache::store(const std::string& module_path, const ModuleFileStamp& stamp, std::shared_ptr<const ScanResult> result) {
@@ -371,25 +444,96 @@ void ModuleIndex::set_status(IndexState state, std::uint32_t percent, std::strin
     }
 }
 
-std::optional<ScanResult> ModuleIndex::scan_files(const pdb::PdbIndex& index) {
-    std::set<std::string> files;
-    std::map<std::string, std::vector<std::uint32_t>> header_deps;
-    std::set<std::string> pch_files;
-    std::set<std::uint32_t> pch_users;                    // compilands that use a precompiled header
-    std::map<std::uint32_t, std::set<std::string>> own_pch;  // what each of them could determine of it
+std::optional<ScanResult> ModuleIndex::scan_files(const pdb::PdbIndex& index, const ScanCache::Lookup& previous) {
     // WP-50 (second review): with a cache, every input is stamped before the scan uses it (ScanInputRecorder): a listed file
     // when its compiland is processed, a file the include search reads (and its directory) just before the read. After the scan
-    // each input is stamped again; any difference (an edit while scanning) makes the result uncacheable, and so does a file that
-    // exists but could not be read (it may be readable, and include more, next time while nothing it depends on shows a change).
+    // each input is stamped again; any difference (an edit while scanning) makes the part that used it uncacheable, and so does
+    // a file that exists but could not be read (it may be readable, and include more, next time while nothing it depends on
+    // shows a change).
+    // WP-55 (R-58): the result is built compiland by compiland. A part of `previous` whose inputs are unchanged is taken as it
+    // is; the others are scanned, the scanner tracing what each compiland's walks asked about (IncludeScanner::set_tracing).
     const bool stamping = spec_.scan_cache != nullptr;
     ScanInputRecorder recorder;
     const auto exists = [&](const std::string& path) { return stamping ? recorder.exists(path) : file_exists(path); };
     ScanFileReader reader = stamping ? recorder.wrap(disk_file_reader()) : disk_file_reader();
     IncludeScanner scanner(std::move(reader));
+    scanner.set_tracing(stamping);
+    ScanResult out;
+
+    // The paths of the result, once each. `problem` (per path) is why a part that refers to it must not be cached: the path met
+    // again with another stamp (it changed between the lookup that vouched for a reused part and this scan; the entry keeps the
+    // first stamp), or used before it was stamped.
+    std::unordered_map<std::string, std::uint32_t> table;
+    std::vector<std::string> problem;
+    const auto intern = [&](const ScanInput& in) -> std::uint32_t {
+        const auto [it, added] = table.emplace(in.path, static_cast<std::uint32_t>(out.inputs.size()));
+        if (added) {
+            out.inputs.push_back(in);
+            problem.emplace_back();
+        } else if (stamping && problem[it->second].empty() && !same_scan_input(out.inputs[it->second], in)) {
+            problem[it->second] = "changed-during-scan:" + in.path;
+        }
+        return it->second;
+    };
+    // A path of a part scanned now, with the stamp taken before the scan used it.
+    const auto add = [&](const std::string& path) -> std::uint32_t {
+        if (stamping) {
+            if (const ScanInput* stamp = recorder.stamped(path)) {
+                return intern(*stamp);
+            }
+        }
+        ScanInput bare;
+        bare.path = path;
+        const std::uint32_t i = intern(bare);
+        if (stamping && problem[i].empty()) {
+            problem[i] = "unstamped:" + path;  // used before it was stamped (not expected): never reused
+        }
+        return i;
+    };
+    // What the walks' paths stand for as inputs, once per path of the scanner: a file that exists (read, over the size limit, or
+    // failing to read) by its own stamp, a path that does not exist by its directory's (a file created there changes it).
+    constexpr std::uint32_t kUnmapped = 0xFFFFFFFFu;
+    std::vector<std::uint32_t> touched_input;  // scanner file id -> index in out.inputs
+    const auto input_of_touched = [&](std::uint32_t id) -> std::uint32_t {
+        if (touched_input.size() <= id) {
+            touched_input.resize(static_cast<std::size_t>(id) + 1024, kUnmapped);
+        }
+        if (touched_input[id] == kUnmapped) {
+            const std::string& p = scanner.path_of(id);
+            const ScanInput* stamp = scanner.readable(id) ? nullptr : recorder.stamped(p);
+            const bool by_itself = scanner.readable(id) || (stamp != nullptr && stamp->exists) || scanner.directory_of(id).empty();
+            touched_input[id] = add(by_itself ? p : scanner.directory_of(id));
+        }
+        return touched_input[id];
+    };
+
+    // The parts of the cache entry that can be reused, by compiland, with the stamps the lookup checked.
+    std::unordered_map<std::uint32_t, const CompilandScan*> reusable;
+    std::vector<std::uint32_t> remap;  // index in previous.result->inputs -> index in out.inputs
+    if (previous.result) {
+        for (std::size_t k = 0; k < previous.result->compilands.size() && k < previous.stale.size(); ++k) {
+            if (previous.stale[k].empty()) {
+                reusable.emplace(previous.result->compilands[k].compiland, &previous.result->compilands[k]);
+            }
+        }
+        remap.assign(previous.result->inputs.size(), kUnmapped);
+    }
+    const auto reuse = [&](const CompilandScan& old) {
+        CompilandScan c = old;
+        for (std::vector<std::uint32_t>* v : {&c.files, &c.deps, &c.pch, &c.inputs}) {
+            for (std::uint32_t& i : *v) {
+                if (remap[i] == kUnmapped) {
+                    remap[i] = intern(previous.result->inputs[i]);
+                }
+                i = remap[i];
+            }
+        }
+        out.compilands.push_back(std::move(c));
+        ++out.reused;
+    };
+    std::vector<char> scanned_now;  // per element of out.compilands
+
     const std::uint32_t compiland_total = index.compiland_count();
-    std::vector<SkippedCompiland> skipped;
-    std::set<std::uint32_t> skipped_set;
-    std::set<std::string> absent;  // paths found missing whose appearance would change the result
     for (std::uint32_t ci = 0; ci < compiland_total; ++ci) {
         if (!is_object_compiland(index, ci)) {
             continue;  // an import stub or a linker record: nothing to recompile, not counted
@@ -397,13 +541,36 @@ std::optional<ScanResult> ModuleIndex::scan_files(const pdb::PdbIndex& index) {
         if (cancel_.load(std::memory_order_acquire)) {
             return std::nullopt;
         }
+        if (const auto r = reusable.find(ci); r != reusable.end()) {
+            reuse(*r->second);
+            scanned_now.push_back(0);
+            continue;
+        }
+        CompilandScan c;
+        c.compiland = ci;
+        std::set<std::uint32_t> inputs;
+        std::set<std::uint32_t> files;
+        const auto finish = [&]() {
+            // Everything the walks of this compiland asked about (WP-55, R-58).
+            if (stamping) {
+                for (const std::uint32_t id : scanner.take_touched()) {
+                    inputs.insert(input_of_touched(id));
+                }
+            }
+            c.inputs.assign(inputs.begin(), inputs.end());
+            c.files.assign(files.begin(), files.end());
+            out.compilands.push_back(std::move(c));
+            scanned_now.push_back(1);
+            ++out.rescanned;
+        };
         // WP-26b: a real object is reloadable when its build environment is recorded, whether or not it came from an archive.
         // Otherwise it is skipped: counted, and what it lists is still tracked (include scan and PCH detection run for it as
         // before), so a change to one of its files is reported (CML5921) instead of answering a silent `patched: 0`.
         const pdb::Compiland& comp = index.compiland(ci);
         const std::string library(comp.library_name);
         if (!library.empty() && is_toolchain_archive(library)) {
-            skipped_set.insert(ci);  // never counted or tracked: the CRT, the STL, the SDK
+            c.toolchain = true;  // never counted or tracked: the CRT, the STL, the SDK
+            finish();
             continue;
         }
         Result<pdb::BuildEnv> env = index.build_env(ci);
@@ -414,9 +581,10 @@ std::optional<ScanResult> ModuleIndex::scan_files(const pdb::PdbIndex& index) {
             reason = "its build environment records no source file";
         } else if (!library.empty()) {
             const std::string source = pdb::normalize_path(*env->source_file(), env->cwd().value_or(std::string_view{}));
-            if (!exists(source)) {
+            const bool there = exists(source);
+            inputs.insert(add(source));  // the member becomes reloadable when it appears, skipped when it goes
+            if (!there) {
                 reason = "its source file does not exist";
-                absent.insert(source);  // the member becomes reloadable when it appears
             }
         }
         std::set<std::string> listed;
@@ -426,19 +594,22 @@ std::optional<ScanResult> ModuleIndex::scan_files(const pdb::PdbIndex& index) {
                 recorder.before(*added.first);
             }
         }
+        for (const std::string& f : listed) {
+            inputs.insert(add(f));
+        }
         if (reason.empty()) {
-            files.insert(listed.begin(), listed.end());
+            for (const std::string& f : listed) {
+                files.insert(add(f));
+            }
         } else {
-            skipped.push_back({ci, base_name_of(comp.object_name), library, reason});
-            skipped_set.insert(ci);
+            c.skipped = SkippedCompiland{ci, base_name_of(comp.object_name), library, reason};
             if (!library.empty() && env && env->source_file() && !env->source_file()->empty()) {
+                finish();
                 continue;  // an archive member whose source is gone: a library built elsewhere, its files are not on this machine
             }
             for (const std::string& f : listed) {
                 if (exists(f)) {
-                    files.insert(f);
-                } else {
-                    absent.insert(f);
+                    files.insert(add(f));
                 }
             }
         }
@@ -446,10 +617,12 @@ std::optional<ScanResult> ModuleIndex::scan_files(const pdb::PdbIndex& index) {
         // does not depend on scanning includes (WP-15).
         if (!env) {
             CML_LOG(Debug, "index: compiland %u has no build environment, headers come from the PDB list only: %s", ci, env.error().format().c_str());
+            finish();
             continue;
         }
         Result<toolchain::CompileRecord> record = toolchain::record_from_build_env(*env);
         if (!record) {
+            finish();
             continue;
         }
         const ScanRoots roots = scan_roots_from_record(*record);
@@ -458,8 +631,9 @@ std::optional<ScanResult> ModuleIndex::scan_files(const pdb::PdbIndex& index) {
             // ADR-0013: the PDB list is not an include graph for clang-cl, so follow the includes ourselves.
             deps = scanner.dependencies(roots);
             for (const std::string& d : deps) {
-                files.insert(d);
-                header_deps[d].push_back(ci);
+                const std::uint32_t i = add(d);
+                files.insert(i);
+                c.deps.push_back(i);
             }
         }
         if (roots.creates_pch || roots.uses_pch) {
@@ -472,59 +646,57 @@ std::optional<ScanResult> ModuleIndex::scan_files(const pdb::PdbIndex& index) {
                 }
                 mine.insert(deps.begin(), deps.end());
             } else {
-                pch_users.insert(ci);
+                c.uses_pch = true;
             }
-            files.insert(mine.begin(), mine.end());
-            pch_files.insert(mine.begin(), mine.end());
-            own_pch[ci] = std::move(mine);
+            for (const std::string& f : mine) {
+                const std::uint32_t i = add(f);
+                files.insert(i);
+                c.pch.push_back(i);
+            }
         }
+        finish();
         if (ci % 16 == 0) {
             // Stays inside 30..39: the file lists were announced at 30, hashing starts at 40.
             set_status(IndexState::Loading, 30 + 9 * ci / std::max<std::uint32_t>(1, compiland_total),
                        "scanning includes (" + std::to_string(ci) + "/" + std::to_string(compiland_total) + ")");
         }
     }
-    // A /Yu compiland whose precompiled header is unknown cannot be recompiled safely: the .pch it would use may be stale.
-    std::set<std::uint32_t> pch_unverified;
-    for (const std::uint32_t ci : pch_users) {
-        if (own_pch[ci].empty() && pch_files.empty()) {
-            pch_unverified.insert(ci);
-        }
-    }
     if (spec_.after_scan_for_testing) {
         spec_.after_scan_for_testing();
     }
-    ScanResult out;
-    // WP-50 (review): what the result was built from, so that a cache hit can tell it is still true. The tracked files (sources,
-    // PDB-listed and scanned headers, PCH files), the paths found absent, and the directories the include search looked in (an
-    // include that resolves elsewhere once a file is created or removed there), each with the stamp taken before the scan used
-    // it. A stamp that differs now means the scan may have seen an older state: the result is not cached.
+    // WP-50 (review): each input of a part scanned now is stamped again (once); a part with an input whose stamp differs, or
+    // that met a file it could not read, is not cacheable. A reused part's inputs were checked by the lookup before it was used;
+    // it, too, is not kept when one of them came back with another stamp from a part scanned now (`problem`).
     if (stamping) {
-        std::set<std::string> directories;
-        for (const std::string& d : scanner.directories()) {
-            if (!d.empty() && files.count(d) == 0) {
-                directories.insert(d);
+        std::vector<char> checked(out.inputs.size(), 0);
+        std::vector<std::string> verdict(out.inputs.size());
+        for (std::size_t k = 0; k < out.compilands.size(); ++k) {
+            CompilandScan& c = out.compilands[k];
+            for (const std::uint32_t i : c.inputs) {
+                if (!c.not_cacheable.empty()) {
+                    break;
+                }
+                if (!problem[i].empty()) {
+                    c.not_cacheable = problem[i];
+                    break;
+                }
+                if (scanned_now[k] == 0) {
+                    continue;
+                }
+                if (checked[i] == 0) {
+                    checked[i] = 1;
+                    verdict[i] = recorder.not_cacheable(out.inputs[i].path);
+                }
+                if (!verdict[i].empty()) {
+                    c.not_cacheable = verdict[i];
+                    break;
+                }
             }
         }
-        std::vector<std::string> paths;
-        paths.reserve(files.size() + absent.size() + directories.size());
-        paths.insert(paths.end(), files.begin(), files.end());
-        for (const std::string& f : absent) {
-            if (files.count(f) == 0) {
-                paths.push_back(f);
-            }
-        }
-        paths.insert(paths.end(), directories.begin(), directories.end());
-        out.inputs = recorder.finish(paths, &out.not_cacheable);
     }
-    out.files = std::move(files);
-    out.header_deps = std::move(header_deps);
-    out.pch_files = std::move(pch_files);
-    out.pch_unverified = std::move(pch_unverified);
-    out.skipped = std::move(skipped);
-    out.skipped_set = std::move(skipped_set);
     out.stats = scanner.stats();
     out.files_read = scanner.files_read();
+    assemble_scan_result(out);
     return out;
 }
 
@@ -589,32 +761,80 @@ void ModuleIndex::run() {
     set_status(IndexState::Loading, 30, "reading the file lists");
     const Clock::time_point scan_started = Clock::now();
     // WP-50 (R-55): the same module file indexed before in this session (a hot-restart's new process, a module freed and loaded
-    // again) takes its file lists and include graph from the cache instead of scanning again.
+    // again) takes its file lists and include graph from the cache instead of scanning again. WP-55 (R-58): compiland by
+    // compiland; only the compilands whose inputs changed are scanned again.
     std::optional<ModuleFileStamp> stamp;
     std::shared_ptr<const ScanResult> scan;
+    ScanCache::Lookup previous;
     std::string cache_state = "off";
+    const std::string module_name = base_name_of(spec_.module_path);
     if (spec_.scan_cache) {
         stamp = module_file_stamp(spec_.module_path, *index, spec_.scan_includes);
-        std::string reason = "stat-failed";
         if (stamp) {
-            scan = spec_.scan_cache->find(spec_.module_path, *stamp, &reason);
+            previous = spec_.scan_cache->lookup(spec_.module_path, *stamp);
+        } else {
+            previous.reason = "stat-failed";
         }
-        cache_state = scan ? "warm" : "cold";
-        CML_LOG(Info, "WP50-SCAN-CACHE %s module=%s reason=%s inputs=%zu check_ms=%.1f", scan ? "hit" : "miss", base_name_of(spec_.module_path).c_str(),
-                scan ? "same-stamp" : reason.c_str(), scan ? scan->inputs.size() : std::size_t{0}, ms_since(scan_started));
+        if (previous.result && previous.reason.empty()) {
+            scan = previous.result;
+        }
+        const std::size_t entries = previous.result ? previous.result->compilands.size() : 0;
+        CML_LOG(Info, "WP50-SCAN-CACHE %s module=%s reason=%s inputs=%zu check_ms=%.1f compilands=%zu reused=%zu rescan=%zu",
+                scan ? "hit" : previous.reusable != 0 ? "partial" : "miss", module_name.c_str(), scan ? "same-stamp" : previous.reason.c_str(),
+                previous.result ? previous.result->inputs.size() : std::size_t{0}, ms_since(scan_started), entries, previous.reusable, entries - previous.reusable);
+        if (!scan && previous.result) {
+            // WP-55: which compilands are scanned again, and why (the first of them by name; all at trace).
+            std::size_t named = 0;
+            for (std::size_t k = 0; k < previous.stale.size(); ++k) {
+                if (previous.stale[k].empty()) {
+                    continue;
+                }
+                const std::uint32_t ci = previous.result->compilands[k].compiland;
+                const std::string object = ci < index->compiland_count() ? base_name_of(index->compiland(ci).object_name) : std::string("?");
+                if (named < kRescanLinesShown) {
+                    CML_LOG(Info, "WP55-SCAN-RESCAN module=%s compiland=%u object=%s reason=%s", module_name.c_str(), ci, object.c_str(), previous.stale[k].c_str());
+                } else {
+                    CML_LOG(Trace, "WP55-SCAN-RESCAN module=%s compiland=%u object=%s reason=%s", module_name.c_str(), ci, object.c_str(), previous.stale[k].c_str());
+                }
+                ++named;
+            }
+            if (named > kRescanLinesShown) {
+                CML_LOG(Info, "WP55-SCAN-RESCAN module=%s more=%zu (at trace)", module_name.c_str(), named - kRescanLinesShown);
+            }
+        }
     }
-    if (!scan) {
-        std::optional<ScanResult> fresh = scan_files(*index);
+    std::size_t reused = 0;
+    std::size_t rescanned = 0;
+    if (scan) {
+        cache_state = "warm";
+        reused = scan->compilands.size();
+    } else {
+        std::optional<ScanResult> fresh = scan_files(*index, previous);
         if (!fresh) {
             return;  // cancelled
         }
         fresh->scan_ms = ms_since(scan_started);
+        reused = fresh->reused;
+        rescanned = fresh->rescanned;
         std::shared_ptr<const ScanResult> shared = std::make_shared<const ScanResult>(std::move(*fresh));
-        if (spec_.scan_cache && stamp) {
-            if (shared->not_cacheable.empty()) {
+        if (spec_.scan_cache) {
+            cache_state = reused != 0 ? "partial" : "cold";
+            std::size_t uncached = 0;
+            const std::string* first = nullptr;
+            for (const CompilandScan& c : shared->compilands) {
+                if (!c.not_cacheable.empty()) {
+                    ++uncached;
+                    first = first != nullptr ? first : &c.not_cacheable;
+                }
+            }
+            const bool keep = stamp && (uncached < shared->compilands.size() || shared->compilands.empty());
+            if (keep) {
                 spec_.scan_cache->store(spec_.module_path, *stamp, shared);
-            } else {
-                CML_LOG(Info, "WP50-SCAN-CACHE store=skipped module=%s reason=%s", base_name_of(spec_.module_path).c_str(), shared->not_cacheable.c_str());
+            }
+            if (first != nullptr) {
+                // A part that could not be cached is scanned again by the next index; the others are reused (WP-55).
+                CML_LOG(Info, "WP50-SCAN-CACHE store=%s module=%s reason=%s uncached=%zu compilands=%zu", keep ? "partial" : "skipped", module_name.c_str(),
+                        first->c_str(), uncached, shared->compilands.size());
             }
         }
         scan = std::move(shared);
@@ -628,6 +848,8 @@ void ModuleIndex::run() {
         pch_unverified_ = scan->pch_unverified;
         status_.scan_ms = ms_since(scan_started);
         status_.scan_cache = cache_state;
+        status_.scan_reused = reused;
+        status_.scan_rescanned = rescanned;
         // A warm index reports what the scan it reused read (scan_ms is this index's own time).
         status_.scan_read_ms = scan->stats.read_ms;
         status_.scan_parse_ms = scan->stats.parse_ms;
@@ -675,10 +897,10 @@ void ModuleIndex::run() {
         // WP-50 (R-55): where the build of the index went, one evidence line per index.
         const IndexStatus s = status();
         CML_LOG(Info, "WP50-INDEX module=%s total_ms=%.1f pdb_ms=%.1f audit_ms=%.1f scan_ms=%.1f scan_read_ms=%.1f scan_parse_ms=%.1f scan_found=%zu scan_missing=%zu "
-                      "scan_lookups=%zu baseline_ms=%.1f baseline_files=%zu compilands=%zu cache=%s",
+                      "scan_lookups=%zu baseline_ms=%.1f baseline_files=%zu compilands=%zu cache=%s reused=%zu rescanned=%zu",
                 base_name_of(spec_.module_path).c_str(), ms_since(t0), s.pdb_ms, s.audit_ms, s.scan_ms, s.scan_read_ms,
                 s.scan_parse_ms, s.scan_found, s.scan_missing, s.scan_lookups, s.baseline_ms, s.baseline_files, static_cast<std::size_t>(index->compiland_count()),
-                s.scan_cache.c_str());
+                s.scan_cache.c_str(), s.scan_reused, s.scan_rescanned);
     }
     {
         std::size_t archive_members = 0;
@@ -696,7 +918,6 @@ void ModuleIndex::run() {
                 names += (listed_names == 0 ? "" : ", ") + k.name + " (" + k.reason + ")";
                 ++listed_names;
             }
-            const std::string module_name = base_name_of(spec_.module_path);
             spec_.on_skipped_archive_members(Diag::make(
                 staticlib::diag::kSkippedArchiveCompilands,
                 std::to_string(archive_members) + " object(s) linked into " + module_name + " from static libraries cannot be hot-reloaded: " + names +

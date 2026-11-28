@@ -18,6 +18,8 @@
 #include "cml/util/log.h"
 #include "doctest.h"
 
+#include <windows.h>
+
 using namespace cml;
 using namespace cml::core;
 namespace tp = cml::testpdb;
@@ -304,7 +306,7 @@ TEST_CASE("WP-50: an index of the same module file takes the file lists from the
     CHECK(uncached->status().scan_cache == "off");
 }
 
-TEST_CASE("WP-50 (review): a source edited to include a new header, or a skipped member's source that appears, misses the scan cache") {
+TEST_CASE("WP-55 (R-58): after an edit only the compilands whose inputs changed are scanned again; a skipped member's source that appears rescans that member") {
     QuietLogs quiet;
     World w;
     const auto cache = std::make_shared<ScanCache>();
@@ -323,23 +325,33 @@ TEST_CASE("WP-50 (review): a source edited to include a new header, or a skipped
         const std::vector<std::string> tracked = index->tracked_files();
         return std::find(tracked.begin(), tracked.end(), f) != tracked.end();
     };
+    // The object compilands: app, good, noenv, missing and the CRT member (the import stub has no part).
+    constexpr std::size_t kParts = 5;
     const std::shared_ptr<ModuleIndex> first = build();
     CHECK(first->status().scan_cache == "cold");
+    CHECK(first->status().scan_rescanned == kParts);
+    CHECK(first->status().scan_reused == 0);
     CHECK_FALSE(tracks(first, header));
-    CHECK(build()->status().scan_cache == "warm");
+    const std::shared_ptr<ModuleIndex> warm = build();
+    CHECK(warm->status().scan_cache == "warm");
+    CHECK(warm->status().scan_reused == kParts);
+    CHECK(warm->status().scan_rescanned == 0);
 
     // The source gains an include of a header created for it (as a reload before a hot-restart would have compiled): the module
-    // file is the same, but the stored graph is not, so the index scans again and tracks the new header.
+    // file is the same, app.cpp's part is stale (the bug of WP-50 round 6: the stored graph would miss new.h), the others are not.
     write_text(w.dir.file("new.h"), "#pragma once\nint fresh();\n");
     write_text(w.dir.file("app.cpp"), "#include \"new.h\"\nint app() { return 1; }\n");
     bump_mtime(w.dir.file("app.cpp"));
     const std::shared_ptr<ModuleIndex> edited = build();
-    CHECK(edited->status().scan_cache == "cold");
+    CHECK(edited->status().scan_cache == "partial");
+    CHECK(edited->status().scan_rescanned == 1);
+    CHECK(edited->status().scan_reused == kParts - 1);
     CHECK(tracks(edited, header));
+    CHECK(edited->tracked_files().size() == first->tracked_files().size() + 1);
     const std::shared_ptr<ModuleIndex> again = build();
     CHECK(again->status().scan_cache == "warm");
     CHECK(tracks(again, header));
-    // An edit of the new header reaches the compiland that includes it (the bug: the stale graph answered nothing).
+    // An edit of the new header reaches the compiland that includes it.
     write_text(w.dir.file("new.h"), "#pragma once\nint fresh(int);\n");
     bump_mtime(w.dir.file("new.h"));
     Result<ModuleIndex::Sweep> swept = again->sweep();
@@ -347,17 +359,36 @@ TEST_CASE("WP-50 (review): a source edited to include a new header, or a skipped
     CHECK(std::find(swept->compilands.begin(), swept->compilands.end(), kPlain) != swept->compilands.end());
     again->accept(swept->stamps);
 
-    CHECK(build()->status().scan_cache == "cold");  // new.h changed since the entry was stored
+    const std::shared_ptr<ModuleIndex> header_edited = build();  // new.h changed since the entry was stored: app.cpp's part only
+    CHECK(header_edited->status().scan_cache == "partial");
+    CHECK(header_edited->status().scan_rescanned == 1);
     const std::shared_ptr<ModuleIndex> settled = build();
     CHECK(settled->status().scan_cache == "warm");
 
-    // The archive member skipped because its source was missing: the source appears, the member is no longer skipped.
+    // The archive member skipped because its source was missing: the source appears, the member is no longer skipped, and only it
+    // is scanned again.
     REQUIRE(settled->skipped_compilands().size() == 2);
     write_text(w.dir.file("missing.cpp"), "int missing() { return 1; }\n");
     const std::shared_ptr<ModuleIndex> appeared = build();
-    CHECK(appeared->status().scan_cache == "cold");
+    CHECK(appeared->status().scan_cache == "partial");
+    CHECK(appeared->status().scan_rescanned == 1);
     REQUIRE(appeared->skipped_compilands().size() == 1);
     CHECK(appeared->skipped_compilands()[0].compiland == kLibNoEnv);
+    CHECK(tracks(appeared, header));  // the reused part of app.cpp still includes new.h
+    // The merged result is what a full scan gives.
+    const auto full = [&]() {
+        ModuleIndexSpec spec;
+        spec.module_path = w.exe;
+        spec.scan_includes = true;
+        std::shared_ptr<ModuleIndex> index = ModuleIndex::start(spec);
+        REQUIRE(index->wait(30000));
+        return index;
+    };
+    const std::shared_ptr<ModuleIndex> reference = full();
+    CHECK(reference->status().scan_cache == "off");
+    CHECK(reference->tracked_files() == appeared->tracked_files());
+    CHECK(reference->scanned_headers() == appeared->scanned_headers());
+    CHECK(build()->status().scan_cache == "warm");
 }
 
 namespace {
@@ -378,7 +409,7 @@ bool tracks_file(const std::shared_ptr<ModuleIndex>& index, const std::string& f
 }
 }  // namespace
 
-TEST_CASE("WP-50 (second review): a source edited while the index scans is not cached; the next index scans again and sees the new include") {
+TEST_CASE("WP-50 (second review): a source edited while the index scans is not cached; the next index scans it again and sees the new include") {
     QuietLogs quiet;
     World w;
     const auto cache = std::make_shared<ScanCache>();
@@ -390,38 +421,58 @@ TEST_CASE("WP-50 (second review): a source edited while the index scans is not c
     });
     CHECK(first->status().scan_cache == "cold");
     CHECK_FALSE(tracks_file(first, w.dir.file("new.h")));  // the scan saw the old contents
-    CHECK(cache->size() == 0);                             // ... so its result was not stored
+    CHECK(cache->size() == 1);                             // WP-55: stored, without app.cpp's part
 
     const std::shared_ptr<ModuleIndex> second = build_index(w, cache);
-    CHECK(second->status().scan_cache == "cold");  // nothing stale to hit
+    CHECK(second->status().scan_cache == "partial");  // app.cpp's part scanned again: nothing stale to hit
+    CHECK(second->status().scan_rescanned == 1);
     CHECK(tracks_file(second, w.dir.file("new.h")));
-    CHECK(cache->size() == 1);
     const std::shared_ptr<ModuleIndex> third = build_index(w, cache);
     CHECK(third->status().scan_cache == "warm");
     CHECK(tracks_file(third, w.dir.file("new.h")));
 }
 
-TEST_CASE("WP-50 (second review): a scan that could not read a file that exists is not cached") {
+TEST_CASE("WP-55 (R-63): a header over the size limit is cached with its stamp; a file locked against reading keeps its compiland out of the cache") {
     QuietLogs quiet;
     World w;
     const auto cache = std::make_shared<ScanCache>();
-    // Over the scanner's size limit (8 MiB): it exists, but the scan cannot read it (as during a sharing violation).
+    // Over the scanner's size limit (8 MiB): never read, the same answer every time while its stamp holds (WP-50: never cached).
     write_text(w.dir.file("big.h"), "#pragma once\n" + std::string(9u * 1024u * 1024u, ' ') + "\n");
     write_text(w.dir.file("app.cpp"), "#include \"big.h\"\nint app() { return 1; }\n");
     bump_mtime(w.dir.file("app.cpp"));
     CHECK(build_index(w, cache)->status().scan_cache == "cold");
-    CHECK(cache->size() == 0);
-    CHECK(build_index(w, cache)->status().scan_cache == "cold");  // scanned again every time while it cannot be read
-    CHECK(cache->size() == 0);
+    CHECK(cache->size() == 1);
+    CHECK(build_index(w, cache)->status().scan_cache == "warm");
 
-    // Readable again (and including a header now): scanned, stored, then reused.
+    // Under the limit again (and including a header now): its stamp changed, so app.cpp's part is scanned again.
     write_text(w.dir.file("inner.h"), "#pragma once\n");
     write_text(w.dir.file("big.h"), "#pragma once\n#include \"inner.h\"\n");
     bump_mtime(w.dir.file("big.h"));
     const std::shared_ptr<ModuleIndex> readable = build_index(w, cache);
-    CHECK(readable->status().scan_cache == "cold");
+    CHECK(readable->status().scan_cache == "partial");
+    CHECK(readable->status().scan_rescanned == 1);
     CHECK(tracks_file(readable, w.dir.file("inner.h")));
+    CHECK(build_index(w, cache)->status().scan_cache == "warm");
+
+    // A sharing violation: inner.h is open without read sharing while app.cpp's part is scanned (big.h changes, so that part is
+    // stale). The read may succeed next time, so the part is not kept; the other compilands are.
+    write_text(w.dir.file("big.h"), "#pragma once\n#include \"inner.h\"\n// edited\n");
+    bump_mtime(w.dir.file("big.h"));
+    const std::wstring locked_path = fs::path(w.dir.file("inner.h")).wstring();
+    HANDLE locked = CreateFileW(locked_path.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    REQUIRE(locked != INVALID_HANDLE_VALUE);
+    const std::shared_ptr<ModuleIndex> while_locked = build_index(w, cache);
+    CHECK(while_locked->status().scan_cache == "partial");
+    CHECK(while_locked->status().scan_rescanned == 1);
     CHECK(cache->size() == 1);
+    // Still locked: the part is not reused although nothing it depends on shows a change.
+    const std::shared_ptr<ModuleIndex> still = build_index(w, cache);
+    CHECK(still->status().scan_cache == "partial");
+    CHECK(still->status().scan_rescanned == 1);
+    CloseHandle(locked);
+    const std::shared_ptr<ModuleIndex> unlocked = build_index(w, cache);
+    CHECK(unlocked->status().scan_cache == "partial");
+    CHECK(tracks_file(unlocked, w.dir.file("inner.h")));
     CHECK(build_index(w, cache)->status().scan_cache == "warm");
 }
 

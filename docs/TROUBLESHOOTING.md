@@ -40,15 +40,25 @@ revert, restart).
      The module file is normally read in the background once the index is ready (`image=background`; `kept=0` when the
      module was disabled during the read, whose copy is then dropped); `image=reload` means the first reload had to read it
      itself (set-option `prefetch_module_image` false, the reload came first, or the module was disabled while it ran).
-   * `WP50-SCAN-CACHE hit|miss module=... reason=... inputs=... check_ms=...`: whether an index took the file lists and include
-     graph of an earlier index of the same module file (a hot-restart's new process, a module loaded again). `miss
-     reason=size|mtime|pdb` means the module file was rebuilt since; `absent` that this broker had not indexed it before;
-     `file-changed:<path>` that a file the earlier scan read, or a directory it searched, changed since (an edited source, a
-     header created or removed), so the graph may be stale and is built again. On a hit, `inputs` files and directories were
-     checked in `check_ms`. `store=skipped reason=unreadable:<path>` means the scan met a file that exists but could not be
-     read (locked by an editor's save, over 8 MiB, a read error), and `reason=changed-during-scan:<path>` means a file changed
-     while the index was built. Such a scan is not kept, and the next index of the module scans again. Set-option
-     `cache_include_scan` false scans every time.
+   * `WP50-SCAN-CACHE hit|partial|miss module=... reason=... inputs=... check_ms=... compilands=... reused=... rescan=...`:
+     whether an index took the file lists and include graph of an earlier index of the same module file (a hot-restart's new
+     process, a module loaded again). The cache keeps them per compiland (WP-55): `hit` reuses every compiland, `partial`
+     reuses `reused` of the `compilands` and scans the other `rescan` again, `miss` scans all of them. `miss
+     reason=size|mtime|pdb` means the module file was rebuilt since; `absent` that this broker had not indexed it before.
+     `reason=file-changed:<path>` names the first file the earlier scan read, or directory it searched, that changed since (an
+     edited source, a header created or removed): the compilands that depend on it are scanned again, because their part of
+     the graph may be stale. `inputs` files and directories were checked in `check_ms`. Each compiland scanned again is named
+     by a `WP55-SCAN-RESCAN module=... compiland=<n> object=<file> reason=...` line (the first 20; the rest at trace).
+     `WP50-INDEX ... cache=cold|partial|warm|off reused=... rescanned=...` gives the same counts.
+     `store=partial|skipped reason=unreadable:<path> uncached=<n>` means `uncached` compilands met a file that exists but
+     could not be read (locked by an editor's save, a read error), and `reason=changed-during-scan:<path>` means a file
+     changed while the index was built. Those compilands are not kept (`skipped`: none was), and the next index scans them
+     again. A file over the scanner's 8 MiB limit is not read, but it is not a failed read either: it is kept with its stamp
+     like any other input (WP-55). Set-option `cache_include_scan` false scans every time.
+   * `WP55-INLINE-CACHE module=... object=... kept=... read=... entries=...`: the bind planner's verdicts on what an old
+     procedure inlined (WP-51) that this plan took from an earlier plan against the same module image (`kept`) and those
+     it had to read from the PDB (`read`). They are kept per module state and dropped with it (disable, unload, a new
+     process).
    * The two set-options of WP-50 (control command `set-option {"name":..., "value": true|false}`, both default `true`):
      `prefetch_module_image` (read the module file for the function comparison in the background once its index is
      ready; applies to modules enabled afterwards) and `cache_include_scan` (reuse the file lists and include graph of an unchanged

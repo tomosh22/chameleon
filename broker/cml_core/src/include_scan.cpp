@@ -14,8 +14,6 @@ namespace cml::core {
 
 namespace {
 
-constexpr std::uintmax_t kMaxFileBytes = 8u * 1024u * 1024u;
-
 bool is_space(char c) {
     return c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v';
 }
@@ -222,7 +220,7 @@ ScanFileReader disk_file_reader() {
             return std::nullopt;
         }
         const std::streamoff size = in.tellg();
-        if (size < 0 || static_cast<std::uintmax_t>(size) > kMaxFileBytes) {
+        if (size < 0 || static_cast<std::uint64_t>(size) > kScanMaxFileBytes) {
             return std::nullopt;
         }
         in.seekg(0);
@@ -248,9 +246,19 @@ std::uint32_t IncludeScanner::dir_id(const std::string& normalised_dir) {
     return id;
 }
 
+std::vector<std::uint32_t> IncludeScanner::take_touched() {
+    std::vector<std::uint32_t> out;
+    out.swap(touched_);
+    for (const std::uint32_t id : out) {
+        touched_mark_[id] = 0;
+    }
+    return out;
+}
+
 std::uint32_t IncludeScanner::file_id(const std::string& normalised_path) {
     const auto it = file_ids_.find(normalised_path);
     if (it != file_ids_.end()) {
+        touch(it->second);
         return it->second;
     }
     using Clock = std::chrono::steady_clock;
@@ -274,6 +282,7 @@ std::uint32_t IncludeScanner::file_id(const std::string& normalised_path) {
     file.dir = dir_id(std::string(path::parent_directory(std::string_view(normalised_path))));
     files_.push_back(std::move(file));
     file_ids_.emplace(normalised_path, id);
+    touch(id);
     return id;
 }
 
@@ -282,14 +291,14 @@ std::int64_t IncludeScanner::resolve(std::uint32_t dir, const std::string& name)
     {
         const auto it = resolved_[dir].find(name);
         if (it != resolved_[dir].end()) {
-            return it->second;
+            touch(it->second);  // WP-55: an answer from memory depends on the path as much as a read does
+            return files_[it->second].readable ? static_cast<std::int64_t>(it->second) : -1;
         }
     }
     ++stats_.resolved;
     const std::uint32_t id = file_id(pdb::normalize_path(name, dirs_[dir]));  // may intern a directory: resolved_ may grow
-    const std::int64_t answer = files_[id].readable ? static_cast<std::int64_t>(id) : -1;
-    resolved_[dir].emplace(name, answer);
-    return answer;
+    resolved_[dir].emplace(name, id);
+    return files_[id].readable ? static_cast<std::int64_t>(id) : -1;
 }
 
 const std::vector<IncludeDirective>* IncludeScanner::includes_of(const std::string& normalised_path) {
