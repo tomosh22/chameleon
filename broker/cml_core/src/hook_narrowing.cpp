@@ -6,6 +6,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <string_view>
 #include <unordered_map>
 
 #include "cml/core/bind_diag_ids.h"
@@ -93,6 +94,7 @@ public:
     explicit Narrower(const NarrowInput& in) : in_(in) {
         for (const bind::SymbolDecision& d : in_.plan->decisions) {
             by_raw_index_.emplace(d.symbol_index, &d);
+            by_name_.emplace(d.name, &d);  // WP-58: the first decision of a name, as BindPlan::find_decision answers
         }
         for (const bind::Fixup& f : in_.plan->fixups) {
             if (f.kind == bind::FixupKind::SecRel32) {
@@ -749,11 +751,13 @@ private:
     }
 
     const bind::SymbolDecision* by_raw_name(const std::string& name) const {
-        return in_.plan->find_decision(name);
+        const auto it = by_name_.find(std::string_view(name));
+        return it == by_name_.end() ? nullptr : it->second;
     }
 
     const NarrowInput& in_;
     std::unordered_map<std::uint32_t, const bind::SymbolDecision*> by_raw_index_;
+    std::unordered_map<std::string_view, const bind::SymbolDecision*> by_name_;  // WP-58 (R-62): not a walk of the decisions per hook
     std::unordered_map<std::uint64_t, const bind::Fixup*> secrel_;
     std::set<std::uint64_t> imgrel_;  // WP-36: (section << 32 | offset) of the planned Addr32NbDisp fix-ups
     bool planned_imgrel(std::uint32_t sec_index, std::uint32_t offset) const {

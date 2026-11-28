@@ -1,6 +1,10 @@
 // The event bus and the structured log sink (WP-12).
 #include <cstdio>
+#include <fstream>
+#include <iterator>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "../pdb/test_util.h"
@@ -27,6 +31,11 @@ std::FILE* open_scratch(const std::string& path) {
 #else
     return std::fopen(path.c_str(), "w+b");
 #endif
+}
+
+std::string read_text(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
 // Restores the process-wide log sink and level.
@@ -215,4 +224,70 @@ TEST_CASE("log hub forwards records to subscribers as log events and does not re
     CHECK(sub->events[0].body.get_string("level") == "warn");
     CHECK(sub->events[0].body.get_string("message").find("forwarded") != std::string::npos);
     CHECK(sub->events[1].body.get_string("level") == "error");
+}
+
+// WP-58 (R-62): the background writer keeps the records in order, writes a warning before its log call returns, and leaves
+// nothing behind when the hub is flushed or destroyed.
+TEST_CASE("log hub: the background writer writes every record in order, a warning at once") {
+    SinkGuard guard;
+    testpdb::TempDir dir;
+    const std::string path = dir.file("log_bg.txt");
+    std::FILE* file = open_scratch(path);
+    REQUIRE(file != nullptr);
+    {
+        LogHub::Options options;
+        options.file = file;
+        options.background_writer = true;
+        LogHub hub(options);
+        set_log_level(LogLevel::Trace);
+        set_log_sink(LogHub::sink, &hub);
+        std::thread other([] {
+            for (int i = 0; i < 500; ++i) {
+                CML_LOG(Trace, "other %d", i);
+            }
+        });
+        for (int i = 0; i < 500; ++i) {
+            CML_LOG(Trace, "main %d", i);
+        }
+        other.join();
+        CML_LOG(Warn, "a warning");
+        {
+            // On disk before the call returned, with everything logged before it.
+            const std::string now = read_text(path);
+            CHECK(now.find("a warning") != std::string::npos);
+            CHECK(now.find("main 499") != std::string::npos);
+            CHECK(now.find("other 499") != std::string::npos);
+        }
+        CML_LOG(Debug, "after the warning");
+        hub.flush();
+        CHECK(read_text(path).find("after the warning") != std::string::npos);
+        CML_LOG(Trace, "last");
+        set_log_sink(nullptr, nullptr);
+        CHECK(hub.records() == 1003);
+    }  // the destructor writes what is still queued
+    const std::string all = read_text(path);
+    CHECK(all.find("last") != std::string::npos);
+    // One line per record, each thread's records in the order it logged them.
+    std::size_t lines = 0;
+    std::vector<std::pair<std::string, int>> next = {{": main ", 0}, {": other ", 0}};
+    bool ordered = true;
+    for (std::size_t at = 0; at < all.size();) {
+        const std::size_t end = all.find('\n', at);
+        REQUIRE(end != std::string::npos);
+        const std::string line = all.substr(at, end - at);
+        at = end + 1;
+        ++lines;
+        for (auto& [tag, expected] : next) {
+            const std::size_t k = line.find(tag);
+            if (k != std::string::npos) {
+                ordered = ordered && std::stoi(line.substr(k + tag.size())) == expected;
+                ++expected;
+            }
+        }
+    }
+    CHECK(lines == 1003);
+    CHECK(ordered);
+    CHECK(next[0].second == 500);
+    CHECK(next[1].second == 500);
+    std::fclose(file);
 }

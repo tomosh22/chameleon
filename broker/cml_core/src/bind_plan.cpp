@@ -451,6 +451,28 @@ private:
         }
         return n;
     }
+    // WP-58 (R-62): the compiland's records by their last name component (comp_last), each list in compiland order; built on
+    // first use, so that a lookup of the records of one name does not walk every record of the compiland (once per group of
+    // statics, once per new static).
+    std::unordered_map<std::string, std::vector<std::uint32_t>> records_by_last_;
+    bool records_by_last_built_ = false;
+    const std::vector<std::uint32_t>& records_named(const std::string& last);
+    // WP-58: last_component(v.parent_name), from the cache of the enclosing procedure's record when that record carries the name.
+    std::string parent_last(const pdb::SymbolView& v) {
+        if (v.parent_proc != pdb::kNoSymbol && v.parent_proc < comp_syms_.size() && comp_syms_[v.parent_proc].name == v.parent_name) {
+            return comp_last(&comp_syms_[v.parent_proc]);
+        }
+        return last_component(v.parent_name);
+    }
+    // WP-58: the data records of the compiland in one image section, by RVA, each with its extent: its type's size, or, where
+    // that cannot be known, everything up to the next record of the section (settle_guards). Built once per section.
+    struct RecordExtent {
+        const pdb::SymbolView* view = nullptr;
+        std::uint64_t end = 0;
+        bool known = false;  // the extent is the type's size
+    };
+    std::map<std::uint16_t, std::vector<RecordExtent>> section_extents_;
+    const std::vector<RecordExtent>& section_extents(std::uint16_t section);
     std::map<std::uint32_t, std::int64_t> delta_;  // obj section -> (old RVA - section offset); absent: unknown
     std::set<std::uint32_t> delta_conflict_;
     // WP-40: the image section the layout of an object section maps into (every learned static agrees), so that a guard
@@ -471,6 +493,8 @@ private:
     // (guard_spelling). Computed once per guard (names do not change). Where that spelling is not known, a guard the two
     // spellings tie differently (or only one of them ties) is tied to none, and guard_ambiguous_ keeps what either tied.
     const std::vector<std::uint32_t>& guard_scope_statics(const Sym& guard);
+    std::vector<std::uint32_t> named_statics_;  // WP-58: what guard_scope_statics looks at, in symbol order
+    bool named_statics_built_ = false;
     bool guard_ties(std::uint32_t guard_pos, std::uint32_t static_pos);
     // WP-52 (ADR-0045, convergence ruling): every function-local static bound to the running process that needs a guard has
     // a guard tied to it that is bound to the old one, or it is refused (CML3211, naming the static). `untied`: the guards
@@ -519,6 +543,11 @@ private:
         std::string why;
     };
     ClosureId closure_of(const pdb::SymbolView& local);
+    // WP-58: closure_of by the enclosing procedure (all it reads), and the canonical display name of a closure's call operator
+    // ("??R" + tail), each computed once per plan.
+    std::unordered_map<std::uint32_t, ClosureId> closure_ids_;
+    std::unordered_map<std::string, std::string> closure_operator_names_;
+    const std::string& closure_operator_name(const std::string& tail);
     struct Match {
         const pdb::SymbolView* view = nullptr;
         BindSource how = BindSource::None;
@@ -1069,6 +1098,48 @@ bool Planner::ensure_compiland_symbols() {
     return true;
 }
 
+const std::vector<std::uint32_t>& Planner::records_named(const std::string& last) {
+    static const std::vector<std::uint32_t> kNone;
+    if (!records_by_last_built_ && comp_loaded_) {
+        records_by_last_built_ = true;
+        for (std::uint32_t i = 0; i < comp_syms_.size(); ++i) {
+            records_by_last_[comp_last(&comp_syms_[i])].push_back(i);
+        }
+    }
+    const auto it = records_by_last_.find(last);
+    return it == records_by_last_.end() ? kNone : it->second;
+}
+
+const std::vector<Planner::RecordExtent>& Planner::section_extents(std::uint16_t section) {
+    if (const auto it = section_extents_.find(section); it != section_extents_.end()) {
+        return it->second;
+    }
+    std::vector<const pdb::SymbolView*> records;
+    for (const pdb::SymbolView& v : comp_syms_) {
+        if (pdb::is_data_kind(v.kind) && v.rva != pdb::kNoRva && v.section == section) {
+            records.push_back(&v);
+        }
+    }
+    std::sort(records.begin(), records.end(), [](const pdb::SymbolView* a, const pdb::SymbolView* b) { return a->rva < b->rva; });
+    std::vector<RecordExtent> out(records.size());
+    for (std::size_t k = 0; k < records.size(); ++k) {
+        const pdb::SymbolView& v = *records[k];
+        const std::optional<std::uint64_t> size = pdb_.type_size(v.type_index);
+        RecordExtent& e = out[k];
+        e.view = &v;
+        e.known = size.has_value() && *size != 0;
+        e.end = e.known ? v.rva + *size : 0;
+        if (!e.known) {
+            std::size_t next = k + 1;
+            while (next < records.size() && records[next]->rva == v.rva) {
+                ++next;
+            }
+            e.end = next < records.size() ? records[next]->rva : std::numeric_limits<std::uint64_t>::max();
+        }
+    }
+    return section_extents_.emplace(section, std::move(out)).first->second;
+}
+
 std::vector<const pdb::SymbolView*> Planner::static_candidates(const std::string& base, const std::string& encl, bool want_function,
                                                                 const std::string& display, int tls_mode, const std::string& decorated) {
     const StageTimer timer(plan_.stage_ms.candidates);  // WP-58
@@ -1081,7 +1152,8 @@ std::vector<const pdb::SymbolView*> Planner::static_candidates(const std::string
         return out;
     }
     std::vector<const pdb::SymbolView*> all;
-    for (const pdb::SymbolView& v : comp_syms_) {
+    for (const std::uint32_t i : records_named(base)) {  // WP-58: the records whose last component is base
+        const pdb::SymbolView& v = comp_syms_[i];
         if (v.rva == pdb::kNoRva) {
             continue;
         }
@@ -1097,9 +1169,6 @@ std::vector<const pdb::SymbolView*> Planner::static_candidates(const std::string
             if (thread != (tls_mode == 1)) {
                 continue;
             }
-        }
-        if (comp_last(&v) != base) {
-            continue;
         }
         if (!want_function && (v.kind == pdb::SymbolKind::LocalThread || v.kind == pdb::SymbolKind::GlobalThread)) {
             tls_rvas_.insert(v.rva);
@@ -1179,7 +1248,7 @@ std::vector<const pdb::SymbolView*> Planner::static_candidates(const std::string
         const std::string enclosing = encl == "operator()" ? lambda_enclosing(display, base) : std::string();
         for (const pdb::SymbolView* v : all) {
             const bool local = v->parent_proc != pdb::kNoSymbol;
-            if (encl.empty() ? !local : (local && (last_component(v->parent_name) == encl || is_inlined_record(v, enclosing)))) {
+            if (encl.empty() ? !local : (local && (parent_last(*v) == encl || is_inlined_record(v, enclosing)))) {
                 out.push_back(v);
             }
         }
@@ -1772,9 +1841,19 @@ const std::vector<std::uint32_t>& Planner::guard_scope_statics(const Sym& guard)
     const ScopeKeys gk = scope_keys(gpos);
     const bool guard_read = (use[0] && gk[0].has_value()) || (use[1] && gk[1].has_value());
     std::array<std::vector<std::uint32_t>, 2> tied;
-    for (std::uint32_t pos = 0; pos < syms_.size(); ++pos) {
+    if (!named_statics_built_) {
+        // WP-58: the defined statics with a decorated name that are not guards, once per plan (names do not change).
+        named_statics_built_ = true;
+        for (std::uint32_t pos = 0; pos < syms_.size(); ++pos) {
+            const Sym& s = syms_[pos];
+            if (s.defined && s.is_static && !s.name.empty() && s.name[0] == '?' && !is_guard_variable(s.name)) {
+                named_statics_.push_back(pos);
+            }
+        }
+    }
+    for (const std::uint32_t pos : named_statics_) {
         const Sym& s = syms_[pos];
-        if (!s.defined || !s.is_static || s.dec.type != SymbolType::Data || s.name.empty() || s.name[0] != '?' || is_guard_variable(s.name)) {
+        if (s.dec.type != SymbolType::Data) {
             continue;
         }
         const std::optional<LocalScopeKey>& sk = scope_keys(pos)[0];
@@ -1995,23 +2074,37 @@ const pdb::FunctionSignature& Planner::new_signature(const Sym& sy) {
     return object_debug().at(sy.dec.section, sy.s->value);
 }
 
+const std::string& Planner::closure_operator_name(const std::string& tail) {
+    auto it = closure_operator_names_.find(tail);
+    if (it == closure_operator_names_.end()) {
+        it = closure_operator_names_.emplace(tail, canonical_lambda_names(display_name("??R" + tail))).first;
+    }
+    return it->second;
+}
+
 Planner::ClosureId Planner::closure_of(const pdb::SymbolView& local) {
-    ClosureId id;
     if (local.parent_proc == pdb::kNoSymbol || local.parent_proc >= comp_syms_.size()) {
+        ClosureId id;
         id.known = true;  // not function-local: no closure
         return id;
     }
+    // (WP-58: what follows reads only the enclosing procedure; kept per procedure.)
+    if (const auto cached = closure_ids_.find(local.parent_proc); cached != closure_ids_.end()) {
+        return cached->second;
+    }
+    ClosureId id;
     const pdb::FunctionSignature& sig = old_signature(comp_syms_[local.parent_proc]);
     if (!sig.known) {
         id.why = sig.why;
-        return id;
+    } else {
+        id.known = true;
+        // ".?AV<lambda_1>@?1??f@@YAXXZ@": '.', '?', 'A', the class key ('V' class, 'U' struct), then the qualified name.
+        const std::string u = pdb::without_tu_discriminator(sig.class_unique_name);
+        if (sig.member && u.size() > 4 && u[0] == '.' && u[1] == '?' && u[2] == 'A') {
+            id.tail = u.substr(4);
+        }
     }
-    id.known = true;
-    // ".?AV<lambda_1>@?1??f@@YAXXZ@": '.', '?', 'A', the class key ('V' class, 'U' struct), then the qualified name.
-    const std::string u = pdb::without_tu_discriminator(sig.class_unique_name);
-    if (sig.member && u.size() > 4 && u[0] == '.' && u[1] == '?' && u[2] == 'A') {
-        id.tail = u.substr(4);
-    }
+    closure_ids_.emplace(local.parent_proc, id);
     return id;
 }
 
@@ -2861,7 +2954,7 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
         const std::uint32_t parent = free_cands[c]->parent_proc;
         by_name[c] = parent != pdb::kNoSymbol && parent < comp_syms_.size() && comp_norm(&comp_syms_[parent]).canonical == members_function;
         old_by_name += by_name[c] ? 1u : 0u;
-        by_closure_name[c] = !ids[c].tail.empty() && canonical_lambda_names(display_name("??R" + ids[c].tail)) == members_function;
+        by_closure_name[c] = !ids[c].tail.empty() && closure_operator_name(ids[c].tail) == members_function;
         old_by_closure_name += by_closure_name[c] ? 1u : 0u;
     }
     // Old records in a closure of the same enclosing function as a member (the decorated function: name, class and
@@ -3295,9 +3388,10 @@ void Planner::pair_statics_by_procedure(const std::string& base, bool is_tls, co
         const std::size_t count = new_list.size();
         // The old records as the planner's candidates (the same records, by the same walk order).
         std::vector<const pdb::SymbolView*> old_views;
-        for (const pdb::SymbolView& v : comp_syms_) {
+        for (const std::uint32_t i : records_named(base)) {  // WP-58: the records named base, in compiland order
+            const pdb::SymbolView& v = comp_syms_[i];
             const bool thread = v.kind == pdb::SymbolKind::LocalThread || v.kind == pdb::SymbolKind::GlobalThread;
-            if (v.parent_proc == old_proc->index && pdb::is_data_kind(v.kind) && thread == is_tls && comp_last(&v) == base) {
+            if (v.parent_proc == old_proc->index && pdb::is_data_kind(v.kind) && thread == is_tls) {
                 old_views.push_back(&v);
             }
         }
@@ -4120,8 +4214,9 @@ void Planner::refuse_reset_statics() {
         }
         const std::string base = base_identifier(s.name);
         const std::optional<std::string> top = top_function_of(pos);
-        for (const pdb::SymbolView& v : comp_syms_) {
-            if (!pdb::is_data_kind(v.kind) || v.parent_proc == pdb::kNoSymbol || v.parent_proc >= comp_syms_.size() || comp_last(&v) != base) {
+        for (const std::uint32_t i : records_named(base)) {  // WP-58: the records named base, in compiland order
+            const pdb::SymbolView& v = comp_syms_[i];
+            if (!pdb::is_data_kind(v.kind) || v.parent_proc == pdb::kNoSymbol || v.parent_proc >= comp_syms_.size()) {
                 continue;
             }
             // (A thread-local record never stands for plain data: a static that lost thread_local is another variable.)
@@ -4276,28 +4371,13 @@ void Planner::settle_guards() {
             if (owner && *owner == ci_ && so && ensure_compiland_symbols()) {
                 const std::uint64_t g_begin = static_cast<std::uint64_t>(rva);
                 const std::uint64_t g_end = g_begin + 4;
-                std::vector<const pdb::SymbolView*> records;
-                for (const pdb::SymbolView& v : comp_syms_) {
-                    if (pdb::is_data_kind(v.kind) && v.rva != pdb::kNoRva && v.section == so->section) {
-                        records.push_back(&v);
-                    }
-                }
-                std::sort(records.begin(), records.end(), [](const pdb::SymbolView* a, const pdb::SymbolView* b) { return a->rva < b->rva; });
-                for (std::size_t k = 0; k < records.size() && other == nullptr; ++k) {
-                    const pdb::SymbolView& v = *records[k];
-                    std::optional<std::uint64_t> size = pdb_.type_size(v.type_index);
-                    const bool known = size.has_value() && *size != 0;
-                    std::uint64_t end = known ? v.rva + *size : 0;
-                    if (!known) {
-                        std::size_t next = k + 1;
-                        while (next < records.size() && records[next]->rva == v.rva) {
-                            ++next;
-                        }
-                        end = next < records.size() ? records[next]->rva : std::numeric_limits<std::uint64_t>::max();
-                    }
-                    if (g_begin < end && g_end > v.rva) {
+                // (WP-58: the section's records and their extents are read once per plan, not once per guard.)
+                for (const RecordExtent& e : section_extents(so->section)) {
+                    const pdb::SymbolView& v = *e.view;
+                    if (g_begin < e.end && g_end > v.rva) {
                         other = &v;
-                        other_extent = known ? hex(v.rva) + ".." + hex(end) : hex(v.rva) + " (size unknown)";
+                        other_extent = e.known ? hex(v.rva) + ".." + hex(e.end) : hex(v.rva) + " (size unknown)";
+                        break;
                     }
                 }
             }

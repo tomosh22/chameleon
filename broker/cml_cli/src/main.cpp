@@ -212,6 +212,9 @@ int run_headless(const Options& options) {
     cml::core::LogHub::Options hub_options;
     hub_options.file = out;
     hub_options.format = options.log_format == "json" ? cml::core::LogFormat::Json : cml::core::LogFormat::Text;
+    // WP-58 (R-62): a log file is written by the hub's own thread, so that a reload logging every decision at trace does not pay
+    // a file write per record (a warning or an error is still on disk before its log call returns).
+    hub_options.background_writer = !options.log_file.empty();
     cml::core::LogHub hub(hub_options);
     cml::set_log_sink(cml::core::LogHub::sink, &hub);
     cml::set_log_level(options.verbose ? cml::LogLevel::Debug : cml::LogLevel::Info);
@@ -287,6 +290,7 @@ int run_headless(const Options& options) {
     CML_LOG(Info, "cml_broker exiting with code %d", exit_code);
     hub.attach_events(nullptr);
     cml::set_log_sink(nullptr, nullptr);  // the hub is a local of this function
+    hub.flush();  // WP-58: the log is complete before a console-close handler lets the process end
     SetEvent(g_done_event);  // releases a console-close handler that is waiting for the shutdown
     return exit_code;
 }
