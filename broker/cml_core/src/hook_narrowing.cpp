@@ -1323,6 +1323,10 @@ std::vector<Diag> prove_inlined_lambda_statics(const NarrowInput& input) {
     std::size_t proven = 0;
     std::size_t refused = 0;
     std::size_t skipped = 0;  // re-decided after the listing (refused or unbound by a later step): nothing to prove
+    // WP-56: one comparator for the refers-to checks of every listed static.
+    NarrowInput refs_input = input;
+    refs_input.enabled = true;
+    const Narrower refs(refs_input);
     for (const bind::InlinedLambdaStatic& s : plan.inlined_lambda_statics) {
         const bind::SymbolDecision* d = plan.find_decision(s.symbol);
         if (d == nullptr || d->decision != bind::DecisionKind::BindOldData || d->old_address.rva != s.record_rva) {
@@ -1335,16 +1339,19 @@ std::vector<Diag> prove_inlined_lambda_statics(const NarrowInput& input) {
         // code then used the record at the same places (the static is bound to its address). A procedure that does not refer
         // to the static (another lambda's call operator, whose canonical name is the same; a caller that no longer inlines the
         // lambda) says nothing about whose the record is.
+        // (Review: a procedure without a hook is not proven either; verdict_of refuses it first, and this does not rely on that.)
         if (why.empty()) {
+            const bind::HookEntry* hook = nullptr;
             for (const bind::HookEntry& h : plan.hooks) {
                 if (s.proc_rva != bind::kNoRva && h.old_rva == s.proc_rva) {
-                    NarrowInput ni = input;
-                    ni.enabled = true;
-                    if (!Narrower(ni).refers_to(h, s.symbol)) {
-                        why = "the patch's '" + s.proc + "' does not refer to the static, so its unchanged code does not show whose the record is";
-                    }
+                    hook = &h;
                     break;
                 }
+            }
+            if (hook == nullptr) {
+                why = "'" + s.proc + "' has no hook to show it refers to the static";
+            } else if (!refs.refers_to(*hook, s.symbol)) {
+                why = "the patch's '" + s.proc + "' does not refer to the static, so its unchanged code does not show whose the record is";
             }
         }
         CML_LOG(Trace, "WP53-INLINED-PROOF static='%s' record rva=%s proc='%s' by=%s proven=%s%s%s", s.display.c_str(), hex(s.record_rva).c_str(), s.proc.c_str(), bind::to_string(s.how),

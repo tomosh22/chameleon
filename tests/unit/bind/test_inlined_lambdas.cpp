@@ -1011,7 +1011,8 @@ TEST_CASE("WP-52 ruling: cl's nested lambda static, decided new, is refused whil
         // WP-52: refused (the planner looked one level up only). WP-56 (R-66): the chain of enclosing procedures is searched,
         // the record of o2_nest_step pairs by the layout, and the pairing waits for the code of o2_nest_step (WP-53).
         GuardCase c = plan_guards(kCl, kCl, "o2_nest_step", {{"nested", 0x20}}, {{kClNested, 0x20}, {kClNestedGuard, 0x28}});
-        check_bound_pending_proof(c, kClNested, "o2_nest_step::<lambda_1>::operator()::<lambda_1>::operator()::nested");
+        // (The plan shows display_name's reading of cl's name; the planner compares the resolved one.)
+        check_bound_pending_proof(c, kClNested, "1?1??o2_nest_step::operator()::<lambda_1>::operator()::nested");
     }
     SUBCASE("the record in the outer lambda's call operator, the only one of its name and no types to check: paired, not new") {
         // (The rule applies only to a static decided new; this one is found, as before. In CI the closure types of the old
@@ -1179,6 +1180,36 @@ TEST_CASE("WP-56 (R-68): two lambdas of one function tied only by the resolved n
     bool named = false;
     for (const cml::Diag& d : errors) {
         named = named || contains(d.message, "cannot be confirmed by the code of their call operators");
+    }
+    CHECK(named);
+}
+
+TEST_CASE("WP-56 (review of 6dc968a, finding 2): a lambda added next to one tied by the resolved names refuses both") {
+    // Old: the inner `<lambda_1>` with `nested`. The patch adds `<lambda_2>` with a `nested` of its own next to it: the set of
+    // the lambdas that hold the name changed, so the numbers may have shifted, and `<lambda_1>`'s static, tied to the old record
+    // by the resolved names only, is not paired either (no single-lambda exemption without the same set).
+    SynthWorld w = basic_world(false, kCl);
+    w.data(w.tu(), "`anonymous namespace'::s_a", 0x10);
+    OldTypes t;
+    typed_operator(w, t, kClInnerProc, 0x60, "``o2_nest_step'::`2'::<lambda_1>::operator()'::`2'::<lambda_1>", kClInnerUnique, {{"nested", 0x20}});
+    open_with(w, t);
+    SynthObj o;
+    const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+    o.symbol("?s_a@?A0x1@@3HA", 0x10, bss, false, false);
+    const std::string added = "?nested@?1???R<lambda_2>@?1???R<lambda_1>@?1??o2_nest_step@@YAXXZ@QEBA@XZ@QEBA@XZ@4UO2Name@@A";
+    o.symbol(kClNested, 0x20, bss, false, false);
+    o.symbol(added, 0x30, bss, false, false);
+    o.compile3(kCl);
+    Built b = o.build();
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    auto r = plan_bind(w.input(b), &errors, &partial);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(decision(partial, kClNested).decision != DecisionKind::BindOldData);
+    CHECK(decision(partial, added).decision != DecisionKind::BindOldData);
+    bool named = false;
+    for (const cml::Diag& d : errors) {
+        named = named || (d.id() == "CML3207" && contains(d.message, kClNested) && contains(d.message, "are not the same as in the old image"));
     }
     CHECK(named);
 }

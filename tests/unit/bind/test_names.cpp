@@ -208,6 +208,12 @@ TEST_CASE("resolved_qualified_name (WP-56, R-68): a closure's unique name and it
     CHECK(*op == "??R<lambda_1>@?1???R<lambda_1>@?1??o2_nest_step@@YAXXZ@QEBA@XZ@QEBA@XZ");
     CHECK(scope.compare(0, op->size(), *op) == 0);
     CHECK_FALSE(resolved_decorated_name("??R<lambda_1>@?1???R7?1??f@@YAXXZ@QEBA@XZ@QEBA@XZ").has_value());
+    // (Review of 6dc968a, finding 3.) The names of the types are written out too: a lambda of `JPH::Foo::bar()` returning
+    // `JPH::Baz *`, whose call operator spells JPH `3` (`43` in its return type) where its static spells it `4` (`54`).
+    const std::optional<std::string> jph = resolved_decorated_name("??R<lambda_1>@?1??bar@Foo@JPH@@QEAAPEAVBaz@3@XZ@QEBAPEAV43@XZ");
+    REQUIRE(jph.has_value());
+    CHECK(*jph == "??R<lambda_1>@?1??bar@Foo@JPH@@QEAAPEAVBaz@JPH@@XZ@QEBAPEAVBaz@JPH@@XZ");
+    CHECK(rest_of("?x@?1???R<lambda_1>@?1??bar@Foo@JPH@@QEAAPEAVBaz@4@XZ@QEBAPEAV54@XZ@4HA") == *jph + "@4");
     CHECK_FALSE(resolved_decorated_name("f").has_value());
 }
 

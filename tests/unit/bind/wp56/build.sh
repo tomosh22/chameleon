@@ -10,6 +10,14 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 W=${1:?work directory}
 CLANG_CL=${2:-clang-cl}
 LLD_LINK=${3:-lld-link}
+# The work directory is deleted first: refuse one that is the current directory, '/', this directory, inside it or above it.
+A=$(realpath -m -- "$W")
+H=$(realpath -- "$HERE")
+C=$(realpath -- .)
+if [ "$A" = "/" ] || [ "$A" = "$C" ] || [ "$A" = "$H" ] || [[ "$A" == "$H"/* ]] || [[ "$H" == "$A"/* ]]; then
+  echo "build.sh: refusing work directory '$W' ($A): it is '.', '/', $H, inside it or containing it" >&2
+  exit 2
+fi
 rm -rf "$W"
 mkdir -p "$W"
 cp "$HERE"/src/*.cpp "$HERE"/src/*.h "$W"/

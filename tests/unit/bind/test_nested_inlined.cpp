@@ -180,7 +180,7 @@ TargetAddress address(std::uint32_t rva) {
     return t;
 }
 
-std::vector<Diag> prove_synthetic(bool refers) {
+std::vector<Diag> prove_synthetic(bool refers, bool hooked = true) {
     std::vector<std::uint8_t> code = {0xB9, 7, 0, 0, 0};  // mov ecx, 7
     if (refers) {
         const std::vector<std::uint8_t> lea = {0x48, 0x8D, 0x05, 0, 0, 0, 0};  // lea rax,[rip+S]
@@ -240,7 +240,9 @@ std::vector<Diag> prove_synthetic(bool refers) {
     h.old_va = kImageBase + kOldP;
     h.old_rva = kOldP;
     h.old_size = 16;
-    plan.hooks.push_back(h);
+    if (hooked) {
+        plan.hooks.push_back(h);
+    }
     InlinedLambdaStatic l;
     l.symbol = kS;
     l.display = sd.display;
@@ -270,4 +272,15 @@ TEST_CASE("WP-56: an unchanged procedure proves an inlined lambda's record only 
     CAPTURE(out[0].message);
     CHECK(out[0].id() == "CML3207");
     CHECK(contains(out[0].message, "the patch's 'f' does not refer to the static"));
+}
+
+TEST_CASE("WP-56 (review of 6dc968a, finding 1): a procedure without a hook proves nothing, whatever its code") {
+    // No hook of the plan has P's old entry: nothing compares P or shows that it refers to the static. CML3207. (WP-53's
+    // verdict refuses it first, "is not paired with a function of the patch"; the refers-to check does not rely on that and
+    // refuses it as well, "has no hook to show it refers to the static".)
+    const std::vector<Diag> out = prove_synthetic(true, false);
+    REQUIRE(out.size() == 1);
+    CAPTURE(out[0].message);
+    CHECK(out[0].id() == "CML3207");
+    CHECK(contains(out[0].message, "'f' is not paired with a function of the patch"));
 }
