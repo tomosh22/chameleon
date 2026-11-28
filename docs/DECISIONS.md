@@ -1687,3 +1687,22 @@ keeping `static int n = 0;` and gaining a dynamic static) reloads with both stat
 
 WP-60..WP-63 start together. WP-60 and WP-63 share `bind_plan.cpp` (whoever merges second merges main and re-runs CI). WP-61 and
 WP-62 both touch the agent link; WP-62 must not change agent behaviour. Rules as in ADR-0043.
+
+**Rulings (wave 15):**
+- WP-61 (#93): the R-71 failure was in the test: the scripted broker stored its Welcome ABI after its constructor returned, while the agent
+  was already connecting, so an old-ABI Welcome made the agent report the module as `ModuleLoaded`. No agent path sends a request before
+  the module is reported. Accepted on Windows evidence (a deterministic reproduction of R-71's signature and a 50-run repeat step).
+- WP-60 (#94), high review: the first version made any function with a static that inlined a free function (`std::max`, header helpers)
+  refuse on every edit. Ruled too broad: a free-function helper is cleared by proof, either from the patch (the patch's procedure still
+  inlines the same helper, the helper's source file checksum is unchanged, and the patch defines no static of the record's name in the
+  helper's scope) or, for clang compilands only, from external linkage (an S_GPROC32 or public of the same name and signature). Member
+  templates instantiated with internal types count as internal. Clearing by record kind is clang-only.
+- WP-63 (#95), high review: a bitmask claim counts only a candidate the region writes, follows forward branches to the join, and needs the
+  register proved to hold the guard's value (or a memory-destination `or`/`bts`); any undecoded code or unconsumed candidate relocation
+  in a guard-using section fails the reading; aliases of the guard (section-symbol or label relocations, data relocations by section)
+  are refused. A kept static written through a pointer loaded from memory by a new static's initialiser is an accepted residual (it is
+  the program's own semantics, run once).
+- WP-62 (#96), medium review: the condition-variable gate hid the cycle from TSan instead of removing it for callbacks that run under a
+  send lock. The test rig's scripted agents run their answers outside the send lock, and the invariant (never take the gate under an
+  AgentLink send lock) is documented. The release package never takes the gate (CML_FAULT_INJECTION=OFF).
+- R-72 (found by WP-60) is a pre-existing silent reset and leads wave 16.
