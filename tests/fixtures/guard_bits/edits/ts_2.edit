@@ -1,0 +1,20 @@
+--- a/bits_ts.cpp
++++ b/bits_ts.cpp
+@@ -12,7 +12,10 @@
+ __declspec(noinline) inline int gb_ts_counter()
+ {
+     static int calls = 0;
++    static GbName extra = gb_make(400000);
+     calls += 1;
++    extra.hits += 1;
++    g_gb_ts_extra = extra.id + extra.hits;
+     return 200000 + calls;
+ }
+ 
+@@ -33,5 +36,5 @@
+ 
+ int gb_ts_mark()
+ {
+-    return 1;
++    return 2;
+ }

@@ -68,3 +68,4 @@ add_subdirectory(atomic_reload)       # WP-47 (a header edit over three TUs, the
 add_subdirectory(jump_tables)         # WP-49 (switches: jump tables in the function's own code under cl)
 add_subdirectory(cross_module_atomic) # WP-54 (a header edit over an exe and its DLL, the DLL's TU refused)
 add_subdirectory(inlined_owner_o2)    # WP-57 (/O2 /Ob2: an own static next to a std::sort with a lambda)
+add_subdirectory(guard_bits)          # WP-63 (/O2 /Ob2: an inline function keeps `static int n = 0;` and gains a dynamic static)

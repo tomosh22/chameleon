@@ -1,0 +1,90 @@
+# Scenario `guard_bits` (WP-63, R-69, ADR-0047): the fixture built with /O2 /Ob2 in every cell.
+#   Two inline functions keep a constant-initialised `static int calls = 0;` and each edit adds a dynamically initialised
+#   static next to it: nts_1 in bits_nts.cpp (/Zc:threadSafeInit-: the function's statics share ONE external bitmask `??_B`),
+#   ts_2 in bits_ts.cpp (thread-safe statics: the new static's external guard `?$TSS<n>` is named in calls' block). The
+#   guard's name ties it to calls, which is bound to the running process, and to the new static: WP-59 refused both edits
+#   (CML3600), because a constant-initialised static defines the same symbols as a dynamic one. WP-63 reads from the
+#   patch's code which statics are initialised under the guard (the bit a store sets, or the _Init_thread_header ..
+#   _Init_thread_footer bracket, and the one static the code behind it refers to): only the new one, so the guard is new.
+#   Both reloads must apply in every cell (no refusal is allowed); nts / ts continue from where they were (calls kept), the
+#   new statics count from 300001 / 400001 and are constructed once each (made 0 -> 1 -> 2).
+# Every reload logs `WP63-GUARD-CODE guard=... verdict=new-guard` for the guard it reads.
+name = "guard_bits"
+description = "fixture guard_bits (/O2 /Ob2): an inline function that keeps a constant-initialised static and gains a dynamic one reloads, with and without thread-safe statics"
+fixture = "guard_bits"
+timeout_s = 240
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_guard_bits.exe"
+within_s = 15
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ nts=10\\d{4} ntsx=0 nmark=1 ts=20\\d{4} tsx=0 tmark=1 made=0\\b"
+within_s = 20
+
+# 1. nts_1: gb_nts_counter() gains `extra` (bit 1 of its bitmask; calls is static number 0 and tests no bit).
+[[step]]
+kind = "edit"
+patch = "edits/nts_1.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ nts=10\\d{4} ntsx=30\\d{4} nmark=2 ts=20\\d{4} tsx=0 tmark=1 made=1\\b"
+within_s = 10
+
+# calls continues from its value before the reload (a reset would restart nts at 100001).
+[[step]]
+kind = "expect_monotonic"
+key = "nts"
+min_samples = 20
+since_reload = 10
+within_s = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "ntsx"
+min_samples = 10
+
+# 2. ts_2: gb_ts_counter() gains `extra` (its own external guard in calls' block).
+[[step]]
+kind = "edit"
+patch = "edits/ts_2.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ nts=10\\d{4} ntsx=30\\d{4} nmark=2 ts=20\\d{4} tsx=40\\d{4} tmark=2 made=2\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_monotonic"
+key = "ts"
+min_samples = 20
+since_reload = 10
+within_s = 20
+
+[[step]]
+kind = "expect_monotonic"
+key = "tsx"
+min_samples = 10
+
+[[step]]
+kind = "expect_monotonic"
+key = "nts"
+min_samples = 20

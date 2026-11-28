@@ -28,12 +28,14 @@ cml_add_unit_test(bind
         test_nested_inlined.cpp  # WP-56: a nested lambda's static found up the chain of enclosing procedures (R-66; wp56/)
         test_bitmask_inline.cpp  # WP-59: clang's `??_B` bitmask of an inline function's statics is a guard (R-67; wp59/)
         test_inlined_owners.cpp  # WP-57: an own static next to inlined closure code, proven by its function's code (R-59; wp57/)
+        test_guard_code.cpp  # WP-63: which statics an inline function's external guard guards, read from the code (R-69; wp63/)
     LIBS cml_core)
 target_compile_definitions(cml_test_bind PRIVATE "CML_BIND_GOLDEN_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/golden\""
                                                "CML_BIND_WP53_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/wp53\""
                                                "CML_BIND_WP56_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/wp56\""
                                                "CML_BIND_WP57_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/wp57\""
-                                               "CML_BIND_WP59_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/wp59\"")
+                                               "CML_BIND_WP59_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/wp59\""
+                                               "CML_BIND_WP63_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/wp63\"")
 if(NOT MSVC)
     target_link_libraries(cml_test_bind PRIVATE Threads::Threads)
 endif()
