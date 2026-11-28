@@ -96,7 +96,8 @@ kind = "expect_reload_result"  # an integer member of the last reload's result (
 key = "compiled"               # modules_patched, processes_patched, patched, hooks_installed, ...)
 value = 1
 compiler = "cl"                # optional (WP-49): "cl" or "clang-cl"; the expectation holds for that compiler only, the other
-                               # compiler's cells pass the step without checking
+                               # compiler's cells pass the step without checking. A reload refused under `allow_error`
+                               # leaves no result (WP-52): the step then fails, except in the other compiler's cells
 
 # WP-22: undo reloads
 [[step]]

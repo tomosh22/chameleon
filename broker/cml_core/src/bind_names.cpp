@@ -1,6 +1,9 @@
 #include "cml/core/bind_names.h"
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace cml::core::bind {
@@ -631,6 +634,451 @@ bool is_guard_variable(std::string_view d) {
         return false;
     }
     return is_guard_name(std::string(d.substr(2, e - 2)));
+}
+
+// ---- WP-52 (R-60): name back-references ----------------------------------------------------------------------------
+
+namespace {
+
+// Writes out the part of a decorated name it reads, with every name back-reference replaced by the name it stands for.
+// It reads the qualified names, function encodings and types that the scopes of function-local statics contain (free and
+// member functions, templates, lambdas, anonymous namespaces, pointers, references, arrays, function pointers) and
+// fails on anything else (`ok` false): the caller then has no key, never a wrong one.
+struct BackrefReader {
+    std::string_view s;
+    std::size_t i = 0;
+    bool ok = true;
+    int depth = 0;
+    std::vector<std::string> names;  // the back-reference table: each name with its closing '@'
+    int local_level = 0;             // how many function scopes are open
+    int outermost_level = 0;
+    std::string outermost;           // the function scope opened deepest (the outermost function), written out
+
+    char peek(std::size_t k = 0) const noexcept { return i + k < s.size() ? s[i + k] : '\0'; }
+    bool fail() noexcept {
+        ok = false;
+        return false;
+    }
+    bool take(char c, std::string& out) {
+        if (!ok || peek() != c) {
+            return fail();
+        }
+        out += c;
+        ++i;
+        return true;
+    }
+    bool take_any(std::string& out) {
+        if (!ok || i >= s.size()) {
+            return fail();
+        }
+        out += s[i++];
+        return true;
+    }
+    static bool in(char c, std::string_view set) noexcept { return c != '\0' && set.find(c) != std::string_view::npos; }
+    void memorize(const std::string& name) {
+        if (names.size() < 10 && std::find(names.begin(), names.end(), name) == names.end()) {
+            names.push_back(name);
+        }
+    }
+    // A simple name up to and with its '@'.
+    bool identifier(std::string& name) {
+        const std::size_t e = s.find('@', i);
+        if (!ok || e == std::string_view::npos || e == i) {
+            return fail();
+        }
+        name.assign(s.substr(i, e + 1 - i));
+        i = e + 1;
+        return true;
+    }
+    bool backref(std::string& out) {
+        const std::size_t k = static_cast<std::size_t>(peek() - '0');
+        if (k >= names.size()) {
+            return fail();
+        }
+        out += names[k];
+        ++i;
+        return true;
+    }
+    // "<digit>" (1..10), or hexadecimal letters 'A'..'P' closed by '@'; an optional leading '?' (negative).
+    bool number(std::string& out, std::uint64_t* value = nullptr) {
+        if (peek() == '?') {
+            take_any(out);
+        }
+        std::uint64_t v = 0;
+        if (is_digit(peek())) {
+            v = static_cast<std::uint64_t>(peek() - '0') + 1;
+            take_any(out);
+        } else {
+            while (peek() >= 'A' && peek() <= 'P') {
+                v = v * 16 + static_cast<std::uint64_t>(peek() - 'A');
+                take_any(out);
+            }
+            take('@', out);
+        }
+        if (value != nullptr) {
+            *value = v;
+        }
+        return ok;
+    }
+    // Scope pieces up to the '@' that closes the qualified name.
+    bool chain(std::string& out) {
+        while (ok && peek() != '@') {
+            if (i >= s.size() || !piece(out)) {
+                return fail();
+            }
+        }
+        return take('@', out);
+    }
+    bool piece(std::string& out) {
+        const char c = peek();
+        if (is_digit(c)) {
+            return backref(out);
+        }
+        if (c == '?') {
+            if (peek(1) == '$') {
+                std::string t;
+                if (!template_name(t)) {
+                    return false;
+                }
+                memorize(t);
+                out += t;
+                return true;
+            }
+            if (const std::size_t len = function_scope_length(s, i); len != 0) {
+                out += s.substr(i, len);
+                i += len;
+                return take('?', out) && local_symbol(out);
+            }
+            if (peek(1) == 'A') {  // anonymous namespace "?A0x1234abcd@"
+                std::string t;
+                if (!identifier(t)) {
+                    return false;
+                }
+                memorize(t);
+                out += t;
+                return true;
+            }
+            return fail();
+        }
+        std::string t;
+        if (!identifier(t)) {
+            return false;
+        }
+        memorize(t);
+        out += t;
+        return true;
+    }
+    // "?$name@<arguments>@": the arguments are read with a table of their own, which starts with the template's name; the
+    // whole template is ONE entry of the enclosing table (memorised by the caller, except for a symbol's own name).
+    bool template_name(std::string& out) {
+        if (++depth > 64) {
+            return fail();
+        }
+        out += "?$";
+        i += 2;
+        std::vector<std::string> outer;
+        outer.swap(names);
+        std::string name;
+        if (peek() == '?' || !identifier(name)) {
+            names.swap(outer);
+            return fail();  // an operator template ("??$?6...") is not read
+        }
+        memorize(name);
+        out += name;
+        while (ok && peek() != '@') {
+            if (i >= s.size() || !type(out)) {
+                fail();
+                break;
+            }
+        }
+        take('@', out);
+        names.swap(outer);
+        --depth;
+        return ok;
+    }
+    // A function scope: the enclosing function's own decorated name.
+    bool local_symbol(std::string& out) {
+        const std::size_t start = out.size();
+        ++local_level;
+        const bool read = symbol(out);
+        if (read && local_level > outermost_level) {
+            outermost_level = local_level;
+            outermost = out.substr(start);
+        }
+        --local_level;
+        return read;
+    }
+    // '?' <name> <scope pieces> '@' <encoding>
+    bool symbol(std::string& out) {
+        if (++depth > 64 || !take('?', out)) {
+            return fail();
+        }
+        if (peek() == '?') {
+            if (peek(1) == '$') {
+                if (!template_name(out)) {  // a function template's own name is not memorised
+                    return false;
+                }
+            } else {
+                take_any(out);  // the '?' of an operator, constructor or destructor
+                if (peek() == '_') {
+                    if (peek(1) == '_' || peek(1) == '\0') {
+                        return fail();
+                    }
+                    take_any(out);
+                }
+                if (!(is_digit(peek()) || (peek() >= 'A' && peek() <= 'Z'))) {
+                    return fail();
+                }
+                take_any(out);
+            }
+        } else {
+            std::string t;
+            if (!identifier(t)) {
+                return false;
+            }
+            memorize(t);
+            out += t;
+        }
+        if (!chain(out) || !encoding(out)) {
+            return false;
+        }
+        --depth;
+        return ok;
+    }
+    bool encoding(std::string& out) {
+        const char c = peek();
+        if (c == 'Y' || c == 'Z' || in(c, "CDKLST")) {  // free function, static member function
+            take_any(out);
+            return function_tail(out);
+        }
+        if (in(c, "ABEFIJMNQRUV")) {  // member function: the qualifiers of `this`, then the function
+            take_any(out);
+            while (in(peek(), "EFI")) {
+                take_any(out);
+            }
+            if (in(peek(), "GH")) {
+                take_any(out);
+            }
+            if (!in(peek(), "ABCD")) {
+                return fail();
+            }
+            take_any(out);
+            return function_tail(out);
+        }
+        if (c == '9') {  // a C function (cl decorates the statics of C functions: "?counter@?1??next@@9@9")
+            return take_any(out);
+        }
+        if (c >= '0' && c <= '4') {  // a variable (a template argument `$1?x@@3HA`)
+            take_any(out);
+            if (!type(out)) {
+                return false;
+            }
+            while (in(peek(), "EFI")) {
+                take_any(out);
+            }
+            if (!in(peek(), "ABCD")) {
+                return fail();
+            }
+            return take_any(out);
+        }
+        return fail();
+    }
+    // <calling convention> <return type> <parameters> <throw specification>
+    bool function_tail(std::string& out) {
+        if (!(peek() >= 'A' && peek() <= 'Z')) {
+            return fail();
+        }
+        take_any(out);
+        if (!return_type(out) || !parameters(out)) {
+            return false;
+        }
+        if (peek() == 'Z') {
+            return take_any(out);
+        }
+        if (peek() == '_' && peek(1) == 'E') {
+            take_any(out);
+            return take_any(out);
+        }
+        return fail();
+    }
+    bool return_type(std::string& out) {
+        if (peek() == '@') {  // constructor, destructor
+            return take_any(out);
+        }
+        if (peek() == '?') {  // qualified return type, or a deduced one: "?A?<auto>@@"
+            take_any(out);
+            if (!in(peek(), "ABCD")) {
+                return fail();
+            }
+            take_any(out);
+            if (peek() == '?') {
+                take_any(out);
+                if (is_digit(peek())) {
+                    if (!backref(out)) {
+                        return false;
+                    }
+                } else {
+                    std::string t;
+                    if (!identifier(t)) {
+                        return false;
+                    }
+                    memorize(t);
+                    out += t;
+                }
+                return take('@', out);
+            }
+        }
+        return type(out);
+    }
+    bool parameters(std::string& out) {
+        if (peek() == 'X') {
+            return take_any(out);
+        }
+        while (ok) {
+            const char c = peek();
+            if (c == '@' || c == 'Z') {  // end of the list, or "..." (then the throw specification)
+                return take_any(out);
+            }
+            if (c == '\0') {
+                return fail();
+            }
+            if (is_digit(c)) {  // a type back-reference: the parameter lists in front of it are the same in both names
+                take_any(out);
+                continue;
+            }
+            if (!type(out)) {
+                return false;
+            }
+        }
+        return false;
+    }
+    bool type(std::string& out) {
+        if (++depth > 64) {
+            return fail();
+        }
+        const char c = peek();
+        bool read = false;
+        if (in(c, "CDEFGHIJKMNOX")) {
+            read = take_any(out);
+        } else if (c == '_') {
+            take_any(out);
+            read = peek() >= 'A' && peek() <= 'Z' ? take_any(out) : fail();
+        } else if (in(c, "TUV")) {
+            take_any(out);
+            read = chain(out);
+        } else if (c == 'W') {
+            take_any(out);
+            read = is_digit(peek()) ? take_any(out) && chain(out) : fail();
+        } else if (in(c, "PQRSAB")) {
+            take_any(out);
+            read = pointee(out);
+        } else if (c == 'Y') {
+            take_any(out);
+            std::uint64_t dims = 0;
+            read = number(out, &dims) && dims <= 16;
+            for (std::uint64_t k = 0; read && k < dims; ++k) {
+                read = number(out);
+            }
+            read = read && type(out);
+        } else if (c == '?') {
+            take_any(out);
+            read = in(peek(), "ABCD") ? take_any(out) && type(out) : fail();
+        } else if (c == '$') {
+            read = dollar(out);
+        } else {
+            read = fail();
+        }
+        --depth;
+        return read && ok;
+    }
+    bool pointee(std::string& out) {
+        while (in(peek(), "EFI")) {
+            take_any(out);
+        }
+        if (peek() == '6') {
+            take_any(out);
+            return function_tail(out);
+        }
+        if (in(peek(), "ABCD")) {
+            take_any(out);
+            return type(out);
+        }
+        return fail();
+    }
+    // The '$' forms of types and template arguments.
+    bool dollar(std::string& out) {
+        if (peek(1) == '$') {
+            const char c = peek(2);
+            out += s.substr(i, 3);
+            i += 3;
+            switch (c) {
+                case 'Q':
+                case 'R': return pointee(out);  // rvalue reference
+                case 'C': return in(peek(), "ABCD") && take_any(out) && type(out);
+                case 'A': return peek() == '6' && take_any(out) && function_tail(out);
+                case 'B': return type(out);
+                case 'T':
+                case 'V':
+                case 'Z': return true;  // nullptr_t, an empty pack, a pack separator
+                default: return fail();
+            }
+        }
+        if (peek(1) == '0') {
+            out += "$0";
+            i += 2;
+            return number(out);
+        }
+        if (peek(1) == '1' && peek(2) == '?') {
+            out += "$1";
+            i += 2;
+            return symbol(out);
+        }
+        return fail();
+    }
+};
+
+}  // namespace
+
+std::optional<LocalScopeKey> local_scope_key(std::string_view d, bool guard_name_counted) {
+    if (d.size() < 4 || d[0] != '?') {
+        return std::nullopt;
+    }
+    BackrefReader r;
+    r.s = d;
+    r.i = 1;
+    if (is_guard_variable(d)) {
+        const std::size_t e = d.find('@', 2);
+        if (guard_name_counted) {
+            r.names.emplace_back(d.substr(2, e - 1));
+        }
+        r.i = e + 1;
+    } else {
+        std::string name;
+        if (d[1] == '?' || !r.identifier(name)) {
+            return std::nullopt;  // an operator, a template or a special name: no static of a function
+        }
+        r.memorize(name);
+    }
+    const std::size_t len = function_scope_length(d, r.i);
+    if (len == 0) {
+        return std::nullopt;
+    }
+    LocalScopeKey key;
+    key.block = std::string(d.substr(r.i, len));
+    r.i += len;
+    if (!r.take('?', key.block) || !r.local_symbol(key.rest)) {
+        return std::nullopt;
+    }
+    while (r.ok && r.peek() != '@') {
+        if (r.i >= d.size() || !r.piece(key.rest)) {
+            return std::nullopt;
+        }
+    }
+    if (!r.take('@', key.rest) || !is_digit(r.peek()) || !r.take_any(key.rest) || !r.ok) {
+        return std::nullopt;
+    }
+    key.outermost = std::move(r.outermost);
+    return key;
 }
 
 std::string initializer_target_prefix(std::string_view d) {

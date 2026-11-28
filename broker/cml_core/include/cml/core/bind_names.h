@@ -10,6 +10,7 @@
 // builtin/class/pointer kinds and the function scope of function-local statics; anything else makes
 // display_name() return the decorated name unchanged (never a wrong guess).
 
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -74,6 +75,25 @@ bool is_tu_wide_initializer(std::string_view decorated);  // _GLOBAL__sub_I_...,
 bool is_atexit_destructor(std::string_view decorated);    // ??__F...
 bool is_funclet(std::string_view decorated);              // ?dtor$..., ?catch$..., ?filt$..., ?fin$..., ?try$...
 bool is_guard_variable(std::string_view decorated);       // ?$TSS<n>@..., ?$S<n>@...
+
+// WP-52 (R-60): the scope of a function-local static, or of a guard variable, with its name back-references resolved.
+// The Microsoft mangling writes a name it has seen before in the same decorated name as one digit, '0'..'9', the index
+// of that name in a table the reader fills as it goes (the static's own name first, then every simple name, class
+// template and anonymous namespace of the scope, in order, at most ten). A guard and its static spell the same scope
+// with other digits when one of them has a name in front of the scope that the table counts and the other does not:
+// clang does not count the guard's own name (`$TSS0`, `$S1`), while it counts the static's, so the scope
+// `<lambda_1>::operator()` of `g::<lambda_0>::operator()` is `...QEBA?A?3@XZ` in the guard and `...QEBA?A?4@XZ` in the
+// static (both meaning `<auto>`, clang 18); cl counts the guard's name as well (Jolt's
+// `?$TSS0@?1??GetRTTIOfType@JPH@@YAPEAVRTTI@2@...`, where `2` is `JPH`). `guard_name_counted` picks the spelling for a
+// guard (it is ignored for any other name). Type back-references (digits in a parameter list) are kept as written: the
+// parameter lists in front of them are the same in both names.
+struct LocalScopeKey {
+    std::string block;      // the number of the block the entity is declared in, as written ("?1?"), from the first scope
+    std::string rest;       // the rest of the scope with every name written out, then '@' and the storage class ('4')
+    std::string outermost;  // the outermost function of the scope, names written out ("?g@@YAXXZ")
+};
+// Empty when the name is not function-local, or when any part of the scope cannot be read (never a guess).
+std::optional<LocalScopeKey> local_scope_key(std::string_view decorated, bool guard_name_counted);
 
 // For "??__Eg_tracker@?A0x1@@YAXXZ": the text the global's mangled name (without the leading '?')
 // starts with ("g_tracker@?A0x1@@"). Empty when `decorated` is not a cl dynamic initialiser.

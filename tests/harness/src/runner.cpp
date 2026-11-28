@@ -701,6 +701,9 @@ private:
                 std::printf("RELOAD-OUTCOME refused id=%s fixture=%s compiler=%s config=%s\n", d.id.c_str(), scenario_.fixture.c_str(), report_.compiler.c_str(),
                             options_.config.c_str());
                 std::fflush(stdout);
+                // WP-52: a refused reload has no result; a later expect_reload_result must not read the previous reload's.
+                has_reload_result_ = false;
+                last_reload_result_ = ipc::json::Value::object();
                 return StepOutcome::pass("reload refused, which this step allows: " + d.id + ": " + d.message);
             }
             return StepOutcome::fail(cml::ids::kReloadFailed, "reload failed: " + d.id + ": " + d.message + " What to do: " + d.action);
@@ -969,9 +972,8 @@ private:
 
     // An integer member of the most recent reload's result (WP-16: "compiled", "compile_reused", "processes", ...).
     StepOutcome expect_reload_result(const Step& step) {
-        if (!has_reload_result_) {
-            return StepOutcome::fail(cml::ids::kResultMismatch, "no reload ran before this step");
-        }
+        // WP-52: the compiler is checked first, so that the other compiler's cells pass the step even where the reload before
+        // it was refused (allow_error), which leaves no result.
         if (!step.compiler.empty()) {  // WP-49
             const std::string family = compiler_family(report_.compiler);
             if (family.empty()) {
@@ -982,6 +984,9 @@ private:
                 return StepOutcome::pass("not checked: the expectation " + step.key + " = " + std::to_string(step.result_value) + " is for " + step.compiler +
                                          ", this cell is " + family);
             }
+        }
+        if (!has_reload_result_) {
+            return StepOutcome::fail(cml::ids::kResultMismatch, "no reload ran before this step, or the last one was refused");
         }
         const ipc::json::Value* member = last_reload_result_.find(step.key);
         if (member == nullptr || !member->is_integer() || member->as_integer() != step.result_value) {

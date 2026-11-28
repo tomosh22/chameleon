@@ -850,9 +850,11 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 
 ### CML3211
 
-- **Cause:** Function-local static guard not found in the old image (warning). Since WP-40 only for a guard whose block has no static in the patch at all; a guard of a static bound to the running process that cannot be found is the error `CML3600`, and the guard of a new static is new without a warning.  
+- **Cause:** A guard variable (`$TSS<n>`, `$S<n>`) of a function-local static is tied to no static of the patch. The planner ties a guard to the statics of its block by comparing their decorated scopes with the name back-references resolved (WP-52: clang 18 numbers the back-references in a guard's name one lower than in its static's, cl and clang 20 do not; both spellings are read, and a guard the two tie to different statics is tied to none). (1) A warning when no static of the patch bound to the running process can be the guard's: the patch gets a fresh guard, and only a static that is not in the patch could be constructed by it. (2) An error since WP-52 (ADR-0045) when the patch has a function-local static of the same outermost function (or one whose scope cannot be read) that is bound to the running process and tied to no guard: the guard may be that static's, and a fresh guard would run its initialiser again over the live object. Until WP-52 case (2) was the warning and the reload went on (R-60: the static of a nested lambda under clang 18). A guard of a static bound to the running process that is tied but cannot be found is the error `CML3600`, and the guard of a new static is new without a warning.  
 - **Message:** `guard variable '<...>' of a function-local static was not found in the old image; the patch gets a fresh guard`  
+- **Message:** `the guard variable <...> in <...> cannot be tied to a static of its block, and <...> of the same function is bound to the running process without a guard of its own: the guard may be that static's, and with a fresh guard its initialiser would run again over the live object`  
 - **What to do:** Keep the layout of the statics in this source file unchanged, or hot-restart if the static must not be initialised again.  
+  Other variants of the advice: Hot-restart. If this function was not edited, report the two decorated names (the trace log lists them as 'bind: guard ...').  
 - **Raised by:** `broker/cml_core/include/cml/core/bind_diag_ids.h`
 
 ### CML3212

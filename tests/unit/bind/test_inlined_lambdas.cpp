@@ -379,14 +379,97 @@ TEST_CASE("R-54 review: an inner lambda's static recorded in the outer call oper
     const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
     o.symbol("?s_count@?A0x1@@3HA", 0x10, bss, false, false);
     const std::string gx = "?gx@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?4@XZ@4UObj@@A";
-    // (Its guard is left out: clang spells the guard's scope with another back-reference number than the static's,
-    // `QEBA?A?3@XZ` against `QEBA?A?4@XZ`, so the planner does not tie them together. Pre-existing, reported with WP-51.)
+    // (Its guard: the R-60 tests below.)
     o.symbol(gx, 0x20, bss, false, false);
     Built b = o.build();
     auto r = plan_bind(w.input(b));
     REQUIRE_MESSAGE(r.has_value(), err(r));
     CHECK(decision(*r, gx).decision == DecisionKind::BindOldData);
     CHECK(decision(*r, gx).old_address.rva == 0x3020);
+}
+
+// ---- WP-52 (R-60, ADR-0045): the nested lambda's guard is tied to its bound static -------------------------------------
+
+namespace {
+
+// clang 18's names for the nested case (x86_64-pc-windows-msvc -O2, docs/wp/WP-52.md): the guard does not count its own
+// name in the back-reference table, the static counts `gx`, so the same scope reads `?A?3@` in one and `?A?4@` in the other.
+const char* const kNestedGx = "?gx@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?4@XZ@4UObj@@A";
+const char* const kNestedGuard = "?$TSS0@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?3@XZ@4HA";
+
+// The patch of nested_world: s_count, the inner lambda's `gx` (0x20) and the guard `guard` (0x28).
+Built nested_patch(const std::string& guard) {
+    SynthObj o;
+    const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+    o.symbol("?s_count@?A0x1@@3HA", 0x10, bss, false, false);
+    o.symbol(kNestedGx, 0x20, bss, false, false);
+    o.symbol(guard, 0x28, bss, false, false);
+    return o.build();
+}
+
+}  // namespace
+
+TEST_CASE("R-60: the guard of a nested lambda's static is tied to the static and placed with it (clang 18 names)") {
+    // main (d110b5d): the guard was tied to no static (its scope is spelled with other back-references), so it got a fresh
+    // guard with the warning CML3211 while `gx` stayed bound: the patch ran gx's initialiser again over the live object.
+    SynthWorld w = basic_world(false);
+    nested_world(w);
+    Built b = nested_patch(kNestedGuard);
+    auto r = plan_bind(w.input(b));
+    REQUIRE_MESSAGE(r.has_value(), err(r));
+    CHECK(decision(*r, kNestedGx).decision == DecisionKind::BindOldData);
+    CHECK(decision(*r, kNestedGx).old_address.rva == 0x3020);
+    const SymbolDecision guard = decision(*r, kNestedGuard);
+    CAPTURE(guard.reason);
+    CHECK(guard.decision == DecisionKind::BindOldData);
+    CHECK(guard.source == BindSource::CompilandLayout);
+    CHECK(guard.old_address.rva == 0x3028);
+    CHECK(count_code(r->warnings, diag::kGuardUnmatched) == 0);
+}
+
+TEST_CASE("R-60: a guard that cannot be tied next to a bound static without a guard is refused (CML3211, an error)") {
+    // main: the warning CML3211, a fresh guard, and the plan accepted: the bound `gx` would be constructed again.
+    struct Case {
+        const char* what;
+        std::string guard;
+    };
+    const Case cases[] = {
+        {"a back-reference outside the table (the scope cannot be read)",
+         "?$TSS0@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?7@XZ@4HA"},
+        {"another block of the same function", "?$TSS0@?2???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?3@XZ@4HA"},
+        {"the outer lambda's block (no static of it in the patch)", "?$TSS0@?1???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@4HA"},
+    };
+    for (const Case& c : cases) {
+        CAPTURE(c.what);
+        SynthWorld w = basic_world(false);
+        nested_world(w);
+        Built b = nested_patch(c.guard);
+        std::vector<cml::Diag> errors;
+        BindPlan partial;
+        auto r = plan_bind(w.input(b), &errors, &partial);
+        REQUIRE_FALSE(r.has_value());
+        REQUIRE(count_code(errors, diag::kGuardUnmatched) == 1);
+        const cml::Diag& e = errors[0];
+        CAPTURE(e.message);
+        CHECK(e.id() == "CML3211");
+        CHECK(contains(e.message, "cannot be tied to a static of its block"));
+        CHECK(contains(e.message, "is bound to the running process without a guard of its own"));
+        CHECK(contains(e.message, "initialiser would run again"));
+        CHECK(decision(partial, c.guard).decision == DecisionKind::PatchNewData);
+        CHECK(count_code(partial.warnings, diag::kGuardUnmatched) == 0);
+    }
+}
+
+TEST_CASE("R-60: a guard tied to no static, of another function than every bound static, is still the warning CML3211") {
+    // No bound static of the patch can be the guard's: a fresh guard runs no bound initialiser again.
+    SynthWorld w = basic_world(false);
+    nested_world(w);
+    Built b = nested_patch("?$TSS0@?1??other@@YAHXZ@4HA");
+    auto r = plan_bind(w.input(b));
+    REQUIRE_MESSAGE(r.has_value(), err(r));
+    CHECK(decision(*r, kNestedGx).decision == DecisionKind::BindOldData);
+    CHECK(decision(*r, "?$TSS0@?1??other@@YAHXZ@4HA").decision == DecisionKind::PatchNewData);
+    REQUIRE(count_code(r->warnings, diag::kGuardUnmatched) == 1);
 }
 
 TEST_CASE("R-54 review: the R-54 edit one level down (the inner lambda deleted, its static's name declared in the outer lambda) is refused") {

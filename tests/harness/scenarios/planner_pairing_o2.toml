@@ -87,3 +87,39 @@ min_samples = 20
 kind = "expect_monotonic"
 key = "parts"
 min_samples = 20
+
+# WP-52 (R-60, ADR-0045): nest_4 recompiles nested.cpp, whose nested lambda's static `nested` is bound to the running one.
+# clang 18 spells its guard's scope with other back-references than the static's; until WP-52 the guard was tied to no
+# static, got a fresh one (warning CML3211) and the patch constructed the live static again (nest back to 700001, nmade
+# 2). Now the guard is placed with its static: under clang-cl the reload applies (patched = 1) and nest keeps counting.
+# cl records its guards and either applies or refuses (CML3207 / CML3211 / CML3600 are allowed there; under clang-cl the
+# next step requires the reload to apply). Never a value that drops, nor a second construction.
+[[step]]
+kind = "edit"
+patch = "edits/nest_4.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+allow_error = "CML3207|CML3211|CML3600"
+
+[[step]]
+kind = "expect_reload_result"
+key = "patched"
+value = 1
+compiler = "clang-cl"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ mark=[12] a=10\\d{4} b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=1 made=3 nest=70(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) nmade=1 nmark=[14]\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ mark=[12] a=10\\d{4} b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=1 made=3 nest=70\\d{4} nmade=1 nmark=[14]\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_monotonic"
+key = "nest"
+min_samples = 20
