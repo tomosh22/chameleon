@@ -1,5 +1,6 @@
 #include "ticks.h"
 
+#include <algorithm>
 #include <cctype>
 
 #include "cml/ipc/control_ids.h"
@@ -99,6 +100,11 @@ cml::Result<std::string> check_continues(std::string_view before, std::string_vi
     }
     return name + ": " + std::to_string(old_values.back()) + " before the reload, " + std::to_string(new_values.front()) + " after, " + std::to_string(new_values.size()) +
            " samples since";
+}
+
+bool monotonic_samples_ready(std::string_view output, std::size_t reload_cursor, std::string_view key, std::size_t min_samples, std::size_t since_reload) {
+    const std::size_t at = std::min(reload_cursor, output.size());
+    return tick_values(output, key).size() >= min_samples && tick_values(output.substr(at), key).size() >= since_reload;
 }
 
 }  // namespace cmltest

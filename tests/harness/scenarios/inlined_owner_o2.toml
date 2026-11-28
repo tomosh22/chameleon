@@ -1,0 +1,73 @@
+# Scenario `inlined_owner_o2` (WP-57, R-59, ADR-0046): the fixture built with /O2 /Ob2 in every cell.
+#   io_step() holds an own `static Counter` and sorts with a lambda (std::sort: a template over the closure, inlined into
+#   io_step(); the sort loop is an instantiation over the closure). Until WP-57 the static was refused on any edit of the file
+#   (CML3207, WP-51: the record of a function that inlined closure code may be a deleted lambda's static). The edits change
+#   io_mark() only, so io_step() compiles to the old code: the comparator proves it unchanged under the plan (the sort loop's
+#   new instantiation compared with the old one), the static pairs with the running one and keeps counting, and it is never
+#   constructed again (made stays 1). Both reloads must apply in every cell: mark_2 compares io_step() with the module file,
+#   stacked/mark_3 with the code patch 1 gave it (io_step() is hooked: hook narrowing does not follow the new callee).
+# Every reload logs `WP57-OWNER object=... listed=N proven=N refused=N skipped=N` where the plan lists the static.
+name = "inlined_owner_o2"
+description = "fixture inlined_owner_o2 (/O2 /Ob2): an own static next to a std::sort with a lambda reloads while its function is unchanged, and keeps its value"
+fixture = "inlined_owner_o2"
+timeout_s = 240
+
+[[step]]
+kind = "launch"
+
+[[step]]
+kind = "expect_module_enabled"
+module = "fixture_inlined_owner_o2.exe"
+within_s = 15
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ mark=1 count=80\\d{4} made=1 top=(29|30)\\b"
+within_s = 20
+
+# 1. io_mark 1 -> 2: io_step() is the old code.
+[[step]]
+kind = "edit"
+patch = "edits/mark_2.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ mark=2 count=80\\d{4} made=1 top=(29|30)\\b"
+within_s = 10
+
+# count continues from its value before the reload (a fresh static would restart at 800001 and make made=2).
+[[step]]
+kind = "expect_monotonic"
+key = "count"
+min_samples = 20
+since_reload = 10
+within_s = 20
+
+# 2. io_mark 2 -> 3: io_step() is compared with the code patch 1 gave it, the sort loop with patch 1's copy.
+[[step]]
+kind = "edit"
+patch = "edits/stacked/mark_3.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_result_key = "patched"
+expect_result_value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ mark=3 count=80\\d{4} made=1 top=(29|30)\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_monotonic"
+key = "count"
+min_samples = 20
+since_reload = 10
+within_s = 20
