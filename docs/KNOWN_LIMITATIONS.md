@@ -141,7 +141,7 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
   the compiler that wrote the patch object (clang counts `$TSS<n>` from 19.1.0; an unknown compiler ties only where both readings
   agree). A bound static that needs a guard and has no bound one is refused (CML3211, an error). A function-local static that would
   be new while its function has an old record of that name is refused (CML3207): under cl a static in a nested lambda, and under
-  clang a fully inlined nested lambda's static, cannot be hot-reloaded until R-68; hot-restart instead.
+  clang a fully inlined nested lambda's static, binds since WP-56 (R-68), where its record is found up the chain of enclosing procedures and the procedure holding it is unchanged and refers to it; otherwise it is refused (CML3207). A pairing that only the back-reference-resolved names tie is refused where another lambda of the function has a static of that name (rule (d) cannot confirm it by code).
 - Hot-restart include-scan cache (WP-50, R-55): a module whose include graph reaches a file over 8 MiB (Godot's generated
   `doc_translations.gen.cpp`) or a file that cannot be read is scanned again on every index (`WP50-SCAN-CACHE store=skipped`;
   R-63). A module whose scanned inputs changed is scanned again whole (R-58).
