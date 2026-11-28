@@ -1,0 +1,69 @@
+name: spike-wp53
+
+# WP-53 round 1 (R-61) only: what cl and clang-cl at /O2 /Ob2 record for an inlined lambda's static against the caller's own
+# static. Temporary: removed from the branch once the data is read (docs/wp/WP-53.md names the run).
+on:
+  push:
+    branches: ['wp/53-inlined-mirror']
+    paths: ['spike/wp53/**', '.github/workflows/spike-wp53.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  spike:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Tools
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
+          $dirs = @()
+          if ($env:llvmX64) { $dirs += $env:llvmX64 }
+          $dirs += "$env:VCINSTALLDIR\Tools\Llvm\x64\bin"
+          $dirs += 'C:\Program Files\LLVM\bin'
+          foreach ($d in $dirs) { Write-Host "llvm dir: $d"; Get-ChildItem $d -Filter 'llvm-*' -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $($_.Name)" } }
+          $pdbutil = $dirs | ForEach-Object { Join-Path $_ 'llvm-pdbutil.exe' } | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $pdbutil) { $pdbutil = (Get-ChildItem -Recurse -Filter llvm-pdbutil.exe 'C:\Program Files\LLVM', 'C:\Program Files\Microsoft Visual Studio' -ErrorAction SilentlyContinue | Select-Object -First 1).FullName }
+          if (-not $pdbutil) { throw 'no llvm-pdbutil' }
+          $clang = $dirs | ForEach-Object { Join-Path $_ 'clang-cl.exe' } | Where-Object { Test-Path $_ } | Select-Object -First 1
+          "PDBUTIL=$pdbutil" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "CLANGCL=$clang" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          Write-Host "pdbutil: $pdbutil"; Write-Host "clang-cl: $clang"
+          cl 2>&1 | Select-Object -First 1
+          & $clang --version
+      - name: Build the planner driver
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=cl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --target cml_core
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $inc = @('broker/cml_core/include', 'core/cml_coff/include', 'core/cml_pdb/include', 'core/cml_util/include', 'core/cml_pe/include',
+                   'core/cml_ipc/include', 'core/cml_toolchain/include', 'core/cml_watch/include', 'build/broker/cml_core/generated') | ForEach-Object { "/I$_" }
+          $libs = Get-ChildItem build/lib/*.lib | ForEach-Object { $_.FullName }
+          cl /nologo /MT /O2 /std:c++20 /EHsc @inc spike/wp53/plan.cpp /Febuild/plan.exe /link @libs kernel32.lib user32.lib advapi32.lib ole32.lib shell32.lib psapi.lib dbghelp.lib ntdll.lib bcrypt.lib ws2_32.lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: cl /O2 /Ob2
+        run: ./spike/wp53/run.ps1 -Compiler cl -Cxx cl -Out "$env:RUNNER_TEMP\cl" -Plan build/plan.exe -PdbUtil $env:PDBUTIL
+      - name: clang-cl /O2 /Ob2
+        if: always()
+        run: ./spike/wp53/run.ps1 -Compiler clang-cl -Cxx $env:CLANGCL -Out "$env:RUNNER_TEMP\clang" -Plan build/plan.exe -PdbUtil $env:PDBUTIL
+      - name: Upload the spike images
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spike-wp53-images
+          path: |
+            ${{ runner.temp }}/clang/c1_*
+            ${{ runner.temp }}/clang/c11_*
+            ${{ runner.temp }}/clang/c3_*
+            ${{ runner.temp }}/clang/c7_*
+            ${{ runner.temp }}/clang/c10_*
+            ${{ runner.temp }}/cl/c1_*
+          retention-days: 5

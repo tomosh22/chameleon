@@ -61,6 +61,11 @@ int main(int argc, char** argv) {
                         v.name.data(), v.rva, v.type_index, static_cast<int>(v.parent_name.size()), v.parent_name.data());
             if (pdb::is_proc_kind(v.kind)) {
                 auto sites = (*pdb)->proc_inlinees(v);
+                if (!sites) {
+                    std::printf("      proc_inlinees ERROR CML%u %s\n", sites.error().code, sites.error().message.c_str());
+                } else {
+                    std::printf("      proc_inlinees sites=%u inlinees=%zu complete=%d\n", sites->sites, sites->inlinees.size(), sites->complete ? 1 : 0);
+                }
                 for (std::size_t k = 0; sites && k < sites->inlinees.size(); ++k) {
                     const auto& e = sites->inlinees[k];
                     std::printf("      inlinee '%s' class='%s' unique='%s' sig='%s' sites=%u depth=%u\n", e.name.c_str(), e.class_name.c_str(), e.class_unique.c_str(), e.signature.c_str(),
