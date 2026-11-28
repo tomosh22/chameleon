@@ -1605,5 +1605,26 @@ clang's `??_B<scope>@51` bitmask guards of inline functions' statics under `-fno
 built with clang-cl `-fno-threadsafe-statics` keeps an inline function's static across a reload in the clang-cl cells; unit
 tests with real names; corpus `fail=0`.
 
+**Rulings (wave 14, ADR-0018 where noted):**
+- WP-57 spike ruling (06:35 UTC 2026-11-28). Clang drops a fully inlined call operator, so the patch has no call
+  operator to compare, and closure identity proves nothing: spike cases s10 and s11 differ only in code. The only proof is WP-53's
+  "caller unchanged".
+  - Ruling: with PlanInput::prove_inlined_owners set, a risky own static is listed in BindPlan::inlined_owner_statics and kept
+    only when WP-25's comparator proves the caller unchanged under the plan (one verdict per procedure, shared with WP-53);
+    otherwise it is refused with CML3207.
+  - The comparator gains a callee step for the WP-53 and WP-57 proofs only (hook narrowing unchanged). The old target must start
+    an old procedure of the same size, recursion counts as equal, and the step is capped; reaching the cap means "cannot judge".
+  - An R-54 edit with identical machine code (s7) is accepted. Any edit of the caller itself stays refused, as an accepted
+    limitation. cl's position evidence stays R-65.
+- WP-57 review rulings (b1be388):
+  - The callee's size comes from the PDB whenever it lies in the module image.
+  - A callee that is not a COMDAT and has only an earlier patch's record is refused (unknown-old-size).
+  - A listed pairing never teaches the layout (learn_delta).
+- WP-59 rulings:
+  - Item 0 (pre-existing, default flags): an inline function's external `$TSS` guards were bound by public name whatever the edit did. Now they are tied to their block's statics, and a bound one is kept by name without a code proof only when its block has a single guarded static on both sides; otherwise it goes to prove_bitmask_guards.
+  - A constant-initialised static and a dynamic one cannot be told apart, so both are refused (R-69: read the tested bit from the code).
+  - The single-guard residual is accepted: when it misfires, the static keeps its live value.
+  - Round 2: require_bound_guards covers external function-local statics, and TLS guards tie only TLS statics.
+
 WP-56..WP-59 start together; WP-56, WP-57 and WP-59 share `bind_plan.cpp` (whoever merges second merges main and re-runs CI).
 Rules as in ADR-0043.
