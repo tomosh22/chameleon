@@ -98,6 +98,11 @@ min_samples = 20
 # old code. (CML3207 / CML3211 / CML3600 are allowed; under clang-cl the next step requires the reload to apply.) Never a
 # value that drops, nor a second construction.
 [[step]]
+kind = "set_option"
+option = "log_level"
+value = "trace"
+
+[[step]]
 kind = "edit"
 patch = "edits/nest_4.edit"
 

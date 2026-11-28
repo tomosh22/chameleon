@@ -380,6 +380,30 @@ jobs:
           Get-Content "$env:LOG_DIR/cmltest-ninja-summary.txt"
           if ($failed.Count -gt 0) { Write-Host "FAILED scenarios: $($failed -join ', ')"; exit 1 }
 
+      # WP-56 TEMPORARY (spike, removed before review): the planner_pairing_o2 fixture build (PDB, exe, objects) and a dump.
+      - name: WP-56 spike dump (planner_pairing_o2)
+        if: always()
+        continue-on-error: true
+        run: |
+          $dump = "$env:BUILD_DIR/bin/cml_pdb_dump.exe"
+          foreach ($exe in Get-ChildItem -Recurse "$env:BUILD_DIR/cmltest_scratch" -Filter fixture_planner_pairing_o2.exe) {
+            Write-Host "== $($exe.FullName) =="
+            & $dump $exe.FullName --compiland nested *>&1 | Out-String -Width 400 | Write-Host
+            & $dump $exe.FullName --signatures nested *>&1 | Out-String -Width 400 | Write-Host
+          }
+          Get-ChildItem -Recurse "$env:LOG_DIR" -Filter broker.log | Where-Object { $_.FullName -match 'planner_pairing_o2' } | ForEach-Object {
+            Select-String -Path $_.FullName -Pattern 'nested|nest_|TSS0|WP5|WP4' | Select-Object -Last 400 | ForEach-Object { $_.Line }
+          }
+      - name: WP-56 spike upload (planner_pairing_o2 scratch)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wp56-spike-${{ matrix.os }}-${{ matrix.compiler }}-${{ matrix.config }}
+          path: |
+            build/cmltest_scratch/cmltest-planner_pairing_o2-*/
+            ci-logs/cmltest-ninja-planner_pairing_o2/
+          if-no-files-found: warn
+
       # Once per OS, with MSVC in Debug: the same scenario with the fixture built by the Visual
       # Studio generator (MSBuild), proving that path of the fixture builder.
       - name: cmltest basic scenario (MSBuild generator)
