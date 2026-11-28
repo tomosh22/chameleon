@@ -178,6 +178,53 @@ jobs:
           $line | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
           if ($failed -gt 0) { exit 1 }
 
+      # WP-61 (R-71): "WP-48 review 1" failed once in this cell (ci 46143341335 attempt 1). Its test case, the WP-61 reproduction
+      # and "WP-48 review round 3 (2)" (the same broker set-up) run 50 times here, each run a fresh cml_test_agent.exe with the
+      # agent's Debug log (CML_AGENT_LOG, CML_LOG_LEVEL=debug; a failing check prints the broker's timeline and that log). Stops at
+      # the first failure; a run passes when doctest exits 0 and reports at least one passed and 0 failed test cases. Evidence: the
+      # WP61-WINDOW lines (welcome_before_constructor_returned=1: the broker built its Welcome, reading the ABI, before its
+      # constructor returned; before WP-61 the test stored the ABI only after that return, so such a Welcome had no ABI) and the
+      # last line WP61-REPEAT <cell> runs=N passed=P failed=F welcome_before_constructor=H. H is a LOWER BOUND of the runs that hit
+      # the old window: that window ran on past the constructor's return to the store, and a Welcome in that gap is not counted.
+      - name: WP-61 first-list repeat evidence (x50)
+        if: ${{ !cancelled() && matrix.os == 'windows-2025' && matrix.compiler == 'msvc' && matrix.config == 'RelWithDebInfo' }}
+        timeout-minutes: 40
+        env:
+          CML_TEST_CASE_TIMEOUT_S: '240'
+          CML_LOG_LEVEL: debug
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:LOG_DIR | Out-Null
+          $exe = Join-Path $env:BUILD_DIR 'bin/cml_test_agent.exe'
+          $filter = '--test-case=WP-48 review 1: when the session*,WP-61:*,WP-48 review round 3 (2): after a refused list sent again*'
+          $total = 50; $passed = 0; $failed = 0; $early = 0
+          for ($i = 1; $i -le $total; $i++) {
+            $out = "$env:LOG_DIR/wp61-repeat-$i.txt"
+            $env:CML_AGENT_LOG = Join-Path $PWD "$env:LOG_DIR/wp61-agent-$i.log"
+            & $exe $filter *>&1 | Out-File -Encoding utf8 $out
+            $code = $LASTEXITCODE
+            $window = @(Select-String -Path $out -Pattern 'WP61-WINDOW' | ForEach-Object { $_.Line })
+            $window | ForEach-Object { "run $i $_" }
+            $early += @($window | Where-Object { $_ -match 'welcome_before_constructor_returned=1' }).Count
+            $cases = @(Select-String -Path $out -Pattern 'test cases:' | ForEach-Object { $_.Line })
+            $ok = $false
+            if ($code -eq 0 -and $cases.Count -eq 1 -and $cases[0] -match '(\d+) passed\s*\|\s*(\d+) failed') {
+              $ok = ([int]$Matches[1] -gt 0) -and ([int]$Matches[2] -eq 0)
+            }
+            if ($ok) {
+              $passed++
+              if ($i -gt 1) { Remove-Item $env:CML_AGENT_LOG -ErrorAction SilentlyContinue }  # run 1's log is kept as a sample
+            } else {
+              $failed++; Get-Content $out
+              "--- agent log (run $i) ---"; if (Test-Path $env:CML_AGENT_LOG) { Get-Content $env:CML_AGENT_LOG -Tail 400 }
+              break
+            }
+          }
+          Select-String -Path "$env:LOG_DIR/wp61-repeat-1.txt" -Pattern 'WP61-REPRO' | ForEach-Object { $_.Line }
+          $line = "WP61-REPEAT ${{ matrix.os }} ${{ matrix.compiler }} ${{ matrix.config }} runs=$($passed + $failed) passed=$passed failed=$failed welcome_before_constructor=$early"
+          $line | Tee-Object -FilePath "$env:LOG_DIR/wp61-repeat.txt"
+          $line | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          if ($failed -gt 0) { exit 1 }
+
       - name: Run cml_broker --version
         run: |
           & "$env:BUILD_DIR/bin/cml_broker.exe" --version *>&1 | Tee-Object -FilePath "$env:LOG_DIR/broker-version.txt"

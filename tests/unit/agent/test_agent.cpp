@@ -600,12 +600,18 @@ public:
     using Hook = std::function<Action(const cml::ipc::Message&)>;
 
     // `before_listen` (tests only) runs on the listener thread each time it is about to create the
-    // next pipe instance, i.e. in the gap where no instance of the pipe exists.
-    ScriptedBroker(std::string pipe, Hook hook = nullptr, std::function<void()> before_listen = nullptr)
-        : pipe_(std::move(pipe)), hook_(std::move(hook)), before_listen_(std::move(before_listen)) {
+    // next pipe instance, i.e. in the gap where no instance of the pipe exists. `abi` is the agent ABI
+    // every Welcome answers with (see welcome_abi); it is set before the listener thread starts.
+    ScriptedBroker(std::string pipe, Hook hook = nullptr, std::function<void()> before_listen = nullptr, std::uint32_t abi = 0)
+        : welcome_abi(abi), pipe_(std::move(pipe)), hook_(std::move(hook)), before_listen_(std::move(before_listen)) {
         thread_ = std::thread([this] { run(); });
         ready_ = wait_until([this] { return cml::ipc::pipe_exists(pipe_); }, 10000);
+        constructed_us_.store(elapsed_us());
     }
+    // WP-61 (R-71): a broker of agent ABI `abi` from its first Welcome on. An agent that already waits for the pipe connects as soon
+    // as the listener creates it, which can be before the constructor returns: an ABI stored after the constructor can be too late.
+    ScriptedBroker(std::string pipe, std::uint32_t abi, Hook hook = nullptr)
+        : ScriptedBroker(std::move(pipe), std::move(hook), nullptr, abi) {}
     ~ScriptedBroker() {
         // Every wait of the listener thread (for a client, for data, for a write) includes
         // stop_event_, so this ends it wherever it is, also in the gap between two pipe instances:
@@ -623,8 +629,47 @@ public:
     // Closes the current connection (the agent will reconnect).
     void hang_up() { SetEvent(hangup_event_); }
 
-    // WP-48: the agent ABI the next Welcome answers with (0: none, like a broker before WP-48; 3: ModuleEvents).
+    // WP-48: the agent ABI the next Welcome answers with (0: none, like a broker before WP-48; 3: ModuleEvents). WP-61: pass it to
+    // the constructor; a store after the constructor races an agent that is already waiting for the pipe (R-71).
     std::atomic<std::uint32_t> welcome_abi{0};
+
+    // WP-61: what the Welcome of connection `index` said (kNoWelcome: none was sent).
+    static constexpr std::uint32_t kNoWelcome = 0xFFFFFFFFu;
+    std::uint32_t welcome_sent(std::size_t index) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return index < welcomes_.size() ? welcomes_[index] : kNoWelcome;
+    }
+    // WP-61: microseconds from just before the first pipe instance was created (the earliest moment an agent can connect) to the
+    // constructor's return, to the first message of connection 0 (its Hello), and to the moment connection 0's Welcome was built
+    // (when welcome_abi is read); -1: not yet.
+    long long constructed_after_listen_us() const { return constructed_us_.load() - listening_us_.load(); }
+    long long first_message_after_listen_us() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return times_.empty() || times_[0].empty() ? -1 : times_[0][0] - listening_us_.load();
+    }
+    long long welcome_built_after_listen_us() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return welcome_at_.empty() || welcome_at_[0] < 0 ? -1 : welcome_at_[0] - listening_us_.load();
+    }
+    // WP-61: the messages of connection `index` in arrival order, one line each: microseconds after the first pipe instance, and the
+    // message (cut to `width` characters).
+    std::string timeline(std::size_t index, std::size_t width = 240) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::string out;
+        if (index >= sessions_.size()) {
+            return out;
+        }
+        out += "  welcome abi=" + std::to_string(welcomes_[index] == kNoWelcome ? -1LL : static_cast<long long>(welcomes_[index])) + "\n";
+        for (std::size_t i = 0; i < sessions_[index].size(); ++i) {
+            std::string line = cml::ipc::describe(sessions_[index][i]);
+            if (line.size() > width) {
+                line.resize(width);
+                line += "...";
+            }
+            out += "  +" + std::to_string(times_[index][i] - listening_us_.load()) + "us " + line + "\n";
+        }
+        return out;
+    }
 
     std::size_t connections() const {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -645,6 +690,9 @@ public:
 
 private:
     bool stop_requested() const { return stopping_.load() || WaitForSingleObject(stop_event_, 0) == WAIT_OBJECT_0; }
+    long long elapsed_us() const {
+        return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start_).count();
+    }
 
     // Waits for the overlapped operation `ov` (on io_event_) on `pipe`. True with the byte count when
     // it completed successfully. Otherwise (error, end of stream, stop, and for reads also a hang-up
@@ -710,6 +758,11 @@ private:
             if (before_listen_) {
                 before_listen_();
             }
+            if (listening_us_.load() < 0) {
+                // WP-61: the time origin, taken BEFORE the first instance exists: an agent (and the constructor's pipe_exists poll)
+                // can see the pipe as soon as CreateNamedPipeW has created it, before that call returns here.
+                listening_us_.store(elapsed_us());
+            }
             HANDLE pipe = CreateNamedPipeW(wide.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                                            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, PIPE_UNLIMITED_INSTANCES,
                                            65536, 65536, 0, nullptr);
@@ -747,6 +800,9 @@ private:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             sessions_.emplace_back();
+            times_.emplace_back();
+            welcomes_.push_back(kNoWelcome);
+            welcome_at_.push_back(-1);
             index = sessions_.size() - 1;
         }
         for (;;) {
@@ -770,8 +826,9 @@ private:
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 sessions_[index].push_back(*message);
+                times_[index].push_back(elapsed_us());
             }
-            if (!answer(pipe, *message)) {
+            if (!answer(pipe, *message, index)) {
                 break;
             }
         }
@@ -779,14 +836,20 @@ private:
         ResetEvent(hangup_event_);  // consumed: the next session starts clean
     }
 
-    bool answer(HANDLE pipe, const cml::ipc::Message& message) {
+    bool answer(HANDLE pipe, const cml::ipc::Message& message, std::size_t index) {
         namespace ipc = cml::ipc;
         if (const auto* hello = std::get_if<ipc::Hello>(&message)) {
             ipc::Welcome welcome;
             welcome.request_id = hello->request_id;
             welcome.agent_id = 1;
             welcome.broker_version = "scripted";
+            const long long built_at = elapsed_us();
             welcome.agent_abi_version = welcome_abi.load();  // WP-48: 0 = a broker before WP-48
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                welcomes_[index] = welcome.agent_abi_version;
+                welcome_at_[index] = built_at;
+            }
             return send(pipe, welcome);
         }
         std::uint64_t id = 0;
@@ -835,6 +898,13 @@ private:
     HANDLE hangup_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);  // manual-reset: reset per session
     mutable std::mutex mutex_;
     std::vector<std::vector<cml::ipc::Message>> sessions_;
+    // WP-61: when each message arrived (microseconds after start_), and what each connection's Welcome said.
+    std::vector<std::vector<long long>> times_;
+    std::vector<std::uint32_t> welcomes_;
+    std::vector<long long> welcome_at_;  // when each connection's Welcome read welcome_abi (microseconds after start_; -1: not yet)
+    const std::chrono::steady_clock::time_point start_ = std::chrono::steady_clock::now();
+    std::atomic<long long> listening_us_{-1};
+    std::atomic<long long> constructed_us_{0};
 };
 
 bool is_enable(const cml::ipc::Message& m) { return std::holds_alternative<cml::ipc::EnableModule>(m); }
@@ -1073,8 +1143,7 @@ void free_and_load_inside_one_poll(cml::Agent& agent) {
 TEST_CASE("WP-48: a DLL freed and loaded again inside one poll reaches a broker of ABI 3 as an unload and a load in ModuleEvents") {
     const std::string pipe = unique_pipe_name("events");
     ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));
-    ScriptedBroker broker(pipe);
-    broker.welcome_abi.store(cml::ipc::kAgentAbiModuleEvents);
+    ScriptedBroker broker(pipe, cml::ipc::kAgentAbiModuleEvents);  // WP-61: from the first Welcome on
     REQUIRE(broker.ready());
     cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str());
     REQUIRE(agent.IsValid());
@@ -1115,19 +1184,82 @@ TEST_CASE("WP-48: to a broker before WP-48 (no ABI in Welcome) the same events g
     CHECK(events_seen == 0);  // never a message type the old broker does not know
 }
 
-TEST_CASE("WP-48 review 1: when the session's first module list cannot be built, a request right after it still finds the module") {
-    using FailFn = void (*)(int);
-    const std::string pipe = unique_pipe_name("events_nolist");
+namespace {
+
+std::string lower_ascii(const std::string& text) {
+    std::string lower;
+    for (const char c : text) {
+        lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    return lower;
+}
+
+// WP-61: the agent's own log (CML_AGENT_LOG, read once when cml_agent.dll is loaded: CI's WP-61 repeat step sets it, with
+// CML_LOG_LEVEL=debug, for a process that runs only these tests), its last `max_bytes`; empty without one.
+std::string agent_log_tail(std::size_t max_bytes) {
+    wchar_t path[MAX_PATH];
+    const DWORD n = GetEnvironmentVariableW(L"CML_AGENT_LOG", path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) {
+        return {};
+    }
+    std::FILE* file = _wfsopen(path, L"rb", _SH_DENYNO);
+    if (file == nullptr) {
+        return {};
+    }
+    std::string text;
+    char buffer[4096];
+    for (std::size_t got = 0; (got = std::fread(buffer, 1, sizeof(buffer), file)) > 0;) {
+        text.append(buffer, got);
+    }
+    std::fclose(file);
+    return text.size() > max_bytes ? text.substr(text.size() - max_bytes) : text;
+}
+
+// WP-61: arms the agent's injected module-enumeration failures and disarms them when it goes out of scope, also when a REQUIRE
+// throws: the counter lives in cml_agent.dll, which stays loaded, so a leftover count would fail the module lists of later tests.
+class InjectedEnumerationFailures {
+public:
+    explicit InjectedEnumerationFailures(int count)
+        : fail_(agent_export<void (*)(int)>("cml_agent_testing_fail_enumeration")) {
+        REQUIRE(fail_ != nullptr);
+        fail_(count);
+    }
+    ~InjectedEnumerationFailures() { fail_(0); }
+    InjectedEnumerationFailures(const InjectedEnumerationFailures&) = delete;
+    InjectedEnumerationFailures& operator=(const InjectedEnumerationFailures&) = delete;
+
+private:
+    void (*fail_)(int);
+};
+
+// WP-61 (R-71): what a scripted broker saw of a session whose first module list could not be built, up to the first EnableModule
+// of the test exe (and the whole session for the counts).
+struct FirstListSession {
+    std::uint32_t welcome_abi = ScriptedBroker::kNoWelcome;  // what the broker's Welcome said
+    bool empty_list_first = false;
+    bool seen_enable = false;
+    bool events_before_enable = false;   // the test exe in a ModuleEvents (to a broker of ABI 3) before the request
+    bool loaded_before_enable = false;   // the test exe in a ModuleLoaded (to a broker without the ABI) before the request
+    bool resync_before_enable = false;   // a ModuleEvents with a reason before the request
+    std::size_t events_messages = 0;     // ModuleEvents in the whole session
+    bool disagreement = false;           // CML4722 in the whole session
+    long long hello_after_listen_us = -1;          // when connection 0's Hello arrived
+    long long welcome_built_after_listen_us = -1;  // when its Welcome read the broker's ABI
+    long long constructed_after_listen_us = -1;    // when the broker's constructor returned (all from just before the pipe existed)
+    std::string timeline;                          // the broker's messages in arrival order, with times
+};
+
+// The agent first, with no broker to connect to (it enumerates modules only in a session), then the failures, then a broker that
+// answers Welcome with `abi`; the agent waits for that pipe and connects as soon as it exists. Every attempt of the first list
+// fails (it is sent empty and sent again 1 s later); the request goes out before that. `observe_ms` after the answer.
+FirstListSession run_first_list_failed_session(const char* tag, std::uint32_t abi, DWORD observe_ms) {
+    const std::string pipe = unique_pipe_name(tag);
     ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));
     ScopedEnv broker_env(L"CML_BROKER_PATH", exe_directory() + L"\\no_such_broker.exe");
-    // The agent first, with no broker to connect to (it enumerates modules only in a session), then the failures, then the broker.
     cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str());
     REQUIRE(agent.IsValid());
-    const FailFn fail_enumeration = agent_export<FailFn>("cml_agent_testing_fail_enumeration");
-    // Every attempt of the first list fails (it is sent empty and sent again 1 s later); the request goes out before that.
-    fail_enumeration(3);
-    ScriptedBroker broker(pipe);
-    broker.welcome_abi.store(cml::ipc::kAgentAbiModuleEvents);
+    auto failures = std::make_unique<InjectedEnumerationFailures>(3);  // reset when this ends, also on a failed REQUIRE
+    ScriptedBroker broker(pipe, abi);  // WP-61: the ABI is in place before the listener creates the pipe
     REQUIRE(broker.ready());
     REQUIRE(wait_until([&] { return agent.IsConnected(); }, 20000));
     const std::wstring self = cml::GetCurrentModulePath();
@@ -1138,43 +1270,104 @@ TEST_CASE("WP-48 review 1: when the session's first module list cannot be built,
     cml::Reply reply;
     const cml::Request r = agent.EnableModule(self);
     REQUIRE(agent.WaitForRequest(r, 20000, &reply) == CML_STATUS_OK);
-    Sleep(2500);  // a fixed observation window: two quiet polls and the list sent again (a spurious CML4722 would come here)
-    fail_enumeration(0);
+    Sleep(observe_ms);  // a fixed observation window (two quiet polls and the list sent again: a spurious CML4722 would come here)
+    failures.reset();   // disarmed before the agent stops, as before
     cml::DestroyAgent(agent);
 
     const auto names_self = [&self_name](const std::string& path) {
-        std::string lower;
-        for (const char c : path) {
-            lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-        }
+        const std::string lower = lower_ascii(path);
         return lower.size() >= self_name.size() && lower.compare(lower.size() - self_name.size(), self_name.size(), self_name) == 0;
     };
-    bool empty_list_first = false;
+    FirstListSession out;
+    out.welcome_abi = broker.welcome_sent(0);
+    out.hello_after_listen_us = broker.first_message_after_listen_us();
+    out.welcome_built_after_listen_us = broker.welcome_built_after_listen_us();
+    out.constructed_after_listen_us = broker.constructed_after_listen_us();
+    out.timeline = broker.timeline(0);
     bool list_seen = false;
-    bool known_before_enable = false;
-    bool disagreement = false;
-    bool seen_enable = false;
     for (const cml::ipc::Message& m : broker.messages(0)) {
         if (const auto* list = std::get_if<cml::ipc::ModuleList>(&m); list != nullptr) {
             if (!list_seen) {
-                empty_list_first = list->modules.empty();
+                out.empty_list_first = list->modules.empty();
                 list_seen = true;
             }
-        } else if (const auto* events = std::get_if<cml::ipc::ModuleEvents>(&m); events != nullptr && !seen_enable) {
-            for (const cml::ipc::ModuleEvent& e : events->events) {
-                known_before_enable = known_before_enable || (e.kind == cml::ipc::ModuleEventKind::Loaded && names_self(e.module.path));
+        } else if (const auto* events = std::get_if<cml::ipc::ModuleEvents>(&m); events != nullptr) {
+            ++out.events_messages;
+            if (!out.seen_enable) {
+                for (const cml::ipc::ModuleEvent& e : events->events) {
+                    out.events_before_enable =
+                        out.events_before_enable || (e.kind == cml::ipc::ModuleEventKind::Loaded && names_self(e.module.path));
+                }
+                out.resync_before_enable = out.resync_before_enable || events->reason != 0;
             }
-            CHECK(events->reason == 0);  // not a resync: the broker simply had no list yet
+        } else if (const auto* loaded = std::get_if<cml::ipc::ModuleLoaded>(&m); loaded != nullptr) {
+            out.loaded_before_enable = out.loaded_before_enable || (!out.seen_enable && names_self(loaded->module.path));
         } else if (const auto* enable = std::get_if<cml::ipc::EnableModule>(&m); enable != nullptr && names_self(enable->path)) {
-            seen_enable = true;
+            out.seen_enable = true;
         } else if (const auto* log = std::get_if<cml::ipc::Log>(&m); log != nullptr && log->text.find("CML4722") != std::string::npos) {
-            disagreement = true;
+            out.disagreement = true;
         }
     }
-    CHECK(empty_list_first);
-    CHECK(seen_enable);
-    CHECK(known_before_enable);  // the module was reported before the request that names it
-    CHECK_FALSE(disagreement);
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("WP-48 review 1: when the session's first module list cannot be built, a request right after it still finds the module") {
+    const FirstListSession s = run_first_list_failed_session("events_nolist", cml::ipc::kAgentAbiModuleEvents, 2500);
+    // WP-61 (R-71) evidence: when the agent's Hello arrived, when the broker built its Welcome (the moment it reads the ABI), and
+    // when the broker's constructor returned, all from just before the pipe was created. Before WP-61 the test stored the ABI only
+    // after the constructor had returned, so a Welcome built before that return certainly went out without the ABI:
+    // welcome_before_constructor_returned=1 counts those runs. It is a lower bound of the old window, which ran on to the store.
+    std::printf("WP61-WINDOW hello_us=%lld welcome_us=%lld constructor_returned_us=%lld welcome_before_constructor_returned=%d "
+                "welcome_abi=%lld\n",
+                s.hello_after_listen_us, s.welcome_built_after_listen_us, s.constructed_after_listen_us,
+                s.welcome_built_after_listen_us >= 0 && s.welcome_built_after_listen_us < s.constructed_after_listen_us ? 1 : 0,
+                s.welcome_abi == ScriptedBroker::kNoWelcome ? -1LL : static_cast<long long>(s.welcome_abi));
+    std::fflush(stdout);
+    CHECK(s.welcome_abi == cml::ipc::kAgentAbiModuleEvents);  // R-71: the session speaks ModuleEvents (it did not, see the WP-61 test)
+    CHECK(s.empty_list_first);
+    CHECK(s.seen_enable);
+    CHECK(s.events_before_enable);  // the module was reported before the request that names it
+    CHECK_FALSE(s.loaded_before_enable);
+    CHECK_FALSE(s.resync_before_enable);  // not a resync: the broker simply had no list yet
+    CHECK_FALSE(s.disagreement);
+    const bool ok = s.welcome_abi == cml::ipc::kAgentAbiModuleEvents && s.empty_list_first && s.seen_enable && s.events_before_enable &&
+                    !s.loaded_before_enable && !s.resync_before_enable && !s.disagreement;
+    if (!ok) {
+        // WP-61: what the broker received, in order, and the agent's own log when CML_AGENT_LOG names one.
+        std::printf("WP61-TIMELINE (broker, microseconds after the pipe was created)\n%s", s.timeline.c_str());
+        const std::string log = agent_log_tail(48 * 1024);
+        std::printf("WP61-AGENT-LOG (%s)\n%s\n", log.empty() ? "none: set CML_AGENT_LOG and CML_LOG_LEVEL=debug" : "tail", log.c_str());
+        std::fflush(stdout);
+    }
+}
+
+// WP-61 (R-71): the failure of "WP-48 review 1" on windows-2025 msvc RelWithDebInfo (ci 46143341335 attempt 1) had this signature:
+// the empty first list and the request went out, no CML4722, and no ModuleEvents named the module before the request. The test stored
+// the broker's ABI after the broker's constructor, while the agent already waited for the pipe; an agent that connected in between
+// was answered by a broker without the ABI. This is that session, made deterministic: the agent then (correctly, as to any broker
+// before WP-48) reports the module as a ModuleLoaded before the request, and never sends ModuleEvents.
+TEST_CASE("WP-61: to a Welcome without the ABI the failed first list's module goes as ModuleLoaded before the request (R-71's signature)") {
+    const FirstListSession s = run_first_list_failed_session("events_nolist_abi0", 0, 0);
+    std::printf("WP61-REPRO welcome_abi=%lld empty_list_first=%d seen_enable=%d module_events_before_enable=%d "
+                "module_loaded_before_enable=%d module_events=%llu cml4722=%d\n",
+                s.welcome_abi == ScriptedBroker::kNoWelcome ? -1LL : static_cast<long long>(s.welcome_abi), s.empty_list_first ? 1 : 0,
+                s.seen_enable ? 1 : 0, s.events_before_enable ? 1 : 0, s.loaded_before_enable ? 1 : 0,
+                static_cast<unsigned long long>(s.events_messages), s.disagreement ? 1 : 0);
+    std::fflush(stdout);
+    CHECK(s.welcome_abi == 0);
+    CHECK(s.empty_list_first);
+    CHECK(s.seen_enable);
+    CHECK_FALSE(s.events_before_enable);  // what "WP-48 review 1" checked, and found false
+    CHECK(s.loaded_before_enable);        // the broker still learnt the module before the request: no agent path is at fault
+    CHECK(s.events_messages == 0);
+    CHECK_FALSE(s.disagreement);
+    if (!(s.welcome_abi == 0 && s.empty_list_first && s.seen_enable && !s.events_before_enable && s.loaded_before_enable &&
+          s.events_messages == 0 && !s.disagreement)) {
+        std::printf("WP61-TIMELINE (broker, microseconds after the pipe was created)\n%s", s.timeline.c_str());
+        std::fflush(stdout);
+    }
 }
 
 TEST_CASE("WP-48 review round 2 (3): after the broker refuses the module list, the next poll reports every loaded module") {
@@ -1182,13 +1375,12 @@ TEST_CASE("WP-48 review round 2 (3): after the broker refuses the module list, t
     ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));
     std::atomic<int> lists{0};
     // The first two lists are refused (the second comes 1 s after the first): the request below goes out in that window.
-    ScriptedBroker broker(pipe, [&lists](const cml::ipc::Message& m) {
+    ScriptedBroker broker(pipe, cml::ipc::kAgentAbiModuleEvents, [&lists](const cml::ipc::Message& m) {
         if (std::holds_alternative<cml::ipc::ModuleList>(m) && lists.fetch_add(1) < 2) {
             return ScriptedBroker::Action::Reject;
         }
         return ScriptedBroker::Action::Answer;
     });
-    broker.welcome_abi.store(cml::ipc::kAgentAbiModuleEvents);
     REQUIRE(broker.ready());
     cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str());
     REQUIRE(agent.IsValid());
@@ -1239,16 +1431,17 @@ TEST_CASE("WP-48 review round 2 (3): after the broker refuses the module list, t
 }
 
 TEST_CASE("WP-48 review round 3 (2): after a refused list sent again, a same-base reload still reaches the broker as an unload and a load") {
-    using FailFn = void (*)(int);
     const std::string pipe = unique_pipe_name("events_refused_again");
     ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));
     ScopedEnv broker_env(L"CML_BROKER_PATH", exe_directory() + L"\\no_such_broker.exe");
     cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str());
     REQUIRE(agent.IsValid());
-    const FailFn fail_enumeration = agent_export<FailFn>("cml_agent_testing_fail_enumeration");
-    fail_enumeration(3);  // the first list goes out empty (accepted); the agent sends the full list again, which is refused
+    // The first list goes out empty (accepted); the agent sends the full list again, which is refused. WP-61: disarmed at the end of
+    // the test, also when a REQUIRE throws.
+    const InjectedEnumerationFailures failures(3);
     std::atomic<int> lists{0};
-    ScriptedBroker broker(pipe, [&lists](const cml::ipc::Message& m) {
+    // WP-61: the ABI goes to the constructor; this agent already waits for the pipe and can connect before a later store (R-71).
+    ScriptedBroker broker(pipe, cml::ipc::kAgentAbiModuleEvents, [&lists](const cml::ipc::Message& m) {
         if (std::holds_alternative<cml::ipc::ModuleList>(m)) {
             const int n = lists.fetch_add(1);
             if (n == 1 || n == 2) {
@@ -1257,7 +1450,6 @@ TEST_CASE("WP-48 review round 3 (2): after a refused list sent again, a same-bas
         }
         return ScriptedBroker::Action::Answer;
     });
-    broker.welcome_abi.store(cml::ipc::kAgentAbiModuleEvents);
     REQUIRE(broker.ready());
     REQUIRE(wait_until([&] { return agent.IsConnected(); }, 20000));
 
@@ -1315,8 +1507,7 @@ TEST_CASE("WP-48: without loader notifications the agent falls back to the modul
     const std::string pipe = unique_pipe_name("events_off");
     ScopedEnv pipe_env(L"CML_PIPE_NAME", widen(pipe));
     ScopedEnv off(L"CML_TEST_NO_LOADER_NOTIFICATIONS", L"1");
-    ScriptedBroker broker(pipe);
-    broker.welcome_abi.store(cml::ipc::kAgentAbiModuleEvents);
+    ScriptedBroker broker(pipe, cml::ipc::kAgentAbiModuleEvents);  // WP-61: from the first Welcome on
     REQUIRE(broker.ready());
     cml::Agent agent = cml::CreateDefaultAgent(exe_directory().c_str());
     REQUIRE(agent.IsValid());
