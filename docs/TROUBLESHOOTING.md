@@ -56,7 +56,9 @@ revert, restart).
      could not be read (locked by an editor's save, a read error), and `reason=changed-during-scan:<path>` means a file
      changed while the index was built. Those compilands are not kept (`skipped`: none was), and the next index scans them
      again. A file over the scanner's 8 MiB limit is not read, but it is not a failed read either: it is kept with its stamp
-     like any other input (WP-55). Set-option `cache_include_scan` false scans every time.
+     like any other input (WP-55). A file or directory changed within 2 s of being stamped is also checked by its contents
+     (or its names), because a same-size edit in the same clock tick keeps its size and time. Set-option `cache_include_scan`
+     false scans every time.
    * `WP55-INLINE-CACHE module=... object=... kept=... read=... entries=...`: the bind planner's verdicts on what an old
      procedure inlined (WP-51) that this plan asked for and took from an earlier plan against the same module image (`kept`),
      and those it read from the PDB (`read`, unreadable ones included). They are kept per module state and dropped with it (disable, unload, a new

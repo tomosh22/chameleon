@@ -127,11 +127,27 @@ struct ScanInput {
     bool directory = false;
     std::uint64_t size = 0;
     long long mtime = 0;
+    // WP-55 (review): a stamp is racy when the path's time is within kScanRacyWindow of the moment the stamp was taken (or
+    // later): the file system's clock moves in ticks (NTFS: the system timer, up to ~16 ms; FAT: 2 s), so a change made after the
+    // stamp in the same tick, with the same size, leaves the stamp as it was. A racy stamp is checked by content as well:
+    // `content` is the hash of what the scan read (a file) or of the names in it (a directory), `has_content` whether it is set.
+    bool racy = false;
+    bool has_content = false;
+    std::uint64_t content = 0;
 };
-// What `path` is now.
+inline constexpr long long kScanRacyWindowSeconds = 2;
+// What `path` is now (the stamp only: never racy, no content).
 ScanInput probe_scan_input(const std::string& path);
+// What `path` is now, as a stamp taken before a use: racy when its time is recent, and then, for a directory, with the hash of
+// its names (a file's content is added by ScanInputRecorder::wrap when the scan reads it).
+ScanInput stamp_scan_input(const std::string& path);
 // Whether two stamps of the same path agree (existence, kind, size, time).
 bool same_scan_input(const ScanInput& a, const ScanInput& b);
+// Whether `recorded` still holds: the same stamp now and, when it is racy with a content hash, the same content.
+bool scan_input_holds(const ScanInput& recorded);
+// The hash scan_input_holds() compares: of a file's text (as the scan reads it), or of a directory's sorted names.
+std::uint64_t scan_content_hash(std::string_view text);
+std::uint64_t scan_directory_hash(const std::string& path);
 // "" when every input is still as recorded, else the first path that differs (changed, created or removed).
 std::string changed_scan_input(const std::vector<ScanInput>& inputs);
 

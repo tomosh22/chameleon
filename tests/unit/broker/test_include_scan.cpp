@@ -747,3 +747,61 @@ TEST_CASE("WP-55 (R-58): the scanner traces every path a walk asked about, answe
     scanner.dependencies(ra);
     CHECK(touched().empty());
 }
+
+TEST_CASE("WP-55 (review): a same-size edit within the stamp's clock tick is caught: a racy stamp is checked by content") {
+    namespace fs = std::filesystem;
+    ScratchDir d;
+    const std::string src = d.path("a.cpp");
+    write_file(src, "int a() { return 1; }\n");
+    ScanInputRecorder rec;
+    const ScanFileReader reader = rec.wrap(disk_file_reader());
+    REQUIRE(reader(src).has_value());
+    REQUIRE((rec.stamped(src) != nullptr));
+    const ScanInput stamp = *rec.stamped(src);
+    CHECK(stamp.racy);  // written just now
+    CHECK(stamp.has_content);
+    REQUIRE((rec.stamped(d.dir()) != nullptr));
+    const ScanInput dir_stamp = *rec.stamped(d.dir());
+    CHECK(dir_stamp.racy);
+    CHECK(dir_stamp.has_content);
+
+    ScanCache cache;
+    ModuleFileStamp module;
+    module.size = 1;
+    auto result = std::make_shared<ScanResult>();
+    result->inputs = {stamp, dir_stamp};
+    CompilandScan part;
+    part.inputs = {0, 1};
+    result->compilands.push_back(part);
+    cache.store("C:\\bin\\m.exe", module, result);
+    std::string reason;
+    CHECK((cache.find("C:\\bin\\m.exe", module, &reason) == result));  // the same content: reused
+
+    // The edit lands in the same tick: same size, and (here: put back) the same time. The stamp alone cannot see it.
+    std::error_code ec;
+    const fs::file_time_type t = fs::last_write_time(fs::path(src), ec);
+    write_file(src, "int a() { return 2; }\n");
+    fs::last_write_time(fs::path(src), t, ec);
+    CHECK(same_scan_input(probe_scan_input(src), stamp));
+    CHECK_FALSE(scan_input_holds(stamp));
+    CHECK((cache.find("C:\\bin\\m.exe", module, &reason) == nullptr));
+    CHECK(reason == "file-changed:" + src);
+    CHECK(rec.not_cacheable(src) == "changed-during-scan:" + src);
+
+    // A file created in the directory in the same tick: the names differ.
+    const fs::file_time_type dt = fs::last_write_time(fs::path(d.dir()), ec);
+    write_file(d.path("new.h"), "#pragma once\n");
+    fs::last_write_time(fs::path(d.dir()), dt, ec);
+    CHECK(same_scan_input(probe_scan_input(d.dir()), dir_stamp));
+    CHECK_FALSE(scan_input_holds(dir_stamp));
+
+    // A stamp of a file last written long before is not racy: its time and size are trusted alone.
+    const std::string old = d.path("old.h");
+    write_file(old, "#pragma once\n");
+    fs::last_write_time(fs::path(old), fs::file_time_type::clock::now() - std::chrono::hours(1), ec);
+    const ScanInput settled = stamp_scan_input(old);
+    CHECK(settled.exists);
+    CHECK_FALSE(settled.racy);
+    CHECK_FALSE(settled.has_content);
+    CHECK(scan_input_holds(settled));
+}

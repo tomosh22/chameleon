@@ -11,6 +11,7 @@
 #include "cml/core/pipeline_diag_ids.h"
 #include "cml/core/static_lib_diag_ids.h"
 #include "cml/toolchain/record.h"
+#include "cml/util/hash.h"
 #include "cml/util/path.h"
 #include "cml/util/log.h"
 
@@ -155,9 +156,59 @@ bool same_scan_input(const ScanInput& a, const ScanInput& b) {
     return a.exists == b.exists && a.directory == b.directory && a.size == b.size && a.mtime == b.mtime;
 }
 
+std::uint64_t scan_content_hash(std::string_view text) {
+    return hash64(text);
+}
+
+std::uint64_t scan_directory_hash(const std::string& path) {
+    std::vector<std::string> names;
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(std::filesystem::path(path), ec), end; !ec && it != end; it.increment(ec)) {
+        names.push_back(it->path().filename().string());
+    }
+    std::sort(names.begin(), names.end());
+    std::string joined = ec ? std::string("\x01unreadable") : std::string();
+    for (const std::string& n : names) {
+        joined += n;
+        joined += '\0';
+    }
+    return hash64(joined);
+}
+
+ScanInput stamp_scan_input(const std::string& path) {
+    ScanInput in = probe_scan_input(path);
+    if (!in.exists) {
+        return in;
+    }
+    // (Review of d26fd78: a same-size edit within the file system's timestamp tick of the stamp kept the stamp unchanged, and the
+    // stale graph hit. A recent time, or one in the future, is not trusted alone.)
+    const auto now = std::filesystem::file_time_type::clock::now();
+    const auto window = std::chrono::duration_cast<std::filesystem::file_time_type::duration>(std::chrono::seconds(kScanRacyWindowSeconds));
+    in.racy = in.mtime >= static_cast<long long>((now - window).time_since_epoch().count());
+    if (in.racy && in.directory) {
+        in.content = scan_directory_hash(path);
+        in.has_content = true;
+    }
+    return in;
+}
+
+bool scan_input_holds(const ScanInput& recorded) {
+    if (!same_scan_input(probe_scan_input(recorded.path), recorded)) {
+        return false;
+    }
+    if (!recorded.racy || !recorded.has_content) {
+        return true;
+    }
+    if (recorded.directory) {
+        return scan_directory_hash(recorded.path) == recorded.content;
+    }
+    const std::optional<std::string> text = disk_file_reader()(recorded.path);
+    return text && scan_content_hash(*text) == recorded.content;
+}
+
 std::string changed_scan_input(const std::vector<ScanInput>& inputs) {
     for (const ScanInput& recorded : inputs) {
-        if (!same_scan_input(probe_scan_input(recorded.path), recorded)) {
+        if (!scan_input_holds(recorded)) {
             return recorded.path;
         }
     }
@@ -167,7 +218,7 @@ std::string changed_scan_input(const std::vector<ScanInput>& inputs) {
 const ScanInput& ScanInputRecorder::before(const std::string& path) {
     auto it = before_.find(path);
     if (it == before_.end()) {
-        it = before_.emplace(path, probe_scan_input(path)).first;
+        it = before_.emplace(path, stamp_scan_input(path)).first;
     }
     return it->second;
 }
@@ -185,6 +236,12 @@ ScanFileReader ScanInputRecorder::wrap(ScanFileReader disk) {
         const bool may_exist = dir.empty() || before(dir).exists || before_.count(path) != 0;
         const ScanInput* file = may_exist ? &before(path) : nullptr;  // std::map: the reference stays valid
         std::optional<std::string> text = disk(path);
+        if (text && file != nullptr && file->racy && !file->directory) {
+            // (Review: a racy stamp is checked by the content the scan used.)
+            ScanInput& stamp = before_[path];
+            stamp.content = scan_content_hash(*text);
+            stamp.has_content = true;
+        }
         // WP-55 (R-63): a file the stamp found over the size limit is never read, whatever happens at the read: the same answer
         // every time while its stamp holds. Any other failed read of a file that exists may succeed next time.
         if (!text && file != nullptr && file->exists && !file->directory && file->size <= kScanMaxFileBytes) {
@@ -201,7 +258,7 @@ std::string ScanInputRecorder::not_cacheable(const std::string& path) {
     auto it = rechecked_.find(path);
     if (it == rechecked_.end()) {
         const ScanInput& was = before(path);  // a path first met here is stamped now (and compared with itself)
-        it = rechecked_.emplace(path, !same_scan_input(probe_scan_input(path), was)).first;
+        it = rechecked_.emplace(path, !scan_input_holds(was)).first;
     }
     return it->second ? "changed-during-scan:" + path : std::string();
 }
@@ -262,7 +319,7 @@ ScanCache::Lookup ScanCache::lookup(const std::string& module_path, const Module
     std::vector<char> changed(r.inputs.size(), 0);
     std::string first_changed;
     for (std::size_t i = 0; i < r.inputs.size(); ++i) {
-        if (!same_scan_input(probe_scan_input(r.inputs[i].path), r.inputs[i])) {
+        if (!scan_input_holds(r.inputs[i])) {
             changed[i] = 1;
             if (first_changed.empty()) {
                 first_changed = r.inputs[i].path;
@@ -668,6 +725,24 @@ std::optional<ScanResult> ModuleIndex::scan_files(const pdb::PdbIndex& index, co
     // that met a file it could not read, is not cacheable. A reused part's inputs were checked by the lookup before it was used;
     // it, too, is not kept when one of them came back with another stamp from a part scanned now (`problem`).
     if (stamping) {
+        // A racy stamp copied into the table before the scan read the file gets the content it read; a reused part's racy stamp
+        // whose content differs from what this scan read changed after the lookup (`problem`).
+        for (std::size_t i = 0; i < out.inputs.size(); ++i) {
+            ScanInput& in = out.inputs[i];
+            if (!in.racy || in.directory) {
+                continue;
+            }
+            const ScanInput* now = recorder.stamped(in.path);
+            if (now == nullptr || !now->has_content) {
+                continue;
+            }
+            if (!in.has_content) {
+                in.content = now->content;
+                in.has_content = true;
+            } else if (in.content != now->content && problem[i].empty()) {
+                problem[i] = "changed-during-scan:" + in.path;
+            }
+        }
         std::vector<char> checked(out.inputs.size(), 0);
         std::vector<std::string> verdict(out.inputs.size());
         for (std::size_t k = 0; k < out.compilands.size(); ++k) {
