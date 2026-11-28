@@ -1393,7 +1393,7 @@ Result<Value> ReloadService::revert(const Value& args) {
     // here, under the failure-injection gate, and held until finish_injection below has run (an inject-failure sees the revert running
     // until then); revert_impl refuses busy after checking its arguments when it could not be taken.
 #if defined(CML_FAULT_INJECTION)
-    std::unique_lock<std::mutex> gate(faults_.gate());
+    std::unique_lock<std::mutex> gate = faults_.lock_gate();  // WP-62: waits for an inject-failure that is arming agents
 #endif
     std::optional<ExclusiveRun> exclusive;
     exclusive.emplace(reload_mutex_, running_);

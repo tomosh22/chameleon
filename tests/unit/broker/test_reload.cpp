@@ -2489,6 +2489,91 @@ TEST_CASE("revert injection (R-51 1): while a revert disarms what is left for it
     CHECK_FALSE(rig.service->faults().take_agent_armed(ipc::fault::Stage::RevertRestore, kPid));
 }
 
+// ---- WP-62 (R-70): inject-failure sends ArmFault without holding the gate ------------------------------------------------------
+
+TEST_CASE("revert injection (WP-62): inject-failure lets go of the gate before it sends ArmFault; it is marked as arming until it is done") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    apply_two_patches(rig);
+    int asked = 0;
+    bool gate_free = false;
+    bool arming = false;
+    rig.on_arm = [&](const ipc::ArmFault& arm) {
+        if (arm.count != 0) {
+            // The scripted agent answers inside the link's send, under its send lock. Before WP-62 the gate was held here: the order
+            // gate -> send lock that TSan reported against send lock -> gate (an inject-failure made from this callback).
+            ++asked;
+            gate_free = rig.service->faults().gate_free_for_testing();
+            arming = rig.service->faults().arming_for_testing();
+        }
+    };
+    REQUIRE(inject_failure(*rig.service, inject_args("revert-restore")).has_value());
+    CHECK(asked == 1);
+    CHECK(gate_free);
+    CHECK(arming);
+    CHECK_FALSE(rig.service->faults().arming_for_testing());
+    CHECK(rig.service->faults().gate_free_for_testing());
+    SUBCASE("an arming the agent refuses ends the arming too, and leaves no record") {
+        gate_free = false;
+        arming = false;
+        rig.arm_status = ipc::fault::ids::kBadRequest;
+        Result<Value> refused = inject_failure(*rig.service, inject_args("revert-uncommit"));
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(asked == 2);
+        CHECK(gate_free);
+        CHECK(arming);
+        CHECK_FALSE(rig.service->faults().arming_for_testing());
+        CHECK_FALSE(rig.service->faults().take_agent_armed(ipc::fault::Stage::RevertUncommit, kPid));
+        rig.arm_status = 0;
+    }
+    // A revert still starts (lock_gate does not wait for an arming that ended) and disarms what was armed for it.
+    rig.on_arm = nullptr;
+    Result<Value> last = revert_with(rig, "last");
+    REQUIRE_MESSAGE(last.has_value(), last.error().format());
+    CHECK_FALSE(rig.service->faults().take_agent_armed(ipc::fault::Stage::RevertRestore, kPid));
+}
+
+TEST_CASE("revert injection (WP-62): a revert that starts while inject-failure sends ArmFault without the gate waits for it and finds the record") {
+    QuietLogs quiet;
+    Rig rig;
+    rig.enable();
+    apply_two_patches(rig);
+    std::thread reverter;
+    std::atomic<bool> revert_done{false};
+    std::optional<Result<Value>> reverted;
+    std::atomic<bool> revert_started_early{false};
+    rig.on_arm = [&](const ipc::ArmFault& arm) {
+        if (arm.count != 1 || reverter.joinable()) {
+            return;
+        }
+        // The record is made and the gate is free (WP-62); a revert asked for now must still wait for the arming to end.
+        reverter = std::thread([&] {
+            reverted.emplace(revert_with(rig, "last"));
+            revert_done = true;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        revert_started_early = rig.service->reload_running() || revert_done.load();
+    };
+    Result<Value> armed = inject_failure(*rig.service, inject_args("revert-restore"));
+    REQUIRE_MESSAGE(armed.has_value(), armed.error().format());
+    REQUIRE(reverter.joinable());
+    reverter.join();
+    CHECK_FALSE(revert_started_early.load());
+    REQUIRE(reverted.has_value());
+    REQUIRE_MESSAGE(reverted->has_value(), reverted->error().format());
+    // The revert's end found the record: the stage was disarmed in the agent, and it is listed as unused.
+    const Value* disarmed = (*reverted)->find("injection_disarmed");
+    REQUIRE(disarmed != nullptr);
+    REQUIRE(disarmed->items().size() == 1);
+    CHECK(disarmed->items()[0].as_string() == "revert-restore");
+    CHECK_FALSE(rig.service->faults().take_agent_armed(ipc::fault::Stage::RevertRestore, kPid));
+    const auto arms = rig.seen<ipc::ArmFault>();
+    REQUIRE(arms.size() == 2);
+    CHECK(arms[0].count == 1);
+    CHECK(arms[1].count == 0);
+}
+
 namespace {
 
 // WP-44: a process host that only answers has_exited (the revert tests do not restart anything).

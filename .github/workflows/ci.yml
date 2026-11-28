@@ -789,6 +789,80 @@ jobs:
           path: ci-logs/
           if-no-files-found: warn
 
+  # WP-62 (R-70): ThreadSanitizer (GCC, Linux) on the portable suites: every unit suite that builds on Linux with
+  # CML_ALLOW_NON_WINDOWS (unit.broker_core among them), the broker's command-line tests and the fuzz corpus replays. The
+  # suites that need a Windows fixture (unit.coff, unit.coff_link, unit.pe, fixture.*) do not build there and are not run.
+  # Any report fails the job: TSan exits 66 once it has reported, and there is no suppression file. A pre-check like every
+  # Linux build; it does not replace the Windows matrix.
+  tsan:
+    name: ubuntu-24.04 / gcc / ThreadSanitizer (portable suites)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      BUILD_DIR: build-tsan
+      # halt_on_error: the first report ends the suite (exit code 66); second_deadlock_stack: both stacks of a lock-order inversion.
+      TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1
+      TSAN_TARGETS: >-
+        cml_test_util cml_test_pdb cml_test_ipc cml_test_proc cml_test_watch cml_test_agent cml_test_broker_core cml_test_license
+        cml_test_toolchain cml_test_agent_hook cml_test_bind cml_test_reexecute cml_test_ui cml_test_harness cml_test_control
+        cml_broker cml_fuzz_coff cml_fuzz_pe cml_fuzz_pdb cml_fuzz_ipc cml_fuzz_control cml_fuzz_lde
+      TSAN_TESTS: '^(unit\.(util|pdb|ipc|proc|watch|agent|broker_core|license|toolchain|agent_hook|bind|reexecute|ui|harness|control)|broker\.(version|unknown_option_fails)|fuzz\.replay\..*|docs\.troubleshooting)$'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ninja and print toolchain versions
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q ninja-build
+          g++ --version
+          cmake --version
+          ninja --version
+
+      # The runner's kernel randomises mmap with more bits than GCC's TSan runtime accepts ("unexpected memory mapping").
+      - name: Lower mmap randomisation for TSan
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      # -Wno-maybe-uninitialized: with -fsanitize=thread GCC 13 reports std::optional members as maybe uninitialised
+      # (reload_service.cpp, hook_narrowing.cpp), which -Werror turns into errors; the plain Linux and Windows builds keep the warning.
+      - name: Configure (portable parts, -fsanitize=thread)
+        run: >
+          cmake -S . -B "$BUILD_DIR" -G Ninja -DCML_ALLOW_NON_WINDOWS=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_COMPILER=g++ "-DCMAKE_CXX_FLAGS=-fsanitize=thread -Wno-maybe-uninitialized"
+          "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread" "-DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=thread"
+
+      - name: Build the portable suites
+        run: cmake --build "$BUILD_DIR" --target $TSAN_TARGETS
+
+      - name: Test under TSan
+        run: |
+          ctest --test-dir "$BUILD_DIR" -N -R "$TSAN_TESTS"
+          start=$(date +%s)
+          set +e
+          ctest --test-dir "$BUILD_DIR" -R "$TSAN_TESTS" --output-on-failure -j 4 --timeout 1500 2>&1 | tee tsan-ctest.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "TSAN-RUN seconds=$(( $(date +%s) - start )) rc=$rc"
+          # Every suite's output, the passing ones too (ctest prints only the failing ones).
+          if grep -q "WARNING: ThreadSanitizer" "$BUILD_DIR/Testing/Temporary/LastTest.log"; then
+            grep -n -A40 "WARNING: ThreadSanitizer" "$BUILD_DIR/Testing/Temporary/LastTest.log" | head -400
+            echo "::error::ThreadSanitizer reported (above)"
+            exit 1
+          fi
+          exit $rc
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-tsan
+          path: |
+            tsan-ctest.txt
+            build-tsan/Testing/Temporary/LastTest.log
+          if-no-files-found: warn
+
   # WP-05: which clang-cl versions record S_BUILDINFO with the cc1 command line (ADR-0012), and does
   # replaying that command as `clang -cc1 ...` work with each? One cell per LLVM release (17..20),
   # installed from the official installer into its own directory (side by side, no choco).

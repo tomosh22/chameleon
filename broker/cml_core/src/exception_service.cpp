@@ -369,7 +369,7 @@ Result<Value> ExceptionService::action(const Value& args) {
     return act(link, pid, key, name, kind, exception_id, offer);
 #else
     {
-        std::lock_guard<std::mutex> gate(service_->faults().gate());
+        const std::unique_lock<std::mutex> gate = service_->faults().lock_gate();  // WP-62: waits for an inject-failure that is arming agents
         service_->faults().begin_operation("exception-action");
     }
     struct EndOperation {

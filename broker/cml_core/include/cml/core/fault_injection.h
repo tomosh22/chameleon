@@ -16,11 +16,19 @@
 //     or by {"stage":"none"} leaves it ({"stage":"none"} removes the file). An agent stage is armed in the agent process, which
 //     outlives a broker restart by itself; what is persisted for it is the broker's record that the end of its operation must
 //     disarm it there.
-//   * R-51: the operations with an end-of-operation cleanup (restart, revert, exception-action) take `gate()` while they start, and
-//     inject_failure holds it from its busy check to its last ArmFault, so an arming can never fall between an operation's start
-//     and its end. Each operation runs its cleanup (finish_injection) before it lets go of its run lock.
+//   * R-51: the operations with an end-of-operation cleanup (restart, revert, exception-action) take the gate (lock_gate()) while
+//     they start, and inject_failure keeps them out from its busy check to its last ArmFault (WP-62: by begin_arming, below), so an
+//     arming can never fall between an operation's start and its end. Each operation runs its cleanup (finish_injection) before it
+//     lets go of its run lock.
+//   * WP-62 (R-70): the gate is never held while a message goes to an agent. inject_failure makes its busy check and its records
+//     under the gate, marks itself as arming (begin_arming) and lets go of the gate before its first ArmFault; until it ends
+//     (end_arming), lock_gate() waits, so an operation still cannot start between the records and the last ArmFault. Lock order:
+//     nothing that holds the gate takes a link's send lock (AgentLink::send), so a transport that calls back into the broker from
+//     inside a send (the unit tests' scripted agents do) may take the gate. Before WP-62 inject_failure sent under the gate, and
+//     such a callback inverted the order (gate -> send lock against send lock -> gate).
 
 #include <array>
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -78,9 +86,17 @@ public:
     bool armed_for_process(std::uint32_t pid) const;
 
     // R-51: see the top of the file. Taken by inject_failure (for a stage with an end-of-operation cleanup) and by the operations
-    // while they start; never held while an operation runs.
-    std::mutex& gate() noexcept { return gate_; }
-    // WP-44: operations of a group that the broker counts itself (the group "exception-action"); callers hold gate() for begin.
+    // while they start; never held while an operation runs. WP-62 (R-70): lock_gate() takes it once no inject-failure is arming
+    // agents (it waits for end_arming), and nobody holds it while a message goes to an agent.
+    std::unique_lock<std::mutex> lock_gate();
+    // WP-62: inject_failure, holding the gate (from lock_gate()), is about to send ArmFault to agents: marks the arming and lets go
+    // of the gate. Every lock_gate() waits until end_arming(), which takes the gate itself.
+    void begin_arming(std::unique_lock<std::mutex>& gate);
+    void end_arming();
+    // WP-62 (tests): whether the gate is free right now (try_lock), and whether an inject-failure is arming agents.
+    bool gate_free_for_testing();
+    bool arming_for_testing();
+    // WP-44: operations of a group that the broker counts itself (the group "exception-action"); callers hold the gate (lock_gate()) for begin.
     void begin_operation(const char* group);
     void end_operation(const char* group);
     bool operation_running(const char* group) const;
@@ -106,6 +122,8 @@ private:
 
     mutable std::mutex mutex_;
     std::mutex gate_;  // R-51
+    std::condition_variable gate_cv_;  // WP-62: lock_gate() waits on it while arming_
+    bool arming_ = false;  // WP-62: under gate_; an inject-failure sends ArmFault without the gate
     std::array<Arming, ipc::fault::kStageCount> armed_{};
     std::array<std::set<std::uint32_t>, ipc::fault::kStageCount> agent_armed_{};  // WP-43
     std::array<std::set<std::uint32_t>, ipc::fault::kStageCount> agent_persist_{};  // WP-44: the records of agent_armed_ that persist

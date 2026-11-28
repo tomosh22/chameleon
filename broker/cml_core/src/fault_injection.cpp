@@ -22,7 +22,7 @@ using ipc::json::Value;
 namespace {
 
 // WP-44: the groups whose operations disarm what is still armed for them at their end (finish_injection). An arming of such a group
-// is recorded and its operation's start is ordered against it (FaultInjector::gate()).
+// is recorded and its operation's start is ordered against it (FaultInjector::lock_gate()).
 bool has_cleanup(const std::string& group) {
     return group == "restart" || group == "revert" || group == "exception-action" || group == "watch";
 }
@@ -212,6 +212,35 @@ void FaultInjector::end_operation(const char* group) {
             return;
         }
     }
+}
+
+std::unique_lock<std::mutex> FaultInjector::lock_gate() {
+    std::unique_lock<std::mutex> gate(gate_);
+    gate_cv_.wait(gate, [this] { return !arming_; });
+    return gate;
+}
+
+void FaultInjector::begin_arming(std::unique_lock<std::mutex>& gate) {
+    arming_ = true;
+    gate.unlock();
+}
+
+void FaultInjector::end_arming() {
+    {
+        std::lock_guard<std::mutex> gate(gate_);
+        arming_ = false;
+    }
+    gate_cv_.notify_all();
+}
+
+bool FaultInjector::gate_free_for_testing() {
+    std::unique_lock<std::mutex> gate(gate_, std::try_to_lock);
+    return gate.owns_lock();
+}
+
+bool FaultInjector::arming_for_testing() {
+    std::lock_guard<std::mutex> gate(gate_);
+    return arming_;
 }
 
 bool FaultInjector::operation_running(const char* group) const {
@@ -665,10 +694,11 @@ Result<Value> inject_failure(ReloadService& service, const Value& args) {
     // WP-43: a stage with an end-of-operation cleanup is armed for the next operation; arming it while one runs could fire in the middle of
     // it (the undo of a revert's re-pointing, say). R-51: the check and the arming are one step against the start of such an operation
     // (the gate, which the operations take while they start), and each operation disarms what is left while it still counts as running.
+    // WP-62 (R-70): the gate is held for the check and the records only, never while ArmFault goes to an agent (see begin_arming below).
     const bool cleanup = has_cleanup(group);
     std::unique_lock<std::mutex> gate;
     if (cleanup) {
-        gate = std::unique_lock<std::mutex>(service.faults().gate());
+        gate = service.faults().lock_gate();
         const bool busy = (group == "restart" && service.restart_active()) || (group == "revert" && service.reload_running()) ||
                           (group == "exception-action" && service.faults().operation_running("exception-action")) ||
                           (group == "watch" && service.faults().operation_running("watch"));
@@ -701,6 +731,20 @@ Result<Value> inject_failure(ReloadService& service, const Value& args) {
             for (const std::shared_ptr<AgentLink>& link : targets) {
                 service.faults().note_agent_armed(info->stage, link->snapshot().pid, persist);
             }
+        }
+        // WP-62 (R-70): the gate is let go of before the first ArmFault (the send lock of a link is never taken under it); an operation
+        // that starts meanwhile still waits, in lock_gate(), until the last ArmFault (and any undo) is done.
+        struct ArmingScope {
+            FaultInjector* faults = nullptr;
+            ~ArmingScope() {
+                if (faults != nullptr) {
+                    faults->end_arming();
+                }
+            }
+        } arming;
+        if (cleanup) {
+            service.faults().begin_arming(gate);
+            arming.faults = &service.faults();
         }
         // All or nothing: the agents already armed are disarmed again when one of them refuses.
         std::vector<std::shared_ptr<AgentLink>> armed;
