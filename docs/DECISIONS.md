@@ -1543,6 +1543,13 @@ that reload (WP-22 batch revert, per module, newest first). Different processes 
   largest).
 - Unit tests cover each invalidation (changed input, unreadable file, module unload).
 
+**Ruling (WP-52 convergence, ADR-0018):** the CML3211 error is decided per static, not per guard: every function-local
+static of the patch bound to the running process that needs a guard must have a tied guard bound to the old one, or the reload is
+refused (CML3211, naming the static); an untied guard no such refusal names stays a warning. No function matching decides the
+error (this supersedes the round-1 ruling that kept the warning when a scope could not be read, which was the unsafe direction).
+Names are read with the spelling of the compiler that wrote them: the patch object's own S_COMPILE3; clang counts `$TSS<n>` from
+19.1.0 (clang 19.0.x is unknown); with an unknown compiler a guard is tied only when both readings tie the same statics.
+
 WP-52..WP-55 start together (four at once). WP-52 and WP-53 share `broker/cml_core/src/bind_plan.cpp`, and WP-54 and WP-55
 share `reload_service.cpp`: whoever merges second merges main and re-runs CI. Rules as in ADR-0043: one PR per WP, CI on the
 Windows matrix is the only acceptance, the orchestrator reads the logs; "refuse what cannot be proven" stands.
