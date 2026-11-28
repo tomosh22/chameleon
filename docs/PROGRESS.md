@@ -59,6 +59,10 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-49 | Hook narrowing verifies jump tables (R-46; ADR-0044) | 12 | done | wp/49-jump-tables | #78 (6f3af45) | ci 14/14, corpus 8/8, fuzz, package at 40e27fd (runs 46058896301, 46058899613, 46058904453, 46058896309) verified: `jump_tables passed=21 failed=0` in all 8 matrix cells, ctest 128/128 (msvc 2022) and 127/127 (clang-cl 2022), every corpus cell fail=0; the large-PDB benchmark installs 1 hook instead of 275 |
 | WP-50 | First-reload cost and hot-restart time (R-47, R-55; ADR-0044) | 12 | done | wp/50-reload-cost | #77 (4c88f60) | ci 14/14, corpus 8/8, fuzz, package at 4bb92ae (runs 46070844759, 46070844811, 46070844760, 46070844764) verified: every corpus cell pass, Godot hot-restart 11.6 s (128.3 s on main's code); benchmark (ci 46058238658): first reload 616.7 ms against ~470 ms later, hooks 2.8–3.7 ms, large_pdb_reload 22/22, perf 24/24 |
 | WP-51 | An own static never takes an inlined, deleted lambda's static (R-54; ADR-0044) | 12 | done | wp/51-inline-sites | #81 (18e158d) | ci 14/14, corpus 8/8, fuzz at 94c2484 (runs 46067810797, 46067811807, 46067810641) verified: every corpus cell pass, jolt and imgui clang-cl unchanged (18/18, 14/14), every WP51-INLINEES summary refused=0 would_refuse=0; jolt clang-cl plan_ms 419.3 / 883.8 on the largest reloads (R-62) |
+| WP-52 | A nested lambda's guard is tied to its bound static (R-60; ADR-0045) | 13 | in progress | wp/52-nested-guards | — | — |
+| WP-53 | A new static of an inlined lambda never takes its caller's deleted static (R-61; ADR-0045) | 13 | in progress (spike) | wp/53-inlined-mirror | — | — |
+| WP-54 | A reload across several modules of one process applies nothing when one is refused (R-56; ADR-0045) | 13 | in progress | wp/54-cross-module-atomic | — | — |
+| WP-55 | Reload and restart caches (R-58, R-62, R-63; ADR-0045) | 13 | in progress | wp/55-caches | — | — |
 
 ## Orchestrator integration work
 
@@ -151,6 +155,7 @@ wave 11.
 **Wave 11 launched (2026-11-25):** WP-40..WP-43 under ADR-0043; WP-44 starts when the first of them merges.
 **Wave 11 complete (2026-11-25):** WP-40..WP-46 merged (#69..#75). Wave 12 proposed in ADR-0044.
 **Wave 12 complete (2026-11-28):** WP-47..WP-51 merged (#79, #80, #78, #77, #81): a refused reload applies nothing per module
+**Wave 13 launched (2026-11-28):** WP-52..WP-55 under ADR-0045 (four at once); WP-53 starts with a spike.
 (R-52), the agent sees every module load and unload (R-53), jump tables no longer re-hook every switch under cl `/Od` (R-46),
 the first reload's hooks stage drops from 0.3–0.4 s to 4 ms and a Godot hot-restart from 128 s to 11.6 s (R-47, R-55), and an
 own static never takes an inlined, deleted lambda's static (R-54). New findings went to R-56..R-63; R-60 (a nested lambda's
