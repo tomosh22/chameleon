@@ -1263,4 +1263,71 @@ std::vector<Diag> prove_bitmask_guards(const NarrowInput& input) {
     return out;
 }
 
+std::vector<Diag> prove_inlined_lambda_statics(const NarrowInput& input) {
+    std::vector<Diag> out;
+    if (input.plan == nullptr || input.plan->inlined_lambda_statics.empty()) {
+        return out;
+    }
+    const bind::BindPlan& plan = *input.plan;
+    // One verdict per procedure: "" proven (unchanged), else why not.
+    std::map<std::uint32_t, std::string> verdicts;
+    const auto verdict_of = [&](const bind::InlinedLambdaStatic& s) -> const std::string& {
+        const auto found = verdicts.find(s.proc_rva);
+        if (found != verdicts.end()) {
+            return found->second;
+        }
+        std::string why;
+        const bind::HookEntry* hook = nullptr;
+        for (const bind::HookEntry& h : plan.hooks) {
+            if (s.proc_rva != bind::kNoRva && h.old_rva == s.proc_rva) {
+                hook = &h;
+                break;
+            }
+        }
+        if (hook == nullptr) {
+            why = "'" + s.proc + "' is not paired with a function of the patch (its old entry at rva " + hex(s.proc_rva) + " is not hooked)";
+        } else if (input.object == nullptr || input.old_image == nullptr) {
+            why = "the old code of '" + s.proc + "' is not available";
+        } else {
+            NarrowInput ni = input;
+            ni.enabled = true;
+            const Narrower narrower(ni);
+            const NarrowDecision d = narrower.judge(*hook);
+            if (d.reason != NarrowReason::Unchanged) {
+                why = "the code of '" + s.proc + "' changed (" + std::string(to_string(d.reason)) + (d.detail.empty() ? std::string() : ": " + d.detail) + ")";
+            } else {
+                CML_LOG(Trace, "WP53-INLINED-PROC proc='%s' rva=%s unchanged%s", s.proc.c_str(), hex(s.proc_rva).c_str(), d.from_prior ? " (against an earlier patch)" : "");
+            }
+        }
+        return verdicts.emplace(s.proc_rva, std::move(why)).first->second;
+    };
+    std::size_t proven = 0;
+    std::size_t refused = 0;
+    std::size_t skipped = 0;  // re-decided after the listing (refused or unbound by a later step): nothing to prove
+    for (const bind::InlinedLambdaStatic& s : plan.inlined_lambda_statics) {
+        const bind::SymbolDecision* d = plan.find_decision(s.symbol);
+        if (d == nullptr || d->decision != bind::DecisionKind::BindOldData || d->old_address.rva != s.record_rva) {
+            CML_LOG(Trace, "WP53-INLINED-PROOF static='%s' proc='%s' skipped (no longer bound to the record at rva %s)", s.display.c_str(), s.proc.c_str(), hex(s.record_rva).c_str());
+            ++skipped;
+            continue;
+        }
+        const std::string& why = verdict_of(s);
+        CML_LOG(Trace, "WP53-INLINED-PROOF static='%s' record rva=%s proc='%s' by=%s proven=%s%s%s", s.display.c_str(), hex(s.record_rva).c_str(), s.proc.c_str(), bind::to_string(s.how),
+                why.empty() ? "unchanged" : "refused", why.empty() ? "" : " ", why.c_str());
+        if (why.empty()) {
+            ++proven;
+            continue;
+        }
+        ++refused;
+        out.push_back(Diag::make(bind::diag::kAmbiguousStatic,
+                                 "static data '" + s.display + "' (" + s.symbol + ") in " + plan.object_name + " was paired with the record at rva " + hex(s.record_rva) + " of '" + s.proc +
+                                     "', which inlined its lambda; a compiler records the statics of an inlined lambda there and the function's own statics alike, so only an unchanged '" +
+                                     s.proc + "' proves the record is this lambda's (it may be a static the edit deleted from '" + s.proc + "'), and " + why,
+                                 "Leave '" + s.proc + "' unchanged while the program runs (edit other functions of the file), rename the static, or hot-restart."));
+    }
+    CML_LOG(Info, "WP53-INLINED object=%s listed=%zu proven=%zu refused=%zu skipped=%zu", plan.object_name.c_str(), plan.inlined_lambda_statics.size(), proven, refused,
+            skipped);
+    return out;
+}
+
 }  // namespace cml::core

@@ -1,0 +1,4 @@
+# WP-53: checked-in test inputs (built by build.sh); never converted.
+*.pdb binary
+*.exe binary
+*.obj binary

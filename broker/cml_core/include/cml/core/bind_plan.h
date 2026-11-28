@@ -262,6 +262,23 @@ struct HashedLambda {
     std::vector<std::string> statics;     // the patch's statics of the closure bound to old ones (guards included)
 };
 
+// WP-53 (R-61, ADR-0045): a static of a lambda's call operator the plan binds to a record directly in the procedure of the
+// function the lambda was inlined into (WP-40's in-caller pairing: placed by the section layout or by its place in the
+// function), with no record of a call operator at that address. clang-cl at /O2 records an inlined lambda's static there,
+// and the function's own statics as well, under the same name and in the same shape (docs/wp/WP-53.md): nothing in the
+// records tells the two apart, so an edit that deletes `f`'s own `static x` and declares `static x` in its lambda would
+// give the lambda `f`'s live object. The pipeline proves the pairing by the code of that procedure: the patch's version of
+// it must be the old code under the plan (hook_narrowing.h: prove_inlined_lambda_statics), so that the old function used
+// the record exactly as the new one uses the lambda's static. Otherwise CML3207.
+struct InlinedLambdaStatic {
+    std::string symbol;          // decorated name of the patch's static (a guard of such a static is listed like a static)
+    std::string display;
+    std::uint32_t record_rva = kNoRva;  // the old record it is bound to
+    std::string proc;            // the old procedure that holds the record ("f", or an outer call operator)
+    std::uint32_t proc_rva = kNoRva;    // its entry: the hook of the patch's version of it is found by this
+    BindSource how = BindSource::None;  // the step that made the pairing
+};
+
 struct BindPlan {
     std::string object_name;
     std::string module_name;
@@ -292,6 +309,7 @@ struct BindPlan {
     std::vector<LambdaSet> lambda_sets;  // WP-40, see LambdaSet
     std::vector<BitmaskGuard> bitmask_guards;  // WP-40, see BitmaskGuard
     std::vector<HashedLambda> hashed_lambdas;  // WP-46, see HashedLambda
+    std::vector<InlinedLambdaStatic> inlined_lambda_statics;  // WP-53, see InlinedLambdaStatic
 
     PlanSummary summary() const;
     // `BINDPLAN <label> hooks=N bind_old_data=N thunks=N new=N fixups=N` (the CI evidence line).

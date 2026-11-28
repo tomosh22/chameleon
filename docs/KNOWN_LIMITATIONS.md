@@ -26,7 +26,7 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
 | CML3401 | TLS dynamic initialiser/destructor in a patched TU (warning) | The old image's initialiser and destructor stay in effect; a changed initialiser is not run. | Hot-restart if the changed initialiser must take effect. | WP-24 (unit-tested only; no CI fixture has a dynamic `thread_local`) | **live** |
 | CML3402 | Several `S_GTHREAD32` records for one thread_local name | Ambiguous thread_local `<symbol>`. | Rename one of them, or hot-restart. | WP-24 | **live** |
 | CML3103 | Layout of a type with live instances changed | Layout of `<T>` changed; existing objects not migrated. Use a post-patch hook or hot-restart. | Migrate state in a CML_POSTPATCH_HOOK or hot-restart. | WP-07/WP-18 | **not done in WP-18**: needs the UDT layouts (TPI) of the old PDB and of the patch, which cml_pdb does not read yet (WP-04 left type records out) |
-| CML3207 | A static data symbol whose name matches several records of the old compiland (same scope) and cannot be told apart by name, closure (lambda statics, WP-37), RVA in a known section layout, or order within one procedure with equal count, types, block nesting and bound guards (WP-37). **Unity builds (WP-41, F-41.1):** a translation unit or unity batch with several overloads of one function that each hold a guarded local static (Jolt's `GetRTTIOfType`, one per RTTI macro) pair by procedure (cl since WP-40; clang-cl since WP-46, whose record-less guards are then placed by the layout their statics teach, or refused with CML3600). **WP-40 over-refusals:** a function's own static `x` next to a static `x` of one of its lambdas (in the patch or the old image); two functions that `/OPT:ICF` folded to one RVA. **Not detected (R-54, WP-46):** under clang-cl -O2 a lambda inlined everywhere that an edit deletes, with a static of its static's name added to the caller, binds that static to the lambda's live object | Static `<name>` matches `<n>` records named `<id>` in compiland `<i>` ... (with the reason). | Rename one of the statics, keep their number unchanged, or hot-restart. | WP-07, WP-37 | **live**; under cl two same-named block statics of a `static` or anonymous-namespace function are still refused (qualified record names) |
+| CML3207 | A static data symbol whose name matches several records of the old compiland (same scope) and cannot be told apart by name, closure (lambda statics, WP-37), RVA in a known section layout, or order within one procedure with equal count, types, block nesting and bound guards (WP-37). **Unity builds (WP-41, F-41.1):** a translation unit or unity batch with several overloads of one function that each hold a guarded local static (Jolt's `GetRTTIOfType`, one per RTTI macro) pair by procedure (cl since WP-40; clang-cl since WP-46, whose record-less guards are then placed by the layout their statics teach, or refused with CML3600). **WP-40 over-refusals:** a function's own static `x` next to a static `x` of one of its lambdas (in the patch or the old image); two functions that `/OPT:ICF` folded to one RVA. **WP-51 (R-54):** a function-local static whose old record lies in its function's procedure (for a lambda's static: the call operator of its own closure) is refused when that procedure inlined a lambda's code (call operator, invoker, any closure member but conversions/ctor/dtor/`operator=`, a template over a closure) or its inline sites cannot be read. This is deliberately broad: any own static of a function that inlined any closure code is refused, also when that lambda has no static (a `std::sort` or `std::call_once` with a lambda inlined into the function is enough; R-59). Not detected: statics of inlined non-lambda helpers (R-57), and a new static of an inlined lambda taking its caller's deleted static (R-61) | Static `<name>` matches `<n>` records named `<id>` in compiland `<i>` ... (with the reason). | Rename one of the statics, keep their number unchanged, or hot-restart. | WP-07, WP-37 | **live**; under cl two same-named block statics of a `static` or anonymous-namespace function are still refused (qualified record names) |
 | CML3210 | Clang's TU-wide initialiser (`_GLOBAL__sub_I_<file>`) in a TU that has new globals AND globals bound to the old image (warning) | Initialiser `<fn>` initialises every global of `<obj>`, including ones bound to the old image; running it may re-initialise them. | Put new globals with dynamic initialisation into a separate source file, or hot-restart. | WP-07 | **live** |
 | CML3211 | Guard variable of a function-local static cannot be located in the old image because the TU's static layout changed (warning) | Guard variable `<name>` of a function-local static was not found in the old image; the patch gets a fresh guard. | Keep the layout of the statics in this source file unchanged, or hot-restart. | WP-07 | **live** |
 | CML3212 | Reference through a section symbol (private/section-relative) into a section that holds data bound to the old image (warning) | Object section `<n>` holds data bound to the old image and is also referenced through its section symbol. | Give the data external linkage or avoid private references to it. | WP-07 | **live** |
@@ -82,16 +82,19 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
   and not enabled again by the restart; their edits are re-applied when they are enabled later (WP-45).
   A restart that leaves its new process running without finishing (CML5808, CML5809) remembers what it could not do for that
   process; the next `restart` of it does it. A late registration alone does not (WP-43).
-- **A reload of several compilands that is refused partway is partly applied (F-41.4, R-52).** The compilands planned before
-  the refused one stay patched although the reply is `ok:false`; after a header edit, some compilands then run its new inline code
-  and the others the old. The applied part is one batch: `revert` undoes it. Files whose compilands were not all patched are
-  compiled again at the next reload.
+- **A reload of several compilands is atomic per module (WP-47, R-52).** Every compiland of a module is planned, proven and
+  linked before any is applied; a refusal applies nothing (CML3650). A failure while applying rolls back what that reload applied
+  (CML3651); a roll-back that fails or is not confirmed is CML3652/CML3654, and if hooks were not confirmed (CML5309/CML4656) or the
+  agent was lost mid-apply the reply says which compilands may be live (CML3653/CML3655). A reload across several modules or
+  processes is still applied module by module (R-56).
 - **Modules freed and loaded again, or enabled late after a hot-restart (WP-45).** A module instance enabled after the session has
   accepted edits for its sources (FreeLibrary + LoadLibrary, or a module the restarted process loads later, CML5809) gets those
   edits re-applied by a re-apply reload once its index is ready; each instance has its own patch work directory. A re-apply that
   fails is CML5600, an index that fails CML5601; both name the module and the files. Edits are carried only to the same process
-  (restart token, command line and creation time). Limits: a FreeLibrary + LoadLibrary at the same base inside one agent module
-  poll (500 ms) is invisible to the agent, and the new image runs its original code (R-53); when an agent reconnects to a live
+  (restart token, command line and creation time). Limits: since WP-48 (R-53) the agent sees every load and unload through
+  the loader's notifications, so a FreeLibrary + LoadLibrary at the same base is reported even inside one poll; a hook record whose
+  bytes were overwritten by another tool or a debugger is kept, not forgotten (CML4724), and the WP50-HOOKS `lock_us` field also
+  counts time a module-event reconcile held the installer; when an agent reconnects to a live
   process, the module instances enabled at the disconnect leave no carry; a module whose index is not ready during a restart
   (CML5810) gets its edits re-applied when the index is ready, and CML5809/CML5810 name the files that could not be carried. `CML_RESTART_TOKEN` stays in the new process's environment (ADR-0034). `Agent::ScheduleRestart` still
   returns `CML_STATUS_NOT_IMPLEMENTED`. A broker started with a short `--exit-when-idle` can exit during the restart gap.
@@ -127,6 +130,22 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
 - Statics only match old records of exactly the same scope (same enclosing function, or file scope): a static that moved to another function is a new, fresh variable, and a lambda moved to another function is new code that is not hooked.
 - Functions currently executing on a thread's stack keep running old code until they return;
   the next call runs the new code.
+- **Statics of inlined helper functions are not detected (R-57, WP-51).** clang-cl at `-O2` records the function-local statics of
+  an internal-linkage (`static`, anonymous-namespace or local-class) helper it inlined as plain records of the caller. An edit that
+  deletes the helper and declares a static of that name in the caller pairs the new static with the helper's live object, as R-54
+  did for lambdas; the planner refuses that only for a lambda's code (CML3207, WP-51). `WP51-WOULD-REFUSE` lines in the broker log
+  count how often a rule for helpers would fire (none on the corpus).
+- **A nested lambda's bound static can be constructed a second time (R-60, pre-existing).** clang-cl spells an inner lambda's `$TSS`
+  guard scope with other back-reference numbers than its static's, so the guard is decided new (CML3211 warning only) while the
+  static is bound to the running process; the patch runs the static's initializer again over the live object. Hot-restart after
+  editing a TU with a function-local static inside a nested lambda under clang-cl.
+- Hot-restart include-scan cache (WP-50, R-55): a module whose include graph reaches a file over 8 MiB (Godot's generated
+  `doc_translations.gen.cpp`) or a file that cannot be read is scanned again on every index (`WP50-SCAN-CACHE store=skipped`;
+  R-63). A module whose scanned inputs changed is scanned again whole (R-58).
+- Hook narrowing (WP-49, R-46) verifies cl's in-function jump tables, but a function with a clang-cl jump table (in `.rdata`,
+  REL32 entries in an associative COMDAT) or a two-level switch (a byte index table, then the jump table) stays hooked on every
+  reload of its TU. That is harmless but wasteful. A `/Gy-` function (already CML1105) with an inner label is kept hooked
+  (`size-differs`), never dropped.
 - Hook installation (WP-10) cannot see a thread whose real resume point is inside the bytes being
   overwritten when its RIP is in ntdll's exception / APC / callback dispatcher at the moment it is
   stopped (the interrupted RIP is in a context record on its stack, which is not examined). In

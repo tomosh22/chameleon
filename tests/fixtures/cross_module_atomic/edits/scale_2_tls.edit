@@ -1,0 +1,13 @@
+--- a/scale.h
++++ b/scale.h
+@@ -5,8 +5,8 @@
+ // the translation units that include it (ADR-0013); the broker's include scan maps a change of it to them, in each module.
+ // Patched by the scenario `cross_module_atomic` (kScale 1 -> 2; CML_PLUGIN_TLS 0 -> 1 -> 0).
+-constexpr int kScale = 1;
++constexpr int kScale = 2;
+ 
+ // 1: plugin.cpp (in the DLL) defines a new thread_local (refused by the planner, CML3400).
+-#define CML_PLUGIN_TLS 0
++#define CML_PLUGIN_TLS 1
+ 
+ // end of scale.h

@@ -358,7 +358,9 @@ const char* const kOuterClosure = ".?AV<lambda_0>@?0??g@@YAXXZ@";
 const char* const kInnerClosure = ".?AV<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@";
 
 // The old image: `s_count` (teaches the layout), the outer call operator with the record `gx` and the inner one inlined.
-void nested_world(SynthWorld& w) {
+// With `with_k` (WP-53 review): a second lambda k's call operator holds o's `gx` as well (o inlined into k), and k's type
+// cannot be read.
+void nested_world(SynthWorld& w, bool with_k = false) {
     w.data(w.tu(), "`anonymous namespace'::s_count", 0x10);
     OldTypes t;
     const std::uint32_t outer_cls = t.tpi.add(tp::kLfClass, tp::lf_udt("g::<lambda_0>", kOuterClosure, true));
@@ -366,6 +368,9 @@ void nested_world(SynthWorld& w) {
     const std::uint32_t outer_fn = t.tpi.add(tp::kLfMFunction, tp::lf_mfunction(tp::kTInt, outer_cls, this_ptr, t.args, 0));
     const std::uint32_t inner = t.member(w.spec.ipi, "g::<lambda_0>::operator()::<lambda_1>", kInnerClosure, "operator()");
     proc_inlining(w, "g::<lambda_0>::operator()", 0x60, outer_fn, {{"gx", 0x20}}, {{inner}});
+    if (with_k) {
+        proc_inlining(w, "g::<lambda_2>::operator()", 0x90, 0x7777, {{"gx", 0x20}}, {});
+    }
     open_with(w, t);
 }
 
@@ -387,6 +392,38 @@ TEST_CASE("R-54 review: an inner lambda's static recorded in the outer call oper
     REQUIRE_MESSAGE(r.has_value(), err(r));
     CHECK(decision(*r, gx).decision == DecisionKind::BindOldData);
     CHECK(decision(*r, gx).old_address.rva == 0x3020);
+    // WP-53: the record is in the outer call operator, which its function's own statics would have too: proven by code.
+    REQUIRE(r->inlined_lambda_statics.size() == 1);
+    CHECK(r->inlined_lambda_statics[0].symbol == gx);
+    CHECK(r->inlined_lambda_statics[0].proc == "g::<lambda_0>::operator()");
+}
+
+TEST_CASE("R-61 review (WP-53): a record of another closure's call operator at the same address is not a twin") {
+    // clang-cl /O2: the outer lambda o of g keeps its call operator and is also inlined into another lambda k, so a static of
+    // o has a record in o's operator() and in k's operator(), at one address. A static of an inner lambda declared in o (after
+    // an edit that deleted o's static of that name) pairs with one of them. bb63263 took the other for cl's twin record (any
+    // record in a procedure named `operator()` at that address) and listed nothing: the pairing was never proven. A twin is a
+    // record in a call operator of the static's OWN closure; k's closure is not that (here its type cannot even be read).
+    SynthWorld w = basic_world(false);
+    nested_world(w, true);  // o = g::<lambda_0>::operator() with `gx` at 0x20, the inner closure inlined; k with gx too
+    SynthObj o;
+    const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+    o.symbol("?s_count@?A0x1@@3HA", 0x10, bss, false, false);
+    const std::string gx = "?gx@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?4@XZ@4UObj@@A";
+    o.symbol(gx, 0x20, bss, false, false);
+    Built b = o.build();
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    auto r = plan_bind(w.input(b), &errors, &partial);
+    const BindPlan& p = r ? *r : partial;
+    const SymbolDecision d = decision(p, gx);
+    if (d.decision == DecisionKind::BindOldData) {
+        // Bound to one of the two records: the pairing must wait for the proof.
+        REQUIRE(p.inlined_lambda_statics.size() == 1);
+        CHECK(p.inlined_lambda_statics[0].symbol == gx);
+        CHECK(p.inlined_lambda_statics[0].record_rva == 0x3020);
+    }
+    CHECK(d.decision == DecisionKind::BindOldData);  // (the shape this test is about: the layout pairs it)
 }
 
 TEST_CASE("R-54 review: the R-54 edit one level down (the inner lambda deleted, its static's name declared in the outer lambda) is refused") {
