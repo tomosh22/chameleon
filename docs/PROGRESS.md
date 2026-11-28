@@ -62,7 +62,7 @@ on every CI matrix cell + reviewed + `docs/wp/WP-NN.md` present + merged.
 | WP-52 | A nested lambda's guard is tied to its bound static (R-60; ADR-0045) | 13 | done | wp/52-nested-guards | #86 (a12b113) | ci 14/14, corpus all cells, fuzz at 63a69e8 (runs 46102705409, 46102705846, 46102708396) verified: planner_pairing_o2's nest step in all 8 cells (clang-cl binds the nested static with its guard; cl refused with CML3207, no reset); every corpus cell pass |
 | WP-53 | A new static of an inlined lambda never takes its caller's deleted static (R-61; ADR-0045) | 13 | done | wp/53-inlined-mirror | #83 (70f7e7d) | ci 14/14, corpus all cells, fuzz at f3be1cb (runs 46091116595, 46091122825, 46091125315) verified: every corpus cell pass, jolt clang-cl 18/18 and imgui clang-cl 14/14, no CML3207 and no WP53-INLINED lines (no in-caller lambda-static pairings in the corpus) |
 | WP-54 | A reload across several modules of one process applies nothing when one is refused (R-56; ADR-0045) | 13 | done | wp/54-cross-module-atomic | #84 (391b28a) | ci 14/14, corpus all cells, fuzz at 2f3b5b4 (runs 46095410629, 46095412437, 46095414783) verified: `cross_module_atomic passed=18`, `atomic_reload passed=15`, `plugin_reload passed=36` in all 8 matrix cells; every corpus cell pass |
-| WP-55 | Reload and restart caches (R-58, R-62, R-63; ADR-0045) | 13 | in progress | wp/55-caches | — | — |
+| WP-55 | Reload and restart caches (R-58, R-62, R-63; ADR-0045) | 13 | done | wp/55-caches | #85 (910f203) | ci 14/14, corpus all cells, fuzz at 72d367e (runs 46110424337, 46110425061, 46110450828) verified; corpus 46102940336: Godot hot-restart 6215.6 ms (11.6 s before), `WP50-SCAN-CACHE partial` with one compiland of 2585 rescanned; Jolt clang-cl `WP55-INLINE-CACHE kept>0 read=0` on repeats (saves ~5 ms, R-62 open) |
 
 ## Orchestrator integration work
 
@@ -156,6 +156,11 @@ wave 11.
 **Wave 11 complete (2026-11-25):** WP-40..WP-46 merged (#69..#75). Wave 12 proposed in ADR-0044.
 **Wave 12 complete (2026-11-28):** WP-47..WP-51 merged (#79, #80, #78, #77, #81): a refused reload applies nothing per module
 **Wave 13 launched (2026-11-28):** WP-52..WP-55 under ADR-0045 (four at once); WP-53 starts with a spike.
+**Wave 13 complete (2026-11-28):** WP-52..WP-55 merged (#86, #83, #84, #85): a nested lambda's guard is tied to its static and a
+bound static without a bound guard is refused (R-60); a reset static is refused instead of silently reset (cl nested lambdas, R-66);
+an inlined lambda's static never takes its caller's deleted one unless the caller is proven unchanged (R-61); a reload across the
+modules of one process applies nothing when one is refused (R-56); the Godot hot-restart drops to 6.2 s with a per-compiland scan
+cache, and a same-tick timestamp hole in WP-50's cache is closed (R-58, R-63). Wave 14 proposed in ADR-0046.
 (R-52), the agent sees every module load and unload (R-53), jump tables no longer re-hook every switch under cl `/Od` (R-46),
 the first reload's hooks stage drops from 0.3–0.4 s to 4 ms and a Godot hot-restart from 128 s to 11.6 s (R-47, R-55), and an
 own static never takes an inlined, deleted lambda's static (R-54). New findings went to R-56..R-63; R-60 (a nested lambda's
