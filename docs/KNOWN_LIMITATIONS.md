@@ -145,6 +145,11 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
 - Hot-restart include-scan cache (WP-50, R-55): a module whose include graph reaches a file over 8 MiB (Godot's generated
   `doc_translations.gen.cpp`) or a file that cannot be read is scanned again on every index (`WP50-SCAN-CACHE store=skipped`;
   R-63). A module whose scanned inputs changed is scanned again whole (R-58).
+- **Inline functions' statics (WP-59, R-67).** The external guards of an inline function's statics (clang's `??_B…@5n` bitmask
+  under `-fno-threadsafe-statics`, and `$TSS<n>` under the default thread-safe statics) are tied to their statics. A bound guard is
+  kept by its name only when its block has a single guarded static; otherwise only when the function's code is unchanged
+  (CML3600 if not). A constant-initialised static next to a new dynamic one is refused (CML3600), because the two cannot be told
+  apart (R-69); an inline function inlined everywhere has no hook, so an edit that needs the code proof is refused.
 - Hook narrowing (WP-49, R-46) verifies cl's in-function jump tables, but a function with a clang-cl jump table (in `.rdata`,
   REL32 entries in an associative COMDAT) or a two-level switch (a byte index table, then the jump table) stays hooked on every
   reload of its TU. That is harmless but wasteful. A `/Gy-` function (already CML1105) with an inner label is kept hooked
