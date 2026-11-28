@@ -9,6 +9,8 @@
 
 #include "cml/coff/coff.h"
 #include "cml/core/bind_plan.h"
+#include "cml/core/hook_narrowing.h"
+#include "cml/pe/pe.h"
 #include "cml/pdb/index.h"
 #include "cml/util/log.h"
 
@@ -39,6 +41,34 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "obj: %s\n", obj.error().message.c_str());
         return 1;
     }
+    // What the planner reads: every record of the compiland (procedures, data with their parent) and each procedure's inlinees.
+    std::vector<std::uint32_t> cis = (*pdb)->compilands_by_object_name(argv[3]);
+    if (cis.empty()) {
+        cis = (*pdb)->compilands_by_object_stem(argv[3]);
+    }
+    std::printf("compilands named '%s': %zu\n", argv[3], cis.size());
+    for (const std::uint32_t ci : cis) {
+        (void)(*pdb)->load_compiland(ci);
+        auto syms = (*pdb)->compiland_symbols(ci);
+        if (!syms) {
+            continue;
+        }
+        for (const pdb::SymbolView& v : *syms) {
+            if (!pdb::is_proc_kind(v.kind) && !pdb::is_data_kind(v.kind)) {
+                continue;
+            }
+            std::printf("  rec ci=%u #%u %s '%.*s' rva=%x type=%x parent='%.*s'\n", ci, v.index, pdb::is_proc_kind(v.kind) ? "proc" : "data", static_cast<int>(v.name.size()),
+                        v.name.data(), v.rva, v.type_index, static_cast<int>(v.parent_name.size()), v.parent_name.data());
+            if (pdb::is_proc_kind(v.kind)) {
+                auto sites = (*pdb)->proc_inlinees(v);
+                for (std::size_t k = 0; sites && k < sites->inlinees.size(); ++k) {
+                    const auto& e = sites->inlinees[k];
+                    std::printf("      inlinee '%s' class='%s' unique='%s' sig='%s' sites=%u depth=%u\n", e.name.c_str(), e.class_name.c_str(), e.class_unique.c_str(), e.signature.c_str(),
+                                e.sites, e.depth);
+                }
+            }
+        }
+    }
     core::bind::PlanInput in;
     in.object = &*obj;
     in.object_name = argv[2];
@@ -63,5 +93,24 @@ int main(int argc, char** argv) {
         std::printf("WARN CML%u %s\n", e.code, e.message.c_str());
     }
     std::printf("plan: %s\n", r ? "accepted" : "refused");
+    // The WP-25 comparator on every hook of the plan (argv[4]: the old image): is the function's code the old one's under
+    // the plan's decisions?
+    if (argc > 4) {
+        auto image = pe::load_image_file(argv[4]);
+        if (!image) {
+            std::printf("image: %s\n", image.error().message.c_str());
+            return 0;
+        }
+        core::NarrowInput ni;
+        ni.object = &*obj;
+        ni.plan = &p;
+        ni.old_image = &image->image;
+        ni.load_base = in.module_base;
+        ni.is_hooked = [](std::uint64_t) { return false; };
+        const core::NarrowResult n = core::narrow_hooks(ni);
+        for (const core::NarrowDecision& d : n.decisions) {
+            std::printf("code %-40s %s %s\n", d.display.c_str(), core::to_string(d.reason), d.detail.c_str());
+        }
+    }
     return 0;
 }
