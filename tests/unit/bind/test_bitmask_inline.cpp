@@ -11,8 +11,14 @@
 // when its statics are bound and the old image has no bitmask of that name, and kept only while the function's code is
 // unchanged (prove_bitmask_guards).
 //
-// The inputs are real: tests/unit/bind/wp59/<case>.{exe,pdb} (the old image, clang 18 clang-cl -O2 /Zc:threadSafeInit- +
-// lld-link) and <case>.patch.obj (the edited source), built by tests/unit/bind/wp59/build.sh from src/.
+// Review item 0 (ADR-0046): with thread-safe statics (the default) an inline function's statics have external guards
+// `?$TSS<n>@<block>@4HA`, numbered by the static's place among the function's statics in declaration order, which were
+// bound by their public names as well (a static declared in front of `a` takes `$TSS0`, the name of a's old guard). The same
+// rules apply to them, on the statics of their block; a bound one is proven by its function's code, unless it is the only
+// guard and static of its block and the old image has only that guard number there (the t* cases).
+//
+// The inputs are real: tests/unit/bind/wp59/<case>.{exe,pdb} (the old image, clang 18 clang-cl -O2 + lld-link; the b* cases
+// with /Zc:threadSafeInit-) and <case>.patch.obj (the edited source), built by tests/unit/bind/wp59/build.sh from src/.
 #include <algorithm>
 #include <fstream>
 #include <iterator>
@@ -230,4 +236,117 @@ TEST_CASE("R-67: an inline function that gains its statics gets a new bitmask, w
     for (const Diag& w : c.plan.warnings) {
         CHECK_MESSAGE(w.code != diag::kGuardUnmatched, w.message);
     }
+}
+
+namespace {
+
+// The defined symbols of a case's patch object, by name, with the name of their section.
+std::vector<std::string> defined_symbols(const Case& c) {
+    std::vector<std::string> out;
+    for (const coff::Symbol& s : c.object->symbols()) {
+        if (s.section_number <= 0 || s.name.empty() || s.name[0] != '?' || static_cast<std::size_t>(s.section_number) > c.object->sections().size()) {
+            continue;
+        }
+        const std::string section(c.object->sections()[static_cast<std::size_t>(s.section_number) - 1].name);
+        out.push_back(std::string(s.name) + " in " + section);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+const char* const kTss0 = "?$TSS0@?1??counter@@YAHXZ@4HA";
+const char* const kTss1 = "?$TSS1@?1??counter@@YAHXZ@4HA";
+
+}  // namespace
+
+TEST_CASE("R-67 (review item 2): a fresh bitmask next to a bound constant-initialised static is refused, as next to a dynamic one (b6, b7)") {
+    // b6: counter()'s only old static `static int calls = 0;` stays constant-initialised and a dynamic `a` is added; b7: the
+    // same, but calls becomes `= make_int(0)`. Accepting b6's fresh bitmask is right, b7's runs calls' new initialiser over
+    // the live value. The two patches define the same symbols in the same sections, so the planner cannot tell them apart
+    // (which static tests a bit only the code shows) and refuses both (docs/wp/WP-59.md, review item 2).
+    const Case b6("b6_const");
+    const Case b7("b7_both");
+    CHECK(defined_symbols(b6) == defined_symbols(b7));
+    for (const Case* c : {&b6, &b7}) {
+        CAPTURE(c->name);
+        CHECK_FALSE(c->planned);
+        const Diag* d = c->plan_error("CML3600");
+        REQUIRE(d != nullptr);
+        CHECK(contains(d->message, kBits));
+        CHECK(contains(d->message, "counter::calls"));
+        CHECK(contains(d->message, "counter::a"));
+    }
+}
+
+TEST_CASE("R-67 (review item 3): a thread_local of the inline function is not tied to its bitmask (b8)") {
+    // t's guard is `??__J...@51` (WP-24's). The bitmask's statics are a and b, both bound, and the bitmask stays bound to
+    // the old one. (This lld-link image without a CRT records no S_GTHREAD32 the planner finds for t, so t and its guard are
+    // refused as new thread-locals, CML3400; tied to the bitmask, that refused t made the bitmask a refused static's too.)
+    const Case c("b8_tls");
+    for (const Diag& e : c.plan_errors) {
+        CHECK_MESSAGE(e.id() == "CML3400", e.message);
+    }
+    CHECK(c.decision(kA).decision == DecisionKind::BindOldData);
+    CHECK(c.decision(kB).decision == DecisionKind::BindOldData);
+    const SymbolDecision& bits = c.decision(kBits);
+    CHECK(bits.decision == DecisionKind::BindOldData);
+    CHECK(bits.source == BindSource::PdbPublic);
+}
+
+TEST_CASE("WP-59 (review item 0): a static declared in front of an inline function's statics: their $TSS guards are refused (t1, CML3600)") {
+    // clang-cl 18: z takes `$TSS0`, the name of a's old guard (set), a takes `$TSS1`, b's old one, b `$TSS2` (new). Bound by
+    // name, z would never be constructed and b constructed again over the live object.
+    const Case c("t1_front");
+    CHECK_FALSE(c.planned);
+    const Diag* d = c.plan_error("CML3600");
+    REQUIRE(d != nullptr);
+    CHECK(contains(d->message, "?1??counter@@YAHXZ@4HA"));
+    CHECK(contains(d->message, "counter::z"));
+    CHECK(c.decision(kZ).decision == DecisionKind::PatchNewData);
+    CHECK(c.decision(kTss0).decision != DecisionKind::BindOldData);
+    CHECK(c.decision(kTss1).decision != DecisionKind::BindOldData);
+}
+
+TEST_CASE("WP-59 (review item 0): the static in front removed: b's guard takes a's old name and is refused by the code (t5)") {
+    // b's guard is now `$TSS0`, a's old one. Its block has one static and one guard, but the old image has two guards there:
+    // only counter's code could prove it, and counter changed.
+    const Case c("t5_remove");
+    REQUIRE(c.planned);
+    CHECK(c.decision(kB).decision == DecisionKind::BindOldData);
+    CHECK(c.decision(kTss0).decision == DecisionKind::BindOldData);
+    REQUIRE(c.plan.bitmask_guards.size() == 1);
+    CHECK(c.plan.bitmask_guards[0].guard == kTss0);
+    CHECK(c.plan.bitmask_guards[0].function == kCounter);
+    REQUIRE(c.proof.size() == 1);
+    CHECK(c.proof[0].id() == "CML3600");
+    CHECK(contains(c.proof[0].message, kTss0));
+    CHECK(contains(c.proof[0].message, "numbered by their statics' place in it"));
+    CHECK(contains(c.proof[0].message, "the code of 'counter' changed"));
+}
+
+TEST_CASE("WP-59 (review item 0): an inline function's two guarded statics: kept while it is unchanged (t3), refused when it changed (t4)") {
+    const Case t3("t3_other");
+    REQUIRE(t3.planned);
+    CHECK(t3.decision(kTss0).decision == DecisionKind::BindOldData);
+    CHECK(t3.decision(kTss1).decision == DecisionKind::BindOldData);
+    CHECK(t3.plan.bitmask_guards.size() == 2);
+    CHECK(t3.proof.empty());
+    const Case t4("t4_edit");
+    REQUIRE(t4.planned);
+    CHECK(t4.plan.bitmask_guards.size() == 2);
+    CHECK(t4.proof.size() == 2);
+    for (const Diag& d : t4.proof) {
+        CHECK(d.id() == "CML3600");
+        CHECK(contains(d.message, "the code of 'counter' changed"));
+    }
+}
+
+TEST_CASE("WP-59 (review item 0): an inline function's only static and guard (a Meyers singleton) keep the old guard without the code (t2)") {
+    const Case c("t2_single");
+    REQUIRE(c.planned);
+    const char* const guard = "?$TSS0@?1??counter@@YAAEAUObj@@XZ@4HA";
+    CHECK(c.decision("?a@?1??counter@@YAAEAUObj@@XZ@4U2@A").decision == DecisionKind::BindOldData);
+    CHECK(c.decision(guard).decision == DecisionKind::BindOldData);
+    CHECK(c.plan.bitmask_guards.empty());
+    CHECK(c.proof.empty());
 }

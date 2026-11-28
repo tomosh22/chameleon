@@ -129,7 +129,7 @@ within_s = 20
 # its two statics in ONE external bitmask, clang-cl's `??_B?1??o2_bits_counter@@YAHXZ@51`. The edit changes o2_bits_mark()
 # only. Since WP-59 the bitmask is a guard: tied to both statics, bound to the old bitmask by its name and kept because
 # o2_bits_counter() is unchanged (WP40-BITMASK ... proven=unchanged): under clang-cl the reload applies (patched = 1, bmark
-# 1 -> 5) and bits / bsec keep counting from where they were, bmade stays 2. cl may name or record the bitmask otherwise: a
+# 1 -> 5) and bits / bsec keep counting from where they were (expect_monotonic since the reload), bmade stays 2. cl may name or record the bitmask otherwise: a
 # refusal (CML3207 / CML3211 / CML3600) is allowed there; a value that drops or a second construction never is.
 [[step]]
 kind = "edit"
@@ -148,7 +148,7 @@ compiler = "clang-cl"
 
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ mark=[12] a=10\\d{4} b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=1 made=3 nest=7\\d{5} nmade=1 nmark=[14] bits=8(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) bsec=9(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) bmade=2 bmark=[15]\\b"
+regex = "TICK n=\\d+ mark=[12] a=10\\d{4} b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=1 made=3 nest=7\\d{5} nmade=1 nmark=[14] bits=80\\d{4} bsec=90\\d{4} bmade=2 bmark=[15]\\b"
 within_s = 10
 
 [[step]]
