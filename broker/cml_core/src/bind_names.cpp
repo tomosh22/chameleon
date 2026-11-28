@@ -625,7 +625,49 @@ bool is_funclet(std::string_view d) {
            starts_with(d, "?fin$") || starts_with(d, "?try$");
 }
 
+namespace {
+
+// WP-59 (R-67): where the "@5<n>" that closes clang's `??_B<scope>@5<n>` starts (the index of its '@'), npos when `d` is
+// not such a name. <scope> is a function scope ("?<n>?" or "?<hex>@?" and the function's decorated name), <n> a number as
+// the mangling writes one (a digit, or hexadecimal letters 'A'..'P' closed by '@').
+std::size_t inline_bitmask_scope_end(std::string_view d) noexcept {
+    if (d.size() < 10 || !starts_with(d, "??_B?")) {
+        return std::string_view::npos;
+    }
+    std::size_t n = d.size();
+    if (is_digit(d[n - 1])) {
+        n -= 1;
+    } else if (d[n - 1] == '@') {
+        std::size_t k = n - 1;
+        while (k > 0 && d[k - 1] >= 'A' && d[k - 1] <= 'P') {
+            --k;
+        }
+        if (k == n - 1) {
+            return std::string_view::npos;
+        }
+        n = k;
+    } else {
+        return std::string_view::npos;
+    }
+    if (n < 6 || d[n - 1] != '5' || d[n - 2] != '@' || function_scope_length(d, 4) == 0) {
+        return std::string_view::npos;
+    }
+    return n - 2;
+}
+
+}  // namespace
+
+bool is_inline_bitmask_guard(std::string_view d) { return inline_bitmask_scope_end(d) != std::string_view::npos; }
+
+std::string_view inline_bitmask_scope(std::string_view d) {
+    const std::size_t end = inline_bitmask_scope_end(d);
+    return end == std::string_view::npos ? std::string_view() : d.substr(4, end - 4);
+}
+
 bool is_guard_variable(std::string_view d) {
+    if (is_inline_bitmask_guard(d)) {
+        return true;
+    }
     if (!starts_with(d, "?$")) {
         return false;
     }
@@ -1033,7 +1075,12 @@ std::optional<LocalScopeKey> local_scope_key(std::string_view d, bool guard_name
     BackrefReader r;
     r.s = d;
     r.i = 1;
-    if (is_guard_variable(d)) {
+    const bool inline_bitmask = is_inline_bitmask_guard(d);
+    if (inline_bitmask) {
+        // WP-59 (R-67): `??_B` is a special name, which the mangling never puts in the back-reference table: both readings
+        // are the same, and the scope starts right after it.
+        r.i = 4;
+    } else if (is_guard_variable(d)) {
         const std::size_t e = d.find('@', 2);
         if (guard_name_counted) {
             r.names.emplace_back(d.substr(2, e - 1));
@@ -1060,6 +1107,15 @@ std::optional<LocalScopeKey> local_scope_key(std::string_view d, bool guard_name
         if (r.i >= d.size() || !r.piece(key.rest)) {
             return std::nullopt;
         }
+    }
+    if (inline_bitmask) {
+        // "@5<n>" closes the bitmask's scope where "@4<type>" closes a static's: written as the statics' "@4", so that the
+        // bitmask's key is the key of its function's statics.
+        if (r.i != inline_bitmask_scope_end(d) || !r.take('@', key.rest) || !r.ok) {
+            return std::nullopt;
+        }
+        key.rest += '4';
+        return key;
     }
     if (!r.take('@', key.rest) || !is_digit(r.peek()) || !r.take_any(key.rest) || !r.ok) {
         return std::nullopt;

@@ -74,7 +74,14 @@ bool is_dynamic_initializer(std::string_view decorated);  // ??__E..., __cxx_glo
 bool is_tu_wide_initializer(std::string_view decorated);  // _GLOBAL__sub_I_..., __cxx_global_var_init...
 bool is_atexit_destructor(std::string_view decorated);    // ??__F...
 bool is_funclet(std::string_view decorated);              // ?dtor$..., ?catch$..., ?filt$..., ?fin$..., ?try$...
-bool is_guard_variable(std::string_view decorated);       // ?$TSS<n>@..., ?$S<n>@...
+bool is_guard_variable(std::string_view decorated);       // ?$TSS<n>@..., ?$S<n>@..., ??_B<scope>@5<n>
+// WP-59 (R-67): clang's bitmask of an inline (externally visible) function's statics without thread-safe initialisation
+// (`-fno-threadsafe-statics`, `/Zc:threadSafeInit-`): `??_B<scope>@5<n>`, ONE per function, external (a COMDAT of its own),
+// written in the scope of the function's first guarded static ("??_B?1??counter@@YAHXZ@51"). Its bits go to the function's
+// statics in the order they are declared. An internal-linkage function's bitmask is `?$S1@<scope>@4IA` instead.
+bool is_inline_bitmask_guard(std::string_view decorated);
+// Its <scope> ("??_B?1??counter@@YAHXZ@51" -> "?1??counter@@YAHXZ"), empty when `decorated` is not such a bitmask.
+std::string_view inline_bitmask_scope(std::string_view decorated);
 
 // WP-52 (R-60): the scope of a function-local static, or of a guard variable, with its name back-references resolved.
 // The Microsoft mangling writes a name it has seen before in the same decorated name as one digit, '0'..'9', the index

@@ -68,7 +68,7 @@ void o2_nest2_step()
 {
     auto outer = []() {
         auto inner = [] {
-            static O2Name nested2 = o2_nest2_make(800000);
+            static O2Name nested2 = o2_nest2_make(600000);
             return &nested2;
         };
         O2Name* n = inner();
