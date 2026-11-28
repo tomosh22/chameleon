@@ -1550,6 +1550,12 @@ error (this supersedes the round-1 ruling that kept the warning when a scope cou
 Names are read with the spelling of the compiler that wrote them: the patch object's own S_COMPILE3; clang counts `$TSS<n>` from
 19.1.0 (clang 19.0.x is unknown); with an unknown compiler a guard is tied only when both readings tie the same statics.
 
+**Ruling (WP-52, silent resets):** WP-52's cl fixture showed a nested lambda's static and its guard both decided new with no
+diagnostic, so a reload reset live state (pre-existing; R-66 is the clang form). A function-local static of the patch decided new
+while the old compiland holds a data record of the same base name in a procedure of the same outermost function (the function, its
+lambdas' call operators, procedures they were inlined into; counted as the same when it cannot be told) is refused with CML3207.
+A static whose name has no record in that function stays new. Binding such statics instead of refusing them is R-68.
+
 WP-52..WP-55 start together (four at once). WP-52 and WP-53 share `broker/cml_core/src/bind_plan.cpp`, and WP-54 and WP-55
 share `reload_service.cpp`: whoever merges second merges main and re-runs CI. Rules as in ADR-0043: one PR per WP, CI on the
 Windows matrix is the only acceptance, the orchestrator reads the logs; "refuse what cannot be proven" stands.
