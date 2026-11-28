@@ -163,8 +163,6 @@ TEST_CASE("local_scope_key: clang 18 spells a guard's scope with back-references
     CHECK(g->block == "?1?");
     CHECK(g->rest == s->rest);
     CHECK(s->rest == "??R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?<auto>@@XZ@4");
-    CHECK(s->outermost == "?g@@YAXXZ");
-    CHECK(g->outermost == "?g@@YAXXZ");
     // In cl's spelling (the guard's own name counted) the guard's `3` is `g`: another scope.
     CHECK(rest_of(guard, true) != s->rest);
     // The bitmask of -fno-threadsafe-statics, the same scope.
@@ -193,7 +191,7 @@ TEST_CASE("local_scope_key: cl counts the guard's own name (Jolt's GetRTTIOfType
     // Block 11 and later in letters; a class back-reference in the operator's return type.
     const std::optional<LocalScopeKey> k = local_scope_key("?sname@?1???R<lambda_1>@?L@??_flush_scene_change@SceneTree@@AEAAXXZ@QEBAAEBVStringName@@XZ@4V4@A", false);
     REQUIRE(k.has_value());
-    CHECK(k->outermost == "?_flush_scene_change@SceneTree@@AEAAXXZ");
+    CHECK(k->rest == "??R<lambda_1>@?L@??_flush_scene_change@SceneTree@@AEAAXXZ@QEBAAEBVStringName@@XZ@4");
     CHECK(rest_of("?$TSS0@?1???R<lambda_1>@?L@??_flush_scene_change@SceneTree@@AEAAXXZ@QEBAAEBVStringName@@XZ@4HA", true) == k->rest);
     CHECK(rest_of("?$TSS0@?1???R<lambda_1>@?L@??_flush_scene_change@SceneTree@@AEAAXXZ@QEBAAEBVStringName@@XZ@4HA", false) == k->rest);
 }
@@ -215,27 +213,9 @@ TEST_CASE("local_scope_key: no key for names that are not function-local or cann
     CHECK(rest_of("?$S1@?1??cml_get_current_module_path@@9@4IA", true) == "?cml_get_current_module_path@@9@4");
 }
 
-TEST_CASE("local_scope_key (review): the outermost function is taken along the qualified name, never from a type") {
-    // clang 18: `template <class F> int run(F f) { static Registry r; ... }` with a lambda of main (`?main@@9`). main's
-    // function scope is in run's template argument and parameter, not in r's qualified name: the function is run<...>.
+TEST_CASE("local_scope_key (review): a lambda of another function in a template argument and a parameter is read") {
+    // clang 18: `template <class F> int run(F f) { static Registry r; ... }` with a lambda of main (`?main@@9`).
     const char* r = "?r@?1???$run@V<lambda_0>@?0??main@@9@@@YAHV<lambda_0>@?0??main@@9@@Z@4URegistry@@A";
-    const std::optional<LocalScopeKey> k = local_scope_key(r, false);
-    REQUIRE(k.has_value());
-    CHECK(k->outermost == "??$run@V<lambda_0>@?0??main@@9@@@YAHV<lambda_0>@?0??main@@9@@Z");
-    CHECK(rest_of("?$TSS0@?1???$run@V<lambda_0>@?0??main@@9@@@YAHV<lambda_0>@?0??main@@9@@Z@4HA") == k->rest);
-    const std::optional<LocalScopeKey> nested = local_scope_key("?gx@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?4@XZ@4UObj@@A", false);
-    REQUIRE(nested.has_value());
-    CHECK(nested->outermost == "?g@@YAXXZ");
-}
-
-TEST_CASE("outermost_function_as_written: the outermost function of a scope as written, for names without a key") {
-    CHECK(outermost_function_as_written("?q@?1??pm@@YAHP8K@@EAAXXZ@Z@4URegistry@@A") == "?pm@@");
-    CHECK(outermost_function_as_written("?$TSS0@?1??pm@@YAHP8K@@EAAXXZ@Z@4HA") == "?pm@@");
-    CHECK(outermost_function_as_written("?gx@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?4@XZ@4UObj@@A") == "?g@@");
-    CHECK(outermost_function_as_written("?$TSS0@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?7@XZ@4HA") == "?g@@");
-    CHECK(outermost_function_as_written("?sname@?1???R<lambda_1>@?L@??_flush_scene_change@SceneTree@@AEAAXXZ@QEBAAEBVStringName@@XZ@4V4@A") ==
-          "?_flush_scene_change@SceneTree@@");
-    CHECK(outermost_function_as_written("?rtti@?1??GetRTTIOfType@JPH@@YAPEAVRTTI@2@PEAVSphereShape@2@@Z@4V32@A") == "?GetRTTIOfType@JPH@@");
-    CHECK(outermost_function_as_written("?s_a@?A0x1@@3HA").empty());  // not function-local
-    CHECK(outermost_function_as_written("?x@?1??f").empty());          // cut short
+    REQUIRE(local_scope_key(r, false).has_value());
+    CHECK(rest_of("?$TSS0@?1???$run@V<lambda_0>@?0??main@@9@@@YAHV<lambda_0>@?0??main@@9@@Z@4HA") == rest_of(r));
 }

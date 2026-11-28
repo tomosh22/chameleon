@@ -81,26 +81,18 @@ bool is_guard_variable(std::string_view decorated);       // ?$TSS<n>@..., ?$S<n
 // of that name in a table the reader fills as it goes (the static's own name first, then every simple name, class
 // template and anonymous namespace of the scope, in order, at most ten). A guard and its static spell the same scope
 // with other digits when one of them has a name in front of the scope that the table counts and the other does not:
-// clang does not count the guard's own name (`$TSS0`, `$S1`), while it counts the static's, so the scope
+// clang 18 does not count the guard's own name (`$TSS0`, `$S1`), while it counts the static's, so the scope
 // `<lambda_1>::operator()` of `g::<lambda_0>::operator()` is `...QEBA?A?3@XZ` in the guard and `...QEBA?A?4@XZ` in the
-// static (both meaning `<auto>`, clang 18); cl counts the guard's name as well (Jolt's
+// static (both meaning `<auto>`); clang 19.1 and later count `$TSS0` (never `$S1`), and cl counts it as well (Jolt's
 // `?$TSS0@?1??GetRTTIOfType@JPH@@YAPEAVRTTI@2@...`, where `2` is `JPH`). `guard_name_counted` picks the spelling for a
 // guard (it is ignored for any other name). Type back-references (digits in a parameter list) are kept as written: the
 // parameter lists in front of them are the same in both names.
 struct LocalScopeKey {
     std::string block;      // the number of the block the entity is declared in, as written ("?1?"), from the first scope
     std::string rest;       // the rest of the scope with every name written out, then '@' and the storage class ('4')
-    std::string outermost;  // the outermost function of the scope, names written out ("?g@@YAXXZ")
 };
 // Empty when the name is not function-local, or when any part of the scope cannot be read (never a guess).
 std::optional<LocalScopeKey> local_scope_key(std::string_view decorated, bool guard_name_counted);
-
-// WP-52 (review): the outermost function of a function-local static or guard AS WRITTEN, for names local_scope_key cannot
-// read: the text of that function's decorated name up to the end of its qualified name ("?g@@" for the nested lambdas of
-// g, "?pm@@" for "?q@?1??pm@@YAHP8K@@EAAXXZ@Z@4URegistry@@A"). Its back-references are not resolved, and a template's
-// arguments can cut it short, so it is only the fallback of the ADR-0045 ruling (WP-52 review, finding 2): one function
-// can be written two ways, and two can read alike. Empty when it cannot be found.
-std::string outermost_function_as_written(std::string_view decorated);
 
 // For "??__Eg_tracker@?A0x1@@YAXXZ": the text the global's mangled name (without the leading '?')
 // starts with ("g_tracker@?A0x1@@"). Empty when `decorated` is not a cl dynamic initialiser.

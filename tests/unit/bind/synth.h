@@ -115,6 +115,43 @@ public:
         return sec;
     }
 
+    // WP-52: a `.debug$S` section with the object's S_COMPILE3 (CodeView C13 signature, one DEBUG_S_SYMBOLS subsection),
+    // whose version string names the compiler ("clang version 18.1.3", "Microsoft (R) Optimizing Compiler").
+    std::uint32_t compile3(const std::string& version) {
+        std::vector<std::uint8_t> rec;
+        const auto put16 = [&rec](std::uint32_t v) {
+            rec.push_back(static_cast<std::uint8_t>(v & 0xFF));
+            rec.push_back(static_cast<std::uint8_t>((v >> 8) & 0xFF));
+        };
+        put16(0);  // length, patched below
+        put16(0x113C);
+        put16(1);  // flags: C++
+        put16(0);
+        put16(0xD0);  // machine: x64
+        for (int k = 0; k < 8; ++k) {
+            put16(0);  // front end and back end versions
+        }
+        rec.insert(rec.end(), version.begin(), version.end());
+        rec.push_back(0);
+        while (rec.size() % 4 != 0) {
+            rec.push_back(0);
+        }
+        rec[0] = static_cast<std::uint8_t>((rec.size() - 2) & 0xFF);
+        rec[1] = static_cast<std::uint8_t>(((rec.size() - 2) >> 8) & 0xFF);
+        std::vector<std::uint8_t> sec = {4, 0, 0, 0, 0xF1, 0, 0, 0};
+        const std::uint32_t len = static_cast<std::uint32_t>(rec.size());
+        for (int k = 0; k < 4; ++k) {
+            sec.push_back(static_cast<std::uint8_t>((len >> (8 * k)) & 0xFF));
+        }
+        sec.insert(sec.end(), rec.begin(), rec.end());
+        const std::uint32_t idx = section(".debug$S", 0x42100040u, static_cast<std::uint32_t>(sec.size()));
+        coff::ModelSection& s = m_.sections[idx - 1];
+        for (std::size_t k = 0; k < sec.size(); ++k) {
+            s.data[k] = static_cast<std::byte>(sec[k]);
+        }
+        return idx;
+    }
+
     coff::ObjectModel& model() { return m_; }
 
     Built build() {

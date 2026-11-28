@@ -38,7 +38,7 @@ inline constexpr std::uint32_t kImgrelOutOfRange = 3550;  // image-relative disp
 
 // Warnings (the plan is still produced).
 inline constexpr std::uint32_t kSharedInitialiser = 3210;  // TU-wide initialiser may re-run initialisers of bound globals
-inline constexpr std::uint32_t kGuardUnmatched = 3211;     // guard of a function-local static tied to no static: a warning, or (WP-52) an error when a bound static may be its own
+inline constexpr std::uint32_t kGuardUnmatched = 3211;     // a guard tied to no static (warning), or (WP-52) a bound function-local static without a bound guard (error)
 inline constexpr std::uint32_t kSectionRelative = 3212;    // reference through a section symbol into bound data
 // 3213 is retired (ambiguous static functions are the error 3214).
 
