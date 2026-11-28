@@ -1046,9 +1046,10 @@ TEST_CASE("WP-52 ruling: a static whose name no procedure of its function record
 
 // ---- WP-56 (R-68, ADR-0046): cl's nested lambda, its closure compared with the back-references resolved ------------------
 //
-// cl /O2 for planner_pairing_o2/nested.cpp (link without /OPT:REF, as the fixtures): both call operators keep their
-// procedures, and the inner lambda's `nested` and its `$TSS0` are records of the inner call operator, and again (inlined, at
-// the same addresses) of the outer one and of o2_nest_step. The static's decorated name spells the outer closure as a
+// cl /O2 for planner_pairing_o2/nested.cpp (link without /OPT:REF, as the fixtures; the module PDB of CI run 46115540265,
+// windows-2025 msvc RelWithDebInfo, llvm-pdbutil): both call operators keep their procedures, and the inner lambda's
+// `nested` and its `$TSS0` are records of the inner call operator, and again (inside the inline sites, at the same addresses)
+// of the outer one and of o2_nest_step. The names, the procedures' display names and the unique names below are that PDB's. The static's decorated name spells the outer closure as a
 // back-reference to its table, whose slot 0 is the static's own name (`??R1?1??`: `<lambda_1>`), the inner closure's unique
 // name to its own table (`??R0?1??`). WP-37/40 compared the two as written: no closure matched, `nested` and its guard were
 // new (CI 857fa31: the reload reset `nest`), then WP-52 refused that (CML3207).
@@ -1058,7 +1059,7 @@ namespace {
 const char* const kClOuterUnique = ".?AV<lambda_1>@?1??o2_nest_step@@YAXXZ@";
 const char* const kClInnerUnique = ".?AV<lambda_1>@?1???R0?1??o2_nest_step@@YAXXZ@QEBA@XZ@";
 const char* const kClOuterProc = "`o2_nest_step'::`2'::<lambda_1>::operator()";
-const char* const kClInnerProc = "`o2_nest_step'::`2'::<lambda_1>::operator()::`2'::<lambda_1>::operator()";
+const char* const kClInnerProc = "``o2_nest_step'::`2'::<lambda_1>::operator()'::`2'::<lambda_1>::operator()";
 
 // A call operator procedure `name` at `text_offset` of the closure (`cls`, `unique`) with the static records `statics`.
 void typed_operator(SynthWorld& w, OldTypes& t, const std::string& name, std::uint32_t text_offset, const std::string& cls, const std::string& unique,
@@ -1081,7 +1082,7 @@ GuardCase plan_cl_nested(const ClNested& shape, const std::vector<std::pair<std:
     w.data(w.tu(), "`anonymous namespace'::s_a", 0x10);
     OldTypes t;
     const std::vector<std::pair<std::string, std::uint32_t>> records = {{"nested", 0x20}, {"$TSS0", 0x28}};
-    typed_operator(w, t, kClInnerProc, 0x60, "`o2_nest_step'::`2'::<lambda_1>::operator()::`2'::<lambda_1>", shape.inner_unique, records);
+    typed_operator(w, t, kClInnerProc, 0x60, "``o2_nest_step'::`2'::<lambda_1>::operator()'::`2'::<lambda_1>", shape.inner_unique, records);
     typed_operator(w, t, kClOuterProc, 0x90, "`o2_nest_step'::`2'::<lambda_1>", kClOuterUnique, shape.outer_copy ? records : std::vector<std::pair<std::string, std::uint32_t>>{});
     if (shape.caller_copy) {
         proc_inlining(w, "o2_nest_step", 0xC0, t.fn_void, records, {});
@@ -1156,9 +1157,9 @@ TEST_CASE("WP-56 (R-68): two lambdas of one function tied only by the resolved n
     SynthWorld w = basic_world(false, kCl);
     w.data(w.tu(), "`anonymous namespace'::s_a", 0x10);
     OldTypes t;
-    typed_operator(w, t, kClInnerProc, 0x60, "`o2_nest_step'::`2'::<lambda_1>::operator()::`2'::<lambda_1>", kClInnerUnique, {{"nested", 0x20}});
-    typed_operator(w, t, "`o2_nest_step'::`2'::<lambda_1>::operator()::`2'::<lambda_2>::operator()", 0x90,
-                   "`o2_nest_step'::`2'::<lambda_1>::operator()::`2'::<lambda_2>", ".?AV<lambda_2>@?1???R<lambda_1>@?1??o2_nest_step@@YAXXZ@QEBA@XZ@", {{"nested", 0x30}});
+    typed_operator(w, t, kClInnerProc, 0x60, "``o2_nest_step'::`2'::<lambda_1>::operator()'::`2'::<lambda_1>", kClInnerUnique, {{"nested", 0x20}});
+    typed_operator(w, t, "``o2_nest_step'::`2'::<lambda_1>::operator()'::`2'::<lambda_2>::operator()", 0x90,
+                   "``o2_nest_step'::`2'::<lambda_1>::operator()'::`2'::<lambda_2>", ".?AV<lambda_2>@?1???R<lambda_1>@?1??o2_nest_step@@YAXXZ@QEBA@XZ@", {{"nested", 0x30}});
     open_with(w, t);
     SynthObj o;
     const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
