@@ -565,8 +565,30 @@ private:
         bool known = false;  // false: the types cannot be read (`why`)
         std::string tail;    // empty when known: the enclosing function is not a member function of a uniquely named class
         std::string why;
+        // WP-56 (R-68): `tail` with its name back-references written out (resolved_qualified_name), without the unit's
+        // discriminator; nullopt when it cannot be read.
+        std::optional<std::string> key;
     };
     ClosureId closure_of(const pdb::SymbolView& local);
+    // WP-56 (R-68, ADR-0046): a closure's unique name and the decorated name of one of its statics spell the names of the
+    // closure's scope with other back-reference digits (the static's table starts with its own name, the type's is its own:
+    // cl's `??R1?1??` against `??R0?1??` for the outer closure of a nested lambda). The closure comparisons of WP-37/40 and
+    // WP-51/53 therefore compare the scopes with the back-references resolved on both sides. `resolved_closure_scope`: a
+    // lambda's static (or guard) scope after "??R" with its names written out (local_scope_key's rest; a guard in the patch
+    // compiler's spelling, or where that is not known in both spellings when they agree), without the unit's
+    // discriminator; nullopt when it cannot be read. `closure_begins`: both sides resolved, compared resolved; otherwise
+    // as written (the comparison before WP-56).
+    const std::optional<std::string>& resolved_closure_scope(std::uint32_t pos);
+    std::map<std::uint32_t, std::optional<std::string>> resolved_scopes_;
+    static bool closure_begins(std::string_view written_scope, const std::optional<std::string>& resolved_scope, std::string_view tail,
+                               const std::optional<std::string>& tail_key);
+    // WP-56: the display name of a function-local static of the patch with the back-references of its scope written out
+    // (cl's `?nested@?1???R<lambda_1>@?1???R1?1??f@@...` reads `f::<lambda_1>::operator()::<lambda_1>::operator()::nested`,
+    // display_name reads `1?1??f::operator()::...`); its plain display name when the scope cannot be read.
+    std::string local_display(std::uint32_t pos);
+    // The key of a static (scope_keys [0]) or of a guard in the patch compiler's spelling; where that spelling is not known,
+    // both readings when they agree, else none.
+    const std::optional<LocalScopeKey>& spelled_key(std::uint32_t pos);
     struct Match {
         const pdb::SymbolView* view = nullptr;
         BindSource how = BindSource::None;
@@ -711,7 +733,8 @@ private:
                                                           const std::string& display = {}, int tls_mode = 0, const std::string& decorated = {});
     // WP-40: a record of `base` directly in the procedure of the function that encloses the lambda of a static's display
     // name ("f::<lambda_1>::operator()::sname" -> a record "sname" of procedure "f"): clang-cl records the static of an
-    // inlined call operator there. Empty `enclosing`: the static is not in a lambda.
+    // inlined call operator there. Empty `enclosing`: the static is not in a lambda. WP-56 (R-66): is_inlined_record also
+    // takes a record of every function further up the chain (the outer lambdas' call operators, the function itself).
     std::string lambda_enclosing(const std::string& display, const std::string& base) const;
     bool is_inlined_record(const pdb::SymbolView* v, const std::string& enclosing);
     // WP-51 (R-54, ADR-0044): what an old procedure inlined, read once per plan from its inline sites. `risk` names an
@@ -743,6 +766,9 @@ private:
     // WP-51 (review): the closure a lambda's static belongs to, as the decorated scope spells it after "??R" (without the
     // unit's discriminator), with rule (d)'s closure pairing applied.
     std::string own_closure_scope(const Sym& sy) const;
+    // WP-56: the same, resolved (resolved_closure_scope); nullopt where rule (d)'s pairing renames the closure (compared as
+    // written then) or the scope cannot be read.
+    std::optional<std::string> own_closure_key(const Sym& sy);
     std::size_t wp51_procs_ = 0;
     std::size_t wp51_sites_ = 0;
     std::size_t wp51_closures_ = 0;
@@ -1252,7 +1278,21 @@ bool Planner::is_inlined_record(const pdb::SymbolView* v, const std::string& enc
     if (enclosing.empty() || v->parent_proc == pdb::kNoSymbol || v->parent_proc >= comp_syms_.size()) {
         return false;
     }
-    return comp_norm(&comp_syms_[v->parent_proc]).canonical == enclosing;
+    // WP-56 (R-66, ADR-0046): the chain of enclosing procedures. A nested lambda inlined all the way has its static recorded
+    // in the procedure that inlined the outermost lambda ("o2_nest_step::<lambda>::operator()::<lambda>::operator()::nested"
+    // in "o2_nest_step"), so every function of the chain counts: the outer call operators, then the function itself.
+    const std::string& proc = comp_norm(&comp_syms_[v->parent_proc]).canonical;
+    const std::string_view op = "::<lambda>::operator()";
+    std::string_view level = enclosing;
+    while (true) {
+        if (proc == level) {
+            return true;
+        }
+        if (level.size() <= op.size() || level.substr(level.size() - op.size()) != op) {
+            return false;
+        }
+        level.remove_suffix(op.size());
+    }
 }
 
 namespace {
@@ -1466,6 +1506,73 @@ std::string Planner::own_closure_scope(const Sym& sy) const {
     return scope;
 }
 
+std::optional<std::string> Planner::own_closure_key(const Sym& sy) {
+    const std::string written = pdb::without_tu_discriminator(call_operator_scope(sy.name));
+    for (const auto& [from, to] : closure_pairing_) {
+        if (from != to && written.size() > from.size() && written.compare(0, from.size(), from) == 0) {
+            return std::nullopt;  // renamed by rule (d): compared as written (own_closure_scope)
+        }
+    }
+    return resolved_closure_scope(static_cast<std::uint32_t>(&sy - syms_.data()));
+}
+
+const std::optional<std::string>& Planner::resolved_closure_scope(std::uint32_t pos) {
+    const auto it = resolved_scopes_.find(pos);
+    if (it != resolved_scopes_.end()) {
+        return it->second;
+    }
+    const Sym& sy = syms_[pos];
+    std::optional<std::string> out;
+    if (!call_operator_scope(sy.name).empty()) {
+        const std::optional<LocalScopeKey>& key = spelled_key(pos);
+        if (key && starts_with(key->rest, "??R")) {
+            out = pdb::without_tu_discriminator(std::string_view(key->rest).substr(3));
+        }
+    }
+    return resolved_scopes_.emplace(pos, std::move(out)).first->second;
+}
+
+const std::optional<LocalScopeKey>& Planner::spelled_key(std::uint32_t pos) {
+    const Sym& sy = syms_[pos];
+    const ScopeKeys& keys = scope_keys(pos);
+    if (!is_guard_variable(sy.name)) {
+        return keys[0];
+    }
+    // A guard in the spelling of the compiler that wrote the patch object (WP-52); not known: both readings must agree.
+    static const std::optional<LocalScopeKey> none;
+    switch (guard_spelling(sy.name.compare(0, 3, "?$S") == 0)) {
+        case GuardSpelling::Counted: return keys[1];
+        case GuardSpelling::NotCounted: return keys[0];
+        case GuardSpelling::Unknown: break;
+    }
+    return keys[0] && keys[1] && keys[0]->block == keys[1]->block && keys[0]->rest == keys[1]->rest ? keys[0] : none;
+}
+
+bool Planner::closure_begins(std::string_view written_scope, const std::optional<std::string>& resolved_scope, std::string_view tail,
+                             const std::optional<std::string>& tail_key) {
+    if (resolved_scope && tail_key) {
+        return !tail_key->empty() && starts_with(*resolved_scope, *tail_key);
+    }
+    return !tail.empty() && starts_with(written_scope, tail);
+}
+
+std::string Planner::local_display(std::uint32_t pos) {
+    const Sym& sy = syms_[pos];
+    const std::string base = base_identifier(sy.name);
+    const std::optional<LocalScopeKey>& key = spelled_key(pos);
+    if (base.empty() || !key) {
+        return sy.dec.display;
+    }
+    // A scope without name back-references is the key as written: the display stays what display_name made of it.
+    const std::string written = "?" + base + "@" + key->block + key->rest;
+    if (starts_with(sy.name, written)) {
+        return sy.dec.display;
+    }
+    // (Only the names of the scope are read from the key; a guard's own name does not matter to its display.)
+    const std::string display = display_name(written);
+    return display.empty() || display[0] == '?' ? sy.dec.display : display;
+}
+
 const pdb::SymbolView* Planner::own_closure_twin(const Sym& sy, const pdb::SymbolView& record) {
     if (!op_records_indexed_) {
         op_records_indexed_ = true;
@@ -1482,6 +1589,7 @@ const pdb::SymbolView* Planner::own_closure_twin(const Sym& sy, const pdb::Symbo
         return nullptr;
     }
     const std::string scope = own_closure_scope(sy);
+    const std::optional<std::string> key = own_closure_key(sy);
     for (const std::uint32_t i : at->second) {
         const pdb::SymbolView& v = comp_syms_[i];
         if (&v == &record || v.parent_proc == record.parent_proc) {
@@ -1490,8 +1598,9 @@ const pdb::SymbolView* Planner::own_closure_twin(const Sym& sy, const pdb::Symbo
         // The call operator's closure, by its type (the unique name without ".?AV" and the unit's discriminator), must begin
         // the static's decorated scope: display names do not tell lambdas apart (clang names them `f::<lambda_0>` alike),
         // and a record of another closure's call operator is that closure's (o's static, inlined into k), not a twin.
+        // (WP-56: with the back-references resolved on both sides.)
         const ClosureId id = closure_of(v);
-        if (id.known && !id.tail.empty() && !scope.empty() && starts_with(scope, id.tail)) {
+        if (id.known && !scope.empty() && closure_begins(scope, key, id.tail, id.key)) {
             return &v;
         }
         CML_LOG(Trace, "WP53-NOT-TWIN static='%s' record rva=%s in '%s': closure %s is not the static's own (%s)", sy.dec.display.c_str(), hex(v.rva).c_str(),
@@ -1521,13 +1630,16 @@ bool Planner::refuse_inlined_owner(Sym& sy, const pdb::SymbolView& record, const
         // (Second review: skipped only when that is proven, i.e. the record's procedure is another closure's call operator AND
         // it inlined the code of the static's own closure. A lambda renumbered without rule (d), or a scope the compiler spells
         // with other back-references than the closure's unique name, is checked like the static's own.)
+        // (WP-56: the closures are compared with their back-references resolved on both sides.)
         const std::string scope = own_closure_scope(sy);
+        const std::optional<std::string> key = own_closure_key(sy);
         const ClosureId id = closure_of(record);
-        if (id.known && !id.tail.empty() && !scope.empty() && !starts_with(scope, id.tail)) {
+        if (id.known && !id.tail.empty() && !scope.empty() && !closure_begins(scope, key, id.tail, id.key)) {
             const InlineVerdict& host = inline_verdict(record.parent_proc);
             const std::string* inlined_own = nullptr;
             for (const std::string& tail : host.closure_tails) {
-                if (starts_with(scope, tail)) {
+                const std::optional<std::string> tail_key = resolved_qualified_name(tail);
+                if (closure_begins(scope, key, tail, tail_key ? std::optional<std::string>(pdb::without_tu_discriminator(*tail_key)) : std::nullopt)) {
                     inlined_own = &tail;
                     break;
                 }
@@ -2090,6 +2202,10 @@ Planner::ClosureId Planner::closure_of(const pdb::SymbolView& local) {
     const std::string u = pdb::without_tu_discriminator(sig.class_unique_name);
     if (sig.member && u.size() > 4 && u[0] == '.' && u[1] == '?' && u[2] == 'A') {
         id.tail = u.substr(4);
+        // WP-56 (R-68): resolved on the unique name as written (the discriminator is dropped afterwards, as on the static's side).
+        if (const std::optional<std::string> k = resolved_qualified_name(std::string_view(sig.class_unique_name).substr(4))) {
+            id.key = pdb::without_tu_discriminator(*k);
+        }
     }
     return id;
 }
@@ -2893,6 +3009,7 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
     std::vector<std::string_view> scope(unmatched.size());
     std::vector<std::string> own_scope(unmatched.size());   // WP-40: the scope as the patch spells it (before an override)
     std::vector<bool> overridden(unmatched.size(), false);  // WP-40: paired with another closure than its number names
+    std::vector<std::optional<std::string>> scope_key(unmatched.size());  // WP-56: resolved (nullopt: compared as written)
     for (std::size_t m = 0; m < unmatched.size(); ++m) {
         scope_text[m] = pdb::without_tu_discriminator(call_operator_scope(syms_[unmatched[m]].name));
         own_scope[m] = scope_text[m];
@@ -2908,6 +3025,11 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
             }
         }
         scope[m] = scope_text[m];
+        // WP-56 (R-68): the scope with its back-references resolved, compared with the closures' resolved unique names
+        // (closure_begins); a closure renamed by rule (d) is compared as written.
+        if (!overridden[m]) {
+            scope_key[m] = resolved_closure_scope(unmatched[m]);
+        }
         if (!scope[m].empty() && !after_first_component(scope[m]).empty()) {
             scoped.push_back(m);
         }
@@ -2937,7 +3059,9 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
     // not know, and nothing is decided ("no closure matches, so the statics are new" would restart them silently). The
     // other direction is harmless: a closure whose unique name IS the decorated scope of a member identifies its record
     // exactly, however the linker spelled the procedure's display name.
-    std::string members_function = canonical_lambda_names(syms_[unmatched[scoped.front()]].dec.display);
+    // (WP-56: the display with the scope's back-references written out; cl's nested lambdas are unreadable otherwise.)
+    const std::string members_display = local_display(unmatched[scoped.front()]);
+    std::string members_function = canonical_lambda_names(members_display);
     const std::string suffix = "::" + base;
     if (members_function.size() > suffix.size() && members_function.compare(members_function.size() - suffix.size(), suffix.size(), suffix) == 0) {
         members_function.resize(members_function.size() - suffix.size());
@@ -2950,7 +3074,8 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
         const std::uint32_t parent = free_cands[c]->parent_proc;
         by_name[c] = parent != pdb::kNoSymbol && parent < comp_syms_.size() && comp_norm(&comp_syms_[parent]).canonical == members_function;
         old_by_name += by_name[c] ? 1u : 0u;
-        by_closure_name[c] = !ids[c].tail.empty() && canonical_lambda_names(display_name("??R" + ids[c].tail)) == members_function;
+        // (WP-56: read with its back-references resolved where it can be: display_name does not resolve them.)
+        by_closure_name[c] = !ids[c].tail.empty() && canonical_lambda_names(display_name("??R" + (ids[c].key ? *ids[c].key : ids[c].tail))) == members_function;
         old_by_closure_name += by_closure_name[c] ? 1u : 0u;
     }
     // Old records in a closure of the same enclosing function as a member (the decorated function: name, class and
@@ -2959,18 +3084,31 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
     std::vector<std::vector<std::size_t>> hits(unmatched.size());
     std::vector<std::size_t> cand_hits(free_cands.size(), 0);
     std::size_t old_in_function = 0;
+    // WP-56: which members were tied to their record only by the resolved comparison (as written they differ).
+    std::vector<bool> by_resolved(unmatched.size(), false);
     for (std::size_t c = 0; c < free_cands.size(); ++c) {
         if (ids[c].tail.empty()) {
             continue;
         }
         const std::string_view function_part = after_first_component(ids[c].tail);
         for (const std::size_t m : scoped) {
-            if (!function_part.empty() && starts_with(after_first_component(scope[m]), function_part)) {
+            const bool resolved = scope_key[m] && ids[c].key;
+            if (resolved) {
+                const std::string_view key_function = after_first_component(*ids[c].key);
+                if (!key_function.empty() && starts_with(after_first_component(*scope_key[m]), key_function)) {
+                    in_function[c] = true;
+                }
+            } else if (!function_part.empty() && starts_with(after_first_component(scope[m]), function_part)) {
                 in_function[c] = true;
             }
-            if (starts_with(scope[m], ids[c].tail)) {
+            if (closure_begins(scope[m], scope_key[m], ids[c].tail, ids[c].key)) {
                 hits[m].push_back(c);
                 ++cand_hits[c];
+                by_resolved[m] = by_resolved[m] || !starts_with(scope[m], ids[c].tail);
+                if (resolved) {
+                    CML_LOG(Trace, "WP56-CLOSURE static=%s closure=%s resolved=%s as-written=%s", syms_[unmatched[m]].name.c_str(), ids[c].tail.c_str(), ids[c].key->c_str(),
+                            starts_with(scope[m], ids[c].tail) ? "same" : "differs");
+                }
             }
         }
         old_in_function += in_function[c] ? 1u : 0u;
@@ -2987,7 +3125,7 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
     // (their RVA) and to their place in the function, which pair them or refuse. Only when the function has as many
     // records of the name in its lambdas (in their own procedures and inlined) as the patch has statics, though: a lambda
     // added or removed shifts the layout of the rest, and then nothing is placed by layout either.
-    const std::string enclosing = lambda_enclosing(syms_[unmatched[scoped.front()]].dec.display, base);
+    const std::string enclosing = lambda_enclosing(members_display, base);
     std::size_t old_inlined = 0;
     std::size_t old_of_function = 0;
     for (std::size_t c = 0; c < free_cands.size(); ++c) {
@@ -3016,11 +3154,22 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
     // ADR-0043 ruling; until then a record in the function was taken for the own static's whenever every lambda static of
     // the patch had a record in a call operator, so a new own static could take a removed inlined lambda's live record).
     // They are still counted here, so that the lambdas' statics are left to the layout only if the counts agree.
+    // WP-56 (R-66): records of every function of the enclosing chain are taken (is_inlined_record), so the own statics of
+    // each of them (an outer lambda's, the function's) are counted too.
     std::size_t own_in_patch = 0;
     if (old_inlined != 0 && !enclosing.empty()) {
-        const std::string own = enclosing + "::" + base;
-        for (const Sym& s : syms_) {
-            own_in_patch += s.defined && s.is_static && s.dec.type == SymbolType::Data && canonical_lambda_names(s.dec.display) == own ? 1u : 0u;
+        std::set<std::string> own;
+        const std::string op = "::<lambda>::operator()";
+        for (std::string level = enclosing;;) {
+            own.insert(level + "::" + base);
+            if (level.size() <= op.size() || level.compare(level.size() - op.size(), op.size(), op) != 0) {
+                break;
+            }
+            level.resize(level.size() - op.size());
+        }
+        for (std::uint32_t pos = 0; pos < syms_.size(); ++pos) {
+            const Sym& s = syms_[pos];
+            own_in_patch += s.defined && s.is_static && s.dec.type == SymbolType::Data && own.count(canonical_lambda_names(local_display(pos))) != 0 ? 1u : 0u;
         }
     }
     if (old_inlined != 0) {
@@ -3095,10 +3244,19 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
         std::string changed_lambda;
         if (same_set) {
             std::vector<std::pair<std::uint32_t, std::string>> call_operators;  // new "??R<lambda_N>..." functions, without the unit's hash
+            std::vector<std::optional<std::string>> call_operator_keys;          // WP-56: the same, resolved (after "??R")
+            const Sym* unreadable_operator = nullptr;                             // WP-56: the first one that cannot be resolved
             for (std::uint32_t pos = 0; pos < syms_.size(); ++pos) {
                 const Sym& f = syms_[pos];
                 if (f.defined && f.dec.type == SymbolType::Function && starts_with(f.name, "??R<lambda_")) {
                     call_operators.emplace_back(pos, pdb::without_tu_discriminator(std::string_view(f.name).substr(3)));
+                    // (resolved_decorated_name writes out the name back-references of the whole name, those in its return and
+                    // parameter types too: `PEAV43@` of a `JPH::Baz *` reads `PEAVBaz@JPH@@` as in the static's scope.)
+                    const std::optional<std::string> k = resolved_decorated_name(f.name);
+                    call_operator_keys.push_back(k ? std::optional<std::string>(pdb::without_tu_discriminator(std::string_view(*k).substr(3))) : std::nullopt);
+                    if (!k && unreadable_operator == nullptr) {
+                        unreadable_operator = &f;
+                    }
                 }
             }
             for (const std::size_t m : scoped) {
@@ -3108,12 +3266,24 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
                 const pdb::SymbolView* c = free_cands[hits[m][0]];
                 const Sym* op = nullptr;
                 const std::string_view mine = own_scope[m];
-                for (const std::pair<std::uint32_t, std::string>& entry : call_operators) {
-                    const std::string& text = entry.second;
-                    if (mine.size() > text.size() && mine.compare(0, text.size(), text) == 0 && mine[text.size()] == '@') {
-                        op = &syms_[entry.first];
+                for (std::size_t k = 0; k < call_operators.size(); ++k) {
+                    // (WP-56: resolved on both sides where both can be read; the static's table starts with its own name, the
+                    // call operator's does not.)
+                    const bool resolved = scope_key[m] && call_operator_keys[k];
+                    const std::string_view text = resolved ? std::string_view(*call_operator_keys[k]) : std::string_view(call_operators[k].second);
+                    const std::string_view own = resolved ? std::string_view(*scope_key[m]) : mine;
+                    if (own.size() > text.size() && own.compare(0, text.size(), text) == 0 && own[text.size()] == '@') {
+                        op = &syms_[call_operators[k].first];
                         break;
                     }
+                }
+                if (op == nullptr && by_resolved[m] && unreadable_operator != nullptr) {
+                    // (WP-56 review, finding 3: a pairing the resolved names made is not left without step 1 because a call operator
+                    // of the patch could not be read; it may be this lambda's.)
+                    changed_lambda = "the call operator '" + unreadable_operator->name + "' of the patch cannot be read with its back-references written out, so the "
+                                     "signature of the call operator of '" + syms_[unmatched[m]].dec.display +
+                                     "' cannot be compared with the old one, and a lambda's compiler-assigned number is its only other identity";
+                    continue;
                 }
                 if (op == nullptr || c->parent_proc == pdb::kNoSymbol || c->parent_proc >= comp_syms_.size()) {
                     continue;  // no call operator of its own in the patch (inlined) or none recorded: nothing to compare
@@ -3145,8 +3315,43 @@ void Planner::pair_statics_by_closure(const std::string& base, std::vector<std::
                 no_layout.insert(unmatched[m]);
             }
         } else {
+            // WP-56: a static tied to its closure only by the resolved comparison cannot be noted for rule (d) (note_lambda and
+            // the pipeline's code comparison find closures as written). Where another static of this name is in another lambda
+            // of the same function, the numbers of their lambdas are not confirmed by code: none of them is paired (refused,
+            // or left to the place step; the layout is not used). One lambda of the function with such a static needs no
+            // confirmation, but only because the set of its lambdas is the same on both sides: this branch is reached only with
+            // same_set (a lambda added or removed, whose numbers may have shifted, is refused above, "... are not the same as in
+            // the old image ..."), and the check is repeated here so that the exemption never stands without it (review of
+            // 6dc968a, finding 2).
+            const auto function_of = [&](std::size_t m) -> std::string {
+                return hits[m].size() == 1 && ids[hits[m][0]].key ? std::string(after_first_component(*ids[hits[m][0]].key)) : std::string();
+            };
+            std::set<std::string> unconfirmed;  // functions (resolved) with a resolved-only pairing and another lambda's static
+            for (const std::size_t m : scoped) {
+                const std::string fn = by_resolved[m] ? function_of(m) : std::string();
+                for (const std::size_t o : scoped) {
+                    if (!fn.empty() && o != m && function_of(o) == fn && hits[o][0] != hits[m][0]) {
+                        unconfirmed.insert(fn);
+                    }
+                }
+            }
+            for (const std::size_t m : scoped) {
+                if (unconfirmed.count(function_of(m)) == 0 && (same_set || !by_resolved[m])) {
+                    continue;
+                }
+                CML_LOG(Trace, "WP56-CLOSURE static=%s: the lambdas of its function with a static named '%s' are tied by resolved names only: not paired by number",
+                        syms_[unmatched[m]].name.c_str(), base.c_str());
+                why[unmatched[m]] = "its function's lambdas that hold a static named '" + base +
+                                    "' are spelled with name back-references, so they cannot be confirmed by the code of their call operators, and a lambda's "
+                                    "compiler-assigned number is its only other identity";
+                no_layout.insert(unmatched[m]);
+                hits[m].clear();
+            }
             for (const std::size_t m : scoped) {
                 Sym& sy = syms_[unmatched[m]];
+                if (hits[m].empty()) {
+                    continue;  // WP-56: not paired (above)
+                }
                 if (hits[m].size() == 1 && cand_hits[hits[m][0]] == 1 && refuse_inlined_owner(sy, *free_cands[hits[m][0]], "operator()", "closure")) {
                     member_done[m] = true;  // WP-51: refused before it teaches the layout
                 } else if (hits[m].size() == 1 && cand_hits[hits[m][0]] == 1) {
@@ -3650,7 +3855,9 @@ void Planner::bridge_statics() {
         bool is_tls = false;
         std::string base;
         std::string encl;
-        std::string display;
+        std::string display;  // the members' display name, as the plan shows it
+        // WP-56: the display the planner compares, with the back-references of a local scope written out (local_display).
+        std::string shown;
         std::vector<std::uint32_t> members;  // positions in syms_
     };
     std::map<std::string, Group> groups;
@@ -3714,7 +3921,9 @@ void Planner::bridge_statics() {
         const std::string encl = c_data ? cname.encl : enclosing_function(sy.name);
         const bool is_tls = !is_func && sy.dec.section != 0 && secs_[sy.dec.section - 1].tls;
         // The spelling ("platform.0" vs "platform") is not part of a C static's identity: one group per (name, scope).
-        const std::string key = std::string(is_func ? "F|" : (is_tls ? "T|" : "D|")) + (c_data ? std::string() : canonical_lambda_names(sy.dec.display)) + "|" + base + "|" + encl;
+        // (WP-56: a function-local static's display with the back-references of its scope written out, local_display.)
+        const std::string shown = is_func || c_data ? sy.dec.display : local_display(static_cast<std::uint32_t>(pos));
+        const std::string key = std::string(is_func ? "F|" : (is_tls ? "T|" : "D|")) + (c_data ? std::string() : canonical_lambda_names(shown)) + "|" + base + "|" + encl;
         Group& g = groups[key];
         g.is_func = is_func;
         g.is_tls = is_tls;
@@ -3724,6 +3933,7 @@ void Planner::bridge_statics() {
         }
         g.encl = encl;
         g.display = (sy.dec.display == sy.name || c_data) ? std::string() : sy.dec.display;
+        g.shown = (sy.dec.display == sy.name || c_data) ? std::string() : shown;
         g.members.push_back(static_cast<std::uint32_t>(pos));
     }
     for (auto& [key, g] : groups) {
@@ -3746,7 +3956,7 @@ void Planner::bridge_statics() {
     std::set<std::string> lambda_static_functions;  // "<function display>|<name>"
     for (const auto& [key, g] : groups) {
         if (!g.is_func && g.encl == "operator()") {
-            const std::string enclosing = lambda_enclosing(g.display, g.base);
+            const std::string enclosing = lambda_enclosing(g.shown, g.base);
             if (!enclosing.empty()) {
                 lambda_static_functions.insert(enclosing + "|" + g.base);
             }
@@ -3762,10 +3972,10 @@ void Planner::bridge_statics() {
     bool old_lambda_statics_done = false;
     std::map<std::string, const pdb::SymbolView*> old_lambda_statics;  // "<function>|<name>" -> a record
     const auto own_static_lambda_risk = [&](const Group& g) -> std::string {
-        if (g.is_func || g.encl.empty() || g.encl == "operator()" || g.display.empty() || is_guard_variable("?" + g.base + "@")) {
+        if (g.is_func || g.encl.empty() || g.encl == "operator()" || g.shown.empty() || is_guard_variable("?" + g.base + "@")) {
             return {};
         }
-        const std::string canonical = canonical_lambda_names(g.display);
+        const std::string canonical = canonical_lambda_names(g.shown);
         const std::string suffix = "::" + g.base;
         if (canonical.size() <= suffix.size() || canonical.compare(canonical.size() - suffix.size(), suffix.size(), suffix) != 0) {
             return {};
@@ -3815,7 +4025,7 @@ void Planner::bridge_statics() {
     // Pass A: unambiguous name matches (also learns the section deltas).
     for (auto& [key, g] : groups) {
         std::vector<const pdb::SymbolView*> cands =
-            static_candidates(g.base, g.encl, g.is_func, g.display, g.is_tls ? 1 : 0, g.is_func && g.members.size() == 1 ? syms_[g.members.front()].name : std::string());
+            static_candidates(g.base, g.encl, g.is_func, g.shown, g.is_tls ? 1 : 0, g.is_func && g.members.size() == 1 ? syms_[g.members.front()].name : std::string());
         // WP-46 (review): a destructor's record that is its deleting destructor (`should_call_delete`, F-41.3) is no candidate
         // in pass A either, where one member and one candidate pair by the name alone.
         if (g.is_func && !g.base.empty() && g.base[0] == '~') {
@@ -3855,7 +4065,7 @@ void Planner::bridge_statics() {
         }
         // (WP-40: a record of a lambda's static found in the procedure that inlined the lambda is not identified by its
         // name; see static_candidates.)
-        const std::string enclosing = g.is_func || g.encl != "operator()" ? std::string() : lambda_enclosing(g.display, g.base);
+        const std::string enclosing = g.is_func || g.encl != "operator()" ? std::string() : lambda_enclosing(g.shown, g.base);
         if (g.members.size() == 1 && cands.size() == 1 && !is_inlined_record(cands.front(), enclosing)) {
             // WP-51 (R-54): before the pair teaches the section layout.
             if (!g.is_func && refuse_inlined_owner(syms_[g.members.front()], *cands.front(), g.encl, "pass A")) {
@@ -3882,7 +4092,7 @@ void Planner::bridge_statics() {
     for (const std::string& key : deferred) {
         Group& g = groups[key];
         Pending& p = pending[key];
-        p.cands = static_candidates(g.base, g.encl, g.is_func, g.display, g.is_tls ? 1 : 0, g.is_func && g.members.size() == 1 ? syms_[g.members.front()].name : std::string());
+        p.cands = static_candidates(g.base, g.encl, g.is_func, g.shown, g.is_tls ? 1 : 0, g.is_func && g.members.size() == 1 ? syms_[g.members.front()].name : std::string());
         p.free_cands = p.cands;
         p.unmatched = g.members;
     }
@@ -3929,7 +4139,7 @@ void Planner::bridge_statics() {
         // compiler-assigned number, which identifies it only while the lambdas are the same as before: such a group is
         // paired by name only when the names of the patch are exactly the names of the old image.
         bool exact_names = !by_signature;
-        if (exact_names && g.is_func && g.display.find("<lambda") != std::string::npos) {
+        if (exact_names && g.is_func && g.shown.find("<lambda") != std::string::npos) {
             std::multiset<std::string> new_names;
             std::multiset<std::string> old_names;
             for (const std::uint32_t pos : unmatched) {
@@ -4069,7 +4279,7 @@ void Planner::bridge_statics() {
         if (g.is_func || g.encl != "operator()") {
             continue;
         }
-        const std::string enclosing = lambda_enclosing(g.display, g.base);
+        const std::string enclosing = lambda_enclosing(g.shown, g.base);
         if (enclosing.empty()) {
             continue;
         }
@@ -4696,11 +4906,12 @@ std::optional<OldRef> Planner::resolve_name(Sym& sy) {
     if (is_tu_private_name(name)) {
         const std::string base = base_identifier(name);
         const std::string encl = enclosing_function(name);
+        // (WP-56: the display with the back-references of a local scope written out.)
+        const std::string shown = sy.dec.display == name ? std::string() : local_display(static_cast<std::uint32_t>(&sy - syms_.data()));
         for (const bool want_function : {false, true}) {
-            const std::vector<const pdb::SymbolView*> cands =
-                static_candidates(base, encl, want_function, sy.dec.display == name ? std::string() : sy.dec.display, -1, want_function ? name : std::string());
+            const std::vector<const pdb::SymbolView*> cands = static_candidates(base, encl, want_function, want_function && !shown.empty() ? sy.dec.display : shown, -1, want_function ? name : std::string());
             // (A record of a lambda's static in the procedure that inlined the lambda does not identify it by name.)
-            const std::string enclosing = want_function || encl != "operator()" ? std::string() : lambda_enclosing(sy.dec.display, base);
+            const std::string enclosing = want_function || encl != "operator()" ? std::string() : lambda_enclosing(shown, base);
             if (cands.size() == 1 && !is_inlined_record(cands.front(), enclosing)) {
                 OldRef r;
                 r.addr = module_address(cands.front()->rva);
