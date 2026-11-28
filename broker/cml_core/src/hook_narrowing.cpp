@@ -75,6 +75,7 @@ std::int64_t sign_extend32(std::uint64_t v) {
 struct Keep {
     NarrowReason reason;
     std::string detail;
+    bool unproven = false;  // WP-57: the callee step could not prove a called new function to be the old code
 };
 
 // Bytes from `value` to the next symbol defined in the same section (or the section end).
@@ -117,9 +118,12 @@ public:
             return out;
         }
         last_prior_.reset();
+        callee_pairs_ = 0;  // WP-57: the callee step's pairs are per judgement
+        callee_equal_.clear();
         if (const std::optional<Keep> keep = check(h)) {
             out.reason = keep->reason;
             out.detail = keep->detail;
+            out.unproven = keep->unproven;
         } else {
             out.reason = NarrowReason::Unchanged;
         }
@@ -573,6 +577,16 @@ private:
                 continue;  // WP-49: the same place of the function, whether named by a label or by the section with an offset
             }
             if (a.target.kind == CodeTarget::Kind::NewSymbol) {
+                // WP-57: a static function this patch introduces, where the earlier patch's code reached an address (its own
+                // copy of the function, or the old one): equal when the new function is the code there.
+                const bind::SymbolDecision* callee = by_raw_name(a.target.name);
+                if (callee != nullptr && b.target.kind == CodeTarget::Kind::Address && a.offset == b.offset && a.type == b.type && a.addend == b.addend &&
+                    callee_step_applies(*callee, static_cast<coff::RelocType>(a.type))) {
+                    if (std::optional<Keep> keep = check_new_callee(h.display, *callee, b.target.value)) {
+                        return keep;
+                    }
+                    continue;
+                }
                 return Keep{NarrowReason::TargetNew, "reference to the new symbol '" + a.target.name + "'"};
             }
             if (a.target.kind == CodeTarget::Kind::Local && b.target.kind == CodeTarget::Kind::Local && a.offset == b.offset && a.target.value != b.target.value) {
@@ -650,6 +664,10 @@ private:
                 }
                 return std::nullopt;
             case bind::DecisionKind::PatchNewFunction:
+                if (callee_step_applies(d, r.reloc.type)) {
+                    return check_new_callee(h.display, d, old_target);  // WP-57
+                }
+                return Keep{NarrowReason::TargetNew, "reference to the new symbol '" + d.display + "'"};
             case bind::DecisionKind::PatchNewData:
                 return Keep{NarrowReason::TargetNew, "reference to the new symbol '" + d.display + "'"};
             case bind::DecisionKind::PatchFresh:
@@ -657,6 +675,75 @@ private:
             default:
                 return Keep{NarrowReason::Unverifiable, "reference to '" + name + "' (" + bind::to_string(d.decision) + ")"};
         }
+    }
+
+    // ---- WP-57 (ADR-0046): the callee step of the inlined-static proofs --------------------------------------------------
+
+    // A call or jump of the judged code to a static function the patch introduces: only these are followed.
+    bool callee_step_applies(const bind::SymbolDecision& d, coff::RelocType type) const {
+        return in_.follow_new_callees && d.decision == bind::DecisionKind::PatchNewFunction && d.type == bind::SymbolType::Function && d.defined && d.is_static &&
+               bind::is_rel32(rel32_kind_of(type));
+    }
+
+    // nullopt: the new static function `d` is the code the old (or the earlier patch's) code reached at `old_va`, by the rules of
+    // this comparison, applied recursively. A pair being compared counts as equal (a recursive function calls itself), so the
+    // pairs that compare equal form a bisimulation: running the new function is running the code there.
+    std::optional<Keep> check_new_callee(const std::string& caller, const bind::SymbolDecision& d, std::uint64_t old_va) const {
+        const std::pair<std::string, std::uint64_t> key(d.name, old_va);
+        if (callee_open_.count(key) != 0 || callee_equal_.count(key) != 0) {
+            CML_LOG(Trace, "WP57-CALLEE caller='%s' callee='%s' old va=%s verdict=equal (%s)", caller.c_str(), d.display.c_str(), hex(old_va).c_str(),
+                    callee_open_.count(key) != 0 ? "being compared" : "compared before");
+            return std::nullopt;
+        }
+        const auto refuse = [&](NarrowReason reason, const std::string& why) {
+            CML_LOG(Trace, "WP57-CALLEE caller='%s' callee='%s' old va=%s verdict=%s %s", caller.c_str(), d.display.c_str(), hex(old_va).c_str(), to_string(reason), why.c_str());
+            return Keep{reason, "the new static function '" + d.display + "' is called where the old code reached " + hex(old_va) + ", and " + why, true};
+        };
+        if (callee_pairs_ >= in_.max_callee_pairs) {
+            return refuse(NarrowReason::Unverifiable, "more than " + std::to_string(in_.max_callee_pairs) + " callee pairs would have to be compared");
+        }
+        ++callee_pairs_;
+        bind::HookEntry callee;
+        callee.new_symbol = d.name;
+        callee.display = d.display;
+        callee.old_va = old_va;
+        // (Review: inside the module image only when the offset is below its size.)
+        const bool in_module = in_.old_image != nullptr && old_va >= in_.load_base && old_va - in_.load_base < in_.old_image->optional_header().size_of_image;
+        callee.old_rva = in_module ? static_cast<std::uint32_t>(old_va - in_.load_base) : bind::kNoRva;
+        const std::optional<std::uint32_t> size = in_module && in_.old_proc_size ? in_.old_proc_size(callee.old_rva) : std::nullopt;
+        std::shared_ptr<const CodeImage> prior = in_.prior_code ? in_.prior_code(old_va) : nullptr;
+        if (prior != nullptr) {
+            // An earlier patch's code at that address. (Review: its record was cut at the same next-symbol boundary as the new
+            // function, so its length proves nothing about the extent: WP-49's check takes the PDB's size of the old procedure
+            // where the address is in the module image; otherwise only a COMDAT callee, which is its whole section, is compared:
+            // check_prior refuses another with UnknownOldSize when old_size is 0.)
+            callee.old_size = size.value_or(0);
+        } else {
+            if (!size) {
+                return refuse(NarrowReason::TargetNew, "no old procedure starts there");
+            }
+            Loc loc;
+            if (std::optional<Keep> keep = locate(d.name, &loc)) {
+                return refuse(keep->reason, keep->detail);
+            }
+            if (loc.len != *size) {
+                return refuse(NarrowReason::SizeDiffers, "the old procedure there has " + std::to_string(*size) + " bytes, the new function " + std::to_string(loc.len));
+            }
+            callee.old_size = *size;
+        }
+        callee_open_.insert(key);
+        const std::shared_ptr<const CodeImage> outer_prior = last_prior_;
+        const std::optional<Keep> keep = prior != nullptr ? check_prior(callee, *prior) : check(callee);
+        last_prior_ = outer_prior;
+        callee_open_.erase(key);
+        if (keep) {
+            return refuse(keep->reason == NarrowReason::Unverifiable ? NarrowReason::Unverifiable : NarrowReason::TargetNew,
+                          std::string("its code is not the code there (") + to_string(keep->reason) + (keep->detail.empty() ? std::string() : ": " + keep->detail) + ")");
+        }
+        callee_equal_.insert(key);
+        CML_LOG(Trace, "WP57-CALLEE caller='%s' callee='%s' old va=%s verdict=equal%s", caller.c_str(), d.display.c_str(), hex(old_va).c_str(),
+                prior != nullptr ? " (against an earlier patch)" : "");
+        return std::nullopt;
     }
 
     static bind::FixupKind rel32_kind_of(coff::RelocType type) {
@@ -765,6 +852,10 @@ private:
     }
     mutable std::unordered_map<const coff::Section*, std::vector<coff::ResolvedRelocation>> relocs_;
     mutable std::shared_ptr<const CodeImage> last_prior_;
+    // WP-57: the callee pairs (new function, old address) of the current judgement: being compared, and compared equal.
+    mutable std::set<std::pair<std::string, std::uint64_t>> callee_open_;
+    mutable std::set<std::pair<std::string, std::uint64_t>> callee_equal_;
+    mutable std::size_t callee_pairs_ = 0;
 };
 
 }  // namespace
@@ -1279,44 +1370,65 @@ std::vector<Diag> prove_bitmask_guards(const NarrowInput& input) {
     return out;
 }
 
-std::vector<Diag> prove_inlined_lambda_statics(const NarrowInput& input) {
+namespace {
+
+// WP-53 / WP-57: one verdict per procedure (by its old entry RVA and its name; a procedure without an RVA is judged every
+// time): "" when the patch's version of it is the old code under the plan (WP-25's comparison, with the callee step), else
+// why not: "the code of 'P' changed" where it differs, "'P' cannot be proven unchanged" where the comparison (or the callee
+// step) could not judge it.
+std::string inlined_proc_verdict(const NarrowInput& input, const std::string& proc, std::uint32_t proc_rva, InlinedProcVerdicts& verdicts) {
+    const std::pair<std::uint32_t, std::string> key(proc_rva, proc);
+    if (proc_rva != bind::kNoRva) {
+        const auto found = verdicts.find(key);
+        if (found != verdicts.end()) {
+            return found->second;
+        }
+    }
+    const bind::BindPlan& plan = *input.plan;
+    std::string why;
+    const bind::HookEntry* hook = nullptr;
+    for (const bind::HookEntry& h : plan.hooks) {
+        if (proc_rva != bind::kNoRva && h.old_rva == proc_rva) {
+            hook = &h;
+            break;
+        }
+    }
+    if (hook == nullptr) {
+        why = "'" + proc + "' is not paired with a function of the patch (its old entry at rva " + hex(proc_rva) + " is not hooked)";
+    } else if (input.object == nullptr || input.old_image == nullptr) {
+        why = "the old code of '" + proc + "' is not available";
+    } else {
+        NarrowInput ni = input;
+        ni.enabled = true;
+        ni.follow_new_callees = true;  // WP-57 (ADR-0046): only these proofs follow calls to new static functions
+        const Narrower narrower(ni);
+        const NarrowDecision d = narrower.judge(*hook);
+        if (d.reason != NarrowReason::Unchanged) {
+            const bool differs = !d.unproven && (d.reason == NarrowReason::BytesDiffer || d.reason == NarrowReason::SizeDiffers ||
+                                                 d.reason == NarrowReason::TargetChanged || d.reason == NarrowReason::TargetNew);
+            const std::string reason = std::string(to_string(d.reason)) + (d.detail.empty() ? std::string() : ": " + d.detail);
+            why = differs ? "the code of '" + proc + "' changed (" + reason + ")" : "'" + proc + "' cannot be proven unchanged (" + reason + ")";
+        } else {
+            CML_LOG(Trace, "WP53-INLINED-PROC proc='%s' rva=%s unchanged%s", proc.c_str(), hex(proc_rva).c_str(), d.from_prior ? " (against an earlier patch)" : "");
+        }
+    }
+    if (proc_rva != bind::kNoRva) {
+        verdicts.emplace(key, why);
+    }
+    return why;
+}
+
+}  // namespace
+
+std::vector<Diag> prove_inlined_lambda_statics(const NarrowInput& input, InlinedProcVerdicts* shared) {
     std::vector<Diag> out;
     if (input.plan == nullptr || input.plan->inlined_lambda_statics.empty()) {
         return out;
     }
     const bind::BindPlan& plan = *input.plan;
-    // One verdict per procedure: "" proven (unchanged), else why not.
-    std::map<std::uint32_t, std::string> verdicts;
-    const auto verdict_of = [&](const bind::InlinedLambdaStatic& s) -> const std::string& {
-        const auto found = verdicts.find(s.proc_rva);
-        if (found != verdicts.end()) {
-            return found->second;
-        }
-        std::string why;
-        const bind::HookEntry* hook = nullptr;
-        for (const bind::HookEntry& h : plan.hooks) {
-            if (s.proc_rva != bind::kNoRva && h.old_rva == s.proc_rva) {
-                hook = &h;
-                break;
-            }
-        }
-        if (hook == nullptr) {
-            why = "'" + s.proc + "' is not paired with a function of the patch (its old entry at rva " + hex(s.proc_rva) + " is not hooked)";
-        } else if (input.object == nullptr || input.old_image == nullptr) {
-            why = "the old code of '" + s.proc + "' is not available";
-        } else {
-            NarrowInput ni = input;
-            ni.enabled = true;
-            const Narrower narrower(ni);
-            const NarrowDecision d = narrower.judge(*hook);
-            if (d.reason != NarrowReason::Unchanged) {
-                why = "the code of '" + s.proc + "' changed (" + std::string(to_string(d.reason)) + (d.detail.empty() ? std::string() : ": " + d.detail) + ")";
-            } else {
-                CML_LOG(Trace, "WP53-INLINED-PROC proc='%s' rva=%s unchanged%s", s.proc.c_str(), hex(s.proc_rva).c_str(), d.from_prior ? " (against an earlier patch)" : "");
-            }
-        }
-        return verdicts.emplace(s.proc_rva, std::move(why)).first->second;
-    };
+    InlinedProcVerdicts own;
+    InlinedProcVerdicts& verdicts = shared != nullptr ? *shared : own;
+    const auto verdict_of = [&](const bind::InlinedLambdaStatic& s) { return inlined_proc_verdict(input, s.proc, s.proc_rva, verdicts); };
     std::size_t proven = 0;
     std::size_t refused = 0;
     std::size_t skipped = 0;  // re-decided after the listing (refused or unbound by a later step): nothing to prove
@@ -1327,7 +1439,7 @@ std::vector<Diag> prove_inlined_lambda_statics(const NarrowInput& input) {
             ++skipped;
             continue;
         }
-        const std::string& why = verdict_of(s);
+        const std::string why = verdict_of(s);
         CML_LOG(Trace, "WP53-INLINED-PROOF static='%s' record rva=%s proc='%s' by=%s proven=%s%s%s", s.display.c_str(), hex(s.record_rva).c_str(), s.proc.c_str(), bind::to_string(s.how),
                 why.empty() ? "unchanged" : "refused", why.empty() ? "" : " ", why.c_str());
         if (why.empty()) {
@@ -1343,6 +1455,44 @@ std::vector<Diag> prove_inlined_lambda_statics(const NarrowInput& input) {
     }
     CML_LOG(Info, "WP53-INLINED object=%s listed=%zu proven=%zu refused=%zu skipped=%zu", plan.object_name.c_str(), plan.inlined_lambda_statics.size(), proven, refused,
             skipped);
+    return out;
+}
+
+std::vector<Diag> prove_inlined_owner_statics(const NarrowInput& input, InlinedProcVerdicts* shared) {
+    std::vector<Diag> out;
+    if (input.plan == nullptr || input.plan->inlined_owner_statics.empty()) {
+        return out;
+    }
+    const bind::BindPlan& plan = *input.plan;
+    InlinedProcVerdicts own;
+    InlinedProcVerdicts& verdicts = shared != nullptr ? *shared : own;
+    std::size_t proven = 0;
+    std::size_t refused = 0;
+    std::size_t skipped = 0;  // re-decided after the listing (refused or unbound by a later step): nothing to prove
+    for (const bind::InlinedOwnerStatic& s : plan.inlined_owner_statics) {
+        const bind::SymbolDecision* d = plan.find_decision(s.symbol);
+        if (d == nullptr || d->decision != bind::DecisionKind::BindOldData || d->old_address.rva != s.record_rva) {
+            CML_LOG(Trace, "WP57-OWNER-PROOF static='%s' proc='%s' skipped (no longer bound to the record at rva %s)", s.display.c_str(), s.proc.c_str(), hex(s.record_rva).c_str());
+            ++skipped;
+            continue;
+        }
+        const std::string why = inlined_proc_verdict(input, s.proc, s.proc_rva, verdicts);
+        CML_LOG(Trace, "WP57-OWNER-PROOF static='%s' record rva=%s proc='%s' (%s) proven=%s%s%s", s.display.c_str(), hex(s.record_rva).c_str(), s.proc.c_str(), s.step.c_str(),
+                why.empty() ? "unchanged" : "refused", why.empty() ? "" : " ", why.c_str());
+        if (why.empty()) {
+            ++proven;
+            continue;
+        }
+        ++refused;
+        // WP-51's message, and why the code of the procedure does not prove the pairing.
+        out.push_back(Diag::make(bind::diag::kAmbiguousStatic,
+                                 "static data '" + s.display + "' (" + s.symbol + ") in " + plan.object_name + " cannot be paired with the record '" + s.record + "' at rva " +
+                                     hex(s.record_rva) + " of its function: " + s.risk +
+                                     ", and a compiler records the statics of inlined code as records of the calling procedure under their own names, so the record may be that code's static and not this one; only an unchanged '" +
+                                     s.proc + "' proves it is this one, and " + why,
+                                 "Leave '" + s.proc + "' unchanged while the program runs (edit other functions of the file), rename the static, or hot-restart."));
+    }
+    CML_LOG(Info, "WP57-OWNER object=%s listed=%zu proven=%zu refused=%zu skipped=%zu", plan.object_name.c_str(), plan.inlined_owner_statics.size(), proven, refused, skipped);
     return out;
 }
 

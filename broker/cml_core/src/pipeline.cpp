@@ -1024,6 +1024,7 @@ private:
         in.registry = &registry;
         in.modules = &process_modules;
         in.inline_verdicts = &module_.inline_verdicts;  // WP-55 (R-62)
+        in.prove_inlined_owners = true;  // WP-57 (R-59): proven below (prove_inlined_owner_statics)
         const std::uint64_t verdict_kept_before = module_.inline_verdicts.kept();
         const std::uint64_t verdict_reads_before = module_.inline_verdicts.reads();
         if (const std::optional<Diag> f = injected(ipc::fault::Stage::BindPlan)) {
@@ -1082,8 +1083,22 @@ private:
         }
         // WP-53 (R-61, ADR-0045): a lambda's static bound to a record directly in the procedure that inlined it stands only
         // while that procedure's code is the old code (the record may be the procedure's own static); otherwise CML3207.
-        if (!plan.inlined_lambda_statics.empty()) {
-            const std::vector<Diag> unproven = prove_inlined_lambda_statics(narrow_input(s, image.get()));
+        // WP-57 (R-59, ADR-0046): an own static WP-51 found at risk (its procedure inlined closure code) stands only while that
+        // procedure's code is the old code as well (the record may be a deleted lambda's static); otherwise CML3207. Both
+        // proofs share one verdict per procedure and follow calls to new static functions (the callee step).
+        if (!plan.inlined_lambda_statics.empty() || !plan.inlined_owner_statics.empty()) {
+            InlinedProcVerdicts verdicts;
+            NarrowInput proof = narrow_input(s, image.get());
+            proof.old_proc_size = [&pdb](std::uint32_t rva) -> std::optional<std::uint32_t> {
+                const Result<std::optional<pdb::SymbolView>> proc_at = pdb.find_proc_by_rva(rva);
+                if (!proc_at || !proc_at->has_value() || (*proc_at)->rva != rva || (*proc_at)->size == 0) {
+                    return std::nullopt;
+                }
+                return (*proc_at)->size;
+            };
+            std::vector<Diag> unproven = prove_inlined_lambda_statics(proof, &verdicts);
+            const std::vector<Diag> owners = prove_inlined_owner_statics(proof, &verdicts);
+            unproven.insert(unproven.end(), owners.begin(), owners.end());
             if (!unproven.empty()) {
                 return first_failure("plan", unproven, unproven.front());
             }
