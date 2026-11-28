@@ -25,6 +25,9 @@
 // is gone (CML3655: nothing re-baselined or announced). `patch_applied`
 // is published when the reload's compilands are live, never for one that was rolled back. docs/wp/WP-47.md.
 //
+// WP-54 (ADR-0045): the same over the modules of one process. ModuleReload splits a module's run into its prepare phase (sweep ..
+// fix-ups) and its apply phase, so that reload_process() (process_reload.h) prepares every module of a process before it applies any.
+//
 // The external effects (compiler, linker) are in PipelineEnv so the orchestration is unit-tested on every host
 // with a scripted agent; native_pipeline_env() has the Windows implementation.
 
@@ -187,10 +190,48 @@ public:
 
     // Runs steps 1 to 9 for one module. Returns the report (patched == false when nothing changed) or the
     // first error; every error and warning has been published as a diag event already.
-    Result<PatchReport> patch_module(AgentLink& link, ModuleState& module, const PipelineContext& context);
+    Result<PatchReport> patch_module(AgentLink& link, ModuleState& module, const PipelineContext& context) const;
+
+    const PipelineEnv& env() const noexcept { return env_; }
 
 private:
     PipelineEnv env_;
+};
+
+// WP-54 (ADR-0045, R-56): the reload of one module in its two phases, so that the reload service can prepare every module of a
+// process before it applies any (process_reload.h). patch_module() is prepare() followed by apply(). The pipeline, the link, the
+// module and the context must outlive the object.
+class ModuleReload {
+public:
+    // `events_held`: the `patch_applied` events are kept for take_applied_events() instead of being published.
+    ModuleReload(const PatchPipeline& pipeline, AgentLink& link, ModuleState& module, const PipelineContext& context, bool events_held);
+    ~ModuleReload();
+    ModuleReload(const ModuleReload&) = delete;
+    ModuleReload& operator=(const ModuleReload&) = delete;
+
+    // Sweep, compile, and plan, verify and link every recompiled compiland (WP-47's prepare phase). Nothing is applied: the agent is
+    // asked for the module's reservation and nothing else. An error ends the reload of the module (a refused compiland has given the
+    // address space back, nothing is re-baselined; the error was published as a diag event).
+    Result<void> prepare();
+    // prepare() succeeded and staged compilands wait for apply() or abandon() (false: nothing to compile, or it failed).
+    bool prepared() const;
+    // Applies what prepare() staged (a failure rolls back the compilands of this module applied before it, WP-47) and re-baselines.
+    // After a prepare() that found nothing to compile: the report (patched == false).
+    Result<PatchReport> apply();
+    // Another module of the process was refused or failed: nothing of this module is applied, its staged compilands give their
+    // address space back and none of its files is re-baselined. Returns `why` (not published).
+    Diag abandon(Diag why);
+    // After a failed apply(): the compiland that failed may still become live (CML5309 / CML4656: WP-47's CML3653 case).
+    bool may_be_live() const;
+    // The stage of the last failure ("sweep", "compile", "plan", "link", "reserve", ...), empty when nothing failed.
+    const std::string& failed_stage() const;
+    // The `patch_applied` events of an applied module (events_held).
+    std::vector<Event> take_applied_events();
+    ModuleState& module() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 ipc::json::Value to_json(const PatchReport& report);

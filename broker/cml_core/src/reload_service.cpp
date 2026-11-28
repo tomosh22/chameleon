@@ -11,6 +11,7 @@
 #include "cml/core/control_args.h"
 #include "cml/core/header_diag_ids.h"
 #include "cml/core/pipeline_diag_ids.h"
+#include "cml/core/process_reload.h"
 #include "cml/core/process_registry.h"
 #include "cml/core/reenable_diag_ids.h"
 #include "cml/core/restart.h"
@@ -1261,31 +1262,54 @@ Result<Value> ReloadService::run_reload(const Value& args, bool automatic, bool 
     std::optional<Diag> first_error;
     std::size_t failed = 0;
     StageTimes sum;
-    for (const Target& t : list) {
-        const auto module_generation = [&] {
-            std::lock_guard<std::mutex> lock(t.module->mutex);
-            return t.module->generation;
-        };
-        const std::uint64_t generation_before = module_generation();
-        Result<PatchReport> r = pipeline_.patch_module(*t.link, *t.module, ctx);
-        // Patches that were applied count (and have published their patch_applied events) even when a later
-        // compiland of the same reload failed: the broker-wide generation follows the module's own.
-        generation_.fetch_add(module_generation() - generation_before);
-        if (!r) {
-            ++failed;
-            keep_session_dir_ = true;  // objects, DLLs and PDBs of a failed reload are evidence
-            if (!first_error) {
-                first_error = r.error();
+    // WP-54 (ADR-0045): the modules of one process are prepared together and applied all or none (process_reload.h); processes
+    // stay independent. The groups keep the order of `list`, and so does the answer's `patches`.
+    std::vector<std::vector<std::size_t>> processes;
+    for (std::size_t i = 0; i < list.size(); ++i) {
+        const auto same = std::find_if(processes.begin(), processes.end(), [&](const std::vector<std::size_t>& g) { return list[g.front()].link == list[i].link; });
+        if (same != processes.end()) {
+            same->push_back(i);
+        } else {
+            processes.push_back({i});
+        }
+    }
+    for (const std::vector<std::size_t>& group : processes) {
+        std::vector<ModuleState*> modules;
+        std::vector<std::uint64_t> generations_before;
+        for (const std::size_t i : group) {
+            modules.push_back(list[i].module.get());
+            std::lock_guard<std::mutex> lock(list[i].module->mutex);
+            generations_before.push_back(list[i].module->generation);
+        }
+        ProcessReload done = reload_process(pipeline_, *list[group.front()].link, modules, ctx);
+        // Patches that stay applied count even when the reload failed (WP-47: an unconfirmed install); a roll-back puts the module's
+        // generation back. The broker-wide generation follows the modules' own.
+        for (std::size_t g = 0; g < group.size(); ++g) {
+            std::lock_guard<std::mutex> lock(modules[g]->mutex);
+            generation_.fetch_add(modules[g]->generation - generations_before[g]);
+        }
+        if (done.error && !first_error) {
+            first_error = done.error;
+        }
+        for (std::size_t g = 0; g < group.size(); ++g) {
+            Result<PatchReport>& r = done.modules[g];
+            const Target& t = list[group[g]];
+            if (!r) {
+                ++failed;
+                keep_session_dir_ = true;  // objects, DLLs and PDBs of a failed reload are evidence
+                if (!first_error) {
+                    first_error = r.error();
+                }
+                continue;
             }
-            continue;
+            sum.add(r->times);
+            if (r->patched) {
+                const std::string stem(path::base_name(std::string_view(t.module->name)));
+                const std::size_t dot = stem.find_last_of('.');
+                CML_LOG(Info, "%s", timing_line(dot == std::string::npos ? stem : stem.substr(0, dot), r->times).c_str());
+            }
+            reports.push_back(std::move(*r));
         }
-        sum.add(r->times);
-        if (r->patched) {
-            const std::string stem(path::base_name(std::string_view(t.module->name)));
-            const std::size_t dot = stem.find_last_of('.');
-            CML_LOG(Info, "%s", timing_line(dot == std::string::npos ? stem : stem.substr(0, dot), r->times).c_str());
-        }
-        reports.push_back(std::move(*r));
     }
     const double wall_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
     if (first_error) {
@@ -1301,6 +1325,7 @@ Result<Value> ReloadService::run_reload(const Value& args, bool automatic, bool 
     std::size_t hooks = 0, run = 0, patched = 0, compiled = 0, reused = 0, attempts = 0, modules_patched = 0;
     std::size_t hooks_planned = 0, hooks_dropped = 0, modules_unchanged = 0;  // WP-25
     std::size_t imgrel_sites = 0, imgrel_verified = 0;  // WP-36
+    std::size_t objects_held_peak = 0;                  // WP-54: a module's prepare drops its objects before the next module's starts
     std::set<std::uint32_t> patched_pids;
     Value patches = Value::array();
     Value changed = Value::array();
@@ -1311,6 +1336,7 @@ Result<Value> ReloadService::run_reload(const Value& args, bool automatic, bool 
         modules_unchanged += p.no_functional_change ? 1 : 0;
         imgrel_sites += p.imgrel_sites;
         imgrel_verified += p.imgrel_verified;
+        objects_held_peak = std::max(objects_held_peak, p.objects_held_peak);
         run += p.initializers_run;
         patched += p.patches;
         compiled += p.compiled;
@@ -1346,6 +1372,8 @@ Result<Value> ReloadService::run_reload(const Value& args, bool automatic, bool 
     // address displacements). cmltest prints them as `WP36-IMGREL sites=N verified=N`.
     result.set("imgrel_sites", Value::integer(static_cast<std::int64_t>(imgrel_sites)));
     result.set("imgrel_verified", Value::integer(static_cast<std::int64_t>(imgrel_verified)));
+    // WP-54: the most COFF objects of recompiled compilands the reload held at once (1 for any number of compilands and modules).
+    result.set("objects_held_peak", Value::integer(static_cast<std::int64_t>(objects_held_peak)));
     result.set("changed_files", std::move(changed));
     result.set("patches", std::move(patches));
     sum.total = wall_ms;
