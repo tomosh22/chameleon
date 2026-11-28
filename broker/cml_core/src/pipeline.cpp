@@ -676,8 +676,8 @@ private:
         }
         if (failure) {
             release_ranges(0);
-            Result<PatchReport> finished = finish(failure);
-            return finished.error();
+            Result<PatchReport> ended = finish(failure);
+            return ended.error();
         }
         std::size_t with_effect = 0;
         for (const std::unique_ptr<Staged>& s : staged_) {
