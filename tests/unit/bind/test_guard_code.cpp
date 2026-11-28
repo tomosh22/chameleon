@@ -268,6 +268,7 @@ struct Asm {
     std::vector<std::uint8_t> bytes;
     std::vector<GuardCodeReloc> relocs;
     std::vector<std::uint32_t> starts;
+    std::vector<GuardEntryRef> entries;
 
     Asm& raw(std::initializer_list<int> b) {
         for (const int v : b) {
@@ -308,6 +309,7 @@ struct Asm {
         s.data = std::span<const std::byte>(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size());
         s.relocs = relocs;
         s.function_starts = starts;
+        s.entry_refs = entries;
         return s;
     }
 };
@@ -325,7 +327,9 @@ std::map<std::string, std::int32_t, std::less<>> candidates() { return {{kCalls,
 // `options`: 'h' hoists the guard's address into rbx (lea rbx,[G]; mov rcx,rbx), 'c' writes calls in the bracket too,
 // 'n' writes another static instead of a, 'j' adds a jump from behind the function into the bracket, 'z' a jmp to the next
 // instruction after the call of make (clang -O0), 't' a branch out of the bracket to a tail call behind the function,
-// 'x' a branch to an inlined throw behind the function (`call _CxxThrowException; int3`).
+// 'x' a branch to an inlined throw behind the function (`call _CxxThrowException; int3`), 'i' the same with `int 3`
+// (CD 03) instead of int3, 'r' a conditional tail call out of the bracket (`jne ?elsewhere`, rel32 with a relocation),
+// 's' a branch from the bracket to the start of a sibling function behind it.
 Asm cl_thread_safe(const std::string& options = "") {
     Asm s;
     s.raw({0x48, 0x83, 0xEC, 0x28});                   // sub rsp, 28h
@@ -357,7 +361,12 @@ Asm cl_thread_safe(const std::string& options = "") {
         s.raw({0x89, 0x05}).rel(kCalls);                // mov [rip+calls], eax
     }
     std::uint32_t out_jne = 0xFFFFFFFFu;
-    if (options.find('t') != std::string::npos || options.find('x') != std::string::npos) {
+    if (options.find('r') != std::string::npos) {
+        s.raw({0x85, 0xC0});                            // test eax, eax
+        s.raw({0x0F, 0x85}).rel("?elsewhere@@YAXXZ");   // jne elsewhere (a conditional tail call)
+    }
+    if (options.find('t') != std::string::npos || options.find('x') != std::string::npos || options.find('i') != std::string::npos ||
+        options.find('s') != std::string::npos) {
         s.raw({0x85, 0xC0});                            // test eax, eax
         out_jne = s.here();
         s.raw({0x75, 0x00});                            // jne out (behind the function)
@@ -376,7 +385,14 @@ Asm cl_thread_safe(const std::string& options = "") {
     }
     if (out_jne != 0xFFFFFFFFu) {
         s.jump8(out_jne, s.here());
-        if (options.find('t') != std::string::npos) {
+        if (options.find('s') != std::string::npos) {
+            s.starts.push_back(s.here());               // out: a sibling function
+            s.raw({0x33, 0xC0});                        //   xor eax, eax
+            s.raw({0xC3});                              //   ret
+        } else if (options.find('i') != std::string::npos) {
+            s.raw({0xE8}).rel("_CxxThrowException");    // out: call _CxxThrowException
+            s.raw({0xCD, 0x03});                        // int 3 (not int3)
+        } else if (options.find('t') != std::string::npos) {
             s.raw({0xE9}).rel("?elsewhere@@YAXXZ");     // out: jmp elsewhere (a tail call)
         } else {
             s.raw({0xE8}).rel("_CxxThrowException");    // out: call _CxxThrowException
@@ -476,7 +492,7 @@ TEST_CASE("R-69 (reader): a jmp to the next instruction inside a region falls th
 TEST_CASE("R-69 (review 2, items 3 and 5): a bracket path that leaves by a tail call refuses; one that ends in an inlined throw reads") {
     const GuardCodeReading t = read(cl_thread_safe("t"), kG, GuardCodeKind::ThreadSafe);
     CHECK_FALSE(t.proved);
-    CHECK(contains(t.why, "before its _Init_thread_footer"));
+    CHECK(contains(t.why, "leaves its function"));
     const GuardCodeReading x = read(cl_thread_safe("x"), kG, GuardCodeKind::ThreadSafe);
     REQUIRE(x.proved);
     CHECK(x.statics == std::set<std::string>{kA});
@@ -510,7 +526,7 @@ TEST_CASE("R-69 (review 2, item 2): an instruction not on the list of pure reads
     a.jump8(jne, done);
     const GuardCodeReading r = read(a, kM, GuardCodeKind::Bitmask);
     CHECK_FALSE(r.proved);
-    CHECK((contains(r.why, "writes 2 of them") || contains(r.why, "not read") || contains(r.why, "not known to the decoder")));
+    CHECK(contains(r.why, "writes 2 of them"));  // so 0F C7 /1 decoded, and counted as a write
 }
 
 TEST_CASE("R-69 (review 2, item 4): a function start is entered from outside: A's load falling into B's `or` proves nothing") {
@@ -524,6 +540,98 @@ TEST_CASE("R-69 (review 2, item 4): a function start is entered from outside: A'
     const GuardCodeReading r = read(a, kM, GuardCodeKind::Bitmask);
     CHECK_FALSE(r.proved);
     CHECK(contains(r.why, "from outside"));
+}
+
+TEST_CASE("R-69 (review 3, items 1, 2, 4): bracket exits by a conditional tail call, into a sibling function, or by `int imm8` refuse") {
+    for (const char* options : {"r", "s", "i"}) {
+        CAPTURE(options);
+        const GuardCodeReading r = read(cl_thread_safe(options), kG, GuardCodeKind::ThreadSafe);
+        CHECK_FALSE(r.proved);
+    }
+    CHECK(contains(read(cl_thread_safe("r"), kG, GuardCodeKind::ThreadSafe).why, "a branch out of the section"));
+    CHECK(contains(read(cl_thread_safe("s"), kG, GuardCodeKind::ThreadSafe).why, "which is entered from outside"));
+    CHECK(contains(read(cl_thread_safe("i"), kG, GuardCodeKind::ThreadSafe).why, "before its _Init_thread_footer"));
+}
+
+TEST_CASE("R-69 (review 3, item 2): a bitmask region that runs on into the next function refuses") {
+    Asm a;
+    a.raw({0x8B, 0x05}).rel(kM);                   // mov eax, [rip+M]
+    a.raw({0xA8, 0x01});                           // test al, 1
+    const std::uint32_t jne = a.here();
+    a.raw({0x75, 0x00});                           // jne done
+    a.raw({0xC3});                                 // ret (nothing to do)
+    const std::uint32_t init = a.here();
+    a.raw({0x83, 0xC8, 0x01});                     // init: or eax, 1
+    a.raw({0x89, 0x05}).rel(kM);                   //       mov [rip+M], eax
+    a.raw({0x48, 0x89, 0x05}).rel(kA);             //       mov [rip+a], rax   (and no jmp: falls into the next function)
+    a.starts.push_back(a.here());                  // next function
+    a.raw({0xC3});
+    a.bytes[jne] = 0x74;                           // je init
+    a.jump8(jne, init);
+    const GuardCodeReading r = read(a, kM, GuardCodeKind::Bitmask);
+    CHECK_FALSE(r.proved);
+    CHECK(contains(r.why, "runs on into the next function"));
+}
+
+TEST_CASE("R-69 (review 3, item 3): a static initialised from another one through an SSE source operand (mulsd) is proved") {
+    // `static double d = f() * scale;` with scale another static of the function: `mulsd xmm0, [scale]` reads scale.
+    const char* const kD2 = "?d@?1??counter@@YAHXZ@4NA";
+    const char* const kScale = "?scale@?1??counter@@YAHXZ@4NA";
+    Asm a;
+    a.raw({0x8B, 0x05}).rel(kM);                   // mov eax, [rip+M]
+    a.raw({0xA8, 0x02});                           // test al, 2
+    const std::uint32_t jne = a.here();
+    a.raw({0x75, 0x00});                           // jne done
+    a.raw({0x83, 0xC8, 0x02});                     // or eax, 2
+    a.raw({0x89, 0x05}).rel(kM);                   // mov [rip+M], eax
+    a.raw({0xE8}).rel("?f@@YANXZ");                // call f
+    a.raw({0xF2, 0x0F, 0x59, 0x05}).rel(kScale);   // mulsd xmm0, [rip+scale]
+    a.raw({0xF2, 0x0F, 0x11, 0x05}).rel(kD2);      // movsd [rip+d], xmm0
+    const std::uint32_t done = a.here();
+    a.raw({0xC3});                                 // done: ret
+    a.jump8(jne, done);
+    const GuardCodeReading r = read(a, kM, GuardCodeKind::Bitmask, {}, {{kD2, 3}, {kScale, 4}});
+    REQUIRE(r.proved);
+    CHECK(r.statics == std::set<std::string>{kD2});
+}
+
+TEST_CASE("R-69 (review 3, item 5): a relocation that points at a claim's `or` (lea rax, [.text$mn+0x0a]) makes it an entry: refused") {
+    Asm a = cl_bitmask();  // its `or eax, 1` is at +0x0a
+    a.raw({0x48, 0x8D, 0x05}).rel(".text$mn", 0, 0x0A, 1);  // lea rax, [rip+.text$mn+0x0a] (cl's REL32: addend = offset)
+    a.raw({0xC3});
+    const std::uint32_t field = a.relocs.back().offset;
+    const std::vector<std::uint32_t> offsets = relocation_target_offsets(0x0004, std::span<const std::byte>(reinterpret_cast<const std::byte*>(a.bytes.data()) + field, 4),
+                                                                         a.bytes[field - 2], a.bytes[field - 1], 0);
+    CHECK(std::find(offsets.begin(), offsets.end(), 0x0Au) != offsets.end());
+    GuardEntryRef ref;
+    ref.offsets = offsets;
+    ref.from = "the relocation to '.text$mn'";
+    a.entries.push_back(ref);
+    const GuardCodeReading r = read(a, kM, GuardCodeKind::Bitmask);
+    CHECK_FALSE(r.proved);
+    CHECK((contains(r.why, "from outside") || contains(r.why, "can be reached other than from the instruction before it")));
+    // A call's rel32 names its target exactly.
+    const std::uint8_t call_field[4] = {0x10, 0, 0, 0};
+    CHECK(relocation_target_offsets(0x0004, std::span<const std::byte>(reinterpret_cast<const std::byte*>(call_field), 4), 0x00, 0xE8, 0x20) ==
+          std::vector<std::uint32_t>{0x30});
+}
+
+TEST_CASE("R-69 (review 3, item 6): xchg with a candidate writes it") {
+    Asm a;
+    a.raw({0x8B, 0x05}).rel(kM);                   // mov eax, [rip+M]
+    a.raw({0xA8, 0x01});                           // test al, 1
+    const std::uint32_t jne = a.here();
+    a.raw({0x75, 0x00});                           // jne done
+    a.raw({0x83, 0xC8, 0x01});                     // or eax, 1
+    a.raw({0x89, 0x05}).rel(kM);                   // mov [rip+M], eax
+    a.raw({0x48, 0x89, 0x05}).rel(kA);             // mov [rip+a], rax
+    a.raw({0x87, 0x05}).rel(kCalls);               // xchg [rip+calls], eax
+    const std::uint32_t done = a.here();
+    a.raw({0xC3});                                 // done: ret
+    a.jump8(jne, done);
+    const GuardCodeReading r = read(a, kM, GuardCodeKind::Bitmask);
+    CHECK_FALSE(r.proved);
+    CHECK(contains(r.why, "writes 2 of them"));
 }
 
 TEST_CASE("R-69 (reader): shapes that are not read refuse") {

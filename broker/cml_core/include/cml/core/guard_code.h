@@ -21,8 +21,10 @@
 // A claim's region is every instruction reachable from it (direct branches followed, calls return) that the code cannot
 // reach from any function start without passing the claim, up to the next use of the guard (a bitmask) or the guard's
 // footer (thread-safe: every path must end there or rejoin the rest of the code; none may end at a ret, a tail call or the
-// end of the section, only at a trap right behind a call, an inlined throw). Nothing may enter the region from outside it,
-// and a function start counts as entered from outside. Its static is the ONE candidate (the statics the guard's name ties:
+// end of the section, only at int3 or ud2 right behind a call, an inlined throw; no branch out of the section and no fall
+// into another function in either kind). Nothing may enter the region from outside it: a function start, every symbol of
+// the section and every relocation target in it (GuardEntryRef) count as entered from outside, and no fall-through
+// crosses a function start. Its static is the ONE candidate (the statics the guard's name ties:
 // its function's or its block's) that the region WRITES: any instruction that references a candidate writes it unless it
 // is on an explicit list of pure reads (mov/movzx/movsx loads, cmp, test, bt, the ALU forms that read memory into a
 // register, the SSE loads; so a store, a read-modify-write, cmpxchg8b/16b, an x87 store or `lea` all write); a candidate
@@ -69,13 +71,35 @@ struct GuardCodeReloc {
     std::int32_t target_section = 0;  // the target's section number (1-based; <= 0: undefined, absolute, ...)
 };
 
+// A place in a code section that something outside the code's own branches may reach (review round 3): a symbol defined
+// there (any type: a label, a static, a section symbol) or the target of a relocation from any linked section of the
+// object. `offsets`: where it may be (one offset, or for a REL32 whose instruction is not known the offsets that its tail
+// allows: relocation_target_offsets). Every one of them that is an instruction start is an entry: entered from outside.
+// None at an instruction start: refused (control lands inside an instruction), unless `state_key` (a relocation from
+// `.xdata`: clang's ip2state keys sit one byte behind a call's return address, they are lookup keys, not entries).
+struct GuardEntryRef {
+    std::vector<std::uint32_t> offsets;
+    bool state_key = false;
+    std::string from;  // for messages: what refers there
+};
+
 // One code section of the patch.
 struct GuardCodeSection {
     std::string name;  // for messages (".text$mn", "section 7")
     std::span<const std::byte> data;
     std::vector<GuardCodeReloc> relocs;  // any order
     std::vector<std::uint32_t> function_starts;  // offsets of the section's function symbols (any order); 0 is added
+    std::vector<GuardEntryRef> entry_refs;       // further places entered from outside (see GuardEntryRef)
+    std::string outside_model;  // non-empty: why the section cannot be read at all (a function of it has catch handlers)
 };
+
+// The offsets in its target's section that a relocation may point at: `target_value` (the symbol's offset in its
+// section) + the addend in `field` (4 bytes; 8 for ADDR64), and for the REL32 family the bytes behind the field, which the
+// relocation does not say: exactly 0 when the field follows a call / jmp / jcc rel32 opcode (`before`: the two bytes in
+// front of the field, 0 where there are none), else every tail from k to 4 (REL32_k). Empty for a type that names no offset
+// (SECTION, SECREL, ...).
+std::vector<std::uint32_t> relocation_target_offsets(std::uint16_t raw_type, std::span<const std::byte> field, std::uint8_t before2, std::uint8_t before1,
+                                                     std::uint32_t target_value);
 
 struct GuardClaim {
     std::string section;

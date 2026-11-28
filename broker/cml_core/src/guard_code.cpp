@@ -243,6 +243,10 @@ bool reads_only(const Ops& o) {
                 return r == 7;  // cmp m, imm
             case 0xF6: case 0xF7:
                 return r == 0;  // test m, imm
+            case 0xD9: case 0xDD: case 0xDB:
+                return r == 0;  // fld m32, fld m64, fild m32
+            case 0xDF:
+                return r == 5;  // fild m64
             default:
                 return false;
         }
@@ -257,6 +261,15 @@ bool reads_only(const Ops& o) {
             return r == 4 && !o.other_prefix;  // bt m, imm
         case 0x10: case 0x12: case 0x16: case 0x28: case 0x6F: case 0x2E: case 0x2F:
             return true;  // SSE loads and compares (with or without 66 / F2 / F3)
+        case 0x51: case 0x58: case 0x59: case 0x5C: case 0x5D: case 0x5E: case 0x5F:  // sqrt, add, mul, sub, min, div, max
+        case 0x54: case 0x55: case 0x56: case 0x57:                                    // and, andn, or, xor (ps / pd)
+        case 0x2A: case 0x2C: case 0x2D: case 0x5A: case 0x5B: case 0xE6:              // conversions
+        case 0xC2:                                                                      // cmpps / cmpss / cmppd / cmpsd
+            return true;  // SSE / SSE2 with memory as the source (none / 66 / F2 / F3): the destination is a register
+        case 0xBC: case 0xBD:
+            return true;  // bsf / bsr, and with F3 tzcnt / lzcnt
+        case 0xB8:
+            return o.f3;  // F3 0F B8 popcnt (without F3: jmpe, not read)
         case 0x7E:
             return o.f3;  // F3 0F 7E movq xmm, m64 (without it: movd m, mm/xmm, a store)
         default:
@@ -326,6 +339,9 @@ bool Reader::section(const GuardCodeSection& cs, GuardCodeReading& out) {
     }
     if (!refers) {
         return true;
+    }
+    if (!cs.outside_model.empty()) {
+        return fail(out, cs.name + " uses the guard, and " + cs.outside_model);
     }
     // In a section that uses the guard, the same for the candidates' sections: a write through an alias would not be seen.
     for (const GuardCodeReloc& rel : cs.relocs) {
@@ -410,9 +426,41 @@ bool Reader::section(const GuardCodeSection& cs, GuardCodeReading& out) {
         const auto it = std::lower_bound(code.begin(), code.end(), offset, [](const Insn& i, std::uint32_t v) { return i.start < v; });
         return it != code.end() && it->start == offset ? static_cast<std::uint32_t>(it - code.begin()) : kNone;
     };
-    // The control flow: successors of every instruction (calls return; a jump with a relocation is a tail call).
+    // Where control enters from outside (review round 3): every function start, and every place a symbol or a relocation
+    // of the object names (GuardEntryRef). A function start is also a boundary: no instruction falls through into one.
+    std::vector<bool> is_start(code.size(), false);
+    std::vector<bool> is_entry(code.size(), false);
+    for (const std::uint32_t e : entries) {
+        is_start[e] = true;
+        is_entry[e] = true;
+    }
+    for (const GuardEntryRef& ref : cs.entry_refs) {
+        bool hit = false;
+        for (const std::uint32_t o : ref.offsets) {
+            if (o == size) {
+                hit = true;  // the end of the section (a function's end)
+                continue;
+            }
+            if (const std::uint32_t k = index_of(o); k != kNone) {
+                is_entry[k] = true;
+                hit = true;
+            }
+        }
+        if (!hit && !ref.state_key) {
+            return fail(out, ref.from + " points into the middle of an instruction in " + cs.name + " (+" + hex(ref.offsets.empty() ? 0u : ref.offsets.front()) + ")");
+        }
+    }
+    for (std::uint32_t k = 0; k < code.size(); ++k) {
+        if (is_entry[k] && !is_start[k]) {
+            entries.push_back(k);  // reached from outside: the code reachable from it is shared too
+        }
+    }
+    // The control flow: successors of every instruction (calls return; a jump with a relocation leaves the section). No
+    // fall-through crosses into another function; `falls_off` marks an instruction that would (or would run off the end).
     std::vector<std::vector<std::uint32_t>> succ(code.size());
     std::vector<std::vector<std::uint32_t>> pred(code.size());
+    std::vector<bool> falls_off(code.size(), false);
+    std::vector<bool> leaves(code.size(), false);  // a branch out of the section (a relocated jmp / jcc)
     for (std::uint32_t k = 0; k < code.size(); ++k) {
         const Insn& insn = code[k];
         const bool is_jmp = (insn.flags & lde::kInsnJmp) != 0;
@@ -427,8 +475,15 @@ bool Reader::section(const GuardCodeSection& cs, GuardCodeReading& out) {
             }
             succ[k].push_back(t);
         }
-        if ((insn.flags & (lde::kInsnRet | lde::kInsnTrap)) == 0 && !is_jmp && k + 1 < code.size()) {
-            succ[k].push_back(k + 1);
+        if ((is_jmp || is_jcc) && insn.jump_to == kNone) {
+            leaves[k] = true;
+        }
+        if ((insn.flags & (lde::kInsnRet | lde::kInsnTrap)) == 0 && !is_jmp) {
+            if (k + 1 < code.size() && !is_start[k + 1]) {
+                succ[k].push_back(k + 1);
+            } else {
+                falls_off[k] = true;
+            }
         }
         for (const std::uint32_t s : succ[k]) {
             pred[s].push_back(k);
@@ -443,11 +498,6 @@ bool Reader::section(const GuardCodeSection& cs, GuardCodeReading& out) {
         const std::int64_t tail = static_cast<std::int64_t>(insn.start) + insn.length - (static_cast<std::int64_t>(rel.offset) + 4);
         return static_cast<std::int64_t>(a) + tail - rel.rel_tail;
     };
-    // A function start is entered from outside the section's code (its callers): an extra predecessor no walk can see.
-    std::vector<bool> is_entry(code.size(), false);
-    for (const std::uint32_t e : entries) {
-        is_entry[e] = true;
-    }
     const auto memory_operand = [&](const Insn& insn, const GuardCodeReloc& rel) {
         const Ops& o = insn.ops;
         return o.ok && o.riprel && (insn.flags & lde::kInsnRipRel) != 0 && rel.offset == insn.start + o.disp_at;
@@ -672,7 +722,16 @@ bool Reader::section(const GuardCodeSection& cs, GuardCodeReading& out) {
                 continue;  // already seen, or a join with the rest of the code
             }
             const Insn& insn = code[x];
+            if (falls_off[x] || leaves[x]) {
+                return fail(out, "the region of the claim at " + where(c) + " leaves its function at " + where(x) +
+                                     (leaves[x] ? " (a branch out of the section)" : " (it runs on into the next function)"));
+            }
             if (thread_safe) {
+                for (const std::uint32_t t : succ[x]) {
+                    if (is_entry[t]) {
+                        return fail(out, "the region of the guard's _Init_thread_header at " + where(c) + " continues at " + where(t) + ", which is entered from outside");
+                    }
+                }
                 if (insn.use == Use::Footer) {
                     footer_reached = true;
                     footers.insert(x);
@@ -685,8 +744,9 @@ bool Reader::section(const GuardCodeSection& cs, GuardCodeReading& out) {
                     // A path that ends here leaves the bracket without its footer (a ret, a tail call, the end of the
                     // section), unless it is a trap right behind a call that does not return (`call _CxxThrowException;
                     // int3`: an inlined throw).
-                    const bool noreturn = (insn.flags & lde::kInsnTrap) != 0 && x > 0 && (code[x - 1].flags & lde::kInsnCall) != 0 &&
-                                          pred[x].size() == 1 && pred[x][0] == x - 1;
+                    const std::uint8_t b0 = base[insn.start];
+                    const bool int3_or_ud2 = (insn.length == 1 && b0 == 0xCC) || (insn.length == 2 && b0 == 0x0F && base[insn.start + 1] == 0x0B);
+                    const bool noreturn = int3_or_ud2 && x > 0 && (code[x - 1].flags & lde::kInsnCall) != 0 && pred[x].size() == 1 && pred[x][0] == x - 1;
                     if (!noreturn) {
                         return fail(out, "the region of the guard's _Init_thread_header at " + where(c) + " leaves it at " + where(x) + " before its _Init_thread_footer");
                     }
@@ -705,6 +765,9 @@ bool Reader::section(const GuardCodeSection& cs, GuardCodeReading& out) {
         for (std::uint32_t x = 0; x < code.size(); ++x) {
             if (!in_region[x]) {
                 continue;
+            }
+            if (is_entry[x]) {
+                return fail(out, "the region of the claim at " + where(c) + " is entered from outside at " + where(x));
             }
             for (const std::uint32_t p : pred[x]) {
                 if (!in_region[p] && p != from) {
@@ -785,6 +848,54 @@ GuardCodeReading read_guard_code(std::span<const GuardCodeSection* const> code, 
     }
     out.proved = true;
     return out;
+}
+
+std::vector<std::uint32_t> relocation_target_offsets(std::uint16_t raw_type, std::span<const std::byte> field, std::uint8_t before2, std::uint8_t before1,
+                                                     std::uint32_t target_value) {
+    std::vector<std::uint32_t> out;
+    const auto field_value = [&](std::size_t n) -> std::int64_t {
+        std::uint64_t v = 0;
+        for (std::size_t i = 0; i < n && i < field.size(); ++i) {
+            v |= static_cast<std::uint64_t>(std::to_integer<std::uint8_t>(field[i])) << (8 * i);
+        }
+        return n == 4 ? static_cast<std::int64_t>(static_cast<std::int32_t>(static_cast<std::uint32_t>(v))) : static_cast<std::int64_t>(v);
+    };
+    const auto push = [&](std::int64_t o) {
+        if (o >= 0 && o <= 0xFFFFFFFFll) {
+            out.push_back(static_cast<std::uint32_t>(o));
+        }
+    };
+    switch (raw_type) {
+        case 0x0001:  // ADDR64
+            if (field.size() >= 8) {
+                push(static_cast<std::int64_t>(target_value) + field_value(8));
+            }
+            return out;
+        case 0x0002:  // ADDR32
+        case 0x0003:  // ADDR32NB
+            if (field.size() >= 4) {
+                push(static_cast<std::int64_t>(target_value) + field_value(4));
+            }
+            return out;
+        case 0x0004: case 0x0005: case 0x0006: case 0x0007: case 0x0008: case 0x0009: {  // REL32, REL32_1 .. REL32_5
+            if (field.size() < 4) {
+                return out;
+            }
+            const std::int64_t k = raw_type - 0x0004;
+            const std::int64_t a = static_cast<std::int64_t>(target_value) + field_value(4);
+            const bool branch = before1 == 0xE8 || before1 == 0xE9 || (before2 == 0x0F && before1 >= 0x80 && before1 <= 0x8F);
+            if (branch) {
+                push(a - k);  // call / jmp / jcc rel32: the field is the instruction's last bytes
+                return out;
+            }
+            for (std::int64_t tail = k; tail <= 4; ++tail) {
+                push(a + tail - k);
+            }
+            return out;
+        }
+        default:
+            return out;
+    }
 }
 
 }  // namespace cml::core::bind

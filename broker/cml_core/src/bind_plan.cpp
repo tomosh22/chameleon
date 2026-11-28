@@ -617,6 +617,8 @@ private:
     std::map<std::uint32_t, GuardCodeSection> guard_code_cache_;  // the code sections described so far, by index into secs_
     std::vector<std::vector<std::uint32_t>> guard_code_starts_;      // per section: the offsets of its function symbols
     bool guard_code_index_built_ = false;
+    std::vector<std::vector<const coff::Symbol*>> guard_code_symbols_;  // per section: every symbol defined in it
+    std::vector<std::string_view> guard_code_catch_maps_;               // `$tryMap$...` / `$handlerMap$...` symbols
     std::unordered_map<std::string_view, std::vector<std::uint32_t>> sections_by_target_;  // symbol name -> sections referring to it
     std::unordered_map<std::int32_t, std::vector<std::uint32_t>> sections_by_target_section_;  // symbol's section -> sections
     // (guard, static) pairs that the guard's name ties and its code proves it does not guard (a constant-initialised static
@@ -4800,10 +4802,19 @@ std::optional<std::set<std::uint32_t>> Planner::guard_code_statics(const Sym& gu
     if (!guard_code_index_built_) {
         guard_code_index_built_ = true;
         guard_code_starts_.assign(secs_.size(), {});
+        guard_code_symbols_.assign(secs_.size(), {});
         for (const coff::Symbol& s : obj_.symbols()) {
-            if (s.section_number > 0 && static_cast<std::size_t>(s.section_number) <= secs_.size() && s.is_function() && (s.is_external() || s.is_static())) {
-                guard_code_starts_[static_cast<std::size_t>(s.section_number) - 1].push_back(s.value);
+            if (s.name.rfind("$tryMap$", 0) == 0 || s.name.rfind("$handlerMap$", 0) == 0) {
+                guard_code_catch_maps_.push_back(s.name);
             }
+            if (s.section_number <= 0 || static_cast<std::size_t>(s.section_number) > secs_.size()) {
+                continue;
+            }
+            const std::size_t sec = static_cast<std::size_t>(s.section_number) - 1;
+            if (s.is_function() && (s.is_external() || s.is_static())) {
+                guard_code_starts_[sec].push_back(s.value);
+            }
+            guard_code_symbols_[sec].push_back(&s);  // review round 3: every symbol of a section is an entry of it
         }
         for (std::uint32_t i = 0; i < relocs_.size(); ++i) {
             for (const coff::ResolvedRelocation& rr : relocs_[i]) {
@@ -4863,6 +4874,48 @@ std::optional<std::set<std::uint32_t>> Planner::guard_code_statics(const Sym& gu
                 cs.relocs.push_back(std::move(r));
             }
             cs.function_starts = guard_code_starts_[i];
+            // Review round 3: every symbol defined in the section and every relocation of the object into it (from any linked
+            // section; debug information is not linked and transfers no control) may be entered from outside.
+            for (const coff::Symbol* sym : guard_code_symbols_[i]) {
+                GuardEntryRef ref;
+                ref.offsets.push_back(sym->value);
+                ref.from = "the symbol '" + std::string(sym->name) + "'";
+                cs.entry_refs.push_back(std::move(ref));
+                // A function with catch handlers is re-entered at its continuations, which the reader does not model.
+                if (sym->is_function()) {
+                    for (const std::string_view map : guard_code_catch_maps_) {
+                        if (map.size() > sym->name.size() && map.compare(map.size() - sym->name.size(), sym->name.size(), sym->name) == 0 && cs.outside_model.empty()) {
+                            cs.outside_model = "its function '" + std::string(sym->name) + "' has catch handlers ('" + std::string(map) +
+                                               "'), whose continuations re-enter it: not read";
+                        }
+                    }
+                }
+            }
+            if (const auto by = sections_by_target_section_.find(static_cast<std::int32_t>(i + 1)); by != sections_by_target_section_.end()) {
+                for (const std::uint32_t j : by->second) {
+                    const coff::ByteSpan from_data = secs_[j].sec->data;
+                    for (const coff::ResolvedRelocation& rr : relocs_[j]) {
+                        if (rr.reloc.type == coff::RelocType::Absolute || rr.target->section_number != static_cast<std::int32_t>(i + 1)) {
+                            continue;
+                        }
+                        const std::uint32_t at = rr.reloc.virtual_address;
+                        const std::size_t width = rr.reloc.type == coff::RelocType::Addr64 ? 8u : 4u;
+                        if (static_cast<std::uint64_t>(at) + width > from_data.size()) {
+                            continue;
+                        }
+                        GuardEntryRef ref;
+                        ref.offsets = relocation_target_offsets(rr.reloc.raw_type, from_data.subspan(at, width),
+                                                                at >= 2 ? std::to_integer<std::uint8_t>(from_data[at - 2]) : std::uint8_t{0},
+                                                                at >= 1 ? std::to_integer<std::uint8_t>(from_data[at - 1]) : std::uint8_t{0}, rr.target->value);
+                        if (ref.offsets.empty()) {
+                            continue;  // SECTION, SECREL, ...: no offset in the code
+                        }
+                        ref.state_key = starts_with(secs_[j].name, ".xdata");
+                        ref.from = "the relocation at +" + hex(at) + " of " + secs_[j].name + " (section " + std::to_string(j + 1) + ") to '" + std::string(rr.target->name) + "'";
+                        cs.entry_refs.push_back(std::move(ref));
+                    }
+                }
+            }
             cached = guard_code_cache_.emplace(static_cast<std::uint32_t>(i), std::move(cs)).first;
         }
         code.push_back(&cached->second);
