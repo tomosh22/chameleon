@@ -444,7 +444,7 @@ void ModuleIndex::set_status(IndexState state, std::uint32_t percent, std::strin
     }
 }
 
-std::optional<ScanResult> ModuleIndex::scan_files(const pdb::PdbIndex& index, const ScanCache::Lookup& previous) {
+std::optional<ScanResult> ModuleIndex::scan_files(const pdb::PdbIndex& index, const ScanCache::Lookup& previous, std::set<std::uint32_t>* disproved) {
     // WP-50 (second review): with a cache, every input is stamped before the scan uses it (ScanInputRecorder): a listed file
     // when its compiland is processed, a file the include search reads (and its directory) just before the read. After the scan
     // each input is stamped again; any difference (an edit while scanning) makes the part that used it uncacheable, and so does
@@ -678,6 +678,11 @@ std::optional<ScanResult> ModuleIndex::scan_files(const pdb::PdbIndex& index, co
                 }
                 if (!problem[i].empty()) {
                     c.not_cacheable = problem[i];
+                    if (scanned_now[k] == 0 && disproved != nullptr) {
+                        // (Review: a reused part whose input changed after the lookup holds a stale graph; it must not reach
+                        // this index either. The caller scans it again.)
+                        disproved->insert(c.compiland);
+                    }
                     break;
                 }
                 if (scanned_now[k] == 0) {
@@ -778,7 +783,15 @@ void ModuleIndex::run() {
         if (previous.result && previous.reason.empty()) {
             scan = previous.result;
         }
-        const std::size_t entries = previous.result ? previous.result->compilands.size() : 0;
+        // (Review: without an entry every object compiland is scanned, and the line says so.)
+        std::size_t entries = 0;
+        if (previous.result) {
+            entries = previous.result->compilands.size();
+        } else {
+            for (std::uint32_t ci = 0; ci < index->compiland_count(); ++ci) {
+                entries += is_object_compiland(*index, ci) ? 1 : 0;
+            }
+        }
         CML_LOG(Info, "WP50-SCAN-CACHE %s module=%s reason=%s inputs=%zu check_ms=%.1f compilands=%zu reused=%zu rescan=%zu",
                 scan ? "hit" : previous.reusable != 0 ? "partial" : "miss", module_name.c_str(), scan ? "same-stamp" : previous.reason.c_str(),
                 previous.result ? previous.result->inputs.size() : std::size_t{0}, ms_since(scan_started), entries, previous.reusable, entries - previous.reusable);
@@ -809,7 +822,47 @@ void ModuleIndex::run() {
         cache_state = "warm";
         reused = scan->compilands.size();
     } else {
-        std::optional<ScanResult> fresh = scan_files(*index, previous);
+        // (Review: a part the lookup vouched for can be proven stale by the scan of another part, when an input they share
+        // changed after the lookup. Such a part is scanned again in a second pass; if that pass is disproved as well, nothing is
+        // reused for this index: everything is scanned and the result is not stored.)
+        if (spec_.before_scan_for_testing) {
+            spec_.before_scan_for_testing(1);
+        }
+        std::set<std::uint32_t> disproved;
+        std::optional<ScanResult> fresh = scan_files(*index, previous, &disproved);
+        bool store_allowed = true;
+        if (fresh && !disproved.empty()) {
+            ScanCache::Lookup second = previous;
+            std::string why;
+            for (std::size_t k = 0; k < second.stale.size(); ++k) {
+                const CompilandScan& part = second.result->compilands[k];
+                if (second.stale[k].empty() && disproved.count(part.compiland) != 0) {
+                    second.stale[k] = "changed-after-lookup";
+                    --second.reusable;
+                }
+            }
+            for (const CompilandScan& c : fresh->compilands) {
+                if (why.empty() && disproved.count(c.compiland) != 0) {
+                    why = c.not_cacheable;
+                }
+            }
+            CML_LOG(Info, "WP55-SCAN-RESCAN module=%s second-pass compilands=%zu reason=%s", module_name.c_str(), disproved.size(), why.c_str());
+            if (spec_.before_scan_for_testing) {
+                spec_.before_scan_for_testing(2);
+            }
+            disproved.clear();
+            fresh = scan_files(*index, second, &disproved);
+            if (fresh && !disproved.empty()) {
+                CML_LOG(Info, "WP55-SCAN-RESCAN module=%s gave-up compilands=%zu (inputs keep changing: scanned in full, not stored)", module_name.c_str(),
+                        disproved.size());
+                if (spec_.before_scan_for_testing) {
+                    spec_.before_scan_for_testing(3);
+                }
+                disproved.clear();
+                fresh = scan_files(*index, ScanCache::Lookup{}, &disproved);
+                store_allowed = false;
+            }
+        }
         if (!fresh) {
             return;  // cancelled
         }
@@ -827,7 +880,7 @@ void ModuleIndex::run() {
                     first = first != nullptr ? first : &c.not_cacheable;
                 }
             }
-            const bool keep = stamp && (uncached < shared->compilands.size() || shared->compilands.empty());
+            const bool keep = store_allowed && stamp && (uncached < shared->compilands.size() || shared->compilands.empty());
             if (keep) {
                 spec_.scan_cache->store(spec_.module_path, *stamp, shared);
             }

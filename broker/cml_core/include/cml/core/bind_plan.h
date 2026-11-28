@@ -335,8 +335,14 @@ public:
     // A zero identity (an image of unknown identity) is never kept.
     void store(const pdb::PdbId& image, std::uint32_t compiland, std::uint32_t proc, CachedInlineVerdict verdict);
     std::size_t size() const;
-    std::uint64_t hits() const;    // find() calls that found a verdict
+    std::uint64_t hits() const;    // find() calls that found a verdict (the planner's batch probes included)
     std::uint64_t stores() const;  // verdicts stored
+    // What the planner reports (WP55-INLINE-CACHE): verdicts of procedures it asked about that came from here, and verdicts it
+    // judged from a read of the module stream (whether or not the sites could be read, and whether or not they were kept).
+    void count_kept();
+    void count_read();
+    std::uint64_t kept() const;
+    std::uint64_t reads() const;
 
 private:
     mutable std::mutex mutex_;
@@ -344,6 +350,8 @@ private:
     std::map<std::pair<std::uint32_t, std::uint32_t>, CachedInlineVerdict> entries_;  // (compiland, proc)
     mutable std::uint64_t hits_ = 0;
     std::uint64_t stores_ = 0;
+    std::uint64_t kept_ = 0;
+    std::uint64_t reads_ = 0;
 };
 
 struct PlanInput {

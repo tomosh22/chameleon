@@ -545,6 +545,8 @@ TEST_CASE("WP-55 (R-62): the verdicts on inline sites are kept across the plans 
             CHECK(decision(partial, kOwn).decision != DecisionKind::BindOldData);
             CHECK(cache.stores() == 1);  // read once, by the first plan
             CHECK(cache.hits() == static_cast<std::uint64_t>(round));
+            CHECK(cache.kept() == static_cast<std::uint64_t>(round));  // WP55-INLINE-CACHE kept=
+            CHECK(cache.reads() == 1);                                 // ... read=
         }
         CHECK(cache.size() == 1);
     }
@@ -571,6 +573,8 @@ TEST_CASE("WP-55 (R-62): the verdicts on inline sites are kept across the plans 
         }
         CHECK(cache.stores() == 1);
         CHECK(cache.hits() == 1);
+        CHECK(cache.kept() == 1);
+        CHECK(cache.reads() == 1);
     }
     SUBCASE("a changed input: a verdict kept for another image, or for another procedure at that place, is not used") {
         // A function that inlined nothing, and a poisoned cache that says it inlined a lambda: used, it would refuse.
@@ -607,6 +611,8 @@ TEST_CASE("WP-55 (R-62): the verdicts on inline sites are kept across the plans 
             cache.store(other, 0, proc, poison);
             CHECK(plan_with(cache).empty());  // paired, as without a cache
             CHECK(cache.hits() == 0);
+            CHECK(cache.kept() == 0);
+            CHECK(cache.reads() == 1);  // read afresh
             CHECK(cache.size() == 1);  // the stale entry went with its image
             CHECK_FALSE(cache.find(other, 0, proc, rva, "o2_step").has_value());
             CHECK(cache.find(w.index->id(), 0, proc, rva, "o2_step").has_value());
@@ -632,6 +638,35 @@ TEST_CASE("WP-55 (R-62): the verdicts on inline sites are kept across the plans 
             CHECK_FALSE(cache.find(cml::pdb::PdbId{}, 0, proc, rva, "o2_step").has_value());
         }
     }
+    SUBCASE("kept= counts the verdicts asked for, not the batch's probes; read= every verdict judged from a read") {
+        // Two procedures hold a record named like the patch's static; only o2_step's verdict is asked for. o2_other's verdict is
+        // in the cache already: the batch probes it (a hit) but nobody asked for it, so it is not `kept`.
+        SynthWorld w = basic_world(false);
+        OldTypes t;
+        proc_inlining(w, "o2_step", 0x60, t.fn_void, {{"sname", 0x20}}, {});
+        proc_inlining(w, "o2_other", 0x90, t.fn_void, {{"sname", 0x30}}, {});
+        open_with(w, t);
+        const auto [other, other_rva] = proc_of(w, "o2_other");
+        CachedInlineVerdict clean;
+        clean.proc_rva = other_rva;
+        clean.proc_name = "o2_other";
+        InlineVerdictCache cache;
+        cache.store(w.index->id(), 0, other, clean);
+        Built b = own_static_patch();
+        PlanInput in = w.input(b);
+        in.inline_verdicts = &cache;
+        auto r = plan_bind(in);
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        CHECK(decision(*r, kOwn).old_address.rva == 0x3020);
+        CHECK(cache.hits() == 1);   // the probe of o2_other
+        CHECK(cache.kept() == 0);   // ... not asked for
+        CHECK(cache.reads() == 1);  // o2_step, read
+        // The next plan asks for o2_step again: from the cache, and counted.
+        auto again = plan_bind(in);
+        REQUIRE_MESSAGE(again.has_value(), err(again));
+        CHECK(cache.kept() == 1);
+        CHECK(cache.reads() == 1);
+    }
     SUBCASE("an inlinee that cannot be read is part of the image: the verdict is kept and refuses again from the cache") {
         SynthWorld w = basic_world(false);
         OldTypes t;
@@ -648,5 +683,7 @@ TEST_CASE("WP-55 (R-62): the verdicts on inline sites are kept across the plans 
         }
         CHECK(cache.stores() == 1);
         CHECK(cache.hits() == 1);
+        CHECK(cache.kept() == 1);
+        CHECK(cache.reads() == 1);
     }
 }

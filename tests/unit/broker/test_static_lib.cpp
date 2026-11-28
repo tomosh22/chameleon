@@ -392,12 +392,14 @@ TEST_CASE("WP-55 (R-58): after an edit only the compilands whose inputs changed 
 }
 
 namespace {
-std::shared_ptr<ModuleIndex> build_index(const World& w, const std::shared_ptr<ScanCache>& cache, std::function<void()> after_scan = nullptr) {
+std::shared_ptr<ModuleIndex> build_index(const World& w, const std::shared_ptr<ScanCache>& cache, std::function<void()> after_scan = nullptr,
+                                        std::function<void(int)> before_scan = nullptr) {
     ModuleIndexSpec spec;
     spec.module_path = w.exe;
     spec.scan_includes = true;
     spec.scan_cache = cache;
     spec.after_scan_for_testing = std::move(after_scan);
+    spec.before_scan_for_testing = std::move(before_scan);
     std::shared_ptr<ModuleIndex> index = ModuleIndex::start(spec);
     REQUIRE(index->wait(30000));
     REQUIRE(index->status().state == IndexState::Ready);
@@ -430,6 +432,85 @@ TEST_CASE("WP-50 (second review): a source edited while the index scans is not c
     const std::shared_ptr<ModuleIndex> third = build_index(w, cache);
     CHECK(third->status().scan_cache == "warm");
     CHECK(tracks_file(third, w.dir.file("new.h")));
+}
+
+TEST_CASE("WP-55 (review): a reused part disproved by an input that changed after the lookup is scanned again before it reaches the index") {
+    QuietLogs quiet;
+    World w;
+    const auto cache = std::make_shared<ScanCache>();
+    // app.cpp and good.cpp both include shared.h.
+    write_text(w.dir.file("shared.h"), "#pragma once\n");
+    write_text(w.dir.file("app.cpp"), "#include \"shared.h\"\nint app() { return 1; }\n");
+    write_text(w.dir.file("good.cpp"), "#include \"shared.h\"\nint good() { return 1; }\n");
+    bump_mtime(w.dir.file("app.cpp"));
+    bump_mtime(w.dir.file("good.cpp"));
+    CHECK(build_index(w, cache)->status().scan_cache == "cold");
+
+    // app.cpp is edited (its part is stale); good.cpp's part is vouched for by the lookup. Between the lookup and the scan,
+    // shared.h gains #include "new.h". The scan of app.cpp sees the new shared.h, which disproves good.cpp's part: without the
+    // second pass good.cpp's compiland would miss new.h for the session.
+    write_text(w.dir.file("app.cpp"), "#include \"shared.h\"\nint app() { return 2; }\n");
+    bump_mtime(w.dir.file("app.cpp"));
+    std::vector<int> passes;
+    const std::shared_ptr<ModuleIndex> index = build_index(w, cache, nullptr, [&](int pass) {
+        passes.push_back(pass);
+        if (pass == 1) {
+            write_text(w.dir.file("new.h"), "#pragma once\nint fresh();\n");
+            write_text(w.dir.file("shared.h"), "#pragma once\n#include \"new.h\"\n");
+            bump_mtime(w.dir.file("shared.h"));
+        }
+    });
+    CHECK(passes == std::vector<int>{1, 2});
+    CHECK(index->status().scan_cache == "partial");
+    CHECK(index->status().scan_rescanned == 2);  // app.cpp's, and good.cpp's in the second pass
+    CHECK(index->status().scan_reused == 3);
+    write_text(w.dir.file("new.h"), "#pragma once\nint fresh(int);\n");
+    bump_mtime(w.dir.file("new.h"));
+    Result<ModuleIndex::Sweep> swept = index->sweep();
+    REQUIRE(swept.has_value());
+    CHECK(std::find(swept->compilands.begin(), swept->compilands.end(), kPlain) != swept->compilands.end());
+    CHECK(std::find(swept->compilands.begin(), swept->compilands.end(), kLibGood) != swept->compilands.end());  // the bug: absent
+    // The second pass's result was stored: the next index (new.h changed since) rescans the two parts that include it.
+    const std::shared_ptr<ModuleIndex> next = build_index(w, cache);
+    CHECK(next->status().scan_cache == "partial");
+    CHECK(next->status().scan_rescanned == 2);
+    CHECK(build_index(w, cache)->status().scan_cache == "warm");
+}
+
+TEST_CASE("WP-55 (review): when the second pass is disproved too, nothing is reused for that index and nothing is stored") {
+    QuietLogs quiet;
+    World w;
+    const auto cache = std::make_shared<ScanCache>();
+    // app.cpp includes shared.h (as good.cpp does) and noenv.cpp, the source the skipped member lists.
+    write_text(w.dir.file("shared.h"), "#pragma once\n");
+    write_text(w.dir.file("app.cpp"), "#include \"shared.h\"\n#include \"noenv.cpp\"\nint app() { return 1; }\n");
+    write_text(w.dir.file("good.cpp"), "#include \"shared.h\"\nint good() { return 1; }\n");
+    bump_mtime(w.dir.file("app.cpp"));
+    bump_mtime(w.dir.file("good.cpp"));
+    CHECK(build_index(w, cache)->status().scan_cache == "cold");
+
+    write_text(w.dir.file("app.cpp"), "#include \"shared.h\"\n#include \"noenv.cpp\"\nint app() { return 2; }\n");
+    bump_mtime(w.dir.file("app.cpp"));
+    std::vector<int> passes;
+    const std::shared_ptr<ModuleIndex> index = build_index(w, cache, nullptr, [&](int pass) {
+        passes.push_back(pass);
+        if (pass == 1) {  // disproves good.cpp's part
+            write_text(w.dir.file("shared.h"), "#pragma once\n// 1\n");
+            bump_mtime(w.dir.file("shared.h"));
+        } else if (pass == 2) {  // disproves noenv.cpp's part, reused in the second pass
+            write_text(w.dir.file("noenv.cpp"), "int noenv() { return 2; }\n");
+            bump_mtime(w.dir.file("noenv.cpp"));
+        }
+    });
+    CHECK(passes == std::vector<int>{1, 2, 3});
+    CHECK(index->status().scan_cache == "cold");
+    CHECK(index->status().scan_reused == 0);
+    CHECK(index->status().scan_rescanned == 5);
+    // Not stored: the entry of the first index is still the one looked up, so app, good and noenv are stale against it.
+    const std::shared_ptr<ModuleIndex> next = build_index(w, cache);
+    CHECK(next->status().scan_cache == "partial");
+    CHECK(next->status().scan_rescanned == 3);
+    CHECK(build_index(w, cache)->status().scan_cache == "warm");
 }
 
 TEST_CASE("WP-55 (R-63): a header over the size limit is cached with its stamp; a file locked against reading keeps its compiland out of the cache") {

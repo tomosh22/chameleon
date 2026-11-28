@@ -93,6 +93,9 @@ struct ModuleIndexSpec {
     // Tests (WP-50): called on the worker thread after the scan of the file lists and includes, before its inputs are compared
     // with the stamps taken while scanning (an edit made "during the scan").
     std::function<void()> after_scan_for_testing;
+    // Tests (WP-55): called on the worker thread after the cache lookup, before each pass of the scan (1, 2, 3: see
+    // ModuleIndex::run), so that an input can change between the lookup that vouched for a part and the scan of another part.
+    std::function<void(int pass)> before_scan_for_testing;
 };
 
 // WP-26b: a compiland that cannot be reloaded although its object is real (no build environment, missing source file).
@@ -328,8 +331,10 @@ private:
     void set_status(IndexState state, std::uint32_t percent, std::string phase, std::optional<Diag> error = std::nullopt, bool drop_pdb = false);
     Result<std::shared_ptr<const pdb::PdbIndex>> open_pdb();
     // The file lists and the include scan of every compiland (WP-50: cached as a ScanResult). WP-55: the parts of `previous`
-    // that can be reused are taken from it, the others are scanned. nullopt when cancelled.
-    std::optional<ScanResult> scan_files(const pdb::PdbIndex& index, const ScanCache::Lookup& previous);
+    // that can be reused are taken from it, the others are scanned. nullopt when cancelled. `*disproved` receives the
+    // compilands of reused parts that an input stamped differently by a part scanned now proved stale (it changed after the
+    // lookup): the result must not be used then, and the caller scans again with those parts stale too.
+    std::optional<ScanResult> scan_files(const pdb::PdbIndex& index, const ScanCache::Lookup& previous, std::set<std::uint32_t>* disproved);
 
     ModuleIndexSpec spec_;
     mutable std::mutex mutex_;

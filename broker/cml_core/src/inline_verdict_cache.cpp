@@ -45,4 +45,24 @@ std::uint64_t InlineVerdictCache::stores() const {
     return stores_;
 }
 
+void InlineVerdictCache::count_kept() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++kept_;
+}
+
+void InlineVerdictCache::count_read() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++reads_;
+}
+
+std::uint64_t InlineVerdictCache::kept() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return kept_;
+}
+
+std::uint64_t InlineVerdictCache::reads() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return reads_;
+}
+
 }  // namespace cml::core::bind

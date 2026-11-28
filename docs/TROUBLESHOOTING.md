@@ -49,6 +49,8 @@ revert, restart).
      edited source, a header created or removed): the compilands that depend on it are scanned again, because their part of
      the graph may be stale. `inputs` files and directories were checked in `check_ms`. Each compiland scanned again is named
      by a `WP55-SCAN-RESCAN module=... compiland=<n> object=<file> reason=...` line (the first 20; the rest at trace).
+     `WP55-SCAN-RESCAN ... second-pass` means a file changed between the check and the scan, so parts the check had vouched
+     for were scanned again; `gave-up` that files kept changing, so that index scanned everything and kept nothing.
      `WP50-INDEX ... cache=cold|partial|warm|off reused=... rescanned=...` gives the same counts.
      `store=partial|skipped reason=unreadable:<path> uncached=<n>` means `uncached` compilands met a file that exists but
      could not be read (locked by an editor's save, a read error), and `reason=changed-during-scan:<path>` means a file
@@ -56,8 +58,8 @@ revert, restart).
      again. A file over the scanner's 8 MiB limit is not read, but it is not a failed read either: it is kept with its stamp
      like any other input (WP-55). Set-option `cache_include_scan` false scans every time.
    * `WP55-INLINE-CACHE module=... object=... kept=... read=... entries=...`: the bind planner's verdicts on what an old
-     procedure inlined (WP-51) that this plan took from an earlier plan against the same module image (`kept`) and those
-     it had to read from the PDB (`read`). They are kept per module state and dropped with it (disable, unload, a new
+     procedure inlined (WP-51) that this plan asked for and took from an earlier plan against the same module image (`kept`),
+     and those it read from the PDB (`read`, unreadable ones included). They are kept per module state and dropped with it (disable, unload, a new
      process).
    * The two set-options of WP-50 (control command `set-option {"name":..., "value": true|false}`, both default `true`):
      `prefetch_module_image` (read the module file for the function comparison in the background once its index is

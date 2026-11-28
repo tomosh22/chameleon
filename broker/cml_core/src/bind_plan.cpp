@@ -622,6 +622,7 @@ private:
         std::size_t closures = 0;
         std::size_t unreadable = 0;
         bool asked = false;  // counted in the WP51-INLINEES summary (a verdict of the batch nobody asked for is not)
+        bool cached = false;  // WP-55: taken from PlanInput::inline_verdicts
     };
     std::map<std::uint32_t, InlineVerdict> inline_verdicts_;  // by the procedure's index in comp_syms_
     const InlineVerdict& inline_verdict(std::uint32_t proc);
@@ -1186,6 +1187,9 @@ void Planner::judge_inlinees(std::uint32_t proc, const Result<pdb::PdbIndex::Pro
     InlineVerdict& v = inline_verdicts_[proc];
     const pdb::SymbolView& p = comp_syms_[proc];
     const std::string where = "'" + std::string(p.name) + "' (rva " + hex(p.rva) + ")";
+    if (in_.inline_verdicts != nullptr) {
+        in_.inline_verdicts->count_read();  // WP-55: a verdict judged from a read (kept below only when the sites could be read)
+    }
     if (!sites) {
         v.risk = "the inline sites of " + where + " cannot be read (" + sites.error().message + ")";
         v.unreadable = 1;
@@ -1265,6 +1269,7 @@ bool Planner::cached_verdict(std::uint32_t proc) {
     v.inlinees = kept->inlinees;
     v.closures = kept->closures;
     v.unreadable = kept->unreadable;
+    v.cached = true;
     CML_LOG(Trace, "WP55-INLINE-CACHE proc='%s' rva=%s verdict=%s (kept from an earlier plan)", std::string(p.name).c_str(), hex(p.rva).c_str(),
             v.risk.empty() ? "no-closure" : "risk");
     return true;
@@ -1318,6 +1323,9 @@ const Planner::InlineVerdict& Planner::inline_verdict(std::uint32_t proc) {
     if (!v.asked) {
         // (Review: the summary counts only the procedures whose verdict was asked for, not the rest of the batch.)
         v.asked = true;
+        if (v.cached) {
+            in_.inline_verdicts->count_kept();  // WP-55: only verdicts asked for count, not the batch's probes
+        }
         ++wp51_procs_;
         wp51_sites_ += v.sites;
         wp51_closures_ += v.closures;
