@@ -149,8 +149,9 @@ void LogHub::write(LogLevel level, const char* file, int line, const char* messa
         while (ring_.size() > options_.ring_size) {
             ring_.pop_front();
         }
-        if (options_.file != nullptr && writer_.joinable()) {
-            // WP-58: queued for the writer; a warning or an error is on disk before the call returns.
+        if (options_.file != nullptr && writer_.joinable() && !stop_) {
+            // WP-58: queued for the writer; a warning or an error is on disk before the call returns. (Once the hub is being
+            // destroyed, a late record is written by its own thread, below.)
             const bool was_empty = queued_.empty();
             queued_ += text;
             queued_ += '\n';
