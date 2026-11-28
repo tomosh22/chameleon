@@ -213,7 +213,7 @@ std::vector<Diag> prove_hashed_lambdas(const NarrowInput& input);
 // plan's decisions. Unchanged proves the pairing: the old procedure used that record exactly as the new one uses the
 // lambda's static. Anything else (changed, not hooked, not comparable, an earlier patch's code that differs) gives one
 // CML3207 per listed static of that procedure. One verdict per procedure. Logs `WP53-INLINED-PROOF static=... proc=...
-// proven=unchanged|refused` (trace) per static and `WP53-INLINED object=... listed=N proven=N refused=N` (Info, when the
+// proven=unchanged|refused` (trace) per static and `WP53-INLINED object=... listed=N proven=N refused=N skipped=N` (Info, when the
 // plan lists any).
 std::vector<Diag> prove_inlined_lambda_statics(const NarrowInput& input);
 

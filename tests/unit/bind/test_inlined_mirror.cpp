@@ -11,6 +11,8 @@
 // <case>.patch.obj (the edited source), built by tests/unit/bind/wp53/build.sh from src/. On main (d110b5d) c10 and c7
 // were accepted with the wrong pairing (c10 by the layout, c7 by the place in the function), and c3, c4, c5, c12 were
 // refused only because their guard found no layout (CML3600): the edit had changed the order the globals were created in.
+// In c4 and c12 that refused guard is also the only difference the code proof sees; with the layout kept such an edit has
+// the old code and is accepted (c13), as ruled for c7.
 #include <algorithm>
 #include <fstream>
 #include <iterator>
@@ -130,10 +132,6 @@ TEST_CASE("R-61: a lambda's new static is not given its caller's deleted static 
         const Case c("c3_r61");
         check_refused(c, kLambdaX);
     }
-    SUBCASE("c4: the lambda is new in the patch") {
-        const Case c("c4_r61_newlambda");
-        check_refused(c, kLambdaX);
-    }
     SUBCASE("c5: the lambda already had a static y and gains x") {
         const Case c("c5_r61_other");
         check_refused(c, kLambdaX);
@@ -143,23 +141,62 @@ TEST_CASE("R-61: a lambda's new static is not given its caller's deleted static 
     SUBCASE("c10: the own x was in a block of f; the layout survives the edit, so main accepted the wrong pairing") {
         const Case c("c10_r61_block");
         CHECK(c.planned);  // the planner still pairs it; the proof refuses
+        REQUIRE(c.listed(kLambdaX) != nullptr);
         CHECK(c.listed(kLambdaX)->how == BindSource::CompilandRva);
-        check_refused(c, kLambdaX);
-    }
-    SUBCASE("c12: an R-61 edit that keeps f's layout of code but not of data") {
-        const Case c("c12_r61_samecode");
         check_refused(c, kLambdaX);
     }
 }
 
-TEST_CASE("R-61 is refused whatever the order the globals were created in (not by the guard's layout)") {
-    // c3, c4, c5 and c12 fail the plan with CML3600 (their guard found no layout: the edit changed the order in which the
-    // globals were created); c10 keeps the order and plans. The proof refuses all of them alike.
-    for (const char* name : {"c3_r61", "c4_r61_newlambda", "c5_r61_other", "c10_r61_block", "c12_r61_samecode"}) {
+TEST_CASE("R-61 is refused whatever the order the globals were created in, where the code of f changed") {
+    // c3 and c5 fail the plan with CML3600 as well (their guard found no layout: the edit changed the order in which the
+    // globals were created); c10 keeps the order and plans. In all three the code of f itself changed, and the proof
+    // refuses them alike, whatever the guard's fate.
+    for (const char* name : {"c3_r61", "c5_r61_other", "c10_r61_block"}) {
         const Case c(name);
         CAPTURE(c.name);
-        CHECK(c.refusal(kLambdaX) != nullptr);
+        const Diag* d = c.refusal(kLambdaX);
+        REQUIRE(d != nullptr);
+        CHECK_FALSE(contains(d->message, "target-new"));  // a change of f's own code, not the refused guard
     }
+}
+
+TEST_CASE("c4 and c12: their refusal comes from the guard that found no layout, not from f's code") {
+    // In c4 (the lambda new in the patch) and c12 (x moved into a lambda that only returns it) the only difference the
+    // comparator finds is the reference to the lambda's guard, which the plan could not place (CML3600: the edit changed the
+    // order the globals were created in) and made new ("target-new"). With the layout kept, a c12-shaped edit has the old
+    // code and is accepted: see c13.
+    for (const char* name : {"c4_r61_newlambda", "c12_r61_samecode"}) {
+        const Case c(name);
+        CAPTURE(c.name);
+        CHECK_FALSE(c.planned);
+        bool cml3600 = false;
+        for (const Diag& e : c.plan_errors) {
+            cml3600 = cml3600 || e.code == diag::kGuardMismatch;
+        }
+        CHECK(cml3600);
+        const Diag* d = c.refusal(kLambdaX);
+        REQUIRE(d != nullptr);
+        CHECK(contains(d->message, "target-new"));
+        CHECK(contains(d->message, "$TSS0"));
+    }
+}
+
+TEST_CASE("c13: an R-61 edit with the guard placed and f's code unchanged is accepted (ADR-0045, as c7)") {
+    // c12 rewritten so that s_count is created first on both sides: the layout is kept, the lambda's guard is placed on f's
+    // old guard, and the patch's f is the old f byte for byte. The running program cannot tell the binding from an unchanged
+    // function, so the pairing stands and the lambda's x keeps f's deleted x's value.
+    const Case c("c13_r61_samecode_layout");
+    const std::string first_error = c.plan_errors.empty() ? std::string() : c.plan_errors.front().message;
+    CAPTURE(first_error);
+    REQUIRE(c.planned);
+    REQUIRE(c.listed(kLambdaX) != nullptr);
+    const SymbolDecision* x = c.plan.find_decision(c.listed(kLambdaX)->symbol);
+    REQUIRE(x != nullptr);
+    CHECK(x->decision == DecisionKind::BindOldData);
+    const SymbolDecision* guard = c.plan.find_decision("?$TSS0@?1???R<lambda_0>@?0??f@@YAXXZ@QEBA@XZ@4HA");
+    REQUIRE(guard != nullptr);
+    CHECK(guard->decision == DecisionKind::BindOldData);
+    CHECK(c.proof.empty());
 }
 
 TEST_CASE("WP-40's lambda statics in their caller still bind while the caller is unchanged (c11, the fixture's mark_3)") {

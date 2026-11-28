@@ -1303,10 +1303,12 @@ std::vector<Diag> prove_inlined_lambda_statics(const NarrowInput& input) {
     };
     std::size_t proven = 0;
     std::size_t refused = 0;
+    std::size_t skipped = 0;  // re-decided after the listing (refused or unbound by a later step): nothing to prove
     for (const bind::InlinedLambdaStatic& s : plan.inlined_lambda_statics) {
         const bind::SymbolDecision* d = plan.find_decision(s.symbol);
         if (d == nullptr || d->decision != bind::DecisionKind::BindOldData || d->old_address.rva != s.record_rva) {
             CML_LOG(Trace, "WP53-INLINED-PROOF static='%s' proc='%s' skipped (no longer bound to the record at rva %s)", s.display.c_str(), s.proc.c_str(), hex(s.record_rva).c_str());
+            ++skipped;
             continue;
         }
         const std::string& why = verdict_of(s);
@@ -1323,7 +1325,8 @@ std::vector<Diag> prove_inlined_lambda_statics(const NarrowInput& input) {
                                      s.proc + "' proves the record is this lambda's (it may be a static the edit deleted from '" + s.proc + "'), and " + why,
                                  "Leave '" + s.proc + "' unchanged while the program runs (edit other functions of the file), rename the static, or hot-restart."));
     }
-    CML_LOG(Info, "WP53-INLINED object=%s listed=%zu proven=%zu refused=%zu", plan.object_name.c_str(), plan.inlined_lambda_statics.size(), proven, refused);
+    CML_LOG(Info, "WP53-INLINED object=%s listed=%zu proven=%zu refused=%zu skipped=%zu", plan.object_name.c_str(), plan.inlined_lambda_statics.size(), proven, refused,
+            skipped);
     return out;
 }
 
