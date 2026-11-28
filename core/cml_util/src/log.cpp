@@ -20,6 +20,7 @@ struct SinkRecord {
     void* user;
 };
 std::atomic<const SinkRecord*> g_record{nullptr};  // nullptr = default stderr sink
+std::atomic<unsigned long long> g_written{0};  // WP-58: records dispatched
 
 const char* base_name(const char* path) noexcept {
     if (path == nullptr) {
@@ -64,6 +65,10 @@ void set_log_sink(LogSink sink, void* user) noexcept {
     g_record.store(record, std::memory_order_release);
 }
 
+unsigned long long log_records_written() noexcept {
+    return g_written.load(std::memory_order_relaxed);
+}
+
 const char* to_string(LogLevel level) noexcept {
     switch (level) {
         case LogLevel::Trace:
@@ -93,6 +98,7 @@ void log_write(LogLevel level, const char* file, int line, const char* fmt, ...)
         std::memcpy(buffer, kFailed, sizeof(kFailed));
     }
 
+    g_written.fetch_add(1, std::memory_order_relaxed);
     const SinkRecord* record = g_record.load(std::memory_order_acquire);
     if (record != nullptr) {
         record->sink(record->user, level, file, line, buffer);

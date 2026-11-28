@@ -183,6 +183,24 @@ double ms_between(Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
 }
 
+// WP-58: the planner's stages of a unit, summed over its plans (rule (d) can plan a unit twice).
+void add_stage_times(bind::PlanStageTimes& sum, const bind::PlanStageTimes& t) {
+    sum.compiland += t.compiland;
+    sum.symbols += t.symbols;
+    sum.defined += t.defined;
+    sum.statics += t.statics;
+    sum.candidates += t.candidates;
+    sum.inline_sites += t.inline_sites;
+    sum.guards += t.guards;
+    sum.reset += t.reset;
+    sum.thread_locals += t.thread_locals;
+    sum.undefined += t.undefined;
+    sum.fixups += t.fixups;
+    sum.initialisers += t.initialisers;
+    sum.assemble += t.assemble;
+    sum.log_lines += t.log_lines;
+}
+
 class Lap {
 public:
     Lap() : t_(Clock::now()) {}
@@ -992,6 +1010,8 @@ private:
         const Clock::time_point plan_image = Clock::now();
         const std::size_t export_parses_before = ctx_.exports ? ctx_.exports->parses() : 0;
         const pdb::Timings pdb_before = pdb.timings();  // WP-50: the PDB's lazily loaded tables, before and after the bind plan
+        const unsigned long long log_lines_before = log_records_written();  // WP-58: what the plan stage logged
+        bind::PlanStageTimes stages;  // WP-58: the planner's stages (both plans of a unit that rule (d) plans again)
         FileProcessModules process_modules(snapshot_.modules, LoadedModule{module_.path, module_.base, module_.size}, ctx_.exports, image);
         const OverlayRegistry registry(*this);
         bind::PlanInput in;
@@ -1019,6 +1039,7 @@ private:
         }
         s.plan = std::move(*planned);
         bind::BindPlan& plan = s.plan;
+        add_stage_times(stages, plan.stage_ms);
         const Clock::time_point plan_bound = Clock::now();
         // WP-40 (R-48 item 5, ADR-0043 rule (d)): lambdas the type records cannot tell apart were paired by their numbers;
         // their call operators' code decides. Where it shows that lambdas changed places, the unit is planned again with
@@ -1040,6 +1061,7 @@ private:
                     return first_failure("plan", errors, again.error());
                 }
                 plan = std::move(*again);
+                add_stage_times(stages, plan.stage_ms);
             }
         }
         // WP-46 (F-41.2, ADR-0043 ruling D1): lambdas cl names by a hash (its legacy lambda processor) were paired by that name,
@@ -1115,13 +1137,20 @@ private:
             const Clock::time_point plan_done = Clock::now();
             const std::size_t export_parses = (ctx_.exports ? ctx_.exports->parses() : 0) - export_parses_before;
             const pdb::Timings pdb_after = pdb.timings();
+            // WP-58 (R-62): the bind planner's stages (bind_*_ms; candidates, inline, guards and reset are parts of statics) and the
+            // records logged by the planner (bind_log_lines) and by the whole plan stage (log_lines), whose cost is in every stage.
             CML_LOG(Info, "WP50-PLAN module=%s object=%s total_ms=%.1f object_ms=%.1f image_ms=%.1f bind_ms=%.1f export_parses=%zu prove_ms=%.1f "
-                          "narrow_ms=%.1f rest_ms=%.1f hooks_planned=%zu pdb_module_symbols_ms=%.1f pdb_publics_ms=%.1f pdb_buildinfo_ms=%.1f",
+                          "narrow_ms=%.1f rest_ms=%.1f hooks_planned=%zu pdb_module_symbols_ms=%.1f pdb_publics_ms=%.1f pdb_buildinfo_ms=%.1f "
+                          "bind_compiland_ms=%.1f bind_symbols_ms=%.1f bind_defined_ms=%.1f bind_statics_ms=%.1f bind_candidates_ms=%.1f bind_inline_ms=%.1f "
+                          "bind_guards_ms=%.1f bind_reset_ms=%.1f bind_tls_ms=%.1f bind_undefined_ms=%.1f bind_fixups_ms=%.1f bind_init_ms=%.1f bind_assemble_ms=%.1f "
+                          "bind_log_lines=%llu log_lines=%llu",
                     module_.name.c_str(), std::string(path::base_name(std::string_view(u.outcome.object_path))).c_str(), ms_between(plan_started, plan_done),
                     ms_between(plan_started, plan_object), ms_between(plan_object, plan_image), ms_between(plan_image, plan_bound), export_parses,
                     ms_between(plan_bound, plan_proved), ms_between(plan_proved, plan_narrowed), ms_between(plan_narrowed, plan_done), narrowed.planned,
                     pdb_after.module_symbols_ms - pdb_before.module_symbols_ms, pdb_after.publics_ms - pdb_before.publics_ms,
-                    pdb_after.buildinfo_ms - pdb_before.buildinfo_ms);
+                    pdb_after.buildinfo_ms - pdb_before.buildinfo_ms, stages.compiland, stages.symbols, stages.defined, stages.statics, stages.candidates,
+                    stages.inline_sites, stages.guards, stages.reset, stages.thread_locals, stages.undefined, stages.fixups, stages.initialisers, stages.assemble,
+                    static_cast<unsigned long long>(stages.log_lines), log_records_written() - log_lines_before);
             // WP-55 (R-62): the verdicts on inline sites this unit's plan took from earlier plans of the image, and those it read.
             const std::uint64_t verdict_kept = module_.inline_verdicts.kept() - verdict_kept_before;
             const std::uint64_t verdict_reads = module_.inline_verdicts.reads() - verdict_reads_before;

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <limits>
 #include <cstdio>
 #include <cstring>
@@ -141,6 +142,19 @@ bool starts_with(std::string_view s, std::string_view prefix) noexcept {
 }
 
 constexpr std::uint32_t kNone32 = 0xFFFFFFFFu;
+
+// WP-58: adds the wall time of its scope to one stage of PlanStageTimes.
+class StageTimer {
+public:
+    explicit StageTimer(double& into) : into_(into), started_(std::chrono::steady_clock::now()) {}
+    ~StageTimer() { into_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started_).count(); }
+    StageTimer(const StageTimer&) = delete;
+    StageTimer& operator=(const StageTimer&) = delete;
+
+private:
+    double& into_;
+    std::chrono::steady_clock::time_point started_;
+};
 
 // ---------------------------------------------------------------------------------------------
 // The planner
@@ -1057,6 +1071,7 @@ bool Planner::ensure_compiland_symbols() {
 
 std::vector<const pdb::SymbolView*> Planner::static_candidates(const std::string& base, const std::string& encl, bool want_function,
                                                                 const std::string& display, int tls_mode, const std::string& decorated) {
+    const StageTimer timer(plan_.stage_ms.candidates);  // WP-58
     // A static matches an old record ONLY when its scope matches exactly: the same enclosing function, or
     // file scope. Records of other scopes are never candidates (a wrong match would bind live state or a
     // hook to an unrelated entity): "f::counter" is not "g::counter", and a new file-scope "count" is
@@ -1329,6 +1344,7 @@ bool Planner::cached_verdict(std::uint32_t proc) {
 }
 
 const Planner::InlineVerdict& Planner::inline_verdict(std::uint32_t proc) {
+    const StageTimer timer(plan_.stage_ms.inline_sites);  // WP-58
     auto found = inline_verdicts_.find(proc);
     if (found == inline_verdicts_.end() && cached_verdict(proc)) {
         found = inline_verdicts_.find(proc);
@@ -4016,8 +4032,11 @@ void Planner::bridge_statics() {
     // WP-46: the lambdas named by a hash (F-41.2), before the guards are settled (a static refused here takes its guard
     // along); then the layout for guards without a record (F-41.1).
     note_hashed_lambdas();
-    learn_guard_layout();
-    settle_guards();
+    {
+        const StageTimer timer(plan_.stage_ms.guards);  // WP-58
+        learn_guard_layout();
+        settle_guards();
+    }
     build_lambda_sets();
     // Anything still undecided (defensive).
     for (Sym& sy : syms_) {
@@ -4025,7 +4044,10 @@ void Planner::bridge_statics() {
             decide(sy, sy.dec.type == SymbolType::Function ? DecisionKind::PatchNewFunction : DecisionKind::PatchNewData, BindSource::None, sy.dec.type, {}, "unmatched static: new");
         }
     }
-    refuse_reset_statics();
+    {
+        const StageTimer timer(plan_.stage_ms.reset);  // WP-58
+        refuse_reset_statics();
+    }
 }
 
 namespace {
@@ -5051,8 +5073,11 @@ Result<BindPlan> Planner::run(std::vector<Diag>* all_errors) {
     plan_.object_name = in_.object_name;
     plan_.module_name = in_.module_name;
     plan_.module_base = in_.module_base;
+    PlanStageTimes& t = plan_.stage_ms;  // WP-58
+    const unsigned long long log_lines_before = log_records_written();
 
     const auto finish_errors = [&]() -> Result<BindPlan> {
+        t.log_lines = log_records_written() - log_lines_before;
         // Everything collected so far, the fatal error (an unreadable PDB or object) last.
         if (all_errors != nullptr) {
             *all_errors = errors_;
@@ -5071,33 +5096,62 @@ Result<BindPlan> Planner::run(std::vector<Diag>* all_errors) {
         error(diag::kUnsupportedObject, "object " + in_.object_name + " is not an x64 object", "Compile the patch for x64.");
         return finish_errors();
     }
-    if (!resolve_compiland()) {
+    bool compiland_found = false;
+    {
+        const StageTimer timer(t.compiland);
+        compiland_found = resolve_compiland();
+    }
+    if (!compiland_found) {
         return finish_errors();
     }
-    collect_sections();
-    collect_symbols();
-    load_relocations();
+    {
+        const StageTimer timer(t.symbols);
+        collect_sections();
+        collect_symbols();
+        load_relocations();
+    }
     if (fatal_) {
         return finish_errors();
     }
-    decide_defined();
-    bridge_statics();
-    reject_new_thread_locals();
-    warn_thread_local_initialisers();
+    {
+        const StageTimer timer(t.defined);
+        decide_defined();
+    }
+    {
+        const StageTimer timer(t.statics);
+        bridge_statics();
+    }
+    {
+        const StageTimer timer(t.thread_locals);
+        reject_new_thread_locals();
+        warn_thread_local_initialisers();
+    }
     if (fatal_) {
         return finish_errors();
     }
-    resolve_undefined();
+    {
+        const StageTimer timer(t.undefined);
+        resolve_undefined();
+    }
     if (fatal_) {
         return finish_errors();
     }
-    build_fixups();
-    find_initialisers();
+    {
+        const StageTimer timer(t.fixups);
+        build_fixups();
+    }
+    {
+        const StageTimer timer(t.initialisers);
+        find_initialisers();
+    }
     if (!errors_.empty()) {
         // Still describe what was decided in the trace, then fail.
         return finish_errors();
     }
-    assemble();
+    {
+        const StageTimer timer(t.assemble);
+        assemble();
+    }
     // New globals know the initialisers that run for them.
     for (NewGlobal& g : plan_.new_globals) {
         for (const InitialiserEntry& e : plan_.initialisers) {
@@ -5110,6 +5164,7 @@ Result<BindPlan> Planner::run(std::vector<Diag>* all_errors) {
     CML_LOG(Debug, "bind: plan for %s: hooks=%zu bind_old_data=%zu thunks=%zu new=%zu fixups=%zu warnings=%zu", in_.object_name.c_str(), s.hooks,
             s.bind_old_data, s.thunks, s.new_symbols, s.fixups, plan_.warnings.size());
     CML_LOG(Debug, "bind: %s", plan_.imgrel_line(in_.object_name).c_str());
+    t.log_lines = log_records_written() - log_lines_before;
     return std::move(plan_);
 }
 

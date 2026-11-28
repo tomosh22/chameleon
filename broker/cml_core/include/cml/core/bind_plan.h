@@ -279,6 +279,26 @@ struct InlinedLambdaStatic {
     BindSource how = BindSource::None;  // the step that made the pairing
 };
 
+// WP-58 (R-62): where plan_bind spends its time, for the pipeline's `WP50-PLAN` line. Milliseconds of wall time per stage of
+// the planner; `candidates`, `inline_sites`, `guards` and `reset` are parts of `statics` (bridge_statics). `log_lines`: the
+// records logged while planning (at trace, every decision is one; their cost is part of each stage).
+struct PlanStageTimes {
+    double compiland = 0;     // resolve_compiland
+    double symbols = 0;       // sections, symbols, relocations of the object
+    double defined = 0;       // decide_defined: external definitions (registry, publics)
+    double statics = 0;       // bridge_statics, all of it
+    double candidates = 0;    //   static_candidates: the old records of a group of statics
+    double inline_sites = 0;  //   WP-51: inline-site verdicts (inline_verdict)
+    double guards = 0;        //   guards: learn_guard_layout, settle_guards, require_bound_guards
+    double reset = 0;         //   WP-52: refuse_reset_statics
+    double thread_locals = 0;  // reject_new_thread_locals, warn_thread_local_initialisers
+    double undefined = 0;     // resolve_undefined
+    double fixups = 0;        // build_fixups
+    double initialisers = 0;  // find_initialisers
+    double assemble = 0;      // assemble
+    std::uint64_t log_lines = 0;
+};
+
 struct BindPlan {
     std::string object_name;
     std::string module_name;
@@ -310,6 +330,7 @@ struct BindPlan {
     std::vector<BitmaskGuard> bitmask_guards;  // WP-40, see BitmaskGuard
     std::vector<HashedLambda> hashed_lambdas;  // WP-46, see HashedLambda
     std::vector<InlinedLambdaStatic> inlined_lambda_statics;  // WP-53, see InlinedLambdaStatic
+    PlanStageTimes stage_ms;  // WP-58, see PlanStageTimes (evidence only: no decision depends on it)
 
     PlanSummary summary() const;
     // `BINDPLAN <label> hooks=N bind_old_data=N thunks=N new=N fixups=N` (the CI evidence line).
