@@ -18,6 +18,7 @@
 #include "cml/core/bind_diag_ids.h"
 #include "cml/core/bind_names.h"
 #include "cml/core/bind_types.h"
+#include "cml/core/guard_code.h"
 #include "cml/core/imgrel_site.h"
 #include "cml/util/format.h"
 #include "cml/util/log.h"
@@ -449,6 +450,26 @@ std::string hashed_closure_static(std::string_view name) {
     return !c.empty() && name.compare(at + 4, c.size() + 2, c + "@@") == 0 ? c : std::string();
 }
 
+// Bytes a relocation of this type patches; 0 for a type whose field is not known (it then fits no operand).
+std::uint32_t reloc_field_width(coff::RelocType t) {
+    switch (t) {
+        case coff::RelocType::Addr64: return 8;
+        case coff::RelocType::Addr32:
+        case coff::RelocType::Addr32Nb:
+        case coff::RelocType::Rel32:
+        case coff::RelocType::Rel32_1:
+        case coff::RelocType::Rel32_2:
+        case coff::RelocType::Rel32_3:
+        case coff::RelocType::Rel32_4:
+        case coff::RelocType::Rel32_5:
+        case coff::RelocType::SecRel:
+        case coff::RelocType::SRel32: return 4;
+        case coff::RelocType::Section: return 2;
+        case coff::RelocType::SecRel7: return 1;
+        default: return 0;
+    }
+}
+
 class Planner {
 public:
     Planner(const PlanInput& in, BindPlan* partial) : in_(in), obj_(*in.object), pdb_(*in.module_pdb), partial_(partial) {}
@@ -589,6 +610,15 @@ private:
     std::map<std::string, std::size_t> patch_tss_per_scope_;  // the patch's external `$TSS` guards: scope -> how many
     bool old_tss_listed_ = false;
     std::map<std::string, std::set<std::uint32_t>> old_tss_numbers_;  // the old image's `?$TSS<n>@<scope>@4HA` publics: scope -> numbers
+    // WP-63 (R-69, ADR-0047): which statics of its scope an external guard guards, read from the patch's code (guard_code.h);
+    // nullopt, with `why`, where the code does not show it. The code sections are described once per plan.
+    std::optional<std::set<std::uint32_t>> guard_code_statics(const Sym& guard, const std::vector<std::uint32_t>& scope, bool bitmask, std::string& why,
+                                                              std::set<std::uint32_t>& address_taken);
+    std::vector<GuardCodeSection> guard_code_sections_;
+    bool guard_code_built_ = false;
+    // (guard, static) pairs that the guard's name ties and its code proves it does not guard (a constant-initialised static
+    // next to a new dynamic one): require_bound_guards does not count the guard as the static's.
+    std::set<std::pair<std::uint32_t, std::uint32_t>> code_untied_;
 
     // WP-37 (ADR-0042): canonical signatures, read lazily on both sides. The old side is the module PDB's type stream,
     // the new side the patch object's .debug$S / .debug$T (or its type server PDB): cml/core/bind_types.h.
@@ -2149,7 +2179,9 @@ std::set<std::uint32_t> Planner::require_bound_guards(const std::vector<std::uin
         // statics are thread-locals, which this rule leaves to WP-24.
         if (g.defined && g.dec.type == SymbolType::Data && is_guard_variable(g.name) && !(g.dec.section != 0 && secs_[g.dec.section - 1].tls)) {
             for (const std::uint32_t st : guard_scope_statics(g)) {
-                tied_to[st].push_back(pos);
+                if (code_untied_.count({pos, st}) == 0) {  // WP-63: not where the code proves the guard is not the static's
+                    tied_to[st].push_back(pos);
+                }
             }
         }
     }
@@ -4599,9 +4631,12 @@ void Planner::refuse_reset_statics() {
 // prove_bitmask_guards), except a `$TSS` whose block holds that one static and that one guard in the patch, and only that
 // guard number in the old image (external_tss_alone_in_block): its static is the only one it can belong to.
 void Planner::settle_external_guard(Sym& sy, std::vector<std::uint32_t>& untied) {
-    const bool bitmask = is_inline_bitmask_guard(sy.name);
+    // WP-63: an external `?$S<n>` (cl's bitmask spelling, should cl give an inline function's statics one under that name
+    // rather than `??_B`; not seen yet) is a bitmask of the same kind: settled by the same rules, never bound by its name
+    // next to new statics.
+    const bool bitmask = is_inline_bitmask_guard(sy.name) || (sy.name.size() > 3 && sy.name.compare(0, 3, "?$S") == 0 && sy.name[3] >= '0' && sy.name[3] <= '9');
     if (!bitmask && sy.name.compare(0, 5, "?$TSS") != 0) {
-        return;  // another external guard (an external `?$S<n>` is not known to exist): as decided
+        return;  // another external guard: as decided
     }
     if (sy.dec.section != 0 && secs_[sy.dec.section - 1].tls) {
         return;  // a thread-local guard: WP-24's (CML3400)
@@ -4639,13 +4674,74 @@ void Planner::settle_external_guard(Sym& sy, std::vector<std::uint32_t>& untied)
         decide(sy, DecisionKind::PatchNewData, BindSource::None, SymbolType::Data, {}, "external guard of a static that is refused");
         return;
     }
+    // WP-63 (R-69, ADR-0047): the name ties the guard to every static of its function (`??_B`) or block (`$TSS`), the
+    // constant-initialised ones too, which test no guard. Where that would refuse (bound statics next to new ones, or bound
+    // statics and no old guard of the name), the patch's code says which statics are initialised under the guard. When
+    // every one of those is new, the guard is a new one: the bound statics of its scope are not initialised under it
+    // (constant-initialised, or guarded by another guard of their block), so a fresh guard constructs the new statics once
+    // and touches nothing live. Anything else, and any code that is not read, refuses as before.
+    std::string code_note;
+    if (bound != 0 && (fresh != 0 || !found)) {
+        std::string why;
+        std::set<std::uint32_t> address_taken;
+        const std::optional<std::set<std::uint32_t>> guarded = guard_code_statics(sy, scope, bitmask, why, address_taken);
+        if (guarded) {
+            std::size_t code_bound = 0;
+            std::size_t code_fresh = 0;
+            std::string names;
+            for (const std::uint32_t pos : *guarded) {
+                const Sym& st = syms_[pos];
+                names += (names.empty() ? "" : ", ") + describe(st);
+                if (st.decided && st.dec.decision == DecisionKind::BindOldData) {
+                    ++code_bound;
+                } else if (!(st.decided && st.dec.decision == DecisionKind::PatchFresh)) {
+                    ++code_fresh;
+                }
+            }
+            // A bound static the code does not initialise under the guard keeps its live value only if no region can write
+            // it through an address: the code that uses the guard must never put its address in a register.
+            std::string escaped;
+            for (const std::uint32_t pos : scope) {
+                const Sym& st = syms_[pos];
+                if (guarded->count(pos) == 0 && address_taken.count(pos) != 0 && st.decided && st.dec.decision == DecisionKind::BindOldData) {
+                    escaped = escaped.empty() ? describe(st) : escaped;
+                }
+            }
+            const bool accept = code_bound == 0 && code_fresh != 0 && escaped.empty();
+            CML_LOG(Info, "WP63-GUARD-CODE guard=%s object=%s scope=%zu guarded=%zu bound=%zu new=%zu verdict=%s%s%s", sy.name.c_str(), in_.object_name.c_str(), scope.size(),
+                    guarded->size(), code_bound, code_fresh, accept ? "new-guard" : "refused", escaped.empty() ? "" : " address-taken=", escaped.c_str());
+            if (!escaped.empty() && code_bound == 0 && code_fresh != 0) {
+                code_note = "; the patch's code initialises " + names + " under it, but it takes the address of " + escaped +
+                            ", which could then be written in the initialisation of another static";
+            } else if (accept) {
+                const std::uint32_t gpos = static_cast<std::uint32_t>(&sy - syms_.data());
+                for (const std::uint32_t pos : scope) {
+                    if (guarded->count(pos) == 0) {
+                        code_untied_.insert({gpos, pos});
+                        CML_LOG(Trace, "bind: external guard %s: its code initialises no static %s under it (constant-initialised, or another guard's)", sy.name.c_str(),
+                                syms_[pos].name.c_str());
+                    }
+                }
+                decide(sy, DecisionKind::PatchNewData, BindSource::None, SymbolType::Data, {},
+                       "external guard of new statics, read from the patch's code (it initialises " + names + " under it): new" +
+                           (found ? " (the old guard of that name belongs to other statics)" : ""));
+                return;
+            } else {
+                code_note = "; the patch's code initialises " + names + " under it";
+            }
+        } else {
+            CML_LOG(Info, "WP63-GUARD-CODE guard=%s object=%s scope=%zu guarded=unread verdict=refused why=%s", sy.name.c_str(), in_.object_name.c_str(), scope.size(), why.c_str());
+            code_note = "; which of them are initialised under it cannot be read from the patch's code (" + why + ")";
+        }
+    }
     if (bound != 0 && fresh != 0) {
         error(diag::kGuardMismatch,
               std::string(kind) + describe(sy) + " in " + in_.object_name + what + " guards statics of which some are bound to the running process (" + a_bound + ") and some are new (" +
                   a_new + "); " +
                   (bitmask ? "its bits go to the function's statics in the order they are declared"
                            : "the guards of the function are numbered by their statics' place in it, in the order they are declared") +
-                  ", so with the old guard a new static could take an old one's and never be constructed, and with a fresh one the old statics would be constructed again",
+                  ", so with the old guard a new static could take an old one's and never be constructed, and with a fresh one the old statics would be constructed again" +
+                  code_note,
               "Declare the new static in another function (or keep this function's statics as they are), or hot-restart.");
         sy.diagnosed = true;
         decide(sy, DecisionKind::PatchNewData, BindSource::None, SymbolType::Data, {}, "external guard of new and bound statics (CML3600)");
@@ -4667,7 +4763,8 @@ void Planner::settle_external_guard(Sym& sy, std::vector<std::uint32_t>& untied)
         error(diag::kGuardMismatch,
               std::string(kind) + describe(sy) + " in " + in_.object_name + what + " cannot be bound to the old guard of " + a_bound +
                   ", which is bound to the running process: the old image has no " + (bitmask ? "bitmask" : "guard") +
-                  " of that name (there the static was constant-initialised, or the function's statics were others or in another order); with a fresh one the old object would be constructed a second time",
+                  " of that name (there the static was constant-initialised, or the function's statics were others or in another order); with a fresh one the old object would be constructed a second time" +
+                  code_note,
               "Keep this function's statics as they are (or declare the new one in another function), or hot-restart.");
         sy.diagnosed = true;
         decide(sy, DecisionKind::PatchNewData, BindSource::None, SymbolType::Data, {}, "external guard of bound statics that is not in the old image (CML3600)");
@@ -4684,6 +4781,92 @@ void Planner::settle_external_guard(Sym& sy, std::vector<std::uint32_t>& untied)
     }
     CML_LOG(Trace, "bind: external guard %s is bound by its name, which does not prove its static (%s): the code of its function must be unchanged", sy.name.c_str(), why.c_str());
     external_guards_to_prove_.insert(static_cast<std::uint32_t>(&sy - syms_.data()));
+}
+
+// WP-63 (R-69, ADR-0047): the statics of `scope` (the statics the guard's name ties) that the patch's code initialises under
+// the guard (guard_code.h has the shapes it reads and what it proves). The code sections of the patch are described once.
+// Read-only statics (PatchFresh) are no candidates: they hold no state and test no guard. nullopt, with `why`, where any use
+// of the guard is not read. `address_taken`: the candidates whose address the code that uses the guard materialises.
+std::optional<std::set<std::uint32_t>> Planner::guard_code_statics(const Sym& guard, const std::vector<std::uint32_t>& scope, bool bitmask, std::string& why,
+                                                                   std::set<std::uint32_t>& address_taken) {
+    if (!guard_code_built_) {
+        guard_code_built_ = true;
+        for (std::size_t i = 0; i < secs_.size(); ++i) {
+            const SecInfo& si = secs_[i];
+            if (!si.code || relocs_[i].empty()) {
+                continue;
+            }
+            GuardCodeSection cs;
+            cs.name = si.name + " (section " + std::to_string(i + 1) + ")";
+            cs.data = si.sec->data;
+            cs.relocs.reserve(relocs_[i].size());
+            for (const coff::ResolvedRelocation& rr : relocs_[i]) {
+                if (rr.reloc.type == coff::RelocType::Absolute) {
+                    continue;
+                }
+                GuardCodeReloc r;
+                r.offset = rr.reloc.virtual_address;
+                r.width = reloc_field_width(rr.reloc.type);
+                if (coff::is_rel32_family(rr.reloc.type)) {
+                    r.rel_tail = static_cast<std::int8_t>(static_cast<unsigned>(rr.reloc.type) - static_cast<unsigned>(coff::RelocType::Rel32));
+                }
+                r.target = std::string(rr.target->name);
+                r.target_section = rr.target->section_number;
+                r.target_is_section = rr.target->is_static() && rr.target->aux_count > 0 && !rr.target->is_function() && !r.target.empty() && r.target[0] == '.';
+                cs.relocs.push_back(std::move(r));
+            }
+            for (const coff::Symbol& s : obj_.symbols()) {
+                if (s.section_number == static_cast<std::int32_t>(i + 1) && s.is_function() && (s.is_external() || s.is_static())) {
+                    cs.function_starts.push_back(s.value);
+                }
+            }
+            guard_code_sections_.push_back(std::move(cs));
+        }
+    }
+    // Data that holds the guard's address (debug information aside) may be used to write it: nothing is proved then.
+    std::string data_reference;
+    for (std::size_t i = 0; i < secs_.size() && data_reference.empty(); ++i) {
+        if (secs_[i].code || starts_with(secs_[i].name, ".debug$")) {
+            continue;
+        }
+        for (const coff::ResolvedRelocation& rr : relocs_[i]) {
+            if (rr.reloc.type != coff::RelocType::Absolute && rr.target->name == guard.name) {
+                data_reference = "section " + std::to_string(i + 1) + " (" + secs_[i].name + ")";
+                break;
+            }
+        }
+    }
+    std::map<std::string, std::int32_t, std::less<>> candidates;
+    std::map<std::string, std::uint32_t> pos_of;
+    for (const std::uint32_t pos : scope) {
+        const Sym& st = syms_[pos];
+        if (st.decided && st.dec.decision == DecisionKind::PatchFresh) {
+            continue;
+        }
+        candidates.emplace(st.name, st.s->section_number);
+        pos_of.emplace(st.name, pos);
+    }
+    const GuardCodeReading r = read_guard_code(guard_code_sections_, guard.name, guard.s->section_number, bitmask ? GuardCodeKind::Bitmask : GuardCodeKind::ThreadSafe,
+                                               candidates, data_reference);
+    if (!r.proved) {
+        why = r.why;
+        CML_LOG(Trace, "bind: external guard %s: its uses in the code are not read (%zu read): %s", guard.name.c_str(), r.references, r.why.c_str());
+        return std::nullopt;
+    }
+    std::set<std::uint32_t> out;
+    for (const GuardClaim& c : r.claims) {
+        const std::string what = bitmask ? "the claim of bit " + hex(c.bits) : std::string("the _Init_thread_header");
+        CML_LOG(Trace, "bind: external guard %s: %s at +0x%x in %s (region to +0x%x) initialises %s", guard.name.c_str(), what.c_str(), c.at, c.section.c_str(), c.end,
+                c.static_name.c_str());
+        out.insert(pos_of.at(c.static_name));
+    }
+    for (const std::string& name : r.address_taken) {
+        if (const auto it = pos_of.find(name); it != pos_of.end()) {
+            address_taken.insert(it->second);
+            CML_LOG(Trace, "bind: external guard %s: the code that uses it takes the address of %s", guard.name.c_str(), name.c_str());
+        }
+    }
+    return out;
 }
 
 // WP-59 (review item 0): may the external `$TSS<n>` guard `guard`, tied to the one static `static_pos` of its block, keep
@@ -5214,25 +5397,6 @@ FixupKind rel32_kind(coff::RelocType t) {
     return static_cast<FixupKind>(static_cast<unsigned>(t) - static_cast<unsigned>(coff::RelocType::Rel32));
 }
 
-// Bytes a relocation of this type patches; 0 for a type whose field is not known (it then fits no operand).
-std::uint32_t reloc_field_width(coff::RelocType t) {
-    switch (t) {
-        case coff::RelocType::Addr64: return 8;
-        case coff::RelocType::Addr32:
-        case coff::RelocType::Addr32Nb:
-        case coff::RelocType::Rel32:
-        case coff::RelocType::Rel32_1:
-        case coff::RelocType::Rel32_2:
-        case coff::RelocType::Rel32_3:
-        case coff::RelocType::Rel32_4:
-        case coff::RelocType::Rel32_5:
-        case coff::RelocType::SecRel:
-        case coff::RelocType::SRel32: return 4;
-        case coff::RelocType::Section: return 2;
-        case coff::RelocType::SecRel7: return 1;
-        default: return 0;
-    }
-}
 }  // namespace
 
 // The prover of one section (WP-36): its relocation fields and the starts of the functions it defines.

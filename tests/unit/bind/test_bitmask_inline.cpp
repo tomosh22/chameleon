@@ -260,23 +260,25 @@ const char* const kTss1 = "?$TSS1@?1??counter@@YAHXZ@4HA";
 
 }  // namespace
 
-TEST_CASE("R-67 (review item 2): a fresh bitmask next to a bound constant-initialised static is refused, as next to a dynamic one (b6, b7)") {
+TEST_CASE("R-67 (review item 2), R-69: a fresh bitmask next to a bound constant-initialised static binds, next to a dynamic one it is refused (b6, b7)") {
     // b6: counter()'s only old static `static int calls = 0;` stays constant-initialised and a dynamic `a` is added; b7: the
     // same, but calls becomes `= make_int(0)`. Accepting b6's fresh bitmask is right, b7's runs calls' new initialiser over
-    // the live value. The two patches define the same symbols in the same sections, so the planner cannot tell them apart
-    // (which static tests a bit only the code shows) and refuses both (docs/wp/WP-59.md, review item 2).
+    // the live value. The two patches define the same symbols in the same sections (which static tests a bit only the code
+    // shows): WP-59 refused both (docs/wp/WP-59.md, review item 2). WP-63 (R-69) reads the bits from the code: b6 claims only
+    // a's bit (0x2) and binds, b7 claims calls' (0x1) and a's and is refused (test_guard_code.cpp has the details).
     const Case b6("b6_const");
     const Case b7("b7_both");
     CHECK(defined_symbols(b6) == defined_symbols(b7));
-    for (const Case* c : {&b6, &b7}) {
-        CAPTURE(c->name);
-        CHECK_FALSE(c->planned);
-        const Diag* d = c->plan_error("CML3600");
-        REQUIRE(d != nullptr);
-        CHECK(contains(d->message, kBits));
-        CHECK(contains(d->message, "counter::calls"));
-        CHECK(contains(d->message, "counter::a"));
-    }
+    REQUIRE(b6.planned);
+    CHECK(b6.decision("?calls@?1??counter@@YAHXZ@4HA").decision == DecisionKind::BindOldData);
+    CHECK(b6.decision(kA).decision == DecisionKind::PatchNewData);
+    CHECK(b6.decision(kBits).decision == DecisionKind::PatchNewData);
+    CHECK_FALSE(b7.planned);
+    const Diag* d = b7.plan_error("CML3600");
+    REQUIRE(d != nullptr);
+    CHECK(contains(d->message, kBits));
+    CHECK(contains(d->message, "counter::calls"));
+    CHECK(contains(d->message, "counter::a"));
 }
 
 TEST_CASE("R-67 (review item 3): a thread_local of the inline function is not tied to its bitmask (b8)") {

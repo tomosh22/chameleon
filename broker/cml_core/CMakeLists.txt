@@ -23,6 +23,8 @@ add_library(cml_core STATIC
     # agent's length decoder, which is compiled into this library UNCHANGED (same source file, the broker's flags);
     # the decoder is portable, allocation-free and has no dependency.
     src/imgrel_site.cpp
+    # WP-63 (R-69): which statics an inline function's external guard guards, read from the patch's code (same decoder).
+    src/guard_code.cpp
     "${PROJECT_SOURCE_DIR}/agent/src/hook/length_decoder.cpp"
     # WP-12: the reload pipeline (portable; the compiler and linker are behind PipelineEnv)
     src/hook_narrowing.cpp
@@ -56,8 +58,9 @@ add_library(cml_core STATIC
 target_include_directories(cml_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_BINARY_DIR}/generated")
-# Only imgrel_site.cpp sees the agent's source directory (for "hook/length_decoder.h"); nothing else of the agent is used.
-set_source_files_properties(src/imgrel_site.cpp PROPERTIES INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/agent/src")
+# Only imgrel_site.cpp and guard_code.cpp see the agent's source directory (for "hook/length_decoder.h"); nothing else of
+# the agent is used.
+set_source_files_properties(src/imgrel_site.cpp src/guard_code.cpp PROPERTIES INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/agent/src")
 target_link_libraries(cml_core PUBLIC cml_util cml_ipc cml_coff cml_pdb cml_pe cml_toolchain cml_watch)
 if(NOT MSVC)
     find_package(Threads REQUIRED)
