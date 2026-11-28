@@ -2,7 +2,7 @@
 
 // Fixture `planner_pairing_o2` (WP-40, ADR-0043): built with /O2 /Ob2 in every cell (clang-cl inlines; cl as well, where it
 // is harmless). lambdas.cpp: R-48 item 1, the statics of inlined lambdas. parts.cpp: R-48 item 4, an aggregate clang-cl
-// splits.
+// splits. nested.cpp: R-60, the static of a nested lambda and its guard.
 
 struct O2Name {
     int id;
@@ -18,3 +18,9 @@ int o2_mark();
 void o2_parts_step();
 int o2_parts_sum();  // 500000 + 6n
 int o2_parts_mark();
+
+// WP-52 (R-60): nested.cpp, a static in a nested lambda (its guard spells the scope with other back-references).
+void o2_nest_step();
+int o2_nest_value();  // 700000 + n
+int o2_nest_made();   // stays 1
+int o2_nest_mark();

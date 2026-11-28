@@ -139,3 +139,83 @@ TEST_CASE("display_name: function scopes with a block number written in letters"
     CHECK_FALSE(is_tu_private_name("?f@?$Box@H@@QEAAXXZ"));
     CHECK_FALSE(is_tu_private_name("?g_tick@AB@@3HA"));
 }
+
+// ---- WP-52 (R-60): scopes with their name back-references resolved -----------------------------------------------------
+
+namespace {
+
+std::string rest_of(std::string_view name, bool guard_name_counted = false) {
+    const std::optional<LocalScopeKey> k = local_scope_key(name, guard_name_counted);
+    return k ? k->rest : std::string("(none)");
+}
+
+}  // namespace
+
+TEST_CASE("local_scope_key: clang 18 spells a guard's scope with back-references one lower than its static's") {
+    // clang 18 -O2 (x86_64-pc-windows-msvc), `void g() { auto o = [] { auto i = [] { static Obj gx = make(1); ... }; ... }; }`:
+    // the guard does not count its own name `$TSS0`, the static counts `gx`, so `<auto>` is 3 in one and 4 in the other.
+    const char* guard = "?$TSS0@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?3@XZ@4HA";
+    const char* gx = "?gx@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?4@XZ@4UObj@@A";
+    const std::optional<LocalScopeKey> g = local_scope_key(guard, false);
+    const std::optional<LocalScopeKey> s = local_scope_key(gx, false);
+    REQUIRE(g.has_value());
+    REQUIRE(s.has_value());
+    CHECK(g->block == "?1?");
+    CHECK(g->rest == s->rest);
+    CHECK(s->rest == "??R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?<auto>@@XZ@4");
+    // In cl's spelling (the guard's own name counted) the guard's `3` is `g`: another scope.
+    CHECK(rest_of(guard, true) != s->rest);
+    // The bitmask of -fno-threadsafe-statics, the same scope.
+    CHECK(rest_of("?$S1@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?3@XZ@4IA") == s->rest);
+    // A split piece of the static (clang /O2 SROA) has the same scope.
+    CHECK(rest_of(std::string(gx) + ".0") == s->rest);
+}
+
+TEST_CASE("local_scope_key: templates, parameter types, anonymous namespaces (clang 18)") {
+    // A class template is one name of the table, a function template's own name is none; type back-references are kept.
+    CHECK(rest_of("?$TSS0@?1???$tf@H@@YAHU?$Box@H@@UFoo@@PEAU1@2@Z@4HA") == rest_of("?tx@?1???$tf@H@@YAHU?$Box@H@@UFoo@@PEAU2@2@Z@4UObj@@A"));
+    CHECK(rest_of("?tx@?1???$tf@H@@YAHU?$Box@H@@UFoo@@PEAU2@2@Z@4UObj@@A") == "??$tf@H@@YAHU?$Box@H@@UFoo@@PEAUFoo@@2@Z@4");
+    CHECK(rest_of("?$TSS0@?1??GetRTTIOfType@JPH@@YAPEAURTTI@1@PEAUSphereShape@1@@Z@4HA") ==
+          rest_of("?rtti@?1??GetRTTIOfType@JPH@@YAPEAURTTI@2@PEAUSphereShape@2@@Z@4U32@A"));
+    CHECK(rest_of("?$TSS0@?1???R<lambda_1>@?0??anon@?A0x47809CB@@YAHUFoo@@@Z@QEBA?A?<auto>@@0@Z@4HA") ==
+          rest_of("?lx@?1???R<lambda_1>@?0??anon@?A0x47809CB@@YAHUFoo@@@Z@QEBA?A?<auto>@@0@Z@4UObj@@A.0"));
+    CHECK(rest_of("?$TSS0@?1??m@K@@QEBAHH@Z@4HA") == rest_of("?kx@?1??m@K@@QEBAHH@Z@4UObj@@A"));
+}
+
+TEST_CASE("local_scope_key: cl counts the guard's own name (Jolt's GetRTTIOfType, Godot's SceneTree)") {
+    const char* guard = "?$TSS0@?1??GetRTTIOfType@JPH@@YAPEAVRTTI@2@PEAVSphereShape@2@@Z@4HA";
+    const char* rtti = "?rtti@?1??GetRTTIOfType@JPH@@YAPEAVRTTI@2@PEAVSphereShape@2@@Z@4V32@A";
+    CHECK(rest_of(guard, true) == rest_of(rtti));
+    CHECK(rest_of(rtti) == "?GetRTTIOfType@JPH@@YAPEAVRTTI@JPH@@PEAVSphereShape@JPH@@@Z@4");
+    CHECK(rest_of(guard, false) != rest_of(rtti));  // clang's spelling: `2` would be `RTTI`
+    // Block 11 and later in letters; a class back-reference in the operator's return type.
+    const std::optional<LocalScopeKey> k = local_scope_key("?sname@?1???R<lambda_1>@?L@??_flush_scene_change@SceneTree@@AEAAXXZ@QEBAAEBVStringName@@XZ@4V4@A", false);
+    REQUIRE(k.has_value());
+    CHECK(k->rest == "??R<lambda_1>@?L@??_flush_scene_change@SceneTree@@AEAAXXZ@QEBAAEBVStringName@@XZ@4");
+    CHECK(rest_of("?$TSS0@?1???R<lambda_1>@?L@??_flush_scene_change@SceneTree@@AEAAXXZ@QEBAAEBVStringName@@XZ@4HA", true) == k->rest);
+    CHECK(rest_of("?$TSS0@?1???R<lambda_1>@?L@??_flush_scene_change@SceneTree@@AEAAXXZ@QEBAAEBVStringName@@XZ@4HA", false) == k->rest);
+}
+
+TEST_CASE("local_scope_key: no key for names that are not function-local or cannot be read") {
+    CHECK_FALSE(local_scope_key("?g@?A0xABCDEFAB@@3HA", false).has_value());
+    CHECK_FALSE(local_scope_key("?f@?$Box@H@@QEAAXXZ", false).has_value());
+    CHECK_FALSE(local_scope_key("?s_a@?A0x1@@3HA", false).has_value());
+    CHECK_FALSE(local_scope_key("fixture_note", false).has_value());
+    CHECK_FALSE(local_scope_key("?x@?1??f@@YAXXZ", false).has_value());          // truncated: no storage class
+    CHECK_FALSE(local_scope_key("?x@?1??f@@YAXL@Z@4HA", false).has_value());     // a type that is no type
+    CHECK_FALSE(local_scope_key("?x@?1??f@@YAXU7@@Z@4HA", false).has_value());   // a name back-reference that is not in the table
+    CHECK_FALSE(local_scope_key("?x@?1??f@@$$J0YAXXZ@4HA", false).has_value());  // extern "C" encoding: not read
+    CHECK(local_scope_key("?x@?1??f@@YAXXZ@4HA", false).has_value());
+    // A member pointer parameter is not read (the fallback compares the function as written).
+    CHECK_FALSE(local_scope_key("?q@?1??pm@@YAHP8K@@EAAXXZ@Z@4URegistry@@A", false).has_value());
+    // cl's statics of C functions (the agent's own, as the corpus logs show them).
+    CHECK(rest_of("?cml_module_anchor@?1??cml_get_current_module_path@@9@4HA") == "?cml_get_current_module_path@@9@4");
+    CHECK(rest_of("?$S1@?1??cml_get_current_module_path@@9@4IA", true) == "?cml_get_current_module_path@@9@4");
+}
+
+TEST_CASE("local_scope_key (review): a lambda of another function in a template argument and a parameter is read") {
+    // clang 18: `template <class F> int run(F f) { static Registry r; ... }` with a lambda of main (`?main@@9`).
+    const char* r = "?r@?1???$run@V<lambda_0>@?0??main@@9@@@YAHV<lambda_0>@?0??main@@9@@Z@4URegistry@@A";
+    REQUIRE(local_scope_key(r, false).has_value());
+    CHECK(rest_of("?$TSS0@?1???$run@V<lambda_0>@?0??main@@9@@@YAHV<lambda_0>@?0??main@@9@@Z@4HA") == rest_of(r));
+}

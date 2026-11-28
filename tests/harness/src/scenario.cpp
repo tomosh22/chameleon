@@ -96,7 +96,8 @@ std::string Step::describe() const {
             }
             break;
         case StepKind::ExpectMonotonic:
-            out += " " + key + " (at least " + std::to_string(min_samples) + " samples)";
+            out += " " + key + " (at least " + std::to_string(min_samples) + " samples" +
+                   (since_reload > 0 ? ", " + std::to_string(since_reload) + " since the last reload, continuing from before it" : std::string()) + ")";
             break;
         case StepKind::ExpectDiag:
             out += " " + id + (expect_error_text.empty() ? std::string() : " mentioning " + expect_error_text) + " within " + std::to_string(within_s) + " s";
@@ -464,7 +465,7 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
     }
     if (*kind == "expect_monotonic") {
         step.kind = StepKind::ExpectMonotonic;
-        cml::Result<void> keys = only_keys(table, {"kind", "key", "min_samples", "process"}, "an expect_monotonic step");
+        cml::Result<void> keys = only_keys(table, {"kind", "key", "min_samples", "since_reload", "within_s", "process"}, "an expect_monotonic step");
         if (!keys) return keys.error();
         cml::Result<std::string> key = require_string(table, "key", "an expect_monotonic step");
         if (!key) return key.error();
@@ -473,6 +474,17 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
         cml::Result<int> samples = int_in_range(table, "min_samples", 10, 2, 100000);
         if (!samples) return samples.error();
         step.min_samples = *samples;
+        if (table.find("since_reload") != nullptr) {  // WP-52
+            cml::Result<int> since = int_in_range(table, "since_reload", 0, 1, 100000);
+            if (!since) return since.error();
+            step.since_reload = *since;
+        }
+        if (table.find("within_s") != nullptr) {  // WP-52: how long since_reload waits for its samples
+            if (step.since_reload == 0) return invalid(table.line, "'within_s' of an expect_monotonic step needs since_reload");
+            cml::Result<int> w = int_in_range(table, "within_s", 10, 1, 3600);
+            if (!w) return w.error();
+            step.within_s = *w;
+        }
         return step;
     }
     if (*kind == "set_option") {

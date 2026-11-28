@@ -96,7 +96,17 @@ kind = "expect_reload_result"  # an integer member of the last reload's result (
 key = "compiled"               # modules_patched, processes_patched, patched, hooks_installed, ...)
 value = 1
 compiler = "cl"                # optional (WP-49): "cl" or "clang-cl"; the expectation holds for that compiler only, the other
-                               # compiler's cells pass the step without checking
+                               # compiler's cells pass the step without checking. A refused reload (`allow_error` or
+                               # `expect_error`) leaves no result (WP-52): the step then fails, except in the other
+                               # compiler's cells
+
+# WP-52: a counter continues across the last reload
+[[step]]
+kind = "expect_monotonic"      # `key=` never decreases over the whole output and changes (min_samples, default 10)
+key = "nest"
+min_samples = 20
+since_reload = 10              # optional: at least this many samples since the last reload, the first of them not below
+within_s = 20                  # the last one before it; waits up to within_s (default 10) for them
 
 # WP-22: undo reloads
 [[step]]
