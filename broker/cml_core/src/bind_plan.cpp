@@ -462,6 +462,12 @@ private:
     // a guard tied to it that is bound to the old one, or it is refused (CML3211, naming the static). `untied`: the guards
     // tied to no static (each new). Returns the untied guards a refusal names (they get no warning of their own).
     std::set<std::uint32_t> require_bound_guards(const std::vector<std::uint32_t>& untied);
+    // WP-52 (ADR-0045, ruling on R-66 and the cl nested case): a function-local static decided new while the old compiland
+    // records a static of its name in a procedure of the same outermost function is refused (CML3207): it may be that
+    // record's live object, which a new static would reset. `top_function_of`: the outermost function of a static of the
+    // patch, as a canonical display name ("o2_nest_step"); nullopt when it cannot be read (then any procedure counts).
+    void refuse_reset_statics();
+    std::optional<std::string> top_function_of(std::uint32_t pos);
     bool old_scope_has_guard_record(const Sym& st);
     // [0]: the key of a static, or of a guard in clang 18's spelling (its own name not counted); [1]: a guard in cl's and
     // clang 19's (counted).
@@ -3976,6 +3982,106 @@ void Planner::bridge_statics() {
     for (Sym& sy : syms_) {
         if (sy.defined && !sy.decided) {
             decide(sy, sy.dec.type == SymbolType::Function ? DecisionKind::PatchNewFunction : DecisionKind::PatchNewData, BindSource::None, sy.dec.type, {}, "unmatched static: new");
+        }
+    }
+    refuse_reset_statics();
+}
+
+namespace {
+
+// WP-52: the outermost function of a canonical display name of a function-local entity's scope: the part in front of its
+// first lambda ("o2_nest_step::<lambda>::operator()::<lambda>::operator()" -> "o2_nest_step"; "f" -> "f").
+std::string top_of(const std::string& canonical) {
+    const std::size_t at = canonical.find("::<lambda>");
+    return at == std::string::npos ? canonical : canonical.substr(0, at);
+}
+
+}  // namespace
+
+std::optional<std::string> Planner::top_function_of(std::uint32_t pos) {
+    const Sym& s = syms_[pos];
+    const std::string base = base_identifier(s.name);
+    if (base.empty()) {
+        return std::nullopt;
+    }
+    std::string display;
+    if (const std::optional<LocalScopeKey>& key = scope_keys(pos)[0]) {
+        // The display of the name with its back-references written out (cl's `??R1?1??` reads as `<lambda_1>`).
+        display = display_name("?" + base + "@" + key->block + key->rest);
+    } else {
+        display = s.dec.display;
+    }
+    if (display.empty() || display[0] == '?') {
+        return std::nullopt;
+    }
+    const std::string canonical = canonical_lambda_names(normalized_pdb_name(display));
+    const std::string suffix = "::" + base;
+    if (canonical.size() <= suffix.size() || canonical.compare(canonical.size() - suffix.size(), suffix.size(), suffix) != 0) {
+        return std::nullopt;
+    }
+    const std::string top = top_of(canonical.substr(0, canonical.size() - suffix.size()));
+    if (top.empty()) {
+        return std::nullopt;
+    }
+    return top;
+}
+
+// WP-52 (ADR-0045 ruling, R-66 and cl's nested lambdas): a function-local static the plan decided NEW while the old
+// compiland holds a data record of its name in a procedure of the same outermost function (the function itself, the call
+// operators of its lambdas, procedures they were inlined into) may be that record's live object: the planner did not find
+// which record is its own (R-68: closures whose names use back-references; R-66: a nested lambda inlined all the way), and a
+// new static would silently reset the running state. Refused (CML3207). A static of a name that no procedure of its
+// function records is new, as before. Procedures are matched by their display name, lambda numbers and parameter lists
+// aside (overloads collapse: an accepted over-refusal); one whose function cannot be told counts as the same. Guards are
+// not looked at: a guard follows its static.
+void Planner::refuse_reset_statics() {
+    bool have_records = false;
+    for (std::uint32_t pos = 0; pos < syms_.size(); ++pos) {
+        Sym& s = syms_[pos];
+        if (!s.defined || s.dec.type != SymbolType::Data || !s.decided || s.dec.decision != DecisionKind::PatchNewData || s.diagnosed || s.name.size() < 2 ||
+            s.name[0] != '?' || s.name[1] == '?' || is_guard_variable(s.name)) {
+            continue;
+        }
+        if (s.dec.section != 0 && secs_[s.dec.section - 1].tls) {
+            continue;  // a new thread_local is WP-24's (CML3400)
+        }
+        const std::size_t at = s.name.find('@');
+        if (at == std::string::npos || block_prefix_length(std::string_view(s.name).substr(at + 1)) == 0) {
+            continue;  // not function-local
+        }
+        if (!have_records) {
+            if (!ensure_compiland_symbols()) {
+                return;  // nothing of the compiland can be read: no record was found by anyone either
+            }
+            have_records = true;
+        }
+        const std::string base = base_identifier(s.name);
+        const std::optional<std::string> top = top_function_of(pos);
+        for (const pdb::SymbolView& v : comp_syms_) {
+            if (!pdb::is_data_kind(v.kind) || v.parent_proc == pdb::kNoSymbol || v.parent_proc >= comp_syms_.size() || comp_last(&v) != base) {
+                continue;
+            }
+            // (A thread-local record never stands for plain data: a static that lost thread_local is another variable.)
+            if (v.kind == pdb::SymbolKind::LocalThread || v.kind == pdb::SymbolKind::GlobalThread) {
+                continue;
+            }
+            const pdb::SymbolView& proc = comp_syms_[v.parent_proc];
+            const std::string proc_top = top_of(comp_norm(&proc).canonical);
+            const bool same = !top.has_value() || proc_top.empty() || proc_top == *top;
+            CML_LOG(Trace, "bind: new static %s: old record '%s' at rva %s in '%s' (function '%s'): %s", s.name.c_str(), std::string(v.name).c_str(), hex(v.rva).c_str(),
+                    std::string(proc.name).c_str(), proc_top.c_str(), same ? "of its function: refused" : "another function");
+            if (!same) {
+                continue;
+            }
+            const std::string whose = top.has_value() && !proc_top.empty() ? "a procedure of its function '" + *top + "'"
+                                                                            : "a procedure whose function cannot be told apart from its own";
+            error(diag::kAmbiguousStatic,
+                  "static data " + describe(s) + " in " + in_.object_name + " would be new in the patch, but compiland " + std::to_string(ci_) + " records '" +
+                      std::string(v.name) + "' at rva " + hex(v.rva) + " in '" + std::string(proc.name) + "', " + whose +
+                      ": that record may be this static's live object (the planner could not tell which record is its own), and a new static would reset it",
+                  "Hot-restart, or rename the static if it really is new.");
+            s.diagnosed = true;
+            break;
         }
     }
 }

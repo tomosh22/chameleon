@@ -92,8 +92,11 @@ min_samples = 20
 # clang 18 spells its guard's scope with other back-references than the static's; until WP-52 the guard was tied to no
 # static, got a fresh one (warning CML3211) and the patch constructed the live static again (nest back to 700001, nmade
 # 2). Now the guard is placed with its static: under clang-cl the reload applies (patched = 1) and nest keeps counting.
-# cl records its guards and either applies or refuses (CML3207 / CML3211 / CML3600 are allowed there; under clang-cl the
-# next step requires the reload to apply). Never a value that drops, nor a second construction.
+# Under cl the planner does not find the static's old record (the outer closure is a back-reference in its name, R-68):
+# until the WP-52 ruling the static and its guard were new and the reload reset nest to 700001 (CI 46093165335); now the
+# static decided new next to an old record of its name in its function is refused (CML3207) and nest keeps counting in the
+# old code. (CML3207 / CML3211 / CML3600 are allowed; under clang-cl the next step requires the reload to apply.) Never a
+# value that drops, nor a second construction.
 [[step]]
 kind = "edit"
 patch = "edits/nest_4.edit"

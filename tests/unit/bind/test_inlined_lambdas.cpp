@@ -755,3 +755,68 @@ TEST_CASE("R-54 second review: a call operator whose closure name is spelled wit
     CHECK(contains(errors[0].message, "a lambda's code"));
     CHECK(decision(partial, gx).decision != DecisionKind::BindOldData);
 }
+
+// ---- WP-52 (ADR-0045 ruling): a new static never silently replaces a live one of its function (cl nested, R-66) --------
+
+namespace {
+
+// cl's names for the fixture's nested lambda (planner_pairing_o2/nested.cpp, CI run 46093165335): cl counts `$TSS0`, and the
+// outer closure is written as a back-reference (`??R1?1??`), which the closure comparisons of WP-37/40 do not resolve (R-68).
+const char* const kClNested = "?nested@?1???R<lambda_1>@?1???R1?1??o2_nest_step@@YAXXZ@QEBA@XZ@QEBA@XZ@4UO2Name@@A";
+const char* const kClNestedGuard = "?$TSS0@?1???R<lambda_1>@?1???R1?1??o2_nest_step@@YAXXZ@QEBA@XZ@QEBA@XZ@4HA";
+// clang 18's names for the same fixture, both lambdas inlined into o2_nest_step (R-66: the record two levels up).
+const char* const kClangNested = "?nested@?1???R<lambda_1>@?0???R<lambda_0>@?0??o2_nest_step@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?4@XZ@4UO2Name@@A";
+const char* const kClangNestedGuard = "?$TSS0@?1???R<lambda_1>@?0???R<lambda_0>@?0??o2_nest_step@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?3@XZ@4HA";
+
+void check_reset_refused(const GuardCase& c, const std::string& name) {
+    REQUIRE_FALSE(c.r.has_value());
+    REQUIRE(count_code(c.errors, diag::kAmbiguousStatic) == 1);
+    const cml::Diag* e = nullptr;
+    for (const cml::Diag& d : c.errors) {
+        e = d.code == diag::kAmbiguousStatic ? &d : e;
+    }
+    CAPTURE(e->message);
+    CHECK(e->id() == "CML3207");
+    CHECK(contains(e->message, "would be new in the patch"));
+    CHECK(contains(e->message, "records 'nested' at rva 0x3020"));
+    CHECK(contains(e->message, "a procedure of its function 'o2_nest_step'"));
+    CHECK(contains(e->message, "a new static would reset it"));
+    CHECK(decision(c.partial, name).decision == DecisionKind::PatchNewData);
+    CHECK(count_code(c.errors, diag::kGuardUnmatched) == 0);
+}
+
+}  // namespace
+
+TEST_CASE("WP-52 ruling: cl's nested lambda static, decided new, is refused while its function records a static of its name") {
+    // CI (857fa31, cl /O2): the static and its guard were decided new (new_globals=2) and the reload reset `nest` to 700001.
+    SUBCASE("the record in the function's own procedure (both lambdas inlined)") {
+        GuardCase c = plan_guards(kCl, kCl, "o2_nest_step", {{"nested", 0x20}}, {{kClNested, 0x20}, {kClNestedGuard, 0x28}});
+        check_reset_refused(c, kClNested);
+    }
+    SUBCASE("the record in the outer lambda's call operator, the only one of its name and no types to check: paired, not new") {
+        // (The rule applies only to a static decided new; this one is found, as before. In CI the closure types of the old
+        // image are read and do not match the back-referenced scope, R-68, and the static was new.)
+        GuardCase c = plan_guards(kCl, kCl, "`o2_nest_step'::`2'::<lambda_1>::operator()", {{"nested", 0x20}}, {{kClNested, 0x20}, {kClNestedGuard, 0x28}});
+        REQUIRE_MESSAGE(c.r.has_value(), err(c.r));
+        CHECK(decision(*c.r, kClNested).decision == DecisionKind::BindOldData);
+        CHECK(decision(*c.r, kClNestedGuard).decision == DecisionKind::BindOldData);
+    }
+}
+
+TEST_CASE("WP-52 ruling (R-66): clang 18's fully inlined nested lambda, its static recorded two levels up, is refused") {
+    // clang-cl 18 /O2 without the fixture's noinline: `nested` is a record of o2_nest_step itself; the planner looks one level
+    // up (the outer call operator, which has no procedure) and decided the static new: a silent reset.
+    GuardCase c = plan_guards(kClang18, kClang18, "o2_nest_step", {{"nested", 0x20}}, {{kClangNested, 0x20}, {kClangNestedGuard, 0x28}});
+    check_reset_refused(c, kClangNested);
+}
+
+TEST_CASE("WP-52 ruling: a static whose name no procedure of its function records is new, as before") {
+    const std::string fresh = "?fresh_one@?1???R<lambda_1>@?0???R<lambda_0>@?0??o2_nest_step@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?4@XZ@4UO2Name@@A";
+    GuardCase c = plan_guards(kClang18, kClang18, "o2_nest_step", {{"nested", 0x20}}, {{fresh, 0x30}});
+    REQUIRE_MESSAGE(c.r.has_value(), err(c.r));
+    CHECK(decision(*c.r, fresh).decision == DecisionKind::PatchNewData);
+    // Nor a static of that name in another function's procedures.
+    GuardCase d = plan_guards(kClang18, kClang18, "other_function", {{"nested", 0x20}}, {{kClangNested, 0x30}});
+    REQUIRE_MESSAGE(d.r.has_value(), err(d.r));
+    CHECK(decision(*d.r, kClangNested).decision == DecisionKind::PatchNewData);
+}
