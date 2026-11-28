@@ -18,8 +18,10 @@ std::atomic<int> g_level{static_cast<int>(LogLevel::Info)};
 struct SinkRecord {
     LogSink sink;
     void* user;
+    LogFlush flush;  // WP-58: may be null
 };
 std::atomic<const SinkRecord*> g_record{nullptr};  // nullptr = default stderr sink
+thread_local unsigned long long t_written = 0;  // WP-58: records dispatched on this thread
 
 const char* base_name(const char* path) noexcept {
     if (path == nullptr) {
@@ -52,16 +54,27 @@ bool log_enabled(LogLevel level) noexcept {
     return static_cast<int>(level) >= g_level.load(std::memory_order_relaxed);
 }
 
-void set_log_sink(LogSink sink, void* user) noexcept {
+void set_log_sink(LogSink sink, void* user, LogFlush flush) noexcept {
     if (sink == nullptr) {
         g_record.store(nullptr, std::memory_order_release);
         return;
     }
-    const SinkRecord* record = new (std::nothrow) SinkRecord{sink, user};
+    const SinkRecord* record = new (std::nothrow) SinkRecord{sink, user, flush};
     if (record == nullptr) {
         return;  // out of memory: keep the previous sink rather than pair sink and user wrongly
     }
     g_record.store(record, std::memory_order_release);
+}
+
+void log_flush() noexcept {
+    const SinkRecord* record = g_record.load(std::memory_order_acquire);
+    if (record != nullptr && record->flush != nullptr) {
+        record->flush(record->user);
+    }
+}
+
+unsigned long long log_records_written() noexcept {
+    return t_written;
 }
 
 const char* to_string(LogLevel level) noexcept {
@@ -93,6 +106,7 @@ void log_write(LogLevel level, const char* file, int line, const char* fmt, ...)
         std::memcpy(buffer, kFailed, sizeof(kFailed));
     }
 
+    ++t_written;
     const SinkRecord* record = g_record.load(std::memory_order_acquire);
     if (record != nullptr) {
         record->sink(record->user, level, file, line, buffer);
