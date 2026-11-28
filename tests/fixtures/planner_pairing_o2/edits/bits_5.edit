@@ -1,0 +1,9 @@
+--- a/bitmask.cpp
++++ b/bitmask.cpp
+@@ -64,5 +64,5 @@
+ 
+ int o2_bits_mark()
+ {
+-    return 1;
++    return 5;
+ }
