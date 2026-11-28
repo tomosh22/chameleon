@@ -27,6 +27,27 @@ bool has_cleanup(const std::string& group) {
     return group == "restart" || group == "revert" || group == "exception-action" || group == "watch";
 }
 
+// WP-62 (R-70): an inject-failure that sends ArmFault without the gate (FaultInjector::begin_arming) ends its arming on every way out.
+class ArmingScope {
+public:
+    ArmingScope() = default;
+    ArmingScope(const ArmingScope&) = delete;
+    ArmingScope& operator=(const ArmingScope&) = delete;
+    ~ArmingScope() {
+        if (faults_ != nullptr) {
+            faults_->end_arming();
+        }
+    }
+    // `gate` is held (FaultInjector::lock_gate()); it is let go of here.
+    void begin(FaultInjector& faults, std::unique_lock<std::mutex>& gate) {
+        faults.begin_arming(gate);
+        faults_ = &faults;
+    }
+
+private:
+    FaultInjector* faults_ = nullptr;
+};
+
 }  // namespace
 
 Diag FaultInjector::make_diag(fault::Stage stage) {
@@ -615,6 +636,7 @@ Result<Value> inject_failure(ReloadService& service, const Value& args) {
     // WP-44: "none" for a pid whose agent is gone clears what is armed or recorded for it, but only when the process host confirms that
     // the process has exited (a live process that is only disconnected stays armed in its agent, so its records stay too: CML5961).
     if (pid && targets.empty() && stage_name == fault::kDisarm && service.faults().armed_for_process(*pid) && service.process_exited(*pid)) {
+        const std::unique_lock<std::mutex> gate = service.faults().lock_gate();  // WP-62: after an inject-failure that is arming agents
         service.faults().disarm_process(*pid);
         CML_LOG(Info, "failure injection: process %u has exited (no agent connected); what was armed or recorded for it is cleared", *pid);
         Value cleared = Value::object();
@@ -635,11 +657,17 @@ Result<Value> inject_failure(ReloadService& service, const Value& args) {
     if (stage_name == fault::kDisarm) {
         // Disarm everything that can be disarmed, then say which agents could not be. WP-44: the persisted armings go as well; with a
         // pid only what can fire for that process (the other processes' armings and records stay).
+        // WP-62: under the gate, so an inject-failure that is arming agents ends first: clearing its records before its ArmFault reaches
+        // the agent would leave the agent armed with no record. Like an arming, the agents' ArmFault goes out without the gate, and
+        // nobody arms meanwhile (ArmingScope).
+        std::unique_lock<std::mutex> gate = service.faults().lock_gate();
         if (pid) {
             service.faults().disarm_process(*pid);
         } else {
             service.faults().disarm_all();
         }
+        ArmingScope disarming;
+        disarming.begin(service.faults(), gate);
         std::vector<std::uint32_t> failed;
         std::string reasons;
         for (const std::shared_ptr<AgentLink>& link : targets) {
@@ -734,17 +762,9 @@ Result<Value> inject_failure(ReloadService& service, const Value& args) {
         }
         // WP-62 (R-70): the gate is let go of before the first ArmFault (the send lock of a link is never taken under it); an operation
         // that starts meanwhile still waits, in lock_gate(), until the last ArmFault (and any undo) is done.
-        struct ArmingScope {
-            FaultInjector* faults = nullptr;
-            ~ArmingScope() {
-                if (faults != nullptr) {
-                    faults->end_arming();
-                }
-            }
-        } arming;
+        ArmingScope arming;
         if (cleanup) {
-            service.faults().begin_arming(gate);
-            arming.faults = &service.faults();
+            arming.begin(service.faults(), gate);
         }
         // All or nothing: the agents already armed are disarmed again when one of them refuses.
         std::vector<std::shared_ptr<AgentLink>> armed;

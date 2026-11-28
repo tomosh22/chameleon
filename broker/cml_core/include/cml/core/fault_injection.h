@@ -21,11 +21,14 @@
 //     arming can never fall between an operation's start and its end. Each operation runs its cleanup (finish_injection) before it
 //     lets go of its run lock.
 //   * WP-62 (R-70): the gate is never held while a message goes to an agent. inject_failure makes its busy check and its records
-//     under the gate, marks itself as arming (begin_arming) and lets go of the gate before its first ArmFault; until it ends
-//     (end_arming), lock_gate() waits, so an operation still cannot start between the records and the last ArmFault. Lock order:
-//     nothing that holds the gate takes a link's send lock (AgentLink::send), so a transport that calls back into the broker from
-//     inside a send (the unit tests' scripted agents do) may take the gate. Before WP-62 inject_failure sent under the gate, and
-//     such a callback inverted the order (gate -> send lock against send lock -> gate).
+//     (and {"stage":"none"} its clearing) under the gate, marks itself as arming (begin_arming) and lets go of the gate before its
+//     first ArmFault; until it ends (end_arming), lock_gate() waits, so an operation or another inject-failure still cannot start
+//     between the records and the last ArmFault. Nothing that holds the gate takes a link's send lock (AgentLink::send).
+//     INVARIANT: never call lock_gate(), inject_failure, or an operation that takes the gate (restart, revert, an exception action,
+//     a compile-on-save batch) from code that runs under an AgentLink send lock, that is from inside a link's SendFn. It would
+//     wait for an arming whose ArmFault needs that send lock: a hang that no sanitizer reports (the wait is on a condition
+//     variable). The broker's only SendFn is a pipe write; the unit tests' scripted agents run their hooks on threads of their own,
+//     after the send has returned.
 
 #include <array>
 #include <condition_variable>
@@ -87,7 +90,8 @@ public:
 
     // R-51: see the top of the file. Taken by inject_failure (for a stage with an end-of-operation cleanup) and by the operations
     // while they start; never held while an operation runs. WP-62 (R-70): lock_gate() takes it once no inject-failure is arming
-    // agents (it waits for end_arming), and nobody holds it while a message goes to an agent.
+    // agents (it waits for end_arming), and nobody holds it while a message goes to an agent. Never call it under an AgentLink send
+    // lock (see the top of the file).
     std::unique_lock<std::mutex> lock_gate();
     // WP-62: inject_failure, holding the gate (from lock_gate()), is about to send ArmFault to agents: marks the arming and lets go
     // of the gate. Every lock_gate() waits until end_arming(), which takes the gate itself.
