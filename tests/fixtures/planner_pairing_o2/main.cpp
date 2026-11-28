@@ -19,8 +19,7 @@ int main(int argc, char** argv)
         o2_nest_step();
         o2_bits_step();
         o2_nest2_step();
-        std::printf("TICK n=%d mark=%d a=%d b=%d c=%d parts=%d pm=%d made=%d nest=%d nmade=%d nmark=%d bits=%d bsec=%d bmade=%d bmark=%d nest2=%d n2made=%d
-", n,
+        std::printf("TICK n=%d mark=%d a=%d b=%d c=%d parts=%d pm=%d made=%d nest=%d nmade=%d nmark=%d bits=%d bsec=%d bmade=%d bmark=%d nest2=%d n2made=%d\n", n,
                     o2_mark(), o2_value(0), o2_value(1), o2_value(2), o2_parts_sum(), o2_parts_mark(), o2_made(), o2_nest_value(), o2_nest_made(), o2_nest_mark(),
                     o2_bits_value(), o2_bits_second(), o2_bits_made(), o2_bits_mark(), o2_nest2_value(), o2_nest2_made());
     });
