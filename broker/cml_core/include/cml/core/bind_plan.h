@@ -372,6 +372,20 @@ struct BindPlan {
 // Planning
 // ---------------------------------------------------------------------------------------------
 
+// WP-60 (R-57, ADR-0047): a function other than closure code that an old procedure inlined (its inline sites, at any depth),
+// whose function-local statics the compiler may have recorded as plain records of that procedure: a free function (its
+// linkage cannot be read from LF_FUNC_ID), a member function of a class with internal linkage (in an anonymous namespace or
+// local to a function, or a member template, or a member whose name or signature names such a type), or a member of a class
+// with external linkage (under clang its statics are global records, never local ones).
+struct InlineHelper {
+    std::uint32_t id = 0;        // the old image's IPI id of the inlinee (its inlinee lines name its source file)
+    std::string name;            // qualified as a procedure of the compiland is named ("hs", "`anonymous namespace'::H::get")
+    std::string unqualified;     // as the inlinee records it ("hs", "get"): the scope a static of it names
+    bool name_known = true;      // false: its parent scope cannot be read, so no procedure can be shown to be it
+    const char* kind = "";       // "free-function", "internal-class" or "external-class" (a string literal of the planner)
+    std::string signature;       // its canonical signature (an inlinee whose signature cannot be read is WP-51's risk)
+};
+
 // WP-55 (R-62): WP-51's verdict on an old procedure's inline sites (what it inlined, read from the module stream through
 // PdbIndex::procs_inlinees), kept across the reloads of one module image. The image does not change while it is loaded, so
 // neither do its procedures' inline sites, and a verdict taken from here is the one the planner would read again. Owned by the
@@ -379,17 +393,6 @@ struct BindPlan {
 // identity (GUID and age), the compiland and the procedure's index in its symbols; each entry also holds the procedure's RVA and
 // name, and a lookup that finds another procedure there finds nothing. A store under another PDB identity drops every entry of
 // the old one. A verdict whose inline sites could not be read is not kept. Thread-safe.
-// WP-60 (R-57, ADR-0047): a function other than closure code that an old procedure inlined (its inline sites, at any depth),
-// whose function-local statics the compiler may have recorded as plain records of that procedure: a free function (its
-// linkage cannot be read from LF_FUNC_ID) or a member function of a class (internal: in an anonymous namespace or local to a
-// function; external: a static of it is a global record, never a local one).
-struct InlineHelper {
-    std::string name;            // qualified as a procedure of the compiland is named ("hs", "`anonymous namespace'::H::get")
-    bool name_known = true;      // false: its parent scope cannot be read, so no procedure can be shown to be it
-    const char* kind = "";       // "free-function", "internal-class" or "external-class" (a string literal of the planner)
-    std::string signature;       // its canonical signature (an inlinee whose signature cannot be read is WP-51's risk)
-};
-
 struct CachedInlineVerdict {
     std::uint32_t proc_rva = 0;
     std::string proc_name;

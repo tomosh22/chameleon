@@ -1388,9 +1388,18 @@ TEST_CASE("inlinees (WP-60): a function's parent scope is read from its LF_STRIN
     const std::uint32_t in_anon = w.spec.ipi.record(kLfFuncId, lf_func_id(w.proc_void, "hs", anon));
     const std::uint32_t odd_scope = w.spec.ipi.record(kLfFuncId, lf_func_id(w.proc_void, "odd", w.id_make));  // a function id, not a string
     const std::uint32_t lost_scope = w.spec.ipi.record(kLfFuncId, lf_func_id(w.proc_void, "lost", 0x1FFF));   // not in the IPI
+    // (Review of 8609b97) A string with a substring list is the tail of a longer one: its scope is not known.
+    Bytes tail;
+    put32(tail, anon);  // a (bogus) substring list
+    for (const char ch : std::string("Inner")) {
+        tail.push_back(static_cast<std::uint8_t>(ch));
+    }
+    tail.push_back(0);
+    const std::uint32_t long_scope = w.spec.ipi.record(0x1605, tail);
+    const std::uint32_t in_long = w.spec.ipi.record(kLfFuncId, lf_func_id(w.proc_void, "deep", long_scope));
     Module m = inline_module();
     m.symbols.proc(0x1110, "f", 1, 0x100, 0x80, 0, w.proc_void);
-    for (const std::uint32_t id : {w.id_make, in_anon, odd_scope, lost_scope, w.id_ctor}) {
+    for (const std::uint32_t id : {w.id_make, in_anon, odd_scope, lost_scope, w.id_ctor, in_long}) {
         m.symbols.add(0x114D, inline_site(id));
         m.symbols.add(0x114E, Bytes());
     }
@@ -1400,7 +1409,8 @@ TEST_CASE("inlinees (WP-60): a function's parent scope is read from its LF_STRIN
     const auto idx = open_spec(dir, w.spec);
     const auto got = idx->proc_inlinees(procs_of(*idx)[0]);
     REQUIRE(got.has_value());
-    REQUIRE(got->inlinees.size() == 5);
+    REQUIRE(got->inlinees.size() == 6);
+    CHECK_FALSE(got->inlinees[5].scope_known);
     for (const PdbIndex::Inlinee& e : got->inlinees) {
         CAPTURE(e.name);
         CHECK(e.readable);
@@ -1414,6 +1424,78 @@ TEST_CASE("inlinees (WP-60): a function's parent scope is read from its LF_STRIN
     CHECK_FALSE(got->inlinees[3].scope_known);
     CHECK(got->inlinees[4].scope_known);  // a member: its class names it, no scope is read
     CHECK(got->inlinees[4].scope.empty());
+}
+
+TEST_CASE("inlinee lines (WP-60): the source file checksum of an inlinee, from C13 DEBUG_S_INLINEELINES and DEBUG_S_FILECHKSMS") {
+    const auto subsection = [](Bytes& out, std::uint32_t kind, const Bytes& body) {
+        put32(out, kind);
+        put32(out, static_cast<std::uint32_t>(body.size()));
+        out.insert(out.end(), body.begin(), body.end());
+        while (out.size() % 4 != 0) {
+            out.push_back(0);
+        }
+    };
+    // Checksums: file 0 (MD5, 16 bytes of 0xA1) at offset 0, file 1 (no checksum) at 24, file 2 (MD5 of 0xB2) at 32.
+    Bytes sums;
+    const auto entry = [&](std::uint8_t kind, std::uint8_t size, std::uint8_t fill) {
+        put32(sums, 0);
+        sums.push_back(size);
+        sums.push_back(kind);
+        for (std::uint8_t i = 0; i < size; ++i) {
+            sums.push_back(fill);
+        }
+        while (sums.size() % 4 != 0) {
+            sums.push_back(0);
+        }
+    };
+    entry(1, 16, 0xA1);
+    entry(0, 0, 0);
+    entry(1, 16, 0xB2);
+    REQUIRE(sums.size() == 56);
+    Bytes lines;  // signature 0: (inlinee, file id, line)
+    put32(lines, 0);
+    for (const std::uint32_t v : {0x1001u, 0u, 3u, 0x1002u, 24u, 7u, 0x1003u, 0u, 1u, 0x1003u, 32u, 2u}) {
+        put32(lines, v);
+    }
+    Bytes ex;  // signature 1: (inlinee, file id, line, extra count, extra file ids)
+    put32(ex, 1);
+    for (const std::uint32_t v : {0x1004u, 32u, 9u, 2u, 0u, 24u, 0x1005u, 0u, 4u, 0u}) {
+        put32(ex, v);
+    }
+    Bytes all;
+    subsection(all, 0xF1, Bytes(6, 0));  // symbols: skipped
+    subsection(all, 0xF6, lines);
+    subsection(all, 0xF4, sums);
+    subsection(all, 0xF6, ex);
+    cml::pdb::C13Inlinees c13;
+    REQUIRE(cml::pdb::read_c13_inlinees(std::span<const std::uint8_t>(all.data(), all.size()), c13).has_value());
+    CHECK(c13.checksum_tables == 1);
+    CHECK(c13.lines.size() == 6);
+    const auto f1 = cml::pdb::inlinee_file(c13, 0x1001);
+    REQUIRE(f1.has_value());
+    CHECK(f1->kind == 1);
+    CHECK(f1->bytes == std::vector<std::uint8_t>(16, 0xA1));
+    CHECK_FALSE(cml::pdb::inlinee_file(c13, 0x1002).has_value());  // recorded without a checksum
+    CHECK_FALSE(cml::pdb::inlinee_file(c13, 0x1003).has_value());  // two entries naming different files
+    const auto f4 = cml::pdb::inlinee_file(c13, 0x1004);           // the extra-files form
+    REQUIRE(f4.has_value());
+    CHECK(f4->bytes == std::vector<std::uint8_t>(16, 0xB2));
+    CHECK((cml::pdb::inlinee_file(c13, 0x1005) == cml::pdb::inlinee_file(c13, 0x1001)));
+    CHECK_FALSE(cml::pdb::inlinee_file(c13, 0x1FFF).has_value());  // no entry
+
+    cml::pdb::C13Inlinees twice = c13;  // a second checksum table: the file ids are no longer unambiguous
+    Bytes more;
+    subsection(more, 0xF4, sums);
+    REQUIRE(cml::pdb::read_c13_inlinees(std::span<const std::uint8_t>(more.data(), more.size()), twice).has_value());
+    CHECK(twice.checksum_tables == 2);
+    CHECK_FALSE(cml::pdb::inlinee_file(twice, 0x1001).has_value());
+
+    Bytes cut;
+    put32(cut, 0xF6);
+    put32(cut, 400);  // longer than the span
+    put32(cut, 0);
+    cml::pdb::C13Inlinees bad;
+    CHECK_FALSE(cml::pdb::read_c13_inlinees(std::span<const std::uint8_t>(cut.data(), cut.size()), bad).has_value());
 }
 
 TEST_CASE("inlinees: a procedure that is not in its module, or a module without an end record, is an error") {

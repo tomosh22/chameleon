@@ -3,6 +3,7 @@
 Obj make(int id) { Obj o; o.v = id; o.hits = 0; return o; }
 volatile int g_sink;
 void sink(int v) { g_sink = v; }
+int (*volatile g_ext_glob)(int) = &ext_glob;  // keeps an out-of-line (global) copy of ext_glob in this compiland (h13)
 extern void f(int* a, int n);
 extern void g();
 int main() { int a[4] = {3, 1, 2, 4}; f(a, 4); g(); return 0; }

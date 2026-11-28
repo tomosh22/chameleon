@@ -39,8 +39,10 @@ std::string hex_id(std::uint32_t v) {
     return out;
 }
 
+}  // namespace
+
 // Fills `e` from the IPI record `e.id` (and the TPI record of its class).
-void resolve_inlinee(const TypeSource& types, PdbIndex::Inlinee& e) {
+void PdbIndex::resolve_inlinee(const TypeSource& types, PdbIndex::Inlinee& e) {
     TypeRecord r;
     if (e.id < 0x1000 || !types.find_id(e.id, r)) {
         e.why = "the inline site names id " + hex_id(e.id) + ", which the IPI stream does not hold";
@@ -69,9 +71,10 @@ void resolve_inlinee(const TypeSource& types, PdbIndex::Inlinee& e) {
         e.class_name.assign(name);
         e.class_unique = without_tu_discriminator(unique);
     } else if (const std::uint32_t scope = rd32(r.body); scope != 0) {
-        // WP-60 (R-57): the parent scope, an LF_STRING_ID (its first field the substring list, then the name).
+        // WP-60 (R-57): the parent scope, an LF_STRING_ID (its first field the substring list, then the name). A string with a
+        // substring list is the tail of a longer one (review: not rebuilt here), so its scope is not known.
         TypeRecord s;
-        const std::size_t slen = scope >= 0x1000 && types.find_id(scope, s) && s.kind == cv::LF_STRING_ID && s.body_len > 4
+        const std::size_t slen = scope >= 0x1000 && types.find_id(scope, s) && s.kind == cv::LF_STRING_ID && s.body_len > 4 && rd32(s.body) == 0
                                      ? cv::cstr_len(s.body + 4, s.body_len - 4)
                                      : 0;
         if (slen == 0 || slen == s.body_len - 4) {
@@ -89,8 +92,6 @@ void resolve_inlinee(const TypeSource& types, PdbIndex::Inlinee& e) {
     }
     e.readable = true;
 }
-
-}  // namespace
 
 Result<PdbIndex::ProcInlinees> PdbIndex::proc_inlinees(const SymbolView& proc) const {
     Result<std::vector<ProcInlinees>> all = procs_inlinees(std::vector<SymbolView>{proc});

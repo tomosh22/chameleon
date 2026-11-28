@@ -123,6 +123,12 @@ void ObjectSignatures::load() {
                 continue;
             }
             const std::span<const std::uint8_t> bytes = bytes_of(sec.data);
+            if (bytes.size() > 4) {
+                // WP-60: the inlinee lines and file checksums (a malformed run is skipped; inlinee_file then finds nothing).
+                if (Result<void> lines = pdb::read_c13_inlinees(bytes.subspan(4), c13_); !lines) {
+                    CML_LOG(Debug, "bind: inlinee lines of %s: .debug$S section %u skipped: %s", object_name_.c_str(), sec.index, lines.error().message.c_str());
+                }
+            }
             Result<std::vector<pdb::ObjectProc>> procs = pdb::read_object_procs(bytes);
             if (!procs) {
                 ++bad_sections;
@@ -157,8 +163,13 @@ void ObjectSignatures::load() {
                 if (inserted) {
                     it->second.type_index = p.type_index;
                     it->second.type_is_id = p.type_is_id;
-                } else if (it->second.type_index != p.type_index || it->second.type_is_id != p.type_is_id) {
-                    it->second.conflict = true;
+                    it->second.inlinee_ids = p.inlinees;  // WP-60
+                    it->second.inlinees_usable = p.inlinees_complete;
+                } else {
+                    it->second.inlinees_usable = false;  // WP-60: two records of one function: which sites are its own is not known
+                    if (it->second.type_index != p.type_index || it->second.type_is_id != p.type_is_id) {
+                        it->second.conflict = true;
+                    }
                 }
                 it->second.local_types.insert(it->second.local_types.end(), p.local_types.begin(), p.local_types.end());  // WP-46
                 // The function-local statics of the procedure: each record names its variable through the SECREL
@@ -210,6 +221,34 @@ const ObjectSignatures::ProcStatics* ObjectSignatures::statics_of(std::uint32_t 
     }
     const auto it = procs_.find((static_cast<std::uint64_t>(section) << 32) | value);
     return it == procs_.end() ? nullptr : &it->second.statics;
+}
+
+const std::vector<pdb::PdbIndex::Inlinee>* ObjectSignatures::inlinees_of(std::uint32_t section, std::uint32_t value) {
+    if (!loaded_) {
+        load();
+    }
+    const auto it = procs_.find((static_cast<std::uint64_t>(section) << 32) | value);
+    if (it == procs_.end() || types_ == nullptr || !it->second.inlinees_usable) {
+        return nullptr;
+    }
+    Proc& p = it->second;
+    if (!p.inlinees_resolved) {
+        p.inlinees_resolved = true;
+        for (const std::uint32_t id : p.inlinee_ids) {
+            pdb::PdbIndex::Inlinee e;
+            e.id = id;
+            pdb::PdbIndex::resolve_inlinee(*types_, e);
+            p.inlinees.push_back(std::move(e));
+        }
+    }
+    return &p.inlinees;
+}
+
+std::optional<pdb::FileChecksum> ObjectSignatures::inlinee_file(std::uint32_t id) {
+    if (!loaded_) {
+        load();
+    }
+    return pdb::inlinee_file(c13_, id);
 }
 
 std::optional<std::uint64_t> ObjectSignatures::function_of_static(std::uint32_t section, std::uint32_t value, bool* several) {

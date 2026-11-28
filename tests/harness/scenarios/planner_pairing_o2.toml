@@ -169,8 +169,11 @@ within_s = 20
 # another initialiser (970000), and makes o2_r57_mark() return 7. Until WP-60 clang-cl's single record `rx` of o2_r57_step() (the
 # helper's) paired with the caller's new static and the guard was placed by the layout: the reload applied (rmark=7) and the new
 # static took the helper's live object (r57 kept counting from 960000, its initialiser never ran). Now the caller's inline
-# sites name a helper whose statics cannot be read, and o2_r57_step() changed, so the static is refused: CML3207 in every cell.
-# The refused reload changes nothing: r57 keeps counting from 960000, rmade stays 1, rmark stays 1.
+# sites name a helper whose statics cannot be read, the patch no longer inlines it, and o2_r57_step() changed, so the static is
+# refused: CML3207, required under clang-cl (`compiler`). Under cl the helper's static sits inside the helper's inline site;
+# there either outcome is allowed (review of 8609b97) until the cl cells show which: refused, nothing changes (r57 keeps
+# counting from 960000, rmade=1, rmark=1); applied, the new static must be a fresh one (r57 from 970000, rmade=2, rmark=7). What
+# is never allowed is the wrong pairing: rmark=7 with r57 still counting from 960000.
 [[step]]
 kind = "edit"
 patch = "edits/r57_7.edit"
@@ -179,10 +182,11 @@ patch = "edits/r57_7.edit"
 kind = "reload"
 within_s = 120
 expect_error = "CML3207"
+compiler = "clang-cl"
 
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ mark=[12] a=10\\d{4} b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=1 made=3 nest=7\\d{5} nmade=1 nmark=4 bits=80\\d{4} bsec=90\\d{4} bmade=2 bmark=1 nest2=60\\d{4} n2made=1 help=95\\d{4} hmade=1 hmark=6 r57=96\\d{4} rmade=1 rmark=1\\b"
+regex = "TICK n=\\d+ mark=[12] a=10\\d{4} b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=1 made=3 nest=7\\d{5} nmade=1 nmark=4 bits=80\\d{4} bsec=90\\d{4} bmade=2 bmark=1 nest2=60\\d{4} n2made=1 help=95\\d{4} hmade=1 hmark=6 (r57=96\\d{4} rmade=1 rmark=1|r57=97\\d{4} rmade=2 rmark=7)\\b"
 within_s = 10
 
 [[step]]

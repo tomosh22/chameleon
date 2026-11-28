@@ -263,6 +263,8 @@ Result<void> build_index(PdbIndex::Impl& impl) {
             c.index = static_cast<std::uint32_t>(impl.compilands.size());
             c.symbol_stream = rd16(e + 34);
             c.symbol_bytes = rd32(e + 36);
+            c.c11_bytes = rd32(e + 40);  // WP-60: the line information after the symbols (C11, then C13)
+            c.c13_bytes = rd32(e + 44);
             c.file_count = rd16(e + 48);
             impl.compilands.push_back(std::move(c));
             raws.push_back(ModRaw{reinterpret_cast<const char*>(name), static_cast<std::uint32_t>(name_len),

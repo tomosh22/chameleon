@@ -7,9 +7,11 @@
 // the plan succeeds, its guard placed by the layout). WP-60 applies WP-51/WP-57's rule to helpers: where the caller's inline sites
 // name a helper whose statics may hold the record's name, the static is paired and listed (BindPlan::inlined_owner_statics), and
 // the pipeline keeps it only when WP-25's comparator proves the caller unchanged under the plan (prove_inlined_owner_statics);
-// otherwise CML3207. A helper clears the record when its statics can be read and hold no static of that name: its own
-// procedure in the compiland (an out-of-line copy, found by name and signature) holds none (h5), or it is a member of a class
-// with external linkage and the record is a local one (an external function's static is a global record, h8).
+// otherwise CML3207. A helper clears the record only by proof: its own procedure in the compiland (an out-of-line copy, found by
+// name and signature) holds no static of that name (h5), or the patch proves it unchanged: the patch's function still inlines
+// the same helper, from a source file with the old checksum, and the patch defines no other function-local static of the name
+// (h8, h10; refused when the file changed, h12, or the patch no longer inlines it, h11, h13). Nothing is cleared by linkage
+// (review of 8609b97): an inlinee is named without its template arguments (h11: `get` for `Registry::get<Local>`).
 //
 // The inputs are real: tests/unit/bind/wp60/<case>.{exe,pdb} (the old image, clang 18 clang-cl -O2 + lld-link) and
 // <case>.patch.obj (the edited source), built by tests/unit/bind/wp60/build.sh from src/. Synthetic PDBs (as WP-51's tests) cover
@@ -190,6 +192,7 @@ TEST_CASE("R-57: an own static is not paired with the static of an inlined helpe
         const Case c("h1_r57");
         const Diag d = check_refused(c, "h");
         CHECK(contains(d.message, "the compiland has no procedure of 'h' (every call to it was inlined), so its statics cannot be read"));
+        CHECK(contains(d.message, "the patch does not prove it unchanged (the patch's function no longer inlines it)"));
         CHECK(contains(d.message, "the code of 'f' changed"));
         CHECK(contains(c.listed(kOwnX)->risk, "a helper function (free-function)"));
     }
@@ -221,33 +224,62 @@ TEST_CASE("R-57: an own static next to an inlined helper reloads while its funct
         const Case c("h3_helper_other");
         check_proven(c, "hs");
     }
-    SUBCASE("f edited: refused (the accepted limitation: nothing in the records tells this from h1)") {
+    SUBCASE("f edited: refused (the accepted limitation: the helper is in the edited file, nothing in the records tells this from h1)") {
         const Case c("h4_helper_edit");
         const Diag d = check_refused(c, "hs");
+        CHECK(contains(d.message, "its source file changed"));
         CHECK(contains(d.message, "the code of 'f' changed"));
     }
 }
 
-TEST_CASE("R-57: a helper whose statics can be read and hold no static of the name clears the record (h5, h8)") {
-    SUBCASE("the helper's out-of-line copy (found by name and signature) holds no `x`: f edited, x pairs") {
-        const Case c("h5_outofline");
+TEST_CASE("R-57: a helper whose statics can be read and hold no static of the name clears the record (h5)") {
+    // The helper's out-of-line copy (found by name and signature) holds no `x`: f edited, x pairs.
+    const Case c("h5_outofline");
+    check_paired(c);
+    CHECK(c.plan.inlined_owner_statics.empty());
+    CHECK(c.decision("?calls@?1??hs@@YAHH@Z@4HA").decision == DecisionKind::BindOldData);
+}
+
+TEST_CASE("R-57: the patch proves a helper from an unchanged header (h10, h8), and not from a changed one (h12)") {
+    SUBCASE("`inline int ext_count()` (common.h) still inlined by the edited f: cleared, x pairs") {
+        const Case c("h10_external_free");
         check_paired(c);
         CHECK(c.plan.inlined_owner_statics.empty());
-        CHECK(c.decision("?calls@?1??hs@@YAHH@Z@4HA").decision == DecisionKind::BindOldData);
     }
-    SUBCASE("a member of a class with external linkage (`Ext::bump`): its statics are global records, x is a local one") {
+    SUBCASE("`Ext::bump` (common.h, a member) still inlined by the edited f: cleared, x pairs") {
         const Case c("h8_external_member");
         check_paired(c);
         CHECK(c.plan.inlined_owner_statics.empty());
     }
+    SUBCASE("two functions with an own `x` each (Jolt's GetRTTIOfType overloads have one `rtti` each), both inlining ext_count") {
+        // The other function's `x` is not in the helper's scope, so it does not stop the proof: both pair, nothing is listed.
+        const Case c("h14_two_owners");
+        check_paired(c);
+        CHECK(c.plan.inlined_owner_statics.empty());
+        CHECK(c.decision("?x@?1??k@@YAXXZ@4UObj@@A").decision == DecisionKind::BindOldData);
+    }
+    SUBCASE("`inline int hx()` from a header whose content changed: refused") {
+        const Case c("h12_header_changed");
+        const Diag d = check_refused(c, "hx");
+        CHECK(contains(d.message, "its source file changed (the checksums its inlinee lines name differ)"));
+    }
 }
 
-TEST_CASE("R-57: an inlined external free function is a helper too, its linkage cannot be read (h10, accepted limitation)") {
-    // `inline int ext_count() { static int ec; ... }` inlined into f, f edited: LF_FUNC_ID does not say ext_count is external,
-    // and no procedure of it is in the compiland, so the record `x` may be its static as far as the image shows.
-    const Case c("h10_external_free");
-    const Diag d = check_refused(c, "ext_count");
-    CHECK(contains(d.message, "the code of 'f' changed"));
+TEST_CASE("R-57 (review of 8609b97): nothing is cleared by linkage (h11, h13)") {
+    SUBCASE("a member template of an external class over an anonymous-namespace type (`Registry::get<Local>`), deleted: refused") {
+        // Its LF_MFUNC_ID is named `get`, its class `Registry` has external linkage, but the instantiation has internal linkage
+        // and clang records its static `x` as a plain S_LDATA32 of f. 8609b97 cleared it as an external class's member.
+        const Case c("h11_member_template");
+        const Diag d = check_refused(c, "Registry::get");
+        CHECK(contains(d.message, "the patch's function no longer inlines it"));
+    }
+    SUBCASE("an external inline function with a global out-of-line copy in another compiland, no longer inlined: refused") {
+        // `ext_glob` has an S_GPROC32 (and S_PROCREF) in support.obj, but a template instantiation over an internal type can share
+        // its name and signature in the records, so the global procedure proves nothing about the inlinee.
+        const Case c("h13_external_global");
+        const Diag d = check_refused(c, "ext_glob");
+        CHECK(contains(d.message, "the patch's function no longer inlines it"));
+    }
 }
 
 TEST_CASE("R-57: the helpers of a verdict kept by WP-55's cache are the ones read (h1, then h3)") {
@@ -391,7 +423,7 @@ TEST_CASE("R-57 (synthetic): which inlinees put an own static to the proof") {
         REQUIRE(listed_counter(p) != nullptr);
         CHECK(contains(listed_counter(p)->risk, "the scope of 'ImMax' cannot be read"));
     }
-    SUBCASE("Jolt's GetRTTIOfType inlined only the constructor of JPH::RTTI (a class with external linkage): cleared") {
+    SUBCASE("Jolt's GetRTTIOfType that inlined the constructor of JPH::RTTI (external class): listed, the patch has no debug records to prove it") {
         SynthWorld w = basic_world(false);
         OldTypes t;
         const std::uint32_t ctor = t.member(w.spec.ipi, "JPH::RTTI", ".?AVRTTI@JPH@@", "RTTI");
@@ -407,7 +439,9 @@ TEST_CASE("R-57 (synthetic): which inlinees put an own static to the proof") {
         in.prove_inlined_owners = true;
         auto r = plan_bind(in);
         REQUIRE(r.has_value());
-        CHECK(r->inlined_owner_statics.empty());
+        REQUIRE(r->inlined_owner_statics.size() == 1);
+        CHECK(r->inlined_owner_statics[0].helper == "JPH::RTTI::RTTI");
+        CHECK(contains(r->inlined_owner_statics[0].risk, "no procedure record of the patch declares the static"));
         CHECK(r->find_decision(rtti)->decision == DecisionKind::BindOldData);
     }
     SUBCASE("a member of a class in an anonymous namespace: listed") {

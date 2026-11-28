@@ -826,9 +826,16 @@ private:
     std::size_t wp51_would_refuse_ = 0;
     // WP-60 (R-57, ADR-0047): the helper (not closure code) that `v`'s procedure inlined and whose static `record` may be, as
     // the risk to list the static with ("" when every helper is shown not to hold a static of the record's name), and its name.
-    std::string helper_risk(const InlineVerdict& v, const pdb::SymbolView& record, std::string& helper);
+    std::string helper_risk(const InlineVerdict& v, const pdb::SymbolView& record, const Sym& sy, std::string& helper);
+    // (Review of 8609b97) The patch proof that clears a helper: the patch's own procedure of the static's function still inlines
+    // the helper (same qualified name and signature), the helper's source file has the old checksum, and the patch defines no
+    // other function-local static of the record's name ("" when proven, else why not).
+    std::string helper_by_patch(const InlineHelper& h, const pdb::SymbolView& record, const Sym& sy);
     std::unordered_map<std::string, std::vector<std::uint32_t>> procs_by_name_;  // the compiland's procedures by name (WP-60)
     bool procs_by_name_indexed_ = false;
+    bool old_c13_read_ = false;                      // WP-60: the old compiland's inlinee lines, read once
+    std::optional<pdb::C13Inlinees> old_c13_;
+    std::size_t wp60_by_patch_ = 0;     // helpers cleared by the patch proof
     std::size_t wp60_checked_ = 0;  // own statics whose procedure inlined a helper and no closure code
     std::size_t wp60_risky_ = 0;    // ... of which a helper may hold a static of the record's name
     std::size_t wp60_listed_ = 0;   // ... listed for the proof (PlanInput::prove_inlined_owners)
@@ -1485,12 +1492,17 @@ void Planner::judge_inlinees(std::uint32_t proc, const Result<pdb::PdbIndex::Pro
             // WP-60 (R-57): a helper whose statics the compiler may have recorded here. A free function's linkage cannot be read
             // from LF_FUNC_ID; a member of a class without a unique name counts as internal.
             InlineHelper h;
+            h.id = e.id;
+            h.unqualified = e.name;
             h.signature = e.signature;
             if (!e.member) {
                 h.kind = "free-function";
                 h.name_known = e.scope_known;
                 h.name = e.scope.empty() ? e.name : e.scope + "::" + e.name;
             } else {
+                // The kind is a label for the logs and messages only: nothing is cleared by linkage (review of 8609b97: a
+                // member template instantiated over an internal type, `Registry::get<`anonymous namespace'::Local>`, has
+                // internal linkage, and its LF_MFUNC_ID is named `get` alone, so the records cannot show it is no template).
                 h.kind = e.class_unique.empty() || internal_class(e.class_unique) ? "internal-class" : "external-class";
                 h.name = what;
             }
@@ -1793,7 +1805,7 @@ bool Planner::refuse_inlined_owner(Sym& sy, const pdb::SymbolView& record, const
         // the compiler recorded here in the shape of the function's own (the edit may have deleted the helper).
         if (!v.helpers.empty()) {
             ++wp60_checked_;
-            risk = helper_risk(v, record, helper);
+            risk = helper_risk(v, record, sy, helper);
             if (!risk.empty()) {
                 ++wp60_risky_;
             }
@@ -1843,13 +1855,87 @@ bool Planner::refuse_inlined_owner(Sym& sy, const pdb::SymbolView& record, const
     return true;
 }
 
-std::string Planner::helper_risk(const InlineVerdict& v, const pdb::SymbolView& record, std::string& helper) {
+std::string Planner::helper_by_patch(const InlineHelper& h, const pdb::SymbolView& record, const Sym& sy) {
+    // (Review of 8609b97, 1a) The patch's procedure of the static's function inlines the same helper, the helper's source file is
+    // unchanged (the checksum its inlinee lines name, old against new), and the patch defines no other function-local static of
+    // the record's name: then the helper and its statics are what they were, and none of them is the record.
+    if (!h.name_known) {
+        return "its scope cannot be read";
+    }
+    ObjectSignatures& debug = object_debug();
+    bool several = false;
+    const std::optional<std::uint64_t> fn = debug.function_of_static(sy.dec.section, sy.s->value, &several);
+    if (!fn) {
+        return "no procedure record of the patch declares the static";
+    }
+    const std::vector<pdb::PdbIndex::Inlinee>* sites = debug.inlinees_of(static_cast<std::uint32_t>(*fn >> 32), static_cast<std::uint32_t>(*fn & 0xFFFFFFFFu));
+    if (sites == nullptr) {
+        return "the patch's inline sites of the function cannot be read";
+    }
+    const pdb::PdbIndex::Inlinee* same = nullptr;
+    for (const pdb::PdbIndex::Inlinee& e : *sites) {
+        if (!e.readable || !e.signature_known || e.signature != h.signature) {
+            continue;
+        }
+        const std::string qualified = e.member ? e.class_name + "::" + e.name : (e.scope_known ? (e.scope.empty() ? e.name : e.scope + "::" + e.name) : std::string());
+        if (qualified == h.name) {
+            same = &e;
+            break;
+        }
+    }
+    if (same == nullptr) {
+        return "the patch's function no longer inlines it";
+    }
+    if (!old_c13_read_) {
+        old_c13_read_ = true;
+        Result<pdb::C13Inlinees> lines = pdb_.compiland_inlinee_lines(ci_);
+        if (lines) {
+            old_c13_ = std::move(lines).value();
+        }
+    }
+    const std::optional<pdb::FileChecksum> old_file = old_c13_ ? pdb::inlinee_file(*old_c13_, h.id) : std::nullopt;
+    const std::optional<pdb::FileChecksum> new_file = debug.inlinee_file(same->id);
+    if (!old_file || !new_file) {
+        return "the checksum of its source file is not recorded on both sides";
+    }
+    if (!(*old_file == *new_file)) {
+        return "its source file changed (the checksums its inlinee lines name differ)";
+    }
+    const std::string& base = comp_last(&record);
+    // A function-local static of that name in the helper's scope: its enclosing function's last name component is the helper's
+    // (template arguments left out on both sides). One whose display name does not show its function counts as one.
+    const auto bare = [](std::string_view n) {
+        const std::size_t lt = n.find('<');
+        return std::string(lt == std::string_view::npos || lt == 0 ? n : n.substr(0, lt));
+    };
+    const std::string helper_last = bare(h.unqualified);
+    const std::string suffix = "::" + base;
+    for (const Sym& other : syms_) {
+        if (&other == &sy || !other.defined || other.dec.type == SymbolType::Function || is_guard_variable(other.name) || base_identifier(other.name) != base ||
+            !starts_with(other.name, "?" + base + "@?")) {
+            continue;
+        }
+        const std::string& d = other.dec.display;
+        const bool shown = d.size() > suffix.size() && d.compare(d.size() - suffix.size(), suffix.size(), suffix) == 0;
+        if (!shown || bare(last_component(std::string_view(d).substr(0, d.size() - suffix.size()))) == helper_last) {
+            return "the patch defines a function-local static '" + base + "' of '" + h.unqualified + "' or of a function it cannot name (" + other.name + ")";
+        }
+    }
+    CML_LOG(Trace, "WP60-PATCH-PROOF helper='%s' record='%s': the patch still inlines it from an unchanged file and defines no other static of the name (residual: a "
+            "helper body that depends on macros the edited file defines)", h.name.c_str(), base.c_str());
+    return {};
+}
+
+std::string Planner::helper_risk(const InlineVerdict& v, const pdb::SymbolView& record, const Sym& sy, std::string& helper) {
     // WP-60 (R-57, ADR-0047). A helper the procedure inlined (not closure code) records its statics here under their own names,
     // the shape of the function's own: an edit that deletes the helper and declares a static of that name in the function would
-    // pair it with the helper's live object. A helper clears the record only when its statics can be read and hold none of the
-    // record's name: its own procedures in the compiland (the out-of-line copy, found by name and signature, holds the same
-    // records at the same addresses), or, for a member of a class with external linkage, a local record (a static of an
-    // external function is one object of the program, a global record).
+    // pair it with the helper's live object. A helper clears the record only by proof (review of 8609b97):
+    //  - its own procedures in the compiland (the out-of-line copy, found by name and signature, holds the same records at the
+    //    same addresses) hold no record of that name;
+    //  - or the patch proves it unchanged (helper_by_patch).
+    // Nothing is cleared by linkage: LF_FUNC_ID / LF_MFUNC_ID name a template instantiation without its arguments (`get` for
+    // `Registry::get<`anonymous namespace'::Local>`, which has internal linkage), so neither "a member of a class with external
+    // linkage" nor "a global procedure of that name and signature exists" shows that the inlinee is that external function.
     if (!procs_by_name_indexed_) {
         procs_by_name_indexed_ = true;
         for (std::uint32_t i = 0; i < comp_syms_.size(); ++i) {
@@ -1861,14 +1947,12 @@ std::string Planner::helper_risk(const InlineVerdict& v, const pdb::SymbolView& 
     const pdb::SymbolView& p = comp_syms_[record.parent_proc];
     const std::string where = "'" + std::string(p.name) + "' (rva " + hex(p.rva) + ")";
     const std::string& base = comp_last(&record);
-    const bool local_record = record.kind == pdb::SymbolKind::LocalData || record.kind == pdb::SymbolKind::LocalThread;
+    const auto cleared = [&](const InlineHelper& h, const char* why) {
+        CML_LOG(Trace, "WP60-HELPER record='%s' rva=%s proc=%s helper='%s' kind=%s cleared (%s)", std::string(record.name).c_str(), hex(record.rva).c_str(), where.c_str(),
+                h.name.c_str(), h.kind, why);
+    };
     for (const InlineHelper& h : v.helpers) {
         std::string why;
-        if (std::string_view(h.kind) == "external-class" && local_record) {
-            CML_LOG(Trace, "WP60-HELPER record='%s' rva=%s proc=%s helper='%s' kind=%s cleared (a static of a member of a class with external linkage is a global record)",
-                    std::string(record.name).c_str(), hex(record.rva).c_str(), where.c_str(), h.name.c_str(), h.kind);
-            continue;
-        }
         if (!h.name_known) {
             why = "the scope of '" + h.name + "' cannot be read, so no procedure of the compiland can be shown to be it";
         } else {
@@ -1887,8 +1971,7 @@ std::string Planner::helper_risk(const InlineVerdict& v, const pdb::SymbolView& 
                 }
             }
             if (itself && own.empty()) {
-                CML_LOG(Trace, "WP60-HELPER record='%s' rva=%s proc=%s helper='%s' kind=%s cleared (the procedure itself, inlined into itself)", std::string(record.name).c_str(),
-                        hex(record.rva).c_str(), where.c_str(), h.name.c_str(), h.kind);
+                cleared(h, "the procedure itself, inlined into itself");
                 continue;
             }
             if (own.empty()) {
@@ -1901,14 +1984,22 @@ std::string Planner::helper_risk(const InlineVerdict& v, const pdb::SymbolView& 
                         break;
                     }
                 }
+                if (why.empty()) {
+                    cleared(h, "its own procedure holds no static of this name");
+                    continue;
+                }
             }
         }
-        CML_LOG(Trace, "WP60-HELPER record='%s' rva=%s proc=%s helper='%s' kind=%s %s%s", std::string(record.name).c_str(), hex(record.rva).c_str(), where.c_str(), h.name.c_str(),
-                h.kind, why.empty() ? "cleared (its own procedure holds no static of this name)" : "risky: ", why.c_str());
-        if (!why.empty()) {
-            helper = h.name;
-            return where + " inlined '" + h.name + "', a helper function (" + h.kind + "), and " + why;
+        const std::string patch_why = helper_by_patch(h, record, sy);
+        if (patch_why.empty()) {
+            ++wp60_by_patch_;
+            cleared(h, "the patch proof: still inlined from an unchanged file, no other static of the name");
+            continue;
         }
+        CML_LOG(Trace, "WP60-HELPER record='%s' rva=%s proc=%s helper='%s' kind=%s risky: %s; not proven by the patch: %s", std::string(record.name).c_str(),
+                hex(record.rva).c_str(), where.c_str(), h.name.c_str(), h.kind, why.c_str(), patch_why.c_str());
+        helper = h.name;
+        return where + " inlined '" + h.name + "', a helper function (" + h.kind + "), and " + why + ", and the patch does not prove it unchanged (" + patch_why + ")";
     }
     return {};
 }
@@ -4560,8 +4651,8 @@ void Planner::bridge_statics() {
     if (wp60_checked_ != 0) {
         // WP-60 (R-57): own statics whose procedure inlined a helper and no closure code; risky: a helper may hold a static of
         // the record's name; listed: risky and left to the proof (prove_inlined_owner_statics, WP57-OWNER counts the outcome).
-        CML_LOG(Info, "WP60-HELPERS object=%s checked=%zu risky=%zu cleared=%zu listed=%zu", in_.object_name.c_str(), wp60_checked_, wp60_risky_, wp60_checked_ - wp60_risky_,
-                wp60_listed_);
+        CML_LOG(Info, "WP60-HELPERS object=%s checked=%zu risky=%zu cleared=%zu listed=%zu by_patch=%zu", in_.object_name.c_str(), wp60_checked_, wp60_risky_, wp60_checked_ - wp60_risky_,
+                wp60_listed_, wp60_by_patch_);
     }
 
     // Decide the matched ones.

@@ -739,6 +739,35 @@ Result<std::vector<SymbolView>> PdbIndex::find_global_data(std::string_view name
     return out;
 }
 
+Result<C13Inlinees> PdbIndex::compiland_inlinee_lines(std::uint32_t ci) const {
+    const Impl& impl = *impl_;
+    if (ci >= impl.compilands.size()) {
+        return Diag::make(diag::kCompilandOutOfRange, "compiland_inlinee_lines: compiland " + std::to_string(ci) + " is out of range.",
+                          "Pass an index below compiland_count().");
+    }
+    const Compiland& c = impl.compilands[ci];
+    C13Inlinees out;
+    const std::uint64_t begin = static_cast<std::uint64_t>(c.symbol_bytes) + c.c11_bytes;
+    if (c.symbol_stream == 0xFFFF || c.c13_bytes == 0) {
+        return out;
+    }
+    if (begin + c.c13_bytes > impl.msf->stream_size(c.symbol_stream)) {
+        return Diag::make(diag::kBadModuleSymbols, "The line information of module '" + std::string(c.object_name) + "' in '" + impl.path + "' leaves its stream.",
+                          "Rebuild the module so the linker regenerates the PDB.");
+    }
+    CountedBuffer scratch;
+    std::size_t got = 0;
+    const std::uint8_t* data = impl.msf->read_range(c.symbol_stream, begin, c.c13_bytes, scratch, got);
+    if (data == nullptr || got < c.c13_bytes) {
+        return Diag::make(diag::kBadModuleSymbols, "The line information of module '" + std::string(c.object_name) + "' in '" + impl.path + "' cannot be read.",
+                          "Rebuild the module so the linker regenerates the PDB.");
+    }
+    if (Result<void> r = read_c13_inlinees(std::span<const std::uint8_t>(data, c.c13_bytes), out); !r) {
+        return r.error();
+    }
+    return out;
+}
+
 Result<std::vector<SymbolView>> PdbIndex::find_global(std::string_view name) const {
     auto pubs = find_public(name);
     if (!pubs) {

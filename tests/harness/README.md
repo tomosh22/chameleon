@@ -124,6 +124,8 @@ fixture_args = "--hold-sync"   # header key: extra fixture arguments after `--ag
 [[step]]
 kind = "reload"
 expect_error = "CML5309"     # the reload must FAIL with this diagnostic id (the step passes then)
+compiler = "clang-cl"        # optional (WP-60): "cl" or "clang-cl"; the expect_error holds for that compiler only, in the
+                             # other compiler's cells it is an allow_error (the reload may apply or be refused with it)
 
 [[step]]
 kind = "signal_fixture"        # create the file named by the fixture's CML_FIXTURE_SIGNAL_FILE environment variable

@@ -212,6 +212,10 @@ struct ObjectProc {
     // WP-46: the types of its own local variables (S_LOCAL without fIsParam, S_REGREL32, S_BPREL32; none of an inlined call's)
     std::vector<std::uint32_t> local_types;
     bool statics_complete = true;    // false: more than kMaxProcStatics, the rest was dropped
+    // WP-60 (R-57): the distinct inlinees (ids of the object's types) of its S_INLINESITE / S_INLINESITE2 records at any depth,
+    // in the order of first appearance. false: a site too short to name one, or more than kMaxProcStatics of them.
+    std::vector<std::uint32_t> inlinees;
+    bool inlinees_complete = true;
 };
 // A procedure with more function-local statics than this is not followed further (untrusted input).
 inline constexpr std::size_t kMaxProcStatics = 4096;
@@ -219,6 +223,25 @@ inline constexpr std::size_t kMaxProcStatics = 4096;
 // Walks the symbol subsections of one `.debug$S` section. CML1433 when the section is not C13 or a subsection or
 // record leaves it.
 Result<std::vector<ObjectProc>> read_object_procs(std::span<const std::uint8_t> section);
+
+// WP-60 (R-57): the source file of an inlined function, as C13 line information records it. DEBUG_S_INLINEELINES names, per
+// inlinee id, an entry of the DEBUG_S_FILECHKSMS subsection (the file's checksum: kind 1 MD5, 2 SHA1, 3 SHA256; 0 none).
+struct FileChecksum {
+    std::uint8_t kind = 0;
+    std::vector<std::uint8_t> bytes;
+    bool operator==(const FileChecksum& o) const { return kind == o.kind && bytes == o.bytes; }
+};
+struct C13Inlinees {
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> lines;  // (inlinee id, file id: offset into the checksum subsection)
+    std::vector<std::uint8_t> checksums;                         // the first DEBUG_S_FILECHKSMS subsection seen
+    std::size_t checksum_tables = 0;                             // how many were seen (an object may have one per section)
+};
+// Appends the inlinee lines and the file checksum subsection of a run of C13 subsections (a module stream's C13 block, or an
+// object's .debug$S section after its 4-byte signature). CML1433 when a subsection leaves the span.
+Result<void> read_c13_inlinees(std::span<const std::uint8_t> subsections, C13Inlinees& out);
+// The checksum of the file the inlinee's lines name. nullopt: no entry for it, entries naming different files, more than one
+// checksum subsection, an entry outside the checksum subsection, or a file recorded without a checksum (kind 0).
+std::optional<FileChecksum> inlinee_file(const C13Inlinees& c13, std::uint32_t inlinee);
 
 // Statistics of the lazily read type streams of a PdbIndex / TypeServerPdb (logs, tests, the benchmark).
 struct TypeStreamStats {

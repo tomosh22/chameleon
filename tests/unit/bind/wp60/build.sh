@@ -25,7 +25,7 @@ W=$(cd "$W" && pwd)
 cd "$W"
 CL=("$CLANG_CL" --target=x86_64-pc-windows-msvc /O2 /Ob2 /Z7 /std:c++17 /c /GS- '-fdebug-compilation-dir=C:\wp60' "/clang:-fdebug-prefix-map=$W=C:\\wp60" /clang:-gno-codeview-command-line)
 "${CL[@]}" support.cpp /Fosupport.obj
-for c in h1_r57 h2_r57_samecode h3_helper_other h4_helper_edit h5_outofline h6_outofline_x h7_internal_class h8_external_member h10_external_free; do
+for c in h1_r57 h2_r57_samecode h3_helper_other h4_helper_edit h5_outofline h6_outofline_x h7_internal_class h8_external_member h10_external_free h11_member_template h12_header_changed h13_external_global h14_two_owners; do
   "${CL[@]}" "$c.old.cpp" "/Fo$c.old.obj"
   "${CL[@]}" "$c.new.cpp" "/Fo$c.new.obj"
   "$LLD_LINK" /DEBUG /NODEFAULTLIB /ENTRY:main /SUBSYSTEM:console '/pdbsourcepath:C:\wp60' "/OUT:$c.exe" "/PDB:$c.pdb" "/PDBALTPATH:$c.pdb" support.obj "$c.old.obj"
