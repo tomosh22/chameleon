@@ -159,6 +159,8 @@ struct Compiland {
     std::string_view objname_record;  // S_OBJNAME name (usually == object_name)
     std::uint16_t symbol_stream = 0xFFFF;  // MSF stream holding the module's symbols, 0xFFFF = none
     std::uint32_t symbol_bytes = 0;
+    std::uint32_t c11_bytes = 0;  // WP-60: the module stream's C11 and C13 line information, after the symbols
+    std::uint32_t c13_bytes = 0;
     std::uint32_t file_count = 0;  // entries in the DBI source-info list
 
     bool has_compile3 = false;

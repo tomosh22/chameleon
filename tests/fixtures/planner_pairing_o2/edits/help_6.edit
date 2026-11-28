@@ -1,0 +1,9 @@
+--- a/helpers.cpp
++++ b/helpers.cpp
+@@ -50,5 +50,5 @@
+ 
+ int o2_help_mark()
+ {
+-    return 1;
++    return 6;
+ }

@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "cml/coff/coff.h"
+#include "cml/pdb/index.h"
 #include "cml/pdb/type_records.h"
 
 namespace cml::core::bind {
@@ -65,6 +66,15 @@ public:
     // WP-46: the layout of the class with this unique name (pdb::udt_layout of its definition record). nullopt with `why`.
     std::optional<std::string> class_layout(const std::string& unique, std::string* why);
 
+    // WP-60 (R-57): what the function whose code starts at (section, value) inlined (its procedure record's inline sites at
+    // any depth), each inlinee resolved through the object's types (PdbIndex::resolve_inlinee). nullptr: no procedure record,
+    // two of them, the types unreadable, or a site that cannot be read.
+    const std::vector<pdb::PdbIndex::Inlinee>* inlinees_of(std::uint32_t section, std::uint32_t value);
+    // WP-60: the checksums of the source files of inlinee `id` (an id of the object's types), from the inlinee lines and the file
+    // checksums of the object's .debug$S sections (pdb::inlinee_files). nullopt: not recorded, not unambiguously, or a C13
+    // section of the object could not be read.
+    std::optional<std::vector<pdb::FileChecksum>> inlinee_files(std::uint32_t id);
+
     // Where the types came from; NotRead before the first at().
     ObjectTypeOrigin origin() const noexcept { return origin_; }
     // Unreadable: why. DebugT / TypeServer: a note ("precompiled types are not resolved", the PDB path).
@@ -80,7 +90,13 @@ private:
         pdb::FunctionSignature signature;
         ProcStatics statics;
         std::vector<std::uint32_t> local_types;  // WP-46
+        std::vector<std::uint32_t> inlinee_ids;  // WP-60
+        bool inlinees_usable = true;
+        bool inlinees_resolved = false;
+        std::vector<pdb::PdbIndex::Inlinee> inlinees;
     };
+    pdb::C13Inlinees c13_;           // WP-60: the inlinee lines and file checksums of every .debug$S section
+    std::size_t c13_bad_sections_ = 0;  // WP-60: C13 sections whose line information could not be read
 
     void load();
     void unreadable(std::uint32_t diag_id, std::string why);

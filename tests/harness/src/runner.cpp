@@ -662,7 +662,22 @@ private:
         return false;
     }
 
-    StepOutcome reload(const Step& step) {
+    StepOutcome reload(const Step& given) {
+        // WP-60: an expect_error for one compiler only: in a cell of the other compiler it is an allow_error.
+        Step adjusted;
+        if (!given.compiler.empty() && compiler_family(report_.compiler).empty()) {
+            // (Review of 5624b28) As expect_reload_result: a compiler that is neither cl nor clang-cl cannot be matched.
+            return StepOutcome::fail(cml::ids::kResultMismatch, "the expect_error " + given.expect_error + " is for " + given.compiler + ", and this cell's compiler '" +
+                                                                    report_.compiler + "' is neither cl nor clang-cl");
+        }
+        const bool other_compiler = !given.compiler.empty() && !given.expect_error.empty() && compiler_family(report_.compiler) != given.compiler;
+        if (other_compiler) {
+            adjusted = given;
+            adjusted.allow_error = given.expect_error;
+            adjusted.expect_error.clear();
+            adjusted.expect_line = 0;
+        }
+        const Step& step = other_compiler ? adjusted : given;
         const std::uint32_t limit_ms = std::min<std::uint32_t>(static_cast<std::uint32_t>(step.within_s) * 1000u, remaining_ms());
         if (limit_ms == 0) {
             return scenario_timeout();

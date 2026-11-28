@@ -108,6 +108,9 @@ public:
     Result<std::vector<SymbolView>> find_global_data(std::string_view name) const;
     // Publics first, then global data.
     Result<std::vector<SymbolView>> find_global(std::string_view name) const;
+    // WP-60 (R-57): the inlinee lines and file checksums of a compiland's C13 line information (read_c13_inlinees). Empty when
+    // the module has none; CML1413-style errors when the stream cannot be read.
+    Result<C13Inlinees> compiland_inlinee_lines(std::uint32_t ci) const;
     // Publics located at exactly `rva` (aliases possible).
     Result<std::vector<SymbolView>> publics_at_rva(std::uint32_t rva) const;
     // The public with the greatest rva <= `rva`, within the same section.
@@ -157,6 +160,10 @@ public:
         std::string name;               // as recorded: "operator()", "__invoke", "RTTI", "b_helper"
         std::string class_name;         // member: the class's name ("o2_step::<lambda_0>")
         std::string class_unique;       // member: its unique name without the unit's discriminator ("" when it has none)
+        // WP-60 (R-57): a function's parent scope (LF_FUNC_ID: the LF_STRING_ID it names, "JPH", "`anonymous namespace'"; ""
+        // for none). false: the record names a scope that cannot be read (the inlinee stays readable; only its scope is unknown).
+        bool scope_known = true;
+        std::string scope;
         bool signature_known = false;   // the canonical signature of the inlinee's type (type_records.h)
         std::string signature;
         std::uint32_t sites = 0;        // inline sites of the procedure that name this inlinee
@@ -175,6 +182,9 @@ public:
     // procedure's scope) is a scope of its own: its inline sites are its own, not the enclosing procedure's. CML1417 when
     // the procedures are not of one compiland of this index, CML1413 when one is not found or has no end record.
     Result<std::vector<ProcInlinees>> procs_inlinees(const std::vector<SymbolView>& procs) const;
+    // WP-60: what procs_inlinees reads for one inlinee: `e.id` resolved through `types` (a PDB's, an object's .debug$T, or a
+    // type server's: LF_FUNC_ID / LF_MFUNC_ID, its class, its scope, its signature).
+    static void resolve_inlinee(const TypeSource& types, Inlinee& e);
 
     // ---- Types (WP-37, lazy) -------------------------------------------------------------
     // The type records of this PDB: find_type reads the TPI stream, find_id the IPI stream. Opening an index reads no

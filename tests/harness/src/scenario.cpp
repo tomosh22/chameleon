@@ -388,7 +388,7 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
     }
     if (*kind == "reload") {
         step.kind = StepKind::Reload;
-        cml::Result<void> keys = only_keys(table, {"kind", "within_s", "expect_result_key", "expect_result_value", "expect_error", "allow_error", "expect_file", "expect_line", "expect_column"}, "a reload step");
+        cml::Result<void> keys = only_keys(table, {"kind", "within_s", "expect_result_key", "expect_result_value", "expect_error", "allow_error", "expect_file", "expect_line", "expect_column", "compiler"}, "a reload step");
         if (!keys) return keys.error();
         cml::Result<int> within = int_in_range(table, "within_s", 60, 1, 3600);
         if (!within) return within.error();
@@ -432,6 +432,12 @@ cml::Result<Step> parse_step_kind(const toml::Table& table) {
             if (!ids_shape(*ae)) return invalid(ae->line, "'allow_error' must look like CML3207 (or CML3207|CML3601)");
             if (rk != nullptr || !step.expect_error.empty()) return invalid(ae->line, "'allow_error' excludes 'expect_error' and 'expect_result_key'");
             step.allow_error = ae->text;
+        }
+        if (const toml::Value* co = table.find("compiler")) {
+            // WP-60: the refusal is expected under this compiler only; under the other one either outcome is allowed (allow_error).
+            if (co->kind != toml::Value::Kind::String || (co->text != "cl" && co->text != "clang-cl")) return invalid(co->line, "'compiler' must be cl or clang-cl");
+            if (step.expect_error.empty()) return invalid(co->line, "'compiler' in a reload step needs 'expect_error'");
+            step.compiler = co->text;
         }
         cml::Result<void> where = parse_location(table, step);
         if (!where) return where.error();

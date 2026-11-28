@@ -1,0 +1,31 @@
+--- a/r57.cpp
++++ b/r57.cpp
+@@ -25,18 +25,12 @@
+ 
+ }  // namespace
+ 
+-static __forceinline O2Name& r57_name()
+-{
+-    static O2Name rx = r57_make(960000);
+-    return rx;
+-}
+-
+ void o2_r57_step()
+ {
+     ++s_r57_calls;
+-    O2Name& n = r57_name();
+-    n.hits += 1;
+-    g_r57_value = n.id + n.hits;
++    static O2Name rx = r57_make(970000);
++    rx.hits += 1;
++    g_r57_value = rx.id + rx.hits;
+ }
+ 
+ int o2_r57_value()
+@@ -51,5 +45,5 @@
+ 
+ int o2_r57_mark()
+ {
+-    return 1;
++    return 7;
+ }

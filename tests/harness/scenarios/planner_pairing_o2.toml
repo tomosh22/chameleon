@@ -12,9 +12,9 @@
 #   what it never allows is a value outside its range, a re-initialisation, or a fault.
 # cmltest prints `RELOAD-OUTCOME applied|refused id=...` for both reloads (the evidence of the cell).
 name = "planner_pairing_o2"
-description = "fixture planner_pairing_o2 (/O2 /Ob2): a split aggregate is refused; inlined lambdas' statics keep their values or the reload is refused"
+description = "fixture planner_pairing_o2 (/O2 /Ob2): a split aggregate is refused; inlined lambdas' statics keep their values or the reload is refused; a caller never takes a deleted inlined helper's static"
 fixture = "planner_pairing_o2"
-timeout_s = 240
+timeout_s = 360
 
 [[step]]
 kind = "launch"
@@ -132,6 +132,74 @@ key = "nest2"
 min_samples = 20
 since_reload = 10
 within_s = 20
+
+# WP-60 (R-57, ADR-0047): help_6 recompiles helpers.cpp. o2_help_step() holds an own `static O2Name own` and inlined
+# help_scale(), a `static` helper without statics. clang-cl records an inlined helper's statics as plain records of the caller,
+# in the shape of the caller's own, so as far as the image shows the record of `own` may be a helper's static (one the edit
+# deleted). The edit changes o2_help_mark() only: o2_help_step() is the old code, the comparator proves it (WP60-LISTED, then
+# WP57-OWNER ... proven=1), and `own` keeps the running object. Applied in every cell (no refusal allowed): help keeps counting
+# from where it was, hmade stays 1, hmark=6 shows the patched code runs.
+[[step]]
+kind = "edit"
+patch = "edits/help_6.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+
+[[step]]
+kind = "expect_reload_result"
+key = "patched"
+value = 1
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ mark=[12] a=10\\d{4} b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=1 made=3 nest=7\\d{5} nmade=1 nmark=4 bits=80\\d{4} bsec=90\\d{4} bmade=2 bmark=1 nest2=60\\d{4} n2made=1 help=95\\d{4} hmade=1 hmark=6 r57=96\\d{4} rmade=1 rmark=1\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_monotonic"
+key = "help"
+min_samples = 20
+since_reload = 10
+within_s = 20
+
+# WP-60 (R-57): r57_7 recompiles r57.cpp. The old o2_r57_step() inlined r57_name(), a `static` helper with `static O2Name rx`
+# (__forceinline in both compilers); the edit deletes the helper and declares `static O2Name rx` in o2_r57_step() itself, with
+# another initialiser (970000), and makes o2_r57_mark() return 7. Until WP-60 clang-cl's single record `rx` of o2_r57_step() (the
+# helper's) paired with the caller's new static and the guard was placed by the layout: the reload applied (rmark=7) and the new
+# static took the helper's live object (r57 kept counting from 960000, its initialiser never ran). Now the caller's inline
+# sites name a helper whose statics cannot be read, the patch no longer inlines it, and o2_r57_step() changed, so the static is
+# refused: CML3207, required under clang-cl (`compiler`). Under cl the helper's static sits inside the helper's inline site;
+# there either outcome is allowed (review of 8609b97) until the cl cells show which: refused, nothing changes (r57 keeps
+# counting from 960000, rmade=1, rmark=1); applied, the new static must be a fresh one (r57 from 970000, rmade=2, rmark=7). What
+# is never allowed is the wrong pairing: rmark=7 with r57 still counting from 960000.
+[[step]]
+kind = "edit"
+patch = "edits/r57_7.edit"
+
+[[step]]
+kind = "reload"
+within_s = 120
+expect_error = "CML3207"
+compiler = "clang-cl"
+
+[[step]]
+kind = "expect_stdout"
+regex = "TICK n=\\d+ mark=[12] a=10\\d{4} b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=1 made=3 nest=7\\d{5} nmade=1 nmark=4 bits=80\\d{4} bsec=90\\d{4} bmade=2 bmark=1 nest2=60\\d{4} n2made=1 help=95\\d{4} hmade=1 hmark=6 (r57=96\\d{4} rmade=1 rmark=1|r57=97\\d{4} rmade=2 rmark=7)\\b"
+within_s = 10
+
+[[step]]
+kind = "expect_monotonic"
+key = "r57"
+min_samples = 20
+since_reload = 10
+within_s = 20
+
+# r57_back_8 undoes the refused edit, so that the next reload does not compile r57.cpp again (as parts_back_2).
+[[step]]
+kind = "edit"
+patch = "edits/r57_back_8.edit"
 
 # WP-59 (R-67, ADR-0046): bits_5 recompiles bitmask.cpp (/Zc:threadSafeInit-), whose inline function o2_bits_counter() keeps
 # its two statics in ONE external bitmask, clang-cl's `??_B?1??o2_bits_counter@@YAHXZ@51`. The edit changes o2_bits_mark()

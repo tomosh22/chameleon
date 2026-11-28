@@ -308,6 +308,8 @@ struct PlanStageTimes {
 // records an inlined lambda's statics as plain records of the calling procedure, in the shape of the function's own. The
 // pipeline keeps the pairing only while the patch's version of the procedure is the old code under the plan
 // (hook_narrowing.h: prove_inlined_owner_statics); otherwise CML3207.
+// WP-60 (R-57, ADR-0047): the same for an own static whose procedure inlined a helper function (InlineHelper) that may have had
+// a static of the record's name: a helper deleted by the edit leaves its static's record in the caller in the same shape.
 struct InlinedOwnerStatic {
     std::string symbol;                 // decorated name of the patch's static
     std::string display;
@@ -315,8 +317,11 @@ struct InlinedOwnerStatic {
     std::string record;                 // the record's name
     std::string proc;                   // the old procedure that holds the record (the static's own function)
     std::uint32_t proc_rva = kNoRva;    // its entry: the hook of the patch's version of it is found by this
-    std::string risk;                   // WP-51's verdict on the procedure's inline sites
+    std::string risk;                   // WP-51's verdict on the procedure's inline sites (WP-60: or the helper's, below)
     std::string step;                   // where the pairing was checked ("pass A", "closure", a pass-B source)
+    // WP-60 (R-57, ADR-0047): the inlined helper function (not closure code) whose statics the record may be: one whose own
+    // procedure holds a record of that name, or whose statics cannot be read. Empty: WP-51's closure risk.
+    std::string helper;
 };
 
 struct BindPlan {
@@ -367,6 +372,20 @@ struct BindPlan {
 // Planning
 // ---------------------------------------------------------------------------------------------
 
+// WP-60 (R-57, ADR-0047): a function other than closure code that an old procedure inlined (its inline sites, at any depth),
+// whose function-local statics the compiler may have recorded as plain records of that procedure: a free function (its
+// linkage cannot be read from LF_FUNC_ID), a member function of a class with internal linkage (in an anonymous namespace or
+// local to a function, or a member template, or a member whose name or signature names such a type), or a member of a class
+// with external linkage (under clang its statics are global records, never local ones).
+struct InlineHelper {
+    std::uint32_t id = 0;        // the old image's IPI id of the inlinee (its inlinee lines name its source file)
+    std::string name;            // qualified as a procedure of the compiland is named ("hs", "`anonymous namespace'::H::get")
+    std::string unqualified;     // as the inlinee records it ("hs", "get"): the scope a static of it names
+    bool name_known = true;      // false: its parent scope cannot be read, so no procedure can be shown to be it
+    const char* kind = "";       // "free-function", "internal-class" or "external-class" (a string literal of the planner)
+    std::string signature;       // its canonical signature (an inlinee whose signature cannot be read is WP-51's risk)
+};
+
 // WP-55 (R-62): WP-51's verdict on an old procedure's inline sites (what it inlined, read from the module stream through
 // PdbIndex::procs_inlinees), kept across the reloads of one module image. The image does not change while it is loaded, so
 // neither do its procedures' inline sites, and a verdict taken from here is the one the planner would read again. Owned by the
@@ -381,6 +400,7 @@ struct CachedInlineVerdict {
     std::string wider;
     const char* wider_kind = "";  // a string literal of the planner
     std::vector<std::string> closure_tails;
+    std::vector<InlineHelper> helpers;  // WP-60
     std::uint32_t sites = 0;
     std::size_t inlinees = 0;
     std::size_t closures = 0;
@@ -435,6 +455,8 @@ struct PlanInput {
     // WP-57 (R-59): the caller proves an own static that WP-51 finds at risk by the code of its procedure (the pipeline does,
     // with prove_inlined_owner_statics), so the planner pairs and lists it (BindPlan::inlined_owner_statics) instead of
     // refusing it with CML3207. Off: refused as WP-51 does.
+    // WP-60 (R-57): with it, an own static whose procedure inlined a helper that may have had a static of the record's name is
+    // paired and listed the same way. Off: such a static pairs, logged only (WP51-WOULD-REFUSE), as before WP-60.
     bool prove_inlined_owners = false;
 };
 

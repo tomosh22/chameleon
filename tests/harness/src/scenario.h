@@ -61,6 +61,7 @@ struct Step {
     std::string key;       // ExpectMonotonic: the TICK key ("calls")
     // ExpectReloadResult (WP-49): "cl" or "clang-cl": the expectation holds for that compiler only; a cell of the other compiler
     // passes the step without checking (the number differs where the compilers lay out the same code differently).
+    // Reload (WP-60): the step's expect_error holds for that compiler only; in a cell of the other compiler it is an allow_error.
     std::string compiler;
     int min_samples = 10;  // ExpectMonotonic: at least this many samples of the key in the whole output
     // ExpectMonotonic (WP-52): when > 0, also at least this many samples since the last reload, the first of them not below
