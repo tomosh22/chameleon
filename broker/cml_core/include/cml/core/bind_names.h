@@ -95,6 +95,13 @@ struct LocalScopeKey {
 // Empty when the name is not function-local, or when any part of the scope cannot be read (never a guess).
 std::optional<LocalScopeKey> local_scope_key(std::string_view decorated, bool guard_name_counted);
 
+// WP-52 (review): the outermost function of a function-local static or guard AS WRITTEN, for names local_scope_key cannot
+// read: the text of that function's decorated name up to the end of its qualified name ("?g@@" for the nested lambdas of
+// g, "?pm@@" for "?q@?1??pm@@YAHP8K@@EAAXXZ@Z@4URegistry@@A"). Its back-references are not resolved, and a template's
+// arguments can cut it short, so it is only the fallback of the ADR-0045 ruling (WP-52 review, finding 2): one function
+// can be written two ways, and two can read alike. Empty when it cannot be found.
+std::string outermost_function_as_written(std::string_view decorated);
+
 // For "??__Eg_tracker@?A0x1@@YAXXZ": the text the global's mangled name (without the leading '?')
 // starts with ("g_tracker@?A0x1@@"). Empty when `decorated` is not a cl dynamic initialiser.
 std::string initializer_target_prefix(std::string_view decorated);

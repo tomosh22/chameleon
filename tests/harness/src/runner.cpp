@@ -126,6 +126,7 @@ struct Proc {
     std::size_t id = 0;  // Supervisor id
     fs::path stdout_file;
     std::size_t cursor = 0;  // expect_stdout reads from here
+    std::size_t reload_cursor = 0;  // WP-52: where the output stood when the last reload began
 };
 
 class ScenarioRun {
@@ -669,6 +670,7 @@ private:
         // Output printed from now on belongs to the reloaded program.
         for (Proc& p : procs_) {
             p.cursor = read_whole_file(p.stdout_file).size();
+            p.reload_cursor = p.cursor;
         }
         ipc::json::Value args = ipc::json::Value::object();
         args.set("timeout_ms", ipc::json::Value::integer(limit_ms));
@@ -683,6 +685,9 @@ private:
                 return StepOutcome::fail(cml::ids::kReloadFailed, "the reload succeeded, expected the refusal " + step.expect_error);
             }
             const ipc::ControlDiag& d = *response->diag;
+            // WP-52: a refused reload has no result; a later expect_reload_result must not read the previous reload's.
+            has_reload_result_ = false;
+            last_reload_result_ = ipc::json::Value::object();
             if (!one_of(d.id, step.expect_error)) {
                 return StepOutcome::fail(cml::ids::kReloadFailed, "the reload was refused with " + d.id + ": " + d.message + ", expected " + step.expect_error);
             }
@@ -853,6 +858,29 @@ private:
         cml::Result<std::string> checked = check_monotonic(output, step.key, static_cast<std::size_t>(step.min_samples));
         if (!checked) {
             return StepOutcome::fail(checked.error());
+        }
+        if (step.since_reload > 0) {  // WP-52: the state continued across the last reload; waits up to within_s for the samples
+            const std::uint32_t limit_ms = std::min<std::uint32_t>(static_cast<std::uint32_t>(step.within_s) * 1000u, remaining_ms());
+            const Clock::time_point until = Clock::now() + std::chrono::milliseconds(limit_ms);
+            for (;;) {
+                const std::string now = read_whole_file(proc->stdout_file);
+                const std::size_t at = std::min(proc->reload_cursor, now.size());
+                const std::string_view before = std::string_view(now).substr(0, at);
+                const std::string_view after = std::string_view(now).substr(at);
+                const bool enough = tick_values(after, step.key).size() >= static_cast<std::size_t>(step.since_reload);
+                if (enough || Clock::now() >= until || supervisor_.exit_code(proc->id).has_value()) {
+                    cml::Result<std::string> whole = check_monotonic(now, step.key, static_cast<std::size_t>(step.min_samples));
+                    if (!whole) {
+                        return StepOutcome::fail(whole.error());
+                    }
+                    cml::Result<std::string> continued = check_continues(before, after, step.key, static_cast<std::size_t>(step.since_reload));
+                    if (!continued) {
+                        return StepOutcome::fail(continued.error());
+                    }
+                    return StepOutcome::pass(*whole + "; " + *continued);
+                }
+                Sleep(kPollMs);
+            }
         }
         return StepOutcome::pass(*checked);
     }

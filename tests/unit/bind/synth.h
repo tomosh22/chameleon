@@ -141,14 +141,16 @@ public:
     static constexpr std::uint16_t kRdataSec = 2;
     static constexpr std::uint16_t kDataSec = 3;
 
-    SynthWorld() {
+    // `tu_compiler`: the S_COMPILE3 version string of the TU's compiland (WP-52: the planner reads which compiler wrote it,
+    // "clang version 18.1.3", "Microsoft (R) Optimizing Compiler"; the default names none it knows).
+    explicit SynthWorld(const std::string& tu_compiler = "Test Compiler 19.44", std::uint16_t tu_frontend_major = 19) {
         spec.sections = {{".text", 0x1000, 0x1000, 0x1000, 0x60000020},
                          {".rdata", 0x800, 0x2000, 0x800, 0x40000040},
                          {".data", 0x800, 0x3000, 0x800, 0xC0000040}};
         tp::Module tu;
         tu.name = "C:\\proj\\obj\\logic.cpp.obj";
         tu.symbols.objname(tu.name);
-        tu.symbols.compile3(1, 0, 0xD0, "Test Compiler 19.44");
+        tu.symbols.compile3(1, 0, 0xD0, tu_compiler, tu_frontend_major);
         spec.modules.push_back(std::move(tu));
         tp::Module mn;
         mn.name = "C:\\proj\\obj\\main.cpp.obj";

@@ -453,17 +453,35 @@ private:
     // WP-40: the static data of the patch that is declared in the decorated scope of a guard variable
     // (`?$TSS0@<scope>@4HA` guards statics `?<name>@<scope>@4...`): positions in syms_.
     // WP-52 (R-60): the statics a guard is tied to (the statics of its block, or of its function for a bitmask), by the
-    // scopes with their back-references resolved. Computed once per guard (names do not change); a guard the two
-    // spellings (clang's, cl's: bind_names.h local_scope_key) tie to different statics is tied to none (guard_ambiguous_).
+    // scopes with their back-references resolved, in the spelling of the compiler that wrote the compiland
+    // (guard_spelling). Computed once per guard (names do not change). Where that spelling is not known, a guard the two
+    // spellings tie differently (or only one of them ties) is tied to none, and guard_ambiguous_ keeps what either tied.
     const std::vector<std::uint32_t>& guard_scope_statics(const Sym& guard);
     bool guard_ties(std::uint32_t guard_pos, std::uint32_t static_pos);
-    const Sym* untied_guard_owner(const Sym& guard);
-    // [0]: the key of a static, or of a guard in clang's spelling (its own name not counted); [1]: a guard in cl's.
+    // For an untied guard: a static bound to the running process that may be its own (null: none), and how that was
+    // decided (CML3211's message says which).
+    struct UntiedOwner {
+        const Sym* sym = nullptr;
+        bool ambiguous = false;   // a spelling of the guard's scope ties it to this static, and which spelling is right is not known
+        bool as_written = false;  // a scope could not be read: the function was compared as written
+    };
+    UntiedOwner untied_guard_owner(const Sym& guard);
+    bool old_scope_has_guard_record(const Sym& st);
+    // [0]: the key of a static, or of a guard in clang 18's spelling (its own name not counted); [1]: a guard in cl's and
+    // clang 19's (counted).
     using ScopeKeys = std::array<std::optional<LocalScopeKey>, 2>;
     const ScopeKeys& scope_keys(std::uint32_t pos);
     std::map<std::uint32_t, ScopeKeys> scope_keys_;
     std::map<std::uint32_t, std::vector<std::uint32_t>> guard_statics_;
-    std::set<std::uint32_t> guard_ambiguous_;
+    std::map<std::uint32_t, std::vector<std::uint32_t>> guard_ambiguous_;
+    // WP-52 (review, finding 1): does the compiler that wrote the compiland count a guard's own name (`$TSS<n>`, `$S<n>`)
+    // in the back-reference table? From the compiland's S_COMPILE3: cl counts `$TSS<n>` (Jolt, corpus); clang counts it
+    // from 19.1.0 on (MicrosoftMangle.cpp: `mangleSourceName("$TSS" + ...)`; 17.0.6 and 18.1.8 write it raw) and never
+    // counts `$S1` (written raw in 17.0.6 .. 21.1.0). Unknown otherwise (cl's `$S1`, another compiler, no S_COMPILE3).
+    enum class GuardSpelling { Unknown, NotCounted, Counted };
+    GuardSpelling guard_spelling(bool bitmask);
+    int compiler_family_ = -1;  // -1 not read yet, 0 unknown, 1 cl, 2 clang
+    int clang_major_ = 0;
     void settle_guards();
 
     // WP-37 (ADR-0042): canonical signatures, read lazily on both sides. The old side is the module PDB's type stream,
@@ -1532,20 +1550,60 @@ const Planner::ScopeKeys& Planner::scope_keys(std::uint32_t pos) {
     return scope_keys_.emplace(pos, std::move(keys)).first->second;
 }
 
+Planner::GuardSpelling Planner::guard_spelling(bool bitmask) {
+    if (compiler_family_ < 0) {
+        compiler_family_ = 0;
+        std::string version;
+        std::uint16_t frontend_major = 0;
+        if (ci_ < pdb_.compiland_count() && pdb_.compiland(ci_).has_compile3) {
+            const pdb::CompileInfo& c = pdb_.compiland(ci_).compile;
+            version = std::string(c.version);
+            frontend_major = c.frontend[0];
+        }
+        if (version.find("clang") != std::string::npos) {
+            compiler_family_ = 2;
+            // "clang version 18.1.8 (...)": the major version; else the front end's (clang writes its own version there).
+            const std::size_t at = version.find("clang version ");
+            int major = 0;
+            for (std::size_t k = at == std::string::npos ? version.size() : at + 14; k < version.size() && version[k] >= '0' && version[k] <= '9' && major < 1000; ++k) {
+                major = major * 10 + (version[k] - '0');
+            }
+            clang_major_ = major != 0 ? major : frontend_major;
+        } else if (version.find("Microsoft") != std::string::npos) {
+            compiler_family_ = 1;
+        }
+        CML_LOG(Info, "WP52-GUARD-SPELLING object=%s compiler='%s' family=%s clang_major=%d", in_.object_name.c_str(), version.c_str(),
+                compiler_family_ == 1 ? "cl" : (compiler_family_ == 2 ? "clang" : "unknown"), clang_major_);
+    }
+    if (compiler_family_ == 1) {
+        return bitmask ? GuardSpelling::Unknown : GuardSpelling::Counted;
+    }
+    if (compiler_family_ == 2 && clang_major_ > 0) {
+        if (bitmask) {
+            return GuardSpelling::NotCounted;
+        }
+        return clang_major_ >= 19 ? GuardSpelling::Counted : GuardSpelling::NotCounted;
+    }
+    return GuardSpelling::Unknown;
+}
+
 // WP-52 (R-60): a guard is tied to a static when their scopes, with the back-references resolved, are the same (the same
-// block; for a bitmask, the same function). The guard's scope is read in both spellings: clang's, which does not count the
-// guard's own name in the back-reference table, and cl's, which does (bind_names.h local_scope_key). The two agree on any
-// scope without a back-reference; where they tie the guard to different statics, which spelling is right cannot be
-// told, and the guard is tied to none (settle_guards then refuses it when a bound static may be its own, CML3211). A name
-// the resolver cannot read is compared as written (raw_guard_covers, the rule before WP-52).
+// block; for a bitmask, the same function). The guard's own name is counted in the back-reference table or not, as the
+// compiler that wrote the compiland does it (guard_spelling). Where that is not known, both spellings are read: they agree
+// on any scope without a back-reference; where they do not tie the guard to the same statics (also where only one of
+// them ties it), which is right cannot be told and the guard is tied to none (settle_guards then refuses it when a bound
+// static may be its own, CML3211). A name the resolver cannot read is compared as written (raw_guard_covers, the rule
+// before WP-52).
 const std::vector<std::uint32_t>& Planner::guard_scope_statics(const Sym& guard) {
     const std::uint32_t gpos = static_cast<std::uint32_t>(&guard - syms_.data());
     if (const auto it = guard_statics_.find(gpos); it != guard_statics_.end()) {
         return it->second;
     }
     const bool bitmask = guard.name.compare(0, 3, "?$S") == 0;
+    const GuardSpelling spelling = guard_spelling(bitmask);
+    const std::array<bool, 2> use = {spelling != GuardSpelling::Counted, spelling != GuardSpelling::NotCounted};
     const ScopeKeys gk = scope_keys(gpos);
-    const bool guard_read = gk[0].has_value() || gk[1].has_value();
+    const bool guard_read = (use[0] && gk[0].has_value()) || (use[1] && gk[1].has_value());
     std::array<std::vector<std::uint32_t>, 2> tied;
     for (std::uint32_t pos = 0; pos < syms_.size(); ++pos) {
         const Sym& s = syms_[pos];
@@ -1563,61 +1621,136 @@ const std::vector<std::uint32_t>& Planner::guard_scope_statics(const Sym& guard)
             continue;
         }
         for (std::size_t m = 0; m < 2; ++m) {
-            if (gk[m] && scope_keys_cover(*gk[m], *sk, bitmask)) {
+            if (use[m] && gk[m] && scope_keys_cover(*gk[m], *sk, bitmask)) {
                 tied[m].push_back(pos);
             }
         }
     }
     std::vector<std::uint32_t> out;
-    if (tied[0] == tied[1] || tied[1].empty()) {
+    if (spelling == GuardSpelling::NotCounted) {
         out = tied[0];
-    } else if (tied[0].empty()) {
+    } else if (spelling == GuardSpelling::Counted) {
         out = tied[1];
+    } else if (tied[0] == tied[1]) {
+        out = tied[0];
     } else {
-        guard_ambiguous_.insert(gpos);
-        CML_LOG(Trace, "bind: guard %s: clang's spelling of its scope ties it to %zu static(s), cl's to %zu others: tied to none", guard.name.c_str(), tied[0].size(),
-                tied[1].size());
-    }
-    if (!out.empty() && tied[0] != tied[1]) {
-        CML_LOG(Trace, "bind: guard %s: tied by its scope in %s spelling (back-references resolved)", guard.name.c_str(), tied[0].empty() ? "cl's" : "clang's");
+        std::vector<std::uint32_t> either = tied[0];
+        either.insert(either.end(), tied[1].begin(), tied[1].end());
+        CML_LOG(Trace, "bind: guard %s: the compiler's spelling of back-references is not known, and the two spellings tie it to %zu and %zu static(s): tied to none",
+                guard.name.c_str(), tied[0].size(), tied[1].size());
+        guard_ambiguous_[gpos] = std::move(either);
     }
     return guard_statics_.emplace(gpos, std::move(out)).first->second;
 }
 
-// WP-52 (R-60, ADR-0045): for a guard tied to no static (guard_scope_statics), a static bound to the running process that may
-// be its own: a function-local static of the object, bound to old data, that no guard of the object is tied to, in the
-// same outermost function as the guard (or anywhere, when the scope of either cannot be read). Null when there is none:
-// then a fresh guard cannot run a bound static's initialiser again.
-const Sym* Planner::untied_guard_owner(const Sym& guard) {
+// WP-52 (review, finding 2): does the old image record a guard variable in the procedure that holds the old record `st` is
+// bound to? (cl records its guards; clang records none, so this is false for every clang compiland.)
+bool Planner::old_scope_has_guard_record(const Sym& st) {
+    if (st.dec.old_address.rva == kNoRva || !ensure_compiland_symbols()) {
+        return false;
+    }
+    std::uint32_t parent = pdb::kNoSymbol;
+    for (const pdb::SymbolView& v : comp_syms_) {
+        if (pdb::is_data_kind(v.kind) && v.rva == st.dec.old_address.rva && v.parent_proc != pdb::kNoSymbol) {
+            parent = v.parent_proc;
+            break;
+        }
+    }
+    if (parent == pdb::kNoSymbol) {
+        return false;
+    }
+    for (const pdb::SymbolView& v : comp_syms_) {
+        if (pdb::is_data_kind(v.kind) && v.parent_proc == parent && is_guard_variable("?" + std::string(v.name) + "@")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// WP-52 (R-60, ADR-0045 and its review rulings): for a guard tied to no static (guard_scope_statics), a static bound to the
+// running process that may be its own, i.e. a function-local static of the object, bound to old data, that no guard of
+// the object is tied to, and
+//   * that a spelling of the guard's scope ties the guard to, where the compiler's spelling is not known (ambiguous); or
+//   * where the scope of the guard or of the static cannot be read: of the same outermost function AS WRITTEN
+//     (outermost_function_as_written; if either cannot be found, it is not), and in need of a guard: the old image records
+//     a guard in its procedure, or the patch has a guard of its block (a bitmask: of its function) as written.
+// Where both scopes are read and differ, the static is provably not the guard's. Null when there is none: a fresh guard
+// then cannot run a bound static's initialiser again.
+Planner::UntiedOwner Planner::untied_guard_owner(const Sym& guard) {
     const std::uint32_t gpos = static_cast<std::uint32_t>(&guard - syms_.data());
-    const ScopeKeys gk = scope_keys(gpos);
     std::set<std::uint32_t> guarded;
+    std::vector<std::uint32_t> guards;
     for (std::uint32_t pos = 0; pos < syms_.size(); ++pos) {
         const Sym& g = syms_[pos];
         if (g.defined && g.is_static && g.dec.type == SymbolType::Data && is_guard_variable(g.name)) {
             const std::vector<std::uint32_t>& statics = guard_scope_statics(g);
             guarded.insert(statics.begin(), statics.end());
+            guards.push_back(pos);
         }
     }
-    for (std::uint32_t pos = 0; pos < syms_.size(); ++pos) {
+    const auto candidate = [&](std::uint32_t pos) {
         const Sym& s = syms_[pos];
-        if (!s.defined || !s.is_static || s.dec.type != SymbolType::Data || s.name.empty() || s.name[0] != '?' || is_guard_variable(s.name) || s.diagnosed ||
-            !s.decided || s.dec.decision != DecisionKind::BindOldData || guarded.count(pos) != 0) {
+        return s.defined && s.is_static && s.dec.type == SymbolType::Data && !s.name.empty() && s.name[0] == '?' && !is_guard_variable(s.name) && !s.diagnosed &&
+               s.decided && s.dec.decision == DecisionKind::BindOldData && guarded.count(pos) == 0;
+    };
+    UntiedOwner owner;
+    if (const auto it = guard_ambiguous_.find(gpos); it != guard_ambiguous_.end()) {
+        for (const std::uint32_t pos : it->second) {
+            if (candidate(pos)) {
+                owner.sym = &syms_[pos];
+                owner.ambiguous = true;
+                return owner;
+            }
+        }
+    }
+    const bool bitmask = guard.name.compare(0, 3, "?$S") == 0;
+    const GuardSpelling spelling = guard_spelling(bitmask);
+    const ScopeKeys gk = scope_keys(gpos);
+    const bool guard_read = (spelling != GuardSpelling::Counted && gk[0].has_value()) || (spelling != GuardSpelling::NotCounted && gk[1].has_value());
+    const std::string guard_function = outermost_function_as_written(guard.name);
+    // The block as written ("?1?"), from the first scope after the entity's own name.
+    const auto block_of = [](const std::string& name) -> std::string {
+        const std::size_t at = name.find('@', name.compare(0, 2, "?$") == 0 ? 2 : 1);
+        if (at == std::string::npos) {
+            return {};
+        }
+        const std::string_view rest = std::string_view(name).substr(at + 1);
+        return std::string(rest.substr(0, block_prefix_length(rest)));
+    };
+    for (std::uint32_t pos = 0; pos < syms_.size(); ++pos) {
+        if (!candidate(pos)) {
             continue;
         }
+        const Sym& s = syms_[pos];
         const std::optional<LocalScopeKey>& sk = scope_keys(pos)[0];
-        const std::size_t at = s.name.find('@');
-        if (!sk && (s.name.size() < 2 || s.name[1] == '?' || at == std::string::npos || block_prefix_length(std::string_view(s.name).substr(at + 1)) == 0)) {
+        if (guard_read && sk) {
+            continue;  // both scopes read, and they differ: not the guard's
+        }
+        const std::string block = block_of(s.name);
+        if (block.empty()) {
             continue;  // not function-local (its first scope is no block of a function)
         }
-        const bool same_function = !sk || (!gk[0] && !gk[1]) || (gk[0] && gk[0]->outermost == sk->outermost) || (gk[1] && gk[1]->outermost == sk->outermost);
-        CML_LOG(Trace, "bind: guard %s is tied to no static; %s is bound without a guard of its own%s", guard.name.c_str(), s.name.c_str(),
-                same_function ? " in the same function (or a scope that cannot be read): it may be the guard's" : ", in another function");
-        if (same_function) {
-            return &s;
+        const std::string function = outermost_function_as_written(s.name);
+        if (guard_function.empty() || function.empty() || function != guard_function) {
+            CML_LOG(Trace, "bind: guard %s is tied to no static; %s (bound, no guard of its own, a scope cannot be read) is of %s function as written", guard.name.c_str(),
+                    s.name.c_str(), guard_function.empty() || function.empty() ? "an unknown" : "another");
+            continue;
+        }
+        bool needs_guard = old_scope_has_guard_record(s);
+        for (std::size_t k = 0; !needs_guard && k < guards.size(); ++k) {
+            const std::string& g = syms_[guards[k]].name;
+            const bool g_bitmask = g.compare(0, 3, "?$S") == 0;
+            needs_guard = outermost_function_as_written(g) == function && (g_bitmask || block_of(g) == block);
+        }
+        CML_LOG(Trace, "bind: guard %s is tied to no static; %s (bound, no guard of its own, a scope cannot be read) is of the same function as written%s",
+                guard.name.c_str(), s.name.c_str(), needs_guard ? ": it may be the guard's" : ", but needs no guard (none in its scope, old or new)");
+        if (needs_guard) {
+            owner.sym = &s;
+            owner.as_written = true;
+            return owner;
         }
     }
-    return nullptr;
+    return owner;
 }
 
 bool Planner::guard_ties(std::uint32_t guard_pos, std::uint32_t static_pos) {
@@ -3773,11 +3906,15 @@ void Planner::settle_guards() {
             }
             // WP-52 (R-60): a guard tied to no static. A fresh guard runs its static's initialiser again; that is harmless only
             // when no static bound to the running process can be the guard's (ADR-0045). One that might be is refused.
-            if (const Sym* owner = untied_guard_owner(sy); owner != nullptr) {
+            if (const UntiedOwner owner = untied_guard_owner(sy); owner.sym != nullptr) {
+                const std::string why =
+                    owner.ambiguous ? " (the compiler's spelling of the back-references in the guard's name is not known, and one spelling ties the guard to it)"
+                    : owner.as_written ? " (as far as the function could be told: a scope cannot be read, so the function was compared as written)"
+                                       : "";
                 error(diag::kGuardUnmatched,
-                      "the guard variable " + describe(sy) + " in " + in_.object_name + " cannot be tied to a static of its block, and " + describe(*owner) +
-                          " of the same function is bound to the running process without a guard of its own: the guard may be that static's, and with a fresh guard its "
-                          "initialiser would run again over the live object",
+                      "the guard variable " + describe(sy) + " in " + in_.object_name + " cannot be tied to a static of its block, and " + describe(*owner.sym) +
+                          " of the same function is bound to the running process without a guard of its own" + why +
+                          ": the guard may be that static's, and with a fresh guard its initialiser would run again over the live object",
                       "Hot-restart. If this function was not edited, report the two decorated names (the trace log lists them as 'bind: guard ...').");
                 sy.diagnosed = true;
                 decide(sy, DecisionKind::PatchNewData, BindSource::None, SymbolType::Data, {}, "guard tied to no static, next to a bound static without a guard (CML3211)");

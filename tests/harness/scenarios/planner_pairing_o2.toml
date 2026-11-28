@@ -109,17 +109,15 @@ key = "patched"
 value = 1
 compiler = "clang-cl"
 
+# nest continues from its last value before the reload (since_reload) and never drops; nmade stays 1.
 [[step]]
 kind = "expect_stdout"
-regex = "TICK n=\\d+ mark=[12] a=10\\d{4} b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=1 made=3 nest=70(00[2-9]\\d|0[1-9]\\d\\d|[1-9]\\d{3}) nmade=1 nmark=[14]\\b"
-within_s = 10
-
-[[step]]
-kind = "expect_stdout"
-regex = "TICK n=\\d+ mark=[12] a=10\\d{4} b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=1 made=3 nest=70\\d{4} nmade=1 nmark=[14]\\b"
+regex = "TICK n=\\d+ mark=[12] a=10\\d{4} b=20\\d{4} c=30\\d{4} parts=50\\d{4} pm=1 made=3 nest=7\\d{5} nmade=1 nmark=[14]\\b"
 within_s = 10
 
 [[step]]
 kind = "expect_monotonic"
 key = "nest"
 min_samples = 20
+since_reload = 10
+within_s = 20

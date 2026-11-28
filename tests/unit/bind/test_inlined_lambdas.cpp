@@ -396,6 +396,9 @@ namespace {
 // name in the back-reference table, the static counts `gx`, so the same scope reads `?A?3@` in one and `?A?4@` in the other.
 const char* const kNestedGx = "?gx@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?4@XZ@4UObj@@A";
 const char* const kNestedGuard = "?$TSS0@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?3@XZ@4HA";
+// The S_COMPILE3 version strings the planner reads the spelling from (WP-52 review, finding 1).
+const char* const kClang18 = "clang version 18.1.3";
+const char* const kCl = "Microsoft (R) Optimizing Compiler";
 
 // The patch of nested_world: s_count, the inner lambda's `gx` (0x20) and the guard `guard` (0x28).
 Built nested_patch(const std::string& guard) {
@@ -407,12 +410,37 @@ Built nested_patch(const std::string& guard) {
     return o.build();
 }
 
+// A world of `compiler` whose TU has the file-scope `s_a` (0x10, teaches the layout) and the procedure `function` with the
+// static records `statics`; the patch defines `s_a` and `symbols` (name, .bss offset).
+struct GuardCase {
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    cml::Result<BindPlan> r = cml::Result<BindPlan>(BindPlan{});
+};
+GuardCase plan_guards(const char* compiler, std::uint16_t major, const std::string& function, const std::vector<std::pair<std::string, std::uint32_t>>& statics,
+                      const std::vector<std::pair<std::string, std::uint32_t>>& symbols) {
+    SynthWorld w = basic_world(false, compiler, major);
+    w.data(w.tu(), "`anonymous namespace'::s_a", 0x10);
+    w.proc_with_statics(w.tu(), function, 0x50, statics);
+    w.open();
+    SynthObj o;
+    const std::int32_t bss = static_cast<std::int32_t>(o.section(".bss", kData, 0x40));
+    o.symbol("?s_a@?A0x1@@3HA", 0x10, bss, false, false);
+    for (const auto& [name, offset] : symbols) {
+        o.symbol(name, offset, bss, false, false);
+    }
+    Built b = o.build();
+    GuardCase c;
+    c.r = plan_bind(w.input(b), &c.errors, &c.partial);
+    return c;
+}
+
 }  // namespace
 
 TEST_CASE("R-60: the guard of a nested lambda's static is tied to the static and placed with it (clang 18 names)") {
     // main (d110b5d): the guard was tied to no static (its scope is spelled with other back-references), so it got a fresh
     // guard with the warning CML3211 while `gx` stayed bound: the patch ran gx's initialiser again over the live object.
-    SynthWorld w = basic_world(false);
+    SynthWorld w = basic_world(false, kClang18, 18);
     nested_world(w);
     Built b = nested_patch(kNestedGuard);
     auto r = plan_bind(w.input(b));
@@ -427,49 +455,124 @@ TEST_CASE("R-60: the guard of a nested lambda's static is tied to the static and
     CHECK(count_code(r->warnings, diag::kGuardUnmatched) == 0);
 }
 
+TEST_CASE("R-60 review: where the compiler is not known, a match in one spelling only ties the guard to nothing (CML3211)") {
+    // The same names in a compiland whose S_COMPILE3 names no compiler the planner knows: clang 18's spelling ties the guard
+    // to `gx`, cl's to nothing, and which is right cannot be told. 835ee2c tied it (the one-sided match).
+    SynthWorld w = basic_world(false);
+    nested_world(w);
+    Built b = nested_patch(kNestedGuard);
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    auto r = plan_bind(w.input(b), &errors, &partial);
+    REQUIRE_FALSE(r.has_value());
+    REQUIRE(count_code(errors, diag::kGuardUnmatched) == 1);
+    CAPTURE(errors[0].message);
+    CHECK(contains(errors[0].message, "the compiler's spelling of the back-references in the guard's name is not known"));
+    CHECK(decision(partial, kNestedGuard).decision == DecisionKind::PatchNewData);
+}
+
+TEST_CASE("R-60 review: a cl guard is read in cl's spelling only, never tied to another function's static by clang 18's") {
+    // A cl object (cl counts `$TSS0`). `G`'s own static is not in the patch; in clang 18's spelling its scope would be
+    // JPH::GetRTTIOfType(JPH::SphereShape *), the scope of `rtti`. 835ee2c took that one-sided match: G was tied to `rtti` and
+    // placed by the layout as if it were rtti's guard (next to rtti's real guard). In cl's spelling `1` is GetRTTIOfType.
+    const std::string rtti = "?rtti@?1??GetRTTIOfType@JPH@@YAPEAVRTTI@2@PEAVSphereShape@2@@Z@4V32@A";
+    const std::string own = "?$TSS0@?1??GetRTTIOfType@JPH@@YAPEAVRTTI@2@PEAVSphereShape@2@@Z@4HA";
+    const std::string other = "?$TSS0@?1??GetRTTIOfType@JPH@@YAPEAVRTTI@1@PEAVSphereShape@1@@Z@4HA";
+    GuardCase c = plan_guards(kCl, 19, "JPH::GetRTTIOfType", {{"rtti", 0x14}}, {{rtti, 0x14}, {own, 0x18}, {other, 0x1C}});
+    REQUIRE_MESSAGE(c.r.has_value(), err(c.r));
+    CHECK(decision(*c.r, rtti).decision == DecisionKind::BindOldData);
+    CHECK(decision(*c.r, own).decision == DecisionKind::BindOldData);
+    CHECK(decision(*c.r, own).old_address.rva == 0x3018);
+    const SymbolDecision g = decision(*c.r, other);
+    CAPTURE(g.reason);
+    CHECK(g.decision == DecisionKind::PatchNewData);
+    CHECK(count_code(c.r->warnings, diag::kGuardUnmatched) == 1);  // tied to no static, and rtti has its own guard
+}
+
 TEST_CASE("R-60: a guard that cannot be tied next to a bound static without a guard is refused (CML3211, an error)") {
-    // main: the warning CML3211, a fresh guard, and the plan accepted: the bound `gx` would be constructed again.
-    struct Case {
-        const char* what;
-        std::string guard;
+    // main: the warning CML3211, a fresh guard, and the plan accepted: the bound `gx` would be constructed again. The guard's
+    // back-reference is outside the table: its scope cannot be read, its function as written is g's, its block gx's.
+    const std::string guard = "?$TSS0@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?7@XZ@4HA";
+    SynthWorld w = basic_world(false, kClang18, 18);
+    nested_world(w);
+    Built b = nested_patch(guard);
+    std::vector<cml::Diag> errors;
+    BindPlan partial;
+    auto r = plan_bind(w.input(b), &errors, &partial);
+    REQUIRE_FALSE(r.has_value());
+    REQUIRE(count_code(errors, diag::kGuardUnmatched) == 1);
+    const cml::Diag& e = errors[0];
+    CAPTURE(e.message);
+    CHECK(e.id() == "CML3211");
+    CHECK(contains(e.message, "cannot be tied to a static of its block"));
+    CHECK(contains(e.message, "is bound to the running process without a guard of its own"));
+    CHECK(contains(e.message, "as far as the function could be told"));
+    CHECK(contains(e.message, "initialiser would run again"));
+    CHECK(decision(partial, guard).decision == DecisionKind::PatchNewData);
+    CHECK(count_code(partial.warnings, diag::kGuardUnmatched) == 0);
+}
+
+TEST_CASE("R-60: a guard tied to no static whose scope differs from every bound static's is still the warning CML3211") {
+    // Both scopes are read and differ: no bound static of the patch can be the guard's, and a fresh guard runs no bound
+    // initialiser again. (835ee2c refused the second and third: "the same function".)
+    const char* const guards[] = {
+        "?$TSS0@?1??other@@YAHXZ@4HA",                                                                    // another function
+        "?$TSS0@?2???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?3@XZ@4HA",       // another block
+        "?$TSS0@?1???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@4HA",                                    // the outer lambda's
     };
-    const Case cases[] = {
-        {"a back-reference outside the table (the scope cannot be read)",
-         "?$TSS0@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?7@XZ@4HA"},
-        {"another block of the same function", "?$TSS0@?2???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?3@XZ@4HA"},
-        {"the outer lambda's block (no static of it in the patch)", "?$TSS0@?1???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@4HA"},
-    };
-    for (const Case& c : cases) {
-        CAPTURE(c.what);
-        SynthWorld w = basic_world(false);
+    for (const char* guard : guards) {
+        CAPTURE(guard);
+        SynthWorld w = basic_world(false, kClang18, 18);
         nested_world(w);
-        Built b = nested_patch(c.guard);
-        std::vector<cml::Diag> errors;
-        BindPlan partial;
-        auto r = plan_bind(w.input(b), &errors, &partial);
-        REQUIRE_FALSE(r.has_value());
-        REQUIRE(count_code(errors, diag::kGuardUnmatched) == 1);
-        const cml::Diag& e = errors[0];
-        CAPTURE(e.message);
-        CHECK(e.id() == "CML3211");
-        CHECK(contains(e.message, "cannot be tied to a static of its block"));
-        CHECK(contains(e.message, "is bound to the running process without a guard of its own"));
-        CHECK(contains(e.message, "initialiser would run again"));
-        CHECK(decision(partial, c.guard).decision == DecisionKind::PatchNewData);
-        CHECK(count_code(partial.warnings, diag::kGuardUnmatched) == 0);
+        Built b = nested_patch(guard);
+        auto r = plan_bind(w.input(b));
+        REQUIRE_MESSAGE(r.has_value(), err(r));
+        CHECK(decision(*r, kNestedGx).decision == DecisionKind::BindOldData);
+        CHECK(decision(*r, guard).decision == DecisionKind::PatchNewData);
+        CHECK(count_code(r->warnings, diag::kGuardUnmatched) == 1);
     }
 }
 
-TEST_CASE("R-60: a guard tied to no static, of another function than every bound static, is still the warning CML3211") {
-    // No bound static of the patch can be the guard's: a fresh guard runs no bound initialiser again.
-    SynthWorld w = basic_world(false);
-    nested_world(w);
-    Built b = nested_patch("?$TSS0@?1??other@@YAHXZ@4HA");
-    auto r = plan_bind(w.input(b));
-    REQUIRE_MESSAGE(r.has_value(), err(r));
-    CHECK(decision(*r, kNestedGx).decision == DecisionKind::BindOldData);
-    CHECK(decision(*r, "?$TSS0@?1??other@@YAHXZ@4HA").decision == DecisionKind::PatchNewData);
-    REQUIRE(count_code(r->warnings, diag::kGuardUnmatched) == 1);
+TEST_CASE("R-60 review: an unreadable scope elsewhere in the object does not make an untied guard an error") {
+    // clang 18 names (x86_64-pc-windows-msvc): `pm(void (K::*)())` holds `q`; a member pointer parameter (`P8K@@...`) is a
+    // type local_scope_key does not read. `q` is bound and its guard is not in the patch; the untied guard is other()'s.
+    // 835ee2c: an unreadable scope counted as "the same function", so CML3211 was an error. Now the functions are compared as
+    // written (`?pm@@` against `?other@@`): the warning.
+    const std::string q = "?q@?1??pm@@YAHP8K@@EAAXXZ@Z@4URegistry@@A";
+    const std::string guard = "?$TSS0@?1??other@@YAHXZ@4HA";
+    GuardCase c = plan_guards(kClang18, 18, "pm", {{"q", 0x14}}, {{q, 0x14}, {guard, 0x18}});
+    REQUIRE_MESSAGE(c.r.has_value(), err(c.r));
+    CHECK(decision(*c.r, q).decision == DecisionKind::BindOldData);
+    CHECK(decision(*c.r, guard).decision == DecisionKind::PatchNewData);
+    CHECK(count_code(c.r->warnings, diag::kGuardUnmatched) == 1);
+    // And with its own guard: the two unreadable names are tied as written, the guard is placed with q.
+    const std::string own = "?$TSS0@?1??pm@@YAHP8K@@EAAXXZ@Z@4HA";
+    GuardCase d = plan_guards(kClang18, 18, "pm", {{"q", 0x14}}, {{q, 0x14}, {own, 0x18}});
+    REQUIRE_MESSAGE(d.r.has_value(), err(d.r));
+    CHECK(decision(*d.r, own).decision == DecisionKind::BindOldData);
+    CHECK(count_code(d.r->warnings, diag::kGuardUnmatched) == 0);
+}
+
+TEST_CASE("R-60 review: a constant-initialised static needs no guard and does not make an untied guard an error") {
+    // clang 18: `int cinit() { static int n = 0; ... }`, `n` has no guard. An untied guard of another block of cinit (its
+    // static not in the patch): both scopes are read and differ, the warning. 835ee2c: CML3211 (n counted as "tied to no guard").
+    const std::string n = "?n@?1??cinit@@YAHXZ@4HA";
+    GuardCase c = plan_guards(kClang18, 18, "cinit", {{"n", 0x14}}, {{n, 0x14}, {"?$TSS0@?2??cinit@@YAHXZ@4HA", 0x18}});
+    REQUIRE_MESSAGE(c.r.has_value(), err(c.r));
+    CHECK(decision(*c.r, n).decision == DecisionKind::BindOldData);
+    CHECK(count_code(c.r->warnings, diag::kGuardUnmatched) == 1);
+    // A guard whose scope cannot be read, of cinit as written but of another block: n has no guard record in the old image and
+    // no guard of its block in the patch, so it needs none: the warning.
+    const std::string unreadable = "?$TSS0@?2??cinit@@YAHU7@@Z@4HA";
+    GuardCase d = plan_guards(kClang18, 18, "cinit", {{"n", 0x14}}, {{n, 0x14}, {unreadable, 0x18}});
+    REQUIRE_MESSAGE(d.r.has_value(), err(d.r));
+    CHECK(count_code(d.r->warnings, diag::kGuardUnmatched) == 1);
+    // The same unreadable guard in n's own block: it may be n's (the function as written, the block): refused.
+    const std::string same_block = "?$TSS0@?1??cinit@@YAHU7@@Z@4HA";
+    GuardCase e = plan_guards(kClang18, 18, "cinit", {{"n", 0x14}}, {{n, 0x14}, {same_block, 0x18}});
+    REQUIRE_FALSE(e.r.has_value());
+    REQUIRE(count_code(e.errors, diag::kGuardUnmatched) == 1);
+    CHECK(contains(e.errors[0].message, "as far as the function could be told"));
 }
 
 TEST_CASE("R-54 review: the R-54 edit one level down (the inner lambda deleted, its static's name declared in the outer lambda) is refused") {

@@ -99,11 +99,11 @@ public:
         putstr(b, "");
         add(0x1103, b);
     }
-    void compile3(std::uint8_t language, std::uint32_t extra_flags, std::uint16_t machine, const std::string& version) {
+    void compile3(std::uint8_t language, std::uint32_t extra_flags, std::uint16_t machine, const std::string& version, std::uint16_t frontend_major = 19) {
         Bytes b;
         put32(b, language | extra_flags);
         put16(b, machine);
-        const std::uint16_t versions[8] = {19, 29, 30133, 0, 14, 29, 30133, 0};
+        const std::uint16_t versions[8] = {frontend_major, 29, 30133, 0, 14, 29, 30133, 0};
         for (std::uint16_t v : versions) {
             put16(b, v);
         }

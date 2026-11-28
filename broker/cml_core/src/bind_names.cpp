@@ -651,6 +651,7 @@ struct BackrefReader {
     int depth = 0;
     std::vector<std::string> names;  // the back-reference table: each name with its closing '@'
     int local_level = 0;             // how many function scopes are open
+    int type_level = 0;              // > 0 inside a type (a parameter, a return type, a template argument)
     int outermost_level = 0;
     std::string outermost;           // the function scope opened deepest (the outermost function), written out
 
@@ -801,7 +802,9 @@ struct BackrefReader {
         const std::size_t start = out.size();
         ++local_level;
         const bool read = symbol(out);
-        if (read && local_level > outermost_level) {
+        // Only the function scopes of the qualified name itself count: a function scope inside a type (a lambda of
+        // another function as a parameter or template argument, `run<lambda of main>`) is not the entity's function.
+        if (read && type_level == 0 && local_level > outermost_level) {
             outermost_level = local_level;
             outermost = out.substr(start);
         }
@@ -956,6 +959,7 @@ struct BackrefReader {
         if (++depth > 64) {
             return fail();
         }
+        ++type_level;
         const char c = peek();
         bool read = false;
         if (in(c, "CDEFGHIJKMNOX")) {
@@ -988,6 +992,7 @@ struct BackrefReader {
         } else {
             read = fail();
         }
+        --type_level;
         --depth;
         return read && ok;
     }
@@ -1038,6 +1043,43 @@ struct BackrefReader {
 };
 
 }  // namespace
+
+std::string outermost_function_as_written(std::string_view d) {
+    if (d.size() < 4 || d[0] != '?') {
+        return {};
+    }
+    // The first function scope after the entity's own name, then deeper while the qualified name of the function opened
+    // there holds another function scope before it ends ("@@").
+    std::size_t from = d.find('@', d.compare(0, 2, "?$") == 0 ? 2 : 1);
+    if (from == std::string_view::npos) {
+        return {};
+    }
+    ++from;
+    std::size_t len = function_scope_length(d, from);
+    if (len == 0 || from + len + 1 >= d.size() || d[from + len] != '?' || d[from + len + 1] != '?') {
+        return {};
+    }
+    std::size_t start = from + len + 1;  // the '?' of the enclosing function's own name
+    for (int guard = 0; guard < 64; ++guard) {
+        const std::size_t end = d.find("@@", start + 1);
+        if (end == std::string_view::npos) {
+            return {};
+        }
+        std::size_t deeper = std::string_view::npos;
+        for (std::size_t k = start + 1; k < end; ++k) {
+            const std::size_t l = function_scope_length(d, k);
+            if (l != 0 && k + l + 1 < d.size() && d[k + l] == '?' && d[k + l + 1] == '?') {
+                deeper = k + l + 1;
+                break;
+            }
+        }
+        if (deeper == std::string_view::npos) {
+            return std::string(d.substr(start, end + 2 - start));
+        }
+        start = deeper;
+    }
+    return {};
+}
 
 std::optional<LocalScopeKey> local_scope_key(std::string_view d, bool guard_name_counted) {
     if (d.size() < 4 || d[0] != '?') {

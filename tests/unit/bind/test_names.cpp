@@ -208,7 +208,34 @@ TEST_CASE("local_scope_key: no key for names that are not function-local or cann
     CHECK_FALSE(local_scope_key("?x@?1??f@@YAXU7@@Z@4HA", false).has_value());   // a name back-reference that is not in the table
     CHECK_FALSE(local_scope_key("?x@?1??f@@$$J0YAXXZ@4HA", false).has_value());  // extern "C" encoding: not read
     CHECK(local_scope_key("?x@?1??f@@YAXXZ@4HA", false).has_value());
+    // A member pointer parameter is not read (the fallback compares the function as written).
+    CHECK_FALSE(local_scope_key("?q@?1??pm@@YAHP8K@@EAAXXZ@Z@4URegistry@@A", false).has_value());
     // cl's statics of C functions (the agent's own, as the corpus logs show them).
     CHECK(rest_of("?cml_module_anchor@?1??cml_get_current_module_path@@9@4HA") == "?cml_get_current_module_path@@9@4");
     CHECK(rest_of("?$S1@?1??cml_get_current_module_path@@9@4IA", true) == "?cml_get_current_module_path@@9@4");
+}
+
+TEST_CASE("local_scope_key (review): the outermost function is taken along the qualified name, never from a type") {
+    // clang 18: `template <class F> int run(F f) { static Registry r; ... }` with a lambda of main (`?main@@9`). main's
+    // function scope is in run's template argument and parameter, not in r's qualified name: the function is run<...>.
+    const char* r = "?r@?1???$run@V<lambda_0>@?0??main@@9@@@YAHV<lambda_0>@?0??main@@9@@Z@4URegistry@@A";
+    const std::optional<LocalScopeKey> k = local_scope_key(r, false);
+    REQUIRE(k.has_value());
+    CHECK(k->outermost == "??$run@V<lambda_0>@?0??main@@9@@@YAHV<lambda_0>@?0??main@@9@@Z");
+    CHECK(rest_of("?$TSS0@?1???$run@V<lambda_0>@?0??main@@9@@@YAHV<lambda_0>@?0??main@@9@@Z@4HA") == k->rest);
+    const std::optional<LocalScopeKey> nested = local_scope_key("?gx@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?4@XZ@4UObj@@A", false);
+    REQUIRE(nested.has_value());
+    CHECK(nested->outermost == "?g@@YAXXZ");
+}
+
+TEST_CASE("outermost_function_as_written: the outermost function of a scope as written, for names without a key") {
+    CHECK(outermost_function_as_written("?q@?1??pm@@YAHP8K@@EAAXXZ@Z@4URegistry@@A") == "?pm@@");
+    CHECK(outermost_function_as_written("?$TSS0@?1??pm@@YAHP8K@@EAAXXZ@Z@4HA") == "?pm@@");
+    CHECK(outermost_function_as_written("?gx@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?4@XZ@4UObj@@A") == "?g@@");
+    CHECK(outermost_function_as_written("?$TSS0@?1???R<lambda_1>@?0???R<lambda_0>@?0??g@@YAXXZ@QEBA?A?<auto>@@XZ@QEBA?A?7@XZ@4HA") == "?g@@");
+    CHECK(outermost_function_as_written("?sname@?1???R<lambda_1>@?L@??_flush_scene_change@SceneTree@@AEAAXXZ@QEBAAEBVStringName@@XZ@4V4@A") ==
+          "?_flush_scene_change@SceneTree@@");
+    CHECK(outermost_function_as_written("?rtti@?1??GetRTTIOfType@JPH@@YAPEAVRTTI@2@PEAVSphereShape@2@@Z@4V32@A") == "?GetRTTIOfType@JPH@@");
+    CHECK(outermost_function_as_written("?s_a@?A0x1@@3HA").empty());  // not function-local
+    CHECK(outermost_function_as_written("?x@?1??f").empty());          // cut short
 }

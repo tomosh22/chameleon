@@ -21,4 +21,9 @@ std::vector<long long> tick_values(std::string_view output, std::string_view key
 // values. Returns a one-line summary ("calls: 143 samples, 1 -> 143") or CML5427 naming the first offence.
 cml::Result<std::string> check_monotonic(std::string_view output, std::string_view key, std::size_t min_samples);
 
+// WP-52: `before` is the output up to the last reload, `after` the output since. The series of `key` in `after` has at
+// least `min_after` values and its first is not below the last value of `before` (the reload kept the state, it did not
+// restart it). Returns a one-line summary ("nest: 812 before the reload, 813 after, 40 samples since") or CML5427.
+cml::Result<std::string> check_continues(std::string_view before, std::string_view after, std::string_view key, std::size_t min_after);
+
 }  // namespace cmltest
