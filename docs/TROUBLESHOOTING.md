@@ -1282,6 +1282,51 @@ licensing hook (`CML5998`, `CML5999`) is never raised by the shipped build.
 - **What to do:** Restart the application (or hot-restart it); if it still runs, enable the module again and reload: the reload's files are compiled again.
 - **Raised by:** `broker/cml_core/include/cml/core/atomic_reload_diag_ids.h`
 
+### CML3656
+
+- **Cause:** (warning) A reload covered several modules of one process (an exe and its DLLs, typically through a header they all include) and one module was refused while the reload was being prepared, or its preparation failed otherwise. The diagnostic decides which: a refusal is one of the bind / link range `CML3xxx` (the bind planner, a code proof, the anchor, the link or the fix-ups refused the edit); anything else is a failure (the PDB `CML1xxx`, a compile error `CML2xxx`, the agent `CML4xxx` such as its reservation, the broker's `CML5xxx`: the reload's deadline, no room left in the reservation, no linker driver, an injected failure, a cancellation). The refusal or failure is the reload's error, and its message names the module ("module 2 of 2, plugin.dll"); this warning says which of the two it was, and is published at stage `plan` for a refusal of the planner, a proof or the link, otherwise at the stage of the failure. Since WP-54 a reload prepares every module of a process (sweep, compile, plan, verify and link each recompiled translation unit) before it applies any, so the refusal of one module leaves every module of that process exactly as it was: the modules prepared before it were linked into patch DLLs that were never loaded, the ones after it were not prepared, and no `patch_applied` event was published. Before WP-54 the modules before it stayed patched while the reply was the refusal. Other processes of the same reload are independent: their modules are applied or refused on their own. None of the reload's files is taken into the baseline of these modules, so the next reload compiles them again.  
+- **Message:** `the reload of process <...> was refused at module <...> of <...> (<...>, <...>): none of its modules was applied (<...> module(s) before it (<...>) were planned and linked, none was loaded; <...> after it were not prepared); the process runs what it ran before`  
+- **Message:** `the reload of process <...> stopped at module <...> of <...> (<...>), which failed while it was prepared (stage <...>, <...>): none of its modules was applied (<...> module(s) before it (<...>) were planned and linked, none was loaded; <...> after it were not prepared); the process runs what it ran before`  
+- **What to do:** Fix what the refusal names, then reload: the edit is applied to every module then. Files the reload did not apply are compiled again.  
+  Other variants of the advice: Fix what the failure names, then reload: the edit is applied to every module then. Files the reload did not apply are compiled again.  
+- **Raised by:** `broker/cml_core/include/cml/core/atomic_reload_diag_ids.h`
+
+### CML3657
+
+- **Cause:** (warning) A reload of several modules of one process failed while one module was being applied (the agent refused to load its patch, a fix-up, an initialiser or its hooks, or the reload ran out of time), after other modules of the same process had already been applied by this reload. Those modules were rolled back with the patch revert of WP-22, one module at a time, newest first: functions that an older patch had hooked jump to that patch again, the others get their original bytes back, the patch images are un-committed (they stay loaded, as after `revert`), and the broker's registry, hook table, generation and source baseline go back. No `patch_applied` event was published for them. The failure itself is the reload's error (the failed module's own translation units were dealt with as for any reload: `CML3651`). The modules after the failed one were not applied. Raised only when the agent confirmed every step of every roll-back; otherwise `CML3658` or `CML3659`.  
+- **Message:** `applying module <...> of <...> of process <...> (<...>, <...>) failed, so the <...> module(s) of this reload applied before it (<...>) were rolled back (<...> function(s) back to the original code, <...> re-pointed at an older patch)[; <...> after it were not applied]: the process runs what it ran before the reload`  
+- **What to do:** Fix what the failure names, then reload: the edit is applied to every module then.  
+- **Raised by:** `broker/cml_core/include/cml/core/atomic_reload_diag_ids.h`
+
+### CML3658
+
+- **Cause:** A reload of several modules of one process failed while one module was being applied, and rolling back a module of the same process that this reload had applied before it failed as well (the agent refused the revert of its hooks, for example because a thread would not leave a function, `CML5851`; the message carries the failure and every roll-back that failed). The program runs a part of the edit. The batch of each module whose roll-back failed stays recorded, so a `revert` (scope last) can undo it later (unless the module is no longer loaded where its patches were made, `CML5856`: then its patch list was dropped and the message says so). Nothing of the reload is announced with `patch_applied`.  
+- **Message:** `applying module <...> of <...> of process <...> (<...>, <...>) failed (<...>) and rolling back the <...> module(s) of this reload applied before it (<...>) failed for <...> of them (<...>): the process runs a part of the edit; <...> stay(s) recorded as this reload's batch` (or `...; the module's patch list was dropped`)  
+- **What to do:** Send `revert` (scope last) to try the roll-back again, or restart the application.  
+  Other variants of the advice: Restart the application, or enable the module again and reload.  
+- **Raised by:** `broker/cml_core/include/cml/core/atomic_reload_diag_ids.h`
+
+### CML3659
+
+- **Cause:** A reload of several modules of one process failed while one module was being applied, and the roll-back of a module applied before it (see `CML3657`) was sent but not confirmed: the agent did not confirm the hook changes in time (`CML5852`: synchronised mode, the application did not reach `SyncPoint()`), or did not un-commit the rolled-back patch images (`CML5855`: an older agent). The broker's state follows the roll-back, as it does for `revert` in that case; until the agent applies it the program may run a part of the edit. Nothing of the reload is announced with `patch_applied`; the message carries the failure and the warnings of the roll-back.  
+- **Message:** `applying module <...> of <...> of process <...> (<...>, <...>) failed (<...>) and the roll-back of the <...> module(s) of this reload applied before it (<...>) was sent but not confirmed (<...>): the broker's state follows the roll-back, and the process may run a part of the edit until the agent applies it`  
+- **What to do:** In synchronised mode let the application reach SyncPoint(); if the application's hooks of the rolled-back patches keep running, restart the application.  
+- **Raised by:** `broker/cml_core/include/cml/core/atomic_reload_diag_ids.h`
+
+### CML3660
+
+- **Cause:** (warning) While a reload of several modules of one process was being applied, the agent did not confirm the hooks of one module in time (`CML5309`: synchronised mode, the application did not reach `SyncPoint()`), or could not take them out again after a failure (`CML4656`). That module's patch may still become live (at the next `SyncPoint()`), so nothing is rolled back (a revert would queue behind it), and the reload of the process stopped there: the modules before it stay applied (and are announced, as are that module's own translation units applied before the unconfirmed one, see `CML3653`), the ones after it were not applied. The program may run a part of the edit.  
+- **Message:** `module <...> of <...> of process <...> (<...>, <...>) may still become live and cannot be rolled back, so the reload of the process stopped there: <...> module(s) before it are applied (<...>), <...> after it are not; the process may run a part of the edit`  
+- **What to do:** In synchronised mode let the application reach SyncPoint(), then reload (the files of the modules that were not applied are compiled again), or `revert` this reload.  
+- **Raised by:** `broker/cml_core/include/cml/core/atomic_reload_diag_ids.h`
+
+### CML3661
+
+- **Cause:** (warning) The agent disconnected (the application exited or crashed, or its pipe broke) while a reload of several modules of one process was being applied. The modules applied before that stay recorded as the reload's batches, the others were not applied, and nothing could be rolled back. None of the applied modules' files is taken into the baseline (the baseline they replaced comes back) and no `patch_applied` is published. The disconnection itself is the reload's error.  
+- **Message:** `the agent of process <...> disconnected while module <...> of <...> (<...>, <...>) was applied: <...> module(s) of this reload were applied before it (<...>), <...> after it were not, and nothing could be rolled back; if the process still runs, it runs a part of the edit`  
+- **What to do:** Restart the application (or hot-restart it); if it still runs, enable the modules again and reload: the reload's files are compiled again.  
+- **Raised by:** `broker/cml_core/include/cml/core/atomic_reload_diag_ids.h`
+
 ## CML4200 to CML4299
 
 ### CML4200
