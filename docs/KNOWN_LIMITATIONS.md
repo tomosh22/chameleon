@@ -91,8 +91,10 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
   accepted edits for its sources (FreeLibrary + LoadLibrary, or a module the restarted process loads later, CML5809) gets those
   edits re-applied by a re-apply reload once its index is ready; each instance has its own patch work directory. A re-apply that
   fails is CML5600, an index that fails CML5601; both name the module and the files. Edits are carried only to the same process
-  (restart token, command line and creation time). Limits: a FreeLibrary + LoadLibrary at the same base inside one agent module
-  poll (500 ms) is invisible to the agent, and the new image runs its original code (R-53); when an agent reconnects to a live
+  (restart token, command line and creation time). Limits: since WP-48 (R-53) the agent sees every load and unload through
+  the loader's notifications, so a FreeLibrary + LoadLibrary at the same base is reported even inside one poll; a hook record whose
+  bytes were overwritten by another tool or a debugger is kept, not forgotten (CML4724), and the WP50-HOOKS `lock_us` field also
+  counts time a module-event reconcile held the installer; when an agent reconnects to a live
   process, the module instances enabled at the disconnect leave no carry; a module whose index is not ready during a restart
   (CML5810) gets its edits re-applied when the index is ready, and CML5809/CML5810 name the files that could not be carried. `CML_RESTART_TOKEN` stays in the new process's environment (ADR-0034). `Agent::ScheduleRestart` still
   returns `CML_STATUS_NOT_IMPLEMENTED`. A broker started with a short `--exit-when-idle` can exit during the restart gap.
