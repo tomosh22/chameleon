@@ -126,6 +126,9 @@ Follow-on work for these limitations (and the product gaps that are not diagnost
 - Control-pipe events (`patch_applied`, `diag`, `log`) are delivered asynchronously and may
   arrive after the `reload` response they belong to. A subscriber that does not read for 5 s is
   disconnected (WP-12).
+- The broker writes its log file from a thread of its own (WP-58). Everything logged before a control answer or an event is in the
+  file when the client has it, and nothing is lost on a normal exit; a broker that is killed or crashes can lose the lines of its last
+  2 ms or so (records logged after its last answer or event). Warnings and errors are written before their log call returns.
 - Touching a file is not a change: only content hashes are compared (WP-12). A changed file that no
   compiland lists and the include scan cannot reach is warned as CML5303.
 - Read-only data (`.rdata`, const tables, constants) is not bound to the old image: the patch uses a fresh copy, so edits to it take effect, but its ADDRESS changes across a patch (code of the old image that took and keeps the old address, or compares addresses, sees the old table).
